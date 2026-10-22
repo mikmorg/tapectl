@@ -382,7 +382,9 @@ enforce D4.)
 ### 4.3 mhvtl scope honesty
 mhvtl (loaded now, `/dev/nst0` live) verifies: round-trip, leak scan, chain
 walk, resume. It **cannot** verify the EOT clean-abort (it silently corrupts
-overflow instead of returning ENOSPC — 2026-07-20 drill); that leg is
+overflow instead of returning ENOSPC — 2026-07-20 drill; since re-measured, 2026-10-20:
+it now returns st's early-warning ENOSPC near capacity but still loses data past it,
+`docs/lto6-validation-checklist.md`); that leg is
 real-hardware-only and stays on the §5 checklist, with the MemStore
 fail-safe-truncation test (§4.1) as the software-side stand-in.
 

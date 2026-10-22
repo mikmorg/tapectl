@@ -199,7 +199,12 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// pass [`is_write_target`]'s status test alone while already holding a
 /// whole tape's worth of attached content — this closes that gap.
 ///
-/// Only `'completed'` counts. `session::SealedPending::confirm` moves
+/// `'completed'` counts, and so does `'cut'` (#420; ADR-0012 item 112): a cut
+/// write is on a sealed volume whose tape ended early, and its slices that
+/// reached the tape are on it. It is never a copy, but the volume holds bytes
+/// tapectl knows about and is no write target, whatever its status says (a
+/// rebuild or an adoption can leave a short tape's rows on an `initialized`
+/// row exactly as it leaves `completed` ones). `session::SealedPending::confirm` moves
 /// every `writes` row of a session to `completed` in the SAME transaction
 /// that flips `volumes.status` to `sealed`, so in NORMAL operation
 /// `completed` and `initialized` never coexist on one volume — only the
@@ -226,7 +231,8 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// already has, not add one.
 pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM writes WHERE volume_id = ?1 AND status = 'completed')",
+        "SELECT EXISTS(SELECT 1 FROM writes
+                       WHERE volume_id = ?1 AND status IN ('completed', 'cut'))",
         params![volume_id],
         |row| row.get(0),
     )?)
@@ -3266,6 +3272,55 @@ pub(crate) mod tests {
             has_completed_write(&conn, volume_id).unwrap(),
             "a `completed` writes row must disqualify"
         );
+
+        // #420: a `cut` row is on a sealed tape that ended early; the volume
+        // holds bytes tapectl knows about, so it disqualifies too.
+        conn.execute(
+            "UPDATE writes SET status = 'cut' WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        assert!(
+            has_completed_write(&conn, volume_id).unwrap(),
+            "a `cut` writes row must disqualify"
+        );
+    }
+
+    /// #420 (ADR-0012 item 112), on the shared short-tape fixture: a `cut`
+    /// row is never a copy. The unit whole on the short tape has its copy;
+    /// the two the early end cut have none, though one of them has a slice on
+    /// the tape; a volume holding only cut writes is still no write target.
+    #[test]
+    fn a_cut_row_is_never_a_copy() {
+        use crate::volume::restore::short_tape;
+        let t = short_tape::short_tape();
+        let copies = |unit: &str| -> i64 {
+            let sql = format!(
+                "SELECT {}",
+                copy_count_expr(&CoverageQuery::current_unit("?1"))
+            );
+            let id: i64 = t
+                .conn
+                .query_row("SELECT id FROM units WHERE name = ?1", [unit], |r| r.get(0))
+                .unwrap();
+            t.conn.query_row(&sql, params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(copies("alpha"), 1, "the positive control");
+        assert_eq!(copies("bravo"), 0);
+        assert_eq!(copies("charlie"), 0);
+        let bravo: i64 = t
+            .conn
+            .query_row("SELECT id FROM units WHERE name = 'bravo'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(in_service_copy_of_version(&t.conn, bravo, 1).unwrap(), None);
+        let sole = sole_slices(&t.conn, t.volume_id).unwrap();
+        assert_eq!(sole.len(), 2, "alpha's two slices: {sole:?}");
+        assert!(sole.iter().all(|s| s.unit_name == "alpha"), "{sole:?}");
+
+        let cut_only = short_tape::cut_only_tape();
+        assert!(has_completed_write(&cut_only.conn, cut_only.volume_id).unwrap());
     }
 
     // ── versions_at_stake (ADR-0008 Tier 3 / ADR-0012, issue #147) ──

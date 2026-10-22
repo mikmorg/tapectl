@@ -1,6 +1,6 @@
 [package]
 name = "tapectl"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "Multi-tenant archival storage management for LTO tape and exportable encrypted directories"
 license = "AGPL-3.0"
@@ -18,6 +18,12 @@ toml = "0.8"
 # Already built as `toml` 0.8's own parser, so this adds no crate to the tree.
 toml_edit = "0.22"
 sha2 = { version = "0.10", features = ["asm"] }
+# The hash behind `pass_count::Sha256` (issue #488, the CTO's 2026-10-20
+# approval of the write-shaping note's §12 item 4): `ring`'s SHA-256 is OpenSSL's
+# SSSE3 code, about 32% faster than `sha2`'s `asm` on CPUs without SHA-NI such as
+# home2's Westmere, and builds static for musl. `sha2` stays for its `Digest` traits
+# (the counted type implements them) and as the `research` build's baseline.
+ring = { version = "0.17", default-features = false }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
@@ -42,6 +48,12 @@ rand = "0.9"
 tar = "0.4"
 tempfile = "3"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
+[features]
+# Issue #488: the write-shaping experiment knobs (`TAPECTL_EXP_*`, `crate::research`).
+# OFF by default and in no production build: without it the variables are ignored
+# and a set one draws one warning line.
+research = []
 
 [dev-dependencies]
 clap_mangen = "0.2"

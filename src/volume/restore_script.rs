@@ -326,13 +326,26 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
     function nk(s) {
       return (s == "") ? "not known" : s
     }
+    function cut_here(row, names,    f, line) {
+      if (!cut_read) {
+        cut_read = 1
+        f = ENVIRON["INDEX_CUT"]
+        if (f != "") {
+          while ((getline line < f) > 0) cutv[line] = 1
+          close(f)
+        }
+      }
+      if (val(row, names, "state") != "this-tape") return 0
+      return ((val(row, names, "unit_uuid") "\t" val(row, names, "version")) in cutv)
+    }
     function holder(row, names,    state, sealed, first, last, count, st, s) {
       state = show(val(row, names, "state"))
       sealed = show(val(row, names, "sealed_at"))
       first = show(val(row, names, "first_slice"))
       last = show(val(row, names, "last_slice"))
       count = show(val(row, names, "num_slices"))
-      if (state == "this-tape") st = "this tape"
+      if (state == "this-tape" && cut_here(row, names)) st = "CUT on this tape: it ended early, before the last slice of this version, so it does not hold it whole"
+      else if (state == "this-tape") st = "this tape"
       else if (state == "sealed") st = (sealed == "") ? "sealed" : "sealed " sealed
       else if (state == "quarantined") {
         st = "QUARANTINED: a verify proved this medium bad, it may still read in part"
@@ -346,6 +359,28 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
       s = s "; generation " nk(show(val(row, names, "generation")))
       return s
     }
+  "##;
+
+/// The versions an envelope `MANIFEST.toml` lists that the tape does not hold
+/// whole (`volume-format-v2.md` sec 4.2): a line `uuid TAB version` for each
+/// `[[units]]` block with a slice whose `tape_position` is after `k`, the
+/// tape's `ended_after`. RESTORE.sh collects them for `--where` and `--find`,
+/// whose index programs then print a `this-tape` row of such a version as cut
+/// (`AWK_INDEX_COMMON`'s `cut_here`), never as a holder. `uuid` and
+/// `snapshot_version` are read in the `[[units]]` head only, as
+/// `AWK_SELECT_VERSION` reads them (#135).
+pub(crate) const AWK_CUT_VERSIONS: &str = r##"
+    function done_block() {
+      if (inblk && cut && id != "") printf "%s\t%s\n", id, v
+      inblk = 0; cut = 0; id = ""; v = ""
+    }
+    /^\[\[units\]\]/ { done_block(); inblk = 1; in_head = 1; in_s = 0; next }
+    /^\[\[units\.slices\]\]/ { in_head = 0; in_s = inblk; next }
+    /^\[/ { in_head = 0; in_s = 0 }
+    in_head && /^uuid = / { id = $3; gsub(/"/, "", id) }
+    in_head && /^snapshot_version = / { v = $3 + 0 }
+    in_s && /^tape_position = / { if ($3 + 0 > k + 0) cut = 1 }
+    END { done_block() }
   "##;
 
 /// `--where UNIT` over one `index/units.tsv` (an envelope member,
@@ -423,7 +458,8 @@ pub(crate) const AWK_INDEX_ALL: &str = r##"
         split(row[k, j], r, "\t")
         lab = nk(show(val(r, h, "volume")))
         st = val(r, h, "state")
-        if (st == "this-tape") lab = lab " (this tape)"
+        if (st == "this-tape" && cut_here(r, h)) lab = lab " (CUT on this tape: not held whole)"
+        else if (st == "this-tape") lab = lab " (this tape)"
         else if (st == "quarantined") lab = lab " (QUARANTINED)"
         s = s (s == "" ? "" : ", ") lab
       }
@@ -461,7 +497,7 @@ pub(crate) const AWK_INDEX_ALL: &str = r##"
       }
       rows[k]++
       row[k, rows[k]] = $0
-      if (val(f, h, "state") == "this-tape") here[k] = 1
+      if (val(f, h, "state") == "this-tape" && !cut_here(f, h)) here[k] = 1
     }
     END {
       if (bad) exit 2

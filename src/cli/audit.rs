@@ -352,6 +352,16 @@ const CHECKS: &[Check] = &[
             run: check_tape_alert,
         },
     },
+    Check {
+        // #420 (layout-session.md, `volumes.ended_after`): the two
+        // invariants of a short-sealed volume's rows. Umbrella name for one
+        // function (`short_seal_findings`) that emits `cut_without_ending`
+        // or `completed_past_ending`, one finding per volume and kind.
+        name: "short_seal",
+        scope: Scope::Archive {
+            run: check_short_seal,
+        },
+    },
 ];
 
 /// Collect every audit finding for `unit_filter` (or all active units),
@@ -1858,6 +1868,92 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
             })
             .collect(),
     })
+}
+
+// SHORT SEAL (#420; ADR-0012 item 112; layout-session.md, "volumes.ended_after").
+//
+// The two invariants `audit` checks of a tape that ended early:
+//
+// - `cut_without_ending`: a `cut` row exists only on a volume with
+//   `ended_after` set. A cut row elsewhere means the catalog does not record
+//   where that tape ended, so `volume verify` would look for its seal at the
+//   planned position.
+// - `completed_past_ending`: every `completed` row on a volume with
+//   `ended_after` set has all its slices at positions at or before it. One
+//   past it is a unit the tape does not hold whole counted as a copy.
+//
+// Confirm, `catalog rebuild` and the adoption of a lost write all keep both,
+// so either is a catalog someone edited, or a bug. Warnings, as every
+// archive-wide check (ADR-0004), named per volume. One statement for every
+// volume (the budget pin in `tests/catalog_budget.rs`). A short seal itself
+// draws no finding: it is a normal, successful end of a write, and a warning
+// for it would hold `audit` at exit 1 for the life of every such tape.
+fn check_short_seal(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: short_seal_findings(ctx.conn)?,
+    })
+}
+
+fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+    let mut stmt = conn.prepare(
+        "SELECT 'cut_without_ending', v.label, NULL, COUNT(*), NULL
+           FROM volumes v JOIN writes w ON w.volume_id = v.id
+          WHERE w.status = 'cut' AND v.ended_after IS NULL
+          GROUP BY v.id
+         UNION ALL
+         SELECT 'completed_past_ending', v.label, v.ended_after,
+                COUNT(DISTINCT w.id), MAX(CAST(wp.position AS INTEGER))
+           -- CROSS JOIN fixes the order (SQLite's rule): the short-sealed
+           -- volumes first, their writes and positions by index, so no pass
+           -- is made over every position in the catalog.
+           FROM volumes v
+           CROSS JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+           CROSS JOIN write_positions wp ON wp.write_id = w.id
+          WHERE v.ended_after IS NOT NULL
+            AND CAST(wp.position AS INTEGER) > v.ended_after
+          GROUP BY v.id
+         ORDER BY 2, 1",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(check, label, ended_after, writes, last)| {
+            let message = if check == "cut_without_ending" {
+                format!(
+                    "volume \"{label}\" has {writes} write(s) recorded `cut` but no \
+                     `ended_after`: a cut row exists only on a volume that sealed short, so this \
+                     catalog does not say where that tape ended"
+                )
+            } else {
+                format!(
+                    "volume \"{label}\" ended after tape file {}, but {writes} write(s) on it \
+                     recorded `completed` have a slice past that (up to file {}): those units \
+                     are not on this tape whole, yet they count as copies",
+                    ended_after.unwrap_or_default(),
+                    last.unwrap_or_default()
+                )
+            };
+            AuditFinding {
+                unit: format!("volume:{label}"),
+                check,
+                message,
+                // A full verify reads the seal where the catalog says the tape
+                // ended and names any disagreement (`ended_after_disagrees`).
+                action: format!("tapectl volume verify {label}"),
+            }
+        })
+        .collect())
 }
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
@@ -5346,7 +5442,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 19 distinct `check` name literals this file's findings can
+        /// The 21 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -5371,6 +5467,8 @@ mod tests {
             "no_full_verify",
             "volume_verify_age",
             "tape_alert",
+            "cut_without_ending",
+            "completed_past_ending",
         ];
 
         #[test]
@@ -5386,13 +5484,14 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 7 archive-wide checks. `policy_unresolvable`
-            // is not one of them (see below), and `escrow_kit_missing`/
-            // `escrow_kit_stale` share one row.
+            // 10 per-unit checks + 8 archive-wide checks. `policy_unresolvable`
+            // is not one of them (see below), `escrow_kit_missing`/
+            // `escrow_kit_stale` share one row, and so do
+            // `cut_without_ending`/`completed_past_ending` (#420).
             assert_eq!(
                 names.len(),
-                17,
-                "expected 10 per-unit + 7 archive-wide CHECKS rows, got: {names:?}"
+                18,
+                "expected 10 per-unit + 8 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -5406,6 +5505,9 @@ mod tests {
                     // `escrow_kit_findings`, returns whichever finding
                     // applies (or none) — never both.
                     "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
+                    // The two invariants of a short-sealed volume's rows,
+                    // one `short_seal` row (#420).
+                    "cut_without_ending" | "completed_past_ending" => "short_seal",
                     other => other,
                 };
                 assert!(
@@ -5679,6 +5781,9 @@ mod tests {
             let index_of = |name: &str| -> usize {
                 let canonical = match name {
                     "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
+                    // The two invariants of a short-sealed volume's rows,
+                    // one `short_seal` row (#420).
+                    "cut_without_ending" | "completed_past_ending" => "short_seal",
                     other => other,
                 };
                 CHECKS
@@ -5859,6 +5964,104 @@ mod tests {
             )
             .unwrap();
             assert!(!flagged(&conn), "retired: the warning clears");
+        }
+    }
+
+    /// #420: the invariants of a short-sealed volume's rows
+    /// (layout-session.md, `volumes.ended_after`), on the shared fixture.
+    mod short_seal {
+        use super::*;
+        use crate::volume::restore::short_tape::{self, LABEL};
+
+        fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
+            let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .all(|f| f.check != "cut_without_ending" && f.check != "completed_past_ending"),
+                "{violations:?}"
+            );
+            warnings
+                .into_iter()
+                .filter(|f| f.check == "cut_without_ending" || f.check == "completed_past_ending")
+                .collect()
+        }
+
+        /// A short tape as the write left it keeps both: no finding, and a
+        /// short seal is not itself one.
+        #[test]
+        fn a_short_tape_as_written_draws_no_finding() {
+            let t = short_tape::short_tape();
+            assert!(short_seal_warnings(&t.conn).is_empty());
+            assert!(short_seal_findings(&t.conn).unwrap().is_empty());
+        }
+
+        /// The coordinator's fact: `ended_after` is recorded with
+        /// `sealed_at`, before confirm, so a short write whose confirm
+        /// quarantined it keeps its ending with every row `aborted` and none
+        /// `cut`. That records where the seal physically is, and is no
+        /// finding.
+        #[test]
+        fn an_ending_with_no_cut_rows_on_an_unsealed_volume_is_no_finding() {
+            let t = short_tape::short_tape();
+            t.conn
+                .execute("UPDATE writes SET status = 'aborted'", [])
+                .unwrap();
+            t.conn
+                .execute(
+                    "UPDATE volumes SET status = 'initialized', observed_condition = 'quarantined'",
+                    [],
+                )
+                .unwrap();
+            assert!(short_seal_warnings(&t.conn).is_empty());
+        }
+
+        #[test]
+        fn a_cut_row_on_a_volume_with_no_ending_is_named() {
+            let t = short_tape::short_tape();
+            t.conn
+                .execute("UPDATE volumes SET ended_after = NULL", [])
+                .unwrap();
+            let found = short_seal_warnings(&t.conn);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].check, "cut_without_ending");
+            assert_eq!(found[0].unit, format!("volume:{LABEL}"));
+            assert!(
+                found[0].message.contains("2 write(s) recorded `cut`"),
+                "{}",
+                found[0].message
+            );
+            assert_eq!(found[0].action, format!("tapectl volume verify {LABEL}"));
+        }
+
+        #[test]
+        fn a_completed_row_past_the_end_is_named() {
+            let t = short_tape::short_tape();
+            let k = t.ended_after;
+            let last = t.positions_of("bravo")[1];
+            t.conn
+                .execute(
+                    "UPDATE writes SET status = 'completed' WHERE stage_set_id =
+                       (SELECT ss.id FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                          JOIN units u ON u.id = s.unit_id WHERE u.name = 'bravo')",
+                    [],
+                )
+                .unwrap();
+            let found = short_seal_warnings(&t.conn);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].check, "completed_past_ending");
+            assert!(
+                found[0]
+                    .message
+                    .contains(&format!("ended after tape file {k}")),
+                "{}",
+                found[0].message
+            );
+            assert!(
+                found[0].message.contains(&format!("up to file {last}")),
+                "{}",
+                found[0].message
+            );
         }
     }
 }

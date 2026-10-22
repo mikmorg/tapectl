@@ -1314,6 +1314,9 @@ struct WriteDone {
     loaded: bool,
     /// The volume `--init` created and the medium it decided on, when it ran.
     initialized: Option<Initialized>,
+    /// How the tape ended (#420): a short seal's `ended_after` and the units
+    /// it cut, read from the catalog once the write returned `Ok`.
+    ending: write::RecordedEnding,
     release: StagingRelease,
     moved: MoveAfterWrite,
 }
@@ -1383,12 +1386,17 @@ fn write_and_follow(
     }
     written?;
     // Reached only when the write above returned `Ok` — sealed AND
-    // confirmed. Issues #440 and #438.
+    // confirmed. Issues #440 and #438. #420: how the tape ended, before the
+    // release (which changes no `writes` row) and the move. A catalog that
+    // cannot answer is an empty answer, never a failed write: the copy
+    // stands (ADR-0012 2026-10-07 item 33).
+    let ending = write::recorded_ending(conn, req.label).unwrap_or_default();
     let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
     let moved = move_after_write(conn, req.label, req.move_to);
     Ok(WriteDone {
         loaded: req.loaded,
         initialized,
+        ending,
         release,
         moved,
     })
@@ -1451,6 +1459,13 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             // (issue #482): what the init decided about the medium.
             "medium": done.initialized.as_ref().map(|i| i.medium.to_json()),
             "loaded": done.loaded,
+            // #420, additive: how the tape ended. `"full"` with no cut unit,
+            // or `"short"` with the `ended_after` its seal states and the
+            // units it cut (still staged; the next `volume write` onto
+            // another cartridge writes them whole).
+            "ending": done.ending.kind(),
+            "ended_after": done.ending.ended_after,
+            "cut_units": done.ending.cut_units,
         }),
         &done.release,
     );
@@ -1847,24 +1862,7 @@ pub fn run(
                 // and one who re-copies a whole tape. This array is the
                 // FULL evidence, including the metadata-position mismatches
                 // that `verification_results` cannot store a row for.
-                let mismatches: Vec<serde_json::Value> = report
-                    .mismatches
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "position": m.position,
-                            "kind": m.kind.label(),
-                            "expected": m.expected,
-                            "actual": m.actual,
-                            // Issue #234: per mismatch, which side of
-                            // ADR-0012's line it falls on, so a script can
-                            // tell "this tape is bad" from "this drive
-                            // could not read it" without a kind allow-list
-                            // of its own that would drift.
-                            "proves_medium_bad": m.kind.proves_medium_bad(),
-                        })
-                    })
-                    .collect();
+                let mismatches = verify_mismatches_json(&report);
                 println!(
                     "{}",
                     serde_json::json!({
@@ -1953,22 +1951,8 @@ pub fn run(
                     "verify {label} ({tier_name} tier): {} checked, {} passed, {} failed",
                     report.checked, report.passed, report.failed,
                 );
-                for m in &report.mismatches {
-                    // Issue #234: the classification, per line. Without it
-                    // the operator has to know which of six kind names is
-                    // quarantine-grade to read the summary below.
-                    let verdict = if m.kind.proves_medium_bad() {
-                        "proves the medium is bad"
-                    } else {
-                        "not medium evidence"
-                    };
-                    println!(
-                        "    position {}: {} ({verdict}) — expected {}, found {}",
-                        m.position,
-                        m.kind.label(),
-                        m.expected,
-                        m.actual
-                    );
+                for line in verify_mismatch_lines(&report) {
+                    println!("{line}");
                 }
                 // Issue #234 / ADR-0012's 2026-09-17 amendment: the
                 // distinction must be visible. A clean verify says nothing
@@ -2327,6 +2311,17 @@ pub fn run(
                     "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
                     (factor * 100.0).round() as i64
                 );
+                // ADR-0012 item 113: only when the drive declares
+                // `post_warning_bytes`; every line above is unchanged.
+                let tape = backend.planning_tape_budget(generation.as_deref())?;
+                let mut in_write_order: Vec<(String, i64, u64)> = rows
+                    .iter()
+                    .map(|(name, ver, _, size)| (name.clone(), *ver, size.unwrap_or(0) as u64))
+                    .collect();
+                in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                for line in plan_bound_lines(&tape, &in_write_order) {
+                    println!("{line}");
+                }
                 if let Some(index) = index {
                     println!("{}", plan_index_line(index));
                 }
@@ -4158,6 +4153,103 @@ fn planned_index_bytes(
     Ok(measured.total_bytes() as i64)
 }
 
+/// `volume verify`'s line per mismatch, with its classification (issue
+/// #234): without it the operator has to know which kind names are
+/// quarantine-grade to read the summary below them. The classification is
+/// the verdict's own ([`write::VerifyReport::proves_medium_bad`]): on a
+/// verify whose seal and catalog disagree about where the tape ended (#420)
+/// every line says "not medium evidence", as the verify quarantined nothing.
+fn verify_mismatch_lines(report: &write::VerifyReport) -> Vec<String> {
+    report
+        .mismatches
+        .iter()
+        .map(|m| {
+            let verdict = if report.proves_medium_bad(m) {
+                "proves the medium is bad"
+            } else {
+                "not medium evidence"
+            };
+            format!(
+                "    position {}: {} ({verdict}) — expected {}, found {}",
+                m.position,
+                m.kind.label(),
+                m.expected,
+                m.actual
+            )
+        })
+        .collect()
+}
+
+/// `volume verify --json`'s `mismatches` array: the FULL evidence (issue
+/// #142), including the metadata-position mismatches `verification_results`
+/// cannot store a row for, and per mismatch which side of ADR-0012's line it
+/// falls on (issue #234), so a script can tell "this tape is bad" from "this
+/// drive could not read it" without a kind allow-list of its own that would
+/// drift — by the verdict's own classification, so `proves_medium_bad` is
+/// false throughout when the seal and the catalog disagree about where the
+/// tape ended (#420).
+fn verify_mismatches_json(report: &write::VerifyReport) -> Vec<serde_json::Value> {
+    report
+        .mismatches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "position": m.position,
+                "kind": m.kind.label(),
+                "expected": m.expected,
+                "actual": m.actual,
+                "proves_medium_bad": report.proves_medium_bad(m),
+            })
+        })
+        .collect()
+}
+
+/// `volume plan`'s lines for the plan bound (ADR-0012 item 113): none when
+/// the drive declares no `post_warning_bytes` (the plan stops at the fill
+/// ceiling, as before 1.6.0); otherwise how far a write may plan past the
+/// ceiling, and which staged units one write would plan past it. `units` are
+/// `(name, version, encrypted bytes)` in the order a write takes them (by
+/// unit name). An estimate, as the tape count above it is: each unit is
+/// block-padded whole, and the volume's own files are not counted.
+fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64)]) -> Vec<String> {
+    let Some(bound) = tape.plan_bound_bytes else {
+        return Vec::new();
+    };
+    let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
+    let mut lines = vec![format!(
+        "past the fill ceiling: a write may plan whole units up to {} ({bound} bytes), the \
+         cartridge's nominal capacity, because the drive declares post_warning_bytes (ADR-0012 \
+         item 113); the tape may end before a unit planned past the ceiling, which is then cut \
+         and written whole onto the next cartridge",
+        dec(bound)
+    )];
+    let padded: Vec<u64> = units
+        .iter()
+        .map(|(_, _, bytes)| {
+            crate::volume::layout_model::pad_to_blocks(*bytes, DEFAULT_BLOCK_SIZE as u64)
+        })
+        .collect();
+    let split = crate::volume::layout_model::CapacityBudget {
+        available_bytes: tape.bytes,
+        reserve_bytes: 0,
+        plan_bound_bytes: Some(bound),
+    }
+    .split(0, &padded);
+    let past = &units[split.past_ceiling()];
+    if !past.is_empty() {
+        lines.push(format!(
+            "planned past the fill ceiling of {} by one write of everything staged (the tape may \
+             end before them): {}",
+            dec(tape.bytes),
+            past.iter()
+                .map(|(name, ver, _)| format!("{name} v{ver}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines
+}
+
 fn staged_plan_rows(
     conn: &Connection,
     config: &Config,
@@ -4210,6 +4302,96 @@ fn staged_plan_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #420 (`volume-format-v2.md` §5 step 3): when the seal and the catalog
+    /// disagree about where the tape ended, the verify is inconclusive, so
+    /// no line says "proves the medium is bad" and `--json` says
+    /// `proves_medium_bad: false` for every mismatch — even a content hash
+    /// mismatch, which the walk compared under the catalog's ending.
+    /// Positive control: the same hash mismatch alone proves it.
+    #[test]
+    fn a_verify_whose_ending_disagrees_calls_no_mismatch_medium_evidence() {
+        use crate::store::{Mismatch, MismatchKind};
+        let hash = Mismatch {
+            position: 9,
+            kind: MismatchKind::ContentHashMismatch,
+            expected: "aa".into(),
+            actual: "bb".into(),
+        };
+        let ending = Mismatch {
+            position: 10,
+            kind: MismatchKind::EndedAfterDisagrees,
+            expected: "9".into(),
+            actual: "11".into(),
+        };
+
+        let alone = write::VerifyReport {
+            mismatches: vec![hash.clone()],
+            ..Default::default()
+        };
+        assert!(!alone.ending_disagrees());
+        let lines = verify_mismatch_lines(&alone);
+        assert_eq!(
+            lines,
+            ["    position 9: content_hash_mismatch (proves the medium is bad) — expected aa, found bb"]
+        );
+        assert_eq!(verify_mismatches_json(&alone)[0]["proves_medium_bad"], true);
+
+        let disagreeing = write::VerifyReport {
+            mismatches: vec![hash, ending],
+            ..Default::default()
+        };
+        assert!(disagreeing.ending_disagrees());
+        let lines = verify_mismatch_lines(&disagreeing);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.contains("(not medium evidence)"), "{line}");
+        }
+        assert!(lines[1].contains("ended_after_disagrees"), "{}", lines[1]);
+        for m in verify_mismatches_json(&disagreeing) {
+            assert_eq!(m["proves_medium_bad"], false, "{m}");
+        }
+    }
+
+    /// ADR-0012 item 113: `volume plan` says how far a write may plan past
+    /// the fill ceiling, and which units one write would plan past it, in
+    /// the order a write takes them — and says nothing at all without
+    /// `post_warning_bytes`, so its output is as before 1.6.0.
+    #[test]
+    fn the_plan_names_the_units_past_the_fill_ceiling_only_with_a_plan_bound() {
+        let bs = DEFAULT_BLOCK_SIZE as u64;
+        let tape = crate::config::TapeBudget::new("one LTO-6 tape".into(), 10 * bs, 0.5, 0, false);
+        let units = vec![
+            ("a".to_string(), 1, 2 * bs),
+            ("b".to_string(), 2, 4 * bs),
+            ("c".to_string(), 1, 3 * bs),
+            ("d".to_string(), 1, 5 * bs),
+        ];
+        assert!(
+            plan_bound_lines(&tape, &units).is_empty(),
+            "no bound, no lines"
+        );
+
+        let lines = plan_bound_lines(&tape.clone().with_plan_bound(Some(10 * bs)), &units);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("past the fill ceiling: a write may plan whole units up to "));
+        assert!(
+            lines[0].contains(&format!("({} bytes)", 10 * bs)),
+            "{}",
+            lines[0]
+        );
+        // `a` fits the 5-block ceiling; `b` crosses it, and `c` ends at 9 of
+        // the 10 blocks; `d` is beyond the bound.
+        assert!(
+            lines[1].ends_with("(the tape may end before them): b v2, c v1"),
+            "{}",
+            lines[1]
+        );
+
+        // Every unit under the ceiling: the bound is named, no unit is.
+        let lines = plan_bound_lines(&tape.with_plan_bound(Some(10 * bs)), &units[..1]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
 
     /// #418 R4: `volume plan` names the index's size, twice it for the
     /// envelope backups, and calls it an estimate.
@@ -4579,6 +4761,10 @@ mod tests {
             /// 63): the catalog alone knows the write has nothing to write,
             /// and the pre-flight is the REAL library function asking it.
             Unstaged,
+            /// The tape sealed short (#420): the staged unit is the copy, and
+            /// the unit `testlib/beta` (staged by the test) was cut after
+            /// tape file 9, as a passing short confirm records it.
+            Short,
         }
 
         /// The drive, scripted: `init` leaves the volume row `volume init`
@@ -4693,6 +4879,25 @@ mod tests {
                         [label],
                     )
                     .unwrap();
+                if self.fail == Fail::Short {
+                    self.conn
+                        .execute(
+                            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                             SELECT ss.id, ss.snapshot_id, v.id, 'cut'
+                             FROM stage_sets ss
+                             JOIN snapshots s ON s.id = ss.snapshot_id
+                             JOIN units u ON u.id = s.unit_id, volumes v
+                             WHERE u.name = 'testlib/beta' AND v.label = ?1",
+                            [label],
+                        )
+                        .unwrap();
+                    self.conn
+                        .execute(
+                            "UPDATE volumes SET ended_after = 9 WHERE label = ?1",
+                            [label],
+                        )
+                        .unwrap();
+                }
                 Ok(())
             }
         }
@@ -4832,6 +5037,47 @@ mod tests {
             assert!(json["medium"].is_null(), "no --init, no decision: {json}");
             assert!(json["moved_to"].is_null() && json["move_warning"].is_null());
             assert_eq!(json["volumes_moved"], serde_json::json!([]));
+            // #420: a full seal says so, and cut nothing.
+            assert_eq!(json["ending"], "full");
+            assert!(json["ended_after"].is_null(), "{json}");
+            assert_eq!(json["cut_units"], serde_json::json!([]));
+        }
+
+        /// #420, additive keys: a write whose tape sealed short says so in
+        /// `--json` — `ending: "short"`, the `ended_after` its seal states,
+        /// and the units it cut — with every key it always had unchanged.
+        #[test]
+        fn a_short_seal_is_named_in_the_write_json_with_its_cut_units() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let tenant_id = tenant(&conn);
+            let alpha = unit(&conn, tenant_id, "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let beta = unit(&conn, tenant_id, "testlib/beta");
+            staged_version(&conn, beta, 1, "current", dir.path(), 0);
+            let config = config(dir.path(), 2);
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'p', 10485760, 'initialized')",
+                [NEW],
+            )
+            .unwrap();
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Short,
+                log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
+            };
+
+            let done =
+                write_and_follow(&conn, &config, &steps, &request(false, false, None)).unwrap();
+            let json = write_done_json(NEW, &done);
+            assert_eq!(json["status"], "completed", "a short seal is a success");
+            assert_eq!(json["ending"], "short");
+            assert_eq!(json["ended_after"], 9);
+            assert_eq!(json["cut_units"], serde_json::json!(["testlib/beta"]));
+            assert_eq!(json["label"], NEW);
         }
 
         /// An init that refuses: the write is never attempted, nothing is

@@ -21,8 +21,14 @@ use sha2::Digest;
 
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool};
-use crate::tape::ioctl::{ReadEnd, TapeDevice, TapePosition};
+use crate::tape::ioctl::{
+    write_block_retrying, write_error, EarlyWarningState, ReadEnd, TapeDevice, TapePosition,
+};
 use crate::util::{HashingWriter, TruncatingWriter};
+
+/// The drive's early warning, as [`Store::early_warning`] reports it
+/// (`volume-format-v2.md` §4.3; #420).
+pub use crate::tape::ioctl::EarlyWarning;
 use crate::volume::format;
 use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 
@@ -133,7 +139,23 @@ pub struct ConfirmPlan<'a> {
     /// in this same contact (issue #403: a resume's contact check reads the
     /// seal, and the walk used to locate it and read it again). The walk
     /// takes the seal from here and reads every other file from the medium.
+    /// They are the bytes at the seal's position under [`Self::ended_after`].
     pub seal: Option<&'a [u8]>,
+    /// How the tape ended, as the catalog knows it (#420;
+    /// `volume-format-v2.md` §4.1, §5): `Some(K)` for a short seal at K+1,
+    /// `None` for a full seal at the planned position M (`ended_after =
+    /// M-1`). The walk reads the seal at `K+1` (§1.2 rule 6: a catalog reader
+    /// that knows `ended_after` reads the seal there directly), reads no
+    /// position after K (§4.2 R3), and checks that the seal states this same
+    /// `ended_after` ([`MismatchKind::EndedAfterDisagrees`]).
+    pub ended_after: Option<u32>,
+    /// The entry the write read back past the drive's early warning (#420;
+    /// §4.3 W9, ADR-0012 item 114): K on a short seal, M-1 on a full seal
+    /// after a warning in the last slice. Hashed against File 3 under every
+    /// tier — at the navigable tier it is the one content file read — and
+    /// never skipped on an interrupted readback's word. `None` for a session
+    /// that saw no warning, and for every verify.
+    pub readback: Option<u32>,
 }
 
 impl std::fmt::Debug for ConfirmPlan<'_> {
@@ -144,12 +166,14 @@ impl std::fmt::Debug for ConfirmPlan<'_> {
             .field("resume", &self.resume.map(|r| r.passed.len()))
             .field("on_passed", &self.on_passed.is_some())
             .field("seal", &self.seal.map(<[u8]>::len))
+            .field("ended_after", &self.ended_after)
+            .field("readback", &self.readback)
             .finish()
     }
 }
 
 impl<'a> ConfirmPlan<'a> {
-    /// `tier`, seal first — what [`Store::confirm`] runs.
+    /// `tier`, seal first, a full seal — what [`Store::confirm`] runs.
     pub fn new(tier: Tier) -> Self {
         Self {
             tier,
@@ -157,7 +181,30 @@ impl<'a> ConfirmPlan<'a> {
             resume: None,
             on_passed: None,
             seal: None,
+            ended_after: None,
+            readback: None,
         }
+    }
+
+    /// The same plan, for a tape that ended after `ended_after` (#420):
+    /// `Some(K)` for a short seal at K+1, `None` for a full seal.
+    pub fn with_ending(self, ended_after: Option<u32>) -> Self {
+        Self {
+            ended_after,
+            ..self
+        }
+    }
+
+    /// The same plan, reading `readback` back under every tier: the entry
+    /// written past the drive's early warning (#420, ADR-0012 item 114).
+    pub fn reading_back(self, readback: Option<u32>) -> Self {
+        Self { readback, ..self }
+    }
+
+    /// Where the walk reads the seal on a Layout whose planned seal position
+    /// is `planned`: M, or K+1 on a short ending.
+    pub fn seal_position(&self, planned: u32) -> u32 {
+        self.ended_after.map_or(planned, |k| k.saturating_add(1))
     }
 
     /// The same plan, reading the seal in `order`.
@@ -254,6 +301,16 @@ pub enum MismatchKind {
     /// therefore quarantined a sound cartridge, which is the exact outcome
     /// ADR-0012's amendment exists to prevent.
     ContentUnreadable,
+    /// The seal marker's `ended_after` is not the one the catalog knows
+    /// (#420; `volume-format-v2.md` §5 step 3): the session's ending for a
+    /// write's confirm, `volumes.ended_after` for `volume verify`, NULL (a
+    /// full seal) meaning the planned M-1. A seal on a tape that ended before
+    /// the planned position is read at `ended_after + 1`, so a seal there
+    /// stating another `ended_after` says it is somewhere it was not found.
+    /// The catalog and the tape disagree about where the tape ended; that
+    /// says nothing about the medium, so it is inconclusive, never a
+    /// quarantine.
+    EndedAfterDisagrees,
 }
 
 impl MismatchKind {
@@ -273,6 +330,7 @@ impl MismatchKind {
             MismatchKind::NavigationDisagreement => "navigation_disagreement",
             MismatchKind::ContentHashMismatch => "content_hash_mismatch",
             MismatchKind::ContentUnreadable => "content_unreadable",
+            MismatchKind::EndedAfterDisagrees => "ended_after_disagrees",
         }
     }
 
@@ -361,9 +419,14 @@ impl MismatchKind {
     /// - `SealUnreadable` — **no**, and never. Its own doc says an absent or
     ///   unparseable seal marker is the *normal* signal for an unsealed
     ///   tape, "never an error".
+    /// - `EndedAfterDisagrees` — **no** (#420). `volume-format-v2.md` §5
+    ///   step 3 rules it in terms: the seal's `ended_after` and the
+    ///   catalog's disagree about where the tape ended, which "says nothing
+    ///   about the medium, so the confirm is inconclusive (never a
+    ///   quarantine)".
     ///
     /// Written as an exhaustive `match` with **no wildcard arm** on purpose:
-    /// an eighth variant must fail to compile until someone decides which
+    /// a new variant must fail to compile until someone decides which
     /// side of this line it falls on. The decision is a CTO one (ADR-0012),
     /// not a default. That is what surfaced issue #239 — splitting
     /// `ContentUnreadable` out could not be done silently.
@@ -376,6 +439,7 @@ impl MismatchKind {
             MismatchKind::ContentUnreadable => false,
             MismatchKind::FrontIndexUnreadable => false,
             MismatchKind::SealUnreadable => false,
+            MismatchKind::EndedAfterDisagrees => false,
         }
     }
 }
@@ -437,17 +501,41 @@ impl Evidence {
     /// lives next to the classification rather than as an `any()` at the
     /// call site: one predicate, one place, and adding a caller cannot
     /// reintroduce the blanket rule the amendment rejected.
+    ///
+    /// **Empty whenever the seal and the catalog disagree about where the
+    /// tape ended** ([`Self::ending_disagrees`], #420): `volume-format-v2.md`
+    /// §5 rules that confirm inconclusive, never a quarantine. The tape's own
+    /// seal then says positions past its `ended_after` are not part of it,
+    /// and the walk, reading under the catalog's ending, may have compared
+    /// some of them; a quarantine is the one destructive verdict, and an
+    /// inconclusive one counts no copy and completes no write. Every
+    /// mismatch stays in [`Self::mismatches`] — this withholds the verdict,
+    /// not the findings. (Coordinator's ruling, #420 worker J.)
     pub fn medium_evidence(&self) -> Vec<&Mismatch> {
+        if self.ending_disagrees() {
+            return Vec::new();
+        }
         self.mismatches
             .iter()
             .filter(|m| m.kind.proves_medium_bad())
             .collect()
     }
 
-    /// Whether any mismatch proves the medium is bad — the quarantine
-    /// verdict, as a bool. See [`Evidence::medium_evidence`].
+    /// Whether the evidence proves the medium is bad — the quarantine
+    /// verdict, as a bool: some mismatch proves it, and the seal and the
+    /// catalog agree about where the tape ended. See
+    /// [`Evidence::medium_evidence`].
     pub fn proves_medium_bad(&self) -> bool {
-        self.mismatches.iter().any(|m| m.kind.proves_medium_bad())
+        !self.medium_evidence().is_empty()
+    }
+
+    /// Whether the walk found [`MismatchKind::EndedAfterDisagrees`]: the
+    /// seal states another `ended_after` than the catalog's (#420). Such
+    /// evidence is never a quarantine.
+    pub fn ending_disagrees(&self) -> bool {
+        self.mismatches
+            .iter()
+            .any(|m| m.kind == MismatchKind::EndedAfterDisagrees)
     }
 }
 
@@ -470,9 +558,32 @@ pub trait Store {
     /// flush covers everything written before it; v1's op-envelope sync
     /// marks are a caller choice unrelated to this trait). Returns the
     /// number of bytes committed to the medium, including any block padding.
-    /// A full medium is an `Err` — there is no salvage path (ADR-0007); the
-    /// caller turns that into a clean abort to an unsealed tape.
+    ///
+    /// Past the drive's early warning the store retries every block st
+    /// refuses, itself (`volume-format-v2.md` §4.3 W2), and returns `Ok` for
+    /// an entry whose blocks and filemark were all accepted; the warning is
+    /// then [`Self::early_warning`], never an error. A full medium is an
+    /// `Err` ([`TapectlError::MediumFull`]) only when the store could not
+    /// finish: the hard end (more than 16 refusals of one block in a row) or
+    /// a refused filemark, which is never retried (W3). There is no salvage
+    /// path (ADR-0007); the caller turns that into a clean abort to an
+    /// unsealed tape.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64>;
+
+    /// The drive's early warning (#420; `layout-session.md`, the Store
+    /// seam): `None` until the store's first refused block write, then
+    /// `Some` for the rest of the STORE'S life — sticky, not reset by a
+    /// reposition, because a store is opened for one contact and the
+    /// warning is a fact about that contact's medium. A new store over the
+    /// same cartridge (a resumed session) starts at `None`: past the
+    /// warning, the drive refuses its first block write there again. The
+    /// write session asks after every `Written` entry.
+    ///
+    /// The default is `None`: a store with no early warning (the
+    /// [`Self::eod_at_or_before`] pattern).
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        None
+    }
 
     /// Run the keyless integrity chain walk (`volume-format-v2.md` §5)
     /// against `layout` at the requested `tier`. Never fails with `Err` over
@@ -504,11 +615,13 @@ pub trait Store {
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
         let files = layout.entries.len();
+        // The cached seal is the one at the seal's position under the plan's
+        // ending: K+1 on a short tape (#420), where the walk reads it.
         let seal_pos = layout
             .entries
             .iter()
             .find(|e| matches!(e.kind, ZoneKind::SealMarker))
-            .map(|e| e.position as u32);
+            .map(|e| plan.seal_position(e.position as u32));
         let mut cached = plan.seal;
         chain_walk(layout, plan, |position, sink| {
             if Some(position) == seal_pos {
@@ -659,6 +772,21 @@ pub trait Store {
         Ok(false)
     }
 
+    /// How many whole files the medium holds, counted by the filemarks from
+    /// the beginning of the tape — the number `N` whose last file, `N - 1`,
+    /// is where `volume-format-v2.md` §1.2 rule 6 finds a seal on a medium
+    /// that ends before the planned one ([`locate_seal`], #420). Asked only
+    /// right after [`Self::eod_at_or_before`] said yes: st's own file count
+    /// at END OF DATA (`MTIOCGET`'s `mt_fileno`, the count
+    /// [`Self::reposition_at_most`] takes), where a file with no filemark
+    /// after it is no file. Moves nothing.
+    ///
+    /// `Ok(None)` is "no evidence": the default, for a store that cannot
+    /// count, and a store whose status does not show END OF DATA.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
     /// Erase the medium (`cartridge erase`, ADR-0012 2026-10-12 items 51
     /// and 52). Moves the head; the next read repositions as usual.
     ///
@@ -755,6 +883,131 @@ fn oversized(position: u32, what: &str) -> TapectlError {
     ))
 }
 
+/// What [`locate_seal`] found where `volume-format-v2.md` §1.2 rule 6 looks
+/// for the seal marker: raw, unparsed. Whether the bytes are a seal, and
+/// which seal a reader accepts at that position (full at the planned one, a
+/// short seal only before it), is the parser's and the caller's
+/// (`format.rs`, §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealLocation {
+    /// A file was read where the seal would be: at the planned position, or,
+    /// on a medium that ends before it, the last file on the medium
+    /// (`position` below the planned one). Its block-padded bytes, which may
+    /// be empty (a filemark-only file) and may or may not parse as a seal.
+    File { position: u32, bytes: Vec<u8> },
+    /// A file larger than [`SMALL_FILE_CAP`] is there: no seal marker, and
+    /// nothing past the cap was read.
+    Oversized { position: u32 },
+    /// No file at all: the medium shows END OF DATA at or before the planned
+    /// position, and holds no file.
+    Absent,
+    /// A read failed and nothing shows there is no file there (#460): the
+    /// planned position with no END OF DATA proven at or before it, the last
+    /// file on the medium, or a medium that ends before the planned position
+    /// but whose files the store cannot count. There may be a seal the drive
+    /// cannot read just now. NEVER absent: no caller reads it as unsealed.
+    Unreadable { position: u32, error: String },
+}
+
+impl SealLocation {
+    /// Where the file was read or failed to read; `None` for
+    /// [`Self::Absent`].
+    pub fn position(&self) -> Option<u32> {
+        match self {
+            Self::File { position, .. }
+            | Self::Oversized { position }
+            | Self::Unreadable { position, .. } => Some(*position),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// Find the seal marker's file by `volume-format-v2.md` §1.2 rule 6 (#420):
+/// the one implementation over the [`Store`] trait, for every reader that
+/// needs the seal (`layout-session.md`, the Store seam). `planned` is the
+/// planned position: File 0's `[layout] seal_marker`, File 3's
+/// `seal_marker` entry, or the catalog's Layout.
+///
+/// 1. Read the file at `planned` ([`read_small`]: bounded).
+/// 2. When that read fails, or reads nothing — st answers a read AT end of
+///    data with 0 bytes, as it does a filemark-only file (#327) — ask the
+///    store whether its medium ends at or before `planned`
+///    ([`Store::eod_at_or_before`]). If it does, the medium holds `N`
+///    whole files ([`Store::files_on_medium`]: st's file count at END OF
+///    DATA, a file with no filemark after it not counted) and the seal is
+///    the last, `N - 1`: read it. `N = 0` is [`SealLocation::Absent`].
+/// 3. A failed read with no END OF DATA shown at or before `planned`, or a
+///    medium that ends there but cannot be counted, is
+///    [`SealLocation::Unreadable`] — never absent (#460).
+///
+/// It moves the head only by the store's own reads: on a tape, rewinds and
+/// spaces over filemarks. Never READ POSITION or LOCATE.
+pub fn locate_seal(store: &mut dyn Store, planned: u32) -> SealLocation {
+    let failed = match read_small(store, planned) {
+        Ok(SmallRead::Bytes(bytes)) if !bytes.is_empty() => {
+            return SealLocation::File {
+                position: planned,
+                bytes,
+            }
+        }
+        Ok(SmallRead::Bytes(empty)) => {
+            if !store.eod_at_or_before(planned).unwrap_or(false) {
+                // A filemark-only file, not the end of the medium.
+                return SealLocation::File {
+                    position: planned,
+                    bytes: empty,
+                };
+            }
+            None
+        }
+        Ok(SmallRead::Oversized) => return SealLocation::Oversized { position: planned },
+        Err(e) => {
+            if !store.eod_at_or_before(planned).unwrap_or(false) {
+                return SealLocation::Unreadable {
+                    position: planned,
+                    error: e.to_string(),
+                };
+            }
+            Some(e)
+        }
+    };
+
+    // The medium ends at or before the planned position: the seal, if
+    // there is one, is the last file on it.
+    let files = match store.files_on_medium() {
+        Ok(Some(n)) if n <= planned => n,
+        counted => {
+            let why = match counted {
+                Err(e) => format!("counting them failed: {e}"),
+                Ok(Some(n)) => format!("the store counts {n}, not fewer than {planned}"),
+                Ok(None) => "the store cannot count them".to_string(),
+            };
+            let read = failed.map_or_else(|| "read nothing".to_string(), |e| e.to_string());
+            return SealLocation::Unreadable {
+                position: planned,
+                error: format!(
+                    "{read}; the medium ends at or before file {planned}, but the files on it \
+                     are not known: {why}"
+                ),
+            };
+        }
+    };
+    let Some(last) = files.checked_sub(1) else {
+        return SealLocation::Absent;
+    };
+    match read_small(store, last) {
+        Ok(SmallRead::Bytes(bytes)) => SealLocation::File {
+            position: last,
+            bytes,
+        },
+        Ok(SmallRead::Oversized) => SealLocation::Oversized { position: last },
+        Err(e) => SealLocation::Unreadable {
+            position: last,
+            error: e.to_string(),
+        },
+    }
+}
+
 /// A sink for one small parsed file inside the chain walk: it keeps up to
 /// [`SMALL_FILE_CAP`] bytes and fails the write past that, which stops a
 /// tape read at its next block (issue #400).
@@ -824,6 +1077,15 @@ impl Write for SmallSink<'_> {
 /// does not decide, and [`judge`] puts the seal's verdict in front of it —
 /// or, for a seal that fails the gate, in place of it, discarding whatever
 /// was read after it. The [`Evidence`] is identical in either order.
+///
+/// **The ending (#420, 1.6.0).** The walk reads the tape as far as
+/// [`ConfirmPlan::ended_after`]: the seal at `ended_after + 1` (K+1 on a short
+/// tape, M on a full one), content files at or before `ended_after`, and
+/// nothing after it (`volume-format-v2.md` §4.2, §5). File 3 and the Layout
+/// are both the plan, so step 3 still compares them whole. The seal must state
+/// the same `ended_after` ([`MismatchKind::EndedAfterDisagrees`]), and a seal
+/// before the planned position must require `short-seal` (§1.2 rule 6).
+/// [`ConfirmPlan::readback`] is hashed under every tier (§4.3 W9).
 fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan<'_>, mut read: F) -> Result<Evidence>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
@@ -839,7 +1101,7 @@ where
         .iter()
         .find(|e| matches!(e.kind, ZoneKind::FrontIndex))
         .ok_or_else(|| TapectlError::Other("layout has no front_index entry".into()))?;
-    let seal_pos = seal_entry.position as u32;
+    let planned_seal = seal_entry.position as u32;
     let fi_pos = fi_entry.position as u32;
     let Some(fi_true_len) = fi_entry.size_bytes else {
         return Err(TapectlError::Other(
@@ -847,12 +1109,13 @@ where
         ));
     };
     let fi_true_len = fi_true_len as usize;
+    let ending = WalkEnding::of(&plan, fi_pos, planned_seal)?;
 
     // Step 1 (§5.1), when it is read first: the gate, before anything else
     // moves. An unsealed tape stops here, at one read.
     let seal_first = tier == Tier::Integrity && plan.order == ReadOrder::SealFirst;
     let early = if seal_first {
-        match read_seal(seal_pos, &mut read) {
+        match read_seal(ending, &mut read) {
             SealRead::Refused {
                 files_checked,
                 mismatch,
@@ -869,13 +1132,78 @@ where
         None
     };
 
-    let rest = walk_from_index(layout, plan, fi_pos, seal_pos, fi_true_len, &mut read)?;
+    let rest = walk_from_index(layout, plan, fi_pos, ending, fi_true_len, &mut read)?;
 
     let seal = match early {
         Some(seal) => seal,
-        None => read_seal(seal_pos, &mut read),
+        None => read_seal(ending, &mut read),
     };
-    Ok(judge(tier, fi_pos, seal, rest))
+    Ok(judge(tier, fi_pos, ending, seal, rest))
+}
+
+/// Where the tape ended, as the walk's plan knows it (#420;
+/// `volume-format-v2.md` §4.1, §5): every position the walk reads for
+/// content is at or before `ended_after`, and the seal is the file right
+/// after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalkEnding {
+    /// The last file before the seal: the plan's K on a short ending, M-1
+    /// on a full one.
+    ended_after: u32,
+    /// The planned seal position M (the Layout's `seal_marker` entry).
+    planned_seal: u32,
+    /// The entry to read back past the early warning (§4.3 W9), checked to
+    /// be a content file at or before `ended_after`.
+    readback: Option<u32>,
+}
+
+impl WalkEnding {
+    /// The plan's ending on a Layout whose front index is at `fi_pos` and
+    /// whose seal is planned at `planned_seal`. An `ended_after` that is not
+    /// a position after File 3 and before M, or a readback position that is
+    /// not after File 3 and at or before `ended_after`, is a caller bug, as
+    /// a Layout with no seal marker entry is: an `Err`, never a finding
+    /// about the tape.
+    fn of(plan: &ConfirmPlan<'_>, fi_pos: u32, planned_seal: u32) -> Result<Self> {
+        let ended_after = match plan.ended_after {
+            None => planned_seal.checked_sub(1).ok_or_else(|| {
+                TapectlError::Other("layout's seal_marker entry is at position 0".into())
+            })?,
+            Some(k) if k > fi_pos && k < planned_seal => k,
+            Some(k) => {
+                return Err(TapectlError::Other(format!(
+                    "the confirm plan's ended_after = {k} is not a file between the front \
+                     index (file {fi_pos}) and the planned seal (file {planned_seal})"
+                )))
+            }
+        };
+        if let Some(p) = plan.readback {
+            if p <= fi_pos || p > ended_after {
+                return Err(TapectlError::Other(format!(
+                    "the confirm plan reads back file {p}, which is not a content file between \
+                     the front index (file {fi_pos}) and ended_after = {ended_after}"
+                )));
+            }
+        }
+        Ok(Self {
+            ended_after,
+            planned_seal,
+            readback: plan.readback,
+        })
+    }
+
+    /// Where the seal is read: `ended_after + 1` — M on a full ending, K+1
+    /// on a short one (§1.2 rule 6, a catalog reader that knows
+    /// `ended_after`).
+    fn seal_position(self) -> u32 {
+        self.ended_after + 1
+    }
+
+    /// Whether the seal is read before the planned position: a short seal,
+    /// which §1.2 rule 6 accepts only when it requires `short-seal`.
+    fn is_short(self) -> bool {
+        self.seal_position() < self.planned_seal
+    }
 }
 
 /// What reading the seal marker (step 1, §5.1) found.
@@ -888,18 +1216,29 @@ enum SealRead {
         files_checked: u32,
         mismatch: Mismatch,
     },
-    /// A seal marker this tapectl can read, binding File 3 to this hash.
-    Bound { front_index_sha256: String },
+    /// A seal marker this tapectl can read, binding File 3 to this hash,
+    /// and stating that the tape ended after `ended_after`
+    /// ([`format::ParsedSeal::effective_ended_after`]: a seal before 1.6.0
+    /// states none and ended after `file_count - 2`, rule S3). `None` only
+    /// for a `file_count` below 2.
+    Bound {
+        front_index_sha256: String,
+        ended_after: Option<u64>,
+    },
 }
 
-/// Step 1 (§5.1): read + parse the seal marker (the last file). It is parsed
-/// as TOML, so its true bytes are genuinely needed — small and bounded, so
-/// buffering into a `Vec` here is correct (issue #86). Absent or
-/// unparseable is the normal unsealed signal, never an Err.
-fn read_seal<F>(seal_pos: u32, read: &mut F) -> SealRead
+/// Step 1 (§5.1): read + parse the seal marker (the last file), at
+/// `ended_after + 1` (#420: M on a full ending, K+1 on a short one). It is
+/// parsed as TOML, so its true bytes are genuinely needed — small and
+/// bounded, so buffering into a `Vec` here is correct (issue #86). Absent or
+/// unparseable is the normal unsealed signal, never an Err. So is a seal read
+/// before the planned position that does not itself require `short-seal`:
+/// `volume-format-v2.md` §1.2 rule 6 accepts no other seal there.
+fn read_seal<F>(ending: WalkEnding, read: &mut F) -> SealRead
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
+    let seal_pos = ending.seal_position();
     let mut seal_bytes = Vec::new();
     if let Err(e) = read(
         seal_pos,
@@ -946,7 +1285,34 @@ where
             },
         };
     }
+    // §1.2 rule 6, "which seal a reader accepts": before the planned
+    // position, only a seal that itself requires short-seal. Anything else
+    // there is no seal, and the tape reads as unsealed.
+    if ending.is_short() && !seal.requires_short_seal() {
+        return SealRead::Refused {
+            files_checked: 1,
+            mismatch: Mismatch {
+                position: seal_pos,
+                kind: MismatchKind::SealUnreadable,
+                expected: format!(
+                    "a short seal requiring \"{}\" before the planned seal position {}",
+                    format::SHORT_SEAL,
+                    ending.planned_seal
+                ),
+                actual: format!(
+                    "a seal marker stating requires = [{}], which is no seal before the \
+                     planned position (volume-format-v2.md §1.2 rule 6)",
+                    seal.requires
+                        .iter()
+                        .map(|f| format!("\"{f}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+        };
+    }
     SealRead::Bound {
+        ended_after: seal.effective_ended_after(),
         front_index_sha256: seal.front_index_sha256,
     }
 }
@@ -973,7 +1339,7 @@ fn walk_from_index<F>(
     layout: &Layout,
     plan: ConfirmPlan<'_>,
     fi_pos: u32,
-    seal_pos: u32,
+    ending: WalkEnding,
     fi_true_len: usize,
     read: &mut F,
 ) -> Result<FromIndex>
@@ -1105,6 +1471,30 @@ where
     }
 
     if tier == Tier::Navigable {
+        // #420 (§4.3 W9, §5; ADR-0012 item 114): after the drive's early
+        // warning, the entry written past it is read back under every tier.
+        // Here it is the one content file the navigable tier hashes; File 3
+        // and the seal are read anyway. Never read on a resume's word: this
+        // tier honours none.
+        if let Some(p) = ending.readback {
+            match parsed_fi.iter().find(|c| c.position as u32 == p) {
+                Some(claim) => {
+                    read_back_claim(claim, None, read, &mut files_checked, &mut mismatches);
+                }
+                // The Layout diff above reports a Layout position File 3
+                // does not list; say it here only if nothing named it.
+                None if !mismatches.iter().any(|m| m.position == p) => mismatches.push(Mismatch {
+                    position: p,
+                    kind: MismatchKind::NavigationDisagreement,
+                    expected: format!(
+                        "front index lists position {p}, the file written past the \
+                             early warning"
+                    ),
+                    actual: "missing from front index".to_string(),
+                }),
+                None => {}
+            }
+        }
         return Ok(FromIndex {
             files_checked,
             front_index_sha256: Some(fi_hash),
@@ -1127,20 +1517,29 @@ where
         }
     };
 
-    // Step 4 (§5.4, Integrity tier only): every file except File 3 and the
-    // seal marker, truncated to the front index's claimed size, hashed and
-    // compared to the front index's sha256_encrypted.
+    // Step 4 (§5.4, Integrity tier only): every file at or before
+    // `ended_after` except File 3, truncated to the front index's claimed
+    // size, hashed and compared to the front index's sha256_encrypted. The
+    // seal marker is after `ended_after`, and so on a short tape (#420) is
+    // every position File 3 plans past it: not on this tape, never read
+    // (§4.2 R3), and its claims compared with nothing.
     for claim in &parsed_fi {
         let position = claim.position as u32;
-        if position == fi_pos || position == seal_pos {
+        if position == fi_pos || position > ending.ended_after {
             continue;
         }
         // Issue #410: read back clean by the readback this one continues,
         // against this same claim — counted, reported again under this
-        // walk (so a second interruption keeps it), and not read.
-        if let (Some(r), Some(want), Some(_)) =
-            (resume, claim.sha256_encrypted.as_deref(), claim.size_bytes)
-        {
+        // walk (so a second interruption keeps it), and not read. Except the
+        // entry written past the early warning (#420, ADR-0012 item 114):
+        // that one is read back on every confirm, whatever an earlier
+        // readback found.
+        if let (Some(r), Some(want), Some(_), false) = (
+            resume,
+            claim.sha256_encrypted.as_deref(),
+            claim.size_bytes,
+            ending.readback == Some(position),
+        ) {
             if r.passed.get(&position).map(String::as_str) == Some(want) {
                 files_checked += 1;
                 passed(position, want);
@@ -1157,80 +1556,16 @@ where
                  checked besides the seal)"
             )
         })?;
-        let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes) else {
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::NavigationDisagreement,
-                expected: "front index carries size_bytes + sha256_encrypted".to_string(),
-                actual: "one or both missing for a content file".to_string(),
-            });
-            continue;
-        };
-
-        // Content files are only ever hashed, never otherwise inspected —
-        // so unlike the seal marker/front index above, this never buffers
-        // the file. `TruncatingWriter` trims to `want_size` (the front
-        // index's claimed true length) as bytes arrive, wrapping a
-        // `HashingWriter` that discards into `io::sink()` — the same
-        // composition `restore.rs::restore_one_slice_inner` uses for its
-        // ciphertext pass, just with a sink that has no use for the bytes
-        // themselves (issue #86).
-        let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
-        // A file held from the pass ahead of File 3 is fed through the
-        // identical sink, as `MemStore::read_file` would feed it.
-        let read_result = match held.get(&position) {
-            Some(Held::Bytes { bytes, read }) => sink
-                .write_all(bytes)
-                .map(|()| *read)
-                .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
-            Some(Held::Failed(e)) => Err(e.clone()),
-            None => read(position, &mut sink).map_err(|e| e.to_string()),
-        };
-        let hashing = sink.into_inner();
-
-        let n_read = match read_result {
-            Ok(n) => n,
-            Err(e) => {
-                // Issue #239: a raw I/O or transport error. NOT a hash
-                // disagreement — no hash was ever computed — so it is not
-                // `ContentHashMismatch` and does not quarantine.
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::ContentUnreadable,
-                    expected: "file readable".to_string(),
-                    actual: format!("read failed: {e}"),
-                });
-                continue;
-            }
-        };
-        files_checked += 1;
-
-        if want_size > n_read {
-            // Issue #239: a short read. Ambiguous between a truncated write
-            // and a drive giving up early, and the count alone cannot
-            // separate them, so it takes the same side
-            // `FrontIndexUnreadable` already takes for the identical event
-            // one position over.
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::ContentUnreadable,
-                expected: format!("{want_size} on-tape bytes"),
-                actual: format!("only {n_read} bytes read back"),
-            });
-            continue;
-        }
-        let actual_hash = hashing.finalize_hex();
-        if &actual_hash != want_hash {
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::ContentHashMismatch,
-                expected: want_hash.clone(),
-                actual: actual_hash,
-            });
-        } else {
+        if let Some(want) = read_back_claim(
+            claim,
+            held.get(&position),
+            read,
+            &mut files_checked,
+            &mut mismatches,
+        ) {
             // Issue #410: a checkpoint, as the walk goes — what lets an
             // interrupted readback be continued rather than redone.
-            passed(position, want_hash);
+            passed(position, want);
         }
     }
 
@@ -1241,11 +1576,104 @@ where
     })
 }
 
+/// Step 4's check of one content file (§5.4): read it — or take it from
+/// `held`, the pass ahead of File 3 — truncated to the front index's claimed
+/// size, hash it, and compare with the claim's `sha256_encrypted`. Every
+/// disagreement goes to `mismatches`, and a file whose bytes came back counts
+/// in `files_checked`. Returns the claim's hash when the file read back
+/// clean. Shared by step 4 and the navigable tier's readback past the early
+/// warning (#420), so both judge a file by the same rules.
+fn read_back_claim<'c, F>(
+    claim: &'c format::ParsedIndexEntry,
+    held: Option<&Held>,
+    read: &mut F,
+    files_checked: &mut u32,
+    mismatches: &mut Vec<Mismatch>,
+) -> Option<&'c str>
+where
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
+{
+    let position = claim.position as u32;
+    let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes) else {
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::NavigationDisagreement,
+            expected: "front index carries size_bytes + sha256_encrypted".to_string(),
+            actual: "one or both missing for a content file".to_string(),
+        });
+        return None;
+    };
+
+    // Content files are only ever hashed, never otherwise inspected —
+    // so unlike the seal marker/front index, this never buffers the file.
+    // `TruncatingWriter` trims to `want_size` (the front index's claimed
+    // true length) as bytes arrive, wrapping a `HashingWriter` that
+    // discards into `io::sink()` — the same composition
+    // `restore.rs::restore_one_slice_inner` uses for its ciphertext pass,
+    // just with a sink that has no use for the bytes themselves (issue #86).
+    let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
+    // A file held from the pass ahead of File 3 is fed through the
+    // identical sink, as `MemStore::read_file` would feed it.
+    let read_result = match held {
+        Some(Held::Bytes { bytes, read }) => sink
+            .write_all(bytes)
+            .map(|()| *read)
+            .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
+        Some(Held::Failed(e)) => Err(e.clone()),
+        None => read(position, &mut sink).map_err(|e| e.to_string()),
+    };
+    let hashing = sink.into_inner();
+
+    let n_read = match read_result {
+        Ok(n) => n,
+        Err(e) => {
+            // Issue #239: a raw I/O or transport error. NOT a hash
+            // disagreement — no hash was ever computed — so it is not
+            // `ContentHashMismatch` and does not quarantine.
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::ContentUnreadable,
+                expected: "file readable".to_string(),
+                actual: format!("read failed: {e}"),
+            });
+            return None;
+        }
+    };
+    *files_checked += 1;
+
+    if want_size > n_read {
+        // Issue #239: a short read. Ambiguous between a truncated write
+        // and a drive giving up early, and the count alone cannot
+        // separate them, so it takes the same side
+        // `FrontIndexUnreadable` already takes for the identical event
+        // one position over.
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::ContentUnreadable,
+            expected: format!("{want_size} on-tape bytes"),
+            actual: format!("only {n_read} bytes read back"),
+        });
+        return None;
+    }
+    let actual_hash = hashing.finalize_hex();
+    if &actual_hash != want_hash {
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::ContentHashMismatch,
+            expected: want_hash.clone(),
+            actual: actual_hash,
+        });
+        return None;
+    }
+    Some(want_hash)
+}
+
 /// The verdict, in §5's order whatever order the files were read in: the
 /// seal's gate first — a refused seal is the whole verdict, and anything
 /// read after it is discarded — then step 2's binding (File 3's hash
-/// against the seal's), then everything else in walk order.
-fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
+/// against the seal's), then step 3's (1.6.0) check that the seal ended
+/// where the catalog says (#420), then everything else in walk order.
+fn judge(tier: Tier, fi_pos: u32, ending: WalkEnding, seal: SealRead, rest: FromIndex) -> Evidence {
     match seal {
         SealRead::Refused {
             files_checked,
@@ -1255,8 +1683,11 @@ fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
             files_checked,
             mismatches: vec![mismatch],
         },
-        SealRead::Bound { front_index_sha256 } => {
-            let mut mismatches = Vec::with_capacity(rest.mismatches.len() + 1);
+        SealRead::Bound {
+            front_index_sha256,
+            ended_after,
+        } => {
+            let mut mismatches = Vec::with_capacity(rest.mismatches.len() + 2);
             if let Some(fi_hash) = rest.front_index_sha256 {
                 if fi_hash != front_index_sha256 {
                     // Divergence is quarantine-grade (§2.5), but the walk
@@ -1270,6 +1701,24 @@ fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
                         actual: fi_hash,
                     });
                 }
+            }
+            // §5 step 3 (1.6.0, #420): the seal's `ended_after` is the
+            // catalog's — K on a short ending, M-1 on a full one, both
+            // directions. Inconclusive, never a quarantine
+            // (`MismatchKind::EndedAfterDisagrees`).
+            if ended_after != Some(u64::from(ending.ended_after)) {
+                mismatches.push(Mismatch {
+                    position: ending.seal_position(),
+                    kind: MismatchKind::EndedAfterDisagrees,
+                    expected: format!(
+                        "ended_after = {}, where the catalog says the tape ended",
+                        ending.ended_after
+                    ),
+                    actual: match ended_after {
+                        Some(k) => format!("ended_after = {k}"),
+                        None => "no ended_after".to_string(),
+                    },
+                });
             }
             mismatches.extend(rest.mismatches);
             Evidence {
@@ -1403,9 +1852,16 @@ pub(crate) trait TapeOps: Send {
     /// The st LONG erase from the head onward (`MTERASE`, count 1): what
     /// `cartridge erase --long` asks for (ADR-0012 2026-10-12 item 52).
     fn erase_long(&mut self) -> Result<()>;
+    /// The early warning, once a block write of this device was refused
+    /// (#420): [`Store::early_warning`]'s answer, sticky for the device's
+    /// life.
+    fn early_warning(&self) -> Option<EarlyWarning>;
 }
 
 impl TapeOps for TapeDevice {
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        TapeDevice::early_warning(self)
+    }
     fn block_size(&self) -> usize {
         TapeDevice::block_size(self)
     }
@@ -1607,11 +2063,87 @@ impl TapeOps for CountedOps {
     fn erase_long(&mut self) -> Result<()> {
         self.inner.erase_long()
     }
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.inner.early_warning()
+    }
 }
 
 /// How much `TapeDevice` reads at a time in variable-block mode — its
 /// `read_file_streaming`'s own figure, so a pipeline buffer is one read.
 const VARIABLE_BLOCK_READ: usize = 1024 * 1024;
+
+/// The test hook's environment variable (#420): a write store that acts as st
+/// does past a drive's early warning, below a medium's real end.
+pub const TEST_EARLY_WARNING_AT: &str = "TAPECTL_TEST_EARLY_WARNING_AT";
+
+/// The ONE place `TAPECTL_TEST_EARLY_WARNING_AT` is read (#420), by
+/// [`TapeStore::open`], the write store's open; a read-only open never
+/// writes, so it never asks. `None` when unset; a value that is not a plain
+/// decimal byte count is an error, so a mistyped hook fails the open instead
+/// of writing as if it were unset.
+///
+/// **What it does.** Once the store has written that many bytes since it
+/// opened, its block writes are answered as st answers them past a real
+/// early warning (`volume-format-v2.md` §4.3 W1; [`MediumEnd`], the model the
+/// test doubles share): the block that reaches the figure is written and
+/// arms a refusal, the next block write is refused with ENOSPC at once
+/// without reaching the drive, and so on, one refusal after each block
+/// accepted, a filemark disarming. The refusals go through the device's one
+/// retry (`tape::ioctl::write_block_retrying`), so the session meets them
+/// exactly as it meets a real warning, and seals short (§4.3 W4). It is how
+/// the mhvtl gate runs the reader side of a short tape over real st: mhvtl's
+/// own medium accepts writes past its capacity and loses them instead of
+/// refusing (`docs/lto6-validation-checklist.md`).
+///
+/// **Why it is safe in a production build** (a runtime check, as
+/// `TAPECTL_TEST_PAUSE_AFTER_PLAN` is: `#[cfg(test)]` reaches neither the
+/// gate's binary nor an integration test's library, the #87 finding):
+/// - it only refuses: every block still reaches the drive whole, once, in
+///   order, through the same `write(2)`. No byte, filemark or position on the
+///   tape differs from a write without it, and nothing is skipped;
+/// - its worst outcome on a real drive is a tape that seals short earlier
+///   than it had to, which is a valid tape: every whole unit on it counts,
+///   the cut units stay staged for the next cartridge (ADR-0012 item 112),
+///   and the warning is recorded in the catalog's `write_early_warning`
+///   event. A figure before the first data slice aborts the session
+///   (W6), leaving the tape unsealed and the staging as it was;
+/// - it is loud: [`TapeStore::open`] prints it on stderr, in the tracing
+///   output and in the session log before the first byte is written, and
+///   the device's journal names the first refusal as the hook's.
+fn test_early_warning_at_from_env() -> Option<std::result::Result<u64, String>> {
+    let raw = std::env::var_os(TEST_EARLY_WARNING_AT)?;
+    Some(parse_test_early_warning_at(&raw.to_string_lossy()))
+}
+
+/// The hook's value: a plain decimal byte count (no suffix, no sign).
+fn parse_test_early_warning_at(raw: &str) -> std::result::Result<u64, String> {
+    let digits = raw.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{TEST_EARLY_WARNING_AT}={raw:?} is not a byte count: give the bytes the write \
+             store accepts before it acts as past a drive's early warning, in plain decimal \
+             digits, or unset it"
+        ));
+    }
+    digits.parse::<u64>().map_err(|e| {
+        format!("{TEST_EARLY_WARNING_AT}={raw:?} is not a byte count this tapectl reads: {e}")
+    })
+}
+
+/// What [`TapeStore::open`] says when the hook is set, one line per entry.
+fn test_early_warning_announcement(device: &str, at: u64) -> Vec<String> {
+    vec![
+        format!(
+            "warning: {TEST_EARLY_WARNING_AT}={at} is set: the write store on {device} acts as \
+             st does past a drive's early warning once {at} bytes are written since it opened \
+             (each later block write is refused once with ENOSPC and retried)."
+        ),
+        "warning: this is a TEST hook. It changes no byte the drive writes, but the tape it \
+         writes ends with a short seal where the hook says, not where the medium does. Never \
+         set it for a real write."
+            .to_string(),
+    ]
+}
 
 /// How a command opens the drive (issue #407).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1633,12 +2165,24 @@ impl TapeStore {
     /// `usable_bytes` is the pre-flight capacity oracle's answer (nominal
     /// capacity × the configured usable-capacity factor); the caller
     /// computes it, since only the caller has the config in scope.
+    ///
+    /// `TAPECTL_TEST_EARLY_WARNING_AT=<bytes>` (#420) is read here, and only
+    /// here: see [`test_early_warning_at_from_env`].
     pub fn open(device: &str, block_size: usize, usable_bytes: u64) -> Result<Self> {
         #[cfg(test)]
         if let Some(store) = injected::open(OpenMode::ReadWrite, usable_bytes) {
             return store;
         }
-        let dev = TapeDevice::open(device, block_size)?;
+        let mut dev = TapeDevice::open(device, block_size)?;
+        if let Some(at) = test_early_warning_at_from_env() {
+            let at = at.map_err(TapectlError::Other)?;
+            for line in test_early_warning_announcement(device, at) {
+                tracing::warn!("{line}");
+                crate::progress::stderr_println(&line);
+                crate::progress::log(&line);
+            }
+            dev.fake_early_warning_at(at);
+        }
         dev.rewind()?;
         if let Err(e) = dev.disable_compression() {
             tracing::warn!(err = %e, "could not disable hardware compression (continuing)");
@@ -1783,6 +2327,13 @@ impl Store for TapeStore {
         self.dev.write_stream(src, len, sync)
     }
 
+    /// The device's: its block writes retry st's refusals through
+    /// `tape::ioctl::write_block_retrying`, and it keeps the warning for its
+    /// life, which is this store's.
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.dev.early_warning()
+    }
+
     // confirm: default trait method (T6 finding #1) — identical to what this
     // impl used to define directly. Its chain walk reads in ascending
     // position order after the seal marker, which is what lets the cursor
@@ -1898,6 +2449,19 @@ impl Store for TapeStore {
         let st = self.dev.position()?;
         Ok(st.at_eod && u32::try_from(st.file_number).is_ok_and(|m| m <= position))
     }
+
+    /// st's own file number, when its status shows END OF DATA: the
+    /// filemarks the space or read crossed from the beginning of the tape
+    /// before it met end of data, so the whole files the medium holds — the
+    /// count [`Self::reposition_at_most`] repositions to. A count st has
+    /// lost (`-1`), or a status that is not END OF DATA, is no evidence.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        let st = self.dev.position()?;
+        Ok(st
+            .at_eod
+            .then(|| u32::try_from(st.file_number).ok())
+            .flatten())
+    }
     /// Short: the trait's filemark at BOT. Long: rewind, the st long erase,
     /// rewind. The cursor is `Unknown` after either, so the next read
     /// rewinds.
@@ -1932,10 +2496,132 @@ pub struct MemStore {
     pub syncs: Vec<bool>,
     block_size: usize,
     usable_bytes: u64,
-    /// If set, `execute()` fails with a simulated ENOSPC once the
-    /// cumulative padded bytes already recorded plus this call's would
-    /// exceed the budget. See [`Self::with_enospc_after`].
+    /// The hard end: a block that would take the cumulative padded bytes
+    /// recorded past this is refused, every time. See
+    /// [`Self::with_enospc_after`].
     enospc_after_bytes: Option<u64>,
+    /// How the medium answers past its early warning, and the hazards a
+    /// test can set (#420).
+    end: MediumEnd,
+    /// The bytes `execute` has accepted since the store was made, and the
+    /// early warning once a block was refused (#420).
+    warning: EarlyWarningState,
+}
+
+/// How a test double's medium answers block writes and filemarks at its end
+/// (#420): st's behaviour past the early warning as measured on home2's HP
+/// LTO-6 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`), shared by
+/// [`MemStore`] and the in-memory `FakeTape` so both drive
+/// [`write_block_retrying`] the way the drive does. Positions are stored
+/// bytes from the beginning of the medium. `TapeDevice`'s test hook
+/// (`TAPECTL_TEST_EARLY_WARNING_AT`, [`TapeStore::open`]) runs the same
+/// model in front of a real drive, counting from the store's open.
+///
+/// - **The early warning** (`early_warning_at`): the block whose end reaches
+///   it is accepted and arms a refusal. The next block write is refused at
+///   once with ENOSPC and writes nothing; the one after is accepted and
+///   arms again; and so on — `refusal_run` refusals after each accepted
+///   block (st's usual is 1; runs of up to 3 were measured).
+/// - **A filemark** is accepted at once and disarms: after the warning, the
+///   immediate filemark, the seal block and the synchronous filemark were
+///   each accepted on their first attempt.
+/// - **The hard end** (the double's own capacity, passed in): a block that
+///   would take the medium past it is refused, every time.
+/// - **Hazards a test sets:** `refused_blocks_land` — a "refused" block was
+///   in fact written, so the retry duplicates it (what the readback past the
+///   warning must catch, ADR-0012 item 114); `filemarks_refused_from` — a
+///   filemark is refused once the medium holds that many bytes (W3, W6).
+/// - Any head motion ends the alternation, as st's own state ends on one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediumEnd {
+    pub(crate) early_warning_at: Option<u64>,
+    /// Refusals after each accepted block past the warning; 0 means 1.
+    pub(crate) refusal_run: u32,
+    pub(crate) refused_blocks_land: bool,
+    pub(crate) filemarks_refused_from: Option<u64>,
+    /// Refusals armed for the next block writes.
+    armed: u32,
+}
+
+impl MediumEnd {
+    /// st's answer to one block `write(2)` on a medium holding `stored`
+    /// bytes, whose hard end is `hard_end`. `land` records bytes on the
+    /// medium.
+    pub(crate) fn write_block(
+        &mut self,
+        stored: u64,
+        hard_end: Option<u64>,
+        block: &[u8],
+        land: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<usize> {
+        let len = block.len() as u64;
+        if hard_end.is_some_and(|end| stored + len > end) {
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        if self.refuses_block() {
+            if self.refused_blocks_land {
+                land(block);
+            }
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        land(block);
+        self.block_landed(stored, len);
+        Ok(block.len())
+    }
+
+    /// The first half of [`Self::write_block`], for a medium whose bytes
+    /// land somewhere this model does not hold (`TapeDevice`'s test hook,
+    /// `TAPECTL_TEST_EARLY_WARNING_AT`): whether st refuses the next block
+    /// write. A refusal is spent by asking.
+    pub(crate) fn refuses_block(&mut self) -> bool {
+        if self.armed == 0 {
+            return false;
+        }
+        self.armed -= 1;
+        true
+    }
+
+    /// The second half of [`Self::write_block`]: `len` bytes landed on a
+    /// medium that held `stored`. The block whose end reaches the early
+    /// warning, and every block after it, arms the next refusal.
+    pub(crate) fn block_landed(&mut self, stored: u64, len: u64) {
+        if self.early_warning_at.is_some_and(|at| stored + len >= at) {
+            self.armed = self.refusal_run.max(1);
+        }
+    }
+
+    /// st's answer to one filemark on a medium holding `stored` bytes. Never
+    /// retried by the store (W3).
+    pub(crate) fn write_filemark(&mut self, stored: u64) -> io::Result<()> {
+        if self.filemarks_refused_from.is_some_and(|at| stored >= at) {
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        self.filemark_landed();
+        Ok(())
+    }
+
+    /// A filemark was written: it ends the alternation, as after the
+    /// measured warning the filemark, the seal block and the synchronous
+    /// filemark were each accepted at once.
+    pub(crate) fn filemark_landed(&mut self) {
+        self.armed = 0;
+    }
+
+    /// The model `TAPECTL_TEST_EARLY_WARNING_AT` runs on a real device: st's
+    /// early warning after `at` bytes, one refusal after each block accepted
+    /// past it, filemarks accepted, and no hard end and no hazard (the drive's
+    /// own hard end stays the drive's).
+    pub(crate) fn early_warning_only(at: u64) -> Self {
+        Self {
+            early_warning_at: Some(at),
+            ..Self::default()
+        }
+    }
+
+    /// The head moved: st's alternation starts again.
+    pub(crate) fn moved(&mut self) {
+        self.armed = 0;
+    }
 }
 
 impl MemStore {
@@ -1949,7 +2635,45 @@ impl MemStore {
             block_size,
             usable_bytes: u64::MAX,
             enospc_after_bytes: None,
+            end: MediumEnd::default(),
+            warning: EarlyWarningState::default(),
         }
+    }
+
+    /// The drive's early warning after `bytes` stored bytes on the medium
+    /// (#420): from the block that reaches it, st's alternation
+    /// ([`MediumEnd`]) — a block refused at once after each one accepted,
+    /// which `execute` retries through the real
+    /// `tape::ioctl::write_block_retrying`, so every entry still lands
+    /// whole and [`Store::early_warning`] reports it. The hard end stays
+    /// [`Self::with_enospc_after`].
+    pub fn with_early_warning_after(mut self, bytes: u64) -> Self {
+        self.end.early_warning_at = Some(bytes);
+        self
+    }
+
+    /// Past the early warning, refuse `run` block writes after each one
+    /// accepted, not one (#420: runs of up to 3 were measured). More than
+    /// 16 is the hard end at the next block.
+    pub fn with_refusal_run(mut self, run: u32) -> Self {
+        self.end.refusal_run = run;
+        self
+    }
+
+    /// The hazard the readback past the early warning exists for (#420,
+    /// ADR-0012 item 114): a block st reported refused was in fact written,
+    /// so the retry writes it twice and the entry holds one block too many.
+    pub fn with_refused_blocks_written(mut self) -> Self {
+        self.end.refused_blocks_land = true;
+        self
+    }
+
+    /// Refuse every filemark once the medium holds `bytes` stored bytes
+    /// (#420 W3): the store never retries one, so the entry fails as a full
+    /// medium.
+    pub fn with_filemarks_refused_from(mut self, bytes: u64) -> Self {
+        self.end.filemarks_refused_from = Some(bytes);
+        self
     }
 
     /// Override the capacity `capacity()` reports.
@@ -1959,17 +2683,20 @@ impl MemStore {
     }
 
     /// Simulate a medium that runs out of space after `budget` cumulative
-    /// padded bytes have been written: the next `execute()` call whose
-    /// write would cross that budget fails with a simulated ENOSPC instead
-    /// of succeeding, mirroring a real full medium
-    /// (`docs/design/layout-session.md`: "on write ENOSPC, stop, leave the
-    /// tape unsealed, mark the session aborted"). Without this, `execute()`
+    /// padded bytes have been written — the HARD END (#420): a block that
+    /// would cross the budget is refused every time, so the `execute()` call
+    /// whose write would cross it fails with ENOSPC as a full medium after
+    /// [`crate::tape::ioctl::MAX_REFUSALS_IN_A_ROW`] retries, and records
+    /// nothing of that entry, mirroring a real full medium
+    /// (`docs/design/layout-session.md`: on the hard end, stop, leave the
+    /// tape unsealed, mark the session aborted). Without this, `execute()`
     /// can only fail via a genuinely truncated source — this is what makes
     /// the session's ENOSPC clean-abort path unit-testable with no tape
     /// hardware (T6 behavior 3). Distinct from [`Self::with_usable_bytes`]:
     /// that changes what `capacity()` *reports* (the pre-flight validate-time
     /// oracle); this changes what `execute()` *does* mid-write (the rare-miss
-    /// backstop past that pre-flight gate, ADR-0007).
+    /// backstop past that pre-flight gate, ADR-0007). Distinct, too, from
+    /// [`Self::with_early_warning_after`], whose refusals are retried.
     pub fn with_enospc_after(mut self, budget: u64) -> Self {
         self.enospc_after_bytes = Some(budget);
         self
@@ -1983,31 +2710,59 @@ impl Store for MemStore {
         })
     }
 
+    /// Block by block, as a tape takes it: each zero-padded block through
+    /// the real `write_block_retrying` against [`MediumEnd`], then the
+    /// filemark, never retried. An entry that fails — the hard end, a refused
+    /// filemark, a short source — records nothing: a MemStore file is a
+    /// whole file.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
-        let padded_len = pad_to_blocks(len, self.block_size as u64);
-        if let Some(budget) = self.enospc_after_bytes {
-            let already_written: u64 = self.files.iter().map(|f| f.len() as u64).sum();
-            if already_written + padded_len > budget {
-                return Err(TapectlError::MediumFull(format!(
-                    "MemStore: simulated ENOSPC — writing {padded_len} more bytes would exceed \
-                     the {budget}-byte budget ({already_written} already recorded)"
-                )));
+        let bs = self.block_size.max(1);
+        let padded_len = pad_to_blocks(len, bs as u64);
+        let before: u64 = self.files.iter().map(|f| f.len() as u64).sum();
+        let mut file = Vec::with_capacity(padded_len as usize);
+        let mut block = vec![0u8; bs];
+        let mut read = 0u64;
+        while read < len {
+            let want = (len - read).min(bs as u64) as usize;
+            let mut got = 0;
+            while got < want {
+                let n = src
+                    .read(&mut block[got..want])
+                    .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
+                if n == 0 {
+                    return Err(TapectlError::SourceIo(format!(
+                        "source exhausted after {} of {len} declared bytes",
+                        read + got as u64
+                    )));
+                }
+                got += n;
             }
+            block[want..].fill(0);
+            read += want as u64;
+            let (end, hard_end) = (&mut self.end, self.enospc_after_bytes);
+            write_block_retrying(
+                |b| {
+                    let stored = before + file.len() as u64;
+                    end.write_block(stored, hard_end, b, &mut |l| file.extend(l))
+                },
+                &block,
+                &mut self.warning,
+            )
+            .map_err(|e| write_error("MemStore write", &e))?;
         }
-        let mut buf = Vec::with_capacity(len as usize);
-        src.take(len)
-            .read_to_end(&mut buf)
-            .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
-        if (buf.len() as u64) < len {
-            return Err(TapectlError::SourceIo(format!(
-                "source exhausted after {} of {len} declared bytes",
-                buf.len()
-            )));
-        }
-        buf.resize(padded_len as usize, 0);
-        self.files.push(buf);
+        self.end
+            .write_filemark(before + file.len() as u64)
+            .map_err(|e| write_error("MemStore filemark", &e))?;
+        let written = file.len() as u64;
+        self.files.push(file);
         self.syncs.push(sync);
-        Ok(padded_len)
+        Ok(written)
+    }
+
+    /// `execute` retries refused blocks through the real
+    /// `write_block_retrying`, and keeps the warning for the store's life.
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.warning.warning()
     }
 
     // confirm: default trait method (T6 finding #1) — identical to what this
@@ -2025,6 +2780,7 @@ impl Store for MemStore {
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
+        self.end.moved();
         Ok(())
     }
 
@@ -2045,6 +2801,11 @@ impl Store for MemStore {
         Ok(position as usize >= self.files.len())
     }
 
+    /// Every file recorded is a whole one.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        Ok(Some(self.files.len() as u32))
+    }
+
     /// Short: the trait's filemark at BOT (one empty file). Long: nothing
     /// recorded at all.
     fn erase(&mut self, mode: EraseMode) -> Result<()> {
@@ -2056,6 +2817,7 @@ impl Store for MemStore {
             EraseMode::Long => {
                 self.files.clear();
                 self.syncs.clear();
+                self.end.moved();
             }
         }
         Ok(())
@@ -2407,9 +3169,376 @@ mod tests {
         assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
         assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
         let err = store.execute(&mut Cursor::new(vec![1u8]), 1, false);
-        assert!(err.is_err(), "third write must simulate ENOSPC");
+        assert!(
+            matches!(err, Err(TapectlError::MediumFull(ref m)) if m.contains("os error 28")),
+            "third write must simulate ENOSPC: {err:?}"
+        );
         // The failed call must not have recorded a partial/corrupt entry.
         assert_eq!(store.files.len(), 2);
+    }
+
+    // --- the early warning (#420, `volume-format-v2.md` §4.3) -----------
+
+    /// `n` blocks of `byte`, for the 4096-byte-block stores below.
+    fn blocks(byte: u8, n: usize) -> Vec<u8> {
+        vec![byte; n * 4096]
+    }
+
+    fn put(store: &mut dyn Store, bytes: &[u8]) -> Result<u64> {
+        store.execute(&mut Cursor::new(bytes.to_vec()), bytes.len() as u64, false)
+    }
+
+    /// MemStore past its early warning: st's alternation, retried by the
+    /// real `write_block_retrying`, so every entry lands whole and once, and
+    /// `early_warning()` reports it from the first refusal on — `None`
+    /// before, and sticky after, a reposition included.
+    #[test]
+    fn memstore_with_early_warning_after_lands_whole_entries_and_reports_it() {
+        let mut store = MemStore::new(4096).with_early_warning_after(3 * 4096);
+        put(&mut store, &blocks(1, 2)).unwrap();
+        assert_eq!(store.early_warning(), None);
+        put(&mut store, &blocks(2, 3)).unwrap();
+        assert_eq!(
+            store.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 3 * 4096,
+                refusals: 2
+            })
+        );
+        put(&mut store, &blocks(3, 1)).unwrap();
+        assert_eq!(store.files, vec![blocks(1, 2), blocks(2, 3), blocks(3, 1)]);
+        store.reposition_for_resume(3).unwrap();
+        assert_eq!(store.early_warning().unwrap().refusals, 2, "sticky");
+    }
+
+    /// The hard end past the warning: the entry fails as a full medium and,
+    /// a MemStore file being a whole file, records nothing of it. The
+    /// warning came first and stays.
+    #[test]
+    fn memstore_hard_end_past_the_warning_records_nothing_of_the_entry() {
+        let mut store = MemStore::new(4096)
+            .with_early_warning_after(4096)
+            .with_enospc_after(3 * 4096);
+        // The block that reaches the warning arms a refusal; the filemark
+        // after it disarms, as on the drive.
+        put(&mut store, &blocks(1, 1)).unwrap();
+        assert_eq!(store.early_warning(), None);
+        let err = put(&mut store, &blocks(2, 4)).unwrap_err();
+        assert!(matches!(err, TapectlError::MediumFull(_)), "{err:?}");
+        assert_eq!(store.files, vec![blocks(1, 1)]);
+        assert_eq!(
+            store.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 2 * 4096,
+                refusals: 1 + 16
+            }),
+            "one refusal retried at the warning, sixteen at the hard end"
+        );
+    }
+
+    /// MemStore's hazards, the same model as the FakeTape's: a refused block
+    /// that was written doubles under the retry; a refused filemark fails
+    /// the entry at once, unretried, with no refusal counted.
+    #[test]
+    fn memstore_hazards_double_a_refused_block_and_refuse_a_filemark() {
+        let mut store = MemStore::new(4096)
+            .with_early_warning_after(4096)
+            .with_refused_blocks_written();
+        put(&mut store, &[blocks(1, 1), blocks(2, 1)].concat()).unwrap();
+        assert_eq!(store.files, vec![[blocks(1, 1), blocks(2, 2)].concat()]);
+
+        let mut store = MemStore::new(4096).with_filemarks_refused_from(2 * 4096);
+        put(&mut store, &blocks(1, 1)).unwrap();
+        let err = put(&mut store, &blocks(2, 1)).unwrap_err();
+        assert!(matches!(err, TapectlError::MediumFull(_)), "{err:?}");
+        assert_eq!((store.files.len(), store.early_warning()), (1, None));
+    }
+
+    /// The same medium behind `TapeStore` (its device the FakeTape) and
+    /// behind MemStore: the same files, and the same warning reported
+    /// through `Store::early_warning` — the session's one question.
+    #[test]
+    fn tape_and_memory_stores_report_the_same_warning() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(Vec::new(), 4096);
+        fake.early_warning_at(5 * 4096);
+        fake.state().end.refusal_run = 2;
+        let mut tape = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let mut mem = MemStore::new(4096)
+            .with_early_warning_after(5 * 4096)
+            .with_refusal_run(2);
+        for store in [&mut tape as &mut dyn Store, &mut mem] {
+            put(store, &blocks(1, 4)).unwrap();
+            assert_eq!(store.early_warning(), None);
+            put(store, &blocks(2, 3)).unwrap();
+            put(store, &blocks(3, 2)).unwrap();
+        }
+        assert_eq!(fake.state().files, mem.files);
+        assert_eq!(tape.early_warning(), mem.early_warning());
+        assert_eq!(
+            tape.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 5 * 4096,
+                refusals: 2 * 2 + 2
+            })
+        );
+        // A store over a new open of the same medium starts afresh.
+        let reopened = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        assert_eq!(reopened.early_warning(), None);
+    }
+
+    /// `TAPECTL_TEST_EARLY_WARNING_AT` (#420) is read in one place, so no
+    /// test sets it; if one did, every write store in this binary would act
+    /// past an early warning.
+    #[test]
+    fn the_early_warning_test_hook_is_absent_by_default() {
+        assert!(
+            test_early_warning_at_from_env().is_none(),
+            "{TEST_EARLY_WARNING_AT} must not be set in the test environment; if this fails, \
+             something is exporting it and every write store refuses blocks"
+        );
+    }
+
+    /// The hook takes a plain decimal byte count and nothing else: a
+    /// mistyped value fails the open rather than writing as if unset.
+    #[test]
+    fn the_early_warning_test_hook_takes_a_plain_byte_count() {
+        assert_eq!(parse_test_early_warning_at("123456"), Ok(123_456));
+        assert_eq!(parse_test_early_warning_at(" 7 "), Ok(7));
+        for bad in [
+            "",
+            "  ",
+            "1G",
+            "-5",
+            "1e6",
+            "0x10",
+            "99999999999999999999999",
+        ] {
+            let err = parse_test_early_warning_at(bad).unwrap_err();
+            assert!(err.contains(TEST_EARLY_WARNING_AT), "{bad:?}: {err}");
+        }
+        let said = test_early_warning_announcement("/dev/nstX", 42).join("\n");
+        for want in [
+            "TAPECTL_TEST_EARLY_WARNING_AT=42 is set",
+            "/dev/nstX",
+            "TEST hook",
+            "Never set it for a real write",
+        ] {
+            assert!(said.contains(want), "{want:?} not in {said}");
+        }
+    }
+
+    /// A store with no early warning answers `None` (the trait's default).
+    #[test]
+    fn the_default_store_has_no_early_warning_and_cannot_count_its_files() {
+        struct Plain(MemStore);
+        impl Store for Plain {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+        }
+        let mut plain = Plain(MemStore::new(4096).with_early_warning_after(0));
+        put(&mut plain, &blocks(1, 2)).unwrap();
+        assert!(plain.0.early_warning().is_some(), "positive control");
+        assert_eq!(plain.early_warning(), None);
+        assert_eq!(plain.files_on_medium().unwrap(), None);
+    }
+
+    // --- locate_seal (#420, `volume-format-v2.md` §1.2 rule 6) ------------
+
+    /// File `i` of the fixtures below: one 4096-byte block of `i + 1`.
+    fn nth_file(i: usize) -> Vec<u8> {
+        vec![i as u8 + 1; 4096]
+    }
+
+    fn mem_holding(files: usize) -> MemStore {
+        let mut mem = MemStore::new(4096);
+        mem.files = (0..files).map(nth_file).collect();
+        mem.syncs = vec![false; files];
+        mem
+    }
+
+    fn tape_holding(files: usize) -> (TapeStore, crate::tape::fake::FakeTape) {
+        let fake =
+            crate::tape::fake::FakeTape::with_files((0..files).map(nth_file).collect(), 4096);
+        (TapeStore::from_ops(fake.boxed(), 0).unwrap(), fake)
+    }
+
+    /// Only rewinds, forward spaces and reads: never READ POSITION or LOCATE.
+    fn spaces_only(fake: &crate::tape::fake::FakeTape) {
+        use crate::tape::fake::Op;
+        let ops = fake.ops();
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, Op::Rewind | Op::Space(_) | Op::ReadHead(_))),
+            "{ops:?}"
+        );
+    }
+
+    /// The tape holds a file at the planned position: that file, read
+    /// there, whatever it holds.
+    #[test]
+    fn locate_seal_reads_the_planned_position() {
+        let mut mem = mem_holding(6);
+        assert_eq!(
+            locate_seal(&mut mem, 5),
+            SealLocation::File {
+                position: 5,
+                bytes: nth_file(5)
+            }
+        );
+        assert_eq!(
+            locate_seal(&mut mem, 2),
+            SealLocation::File {
+                position: 2,
+                bytes: nth_file(2)
+            },
+            "a file that is not the last is still the one at the position"
+        );
+        let (mut tape, fake) = tape_holding(6);
+        assert_eq!(locate_seal(&mut tape, 5), locate_seal(&mut mem, 5));
+        spaces_only(&fake);
+    }
+
+    /// The medium ends before the planned position: the seal is the last
+    /// file on it, numbered from the store's count — whether the space to
+    /// the position fails at end of data or lands exactly on it (st reads 0
+    /// bytes there, as from a filemark-only file).
+    #[test]
+    fn locate_seal_reads_the_last_file_when_the_medium_ends_before_the_plan() {
+        let last = SealLocation::File {
+            position: 3,
+            bytes: nth_file(3),
+        };
+        let mut mem = mem_holding(4);
+        assert_eq!(locate_seal(&mut mem, 9), last);
+        assert_eq!(locate_seal(&mut mem, 4), last);
+        for planned in [9, 4] {
+            let (mut tape, fake) = tape_holding(4);
+            assert_eq!(locate_seal(&mut tape, planned), last, "planned {planned}");
+            spaces_only(&fake);
+        }
+
+        // A filemark-only last file is still the last file.
+        let mut mem = mem_holding(2);
+        mem.files[1].clear();
+        assert_eq!(
+            locate_seal(&mut mem, 6),
+            SealLocation::File {
+                position: 1,
+                bytes: Vec::new()
+            }
+        );
+    }
+
+    /// A filemark-only file AT the planned position, on a medium that goes
+    /// on past it, is that file: not the end of the medium.
+    #[test]
+    fn locate_seal_tells_an_empty_file_from_the_end_of_data() {
+        let mut files: Vec<Vec<u8>> = (0..5).map(nth_file).collect();
+        files[3].clear();
+        let fake = crate::tape::fake::FakeTape::with_files(files, 4096);
+        let mut tape = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            locate_seal(&mut tape, 3),
+            SealLocation::File {
+                position: 3,
+                bytes: Vec::new()
+            }
+        );
+    }
+
+    /// A read that fails without END OF DATA shown at or before it is
+    /// unreadable, never absent (#460): at the planned position, and at the
+    /// last file of a medium that ends before it.
+    #[test]
+    fn locate_seal_never_reads_a_failed_read_as_absent() {
+        let (mut tape, fake) = tape_holding(8);
+        fake.state().unreadable = vec![7];
+        assert!(matches!(
+            locate_seal(&mut tape, 7),
+            SealLocation::Unreadable { position: 7, .. }
+        ));
+
+        let (mut tape, fake) = tape_holding(4);
+        fake.state().unreadable = vec![3];
+        assert!(matches!(
+            locate_seal(&mut tape, 9),
+            SealLocation::Unreadable { position: 3, .. }
+        ));
+        spaces_only(&fake);
+
+        // A drive that cannot report its status proves nothing.
+        let (mut tape, fake) = tape_holding(4);
+        fake.state().position_fails = true;
+        assert!(matches!(
+            locate_seal(&mut tape, 9),
+            SealLocation::Unreadable { position: 9, .. }
+        ));
+    }
+
+    /// END OF DATA proven, but a store that cannot count the files on its
+    /// medium cannot say which is last: unreadable at the planned position,
+    /// never absent.
+    #[test]
+    fn locate_seal_without_a_count_is_unreadable() {
+        struct NoCount(MemStore);
+        impl Store for NoCount {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.0.eod_at_or_before(position)
+            }
+        }
+        let got = locate_seal(&mut NoCount(mem_holding(4)), 9);
+        assert!(
+            matches!(&got, SealLocation::Unreadable { position: 9, error }
+                if error.contains("cannot count")),
+            "{got:?}"
+        );
+    }
+
+    /// A medium with no file on it has no seal anywhere: absent, the one
+    /// answer that needs END OF DATA at the beginning of the tape.
+    #[test]
+    fn locate_seal_on_an_empty_medium_is_absent() {
+        assert_eq!(locate_seal(&mut mem_holding(0), 5), SealLocation::Absent);
+        let (mut tape, fake) = tape_holding(0);
+        assert_eq!(locate_seal(&mut tape, 5), SealLocation::Absent);
+        spaces_only(&fake);
+    }
+
+    /// A file larger than any seal at the planned position is no seal, and
+    /// is read no further than the cap; the medium is not searched past it.
+    #[test]
+    fn locate_seal_reports_an_oversized_file_and_reads_no_further() {
+        let mut mem = mem_holding(3);
+        mem.files[2] = vec![9; SMALL_FILE_CAP as usize + 4096];
+        assert_eq!(
+            locate_seal(&mut mem, 2),
+            SealLocation::Oversized { position: 2 }
+        );
+        assert_eq!(locate_seal(&mut mem, 2).position(), Some(2));
+        assert_eq!(SealLocation::Absent.position(), None);
     }
 
     // --- the write confirm's tier (issue #387) ---------------------------
@@ -2609,6 +3738,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1000 * BS,
                 reserve_bytes: BS,
+                plan_bound_bytes: None,
             },
             entries,
         };
@@ -2770,6 +3900,10 @@ mod tests {
             (MismatchKind::ContentUnreadable, false),
             (MismatchKind::FrontIndexUnreadable, false),
             (MismatchKind::SealUnreadable, false),
+            // #420, `volume-format-v2.md` §5 step 3: the catalog and the
+            // seal disagree about where the tape ended — "inconclusive
+            // (never a quarantine)".
+            (MismatchKind::EndedAfterDisagrees, false),
         ];
         for (kind, expected) in ratified {
             assert_eq!(
@@ -2782,7 +3916,7 @@ mod tests {
 
         // COMPLETENESS, so a future variant cannot slip through
         // unclassified. `slot` is exhaustive with no wildcard arm, exactly
-        // like `proves_medium_bad` itself: an eighth variant fails to
+        // like `proves_medium_bad` itself: a new variant fails to
         // COMPILE here (a new arm is required), a slot past `N` panics, and
         // a variant that has an arm but is missing from `ratified` above
         // fails the assertion. A green run therefore means every variant
@@ -2796,9 +3930,10 @@ mod tests {
                 MismatchKind::NavigationDisagreement => 4,
                 MismatchKind::ContentHashMismatch => 5,
                 MismatchKind::ContentUnreadable => 6,
+                MismatchKind::EndedAfterDisagrees => 7,
             }
         }
-        const N: usize = 7;
+        const N: usize = 8;
         let mut covered = [false; N];
         for (kind, _) in ratified {
             covered[slot(*kind)] = true;
@@ -2816,6 +3951,35 @@ mod tests {
             expected: "e".into(),
             actual: "a".into(),
         }
+    }
+
+    /// #420: an `ended_after_disagrees` withholds the quarantine verdict
+    /// from the whole evidence, whatever else it holds, and keeps every
+    /// mismatch. Without it, the same medium-proving mismatch is the
+    /// verdict.
+    #[test]
+    fn an_ending_disagreement_withholds_the_medium_verdict_but_keeps_the_findings() {
+        let mixed = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 6,
+            mismatches: vec![
+                mismatch_of(MismatchKind::EndedAfterDisagrees),
+                mismatch_of(MismatchKind::ContentHashMismatch),
+                mismatch_of(MismatchKind::FrontIndexDivergesFromSeal),
+            ],
+        };
+        assert!(mixed.ending_disagrees());
+        assert!(!mixed.proves_medium_bad());
+        assert!(mixed.medium_evidence().is_empty());
+        assert_eq!(mixed.mismatches.len(), 3, "the findings stay");
+
+        let without = Evidence {
+            mismatches: mixed.mismatches[1..].to_vec(),
+            ..mixed.clone()
+        };
+        assert!(!without.ending_disagrees());
+        assert!(without.proves_medium_bad());
+        assert_eq!(without.medium_evidence().len(), 2);
     }
 
     /// `Evidence`'s verdict is "ANY mismatch proves it", not "all of them" —
@@ -3179,16 +4343,12 @@ mod tests {
 
         // Rebuild + re-store the seal marker bound to the corrupted File 3
         // so step 2 (the binding hash) passes and the walk actually reaches
-        // the consistency check in step 3.
+        // the consistency check in step 3. Its own embedded copy must keep
+        // §4.1's rules (S4: one entry per file, 0 to 5, self-consistent), or
+        // the seal does not parse (S6) and the walk stops at step 1 — so the
+        // inconsistency under test is File 3's alone.
         let new_hash = sha256_hex(&corrupted_true_bytes);
-        let seal_files = vec![FrontIndexFile {
-            position: 3,
-            type_label: "front_index",
-            size_bytes: Some(corrupted_len),
-            sha256_encrypted: Some(new_hash.clone()),
-        }];
-        let seal_true_bytes =
-            generate_seal_marker("FIXT01", 6, &new_hash, &seal_files).into_bytes();
+        let seal_true_bytes = crate::volume::session::fixture_seal("FIXT01", 5, &new_hash);
         let seal_len = seal_true_bytes.len() as u64;
         let mut seal_padded = seal_true_bytes;
         seal_padded.resize(pad_to_blocks(seal_len, BS) as usize, 0);
@@ -3243,6 +4403,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,
@@ -3266,6 +4427,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,
@@ -3924,9 +5086,7 @@ mod tests {
             inner: MemStore {
                 files: mem.files.clone(),
                 syncs: mem.syncs.clone(),
-                block_size: BS as usize,
-                usable_bytes: u64::MAX,
-                enospc_after_bytes: None,
+                ..MemStore::new(BS as usize)
             },
             fault_at: 2,
         }
@@ -4117,5 +5277,647 @@ mod tests {
             vec![9u8; blocks * BS as usize]
         );
         assert!(store.pool.allocated() <= blocks);
+    }
+
+    // ── #420: the chain walk takes the ending (`volume-format-v2.md` §4.1,
+    // §4.2, §5; ADR-0012 item 114) ──
+
+    mod short_ending {
+        use super::*;
+        use crate::volume::layout::generate_short_seal_marker;
+
+        /// Small blocks, so a slice is several of them.
+        const SBS: usize = 4096;
+        const LABEL: &str = "SHORT01";
+        /// Four data slices at 4..=7; the seal is planned at 8.
+        const SLICES: usize = 4;
+        const M: u32 = 4 + SLICES as u32;
+        /// Where these tests' short tapes end: two slices before M-1.
+        const K: u32 = 5;
+
+        /// A planned tape: the Layout, every file's true bytes before the
+        /// seal, and the seal's embedded copy (File 3 filled in).
+        struct Planned {
+            layout: Layout,
+            files: Vec<Vec<u8>>,
+            fi_hash: String,
+            seal_files: Vec<FrontIndexFile>,
+        }
+
+        /// Files 0-2, File 3, [`SLICES`] data slices of three blocks less a
+        /// little whose every block's bytes differ (so a block written twice
+        /// changes the file's hash), and the seal planned at [`M`].
+        fn planned() -> Planned {
+            let mut files: Vec<Vec<u8>> = vec![
+                b"ID THUNK".to_vec(),
+                b"SYSTEM GUIDE".to_vec(),
+                b"#!/bin/sh\n".to_vec(),
+            ];
+            let slices: Vec<Vec<u8>> = (0..SLICES)
+                .map(|i| {
+                    (0..3 * SBS - 100)
+                        .map(|o| (o / SBS + 7 * i + 1) as u8)
+                        .collect()
+                })
+                .collect();
+            let kinds = ["id_thunk", "system_guide", "restore_sh"];
+            let mut fi_files: Vec<FrontIndexFile> = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| FrontIndexFile {
+                    position: i as i32,
+                    type_label: kinds[i],
+                    size_bytes: Some(f.len() as u64),
+                    sha256_encrypted: Some(sha256_hex(f)),
+                })
+                .collect();
+            fi_files.push(FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None,
+                sha256_encrypted: None,
+            });
+            for (i, s) in slices.iter().enumerate() {
+                fi_files.push(FrontIndexFile {
+                    position: 4 + i as i32,
+                    type_label: "data_slice",
+                    size_bytes: Some(s.len() as u64),
+                    sha256_encrypted: Some(sha256_hex(s)),
+                });
+            }
+            fi_files.push(FrontIndexFile {
+                position: M as i32,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None,
+            });
+            let fi_bytes = generate_front_index(LABEL, &fi_files).into_bytes();
+            let fi_hash = sha256_hex(&fi_bytes);
+            let mut seal_files = fi_files.clone();
+            seal_files[3].size_bytes = Some(fi_bytes.len() as u64);
+            seal_files[3].sha256_encrypted = Some(fi_hash.clone());
+            let placeholder =
+                generate_seal_marker(LABEL, M as i32 + 1, &fi_hash, &seal_files).into_bytes();
+            files.push(fi_bytes);
+            files.extend(slices);
+
+            let mut entries: Vec<LayoutEntry> = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| LayoutEntry {
+                    position: i as i32,
+                    kind: match i {
+                        0 => ZoneKind::IdThunk,
+                        1 => ZoneKind::SystemGuide,
+                        2 => ZoneKind::RestoreSh,
+                        3 => ZoneKind::FrontIndex,
+                        _ => ZoneKind::Slice {
+                            stage_slice_id: i as i64,
+                        },
+                    },
+                    size_bytes: Some(f.len() as u64),
+                    sha256: Some(sha256_hex(f)),
+                    source: ContentSource::Generated,
+                })
+                .collect();
+            entries.push(LayoutEntry {
+                position: M as i32,
+                kind: ZoneKind::SealMarker,
+                size_bytes: Some(placeholder.len() as u64),
+                sha256: None,
+                source: ContentSource::Generated,
+            });
+            Planned {
+                layout: Layout {
+                    label: LABEL.into(),
+                    volume_uuid: "uuid-short".into(),
+                    media_type: "LTO-6".into(),
+                    block_size: SBS as u64,
+                    budget: CapacityBudget {
+                        available_bytes: 1000 * SBS as u64,
+                        reserve_bytes: SBS as u64,
+                        plan_bound_bytes: None,
+                    },
+                    entries,
+                },
+                files,
+                fi_hash,
+                seal_files,
+            }
+        }
+
+        impl Planned {
+            /// The seal a 1.6.0 writer puts after `ended_after`: short at
+            /// `ended_after + 1`, or full at M when it is M-1.
+            fn seal(&self, ended_after: u32) -> Vec<u8> {
+                if ended_after == M - 1 {
+                    generate_seal_marker(LABEL, M as i32 + 1, &self.fi_hash, &self.seal_files)
+                } else {
+                    generate_short_seal_marker(
+                        LABEL,
+                        ended_after as i32,
+                        &self.fi_hash,
+                        &self.seal_files[..=ended_after as usize],
+                    )
+                }
+                .into_bytes()
+            }
+
+            /// `store` holding files 0 to `ended_after`, written through
+            /// `execute`, and then `seal`.
+            fn written(&self, mut store: MemStore, ended_after: u32, seal: &[u8]) -> MemStore {
+                for f in &self.files[..=ended_after as usize] {
+                    store
+                        .execute(&mut Cursor::new(f.clone()), f.len() as u64, false)
+                        .unwrap();
+                }
+                store
+                    .execute(&mut Cursor::new(seal.to_vec()), seal.len() as u64, true)
+                    .unwrap();
+                store
+            }
+
+            /// The tape a 1.6.0 writer leaves when it ended after
+            /// `ended_after`, with no warning hazard.
+            fn tape(&self, ended_after: u32) -> MemStore {
+                self.written(MemStore::new(SBS), ended_after, &self.seal(ended_after))
+            }
+
+            /// A store whose early warning comes one byte into file
+            /// `position`, and whose refused blocks land anyway (the hazard
+            /// item 114 exists for): that file holds one block twice.
+            fn hazard_in(&self, position: u32) -> MemStore {
+                let before: u64 = self.files[..position as usize]
+                    .iter()
+                    .map(|f| pad_to_blocks(f.len() as u64, SBS as u64))
+                    .sum();
+                MemStore::new(SBS)
+                    .with_early_warning_after(before + 1)
+                    .with_refused_blocks_written()
+            }
+        }
+
+        /// A seal in the grammar before 1.6.0: no `ended_after`, `requires
+        /// = []` (what every 1.5.0 tape carries).
+        fn seal_1_5_0(seal: &[u8]) -> Vec<u8> {
+            let text = String::from_utf8(seal.to_vec()).unwrap();
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.starts_with("ended_after = "))
+                .collect();
+            let out = kept
+                .join("\n")
+                .replace("requires = [\"short-seal\"]", "requires = []");
+            assert!(!out.contains("ended_after =") && out.contains("requires = []\n"));
+            out.into_bytes()
+        }
+
+        /// A store over `inner` that records every position read.
+        struct Recording {
+            inner: MemStore,
+            reads: Vec<u32>,
+        }
+
+        impl Store for Recording {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.reads.push(position);
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        fn short(tier: Tier) -> ConfirmPlan<'static> {
+            ConfirmPlan::new(tier).with_ending(Some(K))
+        }
+
+        fn kinds(evidence: &Evidence) -> Vec<(u32, MismatchKind)> {
+            evidence
+                .mismatches
+                .iter()
+                .map(|m| (m.position, m.kind))
+                .collect()
+        }
+
+        /// A short plan reads the seal at K+1, hashes files 0 to K at the
+        /// integrity tier, reads nothing after K+1, and passes — in every
+        /// read order. The positive control: a full plan over the same tape
+        /// does read past K+1 (M, where there is nothing), so the recorder
+        /// sees reads there when they happen.
+        #[test]
+        fn a_short_plan_reads_the_seal_at_k_plus_one_and_nothing_after_it() {
+            let p = planned();
+            for (plan, checked) in [
+                (short(Tier::Integrity), 7),
+                (short(Tier::Integrity).with_order(ReadOrder::SealLast), 7),
+                (short(Tier::Navigable), 2),
+            ] {
+                let mut store = Recording {
+                    inner: p.tape(K),
+                    reads: Vec::new(),
+                };
+                let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                assert!(evidence.mismatches.is_empty(), "{plan:?}: {evidence:?}");
+                // Seal + File 3, and at the integrity tier Files 0-2 and
+                // the slices at 4 and 5.
+                assert_eq!(evidence.files_checked, checked, "{plan:?}");
+                assert!(
+                    store.reads.contains(&(K + 1)),
+                    "{plan:?}: {:?}",
+                    store.reads
+                );
+                assert!(
+                    store.reads.iter().all(|r| *r <= K + 1),
+                    "{plan:?}: read past the short seal: {:?}",
+                    store.reads
+                );
+            }
+
+            let mut store = Recording {
+                inner: p.tape(K),
+                reads: Vec::new(),
+            };
+            let control = store
+                .confirm_with(&p.layout, ConfirmPlan::new(Tier::Navigable))
+                .unwrap();
+            assert!(
+                store.reads.contains(&M),
+                "positive control: the recorder sees a read past K+1: {:?}",
+                store.reads
+            );
+            assert_eq!(kinds(&control), [(M, MismatchKind::SealUnreadable)]);
+        }
+
+        /// A full plan with no readback walks as before: `files_checked`
+        /// and the verdict of every full-plan test above are unchanged, and
+        /// a 1.6.0 full seal (which states `ended_after = M-1`) passes both
+        /// tiers.
+        #[test]
+        fn a_full_plan_passes_a_full_1_6_0_seal_at_both_tiers() {
+            let p = planned();
+            let mut store = p.tape(M - 1);
+            let full = store.confirm(&p.layout, Tier::Integrity).unwrap();
+            assert!(full.mismatches.is_empty(), "{full:?}");
+            assert_eq!(full.files_checked, M + 1);
+            let quick = store.confirm(&p.layout, Tier::Navigable).unwrap();
+            assert!(quick.mismatches.is_empty(), "{quick:?}");
+            assert_eq!(quick.files_checked, 2);
+        }
+
+        /// A tape written before 1.6.0 (its seal states no `ended_after`
+        /// and requires nothing, rule S3) still confirms under a full plan:
+        /// no `ended_after_disagrees`.
+        #[test]
+        fn a_1_5_0_seal_under_a_full_plan_still_passes() {
+            let p = planned();
+            let seal = seal_1_5_0(&p.seal(M - 1));
+            let mut store = p.written(MemStore::new(SBS), M - 1, &seal);
+            for tier in [Tier::Integrity, Tier::Navigable] {
+                let evidence = store.confirm(&p.layout, tier).unwrap();
+                assert!(evidence.mismatches.is_empty(), "{tier:?}: {evidence:?}");
+            }
+        }
+
+        /// The hazard (ADR-0012 item 114): st reported a block refused that
+        /// the drive kept, so entry K holds a block twice. The readback past
+        /// the warning hashes entry K under the navigable tier too, and the
+        /// mismatch proves the medium bad; so does the integrity tier. The
+        /// positive control: a navigable confirm with no readback reads no
+        /// content file and passes the same tape.
+        #[test]
+        fn the_readback_catches_a_refused_block_that_was_written_under_every_tier() {
+            let p = planned();
+            let store = p.hazard_in(K);
+            let mut store = p.written(store, K, &p.seal(K));
+            assert!(
+                store.early_warning().is_some(),
+                "the store saw the warning in file {K}"
+            );
+            assert!(
+                store.files[K as usize].len() > 3 * SBS,
+                "file {K} holds a refused block that landed, written again"
+            );
+            for tier in [Tier::Navigable, Tier::Integrity] {
+                let plan = short(tier).reading_back(Some(K));
+                let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                assert_eq!(
+                    kinds(&evidence),
+                    [(K, MismatchKind::ContentHashMismatch)],
+                    "{tier:?}"
+                );
+                assert!(evidence.proves_medium_bad(), "{tier:?}");
+            }
+            let control = store
+                .confirm_with(&p.layout, short(Tier::Navigable))
+                .unwrap();
+            assert!(
+                control.mismatches.is_empty(),
+                "positive control: without the readback the quick tier reads no content \
+                 file: {control:?}"
+            );
+        }
+
+        /// The warning in the last slice (K = M-1): the seal is full, and
+        /// the readback still reads that slice back (item 114: "whether the
+        /// tape then sealed short or … full").
+        #[test]
+        fn the_readback_after_a_warning_in_the_last_slice_reads_that_slice() {
+            let p = planned();
+            let store = p.hazard_in(M - 1);
+            let mut store = p.written(store, M - 1, &p.seal(M - 1));
+            let plan = ConfirmPlan::new(Tier::Navigable).reading_back(Some(M - 1));
+            let evidence = store.confirm_with(&p.layout, plan).unwrap();
+            assert_eq!(
+                kinds(&evidence),
+                [(M - 1, MismatchKind::ContentHashMismatch)]
+            );
+            let control = store.confirm(&p.layout, Tier::Navigable).unwrap();
+            assert!(control.mismatches.is_empty(), "{control:?}");
+        }
+
+        /// A clean readback passes, and is the one content file the
+        /// navigable tier reads. On tape it costs no motion beyond the
+        /// quick confirm's own: the open's rewind, a space to File 3, a
+        /// space on to K, then K and the seal after it with no space
+        /// between them — one rewind and two forward spaces
+        /// (`layout-session.md` counts three; the cursor needs only two).
+        #[test]
+        fn a_clean_readback_passes_and_costs_one_rewind_and_two_spaces_on_tape() {
+            use crate::tape::fake::{FakeTape, Op};
+
+            let p = planned();
+            let mem = p.tape(K);
+            let plan = short(Tier::Navigable).reading_back(Some(K));
+
+            let mut recording = Recording {
+                inner: p.tape(K),
+                reads: Vec::new(),
+            };
+            let evidence = recording.confirm_with(&p.layout, plan).unwrap();
+            assert!(evidence.mismatches.is_empty(), "{evidence:?}");
+            assert_eq!(evidence.files_checked, 3, "File 3, entry K, the seal");
+            assert_eq!(recording.reads, [3, K, K + 1]);
+
+            for order in [ReadOrder::SealFirst, ReadOrder::SealLast] {
+                let fake = FakeTape::with_files(mem.files.clone(), SBS);
+                let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+                let evidence = store
+                    .confirm_with(&p.layout, plan.with_order(order))
+                    .unwrap();
+                assert!(evidence.mismatches.is_empty(), "{order:?}: {evidence:?}");
+                assert_eq!(
+                    fake.ops(),
+                    vec![
+                        Op::Rewind,
+                        Op::Space(3),
+                        Op::Read(3),
+                        Op::Space(K - 4),
+                        Op::Read(K),
+                        Op::Read(K + 1),
+                    ],
+                    "{order:?}"
+                );
+                assert_eq!(fake.rewinds(), 1);
+                assert_eq!(fake.spaces(), 2);
+            }
+        }
+
+        /// The full tier on a short tape, on tape: seal last (a write's
+        /// `--full-confirm`), one rewind and one forward pass ending on the
+        /// seal at K+1; seal first (`volume verify`), out to K+1, one rewind,
+        /// and the pass to K. Neither moves past K+1.
+        #[test]
+        fn a_full_confirm_of_a_short_tape_on_tape_stops_at_the_short_seal() {
+            use crate::tape::fake::{FakeTape, Op};
+
+            let p = planned();
+            let mem = p.tape(K);
+            let plan = short(Tier::Integrity).reading_back(Some(K));
+            let mut seal_last = vec![Op::Rewind];
+            seal_last.extend((0..=K + 1).map(Op::Read));
+            let mut seal_first = vec![Op::Rewind, Op::Space(K + 1), Op::Read(K + 1), Op::Rewind];
+            seal_first.extend((0..=K).map(Op::Read));
+            for (order, expected) in [
+                (ReadOrder::SealLast, seal_last),
+                (ReadOrder::SealFirst, seal_first),
+            ] {
+                let fake = FakeTape::with_files(mem.files.clone(), SBS);
+                let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+                let evidence = store
+                    .confirm_with(&p.layout, plan.with_order(order))
+                    .unwrap();
+                assert!(evidence.mismatches.is_empty(), "{order:?}: {evidence:?}");
+                assert_eq!(fake.ops(), expected, "{order:?}");
+            }
+        }
+
+        /// An interrupted full readback's checkpoints never stand in for
+        /// the readback past the warning: entry K is read again, and the
+        /// hazard is found. The positive control: without the readback, the
+        /// same checkpoints skip K and the walk passes.
+        #[test]
+        fn a_checkpoint_never_stands_in_for_the_readback() {
+            let p = planned();
+            let store = p.hazard_in(K);
+            let mut store = p.written(store, K, &p.seal(K));
+            let checkpoints = Checkpoints {
+                front_index_sha256: p.fi_hash.clone(),
+                passed: p
+                    .seal_files
+                    .iter()
+                    .filter(|f| f.position != 3 && f.position as u32 <= K)
+                    .map(|f| (f.position as u32, f.sha256_encrypted.clone().unwrap()))
+                    .collect(),
+            };
+            let resumed = short(Tier::Integrity).resuming(Some(&checkpoints));
+            let evidence = store
+                .confirm_with(&p.layout, resumed.reading_back(Some(K)))
+                .unwrap();
+            assert_eq!(kinds(&evidence), [(K, MismatchKind::ContentHashMismatch)]);
+            let control = store.confirm_with(&p.layout, resumed).unwrap();
+            assert!(
+                control.mismatches.is_empty(),
+                "positive control: the checkpoint skips K when nothing is owed: {control:?}"
+            );
+        }
+
+        /// `ended_after_disagrees`, both directions, inconclusive: a seal at
+        /// the position the plan reads that states another `ended_after` —
+        /// a short seal stating K-1 at K+1, a full seal (M-1) at K+1, and a
+        /// short seal stating K at M under a full plan.
+        #[test]
+        fn a_seal_stating_another_ended_after_disagrees_and_is_inconclusive() {
+            let p = planned();
+            let cases = [
+                (Some(K), K, p.seal(K - 1), K + 1, K - 1),
+                (Some(K), K, p.seal(M - 1), K + 1, M - 1),
+                (None, M - 1, p.seal(K), M, K),
+            ];
+            for (ending, last, seal, at, states) in cases {
+                let mut store = p.written(MemStore::new(SBS), last, &seal);
+                for tier in [Tier::Integrity, Tier::Navigable] {
+                    let plan = ConfirmPlan::new(tier).with_ending(ending);
+                    let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                    assert_eq!(
+                        kinds(&evidence),
+                        [(at, MismatchKind::EndedAfterDisagrees)],
+                        "{plan:?}"
+                    );
+                    let m = &evidence.mismatches[0];
+                    let expected = ending.unwrap_or(M - 1);
+                    assert_eq!(
+                        m.expected,
+                        format!("ended_after = {expected}, where the catalog says the tape ended")
+                    );
+                    assert_eq!(m.actual, format!("ended_after = {states}"));
+                    assert!(!evidence.proves_medium_bad(), "{plan:?}");
+                }
+            }
+        }
+
+        /// A seal that disagrees keeps every finding but withholds the
+        /// quarantine (coordinator's ruling on #420, §5: "inconclusive,
+        /// never a quarantine"). A seal at K+1 stating K-1 says entry K is
+        /// not part of the tape; the walk, reading under the catalog's K,
+        /// hashed it anyway, and a wrong entry K is reported — but does not
+        /// prove the medium bad. The control: the same wrong entry under a
+        /// seal that agrees does.
+        #[test]
+        fn a_disagreeing_seal_keeps_what_the_plan_read_and_never_quarantines() {
+            let p = planned();
+            let mut store = p.written(MemStore::new(SBS), K, &p.seal(K - 1));
+            store.files[K as usize][10] ^= 0xFF;
+            let evidence = store
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(
+                kinds(&evidence),
+                [
+                    (K + 1, MismatchKind::EndedAfterDisagrees),
+                    (K, MismatchKind::ContentHashMismatch),
+                ],
+                "every finding is kept"
+            );
+            assert!(evidence.ending_disagrees());
+            assert!(!evidence.proves_medium_bad());
+            assert!(evidence.medium_evidence().is_empty());
+
+            let mut agreeing = p.written(MemStore::new(SBS), K, &p.seal(K));
+            agreeing.files[K as usize][10] ^= 0xFF;
+            let control = agreeing
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(kinds(&control), [(K, MismatchKind::ContentHashMismatch)]);
+            assert!(
+                control.proves_medium_bad(),
+                "positive control: the same wrong entry under an agreeing seal quarantines"
+            );
+        }
+
+        /// The catalog and the tape ending in different places is, by the
+        /// spec's reads, no seal where the catalog looks (§1.2 rule 6: a
+        /// catalog reader reads the seal at `ended_after + 1` directly): a
+        /// short plan over a tape that sealed full finds a data slice at
+        /// K+1, and a full plan over a tape that sealed short finds nothing
+        /// at M. Both are `seal_unreadable`, inconclusive.
+        #[test]
+        fn a_plan_and_a_tape_that_ended_elsewhere_find_no_seal_where_the_plan_looks() {
+            let p = planned();
+            let mut sealed_full = p.tape(M - 1);
+            let evidence = sealed_full
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(kinds(&evidence), [(K + 1, MismatchKind::SealUnreadable)]);
+            assert!(!evidence.proves_medium_bad());
+
+            let mut sealed_short = p.tape(K);
+            let evidence = sealed_short.confirm(&p.layout, Tier::Integrity).unwrap();
+            assert_eq!(kinds(&evidence), [(M, MismatchKind::SealUnreadable)]);
+            assert!(!evidence.proves_medium_bad());
+        }
+
+        /// §1.2 rule 6: before the planned position, only a seal that
+        /// itself requires `short-seal` is a seal. One that states
+        /// `ended_after` but requires nothing, and one in the grammar before
+        /// 1.6.0 (which reads as a full seal ending after `file_count - 2`,
+        /// rule S3, here K), are no seal at K+1.
+        #[test]
+        fn a_seal_before_the_planned_position_must_require_short_seal() {
+            let p = planned();
+            let stating = String::from_utf8(p.seal(K))
+                .unwrap()
+                .replace("requires = [\"short-seal\"]", "requires = []")
+                .into_bytes();
+            for seal in [stating, seal_1_5_0(&p.seal(K))] {
+                assert!(
+                    format::parse_seal_marker(&String::from_utf8_lossy(&seal)).is_ok(),
+                    "the seal parses: rule 6, not S1-S6, refuses it"
+                );
+                let mut store = p.written(MemStore::new(SBS), K, &seal);
+                for tier in [Tier::Integrity, Tier::Navigable] {
+                    let evidence = store.confirm_with(&p.layout, short(tier)).unwrap();
+                    assert_eq!(
+                        kinds(&evidence),
+                        [(K + 1, MismatchKind::SealUnreadable)],
+                        "{tier:?}"
+                    );
+                    assert!(
+                        evidence.mismatches[0].actual.contains("rule 6"),
+                        "{evidence:?}"
+                    );
+                }
+            }
+        }
+
+        /// The seal a resume's contact already read (#403) stands for the
+        /// file at K+1 on a short tape, where the walk reads it.
+        #[test]
+        fn the_seal_a_contact_already_read_is_the_one_at_k_plus_one() {
+            let p = planned();
+            let seal = p.seal(K);
+            let mut store = p.tape(K);
+            store.files[K as usize + 1] = vec![0xFF; SBS];
+            let without = store
+                .confirm_with(&p.layout, short(Tier::Navigable))
+                .unwrap();
+            assert_eq!(kinds(&without), [(K + 1, MismatchKind::SealUnreadable)]);
+            let with = store
+                .confirm_with(&p.layout, short(Tier::Navigable).with_seal(Some(&seal)))
+                .unwrap();
+            assert!(with.mismatches.is_empty(), "{with:?}");
+        }
+
+        /// An ending or a readback the Layout cannot have is the caller's
+        /// bug, as a Layout with no seal marker is: an `Err`, never a
+        /// finding about the tape.
+        #[test]
+        fn an_ending_the_layout_cannot_have_is_an_error() {
+            let p = planned();
+            let mut store = p.tape(K);
+            for plan in [
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(M)),
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(u32::MAX)),
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(3)),
+                short(Tier::Navigable).reading_back(Some(K + 1)),
+                short(Tier::Navigable).reading_back(Some(3)),
+            ] {
+                assert!(store.confirm_with(&p.layout, plan).is_err(), "{plan:?}");
+            }
+            // M-1 is a full seal's ending, stated: the same walk as `None`.
+            let stated = ConfirmPlan::new(Tier::Navigable).with_ending(Some(M - 1));
+            let mut full = p.tape(M - 1);
+            assert!(full
+                .confirm_with(&p.layout, stated)
+                .unwrap()
+                .mismatches
+                .is_empty());
+        }
     }
 }

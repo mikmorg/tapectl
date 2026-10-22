@@ -510,6 +510,29 @@ fn largest_unit_line(l: &collection::plan::LargestUnit) -> String {
     line
 }
 
+/// The units of `batch` planned past the fill ceiling (`fill_bytes`), by
+/// name (ADR-0012 item 113, [`collection::plan::past_ceiling_units`]): the
+/// tape may end before them. Empty when the batch fits under the ceiling, as
+/// every batch does unless the drive declares `post_warning_bytes`.
+fn past_ceiling_names(batch: &collection::selector::Batch, fill_bytes: u64) -> Vec<String> {
+    collection::plan::past_ceiling_units(batch, fill_bytes)
+        .iter()
+        .map(|u| u.name.clone())
+        .collect()
+}
+
+/// The line naming [`past_ceiling_names`], or `None` when there are none.
+fn past_ceiling_line(batch: &collection::selector::Batch, fill_bytes: u64) -> Option<String> {
+    let names = past_ceiling_names(batch, fill_bytes);
+    (!names.is_empty()).then(|| {
+        format!(
+            "past the fill ceiling (the tape may end before them; a unit it ends before is cut \
+             and stays staged for the next cartridge): {}",
+            names.join(", ")
+        )
+    })
+}
+
 fn cmd_plan(
     conn: &Connection,
     config: &Config,
@@ -539,12 +562,16 @@ fn cmd_plan(
         // Issue #456: the largest unit beside the tape, so ADR-0012 item 69's
         // trigger (a unit above a tenth of a cartridge) is visible.
         let largest = collection::plan::largest_unit(&batches, &tape);
-        rows.push((lib.name.clone(), batches, refused, largest));
+        rows.push((lib.name.clone(), batches, refused, largest, tape));
     }
     // `--policy-aware` (issue #144): what each prioritised unit falls short
     // of, printed beside it so the order explains itself.
     let findings = if policy_aware {
-        shortfalls(conn, config, rows.iter().flat_map(|(_, b, _, _)| b.iter()))?
+        shortfalls(
+            conn,
+            config,
+            rows.iter().flat_map(|(_, b, _, _, _)| b.iter()),
+        )?
     } else {
         std::collections::HashMap::new()
     };
@@ -552,7 +579,7 @@ fn cmd_plan(
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, batches, refused, largest)| {
+            .map(|(name, batches, refused, largest, tape)| {
                 let batch_json: Vec<serde_json::Value> = batches
                     .iter()
                     .enumerate()
@@ -562,6 +589,9 @@ fn cmd_plan(
                             "units": b.unit_names(),
                             "total_bytes": b.total_bytes,
                             "padded_bytes": b.padded_bytes,
+                            // ADR-0012 item 113: empty unless the drive
+                            // declares post_warning_bytes.
+                            "past_ceiling": past_ceiling_names(b, tape.bytes),
                             "findings": b
                                 .unit_names()
                                 .into_iter()
@@ -578,16 +608,26 @@ fn cmd_plan(
                     "cartridges_needed": batches.len() as i64 * copies,
                     "largest_unit": largest_unit_json(largest.as_ref()),
                     "refused": refused_json(refused),
+                    // ADR-0012 item 113: what one tape takes under the fill
+                    // ceiling, and what a batch is packed to (the same
+                    // figure unless the drive declares post_warning_bytes).
+                    "fill_bytes": tape.bytes,
+                    "packing_bytes": tape.packing_bytes(),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, batches, refused, largest) in &rows {
+        for (name, batches, refused, largest, tape) in &rows {
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
             } else {
                 println!("collection \"{name}\" plan ({copies} copy/copies):");
+                // ADR-0012 item 113: printed only when the drive declares
+                // post_warning_bytes; every other line is as before.
+                if tape.plan_bound_bytes.is_some() {
+                    println!("  packing: {}", tape.describe_packing());
+                }
                 for (i, b) in batches.iter().enumerate() {
                     println!(
                         "  batch {i}: {} units, {} raw, {} on-tape (padded)",
@@ -600,6 +640,9 @@ fn cmd_plan(
                             Some(serde_json::Value::String(f)) => println!("    {u}  ({f})"),
                             _ => println!("    {u}"),
                         }
+                    }
+                    if let Some(line) = past_ceiling_line(b, tape.bytes) {
+                        println!("    {line}");
                     }
                 }
                 println!(
@@ -688,6 +731,11 @@ fn cmd_run(
                 "s"
             },
         );
+        // ADR-0012 item 113: only when the drive declares
+        // post_warning_bytes; the line above is unchanged.
+        if budget.plan_bound_bytes.is_some() {
+            println!("  packing: {}", budget.describe());
+        }
         print_refused_plain(&refused);
     }
 
@@ -698,6 +746,15 @@ fn cmd_run(
             batches.len()
         ))
     })?;
+    // ADR-0012 item 113: the units of this batch planned past the fill
+    // ceiling, named before anything is staged (`volume write` names the
+    // exact ones again before the tape moves). Empty without a plan bound.
+    let past_ceiling = past_ceiling_names(batch, budget.bytes);
+    if !json_output {
+        if let Some(line) = past_ceiling_line(batch, budget.bytes) {
+            println!("  batch {batch_idx}: {line}");
+        }
+    }
 
     // Issue #230. Everything above is planning: `plan_for_run` resolved the
     // destination budget and refused an unknown or non-write-target label,
@@ -719,6 +776,8 @@ fn cmd_run(
                     "batch": batch_idx,
                     "budget_bytes": budget.bytes,
                     "budget_from": budget.binding_label,
+                    "packing_bytes": budget.packing_bytes(),
+                    "past_ceiling": past_ceiling,
                     "units": batch.unit_names(),
                     "labels": labels,
                     "dry_run": true,
@@ -776,6 +835,8 @@ fn cmd_run(
                 "batch": batch_idx,
                 "budget_bytes": budget.bytes,
                 "budget_from": budget.binding_label,
+                "packing_bytes": budget.packing_bytes(),
+                "past_ceiling": past_ceiling,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
                 "staging_released": report.cleaned.is_some(),
@@ -1300,6 +1361,31 @@ mod checksum_mode_tests {
         let line = largest_unit_line(&largest(512 * 1024, 5.0, false));
         assert!(line.contains("(5.0% of the tape's"), "{line}");
         assert!(!line.contains("above a tenth"), "{line}");
+    }
+
+    /// ADR-0012 item 113: `collection plan` and `collection run` name a
+    /// batch's units past the fill ceiling, in the batch's order, and say
+    /// nothing for a batch under it — every batch, without a plan bound.
+    #[test]
+    fn a_batch_names_its_units_past_the_fill_ceiling_and_only_those() {
+        let bs = 512 * 1024u64;
+        let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
+            name: name.into(),
+            size_bytes: blocks * bs,
+        };
+        let batch = collection::selector::Batch {
+            units: vec![unit("lib/a", 3), unit("lib/b", 3), unit("lib/c", 2)],
+            ..Default::default()
+        };
+        assert!(past_ceiling_line(&batch, 8 * bs).is_none(), "all under");
+        assert_eq!(past_ceiling_names(&batch, 8 * bs), Vec::<String>::new());
+        assert_eq!(past_ceiling_names(&batch, 4 * bs), ["lib/b", "lib/c"]);
+        let line = past_ceiling_line(&batch, 4 * bs).unwrap();
+        assert!(
+            line.starts_with("past the fill ceiling (the tape may end before them;"),
+            "{line}"
+        );
+        assert!(line.ends_with(": lib/b, lib/c"), "{line}");
     }
 
     /// `--json` carries the same facts, and `null` when nothing is pending.

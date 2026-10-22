@@ -52,6 +52,21 @@
 //! neither stuck on nor lifted early. `volume rewrite --resume NEW` finishes
 //! the rewrite from wherever the catalog says it stopped.
 //!
+//! # A tape that ended early (#420)
+//!
+//! A rewrite never plans past the fill ceiling, though a write may when the
+//! drive declares `post_warning_bytes` (ADR-0012 item 113): the rewrite may
+//! hold a unit's only copy, and a unit the early warning cut would be left
+//! with none. An unexpected early warning can still seal the destination
+//! short. Its whole units are written; its cut ones are not, so the rewrite
+//! stays open, their staged slices stay held, and the stop names the
+//! ordinary `volume write` (with a full readback, the fact that lifts the
+//! hold) that writes them onto another cartridge; `--resume` then closes it
+//! (layout-session.md "Later contacts"). A SOURCE that sealed short is
+//! rewritten from its completed writes only: its cut rows are no copy, their
+//! slices are not live data and are not carried (they stay staged until
+//! their version is whole elsewhere, and `--with-staged` carries them).
+//!
 //! # The seam
 //!
 //! The four steps that touch the drive are [`RewriteSteps`], as
@@ -703,6 +718,12 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         )));
     }
     let live_bytes: i64 = slices.iter().map(|s| s.encrypted_bytes).sum();
+    // The FILL budget, never `plan_bound_bytes` (#420; ADR-0012 item 113's
+    // reach past the ceiling, the coordinator's ruling): a rewrite may hold
+    // a unit's only copy (item 106), and a unit planned past the ceiling is
+    // one the drive's early warning may cut, which here would leave it with
+    // none. So a rewrite plans to the fill ceiling even when the drive
+    // declares `post_warning_bytes`, and its write builds with no plan bound.
     let budget_bytes = backend.fill_budget_bytes(planned_capacity.max(0) as u64);
     if live_bytes as u64 > budget_bytes {
         return Err(TapectlError::Other(format!(
@@ -1647,7 +1668,12 @@ pub fn resume(
     // nothing to write: the record is closed, and the cartridge is free.
     let held = holds(conn)?;
     let any_held = pending.stage_set_ids.iter().any(|id| held.contains_key(id));
-    if !any_held {
+    // #420: a destination already sealed (short, its cut units since
+    // written elsewhere) is finished by `finish_from`, which closes the
+    // record as completed: the rewrite did write it.
+    let dest_sealed = destination_facts(conn, destination, &pending.stage_set_ids)?
+        .is_some_and(|d| d.status == "sealed");
+    if !any_held && !dest_sealed {
         let mut still_staged = true;
         for ss in &pending.stage_set_ids {
             let status: String = conn.query_row(
@@ -1719,11 +1745,18 @@ struct DestinationFacts {
     status: String,
     /// Writes of the rewrite's sets in a state `volume resume` can continue.
     resumable_writes: i64,
-    /// A completed write of every one of the rewrite's sets is fully read
-    /// back on this volume.
+    /// Every one of the rewrite's sets is done: a completed write of it is
+    /// fully read back on this volume, or (#420) the early end of this
+    /// volume's tape cut it and a fully read back copy of it is on another.
     fully_read_back: bool,
     sealed_not_read_back: bool,
     mounted_cartridge: Option<i64>,
+    /// #420: the rewrite's sets this volume's short seal cut (`cut` rows)
+    /// that no other volume holds fully read back yet. They stay staged and
+    /// held; an ordinary `volume write` writes them whole elsewhere.
+    cut_pending: Vec<i64>,
+    /// `volumes.ended_after`: where this volume's tape ended, if short.
+    ended_after: Option<i64>,
 }
 
 fn destination_facts(
@@ -1731,14 +1764,14 @@ fn destination_facts(
     label: &str,
     stage_sets: &[i64],
 ) -> Result<Option<DestinationFacts>> {
-    let row: Option<(i64, String)> = conn
+    let row: Option<(i64, String, Option<i64>)> = conn
         .query_row(
-            "SELECT id, status FROM volumes WHERE label = ?1",
+            "SELECT id, status, ended_after FROM volumes WHERE label = ?1",
             params![label],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((id, status)) = row else {
+    let Some((id, status, ended_after)) = row else {
         return Ok(None);
     };
     let resumable_writes: i64 = conn.query_row(
@@ -1749,13 +1782,32 @@ fn destination_facts(
     )?;
     let mut fully = !stage_sets.is_empty();
     let mut sealed_not_read_back = false;
+    let mut cut_pending = Vec::new();
     for ss in stage_sets {
-        let (completed, verified): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(write_verified), 0) FROM writes
-             WHERE volume_id = ?1 AND stage_set_id = ?2 AND status = 'completed'",
+        let (completed, verified, cut): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(status = 'completed'), 0),
+                    COALESCE(SUM(CASE WHEN status = 'completed' THEN write_verified END), 0),
+                    COALESCE(SUM(status = 'cut'), 0)
+             FROM writes WHERE volume_id = ?1 AND stage_set_id = ?2",
             params![id, ss],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        // #420 (layout-session.md "Later contacts"): the destination sealed
+        // short and cut this set. It is done once another volume holds it
+        // fully read back — the fact that lifts the hold — and until then it
+        // is the one thing left to write.
+        if cut > 0 {
+            let elsewhere: bool = conn.query_row(
+                &format!("SELECT {}", coverage::fully_read_back_copy("?1")),
+                params![ss],
+                |r| r.get(0),
+            )?;
+            if !elsewhere {
+                fully = false;
+                cut_pending.push(*ss);
+            }
+            continue;
+        }
         if completed == 0 || verified == 0 {
             fully = false;
         }
@@ -1777,7 +1829,48 @@ fn destination_facts(
         fully_read_back: fully,
         sealed_not_read_back,
         mounted_cartridge,
+        cut_pending,
+        ended_after,
     }))
+}
+
+/// Why a rewrite whose destination sealed short stays open (#420;
+/// layout-session.md "Later contacts": the rewrite stays open, the cut
+/// slices stay pinned in staging, and the command names `volume write`).
+/// The early end of the destination's tape cut `cut_sets`: they are not on
+/// it, their staged slices are the only copy and stay held, and an ordinary
+/// write onto another cartridge, read back in full, is what lifts the hold.
+fn cut_by_the_destination(
+    conn: &Connection,
+    destination: &str,
+    ended_after: Option<i64>,
+    cut_sets: &[i64],
+) -> Result<TapectlError> {
+    let mut units = Vec::with_capacity(cut_sets.len());
+    for ss in cut_sets {
+        let unit: Option<String> = conn
+            .query_row(
+                "SELECT u.name || ' v' || s.version FROM stage_sets ss
+                   JOIN snapshots s ON s.id = ss.snapshot_id
+                   JOIN units u ON u.id = s.unit_id WHERE ss.id = ?1",
+                params![ss],
+                |r| r.get(0),
+            )
+            .optional()?;
+        units.push(unit.unwrap_or_else(|| format!("stage set {ss}")));
+    }
+    Ok(TapectlError::WriteInterrupted(format!(
+        "volume \"{destination}\" sealed short: the drive's early warning ended its tape{}, and \
+         the early end cut {} unit(s) of this rewrite: {}. They are not on \"{destination}\"; \
+         their staged slices are their only copy and stay held (nothing releases them, \
+         `--force` included). Write them whole onto another cartridge with a full readback — \
+         load one and run `tapectl volume write <LABEL> --init --full-confirm` (it writes \
+         every staged set, these among them) — then `tapectl volume rewrite --resume \
+         {destination}` closes the rewrite and releases staging.",
+        ended_after.map_or_else(String::new, |k| format!(" after file {k}")),
+        units.len(),
+        units.join(", ")
+    )))
 }
 
 /// From the state the catalog is in to a finished rewrite: erase, init,
@@ -1912,6 +2005,16 @@ fn finish_from(
 
     // ── write, with the full confirm ──
     if !dest.fully_read_back {
+        // #420: a destination that sealed short is written; what its early
+        // end cut is written elsewhere, by an ordinary `volume write`.
+        if !dest.cut_pending.is_empty() {
+            return Err(cut_by_the_destination(
+                conn,
+                &destination,
+                dest.ended_after,
+                &dest.cut_pending,
+            )?);
+        }
         if dest.sealed_not_read_back && dest.resumable_writes == 0 {
             return Err(stopped(
                 TapectlError::Other(format!(
@@ -1951,6 +2054,25 @@ fn finish_from(
         }
     }
     let after = destination_facts(conn, &destination, &scope)?;
+    if let Some(after) = after.as_ref().filter(|d| !d.cut_pending.is_empty()) {
+        let _ = record_step(
+            conn,
+            pending.source_id,
+            &source,
+            "rewrite_cut",
+            serde_json::json!({
+                "destination": destination,
+                "ended_after": after.ended_after,
+                "cut_stage_sets": after.cut_pending,
+            }),
+        );
+        return Err(cut_by_the_destination(
+            conn,
+            &destination,
+            after.ended_after,
+            &after.cut_pending,
+        )?);
+    }
     if !after.as_ref().is_some_and(|d| d.fully_read_back) {
         return Err(stopped(
             TapectlError::Other(format!(
@@ -2322,6 +2444,9 @@ mod tests {
         fail_write: Cell<bool>,
         /// The fake write is a quick confirm: `write_verified = 0`.
         quick_write: Cell<bool>,
+        /// #420: the fake write seals short, cutting every set from this
+        /// index of those it writes on (`cut` rows, `ended_after` 41).
+        cut_from: Cell<Option<usize>>,
         corrupt_a_staged_slice: Cell<bool>,
         serial: RefCell<Option<String>>,
         /// What the stage sets passed to the write were.
@@ -2347,6 +2472,7 @@ mod tests {
                 fail_init: Cell::new(false),
                 fail_write: Cell::new(false),
                 quick_write: Cell::new(false),
+                cut_from: Cell::new(None),
                 corrupt_a_staged_slice: Cell::new(false),
                 serial: RefCell::new(Some(SERIAL.to_string())),
                 written_scope: RefCell::new(None),
@@ -2550,7 +2676,7 @@ mod tests {
                     .collect::<std::result::Result<_, _>>()
                     .unwrap(),
             };
-            for ss in sets {
+            for (i, ss) in sets.into_iter().enumerate() {
                 let snap: i64 = self
                     .w
                     .conn
@@ -2560,20 +2686,27 @@ mod tests {
                         |r| r.get(0),
                     )
                     .unwrap();
+                let cut = self.cut_from.get().is_some_and(|from| i >= from);
                 self.w
                     .conn
                     .execute(
                         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified)
-                         VALUES (?1, ?2, ?3, 'completed', ?4)",
-                        params![ss, snap, vol_id, !self.quick_write.get()],
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            ss,
+                            snap,
+                            vol_id,
+                            if cut { "cut" } else { "completed" },
+                            !cut && !self.quick_write.get()
+                        ],
                     )
                     .unwrap();
             }
             self.w
                 .conn
                 .execute(
-                    "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
-                    params![vol_id],
+                    "UPDATE volumes SET status = 'sealed', ended_after = ?2 WHERE id = ?1",
+                    params![vol_id, self.cut_from.get().map(|_| 41)],
                 )
                 .unwrap();
             Ok(())
@@ -3033,6 +3166,24 @@ mod tests {
         let mut tiny = scene(1);
         tiny.w.config.backends.lto[0].fill_ceiling = 0.00001;
         assert!(refuse(&tiny, "SRC", "NEW").contains("does not fit one tape"));
+        // #420: and a drive that declares its room past the early warning
+        // changes nothing. The live data fits 100% of the nominal capacity a
+        // write may plan to with `post_warning_bytes` (ADR-0012 item 113),
+        // but a rewrite may hold the only copy, and a cut there leaves none:
+        // it plans to the fill ceiling.
+        let mut bound = scene(1);
+        bound.w.config.backends.lto[0].fill_ceiling = 0.00001;
+        bound.w.config.backends.lto[0].post_warning_bytes = Some("99008M".into());
+        let capacity = bound.w.config.backends.lto[0].fill_budget_bytes(2_500_000_000_000);
+        assert!(
+            bound.w.config.backends.lto[0]
+                .plan_bound_bytes(2_500_000_000_000)
+                .unwrap()
+                .is_some_and(|b| b > capacity),
+            "positive control: a write would plan past the fill budget here"
+        );
+        assert!(refuse(&bound, "SRC", "NEW").contains("does not fit one tape"));
+        unchanged(&bound);
 
         // Nothing live: every version is reclaimable.
         let none = scene(1);
@@ -3155,6 +3306,67 @@ mod tests {
             staged_files(&s.w.config)
         );
         assert_eq!(set_status(&s.w.conn, s.keepsake.stage_set_id), "cleaned");
+    }
+
+    /// #420 (layout-session.md "Later contacts"): the destination's write
+    /// sealed short. The rewrite stays open, the cut set stays held in
+    /// staging, and the command names `volume write`; once the cut set has a
+    /// fully read back copy elsewhere, `--resume` closes the rewrite as
+    /// completed and releases staging.
+    #[test]
+    fn a_destination_that_seals_short_keeps_the_rewrite_open_with_the_cut_sets_held() {
+        let s = scene(1);
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
+        // docs has a copy elsewhere, but not one read back in full: the
+        // hold's fact is still to be made.
+        copy_elsewhere(&s, &s.docs, &[3], false, "OTHER-B");
+        let fake = Fake::new(&s);
+        // keepsake whole on NEW, docs cut.
+        fake.cut_from.set(Some(1));
+        let err = rewrite(&s.w.conn, &s.w.config, &fake, &opts("SRC", "NEW")).unwrap_err();
+        assert!(
+            matches!(err, TapectlError::WriteInterrupted(_)),
+            "not finished, resumable: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("sealed short"), "{msg}");
+        assert!(msg.contains("after file 41"), "{msg}");
+        assert!(msg.contains("docs v1"), "{msg}");
+        assert!(
+            msg.contains("tapectl volume write <LABEL> --init --full-confirm"),
+            "{msg}"
+        );
+        assert!(msg.contains("tapectl volume rewrite --resume NEW"), "{msg}");
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        let open: i64 = scalar(
+            &s.w.conn,
+            "SELECT COUNT(*) FROM pending_rewrites WHERE finished_at IS NULL",
+        );
+        assert_eq!(open, 1, "the rewrite stays open");
+        let held = holds(&s.w.conn).unwrap();
+        assert!(held.contains_key(&s.docs.stage_set_id), "{held:?}");
+        assert!(!held.contains_key(&s.keepsake.stage_set_id), "{held:?}");
+        // A resume before the cut set is written elsewhere names it again
+        // and writes nothing.
+        let calls = fake.calls().len();
+        let again = resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string();
+        assert!(again.contains("docs v1"), "{again}");
+        assert_eq!(
+            fake.calls().len(),
+            calls,
+            "no drive step: {:?}",
+            fake.calls()
+        );
+
+        // `volume write` onto another cartridge, read back in full.
+        copy_elsewhere(&s, &s.docs, &[3], true, "WHOLE-C");
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let report = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        assert!(report.closed_without_writing.is_none(), "{report:?}");
+        let outcome: String = scalar(&s.w.conn, "SELECT outcome FROM pending_rewrites");
+        assert_eq!(outcome, "completed");
     }
 
     #[test]

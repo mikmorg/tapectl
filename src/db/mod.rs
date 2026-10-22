@@ -482,6 +482,14 @@ fn migrations() -> Migrations<'static> {
         // are the only copy. Whether a set is still held is derived, not
         // stored. A new pair of tables, no rows touched. See the header.
         M::up(include_str!("migrations/037_pending_rewrites.sql")),
+        // 038 rebuilds `writes` to add status 'cut' to its CHECK and adds
+        // `volumes.ended_after` (issue #420, the short seal; ADR-0012 item
+        // 112): a stage set planned past where a tape sealed short is `cut`,
+        // never a copy, and the volume records where its short seal ended.
+        // 026's rule for a row the old CHECK could not have admitted: refused
+        // by id, never remapped. `.foreign_key_check()`: `write_positions`
+        // points into the rebuilt table. See the header.
+        M::up(include_str!("migrations/038_write_status_cut.sql")).foreign_key_check(),
     ])
 }
 
@@ -5372,6 +5380,288 @@ mod tests {
             report.integrity_ok && report.issues.is_empty(),
             "db fsck must be clean after 037: {:?}",
             report.issues
+        );
+    }
+
+    // --- Migration 038 (issue #420, the short seal; ADR-0012 item 112) ---
+
+    /// `open_memory_at_032_seeded`'s catalog carried on to schema 37, where
+    /// 038 starts, plus a `writes` row in each of the five statuses the seed
+    /// lacks (its 804 is `completed`), with out-of-sequence ids and every
+    /// nullable column set on one of them; a `stage_slices` row for
+    /// `sacrificed_slice_id` to point at, and a `write_positions` row -- the
+    /// one foreign key into `writes`, which the rebuild must not orphan.
+    fn open_memory_at_037_seeded() -> Connection {
+        let mut conn = open_memory_at_032_seeded();
+        migrate_to(&mut conn, Some(37)).expect("the seed migrates to 37");
+        assert_eq!(user_version(&conn), 37, "precondition: at schema 37");
+        conn.execute_batch(
+            "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted,
+                                       staging_path)
+                 VALUES (880, 803, 1, 1024, 1100, 'plain-880', 'enc-880', '/staging/s880.age');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status,
+                                 write_verified, eot_recovery, sacrificed_slice_id,
+                                 started_at, completed_at, notes, created_at, session_dir)
+                 VALUES (881, 803, 600, 701, 'interrupted', 1, 'normal', 880,
+                         '2026-01-07 00:00:00', '2026-01-07 00:00:01', 'note-881',
+                         '2026-01-07 00:00:02', '/staging/sessions/V-INIT-881');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, created_at)
+                 VALUES (883, 803, 600, 702, 'planned', '2026-01-07 00:00:03');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, created_at)
+                 VALUES (885, 803, 600, 703, 'in_progress', '2026-01-07 00:00:04');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, created_at)
+                 VALUES (887, 803, 600, 704, 'failed', '2026-01-07 00:00:05');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, created_at)
+                 VALUES (889, 803, 600, 705, 'aborted', '2026-01-07 00:00:06');
+             INSERT INTO write_positions (id, write_id, stage_slice_id, position, status,
+                                          written_at, sha256_on_volume)
+                 VALUES (890, 804, 880, '7', 'written', '2026-01-07 00:00:07', 'enc-880');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// THE test for 038: `writes` is rebuilt with 'cut' in its status CHECK
+    /// and `volumes` gains `ended_after`, and nothing else moves -- every row
+    /// of every table (each volume row only gains a NULL `ended_after`),
+    /// every schema object outside those two tables (the three `writes`
+    /// indexes recreated exactly), every foreign key in and out, and every
+    /// `writes` column. Afterwards 'cut' is accepted beside every old status,
+    /// anything else is refused, and the old defaults and keys still hold.
+    #[test]
+    fn test_migrate_037_populated_db_to_038_preserves_every_row_and_admits_cut() {
+        let mut conn = open_memory_at_037_seeded();
+
+        let mut rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let writes_cols_before = table_info(&conn, "writes");
+        let volumes_cols_before = table_info(&conn, "volumes");
+        assert_eq!(
+            rows_before["writes"].len(),
+            6,
+            "positive control: six statuses"
+        );
+        assert_eq!(rows_before["write_positions"].len(), 1, "positive control");
+        assert_eq!(
+            index_names(&conn, "writes"),
+            vec![
+                "idx_writes_snapshot",
+                "idx_writes_stage_set",
+                "idx_writes_volume",
+                "sqlite_autoindex_writes_1"
+            ],
+            "positive control: writes has its indexes to compare"
+        );
+        assert!(
+            !volumes_cols_before.iter().any(|c| c.0 == "ended_after"),
+            "positive control: no ended_after before 038"
+        );
+
+        migrate_to(&mut conn, Some(38)).expect("038 must migrate a catalog of legal statuses");
+        assert_eq!(user_version(&conn), 38);
+
+        let mut rows_after = every_row(&conn);
+        let volumes_before = rows_before.remove("volumes").unwrap();
+        let volumes_after = rows_after.remove("volumes").unwrap();
+        assert_eq!(
+            rows_before, rows_after,
+            "038 must not add, drop, renumber or alter a single row outside volumes"
+        );
+        let mut widened: Vec<Vec<String>> = volumes_before
+            .into_iter()
+            .map(|mut row| {
+                row.push("NULL".into());
+                row
+            })
+            .collect();
+        widened.sort();
+        assert_eq!(
+            widened, volumes_after,
+            "every volume row keeps every cell and gains a NULL ended_after"
+        );
+
+        let objects_after = schema_objects(&conn);
+        let untouched = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && (o.1 == "writes" || o.1 == "volumes")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            untouched(&objects_before),
+            untouched(&objects_after),
+            "038 changed a schema object other than the writes and volumes tables, or did \
+             not recreate one of writes' indexes exactly"
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "038 must restate every foreign key");
+        assert_eq!(
+            writes_cols_before,
+            table_info(&conn, "writes"),
+            "no writes column changes: same names, order, types, NOT NULL, defaults"
+        );
+        let mut volumes_cols_expected = volumes_cols_before;
+        volumes_cols_expected.push(("ended_after".into(), "INTEGER".into(), 0, None, 0));
+        assert_eq!(
+            volumes_cols_expected,
+            table_info(&conn, "volumes"),
+            "volumes gains exactly one nullable INTEGER column, last, with no default"
+        );
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+
+        assert!(
+            conn.execute("DELETE FROM writes WHERE id = 804", [])
+                .is_err(),
+            "writes 804 is referenced by write_positions 890; FK enforcement must refuse"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id) VALUES (803, 600, 700)",
+                [],
+            )
+            .is_err(),
+            "UNIQUE(stage_set_id, volume_id) still holds"
+        );
+        let set = |status: &str| {
+            conn.execute(
+                "UPDATE writes SET status = ?1 WHERE id = 883",
+                rusqlite::params![status],
+            )
+        };
+        let err = set("shipped").expect_err("an unknown status must be refused after 038");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        for status in [
+            "cut",
+            "planned",
+            "in_progress",
+            "completed",
+            "failed",
+            "aborted",
+            "interrupted",
+        ] {
+            set(status).unwrap_or_else(|e| panic!("writes.status '{status}' must be legal: {e}"));
+        }
+        conn.execute("DELETE FROM writes WHERE id = 883", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id)
+             VALUES (900, 803, 600, 702)",
+            [],
+        )
+        .unwrap();
+        let default_status: String = conn
+            .query_row("SELECT status FROM writes WHERE id = 900", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(default_status, "planned", "the status DEFAULT is unchanged");
+
+        let set_ended: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM volumes WHERE ended_after IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(set_ended, 0, "ended_after is NULL on every existing volume");
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('V-NEW', 'lto', 'lto0', 1000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let fresh: Option<i64> = conn
+            .query_row(
+                "SELECT ended_after FROM volumes WHERE label = 'V-NEW'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh, None, "a new volume's ended_after defaults to NULL");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', sealed_at = '2026-10-20 00:00:00',
+                                ended_after = 41
+              WHERE label = 'V-NEW'",
+            [],
+        )
+        .expect("a short seal records its ending");
+    }
+
+    /// A `writes` row in a status the old CHECK never admitted was put there
+    /// around it, by hand, and 038 refuses by name and row rather than guess
+    /// (026's rule). The positive control is the test above: the same seed
+    /// with only legal statuses migrates.
+    #[test]
+    fn test_migration_038_refuses_a_hand_set_write_status_by_row() {
+        let mut conn = open_memory_at_037_seeded();
+        conn.pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        conn.execute_batch(
+            "UPDATE writes SET status = 'shipped' WHERE id IN (883, 887);
+             UPDATE writes SET status = 'cut' WHERE id = 885;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", "OFF")
+            .unwrap();
+
+        let err = migrate(&mut conn).expect_err("038 must refuse a hand-set status");
+        let msg = match &err {
+            TapectlError::Migration(m) => m.clone(),
+            other => panic!("expected the generic Migration variant, got {other:?}"),
+        };
+        assert!(msg.starts_with("migration 038 cannot run: "), "{msg}");
+        assert!(
+            msg.contains("writes.status = 'shipped' on 2 row(s) (id 883, 887)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("writes.status = 'cut' on 1 row(s) (id 885)"),
+            "a 'cut' row before 038 cannot have come from tapectl either: {msg}"
+        );
+        assert!(msg.contains("Nothing has been changed."), "{msg}");
+        assert!(
+            !msg.contains("CREATE TABLE") && !msg.contains("CHECK constraint failed"),
+            "038's own words, not the SQL dump: {msg}"
+        );
+        assert_eq!(user_version(&conn), 37, "a refused 038 rolls back");
+        let shipped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writes WHERE status = 'shipped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shipped, 2, "a refused 038 rewrites no row");
+        assert!(
+            !table_info(&conn, "volumes")
+                .iter()
+                .any(|c| c.0 == "ended_after"),
+            "a refused 038 adds no column"
+        );
+    }
+
+    /// The live `writes.status` vocabulary, pinned to the schema rather than
+    /// to a migration file (`live_status_check`'s reason): 001's six and
+    /// 038's `cut`.
+    #[test]
+    fn the_live_write_status_check_is_the_seven_states() {
+        assert_eq!(
+            live_status_check("writes"),
+            [
+                "aborted",
+                "completed",
+                "cut",
+                "failed",
+                "in_progress",
+                "interrupted",
+                "planned"
+            ]
         );
     }
 

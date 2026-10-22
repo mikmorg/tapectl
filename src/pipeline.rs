@@ -6,8 +6,11 @@
 //! **Why.** Until 1.0.6 one thread read a 512 KiB block of the staged file,
 //! hashed it, wrote it to tape, and only then read the next block, so the
 //! drive waited out every disk read and every hash. On a CPU without SHA-NI
-//! the hash alone runs at about 191 MB/s (asm, one core) against the
-//! 160 MB/s an LTO-6 needs to stream: L6-0001's 1.32 TB write took 5 h 22 m,
+//! the hash alone runs at no more than the 160 MB/s an LTO-6 needs to stream
+//! (home2, one core: about 191 MB/s for OpenSSL's code, the figure once given
+//! here, and about 142-157 for the `sha2` asm tapectl used until #488 — the
+//! write-shaping note's §1; since #488 the hash is `ring`'s, OpenSSL's code,
+//! [`crate::pass_count`]): L6-0001's 1.32 TB write took 5 h 22 m,
 //! of which only about 49 minutes were spent inside tape write calls. With
 //! each stage on its own thread the slowest stage sets the rate, not the sum
 //! of all three.
@@ -40,9 +43,19 @@
 //! before, so a phase never claims bytes the tape has not taken. The workers
 //! enter the caller's session ([`progress::Handle`]), so a slow staged-file
 //! read or tape block on a worker still names itself in the session log.
+//!
+//! **Watching it (issue #488).** With `TAPECTL_PIPELINE_TRACE=1` a write
+//! pool runs the pipeline trace ([`crate::pipeline_trace`]): its stages bump
+//! a few atomics per block ([`Gauges`]) and a sampler thread writes one row
+//! every 250 ms beside the session log. Off, the stages hold no gauges and
+//! do nothing extra. A `research` build can also shape the feed between the
+//! queue and the store ([`crate::research`]); no other build can.
 
 use std::io::{self, Read, Write};
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,7 +63,9 @@ use crate::pass_count::Sha256;
 use sha2::Digest;
 
 use crate::error::{Result, TapectlError};
+use crate::pipeline_trace::{self, Gauges, Role, Trace};
 use crate::progress;
+use crate::research::Shaper;
 
 /// How many bytes a pipeline may hold in flight: 256 MiB, 512 of the
 /// default 512 KiB tape blocks.
@@ -83,6 +98,19 @@ pub struct BufferPool {
     /// Buffers that exist now: in `free`, or out in a running pipeline.
     allocated: usize,
     free: Vec<Vec<u8>>,
+    /// Issue #488: what watches the pool's writes, and in a `research` build
+    /// shapes them. Decided by the first file it writes.
+    observe: Observe,
+}
+
+/// The pipeline trace, its gauges and the research shaper, for one write
+/// pool (issue #488). All `None` unless asked for.
+#[derive(Default)]
+struct Observe {
+    decided: bool,
+    gauges: Option<Arc<Gauges>>,
+    trace: Option<Trace>,
+    shaper: Option<Shaper>,
 }
 
 impl BufferPool {
@@ -94,6 +122,7 @@ impl BufferPool {
             max_buffers: max_buffers.max(2),
             allocated: 0,
             free: Vec::new(),
+            observe: Observe::default(),
         }
     }
 
@@ -130,6 +159,59 @@ impl BufferPool {
         self.free.extend(returned.try_iter());
         self.allocated = self.free.len();
     }
+
+    /// Name the staged file the next [`write_verified`] reads, for the
+    /// pipeline trace's `file` column and its staging-disk columns (issue
+    /// #488). Nothing happens unless the trace is on; the path is only
+    /// noted here, and the trace's own thread resolves it.
+    pub fn trace_source(&mut self, path: &Path) {
+        self.decide();
+        if let Some(g) = &self.observe.gauges {
+            g.set_source(path);
+        }
+    }
+
+    /// The first write through this pool decides what watches it (issue
+    /// #488): the research knobs are announced (a production build warns
+    /// about any it ignores), a `research` build's queue size and shaper
+    /// apply, and the trace starts if `TAPECTL_PIPELINE_TRACE=1` asked for
+    /// it. A trace that cannot start says why once and the write goes on.
+    fn decide(&mut self) {
+        if self.observe.decided {
+            return;
+        }
+        self.observe.decided = true;
+        crate::research::announce();
+        let knobs = crate::research::knobs();
+        if let Some(q) = knobs.queue_bytes {
+            self.max_buffers = buffers_for(q, self.chunk);
+        }
+        let traced = pipeline_trace::requested();
+        if !traced && !knobs.shapes() {
+            return;
+        }
+        let gauges = Arc::new(Gauges::default());
+        if traced {
+            let session = progress::handle();
+            match Trace::start(&session, gauges.clone(), self.capacity_bytes()) {
+                Ok(t) => self.observe.trace = Some(t),
+                Err(why) => {
+                    let line = format!(
+                        "pipeline trace: cannot start ({why}); the write goes on without it"
+                    );
+                    if session.log_path().is_some() {
+                        session.log(&line);
+                    } else {
+                        tracing::warn!("{line}");
+                    }
+                }
+            }
+        }
+        self.observe.shaper = Shaper::for_write(knobs, gauges.clone(), self.chunk as u64);
+        if self.observe.trace.is_some() || self.observe.shaper.is_some() {
+            self.observe.gauges = Some(gauges);
+        }
+    }
 }
 
 /// What travels between stages.
@@ -153,6 +235,8 @@ struct Producer<'p> {
     tx: Sender<Msg>,
     /// Time spent waiting for a free buffer: the queue full.
     waited: Duration,
+    /// The trace's gauges, on a traced write (issue #488).
+    gauges: Option<Arc<Gauges>>,
 }
 
 impl Producer<'_> {
@@ -173,9 +257,23 @@ impl Producer<'_> {
             return Some(vec![0u8; self.pool.chunk]);
         }
         let started = Instant::now();
+        if let Some(g) = &self.gauges {
+            g.reader_wait.begin(pipeline_trace::now_ns());
+        }
         let buf = self.returned.recv().ok();
         self.waited += started.elapsed();
+        if let Some(g) = &self.gauges {
+            g.reader_wait.end(pipeline_trace::now_ns());
+        }
         buf
+    }
+
+    /// Count `n` bytes into the queue's read-but-not-hashed share, BEFORE
+    /// they are sent, so the hasher never takes away what was not added.
+    fn note_read(&self, n: usize) {
+        if let Some(g) = &self.gauges {
+            g.read_unhashed.fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
 
     /// Pass `msg` downstream; `false` once there is no one to pass it to.
@@ -293,26 +391,49 @@ pub fn write_verified<R: Read + Send>(
     let (hash_tx, hash_rx) = mpsc::channel::<Msg>();
     let expected = expected_sha256.map(str::to_owned);
     let session = progress::handle();
+    // Issue #488: the trace's gauges and the research shaper, when on.
+    pool.decide();
+    let gauges = pool.observe.gauges.clone();
+    let mut shaper = pool.observe.shaper.take();
+    if let Some(g) = &gauges {
+        g.begin_file(len);
+    }
+    if let Some(sh) = shaper.as_mut() {
+        sh.begin_file(len, pool.capacity_bytes());
+    }
 
     let streamed = std::thread::scope(|s| {
         let reader = {
             let session = session.clone();
+            let gauges = gauges.clone();
             let mut producer = Producer {
                 pool: &mut *pool,
                 returned: &mut free_rx,
                 tx: read_tx,
                 waited: Duration::ZERO,
+                gauges: gauges.clone(),
             };
             spawn(s, "tapectl-stage-read", move || {
                 let _in = session.enter();
+                let _role = gauges.as_ref().map(|g| g.enter(Role::Reader));
                 read_stage(&mut producer, src, len);
                 producer.waited
             })
         };
-        let hasher = spawn(s, "tapectl-hash", move || {
-            let _in = session.enter();
-            hash_stage(read_rx, hash_tx, len, expected.as_deref())
-        });
+        let hasher = {
+            let gauges = gauges.clone();
+            spawn(s, "tapectl-hash", move || {
+                let _in = session.enter();
+                let _role = gauges.as_ref().map(|g| g.enter(Role::Hasher));
+                hash_stage(
+                    read_rx,
+                    hash_tx,
+                    len,
+                    expected.as_deref(),
+                    gauges.as_deref(),
+                )
+            })
+        };
 
         let mut pipe = PipeReader {
             rx: hash_rx,
@@ -322,6 +443,10 @@ pub fn write_verified<R: Read + Send>(
             failed: None,
             withheld: false,
             waited: Duration::ZERO,
+            gauges: gauges.clone(),
+            shaper: shaper.as_mut(),
+            taken: 0,
+            last_return: None,
         };
         let store = execute(&mut pipe);
         let (withheld, consumer_waited) = (pipe.withheld, pipe.waited);
@@ -341,6 +466,10 @@ pub fn write_verified<R: Read + Send>(
         }
     });
     pool.settle(free_rx);
+    if let Some(g) = &gauges {
+        g.end_file();
+    }
+    pool.observe.shaper = shaper;
     streamed
 }
 
@@ -364,8 +493,11 @@ fn read_stage<R: Read>(producer: &mut Producer<'_>, mut src: R, len: u64) {
                 Ok(n) => got += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    if got > 0 && !producer.send(Msg::Data(buf, got)) {
-                        return;
+                    if got > 0 {
+                        producer.note_read(got);
+                        if !producer.send(Msg::Data(buf, got)) {
+                            return;
+                        }
                     }
                     producer.send(Msg::Fail(e));
                     return;
@@ -377,6 +509,7 @@ fn read_stage<R: Read>(producer: &mut Producer<'_>, mut src: R, len: u64) {
             producer.pool.free.push(buf);
             break;
         }
+        producer.note_read(got);
         if !producer.send(Msg::Data(buf, got)) {
             return;
         }
@@ -390,26 +523,47 @@ fn read_stage<R: Read>(producer: &mut Producer<'_>, mut src: R, len: u64) {
 
 /// The hasher stage. Returns the hash of exactly `len` bytes, or `None` if
 /// the stream ended or failed short of them, or the store went away first.
+/// `gauges`: the trace's (issue #488), on a traced write.
 fn hash_stage(
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     len: u64,
     expected: Option<&str>,
+    gauges: Option<&Gauges>,
 ) -> Option<String> {
     let mut hasher = Sha256::new();
     let mut hashed = 0u64;
+    // Bytes moving from the read share of the queue to the hashed share,
+    // and the time spent hashing them.
+    let taken = |n: usize, started: Option<Instant>| {
+        if let Some(g) = gauges {
+            g.read_unhashed.fetch_sub(n as u64, Ordering::Relaxed);
+            if let Some(t) = started {
+                let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                g.hasher_busy_ns.fetch_add(ns, Ordering::Relaxed);
+            }
+        }
+    };
+    let forwarded = |n: usize| {
+        if let Some(g) = gauges {
+            g.hashed_unwritten.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    };
     loop {
         // A reader that vanished without an `End` panicked; the join re-raises it.
         let msg = rx.recv().ok()?;
         match msg {
             Msg::Data(buf, n) => {
+                let started = gauges.map(|_| Instant::now());
                 hasher.update(&buf[..n]);
                 hashed += n as u64;
                 if hashed == len {
                     // The last block: finish the hash before it goes on, so
                     // a mismatched file never reaches its filemark.
                     let actual = format!("{:x}", hasher.finalize());
+                    taken(n, started);
                     if expected == Some(actual.as_str()) {
+                        forwarded(n);
                         if tx.send(Msg::Data(buf, n)).is_ok() {
                             let _ = tx.send(Msg::End);
                         }
@@ -419,6 +573,8 @@ fn hash_stage(
                     }
                     return Some(actual);
                 }
+                taken(n, started);
+                forwarded(n);
                 if tx.send(Msg::Data(buf, n)).is_err() {
                     return None;
                 }
@@ -438,7 +594,7 @@ fn hash_stage(
 
 /// The calling thread's end of the write pipeline: the queue, read back as
 /// one ordinary `Read` for the store.
-struct PipeReader {
+struct PipeReader<'s> {
     rx: Receiver<Msg>,
     /// Where a drained buffer goes back to the reader stage.
     free: Sender<Vec<u8>>,
@@ -449,27 +605,52 @@ struct PipeReader {
     failed: Option<(io::ErrorKind, String)>,
     withheld: bool,
     waited: Duration,
+    /// Issue #488: the trace's gauges, on a traced write. This thread — the
+    /// tape's — only bumps their atomics.
+    gauges: Option<Arc<Gauges>>,
+    /// Issue #488: a `research` build's shaping; never in any other build.
+    shaper: Option<&'s mut Shaper>,
+    /// Bytes handed to the store so far in this file.
+    taken: u64,
+    /// When the last read that returned data returned: the store's time
+    /// until its next read is its time for that block (≈ `write(2)`).
+    last_return: Option<Instant>,
 }
 
-impl PipeReader {
+impl PipeReader<'_> {
     fn next(&mut self) -> Msg {
         match self.rx.try_recv() {
             Ok(msg) => msg,
             Err(TryRecvError::Disconnected) => Msg::Fail(stopped()),
             Err(TryRecvError::Empty) => {
                 let started = Instant::now();
+                if let Some(g) = &self.gauges {
+                    g.writer_wait.begin(pipeline_trace::now_ns());
+                }
                 let msg = self.rx.recv().unwrap_or_else(|_| Msg::Fail(stopped()));
                 self.waited += started.elapsed();
+                if let Some(g) = &self.gauges {
+                    let took = g.writer_wait.end(pipeline_trace::now_ns());
+                    g.writer_wait_max_ns.fetch_max(took, Ordering::Relaxed);
+                }
+                if self.taken > 0 {
+                    if let Some(sh) = self.shaper.as_deref_mut() {
+                        sh.note_starved();
+                    }
+                }
                 msg
             }
         }
     }
 }
 
-impl Read for PipeReader {
+impl Read for PipeReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
+        }
+        if let (Some(g), Some(t)) = (&self.gauges, self.last_return.take()) {
+            g.store_block.record(t.elapsed());
         }
         loop {
             if let Some((buf, len, pos)) = self.current.as_mut() {
@@ -477,8 +658,19 @@ impl Read for PipeReader {
                 out[..n].copy_from_slice(&buf[*pos..*pos + n]);
                 *pos += n;
                 if *pos == *len {
-                    let (buf, _, _) = self.current.take().expect("just drained");
+                    let (buf, len, _) = self.current.take().expect("just drained");
+                    if let Some(g) = &self.gauges {
+                        g.hashed_unwritten.fetch_sub(len as u64, Ordering::Relaxed);
+                    }
                     let _ = self.free.send(buf);
+                }
+                if let Some(sh) = self.shaper.as_deref_mut() {
+                    sh.pace(n);
+                }
+                self.taken += n as u64;
+                if let Some(g) = &self.gauges {
+                    g.written.fetch_add(n as u64, Ordering::Relaxed);
+                    self.last_return = Some(Instant::now());
                 }
                 return Ok(n);
             }
@@ -487,6 +679,9 @@ impl Read for PipeReader {
             }
             if self.ended {
                 return Ok(0);
+            }
+            if let Some(sh) = self.shaper.as_deref_mut() {
+                sh.before_take();
             }
             match self.next() {
                 Msg::Data(buf, n) if n > 0 => self.current = Some((buf, n, 0)),
@@ -560,6 +755,7 @@ pub fn read_through<T: Send>(
             returned: &mut free_rx,
             tx,
             waited: Duration::ZERO,
+            gauges: None,
         };
         let worker = spawn(s, "tapectl-tape-read", move || {
             let _in = session.enter();
@@ -1119,6 +1315,153 @@ mod tests {
             text.contains("slow: a staged read in the test took 9.0 s"),
             "{text}"
         );
+    }
+
+    // ── watching and shaping (issue #488) ──
+
+    /// With the trace off (the default) a write's pool holds no gauges and
+    /// starts nothing, and no trace file appears beside the session log.
+    #[test]
+    fn with_the_trace_off_a_write_holds_no_gauges_and_leaves_no_trace() {
+        if crate::pipeline_trace::requested() || crate::research::knobs().shapes() {
+            eprintln!("SKIP: the trace or a research knob is on in this environment");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = progress::start_session(Some(dir.path()), "t", progress::Display::Off, false);
+        let log = session.log_path().unwrap().to_path_buf();
+        let mut pool = BufferPool::new(CHUNK, 2);
+        pool.trace_source(std::path::Path::new("/nonexistent/slice"));
+        let source = pattern(100);
+        let mut mem = MemStore::new(CHUNK);
+        let streamed = write_verified(
+            &mut pool,
+            Source::new(source.clone()),
+            100,
+            Some(&sha(&source)),
+            |src| mem.execute(src, 100, false),
+        );
+        assert!(matches!(
+            streamed.verdict(Some(&sha(&source))),
+            Verdict::Written(_)
+        ));
+        assert!(
+            pool.observe.decided,
+            "positive control: the pool did decide"
+        );
+        assert!(pool.observe.gauges.is_none() && pool.observe.trace.is_none());
+        assert!(pool.observe.shaper.is_none());
+        drop(session);
+        assert!(!crate::pipeline_trace::trace_path(&log).exists());
+    }
+
+    #[cfg(feature = "research")]
+    mod shaping {
+        use super::*;
+        use crate::research::{Knobs, Refill};
+
+        /// A pool shaped by `knobs`, as a research write's would be.
+        fn shaped(knobs: &Knobs, chunk: usize, buffers: usize) -> (BufferPool, Arc<Gauges>) {
+            let mut pool = BufferPool::new(chunk, buffers);
+            let gauges = Arc::new(Gauges::default());
+            pool.observe = Observe {
+                decided: true,
+                gauges: Some(gauges.clone()),
+                trace: None,
+                shaper: Shaper::for_write(knobs, gauges.clone(), chunk as u64),
+            };
+            assert!(pool.observe.shaper.is_some());
+            (pool, gauges)
+        }
+
+        /// A fixed pace holds the store to it, and changes no byte.
+        #[test]
+        fn a_paced_write_takes_its_time_and_writes_the_same_bytes() {
+            const BLOCK: usize = 64 * 1024;
+            let knobs = Knobs {
+                pace_mbps: Some(20.0),
+                ..Knobs::default()
+            };
+            let (mut pool, gauges) = shaped(&knobs, BLOCK, 8);
+            let source = pattern(4 * 1024 * 1024);
+            let len = source.len() as u64;
+            let mut mem = MemStore::new(BLOCK);
+            let started = Instant::now();
+            let streamed = write_verified(
+                &mut pool,
+                Source::new(source.clone()),
+                len,
+                Some(&sha(&source)),
+                |src| mem.execute(src, len, false),
+            );
+            let took = started.elapsed();
+            assert!(matches!(
+                streamed.verdict(Some(&sha(&source))),
+                Verdict::Written(_)
+            ));
+            assert_eq!(&mem.files[0][..source.len()], &source[..]);
+            // 4 MiB at 20 MB/s, less the four-block burst: about 0.2 s.
+            assert!(took >= Duration::from_millis(180), "{took:?}");
+            assert!(gauges.paced_ns.load(Ordering::Relaxed) >= 150_000_000);
+            assert_eq!(
+                f64::from_bits(gauges.pace_mbps_bits.load(Ordering::Relaxed)),
+                20.0
+            );
+        }
+
+        /// A source that stalls once, mid-file: the store is starved, and a
+        /// refill pause holds it until the queue is back up; every byte is
+        /// still written. Positive control: the same write unshaped holds
+        /// nothing.
+        #[test]
+        fn a_starved_store_pauses_for_a_refill() {
+            const BLOCK: usize = 16 * 1024;
+            struct Stalls(Vec<u8>, usize, bool);
+            impl Read for Stalls {
+                fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                    if !self.2 && self.1 >= self.0.len() / 2 {
+                        self.2 = true;
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    let n = (self.0.len() - self.1).min(buf.len());
+                    buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                    self.1 += n;
+                    Ok(n)
+                }
+            }
+            let source = pattern(2 * 1024 * 1024);
+            let len = source.len() as u64;
+            let run = |knobs: &Knobs| {
+                let (mut pool, gauges) = shaped(knobs, BLOCK, 16);
+                let mut mem = MemStore::new(BLOCK);
+                let streamed = write_verified(
+                    &mut pool,
+                    Stalls(source.clone(), 0, false),
+                    len,
+                    Some(&sha(&source)),
+                    |src| mem.execute(src, len, false),
+                );
+                assert!(matches!(
+                    streamed.verdict(Some(&sha(&source))),
+                    Verdict::Written(_)
+                ));
+                assert_eq!(&mem.files[0][..source.len()], &source[..]);
+                gauges.paused_ns.load(Ordering::Relaxed)
+            };
+            let refill = Knobs {
+                refill: Some(Refill {
+                    low: 0.5,
+                    high: 0.9,
+                }),
+                ..Knobs::default()
+            };
+            assert!(run(&refill) > 0, "the starved store paused for a refill");
+            let paced_only = Knobs {
+                pace_mbps: Some(10_000.0),
+                ..Knobs::default()
+            };
+            assert_eq!(run(&paced_only), 0, "no refill knob, no pause");
+        }
     }
 
     // ── the read pipeline ──

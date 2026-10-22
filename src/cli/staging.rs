@@ -61,10 +61,11 @@ struct UnderCopiedUnit {
 }
 
 /// Every unit with at least one `'staged'` stage_set that is a release
-/// candidate under the non-force guard: at least one `writes` row exists
-/// for it and none is non-`completed` -- the EXACT eligibility guard in
-/// `staging::clean::clean_staging`'s non-force `'staged'` branch, never
-/// re-derived a second way here. Distinct by unit: a unit can have more
+/// candidate under the non-force guard: at least one `writes` row is
+/// `completed` and every other is `completed` or `cut` -- the EXACT
+/// eligibility guard in `staging::clean::clean_staging`'s non-force
+/// `'staged'` branch ([`crate::staging::clean::release_candidate_predicate_sql`]),
+/// never re-derived a second way here. Distinct by unit: a unit can have more
 /// than one such stage_set (e.g. two superseded versions, each with its
 /// own completed copy).
 ///
@@ -94,17 +95,16 @@ fn staged_release_candidate_units(
             ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
         ),
     };
+    // The guard itself, never restated (issue #96): since 1.6.0 (#420) it
+    // also reads a `cut` row as no write, which an inline copy here missed.
+    let candidate = crate::staging::clean::release_candidate_predicate_sql("ss.id");
     let sql = format!(
         "SELECT DISTINCT u.id, u.name
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
          WHERE ss.status = 'staged'
-           AND EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = ss.id)
-           AND NOT EXISTS (
-               SELECT 1 FROM writes w
-               WHERE w.stage_set_id = ss.id AND w.status <> 'completed'
-           )
+           AND {candidate}
            {filter_predicate}
          ORDER BY u.name"
     );

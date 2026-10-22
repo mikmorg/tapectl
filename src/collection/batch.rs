@@ -117,8 +117,9 @@ pub struct BatchExecutionReport {
 /// theoretical one: `copy_labels` is now always exactly one label (`collection
 /// run` refuses more, `docs/adr/0012-...md`'s 2026-09-17 amendment), so this
 /// function writes ONE copy and returns. `clean_staging`'s non-force guard
-/// only checks that no `writes` row for a stage_set is non-`completed` — it
-/// has no notion of "more copies are still coming" — so with exactly one
+/// only checks that no `writes` row for a stage_set is non-`completed` (a
+/// `cut` row, #420, counting as no write at all) — it has no notion of
+/// "more copies are still coming" — so with exactly one
 /// `completed` row it passes *vacuously*
 /// (`default_guard_cleans_when_the_only_planned_copy_completed` pins this).
 /// Calling it unconditionally here would release — and unlink — a unit's

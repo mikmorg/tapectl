@@ -224,12 +224,38 @@
 //! "tapectl 1.1.0" in `die_newer_needed`, `requires` (empty) and
 //! `KNOWN_FEATURES=""`. The MANIFEST.toml pin did not move.
 //!
+//! **RE-PINNED 2026-10-20 for tapectl 1.6.0, under ADR-0012 item 116** (the CTO
+//! pre-authorized the moves items 111-115 name, and nothing else; the bound ends
+//! when v1.6.0 is installed on home2). The previous RESTORE.sh pin was
+//! `95862b49…` (kept byte for byte as `tests/fixtures/restore_sh_1_5_0/`); this
+//! one is `d9787a4f…`. Every hunk of the diff is the short seal's reading
+//! (`volume-format-v2.md` §4.1, §4.2): `KNOWN_FEATURES="short-seal"` and
+//! "tapectl 1.6.0" in `die_newer_needed` (item 73's fixed points, moved by item
+//! 111); the seal's parse rules S1, S2 and S5; on a tape that requires
+//! short-seal, the seal read right after File 3 by spacing to the end of the data
+//! (R1), the file map trimmed to `ended_after`, NOT ON TAPE for the planned files
+//! after it under `--info` and `--verify` (R3), a cut unit refused or named and
+//! never restored (R4), `--where`/`--find` marking this tape's cut versions, and
+//! a second cartridge's seal read first under `--swap-tapes` (R5). A 1.5.0 tape
+//! reads exactly as before. The MANIFEST.toml pin moved by one line,
+//! `may_end_early = true` after `created_at` (item 111).
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
+//!
+//! **A THIRD PIN, ADDED 2026-10-20 for tapectl 1.6.0 (#420):** the short seal
+//! marker (`volume-format-v2.md` §4.1), so the format of the seal a tape ends
+//! with when the drive's early warning comes cannot drift silently. It was
+//! added as a new pin, not a re-pin: no seal was pinned before. Its
+//! `sealed_at` line is normalised as MANIFEST.toml's `created_at` is, and is
+//! the only thing allowed to vary. The same rule holds: if it fails, the
+//! on-tape format changed, which is a CTO decision.
 
 use sha2::{Digest, Sha256};
+use tapectl::volume::format;
 use tapectl::volume::layout::{
-    generate_manifest_toml, generate_restore_script_v2, ManifestSlice, ManifestUnit,
+    generate_manifest_toml, generate_restore_script_v2, generate_seal_marker,
+    generate_short_seal_marker, FrontIndexFile, ManifestSlice, ManifestUnit,
 };
 
 fn sha256_hex(s: &str) -> String {
@@ -240,7 +266,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "95862b49b0621e5970ebd91c49a353231725009e1f527c691cf98b3a116a6315";
+const RESTORE_SH_SHA256: &str = "d9787a4ffdd05ba038416696d9866a9a285fc97509c35692a18dc3a9b68f9e9d";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -386,13 +412,14 @@ fn restore_sh_bytes_are_pinned() {
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
     assert!(!script.contains("__AWK_") && !script.contains("__TOOLS_"));
-    // ADR-0012 2026-10-16 item 73: the two things the re-pin does not move.
+    // ADR-0012 item 73's two fixed points, moved once by item 111 (1.6.0):
+    // the "needs" text names 1.6.0, and short-seal is the one known feature.
     assert_eq!(
         script
-            .matches("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely")
+            .matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
             .count(),
         1,
-        "die_newer_needed still says tapectl 1.1.0"
+        "die_newer_needed says tapectl 1.6.0"
     );
     assert_eq!(
         script.matches("tapectl 1.").count(),
@@ -400,9 +427,9 @@ fn restore_sh_bytes_are_pinned() {
         "no other version named"
     );
     assert_eq!(
-        script.matches("\nKNOWN_FEATURES=\"\"\n").count(),
+        script.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(),
         1,
-        "RESTORE.sh still knows no feature a tape could require"
+        "RESTORE.sh knows short-seal and no other feature"
     );
     assert!(script.contains("LABEL=\"GOLD01\""));
     assert!(script.contains("# Total files on tape: 12"));
@@ -476,6 +503,7 @@ const MANIFEST_EXPECTED: &str = r##"[manifest]
 volume = "GOLD01"
 tenant = "alpha"
 created_at = "<normalised>"
+may_end_early = true
 
 [[units]]
 name = "photos/2019"
@@ -539,5 +567,292 @@ fn manifest_toml_bytes_are_pinned_except_created_at() {
         actual, MANIFEST_EXPECTED,
         "MANIFEST.toml bytes changed (created_at excluded). That is an on-tape format \
          change and a CTO decision; do not re-pin without one."
+    );
+}
+
+// ── the short seal (#420, `volume-format-v2.md` §4.1) ──────────────────────
+
+/// The plan the short-seal pin is cut from: GOLD01's twelve files, as the
+/// RESTORE.sh pin's volume has (File 0 to 3, two envelopes and their two
+/// backups, three data slices, the seal at 11). Sizes and hashes are fixed
+/// literals, so the pin covers the seal's generator and nothing else: File 3's
+/// own entry carries the size and hash a writer fills in at seal time, and the
+/// seal's planned entry is bare.
+fn golden_seal_plan() -> Vec<FrontIndexFile> {
+    let kinds = [
+        "id_thunk",
+        "system_guide",
+        "restore_sh",
+        "front_index",
+        "tenant_envelope",
+        "operator_envelope",
+        "operator_envelope_backup",
+        "tenant_envelope_backup",
+        "data_slice",
+        "data_slice",
+        "data_slice",
+        "seal_marker",
+    ];
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(position, &type_label)| {
+            let bare = type_label == "seal_marker";
+            FrontIndexFile {
+                position: position as i32,
+                type_label,
+                size_bytes: (!bare).then(|| 1_000 + 37 * position as u64),
+                sha256_encrypted: (!bare).then(|| format!("{:02x}", 0xa0 + position).repeat(32)),
+            }
+        })
+        .collect()
+}
+
+/// The front index's sha256 the golden seals bind (a literal: File 3's text
+/// is not this pin's subject).
+const GOLDEN_FRONT_INDEX_SHA256: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+
+/// The early warning's data slice in the golden plan: the second of three,
+/// so the short seal is at 10 and the third slice is cut.
+const GOLDEN_ENDED_AFTER: i32 = 9;
+
+/// Replace the seal's one volatile line, as [`normalise_created_at`] does
+/// MANIFEST.toml's.
+fn normalise_sealed_at(seal: &str) -> String {
+    seal.lines()
+        .map(|l| {
+            if l.starts_with("sealed_at = ") {
+                "sealed_at = \"<normalised>\"".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if seal.ends_with('\n') { "\n" } else { "" }
+}
+
+/// sha256 of [`SHORT_SEAL_EXPECTED`], the normalised short seal.
+const SHORT_SEAL_SHA256: &str = "4e126a221a1d1be7d734296d9122507810cb0719d550b309ee6277ccf18c9195";
+
+const SHORT_SEAL_EXPECTED: &str = r##"================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: GOLD01
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+volume = "GOLD01"
+layout_version = 2
+requires = ["short-seal"]
+file_count = 11
+ended_after = 9
+sealed_at = "<normalised>"
+front_index_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[files]]
+position = 0
+type = "id_thunk"
+size_bytes = 1000
+sha256_encrypted = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+
+[[files]]
+position = 1
+type = "system_guide"
+size_bytes = 1037
+sha256_encrypted = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+
+[[files]]
+position = 2
+type = "restore_sh"
+size_bytes = 1074
+sha256_encrypted = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+
+[[files]]
+position = 3
+type = "front_index"
+size_bytes = 1111
+sha256_encrypted = "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+
+[[files]]
+position = 4
+type = "tenant_envelope"
+size_bytes = 1148
+sha256_encrypted = "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+
+[[files]]
+position = 5
+type = "operator_envelope"
+size_bytes = 1185
+sha256_encrypted = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+
+[[files]]
+position = 6
+type = "operator_envelope_backup"
+size_bytes = 1222
+sha256_encrypted = "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"
+
+[[files]]
+position = 7
+type = "tenant_envelope_backup"
+size_bytes = 1259
+sha256_encrypted = "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+
+[[files]]
+position = 8
+type = "data_slice"
+size_bytes = 1296
+sha256_encrypted = "a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8"
+
+[[files]]
+position = 9
+type = "data_slice"
+size_bytes = 1333
+sha256_encrypted = "a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9"
+
+[[files]]
+position = 10
+type = "seal_marker"
+"##;
+
+/// The short seal's bytes for a fixed input (`volume-format-v2.md` §4.1): the
+/// header, the `[seal]` table in its ruled order with `requires =
+/// ["short-seal"]` and `ended_after = K` after `file_count = K+2`, and the
+/// embedded copy of entries 0 to K with the seal's own bare entry at K+1.
+/// `sealed_at` is normalised; everything else is pinned byte for byte.
+#[test]
+fn short_seal_bytes_are_pinned_except_sealed_at() {
+    let plan = golden_seal_plan();
+    let k = GOLDEN_ENDED_AFTER as usize;
+    let seal = generate_short_seal_marker(
+        "GOLD01",
+        GOLDEN_ENDED_AFTER,
+        GOLDEN_FRONT_INDEX_SHA256,
+        &plan[..=k],
+    );
+    let actual = normalise_sealed_at(&seal);
+    if SHORT_SEAL_EXPECTED == "__SHORT_SEAL__" {
+        eprintln!(
+            "CAPTURE short seal sha256 = {}\nCAPTURE short seal =\n{actual}CAPTURE end",
+            sha256_hex(&actual)
+        );
+    }
+
+    // Exactly one sealed_at line, the fixed-width RFC 3339 second
+    // (`YYYY-MM-DDTHH:MM:SSZ`, 20 bytes): the build sizes the seal with a
+    // placeholder, and a wider stamp would make the seal longer than it.
+    let stamps: Vec<&str> = seal
+        .lines()
+        .filter(|l| l.starts_with("sealed_at = "))
+        .collect();
+    assert_eq!(stamps.len(), 1, "{stamps:?}");
+    let stamp = stamps[0]
+        .trim_start_matches("sealed_at = \"")
+        .trim_end_matches('"');
+    assert_eq!(stamp.len(), 20, "{stamp}");
+    assert!(
+        stamp.ends_with('Z') && stamp.as_bytes()[10] == b'T',
+        "{stamp}"
+    );
+
+    assert_eq!(
+        actual, SHORT_SEAL_EXPECTED,
+        "the short seal's bytes changed (sealed_at excluded). That is an on-tape format \
+         change and a CTO decision; do not re-pin without one."
+    );
+    assert_eq!(
+        sha256_hex(&actual),
+        SHORT_SEAL_SHA256,
+        "the short seal's hash moved with its bytes"
+    );
+}
+
+/// What the pinned bytes must mean, so a re-pin of the text above cannot
+/// carry a seal the readers reject: it parses by rules S1-S6, states K and
+/// K+2, classifies short against the plan's twelve, its copy is File 3's
+/// entries 0 to K plus its own bare entry, its header is the full seal's word
+/// for word, and it is no longer than the full seal (the placeholder the
+/// build sizes, §4.1 "Length").
+#[test]
+fn the_pinned_short_seal_parses_short_and_fits_the_full_seals_room() {
+    let plan = golden_seal_plan();
+    let k = GOLDEN_ENDED_AFTER as usize;
+    let short = generate_short_seal_marker(
+        "GOLD01",
+        GOLDEN_ENDED_AFTER,
+        GOLDEN_FRONT_INDEX_SHA256,
+        &plan[..=k],
+    );
+    let full = generate_seal_marker(
+        "GOLD01",
+        plan.len() as i32,
+        GOLDEN_FRONT_INDEX_SHA256,
+        &plan,
+    );
+
+    let parsed = format::parse_seal_marker(&short).expect("the short seal parses (S1-S6)");
+    parsed.check_parse_rules().expect("and keeps every rule");
+    assert_eq!(parsed.volume, "GOLD01");
+    assert_eq!(parsed.layout_version, 2);
+    assert_eq!(parsed.requires, vec!["short-seal".to_string()]);
+    assert!(parsed.requires_short_seal());
+    assert_eq!(parsed.file_count, GOLDEN_ENDED_AFTER + 2, "S1");
+    assert_eq!(parsed.ended_after, Some(k as u64), "S1");
+    assert_eq!(parsed.front_index_sha256, GOLDEN_FRONT_INDEX_SHA256);
+    assert_eq!(
+        parsed.ending(plan.len() as u64),
+        format::SealEnding::Short {
+            ended_after: k as u64
+        }
+    );
+    // The copy: File 3's entries 0 to K, then the seal's own bare entry.
+    assert_eq!(parsed.files.len(), k + 2, "S4");
+    for (got, want) in parsed.files.iter().zip(&plan[..=k]) {
+        assert_eq!(got.position, want.position);
+        assert_eq!(got.type_label, want.type_label);
+        assert_eq!(got.size_bytes, want.size_bytes);
+        assert_eq!(got.sha256_encrypted, want.sha256_encrypted);
+    }
+    let own = &parsed.files[k + 1];
+    assert_eq!(
+        (own.position, own.type_label.as_str()),
+        (k as i32 + 1, "seal_marker")
+    );
+    assert_eq!(
+        (own.size_bytes, own.sha256_encrypted.as_ref()),
+        (None, None)
+    );
+    assert_eq!(
+        parsed.files[k].type_label, "data_slice",
+        "S5: it ends after a data slice"
+    );
+
+    // The full seal of the same plan: the same header, ended_after M-1.
+    let header = |s: &str| s[..s.find("[seal]").expect("a [seal] table")].to_string();
+    assert_eq!(header(&short), header(&full), "one header for both kinds");
+    let parsed_full = format::parse_seal_marker(&full).expect("the full seal parses");
+    assert_eq!(parsed_full.ended_after, Some(plan.len() as u64 - 2));
+    assert_eq!(
+        parsed_full.ending(plan.len() as u64),
+        format::SealEnding::Full
+    );
+    assert!(
+        short.len() <= full.len(),
+        "a short seal is never longer than the full seal's placeholder: {} > {}",
+        short.len(),
+        full.len()
     );
 }

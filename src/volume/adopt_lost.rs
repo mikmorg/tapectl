@@ -29,6 +29,13 @@
 //!    vouching for itself, which is why a stage set the rebuild created from
 //!    the tape (`stage_sets.origin = 'rebuilt'`) never satisfies it.
 //!
+//! **A tape that ended early** (#420; layout-session.md's condition 3): the
+//! seal is located by `volume-format-v2.md` §1.2 rule 6, the hashes are
+//! compared only at or before its `ended_after`, and a stage set with a slice
+//! after it is not whole but cut: the rebuild recorded it `cut` (and the
+//! ending on this row), adoption checks the rows say what the tape says, and
+//! records `ended_after` with the seal and promotes only the whole versions.
+//!
 //! When all three hold, [`adopt`] writes the session facts a passing confirm
 //! would have written — `status = 'sealed'`, `sealed_at`, the write
 //! bookkeeping, the snapshot promotions and a `write_completed` event — in
@@ -88,17 +95,19 @@ pub enum LostAdoption {
 
 /// Whether `volume_id` is in the state #360 is about: `initialized`, its
 /// seal never recorded, its condition `ok`, and writes rows that are all
-/// `completed` — what a rebuild attaches to a row a pre-write backup left
-/// behind. A recorded seal is #280's territory (an interrupted or aborted
-/// session of this catalog's own), and any unresolved row is a session
-/// `volume resume` continues the ordinary way, so neither is adopted here.
+/// `completed` or `cut` — what a rebuild attaches to a row a pre-write
+/// backup left behind (`cut` for a unit a tape that ended early does not
+/// hold whole, #420). A recorded seal is #280's territory (an interrupted or
+/// aborted session of this catalog's own), and any unresolved row is a
+/// session `volume resume` continues the ordinary way, so neither is adopted
+/// here.
 pub fn is_lost_write(conn: &Connection, volume_id: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT v.status = 'initialized' AND v.sealed_at IS NULL
                 AND v.observed_condition = 'ok'
                 AND EXISTS(SELECT 1 FROM writes WHERE volume_id = v.id)
                 AND NOT EXISTS(SELECT 1 FROM writes
-                               WHERE volume_id = v.id AND status <> 'completed')
+                               WHERE volume_id = v.id AND status NOT IN ('completed', 'cut'))
          FROM volumes v WHERE v.id = ?1",
         params![volume_id],
         |r| r.get(0),
@@ -150,8 +159,8 @@ pub fn adopt(
     if !is_lost_write(conn, volume_id)? {
         return Err(TapectlError::Other(format!(
             "volume \"{label}\" is not a write this catalog lost: only an `initialized` volume \
-             with no recorded seal, an `ok` condition and nothing but completed writes attached \
-             is adopted this way (ADR-0012, 2026-09-29 later)"
+             with no recorded seal, an `ok` condition and nothing but completed (or cut) writes \
+             attached is adopted this way (ADR-0012, 2026-09-29 later)"
         )));
     }
     let expected_uuid: Option<String> = conn.query_row(
@@ -207,7 +216,7 @@ pub fn adopt(
     }
 
     // Condition 3: the tape holds what this catalog staged.
-    let slices = match staged_match(conn, volume_id, &tape.entries)? {
+    let slices = match staged_match(conn, volume_id, &tape.entries, tape.ended_after)? {
         Ok(slices) => slices,
         Err(why) => return Ok(LostAdoption::NotWhatThisCatalogStaged { why }),
     };
@@ -218,18 +227,24 @@ pub fn adopt(
 
 /// What condition 1 read off the tape, once a seal marker bound it.
 struct SealedIndex {
+    /// The front index's entries: the plan, every planned file.
     entries: Vec<format::ParsedIndexEntry>,
     /// The seal marker's own `sealed_at` (RFC 3339): when the seal was
     /// written, which is the time `volumes.sealed_at` records.
     sealed_at: String,
     front_index_sha256: String,
+    /// `Some(K)` when the tape sealed short (#420): only files 0 to K are on
+    /// it (`volume-format-v2.md` §4.2).
+    ended_after: Option<u32>,
 }
 
 /// Condition 1's second half: File 0's own layout pointers name the front
-/// index and the seal marker; the seal marker parses, is one this tapectl
-/// may read, and its `front_index_sha256` is the hash of File 3's true bytes
-/// (trailing NUL padding stripped, `volume-format-v2.md` §4). `Err` names
-/// what failed, for the refusal.
+/// index and the planned seal; the seal is located by `volume-format-v2.md`
+/// §1.2 rule 6 (at that pointer, or as the last file on a tape that ended
+/// early, #420), parses, is one this tapectl may read and rule 6 accepts
+/// where it lies, and its `front_index_sha256` is the hash of File 3's true
+/// bytes (trailing NUL padding stripped, §4). `Err` names what failed, for
+/// the refusal.
 fn sealed_front_index(
     store: &mut dyn Store,
     file0: &str,
@@ -247,22 +262,18 @@ fn sealed_front_index(
     let entries = format::parse_front_index(&String::from_utf8_lossy(fi_true))
         .map_err(|e| format!("the front index (file {fi_pos}) does not parse: {e}"))?;
 
-    // The judgement is `format::judge_seal`'s, shared with `catalog rebuild`
-    // (#458): a seal this tapectl may not read, and a seal that binds
-    // nothing here, are both a seal that does not seal THIS tape, for this
-    // adoption's purposes.
-    let seal_read =
-        crate::store::read_small_bytes(store, seal_pos, "seal marker").map_err(|e| e.to_string());
-    match format::judge_seal(
-        seal_read.as_deref().map_err(String::as_str),
-        fi_true,
-        fi_pos,
-        seal_pos,
-    ) {
+    // The judgement is `rebuild::locate_and_judge_seal`'s, shared with
+    // `catalog rebuild` (#458, #420): a seal this tapectl may not read, and
+    // a seal that binds nothing here, are both a seal that does not seal
+    // THIS tape, for this adoption's purposes.
+    let located =
+        crate::volume::rebuild::locate_and_judge_seal(store, file0, fi_true, fi_pos, seal_pos);
+    match located.verdict {
         format::SealVerdict::Sealed(seal) => Ok(SealedIndex {
             entries,
             sealed_at: seal.sealed_at,
             front_index_sha256: seal.front_index_sha256,
+            ended_after: located.ended_after,
         }),
         format::SealVerdict::Unsealed(why) | format::SealVerdict::Refused(why) => Err(why),
     }
@@ -274,12 +285,22 @@ fn sealed_front_index(
 /// the catalog attached to this volume is one the front index lists; and
 /// every stage set written here is on the tape whole. `Ok(Ok(n))` is the
 /// number of slices matched; `Ok(Err(why))` names the first disagreement.
+///
+/// On a tape that ended early (#420, `ended_after = Some(K)`;
+/// layout-session.md's condition 3): the front index is the plan, so only
+/// its slices at or before K are on the tape and compared, and a stage set
+/// with a slice after K is not whole but cut. The catalog's rows must say
+/// the same — `completed` for a set wholly at or before K, `cut` for every
+/// other, as the rebuild recorded them and a passing short confirm would —
+/// and its recorded ending must be the seal's.
 fn staged_match(
     conn: &Connection,
     volume_id: i64,
     entries: &[format::ParsedIndexEntry],
+    ended_after: Option<u32>,
 ) -> Result<std::result::Result<usize, String>> {
-    let tape: Vec<(i64, Option<&str>)> = entries
+    let on_tape = |position: i64| ended_after.is_none_or(|k| position <= i64::from(k));
+    let planned: Vec<(i64, Option<&str>)> = entries
         .iter()
         .filter(|e| {
             matches!(
@@ -289,6 +310,26 @@ fn staged_match(
         })
         .map(|e| (i64::from(e.position), e.sha256_encrypted.as_deref()))
         .collect();
+
+    let recorded_ending: Option<i64> = conn.query_row(
+        "SELECT ended_after FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    let sealed_ending = ended_after.map(i64::from);
+    if recorded_ending != sealed_ending {
+        let say = |k: Option<i64>| {
+            k.map_or_else(
+                || "it sealed full".to_string(),
+                |k| format!("it ended after file {k}"),
+            )
+        };
+        return Ok(Err(format!(
+            "the catalog records that {}, but the tape's seal says {}",
+            say(recorded_ending),
+            say(sealed_ending)
+        )));
+    }
 
     let mut catalog: std::collections::BTreeMap<i64, (String, String, i64)> =
         std::collections::BTreeMap::new();
@@ -316,7 +357,8 @@ fn staged_match(
         }
     }
 
-    for (position, tape_sha) in &tape {
+    let mut matched = 0usize;
+    for (position, tape_sha) in planned.iter().filter(|(p, _)| on_tape(*p)) {
         let Some(tape_sha) = tape_sha else {
             return Ok(Err(format!(
                 "the front index records no hash for the slice at file {position}"
@@ -341,27 +383,51 @@ fn staged_match(
                  but this catalog staged {staged_sha}"
             )));
         }
+        matched += 1;
     }
     for position in catalog.keys() {
-        if !tape.iter().any(|(p, _)| p == position) {
+        if !planned.iter().any(|(p, _)| p == position) {
             return Ok(Err(format!(
                 "the catalog records a slice of this volume at file {position}, which the \
                  tape's front index does not list as a slice"
             )));
         }
     }
-    let whole: Vec<(i64, i64, i64)> = conn
+    let whole: Vec<(i64, String, i64, i64, Option<i64>)> = conn
         .prepare(
-            "SELECT w.stage_set_id,
+            "SELECT w.stage_set_id, w.status,
                     (SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = w.stage_set_id),
-                    (SELECT COUNT(*) FROM write_positions WHERE write_id = w.id)
+                    (SELECT COUNT(*) FROM write_positions WHERE write_id = w.id),
+                    (SELECT MAX(CAST(position AS INTEGER)) FROM write_positions
+                      WHERE write_id = w.id)
              FROM writes w WHERE w.volume_id = ?1 ORDER BY w.id",
         )?
         .query_map(params![volume_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (stage_set_id, staged, here) in whole {
+    for (stage_set_id, status, staged, here, last) in whole {
+        // #420: a set with a slice after the end is cut, and is not on this
+        // tape whole by definition.
+        let cut = last.is_some_and(|last| !on_tape(last));
+        match (cut, status.as_str()) {
+            (true, "cut") => continue,
+            (false, "completed") => {}
+            (true, _) => {
+                return Ok(Err(format!(
+                    "stage set {stage_set_id} is recorded `{status}`, but its slice at file {} \
+                     lies after the end of the tape (it ended after file {}): it is cut",
+                    last.unwrap_or_default(),
+                    sealed_ending.unwrap_or_default()
+                )))
+            }
+            (false, _) => {
+                return Ok(Err(format!(
+                    "stage set {stage_set_id} is recorded `{status}`, but every slice of it is \
+                     on the tape"
+                )))
+            }
+        }
         if staged != here {
             return Ok(Err(format!(
                 "stage set {stage_set_id} staged {staged} slice(s), but {here} of them are on \
@@ -369,7 +435,7 @@ fn staged_match(
             )));
         }
     }
-    Ok(Ok(tape.len()))
+    Ok(Ok(matched))
 }
 
 /// The session facts a passing confirm writes, written for an adopted lost
@@ -401,10 +467,17 @@ fn record_adoption(
         budget: CapacityBudget {
             available_bytes: 0,
             reserve_bytes: 0,
+            plan_bound_bytes: None,
         },
+        // #420: only the files at or before a short seal's `ended_after` are
+        // on the tape, and they are what the write's figures count.
         entries: tape
             .entries
             .iter()
+            .filter(|p| {
+                tape.ended_after
+                    .is_none_or(|k| i64::from(p.position) <= i64::from(k))
+            })
             .filter_map(|p| {
                 Some(LayoutEntry {
                     position: p.position,
@@ -418,10 +491,13 @@ fn record_adoption(
     };
 
     let tx = crate::db::busy::immediate_tx(conn)?;
+    // #420: `ended_after` with the seal, as a passing short confirm records
+    // it (the rebuild recorded the same; `staged_match` checked they agree).
     let sealed = tx.execute(
-        "UPDATE volumes SET status = 'sealed', sealed_at = COALESCE(?2, datetime('now'))
+        "UPDATE volumes SET status = 'sealed', sealed_at = COALESCE(?2, datetime('now')),
+                            ended_after = ?3
          WHERE id = ?1 AND status = 'initialized' AND sealed_at IS NULL",
-        params![volume_id, sealed_at],
+        params![volume_id, sealed_at, tape.ended_after],
     )?;
     if sealed != 1 {
         return Err(TapectlError::Other(format!(
@@ -429,8 +505,22 @@ fn record_adoption(
              adopted. Run the same command again."
         )));
     }
+    // Only a version this tape holds whole is promoted: a cut one's is not
+    // written yet (#420), as a passing short confirm leaves it.
     let snapshots: Vec<i64> = tx
-        .prepare("SELECT DISTINCT snapshot_id FROM writes WHERE volume_id = ?1 ORDER BY 1")?
+        .prepare(
+            "SELECT DISTINCT snapshot_id FROM writes
+              WHERE volume_id = ?1 AND status = 'completed' ORDER BY 1",
+        )?
+        .query_map(params![volume_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let cut_units: Vec<String> = tx
+        .prepare(
+            "SELECT u.name FROM writes w
+               JOIN snapshots s ON s.id = w.snapshot_id
+               JOIN units u ON u.id = s.unit_id
+              WHERE w.volume_id = ?1 AND w.status = 'cut' ORDER BY w.id",
+        )?
         .query_map(params![volume_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
@@ -451,6 +541,38 @@ fn record_adoption(
         }
     }
     crate::volume::write::record_write_bookkeeping(&tx, volume_id, &layout, block_size)?;
+    let adopted = format!(
+        "adopted by `volume resume`: a write this catalog lost (restored from a backup taken \
+         before it), sealed on the tape at {}. File 0's uuid matched, the seal marker binds \
+         front index {}, a full verify passed after the rebuild, and all {slices} slice \
+         hash(es) equal the ones this catalog staged (ADR-0012, 2026-09-29 later)",
+        tape.sealed_at, tape.front_index_sha256
+    );
+    // #420: on a tape that sealed short, the details a short write's own
+    // `write_completed` event carries, from the one function that makes them
+    // (`write::write_completed_details`: the ending, `ended_after` and the
+    // cut units by name), with the adoption's account beside them under
+    // `adopted`; on a full seal the account alone, as before 1.6.0.
+    let as_written =
+        crate::volume::write::write_completed_details(&crate::volume::session::SealedSession {
+            volume_id,
+            label: label.to_string(),
+            ending: match tape.ended_after {
+                Some(ended_after) => crate::volume::session::Ending::Short { ended_after },
+                None => crate::volume::session::Ending::Full,
+            },
+            cut_units,
+        });
+    let details = match as_written
+        .as_deref()
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+    {
+        Some(mut short) => {
+            short["adopted"] = serde_json::Value::String(adopted);
+            short.to_string()
+        }
+        None => adopted,
+    };
     events::log_event(
         &tx,
         "volume",
@@ -460,14 +582,7 @@ fn record_adoption(
         None,
         None,
         None,
-        Some(&format!(
-            "adopted by `volume resume`: a write this catalog lost (restored from a backup \
-             taken before it), sealed on the tape at {}. File 0's uuid matched, the seal \
-             marker binds front index {}, a full verify passed after the rebuild, and all \
-             {slices} slice hash(es) equal the ones this catalog staged (ADR-0012, \
-             2026-09-29 later)",
-            tape.sealed_at, tape.front_index_sha256
-        )),
+        Some(&details),
         None,
     )?;
     tx.commit()?;
@@ -941,7 +1056,8 @@ mod tests {
 
     /// `Lost`'s sealed tape on a `FakeTape`, so the head motion is recorded;
     /// File 0's `requires` line replaced by `to` (`STATED` leaves the tape as
-    /// written, and proves the fixture states `requires = []`).
+    /// written, and proves the fixture states 1.6.0's
+    /// `requires = ["short-seal"]`, ADR-0012 item 111).
     fn on_fake_tape(
         lost: &Lost,
         to: &str,
@@ -953,7 +1069,7 @@ mod tests {
         (fake, store)
     }
 
-    const STATED: &str = "\nrequires = []\n";
+    const STATED: &str = "\nrequires = [\"short-seal\"]\n";
 
     /// #476 (ADR-0012 2026-10-06 item 15): File 0 is this volume's and reads,
     /// but states a feature this tapectl does not know — a tape it cannot
@@ -1011,8 +1127,9 @@ mod tests {
         assert_refused_untouched(&lost, &verdict);
     }
 
-    /// The positive control: the same tape on the same fake, `requires = []`,
-    /// is adopted as before — and the front index and seal ARE read.
+    /// The positive control: the same tape on the same fake, requiring only
+    /// what this tapectl knows (`short-seal`), is adopted as before — and the
+    /// front index and seal ARE read.
     #[test]
     fn a_tape_that_requires_nothing_is_adopted_through_the_same_store() {
         use crate::tape::fake::Op;
@@ -1301,6 +1418,176 @@ mod tests {
         ] {
             let msg = refusal(LABEL, &v).to_string();
             assert!(msg.contains(LABEL) && msg.contains("ADR-0012"), "{msg}");
+        }
+    }
+
+    /// #420: the lost write of a tape that sealed short. The restored
+    /// catalog is the backup the shared fixture took between `volume init`
+    /// and the write; the tape ended after `bravo`'s first slice.
+    mod short_ending {
+        use super::*;
+        use crate::volume::restore::short_tape::{self, ShortTape, BS, LABEL};
+
+        struct ShortLost {
+            conn: rusqlite::Connection,
+            t: ShortTape,
+        }
+
+        fn site(operation: Operation) -> ContactSite<'static> {
+            ContactSite::new(cfg(), operation, "memstore", Medium::NoBackend)
+        }
+
+        /// Restored from the backup, rebuilt from the tape (its event aged
+        /// a minute), and read back in full.
+        fn rebuilt_and_verified() -> ShortLost {
+            let mut t = short_tape::short_tape();
+            let conn = db::open(&t.backup).unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let report = crate::volume::rebuild::rebuild_from_store(
+                &conn,
+                &mut t.store,
+                std::slice::from_ref(&t.operator),
+                Some(LABEL),
+                "recovered",
+                Some("lto0"),
+                scratch.path(),
+                "memstore",
+                site(Operation::CatalogRebuild),
+            )
+            .unwrap();
+            assert_eq!(report.ended_after, Some(u64::from(t.ended_after)));
+            assert!(
+                report.ended_after_recorded,
+                "the found row takes the tape's ending: {report:?}"
+            );
+            conn.execute(
+                "UPDATE events SET timestamp = datetime(timestamp, '-1 minute')
+                 WHERE action = 'catalog_rebuild'",
+                [],
+            )
+            .unwrap();
+            // `volume verify` reads the seal at ended_after + 1: the passing
+            // full readback condition 2 asks for is reachable on a short tape
+            // only because the rebuild recorded where it ended.
+            let r = crate::volume::write::volume_verify_with_store(
+                &conn,
+                &mut t.store,
+                LABEL,
+                t.volume_id,
+                BS as usize,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
+            ShortLost { conn, t }
+        }
+
+        #[test]
+        fn a_lost_write_that_sealed_short_is_adopted_with_its_cut_units_cut() {
+            let mut lost = rebuilt_and_verified();
+            let k = lost.t.ended_after;
+            assert!(is_lost_write(&lost.conn, lost.t.volume_id).unwrap());
+            let verdict =
+                adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap();
+            let on_tape = lost
+                .t
+                .positions
+                .iter()
+                .flat_map(|(_, p)| p.iter())
+                .filter(|p| **p <= k)
+                .count();
+            assert_eq!(verdict, LostAdoption::Adopted { slices: on_tape });
+            assert_eq!(
+                lost.t.rows(&lost.conn),
+                vec![
+                    ("alpha".into(), "completed".into(), "current".into()),
+                    ("bravo".into(), "cut".into(), "staged".into()),
+                    ("charlie".into(), "cut".into(), "staged".into()),
+                ],
+                "a cut unit's version is not promoted"
+            );
+            let (status, ended_after, files): (String, Option<i64>, i64) = lost
+                .conn
+                .query_row(
+                    "SELECT status, ended_after, num_data_files FROM volumes WHERE id = ?1",
+                    params![lost.t.volume_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
+            assert_eq!(ended_after, Some(i64::from(k)));
+            assert_eq!(
+                files, on_tape as i64,
+                "only the slices on the tape are counted"
+            );
+            let detail: String = lost
+                .conn
+                .query_row(
+                    "SELECT details FROM events WHERE action = 'write_completed'
+                      ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail["ending"], "short");
+            assert_eq!(detail["ended_after"], k);
+            assert_eq!(detail["cut_units"], serde_json::json!(["bravo", "charlie"]));
+            assert!(
+                detail["adopted"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("adopted by `volume resume`"),
+                "{detail}"
+            );
+        }
+
+        /// The catalog's rows must say what the tape says: a unit with a
+        /// slice past the end recorded `completed` is refused, as is a
+        /// recorded ending other than the seal's.
+        #[test]
+        fn a_catalog_that_disagrees_with_where_the_tape_ended_is_refused() {
+            let mut lost = rebuilt_and_verified();
+            lost.conn
+                .execute(
+                    "UPDATE writes SET status = 'completed' WHERE stage_set_id =
+                       (SELECT ss.id FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                          JOIN units u ON u.id = s.unit_id WHERE u.name = 'bravo')",
+                    [],
+                )
+                .unwrap();
+            let LostAdoption::NotWhatThisCatalogStaged { why } =
+                adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap()
+            else {
+                panic!("a completed row past the end must be refused");
+            };
+            assert!(why.contains("it is cut"), "{why}");
+
+            let mut lost = rebuilt_and_verified();
+            lost.conn
+                .execute(
+                    "UPDATE volumes SET ended_after = ended_after - 1 WHERE id = ?1",
+                    params![lost.t.volume_id],
+                )
+                .unwrap();
+            let LostAdoption::NotWhatThisCatalogStaged { why } =
+                adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap()
+            else {
+                panic!("a recorded ending other than the seal's must be refused");
+            };
+            assert!(why.contains("the tape's seal says"), "{why}");
+            assert_eq!(
+                lost.conn
+                    .query_row(
+                        "SELECT status FROM volumes WHERE id = ?1",
+                        params![lost.t.volume_id],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "initialized",
+                "nothing adopted"
+            );
         }
     }
 }

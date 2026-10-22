@@ -374,8 +374,13 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // it runs two statements a unit (the unit's copy count, and the
         // newest passing full readback of a copy): 14 + 8 a unit. Neither is
         // a full scan (the pinned scan set is unchanged); the slope moved on
-        // purpose, because the check now applies to every unit.
-        Command::Audit => (14 + 8 * LARGE, 8, &["encryption_keys", "h", "v", "w"]),
+        // purpose, because the check now applies to every unit. Then
+        // `short_seal` (#420): ONE statement for every volume, the two
+        // invariants of a short-sealed volume's rows (`cut` only where
+        // `ended_after` is set; no `completed` slice past it), joined from
+        // the volumes to their writes and positions by index, so no new full
+        // scan: 15 + 8 a unit.
+        Command::Audit => (15 + 8 * LARGE, 8, &["encryption_keys", "h", "v", "w"]),
         // Per unit by design today: the unit list, then for each unit
         // under the root its policy (`policy::resolve`) and its copy count
         // — three statements a unit.

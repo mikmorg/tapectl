@@ -691,6 +691,21 @@ hash or the drive. Read them together:
 - `tape waited` high and `queue full` near zero: reading the staged file set
   the pace — the staging disk is the limit.
 
+For a closer look than one line per file, set `TAPECTL_PIPELINE_TRACE=1` for
+the command. The write then also writes `<session>.pipeline.tsv` beside its
+session log: one tab-separated row every 250 ms, under a header naming each
+column. A row holds the bytes written, the queue split into read-but-unhashed
+and hashed-but-unwritten, the drive's time per block, the waits on either side
+of the queue, and each pipeline thread's CPU time, run delay and CPU. It also
+holds the host's CPU shares and run delay, the staging disks' busy share and
+latency, the load average and the process's swap. The column list and what
+each means is `tapectl::pipeline_trace::COLUMNS` (and
+`docs/research/2026-10-20-write-shaping.md` §9). Watching changes nothing the
+write does; it is off unless asked for, and a trace that cannot start says so
+once in the session log and the write goes on. Until the write session names
+each staged file to it, the trace's `file` column numbers the files (`#1`,
+`#2`, ...) and its disk columns are empty.
+
 The durations are kept in the catalog too. `volume info` ends with the phase
 timings of the last session recorded against the volume (write, resume,
 verify, read or restore):
@@ -1141,7 +1156,14 @@ The write itself needs no supervision once it is streaming; the drive's
 counters afterwards say whether the feed held: `tapectl volume info <label>`
 shows each write's feed ratio (native tape bytes per data byte sent, judged
 against 1.05), and `tapectl report health` lists every recorded write, the
-uneven feeds first.
+uneven feeds first. On an HP drive each line also gives the drive's own wear
+count, `repositions per 100 MB` (its log page 0x34: "tape direction changes per
+100 MB written. The higher the figure the more wear occurs"), and `tapectl report
+events` shows it on the `write_feed_ratio` line. A write recorded before the figure
+was kept still has the page's raw bytes in the catalog, so it is decoded for those too. The
+drive reads it after the whole command, the confirm's rewinds included; it is
+not yet known whether it averages since the cartridge was loaded or over the
+last stretch written (`docs/research/2026-10-20-write-shaping.md` §6).
 
 ### Check what's pending
 

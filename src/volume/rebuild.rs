@@ -44,6 +44,14 @@
 //! nothing counts it as a copy. A seal this tapectl must not interpret (an
 //! unknown `requires`) refuses the rebuild instead.
 //!
+//! **A tape that ended early is read by its seal** (#420; `volume-format-v2.md`
+//! §1.2 rule 6, §4.2). The seal is located as the last file when the medium
+//! ends before File 0's pointer ([`locate_and_judge_seal`]), and a short seal
+//! is accepted only on a tape that requires `short-seal`. Its `ended_after`
+//! K is recorded on an inserted volume row, a unit with every slice at or
+//! before K is `completed`, every other is `cut`, positions after K are
+//! `pending`, and nothing after K is read. A full seal rebuilds as before.
+//!
 //! **It inserts only what is missing, and never edits what it finds.** Run it
 //! over ten cartridges in any order, twice, and the result is the same
 //! catalog. This is what makes a rebuild safe to run against a catalog that
@@ -229,6 +237,32 @@ pub struct RebuildReport {
     /// never edited (#158), so this is how an unsealed tape under a row the
     /// catalog holds as `sealed` is told apart from one under `initialized`.
     pub found_volume_status: Option<String>,
+
+    // --- where the tape ended (#420, `volume-format-v2.md` §4.2) -------------
+    //
+    // A 1.6.0 tape may end early, at a short seal; the seal is found by §1.2
+    // rule 6 and trusted over the plan.
+    /// `Some(K)` when the tape sealed SHORT, its seal at K+1 stating
+    /// `ended_after = K`: every planned position after K is not on it. `None`
+    /// for a full seal, and for an unsealed tape. An inserted row records it
+    /// as `volumes.ended_after`.
+    pub ended_after: Option<u64>,
+    /// Units, as `<unit> v<N>`, that the early end of the tape cut: a slice
+    /// of theirs is planned after [`Self::ended_after`]. Their writes are
+    /// `cut` (ADR-0012 item 112): never a copy, positions after the end not
+    /// `written`. A tape fact, listed whether or not this run inserted rows.
+    pub cut_units: Vec<String>,
+    /// Set when this label already had a row whose `ended_after` disagrees
+    /// with the seal's (`"none"` when the row records a full seal or no seal
+    /// and the tape is short, or the row's K otherwise). Report-only (#158):
+    /// a row whose seal this catalog recorded keeps its own.
+    pub volume_ended_after_mismatch: Option<String>,
+    /// True when this run recorded the tape's `ended_after` on a row it FOUND
+    /// with no seal recorded and no ending (`sealed_at` and `ended_after`
+    /// NULL; the #360 lost write): not a status (#158 stands) but the fact
+    /// `volume verify` needs to find that tape's seal, and the one
+    /// layout-session.md has a rebuild record "from the seal it located".
+    pub ended_after_recorded: bool,
 
     // --- cartridge identity (issue #165) -----------------------------------
     //
@@ -443,6 +477,7 @@ impl RebuildReport {
             && !self.cartridge_registered
             && !self.cartridge_bound
             && !self.serial_learned
+            && !self.ended_after_recorded
             && self.displaced.is_empty()
     }
 }
@@ -700,13 +735,19 @@ fn rebuild_contacted(
     // and after the envelopes (the seal marker is the last file, so reading
     // it earlier would pass the head over the slices twice; `volume::
     // cost_budget` pins the motion). The same read dates the tape (#305).
-    let seal = read_seal(store, &pointers, &fi, &ident.label);
+    // #420: located by `volume-format-v2.md` §1.2 rule 6, so a tape that
+    // ended early is read as sealed at its short seal, with `ended_after`.
+    let LocatedSeal {
+        verdict: seal,
+        ended_after,
+        ..
+    } = read_seal(store, &pointers, &thunk_text, &fi, &ident.label);
     if let format::SealVerdict::Refused(why) = &seal {
         // Before the transaction, as every other reader of a tape refuses
         // one it must not interpret (`volume-format-v2.md` §1.2 rule 1).
         return Err(TapectlError::Other(why.clone()));
     }
-    let dates = tape_dates(&thunk_text, &entries, &seal);
+    let dates = tape_dates(&thunk_text, &entries, &seal, ended_after);
     let unsealed_reason = match &seal {
         format::SealVerdict::Unsealed(why) => Some(why.clone()),
         _ => None,
@@ -738,6 +779,7 @@ fn rebuild_contacted(
         sealed_at: dates.sealed_at.clone(),
         load_count_at_write: dates.load_count_at_write,
         unsealed_reason,
+        ended_after: ended_after.map(u64::from),
         ..Default::default()
     };
 
@@ -828,10 +870,14 @@ fn rebuild_contacted(
     let attested = attest_escrow(conn, store, identities, &operator.manifest, &mut report);
 
     let tx = crate::db::busy::immediate_tx(conn)?;
+    // A `cut` set (#420) is not counted: it is no copy on this tape, and its
+    // slice header may lie past where the tape ended, so attestation from
+    // this tape is not the remedy for it.
     report.unknown_remaining = tx.query_row(
         "SELECT COUNT(*) FROM stage_sets ss
          JOIN writes w ON w.stage_set_id = ss.id
-         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL",
+         WHERE w.volume_id = ?1 AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
+           AND w.status <> 'cut'",
         params![volume_id],
         |r| r.get(0),
     )?;
@@ -1014,6 +1060,14 @@ fn attest_escrow(
     // forward (issue #389: `TapeStore` spaces forward to a file ahead of the
     // head and rewinds for one behind it). The manifest lists units in the
     // order they were laid out, so this is normally that order already.
+    //
+    // #420 (`volume-format-v2.md` §4.2 R3): on a tape that ended early no
+    // position after `ended_after` is read. A unit whose first slice lies
+    // past it is not on this tape at all, and stays unknown here.
+    let ended_after = report.ended_after;
+    let on_tape = |s: &envelope::ManifestSlice| {
+        ended_after.is_none_or(|k| u64::try_from(s.tape_position).is_ok_and(|p| p <= k))
+    };
     let mut firsts: Vec<(&envelope::ManifestUnit, &envelope::ManifestSlice)> = manifest
         .units
         .iter()
@@ -1021,6 +1075,7 @@ fn attest_escrow(
             unit.slices
                 .iter()
                 .min_by_key(|s| s.number)
+                .filter(|first| on_tape(first))
                 .map(|first| (unit, first))
         })
         .collect();
@@ -1512,43 +1567,220 @@ struct TapeDates {
     data_files: i64,
 }
 
-/// Read the seal marker (issue #458): the one small read at the position File
-/// 0's `[layout]` names, judged by [`format::judge_seal`] against the front
-/// index already in hand (`fi`, as read, block padding included).
+/// What `volume-format-v2.md` §1.2 rule 6 found at the end of a tape and
+/// accepts as its seal, judged against the front index beside it (#420): the
+/// one judgement `catalog rebuild`, the adoption of a lost write
+/// ([`crate::volume::adopt_lost`]) and `restore raw-volume` share, so the
+/// three can never disagree about where a tape ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocatedSeal {
+    /// [`format::SealVerdict::Sealed`] only for a seal rule 6 accepts where
+    /// it was found and that binds the front index.
+    pub verdict: format::SealVerdict,
+    /// Where the seal was read: the planned position, or the last file on a
+    /// medium that ends before it. `None` when no file was there at all.
+    pub position: Option<u32>,
+    /// `Some(K)` for an accepted SHORT seal at K+1 (§4.1): every planned
+    /// position after K is not on the tape (§4.2). `None` for a full seal,
+    /// and for no seal.
+    pub ended_after: Option<u32>,
+}
+
+impl LocatedSeal {
+    fn unsealed(position: Option<u32>, why: String) -> Self {
+        Self {
+            verdict: format::SealVerdict::Unsealed(why),
+            position,
+            ended_after: None,
+        }
+    }
+}
+
+/// Find the seal by `volume-format-v2.md` §1.2 rule 6 ([`crate::store::
+/// locate_seal`]: at `planned`, File 0's `[layout] seal_marker`, or, on a
+/// medium that ends before it, the last file), judge it against the front
+/// index (`front_index` = File 3's true bytes, at `front_index_position`) by
+/// [`format::judge_seal`], and accept it as rule 6 does:
+///
+/// - **at the planned position**, a seal whose `file_count` is the plan's
+///   (`planned + 1`): the full seal (§4.1 "Classification");
+/// - **before it**, only on a tape that requires `short-seal` (File 0's
+///   `requires`; the seal's own when File 0's claims do not parse), a seal
+///   that itself requires it, keeps §4.1's parse rules (it parsed) and states
+///   `file_count = N` for the N files on the medium. Its `ended_after` is K.
+///
+/// Anything else is [`format::SealVerdict::Unsealed`], naming why: a reader
+/// of a catalog row only ever records a tape sealed on a seal it accepts. A
+/// seal this tapectl must not interpret is [`format::SealVerdict::Refused`]
+/// wherever it is (§1.2 rule 1: refused by name, never misread). A read that
+/// fails is unsealed here, as it was before 1.6.0: neither caller verifies a
+/// tape, and an unsealed reading records no copy (#458).
+pub(crate) fn locate_and_judge_seal(
+    store: &mut dyn Store,
+    file0: &str,
+    front_index: &[u8],
+    front_index_position: u32,
+    planned: u32,
+) -> LocatedSeal {
+    let (position, bytes) = match crate::store::locate_seal(store, planned) {
+        crate::store::SealLocation::File { position, bytes } => (position, bytes),
+        crate::store::SealLocation::Oversized { position } => {
+            return LocatedSeal::unsealed(
+                Some(position),
+                format!(
+                    "file {position}, where the seal marker would be, is larger than any seal \
+                     marker, so it is not one"
+                ),
+            )
+        }
+        crate::store::SealLocation::Absent => {
+            return LocatedSeal::unsealed(
+                None,
+                format!(
+                    "no seal marker reads at file {planned}, where File 0 says it is: the \
+                     medium holds no file at all"
+                ),
+            )
+        }
+        crate::store::SealLocation::Unreadable { position, error } => {
+            return LocatedSeal::unsealed(
+                Some(position),
+                format!("no seal marker reads at file {position}: {error}"),
+            )
+        }
+    };
+    let seal = match format::judge_seal(Ok(&bytes), front_index, front_index_position, position) {
+        format::SealVerdict::Sealed(seal) => seal,
+        verdict => {
+            return LocatedSeal {
+                verdict,
+                position: Some(position),
+                ended_after: None,
+            }
+        }
+    };
+    let planned_count = u64::from(planned) + 1;
+    if position >= planned {
+        // The planned position: only the full seal (rule 6). A 1.6.0 seal
+        // states its own position (`file_count - 1`, rule S1), so one found
+        // here that states another is the tape's two ends disagreeing.
+        return match seal.ending(planned_count) {
+            format::SealEnding::Full => LocatedSeal {
+                verdict: format::SealVerdict::Sealed(seal),
+                position: Some(position),
+                ended_after: None,
+            },
+            _ => LocatedSeal::unsealed(
+                Some(position),
+                format!(
+                    "the seal marker at file {position} states file_count = {}, but the plan \
+                     (File 0) has {planned_count} files with the seal last: the tape's two ends \
+                     disagree",
+                    seal.file_count
+                ),
+            ),
+        };
+    }
+    // Before the planned position: the short seal, on a tape that says it may
+    // end early, and only one that says the same and counts the medium.
+    let tape_requires_short_seal = match format::parse_id_thunk_claims(file0) {
+        Ok(claims) => claims.requires.iter().any(|f| f == format::SHORT_SEAL),
+        Err(_) => seal.requires_short_seal(),
+    };
+    if !tape_requires_short_seal {
+        return LocatedSeal::unsealed(
+            Some(position),
+            format!(
+                "the tape ends at file {position}, before the seal marker File 0 plans at file \
+                 {planned}, and File 0 does not require \"{}\": a tape that does not say it may \
+                 end early has no seal there",
+                format::SHORT_SEAL
+            ),
+        );
+    }
+    if !seal.requires_short_seal() || i64::from(seal.file_count) != i64::from(position) + 1 {
+        return LocatedSeal::unsealed(
+            Some(position),
+            format!(
+                "the last file on the tape (file {position}) is a seal marker that does not seal \
+                 a tape ending there (it states file_count = {}{}), so it is no short seal \
+                 (volume-format-v2.md §1.2 rule 6)",
+                seal.file_count,
+                if seal.requires_short_seal() {
+                    String::new()
+                } else {
+                    format!(" and does not require \"{}\"", format::SHORT_SEAL)
+                }
+            ),
+        );
+    }
+    match seal.ending(planned_count) {
+        format::SealEnding::Short { ended_after } => match u32::try_from(ended_after) {
+            Ok(k) if k.checked_add(1) == Some(position) => LocatedSeal {
+                verdict: format::SealVerdict::Sealed(seal),
+                position: Some(position),
+                ended_after: Some(k),
+            },
+            _ => LocatedSeal::unsealed(
+                Some(position),
+                format!(
+                    "the seal marker at file {position} states ended_after = {ended_after}, \
+                     which is not the file before it"
+                ),
+            ),
+        },
+        _ => LocatedSeal::unsealed(
+            Some(position),
+            format!(
+                "the seal marker at file {position} states file_count = {}, which the plan \
+                 (File 0, {planned_count} files) does not end short at",
+                seal.file_count
+            ),
+        ),
+    }
+}
+
+/// Read the seal marker (issue #458): located by `volume-format-v2.md` §1.2
+/// rule 6 from File 0's `[layout]` pointer, and judged by
+/// [`locate_and_judge_seal`] against the front index already in hand (`fi`,
+/// as read, block padding included).
 ///
 /// Every failure to read or to bind is [`format::SealVerdict::Unsealed`]: a
 /// rebuild does not verify the tape (module doc), and a tape with no
 /// readable seal marker is an unsealed one. A seal marker that names
 /// another volume is not this tape's seal either. Only a seal this tapectl
-/// must not interpret is [`format::SealVerdict::Refused`].
+/// must not interpret is [`format::SealVerdict::Refused`]. A short seal
+/// (#420) comes back with its `ended_after`.
 fn read_seal(
     store: &mut dyn Store,
     pointers: &format::IdThunkLayoutPointers,
+    thunk_text: &str,
     fi: &[u8],
     label: &str,
-) -> format::SealVerdict {
-    let Ok(seal_position) = u32::try_from(pointers.seal_marker) else {
-        return format::SealVerdict::Unsealed(format!(
-            "File 0 names seal marker position {}",
-            pointers.seal_marker
-        ));
+) -> LocatedSeal {
+    let Ok(planned) = u32::try_from(pointers.seal_marker) else {
+        return LocatedSeal::unsealed(
+            None,
+            format!("File 0 names seal marker position {}", pointers.seal_marker),
+        );
     };
-    let seal_read = crate::store::read_small_bytes(store, seal_position, "seal marker")
-        .map_err(|e| e.to_string());
-    match format::judge_seal(
-        seal_read.as_deref().map_err(String::as_str),
+    let located = locate_and_judge_seal(
+        store,
+        thunk_text,
         format::without_nul_padding(fi),
         pointers.front_index as u32,
-        seal_position,
-    ) {
-        format::SealVerdict::Sealed(seal) if seal.volume != label => {
-            format::SealVerdict::Unsealed(format!(
-                "the seal marker at file {seal_position} names volume \"{}\", not this \
-                 tape's \"{label}\"",
+        planned,
+    );
+    match located.verdict {
+        format::SealVerdict::Sealed(seal) if seal.volume != label => LocatedSeal::unsealed(
+            located.position,
+            format!(
+                "the seal marker at file {} names volume \"{}\", not this tape's \"{label}\"",
+                located.position.unwrap_or(planned),
                 seal.volume
-            ))
-        }
-        verdict => verdict,
+            ),
+        ),
+        _ => located,
     }
 }
 
@@ -1561,6 +1793,9 @@ fn tape_dates(
     thunk_text: &str,
     entries: &[format::ParsedIndexEntry],
     seal: &format::SealVerdict,
+    // #420: a short seal's `ended_after`; the slices after it are not on
+    // the tape, so they are not its data files.
+    ended_after: Option<u32>,
 ) -> TapeDates {
     let provenance = format::parse_id_thunk_provenance(thunk_text).unwrap_or_default();
     let sealed_at = match seal {
@@ -1580,7 +1815,7 @@ fn tape_dates(
                 matches!(
                     crate::volume::layout_model::ZoneKind::from_type_label(&e.type_label),
                     Some(crate::volume::layout_model::ZoneKind::Slice { .. })
-                )
+                ) && ended_after.is_none_or(|k| i64::from(e.position) <= i64::from(k))
             })
             .count() as i64,
     }
@@ -1619,23 +1854,56 @@ fn insert_all(
     // would put a backend in the catalog that no config declares.
     let backend_name = backend_name.unwrap_or("lto");
     #[allow(clippy::type_complexity)]
-    let existing: Option<(i64, String, String, Option<String>)> = tx
+    let existing: Option<(i64, String, String, Option<String>, Option<i64>)> = tx
         .query_row(
-            "SELECT id, status, observed_condition, sealed_at FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition, sealed_at, ended_after
+             FROM volumes WHERE label = ?1",
             params![label],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
     // Issue #458: what this run read of the seal. Everything it inserts below
     // is `sealed`/`completed` only on a seal that bound the front index.
     let sealed = report.unsealed_reason.is_none();
+    // #420: where a sealed tape ended. `None` is a full seal (or no seal).
+    let ended_after: Option<i64> = report
+        .ended_after
+        .filter(|_| sealed)
+        .and_then(|k| i64::try_from(k).ok());
     let volume_id = match existing {
-        Some((id, status, condition, recorded_sealed_at)) => {
+        Some((id, status, condition, recorded_sealed_at, recorded_ended_after)) => {
             report.found_volume_status = Some(status.clone());
             // Issue #305: the third report-only fact. Never edited (#158).
             if let (Some(recorded), Some(tape)) = (&recorded_sealed_at, &dates.sealed_at) {
                 if !sealed_at_agrees(recorded, tape) {
                     report.volume_sealed_at_mismatch = Some(recorded.clone());
+                }
+            }
+            // #420: where the tape ended. A row with no seal recorded and no
+            // ending of its own (the #360 lost write: `initialized`, its
+            // seal never recorded) takes the tape's: `volume verify` reads
+            // the seal at `ended_after + 1` (§1.2 rule 6, §5), and without
+            // it the verify `volume resume`'s adoption needs could never
+            // pass. That is a fact about the tape, not a status (#158). A
+            // row that recorded its seal keeps its own ending, reported when
+            // it disagrees.
+            if sealed {
+                match (recorded_sealed_at.is_some(), recorded_ended_after) {
+                    (false, None) => {
+                        if let Some(k) = ended_after {
+                            tx.execute(
+                                "UPDATE volumes SET ended_after = ?2
+                                 WHERE id = ?1 AND sealed_at IS NULL AND ended_after IS NULL",
+                                params![id, k],
+                            )?;
+                            report.ended_after_recorded = true;
+                        }
+                    }
+                    (_, recorded) if recorded != ended_after => {
+                        report.volume_ended_after_mismatch =
+                            Some(recorded.map_or_else(|| "none".to_string(), |k| k.to_string()));
+                    }
+                    _ => {}
                 }
             }
             // Same tape, same evidence — but a row this rebuild merely
@@ -1680,13 +1948,17 @@ fn insert_all(
             // shape for an aborted write: `initialized`, no seal recorded,
             // no data file proven (`num_data_files` 0 — the front index
             // lists the plan, not what was laid down).
+            //
+            // #420: a short seal's `ended_after` is recorded with the seal
+            // (migration 038), and `num_data_files` counts only the slices
+            // at or before it ([`tape_dates`]).
             tx.execute(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
                                       capacity_bytes, mam_capacity_bytes, has_manifest, status,
                                       created_at, first_write, sealed_at, last_write,
-                                      num_data_files)
+                                      num_data_files, ended_after)
                  VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, ?10,
-                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9)",
+                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9, ?11)",
                 params![
                     label,
                     uuid,
@@ -1698,6 +1970,7 @@ fn insert_all(
                     dates.sealed_at,
                     if sealed { dates.data_files } else { 0 },
                     if sealed { "sealed" } else { "initialized" },
+                    ended_after,
                 ],
             )?;
             report.volume_inserted = true;
@@ -1733,9 +2006,26 @@ fn insert_all(
             slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
-        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, sealed, report)?;
+        // #420 (`volume-format-v2.md` §4.2; layout-session.md "Later
+        // contacts"): on a short tape a unit is on it whole only when every
+        // slice lies at or before `ended_after`, as a passing short confirm
+        // splits the rows; every other unit is cut.
+        let on_tape =
+            |s: &envelope::ManifestSlice| ended_after.is_none_or(|k| s.tape_position <= k);
+        let written = if !sealed {
+            Written::Aborted
+        } else if unit.slices.iter().all(on_tape) {
+            Written::Completed
+        } else {
+            report
+                .cut_units
+                .push(format!("{} v{}", unit.name, unit.snapshot_version));
+            Written::Cut
+        };
+        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
         for (slice, slice_id) in slice_ids {
-            ensure_position(tx, write_id, slice_id, slice, sealed, report)?;
+            let laid_down = sealed && on_tape(slice);
+            ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
         }
 
         ensure_files(tx, unit, snapshot_id, supplement, report)?;
@@ -2223,12 +2513,23 @@ fn ensure_slice(
     Ok(tx.last_insert_rowid())
 }
 
+/// What a rebuilt `writes` row records of one unit's write on the tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// The tape is sealed and holds the unit whole: `completed`.
+    Completed,
+    /// The tape sealed short before the unit's last slice (#420): `cut`.
+    Cut,
+    /// No seal marker sealed the tape (#458): `aborted`.
+    Aborted,
+}
+
 fn ensure_write(
     tx: &Connection,
     stage_set_id: i64,
     snapshot_id: i64,
     volume_id: i64,
-    sealed: bool,
+    written: Written,
     report: &mut RebuildReport,
 ) -> Result<i64> {
     if let Some(id) = existing_id(
@@ -2247,33 +2548,44 @@ fn ensure_write(
     // gets the status of a write that did not finish: `aborted`, with no
     // completion time. `docs/design/layout-session.md`: an aborted session's
     // tape "is not a copy".
+    //
+    // #420 (ADR-0012 item 112): a unit the early end of a sealed tape cut is
+    // `cut`, as a passing short confirm records it: never a copy, and with
+    // no completion time either.
+    let (status, notes) = match written {
+        Written::Completed => (
+            "completed",
+            "rebuilt from the volume itself; never verified by a read-back",
+        ),
+        Written::Cut => (
+            "cut",
+            "rebuilt from the volume itself; the tape sealed short, ending before this unit's \
+             last slice, so the write is recorded as cut and is not a copy",
+        ),
+        Written::Aborted => (
+            "aborted",
+            "rebuilt from the volume itself; the tape carries no valid seal marker, so the \
+             write is recorded as aborted and is not a copy",
+        ),
+    };
     tx.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
                              completed_at, notes)
          VALUES (?1, ?2, ?3, ?4, 0, CASE WHEN ?4 = 'completed' THEN datetime('now') END, ?5)",
-        params![
-            stage_set_id,
-            snapshot_id,
-            volume_id,
-            if sealed { "completed" } else { "aborted" },
-            if sealed {
-                "rebuilt from the volume itself; never verified by a read-back"
-            } else {
-                "rebuilt from the volume itself; the tape carries no valid seal marker, so \
-                 the write is recorded as aborted and is not a copy"
-            },
-        ],
+        params![stage_set_id, snapshot_id, volume_id, status, notes],
     )?;
     report.writes += 1;
     Ok(tx.last_insert_rowid())
 }
 
+/// `laid_down`: the slice is on the tape — the tape is sealed and, on a
+/// short tape (#420), the slice lies at or before `ended_after`.
 fn ensure_position(
     tx: &Connection,
     write_id: i64,
     stage_slice_id: i64,
     slice: &envelope::ManifestSlice,
-    sealed: bool,
+    laid_down: bool,
     report: &mut RebuildReport,
 ) -> Result<()> {
     if existing_id(
@@ -2293,8 +2605,10 @@ fn ensure_position(
     // (the seal marker's presence means every file before it is present).
     // On an unsealed one the manifest and the front index are the PLAN —
     // envelopes precede the slices — so the position is recorded `pending`,
-    // with nothing measured on the volume, not `written`.
-    if sealed {
+    // with nothing measured on the volume, not `written`. So is a position
+    // after a short seal's `ended_after` (#420, §4.2): not on this tape,
+    // `pending` as the session that wrote the tape left it.
+    if laid_down {
         tx.execute(
             "INSERT INTO write_positions (write_id, stage_slice_id, position, status, written_at,
                                           sha256_on_volume)
@@ -2427,7 +2741,24 @@ fn record_event(
     // Issue #458: the claim the rows make, in the ledger. A rebuild that
     // asserted `sealed` says it read a seal; one that did not says so.
     let seal_clause = match &report.unsealed_reason {
-        None => String::new(),
+        // #420: a short seal is a seal; the ledger says where the tape ended
+        // and which units it cut.
+        None => match report.ended_after {
+            None => String::new(),
+            Some(k) => format!(
+                "; SEALED SHORT after file {k}{}{}",
+                if report.cut_units.is_empty() {
+                    String::new()
+                } else {
+                    format!(": cut (not a copy here) {}", report.cut_units.join(", "))
+                },
+                if report.ended_after_recorded {
+                    "; ended_after recorded on the existing volume row"
+                } else {
+                    ""
+                }
+            ),
+        },
         Some(why) => format!(
             "; NO VALID SEAL MARKER ({why}): {} — not a copy",
             if report.volume_inserted {
@@ -3529,5 +3860,286 @@ mod tests {
             !report.cartridge_registered,
             "an ambiguous claim must never auto-register a third row: {err}"
         );
+    }
+
+    /// #420: `catalog rebuild --from-volume` of a tape that ended early,
+    /// against the write that made it (`volume::restore::short_tape`).
+    mod short_ending {
+        use super::*;
+        use crate::store::{MemStore, Store};
+        use crate::tape::contact::{ContactSite, Medium, Operation};
+        use crate::volume::restore::short_tape::{self, ShortTape, LABEL};
+
+        fn cfg() -> &'static crate::config::Config {
+            static CFG: std::sync::OnceLock<crate::config::Config> = std::sync::OnceLock::new();
+            CFG.get_or_init(crate::config::Config::default)
+        }
+
+        fn rebuild_into(conn: &Connection, t: &mut ShortTape) -> RebuildReport {
+            let scratch = tempfile::tempdir().unwrap();
+            rebuild_from_store(
+                conn,
+                &mut t.store,
+                std::slice::from_ref(&t.operator),
+                Some(LABEL),
+                "recovered",
+                Some("lto0"),
+                scratch.path(),
+                "memstore",
+                ContactSite::new(
+                    cfg(),
+                    Operation::CatalogRebuild,
+                    "memstore",
+                    Medium::NoBackend,
+                ),
+            )
+            .unwrap()
+        }
+
+        /// `(unit, writes.status)` and every `(unit, position, status)` of
+        /// the volume's writes, in a stable order.
+        #[allow(clippy::type_complexity)]
+        fn rows_and_positions(
+            conn: &Connection,
+        ) -> (Vec<(String, String)>, Vec<(String, i64, String)>) {
+            let writes = conn
+                .prepare(
+                    "SELECT u.name, w.status FROM writes w
+                       JOIN snapshots s ON s.id = w.snapshot_id
+                       JOIN units u ON u.id = s.unit_id
+                       JOIN volumes v ON v.id = w.volume_id
+                      WHERE v.label = ?1 ORDER BY u.name",
+                )
+                .unwrap()
+                .query_map(params![LABEL], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let positions = conn
+                .prepare(
+                    "SELECT u.name, CAST(wp.position AS INTEGER), wp.status
+                       FROM write_positions wp
+                       JOIN writes w ON w.id = wp.write_id
+                       JOIN snapshots s ON s.id = w.snapshot_id
+                       JOIN units u ON u.id = s.unit_id
+                       JOIN volumes v ON v.id = w.volume_id
+                      WHERE v.label = ?1 ORDER BY 2",
+                )
+                .unwrap()
+                .query_map(params![LABEL], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            (writes, positions)
+        }
+
+        fn volume_ending(conn: &Connection) -> (String, Option<i64>, i64) {
+            conn.query_row(
+                "SELECT status, ended_after, num_data_files FROM volumes WHERE label = ?1",
+                params![LABEL],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        }
+
+        /// THE pin: a rebuild of a short tape gives the rows the write that
+        /// made it gave — each unit `completed` or `cut` alike, the same
+        /// positions `written` (at or before K) and `pending` (after it),
+        /// and the same `ended_after` — so the catalog says the same thing
+        /// about the tape whether it wrote it or read it back
+        /// (layout-session.md "Later contacts").
+        #[test]
+        fn a_rebuild_of_a_short_tape_gives_the_rows_the_write_gave() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            let fresh = crate::db::open_memory().unwrap();
+            let report = rebuild_into(&fresh, &mut t);
+
+            assert_eq!(report.unsealed_reason, None, "a short seal is a seal");
+            assert_eq!(report.ended_after, Some(u64::from(k)));
+            assert_eq!(report.cut_units, vec!["bravo v1", "charlie v1"]);
+            assert!(report.volume_inserted);
+
+            let written = rows_and_positions(&t.conn);
+            let rebuilt = rows_and_positions(&fresh);
+            assert_eq!(
+                rebuilt.0,
+                vec![
+                    ("alpha".to_string(), "completed".to_string()),
+                    ("bravo".to_string(), "cut".to_string()),
+                    ("charlie".to_string(), "cut".to_string()),
+                ]
+            );
+            assert_eq!(rebuilt, written, "the rebuild and the write agree");
+            for (unit, position, status) in &rebuilt.1 {
+                let expect = if *position <= i64::from(k) {
+                    "written"
+                } else {
+                    "pending"
+                };
+                assert_eq!(status, expect, "{unit} at {position}");
+            }
+            // The volume: sealed, its short ending recorded, and only the
+            // slices at or before K counted as its data files.
+            let slices_on_tape = t
+                .positions
+                .iter()
+                .flat_map(|(_, p)| p.iter())
+                .filter(|p| **p <= k)
+                .count() as i64;
+            assert_eq!(
+                volume_ending(&fresh),
+                ("sealed".to_string(), Some(i64::from(k)), slices_on_tape)
+            );
+            assert_eq!(
+                volume_ending(&t.conn).1,
+                Some(i64::from(k)),
+                "the write recorded the same ending"
+            );
+
+            // Nothing about a cut unit counts as a copy.
+            let copies = |unit: &str| -> i64 {
+                let id: i64 = fresh
+                    .query_row("SELECT id FROM units WHERE name = ?1", [unit], |r| r.get(0))
+                    .unwrap();
+                crate::cli::audit::copy_count_for_unit(&fresh, id).unwrap()
+            };
+            assert_eq!(copies("alpha"), 1);
+            assert_eq!(copies("bravo"), 0);
+            assert_eq!(copies("charlie"), 0);
+
+            // A second run adds nothing.
+            let again = rebuild_into(&fresh, &mut t);
+            assert!(again.is_noop(), "{again:?}");
+            assert_eq!(again.ended_after, Some(u64::from(k)));
+        }
+
+        /// The control: the same write sealed full rebuilds as every tape
+        /// did before 1.6.0 — no ending recorded, every write completed,
+        /// every position written.
+        #[test]
+        fn a_rebuild_of_a_full_tape_is_unchanged() {
+            let mut t = short_tape::full_tape();
+            let fresh = crate::db::open_memory().unwrap();
+            let report = rebuild_into(&fresh, &mut t);
+            assert_eq!(report.unsealed_reason, None);
+            assert_eq!(report.ended_after, None);
+            assert!(report.cut_units.is_empty());
+            let (writes, positions) = rows_and_positions(&fresh);
+            assert!(writes.iter().all(|(_, s)| s == "completed"), "{writes:?}");
+            assert!(
+                positions.iter().all(|(_, _, s)| s == "written"),
+                "{positions:?}"
+            );
+            assert_eq!(positions.len(), 6);
+            assert_eq!(volume_ending(&fresh), ("sealed".to_string(), None, 6));
+            assert_eq!(rows_and_positions(&t.conn), (writes, positions));
+        }
+
+        /// R3 for attestation: the escrow key is asked of each unit's first
+        /// slice header, and on a short tape a unit whose first slice lies
+        /// past `ended_after` is not read at all (the MemStore holds nothing
+        /// there, so a read would count as unreadable).
+        #[test]
+        fn attestation_reads_no_slice_past_the_end_of_a_short_tape() {
+            let mut t = short_tape::short_tape();
+            let fresh = crate::db::open_memory().unwrap();
+            rebuild_into(&fresh, &mut t);
+            // As for a tape whose catalog.db carried no receipts, with the
+            // key in hand registered as the escrow recipient.
+            fresh
+                .execute("UPDATE stage_sets SET key_fingerprints = NULL", [])
+                .unwrap();
+            fresh
+                .execute(
+                    "INSERT INTO tenants (name, is_operator, status) VALUES ('escrowee', 1, 'active')",
+                    [],
+                )
+                .unwrap();
+            let public = t.operator.to_public().to_string();
+            fresh
+                .execute(
+                    "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key,
+                                                  key_type, is_active, is_escrow)
+                     VALUES (last_insert_rowid(), 'escrow', ?1, ?1, 'primary', 1, 1)",
+                    params![public],
+                )
+                .unwrap();
+            let report = rebuild_into(&fresh, &mut t);
+            assert!(report.key_is_escrow);
+            assert_eq!(report.escrow_attest_unreadable, 0, "{report:?}");
+            assert_eq!(
+                report.attested, 2,
+                "alpha's and bravo's first slices: {report:?}"
+            );
+            assert_eq!(
+                report.unknown_remaining, 0,
+                "a cut set is not counted as unknown"
+            );
+        }
+
+        /// §1.2 rule 6's acceptance, through [`locate_and_judge_seal`]: an
+        /// early seal is a short seal only on a tape whose File 0 requires
+        /// `short-seal`; on any other tape it is no seal.
+        #[test]
+        fn an_early_seal_on_a_tape_that_does_not_require_short_seal_is_no_seal() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            let file0 = String::from_utf8(
+                crate::store::read_small_bytes(&mut t.store, 0, "File 0").unwrap(),
+            )
+            .unwrap();
+            let fi_raw = crate::store::read_small_bytes(&mut t.store, 3, "File 3").unwrap();
+            let fi = format::without_nul_padding(&fi_raw).to_vec();
+
+            let located = locate_and_judge_seal(&mut t.store, &file0, &fi, 3, t.planned_seal);
+            assert!(matches!(located.verdict, format::SealVerdict::Sealed(_)));
+            assert_eq!(located.ended_after, Some(k));
+            assert_eq!(located.position, Some(k + 1));
+
+            // The same tape, its File 0 stating it requires nothing.
+            let file0_old = file0.replace("requires = [\"short-seal\"]", "requires = []");
+            assert_ne!(
+                file0_old, file0,
+                "positive control: File 0 requires short-seal"
+            );
+            let located = locate_and_judge_seal(&mut t.store, &file0_old, &fi, 3, t.planned_seal);
+            let format::SealVerdict::Unsealed(why) = &located.verdict else {
+                panic!("an early seal there is no seal: {located:?}");
+            };
+            assert!(why.contains("does not require"), "{why}");
+            assert_eq!(located.ended_after, None);
+
+            // A seal found at the planned position that states another
+            // count is the two ends disagreeing, not a full seal.
+            let mut store = MemStore::new(short_tape::BS as usize);
+            for f in 0..t.planned_seal {
+                let bytes = if f <= k + 1 {
+                    crate::store::read_small_bytes(&mut t.store, f, "file").unwrap_or_default()
+                } else {
+                    b"stand-in".to_vec()
+                };
+                store
+                    .execute(
+                        &mut std::io::Cursor::new(bytes.clone()),
+                        bytes.len() as u64,
+                        false,
+                    )
+                    .unwrap();
+            }
+            let short_seal = crate::store::read_small_bytes(&mut t.store, k + 1, "seal").unwrap();
+            store
+                .execute(
+                    &mut std::io::Cursor::new(short_seal.clone()),
+                    short_seal.len() as u64,
+                    false,
+                )
+                .unwrap();
+            let located = locate_and_judge_seal(&mut store, &file0, &fi, 3, t.planned_seal);
+            let format::SealVerdict::Unsealed(why) = &located.verdict else {
+                panic!("a short seal at the planned position is no full seal: {located:?}");
+            };
+            assert!(why.contains("disagree"), "{why}");
+        }
     }
 }

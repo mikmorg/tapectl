@@ -531,9 +531,12 @@ fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> 
                 for id in &live_ids {
                     let b = staging::clean::release_blocker(conn, *id)?;
                     let rank = |x: &staging::clean::ReleaseBlocker| match x {
-                        staging::clean::ReleaseBlocker::WriteInFlight { .. } => 4,
-                        staging::clean::ReleaseBlocker::Interrupted { .. } => 3,
-                        staging::clean::ReleaseBlocker::Abandoned { .. } => 2,
+                        staging::clean::ReleaseBlocker::WriteInFlight { .. } => 5,
+                        staging::clean::ReleaseBlocker::Interrupted { .. } => 4,
+                        staging::clean::ReleaseBlocker::Abandoned { .. } => 3,
+                        // #420: never written whole, as `NeverWritten`, but
+                        // it names the volume that cut it.
+                        staging::clean::ReleaseBlocker::Cut { .. } => 2,
                         staging::clean::ReleaseBlocker::NeverWritten => 1,
                         staging::clean::ReleaseBlocker::None => 0,
                     };
@@ -560,6 +563,25 @@ fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> 
                          --unit {name} --version {v}` would leave it untouched — \
                          pass --force to release it"
                     ),
+                    // #420 (ADR-0012 item 112): a short seal cut it. The
+                    // slices are the input to the write that puts it on
+                    // tape whole, which is an ordinary `volume write` onto
+                    // another cartridge.
+                    staging::clean::ReleaseBlocker::Cut { volume_label } => {
+                        let on = match volume_label {
+                            Some(l) => format!("volume \"{l}\""),
+                            None => "its volume".to_string(),
+                        };
+                        format!(
+                            "{head}, and it is written whole nowhere: {on} sealed short before \
+                             it, so it was cut there and is not a copy. Write it whole onto \
+                             another cartridge with `tapectl volume write <LABEL>` (`--init` \
+                             initialises a new one); these slices are what that write \
+                             reads. `tapectl staging clean --unit {name} --version {v}` \
+                             leaves it untouched until then — pass --force only to give the \
+                             version up"
+                        )
+                    }
                     // #292: `--force` here destroys the recovery.
                     // Name `volume resume` first, as the Tier-3
                     // refusal does for a sealed-but-unconfirmed
@@ -1264,6 +1286,40 @@ mod tests {
                 "{status}/{volume_status}: {msg}"
             );
         }
+    }
+
+    /// #420 (ADR-0012 item 112): a version whose only write was CUT by a
+    /// short seal is written whole nowhere. The refusal names the volume
+    /// that cut it and the write that finishes it — `volume write` onto
+    /// another cartridge — and not `volume resume` (nothing is resumable)
+    /// nor the abandoned-session advice its `writes` row would otherwise
+    /// fall into.
+    #[test]
+    fn create_with_version_refusal_names_the_volume_that_cut_it_and_the_next_write() {
+        let (conn, paths, config, _tmp) = staged_unit_with_write("cut", "sealed", false);
+        conn.execute(
+            "UPDATE volumes SET ended_after = 9, sealed_at = datetime('now') WHERE label = 'L6-0007'",
+            [],
+        )
+        .unwrap();
+        let msg = stage_version_1_refusal(&conn, &paths, &config);
+        assert!(
+            msg.contains("already has a stage set with live slices"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("volume \"L6-0007\" sealed short before it"),
+            "{msg}"
+        );
+        assert!(msg.contains("`tapectl volume write <LABEL>`"), "{msg}");
+        assert!(msg.contains("another cartridge"), "{msg}");
+        assert!(
+            msg.contains("tapectl staging clean --unit unit1 --version 1"),
+            "{msg}"
+        );
+        assert!(!msg.contains("volume resume"), "{msg}");
+        assert!(!msg.contains("aborted"), "{msg}");
+        assert!(!msg.contains("min_copies"), "{msg}");
     }
 
     /// `create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set`

@@ -55,9 +55,11 @@ pub const EVENT_FIGURES_RECORDED: &str = "write_figures_recorded";
 /// no write of this catalog completed it (a row `catalog rebuild` made keeps
 /// that command's figures), or every figure is already what the tape says.
 ///
-/// "Written by this catalog" is every completed write on the volume having
-/// a start: a write session stamps `writes.started_at` when it begins, and
-/// `catalog rebuild` inserts its `completed` rows with none.
+/// "Written by this catalog" is every completed (or, on a tape that ended
+/// early, cut: #420) write on the volume having a start: a write session
+/// stamps `writes.started_at` when it begins, and `catalog rebuild` inserts
+/// its rows with none. On a short tape the figures count only the slices at
+/// or before `volumes.ended_after`, the ones on the tape.
 pub(crate) fn record_after_verify(
     conn: &Connection,
     volume_id: i64,
@@ -79,15 +81,27 @@ pub(crate) fn record_after_verify(
     if !counts_as_copy {
         return Ok(None);
     }
-    let (completed, begun_here, last_completed): (i64, i64, Option<String>) = conn.query_row(
+    // #420: a `cut` write (the early end of a short tape cut its unit) is
+    // as much this catalog's write as a `completed` one, and a sealed volume
+    // whose warning came inside its first unit holds only cut writes: its
+    // figures are still the tape's. A cut write records no completion time.
+    let (written, begun_here, last_completed): (i64, i64, Option<String>) = conn.query_row(
         "SELECT COUNT(*), COUNT(started_at), MAX(completed_at)
-         FROM writes WHERE volume_id = ?1 AND status = 'completed'",
+         FROM writes WHERE volume_id = ?1 AND status IN ('completed', 'cut')",
         params![volume_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if completed == 0 || begun_here != completed {
+    if written == 0 || begun_here != written {
         return Ok(None);
     }
+    // #420 (`volume-format-v2.md` §4.2): where a short tape ended. The
+    // front index is the plan; only its slices at or before `ended_after`
+    // are on the tape, and the verify read only those.
+    let ended_after: Option<i64> = conn.query_row(
+        "SELECT ended_after FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
     // The same `first_write` the write records (`record_write_bookkeeping`,
     // issue #392): when the volume's first write began.
     let first_began: Option<String> = conn.query_row(
@@ -102,6 +116,7 @@ pub(crate) fn record_after_verify(
         .entries
         .iter()
         .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+        .filter(|e| ended_after.is_none_or(|k| i64::from(e.position) <= k))
         .map(|e| TapeSlice {
             position: i64::from(e.position),
             on_tape_bytes: e.on_tape_bytes(layout.block_size),
@@ -169,7 +184,7 @@ pub(crate) fn record_after_verify(
         return Ok(None);
     }
 
-    if let Some(why) = disagreement(conn, volume_id, &slices)? {
+    if let Some(why) = disagreement(conn, volume_id, &slices, ended_after)? {
         return Ok(Some(Figures::Withheld(why)));
     }
 
@@ -244,10 +259,16 @@ struct TapeSlice<'a> {
 /// hashes it staged. A slice's hash may match either `write_positions.
 /// sha256_on_volume` or `stage_slices.sha256_encrypted`, which paths have
 /// filled differently (the either-match `read_slices` uses, issue #86).
+///
+/// On a tape that ended early (#420, `ended_after = Some(K)`), the slices
+/// this catalog wrote there are those of its `completed` and `cut` writes at
+/// or before K: a cut write's slices that reached the tape are on it (and
+/// stay recorded, ADR-0012 item 112), and its positions after K never were.
 fn disagreement(
     conn: &Connection,
     volume_id: i64,
     tape: &[TapeSlice<'_>],
+    ended_after: Option<i64>,
 ) -> Result<Option<String>> {
     let rows: Vec<(i64, Option<String>, String)> = conn
         .prepare(
@@ -255,9 +276,10 @@ fn disagreement(
              FROM write_positions wp
              JOIN writes w ON w.id = wp.write_id
              JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-             WHERE w.volume_id = ?1 AND w.status = 'completed'",
+             WHERE w.volume_id = ?1 AND w.status IN ('completed', 'cut')
+               AND (?2 IS NULL OR CAST(wp.position AS INTEGER) <= ?2)",
         )?
-        .query_map(params![volume_id], |r| {
+        .query_map(params![volume_id, ended_after], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -298,4 +320,112 @@ fn disagreement(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    //! #420: the figures a full verify records for a tape that ended early,
+    //! on the shared fixture (`volume::restore::short_tape`).
+    use super::*;
+    use crate::config::Config;
+    use crate::store::Tier;
+    use crate::tape::contact::{ContactSite, Medium, Operation};
+    use crate::volume::restore::short_tape::{self, ShortTape, BS, LABEL};
+
+    fn cfg() -> &'static Config {
+        static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+        CFG.get_or_init(Config::default)
+    }
+
+    fn full_verify(t: &mut ShortTape) {
+        let r = crate::volume::write::volume_verify_with_store(
+            &t.conn,
+            &mut t.store,
+            LABEL,
+            t.volume_id,
+            BS as usize,
+            Tier::Integrity,
+            ContactSite::new(
+                cfg(),
+                Operation::VolumeVerify,
+                "memstore",
+                Medium::NoBackend,
+            ),
+        )
+        .unwrap();
+        assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
+    }
+
+    fn data_files(t: &ShortTape) -> i64 {
+        t.conn
+            .query_row(
+                "SELECT num_data_files FROM volumes WHERE id = ?1",
+                params![t.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn on_tape(t: &ShortTape) -> i64 {
+        t.positions
+            .iter()
+            .flat_map(|(_, p)| p.iter())
+            .filter(|p| **p <= t.ended_after)
+            .count() as i64
+    }
+
+    fn recorded(t: &ShortTape) -> bool {
+        t.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE action = ?1 AND entity_id = ?2)",
+                params![EVENT_FIGURES_RECORDED, t.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A short tape's figures count the slices on it, never the plan's: a
+    /// cut write's slice at K is on the tape, its later ones are not.
+    #[test]
+    fn a_full_verify_of_a_short_tape_records_only_the_slices_on_it() {
+        let mut t = short_tape::short_tape();
+        assert_eq!(
+            data_files(&t),
+            0,
+            "the fixture leaves the figures unrecorded"
+        );
+        full_verify(&mut t);
+        assert!(recorded(&t), "the figures were recorded, not withheld");
+        assert_eq!(data_files(&t), on_tape(&t));
+        assert_eq!(on_tape(&t), 3, "alpha's two slices and bravo's first");
+    }
+
+    /// The warning inside the first unit: a sealed volume holding no unit
+    /// whole, every write `cut`. It is still a sealed tape with figures.
+    #[test]
+    fn a_sealed_volume_with_only_cut_writes_gets_its_figures() {
+        let mut t = short_tape::cut_only_tape();
+        assert_eq!(
+            t.rows(&t.conn)
+                .into_iter()
+                .map(|(_, w, _)| w)
+                .collect::<Vec<_>>(),
+            vec!["cut", "cut", "cut"]
+        );
+        full_verify(&mut t);
+        assert!(recorded(&t));
+        assert_eq!(
+            data_files(&t),
+            1,
+            "alpha's first slice is the one on the tape"
+        );
+    }
+
+    /// The control: a full tape records every planned slice.
+    #[test]
+    fn a_full_verify_of_a_full_tape_records_every_slice() {
+        let mut t = short_tape::full_tape();
+        full_verify(&mut t);
+        assert_eq!(data_files(&t), 6);
+    }
 }

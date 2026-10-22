@@ -610,6 +610,24 @@ impl LtoBackendConfig {
         }
     }
 
+    /// The **plan bound** for a volume of `capacity_bytes` (ADR-0012 item 113;
+    /// `volume-format-v2.md` §4.3, the closing paragraph): how far a plan may
+    /// reach past the fill ceiling. `Some(capacity_bytes)` — 100% of the
+    /// cartridge's nominal capacity, the figure decided at `volume init`
+    /// (ADR-0010), never a figure of this drive's — when this drive declares
+    /// [`Self::post_warning_bytes`]; `None` when it does not, and every plan
+    /// then stops at the fill ceiling as before 1.6.0.
+    ///
+    /// The key is the condition and not the measure: what bounds the plan is
+    /// the cartridge. A drive whose post-warning room has been measured can be
+    /// trusted to seal short at its early warning, because the slice cap
+    /// ([`Config::slice_cap_problem`], item 100) keeps a slice and the seal
+    /// inside half of that room. The writing drive's own key decides, not the
+    /// smallest across the drives (which is the slice cap's question).
+    pub fn plan_bound_bytes(&self, capacity_bytes: u64) -> Result<Option<u64>> {
+        Ok(self.post_warning_room_bytes()?.map(|_| capacity_bytes))
+    }
+
     /// This drive's own native generation, parsed.
     pub fn native_generation(&self) -> Result<crate::media::Generation> {
         crate::media::Generation::parse(&self.generation).ok_or_else(|| {
@@ -667,6 +685,12 @@ impl LtoBackendConfig {
     /// against, and the most a single unit may be (issue #395, ADR-0012
     /// 2026-10-06 item 17: a unit is never split across cartridges). Same
     /// "no write path" rule as [`Self::planning_capacity_bytes`].
+    ///
+    /// It carries this drive's plan bound for the capacity planned
+    /// ([`Self::plan_bound_bytes`], ADR-0012 item 113): `collection plan`
+    /// packs batches to it when it is set ([`TapeBudget::packing_bytes`]).
+    /// `bytes` and [`TapeBudget::describe`] stay the fill ceiling's, so every
+    /// caller that reads only them is unchanged.
     pub fn planning_tape_budget(&self, media: Option<&str>) -> Result<TapeBudget> {
         let capacity_bytes = self.planning_capacity_bytes(media)?;
         let generation = match media {
@@ -681,7 +705,8 @@ impl LtoBackendConfig {
             self.fill_ceiling,
             crate::staging::parse_size_to_bytes(&self.enospc_buffer)?.max(0) as u64,
             self.capacity_override.is_some(),
-        ))
+        )
+        .with_plan_bound(self.plan_bound_bytes(capacity_bytes)?))
     }
 }
 
@@ -699,10 +724,17 @@ pub struct TapeBudget {
     pub fill_ceiling: f64,
     /// The end-of-tape reserve (`enospc_buffer`) subtracted.
     pub reserve_bytes: u64,
-    /// `capacity_bytes * fill_ceiling - reserve_bytes`: what one tape takes.
+    /// `capacity_bytes * fill_ceiling - reserve_bytes`: what one tape takes
+    /// under the fill ceiling, and the most a single unit may be.
     pub bytes: u64,
     /// The capacity is the drive's `capacity_override`, not the table's.
     pub overridden: bool,
+    /// The plan bound (ADR-0012 item 113,
+    /// [`LtoBackendConfig::plan_bound_bytes`]): `capacity_bytes` when the
+    /// drive declares `post_warning_bytes`, so a batch may reach past the
+    /// fill ceiling to the whole nominal capacity; `None` stops it at
+    /// [`Self::bytes`].
+    pub plan_bound_bytes: Option<u64>,
 }
 
 impl TapeBudget {
@@ -721,6 +753,39 @@ impl TapeBudget {
             reserve_bytes,
             bytes,
             overridden,
+            plan_bound_bytes: None,
+        }
+    }
+
+    /// The budget with a plan bound (ADR-0012 item 113); `None` leaves it at
+    /// the fill ceiling.
+    pub fn with_plan_bound(mut self, plan_bound_bytes: Option<u64>) -> Self {
+        self.plan_bound_bytes = plan_bound_bytes;
+        self
+    }
+
+    /// What one batch is packed against: the plan bound when there is one,
+    /// with no end-of-tape reserve under it (the reserve is the fill
+    /// ceiling's; past it the short seal is the defence), and [`Self::bytes`]
+    /// otherwise.
+    pub fn packing_bytes(&self) -> u64 {
+        self.plan_bound_bytes.unwrap_or(self.bytes)
+    }
+
+    /// [`Self::describe`], and the plan bound when there is one: what a batch
+    /// is packed against, for `collection plan` to say why a batch is larger
+    /// than the fill ceiling.
+    pub fn describe_packing(&self) -> String {
+        match self.plan_bound_bytes {
+            None => self.describe(),
+            Some(bound) => format!(
+                "{}; a batch may reach past the fill ceiling to {} ({bound} bytes), the whole \
+                 nominal capacity, because the drive declares post_warning_bytes: the units \
+                 planned past the ceiling are on the tape only if it reaches them before its \
+                 early warning (ADR-0012 item 113)",
+                self.describe(),
+                crate::util::format_bytes_decimal(i64::try_from(bound).unwrap_or(i64::MAX)),
+            ),
         }
     }
 
@@ -3390,6 +3455,63 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// ADR-0012 item 113: the plan bound is the capacity it is given — the
+    /// cartridge's, whole — and only when the drive declares
+    /// `post_warning_bytes`, whatever the room's own size.
+    #[test]
+    fn the_plan_bound_is_the_whole_capacity_only_with_post_warning_bytes() {
+        let lto6 = 2_500_000_000_000u64;
+        let without = load_text(&room_config(None, "1G", "")).unwrap();
+        assert_eq!(
+            without.backends.lto[0].plan_bound_bytes(lto6).unwrap(),
+            None
+        );
+        for room in ["99008M", "3G"] {
+            let with = load_text(&room_config(Some(room), "1G", "")).unwrap();
+            let b = &with.backends.lto[0];
+            assert_eq!(b.plan_bound_bytes(lto6).unwrap(), Some(lto6), "{room}");
+            // The capacity is the cartridge's, not the drive's: an LTO-5
+            // cartridge in this LTO-6 drive is bounded at its own capacity.
+            assert_eq!(
+                b.plan_bound_bytes(1_500_000_000_000).unwrap(),
+                Some(1_500_000_000_000)
+            );
+        }
+    }
+
+    /// `planning_tape_budget` carries the bound; its `bytes` and `describe()`
+    /// stay the fill ceiling's, so `stage create`'s one-unit limit and every
+    /// other reader of them are unchanged.
+    #[test]
+    fn the_planning_budget_carries_the_plan_bound_and_keeps_the_fill_ceilings_figures() {
+        let without = load_text(&room_config(None, "1G", "")).unwrap();
+        let t = without.backends.lto[0].planning_tape_budget(None).unwrap();
+        assert_eq!(t.plan_bound_bytes, None);
+        assert_eq!(t.packing_bytes(), t.bytes);
+        assert_eq!(t.describe_packing(), t.describe());
+
+        let with = load_text(&room_config(Some("99008M"), "1G", "")).unwrap();
+        let b = with.backends.lto[0].planning_tape_budget(None).unwrap();
+        assert_eq!(b.plan_bound_bytes, Some(b.capacity_bytes));
+        assert_eq!((b.bytes, b.describe()), (t.bytes, t.describe()));
+        assert_eq!(b.packing_bytes(), b.capacity_bytes);
+        assert!(b.packing_bytes() > b.bytes);
+        let text = b.describe_packing();
+        assert!(
+            text.starts_with(&b.describe())
+                && text.contains(&format!("({} bytes)", b.capacity_bytes))
+                && text.contains("post_warning_bytes")
+                && text.contains("ADR-0012 item 113"),
+            "{text}"
+        );
+        // Another generation's cartridge is bounded at its own capacity.
+        let lto5 = with.backends.lto[0]
+            .planning_tape_budget(Some("LTO-5"))
+            .unwrap();
+        assert_eq!(lto5.plan_bound_bytes, Some(lto5.capacity_bytes));
+        assert!(lto5.capacity_bytes < b.capacity_bytes);
     }
 
     /// Validated at load, like the other sizes: a bad value, and zero, are

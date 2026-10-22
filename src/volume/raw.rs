@@ -50,6 +50,35 @@ pub struct RawRestoreReport {
     pub mismatched_count: usize,
     pub unverifiable_count: usize,
     pub files: Vec<RawFileResult>,
+    /// `Some(K)` when the tape sealed short (#420): its seal, at K+1, says
+    /// the tape ended after file K (`volume-format-v2.md` §4.2).
+    pub ended_after: Option<u32>,
+    /// The planned files after `ended_after` the selection named, as
+    /// `(position, front-index type)`: not on this tape, so not read and not
+    /// dumped (R3). Not a failure.
+    pub not_on_tape: Vec<(i32, String)>,
+}
+
+/// What `restore raw-volume` says of a tape that ended early (#420): where,
+/// and each planned file it did not read, as RESTORE.sh's `--verify` says it
+/// (`NOT ON TAPE`, not a failure). Empty for any other tape.
+pub fn ending_lines(report: &RawRestoreReport) -> Vec<String> {
+    let Some(k) = report.ended_after else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "  the tape ended early: its seal marker, file {}, says it ended after file {k}; \
+         the {} planned file(s) after that are not on it (not a failure)",
+        k + 1,
+        report.not_on_tape.len()
+    )];
+    lines.extend(
+        report
+            .not_on_tape
+            .iter()
+            .map(|(position, kind)| format!("  NOT ON TAPE  file {position:>3}  {kind}")),
+    );
+    lines
 }
 
 impl RawRestoreReport {
@@ -189,6 +218,56 @@ pub fn restore_raw_selected(
             )));
         }
     }
+
+    // #420 (`volume-format-v2.md` §4.2 R1): on a tape that may end early,
+    // where it ended is learnt from its seal before any data slice is read,
+    // and nothing after that is read (R3). File 3 is the plan; the seal,
+    // found by §1.2 rule 6, says which of its files are on the tape. Only a
+    // selection that reaches the slices needs it: every file before the
+    // first data slice is on every sealed tape (§4.3 W4).
+    let ending = end_of_tape(
+        store,
+        &thunk_text,
+        &fi_bytes,
+        &pointers,
+        &entries,
+        selection,
+    )?;
+    let (entries, not_on_tape) = match ending {
+        None => (entries, Vec::new()),
+        Some(k) => {
+            let (on, off): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|e| i64::from(e.position) <= i64::from(k));
+            // The seal itself lies at K+1, where the plan put a data slice:
+            // it is dumped as the seal marker it is, unverifiable like every
+            // seal's own entry.
+            let seal = format::ParsedIndexEntry {
+                position: (k + 1) as i32,
+                type_label: "seal_marker".to_string(),
+                size_bytes: None,
+                sha256_encrypted: None,
+            };
+            for p in &selection.positions {
+                if i64::from(*p) > i64::from(k) + 1 {
+                    return Err(TapectlError::Other(format!(
+                        "--positions {p}: this tape ended early, after file {k} (its seal \
+                         marker, file {}, says so): file {p} of its plan is not on it. \
+                         Nothing was dumped",
+                        k + 1
+                    )));
+                }
+            }
+            let mut on = on;
+            on.push(seal);
+            let not_on_tape = off
+                .into_iter()
+                .filter(|e| selection.selects(e))
+                .map(|e| (e.position, e.type_label))
+                .collect();
+            (on, not_on_tape)
+        }
+    };
     let entries: Vec<_> = entries
         .into_iter()
         .filter(|e| selection.selects(e))
@@ -266,7 +345,66 @@ pub fn restore_raw_selected(
         mismatched_count,
         unverifiable_count,
         files,
+        ended_after: ending,
+        not_on_tape,
     })
+}
+
+/// Where a tape that may end early ended (#420): `Some(K)` when its seal,
+/// found by `volume-format-v2.md` §1.2 rule 6 and accepted there, is a short
+/// one; `None` for a full seal, for a tape that does not require
+/// `short-seal` (it cannot end early, and its seal is read in the dump's own
+/// pass, as before 1.6.0), and for a selection that reads no data slice. A
+/// seal this tapectl must not interpret refuses the dump by name (§1.2
+/// rule 1). With no seal it accepts, the dump reads on as for an unsealed
+/// tape (R2), as before 1.6.0.
+fn end_of_tape(
+    store: &mut dyn Store,
+    thunk_text: &str,
+    fi_bytes: &[u8],
+    pointers: &format::IdThunkLayoutPointers,
+    entries: &[format::ParsedIndexEntry],
+    selection: &RawSelection,
+) -> Result<Option<u32>> {
+    let may_end_early = format::parse_id_thunk_claims(thunk_text)
+        .is_ok_and(|c| c.requires.iter().any(|f| f == format::SHORT_SEAL));
+    let first_slice = entries
+        .iter()
+        .filter(|e| e.type_label == "data_slice")
+        .map(|e| e.position)
+        .min();
+    let reaches_slices = first_slice.is_some_and(|first| {
+        entries
+            .iter()
+            .any(|e| e.position >= first && selection.selects(e))
+    });
+    if !may_end_early || !reaches_slices {
+        return Ok(None);
+    }
+    let (Ok(fi_position), Ok(planned)) = (
+        u32::try_from(pointers.front_index),
+        u32::try_from(pointers.seal_marker),
+    ) else {
+        return Ok(None);
+    };
+    let located = crate::volume::rebuild::locate_and_judge_seal(
+        store,
+        thunk_text,
+        format::without_nul_padding(fi_bytes),
+        fi_position,
+        planned,
+    );
+    match located.verdict {
+        format::SealVerdict::Refused(why) => Err(TapectlError::Other(why)),
+        format::SealVerdict::Sealed(_) => Ok(located.ended_after),
+        format::SealVerdict::Unsealed(why) => {
+            tracing::warn!(
+                "raw-volume: no seal marker this tapectl accepts ({why}); dumping the files the \
+                 front index plans, as for an unsealed tape"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -531,14 +669,20 @@ pub(crate) mod tests {
         let data = b"some plaintext".to_vec();
         let mut store = build_synthetic_tape("RAWFC", &data);
         let f0 = String::from_utf8(store.files[0].clone()).unwrap();
+        // From 1.6.0 File 0 states `requires = ["short-seal"]` (ADR-0012
+        // item 111): the fixture is checked to say so before it is edited.
+        assert!(f0.contains("requires = [\"short-seal\"]"), "{f0}");
         store.files[0] = f0
-            .replace("requires = []", "requires = [\"short-seal\"]")
+            .replace(
+                "requires = [\"short-seal\"]",
+                "requires = [\"unknown-feature\"]",
+            )
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         let err = restore_raw(&mut store, tmp.path(), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("\"short-seal\""), "{err}");
+        assert!(err.contains("\"unknown-feature\""), "{err}");
         assert_eq!(
             fs::read_dir(tmp.path()).unwrap().count(),
             0,
@@ -548,7 +692,10 @@ pub(crate) mod tests {
         // Control: an unknown key nobody requires is read past.
         let mut store = build_synthetic_tape("RAWFC", &data);
         store.files[0] = f0
-            .replace("requires = []", "requires = []\nfuture_key = 1")
+            .replace(
+                "requires = [\"short-seal\"]",
+                "requires = [\"short-seal\"]\nfuture_key = 1",
+            )
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         restore_raw(&mut store, tmp.path(), None).unwrap();
@@ -590,6 +737,117 @@ pub(crate) mod tests {
             expect_label: Option<&str>,
         ) -> Result<RawRestoreReport> {
             restore_raw(store, dest, expect_label)
+        }
+    }
+
+    /// #420: `restore raw-volume` of a tape that ended early, on the shared
+    /// fixture (`volume::restore::short_tape`): the seal is found first (R1),
+    /// nothing after it is read (R3), and the planned files after it are
+    /// named as not on the tape.
+    mod short_ending {
+        use super::*;
+        use crate::volume::restore::short_tape::{self, LABEL};
+
+        #[test]
+        fn a_raw_dump_of_a_short_tape_stops_at_its_seal_and_names_the_rest() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            let dest = TempDir::new().unwrap();
+            let report = restore_raw(&mut t.store, dest.path(), Some(LABEL)).unwrap();
+            assert_eq!(report.ended_after, Some(k));
+            assert!(report.all_verified(), "{:?}", report.files);
+            assert_eq!(
+                report.files_dumped,
+                k as usize + 2,
+                "files 0..=K and the seal"
+            );
+            let last = report.files.last().unwrap();
+            assert_eq!(
+                (last.position, last.type_label.as_str()),
+                ((k + 1) as i32, "seal_marker")
+            );
+            assert!(dest
+                .path()
+                .join(format!("{:04}_seal_marker.bin", k + 1))
+                .exists());
+            assert_eq!(last.verified, None, "a seal's own entry is unverifiable");
+            // Every planned file after K is named, the planned seal among
+            // them, and none was dumped.
+            let planned: Vec<i32> = ((k + 1)..=t.planned_seal).map(|p| p as i32).collect();
+            assert_eq!(
+                report
+                    .not_on_tape
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect::<Vec<_>>(),
+                planned
+            );
+            assert_eq!(
+                report.not_on_tape.last().unwrap().1,
+                "seal_marker",
+                "the plan's seal"
+            );
+            assert!(!dest
+                .path()
+                .join(format!("{:04}_data_slice.bin", k + 1))
+                .exists());
+            let text = ending_lines(&report).join("\n");
+            assert!(text.contains(&format!("ended after file {k}")), "{text}");
+            assert!(text.contains("NOT ON TAPE"), "{text}");
+        }
+
+        #[test]
+        fn a_position_past_the_end_is_refused_and_one_before_it_is_dumped() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            let dest = TempDir::new().unwrap();
+            let past = RawSelection {
+                positions: vec![(k + 2) as i32],
+                types: Vec::new(),
+            };
+            let err = restore_raw_selected(&mut t.store, dest.path(), Some(LABEL), &past)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ended early"), "{err}");
+            assert!(err.contains("not on it"), "{err}");
+            assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+
+            // K itself (the cut unit's slice that IS on the tape) dumps and
+            // verifies: raw-volume is the keyless dump of what is there.
+            let at_k = RawSelection {
+                positions: vec![k as i32],
+                types: Vec::new(),
+            };
+            let report =
+                restore_raw_selected(&mut t.store, dest.path(), Some(LABEL), &at_k).unwrap();
+            assert_eq!(report.files_dumped, 1);
+            assert_eq!(report.verified_count, 1);
+            assert!(report.not_on_tape.is_empty());
+
+            // A selection that reads no data slice does not look for the end.
+            let dest = TempDir::new().unwrap();
+            let script = RawSelection {
+                positions: Vec::new(),
+                types: vec!["restore_sh".to_string()],
+            };
+            let report =
+                restore_raw_selected(&mut t.store, dest.path(), Some(LABEL), &script).unwrap();
+            assert_eq!(report.files_dumped, 1);
+            assert_eq!(report.ended_after, None);
+        }
+
+        /// The control: the same write sealed full dumps every planned file,
+        /// as before 1.6.0.
+        #[test]
+        fn a_raw_dump_of_a_full_tape_is_unchanged() {
+            let mut t = short_tape::full_tape();
+            let dest = TempDir::new().unwrap();
+            let report = restore_raw(&mut t.store, dest.path(), Some(LABEL)).unwrap();
+            assert_eq!(report.ended_after, None);
+            assert!(report.not_on_tape.is_empty());
+            assert_eq!(report.files_dumped, t.planned_seal as usize + 1);
+            assert!(report.all_verified());
+            assert!(ending_lines(&report).is_empty());
         }
     }
 }

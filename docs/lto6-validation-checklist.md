@@ -19,9 +19,13 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
 
 ## What mhvtl cannot tell you (why this session exists)
 
-- **End of tape.** mhvtl accepts writes past its configured capacity without ENOSPC and
-  silently corrupts the overflow (dry-run 2026-07-20). Only a real drive answers where
-  host writes stop, and how.
+- **End of tape.** mhvtl accepts writes past its configured capacity and silently loses
+  the overflow (dry-run 2026-07-20). Measured again on 2026-10-20 (#420, a 500 MB LTO-8
+  cartridge): st now returns ENOSPC once per block from 2 MiB before capacity and the retry
+  lands each block, as a real drive's early warning does; but data past capacity is lost
+  with no error (a file crossing it reads back truncated, one past it reads back empty),
+  while filemarks are kept. So mhvtl shows the early warning, never what a drive keeps past
+  it. Only a real drive answers where host writes stop, and how.
 - **Capacity units and MAM.** mhvtl's MAM and page 0x0c/0x17 are static fictions.
 - **Feed-rate effects.** mhvtl writes to disk; a real drive speed-matches down to about
   54 MB/s and shoe-shines below that, which costs tape.
@@ -175,6 +179,95 @@ the fill's own account, and exit 1 ("MEASUREMENT COMPLETE (readback: FAIL)") is 
 - [ ] MAM's capacity unit and over-report (record: MiB, over-report 0 bytes on 2026-09-23).
 - [ ] End of data: a forward read past it errors, it does not return stale data (§3.2's assumption;
       not yet measured on the real drive).
+
+## The short seal on the real drive (1.6.0 acceptance; #420)
+
+ADR-0012 items 110, 114, 115 and 117: a write that meets the drive's real early warning seals
+short, and what it wrote past the warning (at most one slice and the seal) reads back. A failed
+readback here stops #420; it does not re-scope it. `scripts/short-seal-acceptance.sh` runs it on
+the test cartridge EW7VWMVKF6 in a throwaway home, and the CTO authorizes each run (item 117).
+`--print-plan` prints the operator's part and the drive time without touching anything.
+
+**How the tape is filled** (item 115). Three small real units and, sorting between them, one
+filler unit (`volume write` orders the batch by name: `ssa-a-docs`, `ssa-b-photos`,
+`ssa-m-filler`, `ssa-z-tail`). The filler is staged normally from a source a little larger than
+one slice, so its stage set is real (recipients, escrow receipt, dar catalogue) and its slice 1 is
+a full 1 GiB slice. `examples/short_seal_filler.rs` (`fill`) then gives it about 2,370 slice rows,
+all naming that one staged file. The write's checks read row counts and file sizes, and its
+hashing streams the file each time, so no 2.6 TB staging area is needed. The filler is cut and
+never restored. Its one file is moved to `/dev/shm` when there is room, because the write evicts
+each slice from the page cache behind it.
+
+**The capacity.** The run registers the cartridge at 2.55 TB (`cartridge register --capacity`,
+in the throwaway catalog only), not the generation table's 2.5 TB:
+- item 113 lets a plan reach 100% of the cartridge's capacity and no further;
+- this cartridge's first refusal came at 2,502,136,168,448 bytes (2026-10-20) and
+  2,501,995,134,976 (2026-09-23), 1.0009 of 2.5 TB;
+- so a plan bounded at 2.5 TB ends about 2 GB before the warning, seals full and proves nothing.
+
+At 2.55 TB the fill ceiling (97%, 2.47 TB) is below the warning and the plan bound is above it.
+The filler is planned past the ceiling (item 113) and the warning lands inside it. The drive's
+`capacity_override` is not used: it is for virtual drives. Production keeps the table figure.
+
+**Before the run.**
+- [ ] The whole chain is green on the candidate (item 117), including the mhvtl rehearsal:
+      `scripts/short-seal-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst`
+      (an LTO-6 emulation; the store's test hook `TAPECTL_TEST_EARLY_WARNING_AT` stands in for
+      the warning, because mhvtl loses data past its medium's end instead of refusing it).
+- [ ] The candidate binary and its `short_seal_filler` example are built the same way and copied
+      to home2 (`cargo build --example short_seal_filler`, statically for musl there).
+- [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
+      drive; the host is quiet for the whole run (`docs/operator-guide.md`, "A quiet host while
+      the tape runs").
+
+```bash
+TAPECTL_HOME="$HOME/.cache/tapectl/ssa-home-$(date +%Y%m%d)" \
+TAPECTL_BIN=/path/to/tapectl-1.6.0 FIXTURE_BIN=/path/to/short_seal_filler \
+  scripts/short-seal-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
+    --i-will-lose-the-cartridge EW7VWMVKF6
+```
+
+It refuses (exit 2, nothing touched) when any of these fails:
+- `TAPECTL_HOME` is unset, not empty, or one of production's homes. Those are `/etc/tapectl/home`'s
+  target, the service user's home, `/srv/archive_meta/tapectl` and this account's `~/.tapectl`.
+- The drive is not HUJ808A5L4, or the chip serial is not EW7VWMVKF6.
+- The binary is older than 1.6.0.
+- `TAPECTL_TEST_EARLY_WARNING_AT` is set.
+- The drive-poll timer is active, or the tape lock is held.
+
+**The steps, what each must show, and its drive time** (the write at ~158 MB/s, the reads at the
+140 MiB/s production verify ran at):
+
+| step | must show | time |
+|---|---|---|
+| 1 setup | no tape. The home, the config (`post_warning_bytes = "99008M"`, item 118's figure; `min_copies = 1`), four units staged, the filler's rows | ~10 min |
+| 2 erase, `volume init SSA-0001` | whatever the cartridge held is erased by this home's `cartridge erase` (File 0's label confirmed), so init needs no `--force`; the medium line's capacity is the registered 2.55 TB | ~5 min |
+| 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K, cut `ssa-m-filler` and `ssa-z-tail`; the volume `sealed` with `ended_after` K; `completed` and `cut` rows; the `write_early_warning` event; the confirm phase's bytes (`phase_timings`) cover the slice at file K and the seal, item 114's readback; the whole units' staging released (`min_copies = 1`) and the cut units' kept | ~4.5-5 h |
+| 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` "Verdict: SEALED" and "ended early, after file K"; `--verify` "VERIFY: PASS" with the planned files after K marked NOT ON TAPE | ~9-10 h |
+| 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; the cut unit refused by both | ~15 min |
+| 6 rebuild | `catalog rebuild --from-volume` into a second bare home; `short_seal_filler compare` agrees on the volume, its units, every write's status and every slice on the tape | ~15 min |
+| 7 rewrite | the filler released by `staging clean --force`; `SSA-0001` retired; `cartridge erase`; `SSA-0002` initialised without `--force`; the cut unit written whole (full seal), verified and restored | ~20 min |
+
+About 14-16 hours of drive time in all. Step 4's two whole-tape reads are most of it.
+
+- [ ] Record: K, the `write_early_warning` event's `bytes_at` and `refusals` beside the profile's
+      first refusal (2,502,136,168,448), the `write_feed_ratio` event, and each step's duration
+      (`steps.tsv`).
+- [ ] Record the readback past the warning (item 114): the step-3 log line "item 114: the confirm
+      read back N bytes", from the confirm phase's own byte count. Steps 4 and 6 read the slice and
+      the seal again.
+- [ ] A FAIL stops the run and leaves the cartridge as that step left it. Read the failure first
+      (`RESULT.txt`, the step's `.err` and `.out` files, `drive-at-fail/`), and keep the cartridge
+      unwritten until it is understood (#420's lost readback). On a FAIL in step 3 or 4,
+      `catalog-at-fail.db` and the tape are the evidence.
+- [ ] Afterwards the cartridge holds `SSA-0002`, owned by the throwaway home. Retire it and run
+      `cartridge erase` there before the cartridge is a test cartridge again. Then start the
+      drive-poll timer.
+
+The run directory (`/scratch/tapectl-short-seal/ssa-<UTC>-<serial>/`, or under
+`~/.cache/tapectl/short-seal` where there is no `/scratch`) keeps every command's output. Per
+step, it also keeps the drive's `/sys/class/scsi_tape/nstN/options` and `stats/`, MAM, and log
+pages 0x02 0x03 0x0c 0x17 from before and after (one LOG SENSE each; never 0x2E).
 
 ## After a pass
 

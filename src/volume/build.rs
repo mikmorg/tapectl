@@ -29,8 +29,8 @@ use super::format;
 use super::index::{self, IndexFiles};
 use super::layout::{self, FrontIndexFile, IdThunkV2Params};
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, SliceCheck,
-    ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, PlanSplit,
+    SliceCheck, ZoneKind,
 };
 
 // ── Plain-data inputs ──
@@ -197,7 +197,28 @@ pub struct BuiltLayout {
 /// (`docs/design/volume-format-v2.md` §§1, 3, 4). Generators run ONCE here —
 /// nothing on this path is ever re-invoked on a later read; resume re-reads
 /// these frozen files (plan T5b, sheet §2.2).
+///
+/// The Layout's plan stops at the fill ceiling (no plan bound); a write whose
+/// drive declares `post_warning_bytes` builds with
+/// [`build_with_plan_bound`] instead.
 pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
+    build_with_plan_bound(inputs, None, session_dir)
+}
+
+/// [`build`], with the plan bound of ADR-0012 item 113 frozen into the
+/// Layout's budget ([`CapacityBudget::plan_bound_bytes`]): `Some(capacity)`,
+/// 100% of the cartridge's nominal capacity, when the writing drive declares
+/// `post_warning_bytes` ([`crate::config::LtoBackendConfig::plan_bound_bytes`]),
+/// and `None` to stop at the fill ceiling as [`build`] does. The bound is an
+/// input to no generator, only to the Layout's budget and its `layout.json`:
+/// the units are the caller's, every one is laid out whole, and the front
+/// index lists them all — the ones past the ceiling too
+/// ([`BuiltLayout::split`] says which those are).
+pub fn build_with_plan_bound(
+    inputs: &BuildInputs,
+    plan_bound_bytes: Option<u64>,
+    session_dir: &Path,
+) -> Result<BuiltLayout> {
     fs::create_dir_all(session_dir)?;
 
     let volume_uuid = Uuid::parse_str(&inputs.volume_uuid).map_err(|e| {
@@ -579,6 +600,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         budget: CapacityBudget {
             available_bytes: inputs.usable_bytes,
             reserve_bytes: inputs.enospc_buffer,
+            plan_bound_bytes,
         },
         entries,
     };
@@ -652,6 +674,32 @@ impl BuiltLayout {
         }
     }
 
+    /// How `units` — the ones this Layout was built from, in the order
+    /// given to [`build`] — sit against its budget (ADR-0012 item 113,
+    /// [`Layout::split_units`]): `units[split.past_ceiling()]` are planned
+    /// past the fill ceiling ("the tape may end before them"), and a split
+    /// that does not [`PlanSplit::fits`] is a Layout `validate` refuses.
+    pub fn split(&self, units: &[BuildUnit]) -> PlanSplit {
+        self.layout.split_units(&unit_slice_ids(units))
+    }
+
+    /// The data slices of the units planned past the fill ceiling, in
+    /// position order ([`Layout::entries_past_ceiling`]).
+    pub fn entries_past_ceiling(&self, units: &[BuildUnit]) -> Vec<&LayoutEntry> {
+        self.layout.entries_past_ceiling(&unit_slice_ids(units))
+    }
+}
+
+/// Each unit's slices as `stage_slice_id`s, in the units' order — the unit
+/// boundaries [`Layout::split_units`] needs and a Layout does not carry.
+pub fn unit_slice_ids(units: &[BuildUnit]) -> Vec<Vec<i64>> {
+    units
+        .iter()
+        .map(|u| u.slices.iter().map(|s| s.slice_id).collect())
+        .collect()
+}
+
+impl BuiltLayout {
     /// The position + materialized path of the (at most one) entry whose
     /// kind matches `kind_matches`, if it is `Materialized`. Staged entries
     /// never match any of this function's callers' predicates (none of
@@ -1791,6 +1839,190 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let err = build(&inputs, session.path()).unwrap_err().to_string();
         assert!(err.contains("no files for tenant 2"), "{err}");
+    }
+
+    // ── the plan bound (ADR-0012 item 113) ──
+
+    /// Three units in the caller's order, each slice one block on tape:
+    /// "unit-alpha" (slices 1 and 2), "unit-bravo" (slice 3), "unit-charlie"
+    /// (slice 4).
+    fn three_unit_inputs() -> (BuildInputs, tempfile::TempDir) {
+        let src = tempfile::tempdir().unwrap();
+        let (t1, a) = fake_tenant_and_unit(
+            src.path(),
+            1,
+            "alpha",
+            vec![(1, 1, b"alpha one"), (2, 2, b"alpha two")],
+        );
+        let (t2, b) = fake_tenant_and_unit(src.path(), 2, "bravo", vec![(3, 1, b"bravo one")]);
+        let (t3, c) = fake_tenant_and_unit(src.path(), 3, "charlie", vec![(4, 1, b"charlie one")]);
+        let inputs = base_inputs(
+            "550e8400-e29b-41d4-a716-446655440000",
+            vec![t1, t2, t3],
+            vec![a, b, c],
+        );
+        (inputs, src)
+    }
+
+    fn slice_position(layout: &Layout, slice_id: i64) -> i32 {
+        layout
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind
+                    == ZoneKind::Slice {
+                        stage_slice_id: slice_id,
+                    }
+            })
+            .unwrap()
+            .position
+    }
+
+    /// (position, type, block-padded size) of every entry: what the bound must not
+    /// move. Padded, because an envelope's exact size varies a little between two
+    /// builds of the same inputs (a generated timestamp is not of fixed width).
+    fn shape(layout: &Layout) -> Vec<(i32, &'static str, Option<u64>)> {
+        layout
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.position,
+                    e.kind.type_label(),
+                    e.on_tape_bytes(layout.block_size),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_a_plan_bound_whole_units_are_planned_past_the_fill_ceiling_up_to_nominal() {
+        let (mut inputs, _src) = three_unit_inputs();
+        let probe = tempfile::tempdir().unwrap();
+        let probe = build(&inputs, probe.path()).unwrap().layout;
+        let fixed = probe.fixed_on_tape_bytes();
+        let total = probe.on_tape_bytes().unwrap();
+        assert_eq!(total, fixed + 4 * BS, "four one-block slices");
+        // The fill budget holds the files that are not slices, alpha's two
+        // slices and the reserve: bravo and charlie are past the ceiling.
+        inputs.usable_bytes = fixed + 2 * BS + inputs.enospc_buffer;
+
+        // Without a bound: refused, as before 1.6.0, and nothing is past the
+        // ceiling.
+        let unbounded_dir = tempfile::tempdir().unwrap();
+        let unbounded = build(&inputs, unbounded_dir.path()).unwrap();
+        let errs = unbounded
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })),
+            "{errs:?}"
+        );
+        let split = unbounded.split(&inputs.units);
+        assert_eq!((split.committed, split.planned), (1, 1));
+        assert!(unbounded.entries_past_ceiling(&inputs.units).is_empty());
+        let sidecar = std::fs::read_to_string(unbounded_dir.path().join(LAYOUT_SIDECAR)).unwrap();
+        assert!(!sidecar.contains("plan_bound_bytes"), "{sidecar}");
+
+        // With a bound of exactly the plan's end: it validates, and the two
+        // later units are planned past the ceiling, whole and in order.
+        let session = tempfile::tempdir().unwrap();
+        let built = build_with_plan_bound(&inputs, Some(total), session.path()).unwrap();
+        built.validate(&ok_keys(&inputs), SliceCheck::Size).unwrap();
+        let split = built.split(&inputs.units);
+        assert_eq!(split.past_ceiling(), 1..3);
+        assert!(split.fits());
+        let names: Vec<&str> = inputs.units[split.past_ceiling()]
+            .iter()
+            .map(|u| u.unit_name.as_str())
+            .collect();
+        assert_eq!(names, ["unit-bravo", "unit-charlie"]);
+        let past: Vec<i32> = built
+            .entries_past_ceiling(&inputs.units)
+            .iter()
+            .map(|e| e.position)
+            .collect();
+        let alpha_last = slice_position(&built.layout, 2);
+        assert_eq!(past, vec![alpha_last + 1, alpha_last + 2]);
+        assert_eq!(slice_position(&built.layout, 3), alpha_last + 1);
+
+        // They are ordinary plan entries: the bound moves no position or
+        // size, and the front index lists every slice.
+        assert_eq!(shape(&built.layout), shape(&unbounded.layout));
+        let fi = built
+            .layout
+            .entries
+            .iter()
+            .find(|e| e.kind == ZoneKind::FrontIndex)
+            .unwrap();
+        let ContentSource::Materialized(fi_path) = &fi.source else {
+            panic!("the front index is materialized");
+        };
+        let parsed =
+            format::parse_front_index_document(&std::fs::read_to_string(fi_path).unwrap()).unwrap();
+        for p in &past {
+            assert!(
+                parsed
+                    .files
+                    .iter()
+                    .any(|f| f.position == *p && f.type_label == "data_slice"),
+                "File 3 lists the slice at {p}"
+            );
+        }
+
+        // The bound is frozen with the Layout, so a resume revalidates
+        // against the bound the plan was made with.
+        let frozen: Layout =
+            serde_json::from_slice(&std::fs::read(session.path().join(LAYOUT_SIDECAR)).unwrap())
+                .unwrap();
+        assert_eq!(frozen.budget.plan_bound_bytes, Some(total));
+        assert_eq!(frozen, built.layout);
+
+        // One byte under the plan's end: refused by the bound, and charlie,
+        // the unit that crosses it, is wholly beyond it.
+        let session = tempfile::tempdir().unwrap();
+        let built = build_with_plan_bound(&inputs, Some(total - 1), session.path()).unwrap();
+        let errs = built
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
+        assert_eq!(
+            errs,
+            vec![LayoutError::PlanBoundExceeded {
+                needed: total,
+                bound: total - 1
+            }]
+        );
+        let split = built.split(&inputs.units);
+        assert_eq!((split.committed, split.planned), (1, 2));
+        assert_eq!(split.beyond_bound(), 2..3);
+    }
+
+    #[test]
+    fn a_unit_that_crosses_the_fill_ceiling_is_wholly_past_it() {
+        let (mut inputs, _src) = three_unit_inputs();
+        let probe = tempfile::tempdir().unwrap();
+        let probe = build(&inputs, probe.path()).unwrap().layout;
+        let fixed = probe.fixed_on_tape_bytes();
+        let total = probe.on_tape_bytes().unwrap();
+        // Alpha's first slice fits under the ceiling and its second does not:
+        // alpha is not committed in part. Nothing is committed, and every
+        // unit is past the ceiling (an empty committed plan is what the
+        // arithmetic gives; the files that are not slices still meet today's
+        // gate).
+        inputs.usable_bytes = fixed + BS + inputs.enospc_buffer;
+        let session = tempfile::tempdir().unwrap();
+        let built = build_with_plan_bound(&inputs, Some(total), session.path()).unwrap();
+        built.validate(&ok_keys(&inputs), SliceCheck::Size).unwrap();
+        let split = built.split(&inputs.units);
+        assert_eq!(split.past_ceiling(), 0..3);
+        let past: Vec<i32> = built
+            .entries_past_ceiling(&inputs.units)
+            .iter()
+            .map(|e| e.position)
+            .collect();
+        let first = slice_position(&built.layout, 1);
+        assert_eq!(past, vec![first, first + 1, first + 2, first + 3]);
     }
 
     #[test]

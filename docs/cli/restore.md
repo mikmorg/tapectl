@@ -56,7 +56,7 @@ tapectl restore volume [OPTIONS] --to <DIR> [LABEL]
 **Options**
 
 - `--to <DIR>` *(required)* — Destination directory: each unit is restored into `DIR/<unit name>`, which must be empty or new
-- `--unit <NAME>` — A unit to restore; repeat for several. Without it, every unit with written slices on the volume
+- `--unit <NAME>` — A unit to restore; repeat for several. Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--scratch <DIR>` — Where each unit's scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit's own directory, never the system temp directory
 - `--overwrite` — Restore into unit directories that already hold files, replacing any that collide. Without it a unit directory that is not empty is refused before the tape is touched

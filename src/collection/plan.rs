@@ -64,13 +64,22 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// dropped — every caller of this function (`plan_for_collection`,
 /// `plan_for_run`) must keep reporting it and exit non-zero.
 ///
-/// `limit` says where `budget` came from, for the refusal of a unit too big
+/// `limit` says where `packing` came from, for the refusal of a unit too big
 /// for one tape (issues #391, #395: the refusal names the overage and the
 /// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
 ///
+/// `packing` (ADR-0012 item 113): without a plan bound, batches are packed
+/// against the room under the fill ceiling, exactly as before 1.6.0. With one
+/// (the drive declares `post_warning_bytes`), they are packed against the room
+/// to the plan bound — the cartridge's whole nominal capacity — in the same
+/// next-fit order, so the units after the ceiling are whole units appended in
+/// order ([`past_ceiling_units`] names them); and a unit must still fit under
+/// the fill ceiling of an empty tape alone, which is `stage create`'s own
+/// limit, so a batch never holds a unit `stage create` would refuse.
+///
 /// `staged` (issue #475): the destination budget, when the caller has one
 /// (`collection run`). Staged data that will ride along to the tape comes out
-/// of `budget` before packing, so a unit too big for what is LEFT, though it
+/// of `packing` before packing, so a unit too big for what is LEFT, though it
 /// fits an empty tape, is refused as that — staged data to write first — and
 /// not as a unit that "can never be batched".
 ///
@@ -87,7 +96,7 @@ fn batches_for_budget(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
-    budget: u64,
+    packing: &Packing,
     limit: &str,
     staged: Option<&DestinationBudget>,
     policy_aware: bool,
@@ -144,14 +153,90 @@ fn batches_for_budget(
         })
         .collect();
 
-    let planned = if policy_aware {
-        selector::plan_batches_prioritised(synthetic, &prioritised, budget, BLOCK_SIZE)
-    } else {
-        selector::plan_batches(synthetic, budget, BLOCK_SIZE)
+    let select = |units: Vec<selector::PendingUnit>, budget: u64| {
+        if policy_aware {
+            selector::plan_batches_prioritised(units, &prioritised, budget, BLOCK_SIZE)
+        } else {
+            selector::plan_batches(units, budget, BLOCK_SIZE)
+        }
+    };
+    let planned = match &packing.past_ceiling {
+        None => select(synthetic, packing.fill),
+        Some(past) => {
+            // ADR-0012 item 113: a unit alone must fit under an empty tape's
+            // fill ceiling, the limit `stage create` refuses at. The selector
+            // run at that figure is the refusal (in the selector's own order
+            // and words); its batches are not used.
+            if let Err(oversized) = select(synthetic.clone(), past.unit_limit) {
+                return Err(oversized_refusal(
+                    &lib.name,
+                    &oversized,
+                    &past.unit_limit_describe,
+                    None,
+                ));
+            }
+            select(synthetic, past.room)
+        }
     };
     let batches =
         planned.map_err(|oversized| oversized_refusal(&lib.name, &oversized, limit, staged))?;
     Ok((batches, scan.refused))
+}
+
+/// What [`batches_for_budget`] packs one batch against (ADR-0012 item 113).
+#[derive(Debug, Clone)]
+struct Packing {
+    /// The room under the fill ceiling: what a batch is packed against
+    /// without a plan bound, exactly as before 1.6.0.
+    fill: u64,
+    /// With a plan bound (the drive declares `post_warning_bytes`).
+    past_ceiling: Option<PastCeilingPacking>,
+}
+
+impl Packing {
+    /// Packing with no plan bound: `fill` is all a batch may take.
+    #[cfg(test)]
+    fn under_ceiling(fill: u64) -> Self {
+        Packing {
+            fill,
+            past_ceiling: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PastCeilingPacking {
+    /// The room to the plan bound: what a batch is packed against.
+    room: u64,
+    /// The most one unit may be: an empty tape's room under the fill ceiling.
+    unit_limit: u64,
+    /// Where `unit_limit` came from, for the refusal of a unit above it.
+    unit_limit_describe: String,
+}
+
+/// The units of `batch` planned past the fill ceiling (ADR-0012 item 113):
+/// every unit after the first whose running block-padded total passes
+/// `fill_bytes` (the batch's room under the ceiling: [`TapeBudget::bytes`] for
+/// `collection plan`, [`DestinationBudget::bytes`] for `collection run`), in
+/// the batch's order — whole units, never reordered, by
+/// [`CapacityBudget::split`]'s one definition. These are the units of which
+/// "the tape may end before them" is true. Empty when the batch fits under
+/// the ceiling, as every batch does without a plan bound.
+///
+/// [`CapacityBudget::split`]: crate::volume::layout_model::CapacityBudget::split
+pub fn past_ceiling_units(batch: &Batch, fill_bytes: u64) -> &[selector::PendingUnit] {
+    let padded: Vec<u64> = batch
+        .units
+        .iter()
+        .map(|u| pad_to_blocks(u.size_bytes, BLOCK_SIZE))
+        .collect();
+    let split = crate::volume::layout_model::CapacityBudget {
+        available_bytes: fill_bytes,
+        reserve_bytes: 0,
+        plan_bound_bytes: Some(u64::MAX),
+    }
+    .split(0, &padded);
+    &batch.units[split.past_ceiling()]
 }
 
 /// The refusal for units the selector found too big for the budget it was
@@ -203,13 +288,13 @@ fn oversized_refusal(
         "collection \"{collection}\": {}; write it first (`tapectl volume write {}`), then run \
          the collection again onto an empty initialised volume. {} pending unit(s) fit an \
          empty tape but not beside the staged data: {}. The limit: {limit}",
-        if b.bytes == 0 {
+        if b.packing_bytes() == 0 {
             "staged data already fills this tape".to_string()
         } else {
             format!(
                 "staged data already takes {} of this tape, leaving {}",
                 dec(b.already_staged_bytes),
-                dec(b.bytes)
+                dec(b.packing_bytes())
             )
         },
         b.binding_label,
@@ -271,13 +356,23 @@ pub fn plan_for_collection_with_budget(
     // Issue #395: the budget and the description of where it came from are
     // one value, so the refusal names the figures the packing used.
     let tape = backend.planning_tape_budget(media)?;
+    // ADR-0012 item 113: with the drive's plan bound a batch reaches past the
+    // fill ceiling to the whole nominal capacity; without it, as before.
+    let packing = Packing {
+        fill: tape.bytes,
+        past_ceiling: tape.plan_bound_bytes.map(|bound| PastCeilingPacking {
+            room: bound,
+            unit_limit: tape.bytes,
+            unit_limit_describe: tape.describe(),
+        }),
+    };
 
     let (batches, refused) = batches_for_budget(
         conn,
         config,
         lib,
-        tape.bytes,
-        &tape.describe(),
+        &packing,
+        &tape.describe_packing(),
         None,
         policy_aware,
     )?;
@@ -353,6 +448,16 @@ pub struct DestinationBudget {
     /// What is already staged and will ride along (issue #232 item 1),
     /// subtracted.
     pub already_staged_bytes: u64,
+    /// The plan bound (ADR-0012 item 113,
+    /// [`crate::config::LtoBackendConfig::plan_bound_bytes`]): the binding
+    /// volume's whole capacity when the drive declares `post_warning_bytes`,
+    /// so a batch may reach past the fill ceiling to it
+    /// ([`Self::packing_bytes`]); `None` stops it at [`Self::bytes`].
+    pub plan_bound_bytes: Option<u64>,
+    /// An empty volume's room under the fill ceiling (its capacity at the
+    /// fill ceiling, less the reserve): the most one unit may be when a batch
+    /// reaches past the ceiling, `stage create`'s own limit.
+    pub unit_limit_bytes: u64,
     /// Copy-distinctness warnings (issue #144): a destination at a location
     /// where a stage set riding along already has a copy, one rendered
     /// [`coverage::Distinctness::warning`] per such label. Advisory
@@ -361,11 +466,23 @@ pub struct DestinationBudget {
 }
 
 impl DestinationBudget {
-    /// Where [`Self::bytes`] came from, for a refusal (issues #391, #395).
+    /// What one batch is packed against (ADR-0012 item 113): with a plan
+    /// bound, the room to it less what is already staged (no end-of-tape
+    /// reserve under it: the reserve is the fill ceiling's); without one,
+    /// [`Self::bytes`].
+    pub fn packing_bytes(&self) -> u64 {
+        match self.plan_bound_bytes {
+            Some(bound) => bound.saturating_sub(self.already_staged_bytes),
+            None => self.bytes,
+        }
+    }
+
+    /// Where [`Self::bytes`] came from, for a refusal (issues #391, #395),
+    /// and, with a plan bound, how far a batch may reach past it.
     pub fn describe(&self) -> String {
         let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
         let bin = |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
-        format!(
+        let under_ceiling = format!(
             "volume \"{}\" takes {} ({} bytes) for this batch: its {} capacity at the {}% fill \
              ceiling, less the {} end-of-tape reserve and the {} already staged",
             self.binding_label,
@@ -375,6 +492,37 @@ impl DestinationBudget {
             crate::volume::layout_model::fill_ceiling_percent(self.fill_ceiling),
             bin(self.reserve_bytes),
             bin(self.already_staged_bytes),
+        );
+        match self.plan_bound_bytes {
+            None => under_ceiling,
+            Some(_) => format!(
+                "{under_ceiling}; a batch may reach past the fill ceiling to {} ({} bytes), its \
+                 whole nominal capacity less the {} already staged, because the drive declares \
+                 post_warning_bytes: the units planned past the ceiling are on the tape only if \
+                 it reaches them before its early warning (ADR-0012 item 113)",
+                dec(self.packing_bytes()),
+                self.packing_bytes(),
+                bin(self.already_staged_bytes),
+            ),
+        }
+    }
+
+    /// Where [`Self::unit_limit_bytes`] came from, for the refusal of a unit
+    /// above it when a batch reaches past the fill ceiling.
+    fn describe_unit_limit(&self) -> String {
+        format!(
+            "volume \"{}\" takes {} ({} bytes) for one unit: its {} capacity at the {}% fill \
+             ceiling, less the {} end-of-tape reserve. A batch may reach past the ceiling \
+             (the drive declares post_warning_bytes, ADR-0012 item 113), but a unit alone \
+             must fit under it, as `stage create` requires",
+            self.binding_label,
+            crate::util::format_bytes_decimal(
+                i64::try_from(self.unit_limit_bytes).unwrap_or(i64::MAX)
+            ),
+            self.unit_limit_bytes,
+            crate::util::format_bytes_decimal(self.binding_capacity_bytes.max(0)),
+            crate::volume::layout_model::fill_ceiling_percent(self.fill_ceiling),
+            crate::util::format_bytes_binary(i64::try_from(self.reserve_bytes).unwrap_or(i64::MAX)),
         )
     }
 }
@@ -608,6 +756,10 @@ pub fn destination_budget(
     let bytes = usable
         .saturating_sub(enospc_buffer)
         .saturating_sub(already_staged);
+    // ADR-0012 item 113: the binding volume's own capacity is the bound — the
+    // figure `volume write` gates its plan against (`volumes.capacity_bytes`,
+    // ADR-0010) — when the drive declares `post_warning_bytes`.
+    let plan_bound_bytes = backend.plan_bound_bytes(binding_capacity_bytes.max(0) as u64)?;
 
     Ok(DestinationBudget {
         bytes,
@@ -617,6 +769,8 @@ pub fn destination_budget(
         fill_ceiling: backend.fill_ceiling,
         reserve_bytes: enospc_buffer,
         already_staged_bytes: already_staged,
+        plan_bound_bytes,
+        unit_limit_bytes: usable.saturating_sub(enospc_buffer),
         warnings,
     })
 }
@@ -665,11 +819,20 @@ pub fn plan_for_run(
         )));
     }
     let budget = destination_budget(conn, config, device, labels)?;
+    // ADR-0012 item 113, as in `plan_for_collection_with_budget`.
+    let packing = Packing {
+        fill: budget.bytes,
+        past_ceiling: budget.plan_bound_bytes.map(|_| PastCeilingPacking {
+            room: budget.packing_bytes(),
+            unit_limit: budget.unit_limit_bytes,
+            unit_limit_describe: budget.describe_unit_limit(),
+        }),
+    };
     let (batches, refused) = batches_for_budget(
         conn,
         config,
         lib,
-        budget.bytes,
+        &packing,
         &budget.describe(),
         Some(&budget),
         policy_aware,
@@ -1116,8 +1279,16 @@ mod tests {
         assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
         assert_eq!(budget.num_destinations, 2);
 
-        let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", None, false).unwrap();
+        let (batches, refused) = batches_for_budget(
+            &conn,
+            &config,
+            &lib,
+            &Packing::under_ceiling(budget.bytes),
+            "test",
+            None,
+            false,
+        )
+        .unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1893,8 +2064,16 @@ mod tests {
              the other staged set, not the raw 10 MiB capacity"
         );
 
-        let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", None, false).unwrap();
+        let (batches, refused) = batches_for_budget(
+            &conn,
+            &config,
+            &lib,
+            &Packing::under_ceiling(budget.bytes),
+            "test",
+            None,
+            false,
+        )
+        .unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -2494,5 +2673,256 @@ compression = "bogus"
             .unwrap()
             .percent_of_tape_budget;
         assert!((share - 10.0).abs() < 1e-9, "{share}");
+    }
+
+    // ── the plan bound (ADR-0012 item 113) ──
+
+    const MIB: usize = 1024 * 1024;
+    /// A unit's size estimate runs a little over its one file (under 4 KiB,
+    /// as `the_largest_pending_unit_is_reported_as_a_share_of_the_tape`
+    /// allows), so a file of N MiB less this pads to exactly N MiB of blocks.
+    const SLACK: usize = 16 * 1024;
+
+    /// The tiny backend (a 10 MB `capacity_override`, no reserve) at a 50%
+    /// fill ceiling, with or without a measured post-warning room.
+    fn config_with_half_ceiling(room: Option<&str>) -> Config {
+        let mut config = config_with_tiny_backend();
+        config.backends.lto[0].fill_ceiling = 0.5;
+        config.backends.lto[0].post_warning_bytes = room.map(str::to_string);
+        config
+    }
+
+    fn names(units: &[selector::PendingUnit]) -> Vec<&str> {
+        units.iter().map(|u| u.name.as_str()).collect()
+    }
+
+    fn batch_names(batches: &[Batch]) -> Vec<Vec<&str>> {
+        batches.iter().map(|b| b.unit_names()).collect()
+    }
+
+    fn media_tenant() -> Connection {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// `collection plan` with the drive's `post_warning_bytes` packs a batch
+    /// to the whole 10 MB capacity instead of the 5 MB fill budget: whole
+    /// units, in the selector's name order, the ones after the ceiling named
+    /// by `past_ceiling_units`. Without the key the same units pack exactly
+    /// as the selector packs them at the fill budget, as before 1.6.0.
+    #[test]
+    fn plan_packs_whole_units_past_the_fill_ceiling_only_with_post_warning_bytes() {
+        let conn = media_tenant();
+        let (lib, _root, _home) = collection_of(
+            &conn,
+            &[
+                ("alpha", 2 * MIB - SLACK),
+                ("beta", 2 * MIB - SLACK),
+                ("gamma", 2 * MIB - SLACK),
+                ("delta", 4 * MIB - SLACK),
+            ],
+        );
+
+        let without = config_with_half_ceiling(None);
+        let (batches, refused, tape) =
+            plan_for_collection_with_budget(&conn, &without, &lib, None, None, false).unwrap();
+        assert!(refused.is_empty());
+        assert_eq!((tape.bytes, tape.plan_bound_bytes), (5_000_000, None));
+        let units: Vec<selector::PendingUnit> =
+            batches.iter().flat_map(|b| b.units.clone()).collect();
+        assert_eq!(
+            batches,
+            selector::plan_batches(units, 5_000_000, BLOCK_SIZE).unwrap(),
+            "without the key: the selector at the fill budget, unchanged"
+        );
+        assert_eq!(
+            batch_names(&batches),
+            [
+                vec!["testlib/alpha", "testlib/beta"],
+                vec!["testlib/delta"],
+                vec!["testlib/gamma"]
+            ]
+        );
+        assert!(batches
+            .iter()
+            .all(|b| past_ceiling_units(b, tape.bytes).is_empty()));
+
+        let with = config_with_half_ceiling(Some("3G"));
+        let (batches, refused, tape) =
+            plan_for_collection_with_budget(&conn, &with, &lib, None, None, false).unwrap();
+        assert!(refused.is_empty());
+        assert_eq!(
+            (tape.bytes, tape.plan_bound_bytes, tape.packing_bytes()),
+            (5_000_000, Some(10_000_000), 10_000_000)
+        );
+        // alpha + beta + delta = 8 MiB fit the 10 MB bound; gamma would
+        // take it to 10 MiB and starts the next batch.
+        assert_eq!(
+            batch_names(&batches),
+            [
+                vec!["testlib/alpha", "testlib/beta", "testlib/delta"],
+                vec!["testlib/gamma"]
+            ]
+        );
+        assert!(batches.iter().all(|b| b.padded_bytes <= 10_000_000));
+        // alpha + beta (4 MiB) are under the 5 MB ceiling; delta crosses it
+        // and is wholly past it.
+        assert_eq!(
+            names(past_ceiling_units(&batches[0], tape.bytes)),
+            ["testlib/delta"]
+        );
+        assert!(past_ceiling_units(&batches[1], tape.bytes).is_empty());
+    }
+
+    /// A unit alone must still fit under an empty tape's fill ceiling (it is
+    /// `stage create`'s limit): one between the ceiling and the bound is
+    /// refused with or without the key, in the same words.
+    #[test]
+    fn plan_refuses_a_unit_over_the_fill_ceiling_alone_even_with_the_bound() {
+        let conn = media_tenant();
+        let (lib, _root, _home) =
+            collection_of(&conn, &[("alpha", MIB - SLACK), ("big", 6 * MIB - SLACK)]);
+        let refusal = |config: &Config| {
+            plan_for_collection(&conn, config, &lib, None, None, false)
+                .unwrap_err()
+                .to_string()
+        };
+        let without = refusal(&config_with_half_ceiling(None));
+        let with = refusal(&config_with_half_ceiling(Some("3G")));
+        assert!(
+            with.contains("testlib/big") && with.contains("can never be batched"),
+            "{with}"
+        );
+        assert!(!with.contains("testlib/alpha"), "{with}");
+        assert_eq!(with, without);
+    }
+
+    /// `collection run` packs to the destination's whole capacity less the
+    /// staged data riding along, with the key; without it, to its fill budget
+    /// less that data, as before.
+    #[test]
+    fn run_packs_past_the_fill_ceiling_to_the_destinations_capacity_with_the_key() {
+        // L1 is 10 MiB; 1 MiB is already staged. The 50% ceiling leaves 4 MiB
+        // under it, and the bound leaves 9 MiB.
+        let conn = destination_with_staged_data(MIB as i64);
+        let (lib, _root, _home) = collection_of(
+            &conn,
+            &[
+                ("alpha", 2 * MIB - SLACK),
+                ("beta", 2 * MIB - SLACK),
+                ("gamma", 2 * MIB - SLACK),
+                ("delta", 2 * MIB - SLACK),
+                ("epsilon", 2 * MIB - SLACK),
+            ],
+        );
+        let plan = |config: &Config| {
+            plan_for_run(&conn, config, &lib, "/dev/null", &["L1".into()], false).unwrap()
+        };
+
+        let (batches, budget, _) = plan(&config_with_half_ceiling(None));
+        assert_eq!(
+            (
+                budget.bytes,
+                budget.plan_bound_bytes,
+                budget.packing_bytes()
+            ),
+            (4 * MIB as u64, None, 4 * MIB as u64)
+        );
+        assert_eq!(batches.len(), 3);
+        assert!(!budget.describe().contains("item 113"));
+
+        let (batches, budget, _) = plan(&config_with_half_ceiling(Some("3G")));
+        assert_eq!(
+            (
+                budget.bytes,
+                budget.plan_bound_bytes,
+                budget.packing_bytes()
+            ),
+            (4 * MIB as u64, Some(10 * MIB as u64), 9 * MIB as u64)
+        );
+        assert_eq!(
+            batch_names(&batches),
+            [
+                vec![
+                    "testlib/alpha",
+                    "testlib/beta",
+                    "testlib/delta",
+                    "testlib/epsilon"
+                ],
+                vec!["testlib/gamma"]
+            ]
+        );
+        assert_eq!(
+            names(past_ceiling_units(&batches[0], budget.bytes)),
+            ["testlib/delta", "testlib/epsilon"]
+        );
+        let text = budget.describe();
+        assert!(
+            text.contains(&format!("({} bytes)", 9 * MIB)) && text.contains("ADR-0012 item 113"),
+            "{text}"
+        );
+    }
+
+    /// With the key, staged data that leaves less than a unit to the bound
+    /// still says "write it first", naming what the bound leaves; and a unit
+    /// over an empty volume's fill ceiling is never batched, naming that
+    /// limit.
+    #[test]
+    fn run_with_the_key_refuses_by_the_bound_and_by_the_unit_limit() {
+        let room = config_with_half_ceiling(Some("3G"));
+        let conn = destination_with_staged_data(9 * MIB as i64);
+        let (lib, _root, _home) = collection_of(&conn, &[("alpha", 2 * MIB - SLACK)]);
+        let msg = plan_for_run(&conn, &room, &lib, "/dev/null", &["L1".into()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("staged data already takes")
+                && msg.contains("leaving 1.0 MB")
+                && msg.contains("`tapectl volume write L1`"),
+            "{msg}"
+        );
+
+        let conn = destination_with_staged_data(MIB as i64);
+        let (lib, _root, _home) = collection_of(&conn, &[("big", 6 * MIB - SLACK)]);
+        let msg = plan_for_run(&conn, &room, &lib, "/dev/null", &["L1".into()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("testlib/big")
+                && msg.contains("can never be batched")
+                && msg.contains("for one unit")
+                && msg.contains("as `stage create` requires"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn past_ceiling_units_keeps_the_batch_order_and_whole_units() {
+        let unit = |name: &str, blocks: u64| selector::PendingUnit {
+            name: name.into(),
+            size_bytes: blocks * BLOCK_SIZE,
+        };
+        let batch = Batch {
+            units: vec![unit("a", 3), unit("b", 3), unit("c", 1)],
+            total_bytes: 7 * BLOCK_SIZE,
+            padded_bytes: 7 * BLOCK_SIZE,
+        };
+        // b crosses a 5-block ceiling and is wholly past it; c would fit
+        // beside a alone but follows b.
+        assert_eq!(
+            names(past_ceiling_units(&batch, 5 * BLOCK_SIZE)),
+            ["b", "c"]
+        );
+        assert!(past_ceiling_units(&batch, 7 * BLOCK_SIZE).is_empty());
+        assert_eq!(
+            names(past_ceiling_units(&batch, 0)),
+            ["a", "b", "c"],
+            "no room under the ceiling: every unit is past it"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::config::Config;
@@ -68,23 +68,36 @@ pub enum CleanScope<'a> {
 /// The exact non-force `'staged'` eligibility condition [`clean_staging`]
 /// enforces, as a reusable SQL boolean expression (issue #96's
 /// single-derivation rule, restated for issue #279): at least one `writes`
-/// row references the stage_set named by `id_expr` and none of them is
-/// anything but `'completed'`. `id_expr` is the caller's own qualified
-/// column or placeholder (`stage_sets.id`, `ss.id`, `?1`) so this drops
-/// into any query's WHERE clause without forcing a particular alias.
+/// row of the stage_set named by `id_expr` is `'completed'`, and every
+/// other is `'completed'` or `'cut'`. `id_expr` is the caller's own
+/// qualified column or placeholder (`stage_sets.id`, `ss.id`, `?1`) so this
+/// drops into any query's WHERE clause without forcing a particular alias.
 ///
-/// Both `clean_staging`'s own non-force SQL below and
-/// `cli::staging::staged_release_candidate_units` build their queries from
-/// this same fragment; `cli::stage`'s live-slices refusal evaluates it
-/// directly against one stage_set id via [`is_release_candidate`]. None of
-/// the three hand-writes a second copy of the `EXISTS (SELECT 1 FROM
-/// writes ...)` pair.
-fn release_candidate_predicate_sql(id_expr: &str) -> String {
+/// **A `'cut'` row is no write** (1.6.0, issue #420; ADR-0012 item 112;
+/// `layout-session.md` "The short ending"). It is a stage set planned past
+/// where its tape sealed short: never a copy, and finished with, so it
+/// neither releases the staging nor holds it as an unfinished write would.
+/// A stage set whose only rows are `'cut'` therefore stays staged -- the
+/// next ordinary `volume write` writes it whole on another cartridge from
+/// exactly these slices -- and once one of its rows is `'completed'` it is
+/// released by the same rule as any other. Requiring a `'completed'` row
+/// (rather than any row) changes nothing for a set without `'cut'` rows:
+/// there, "every row completed" already implies one is.
+///
+/// `clean_staging`'s own non-force SQL below builds its query from this
+/// fragment. `cli::staging::staged_release_candidate_units` must state the
+/// same rule; this is `pub(crate)` so that query can be built from it too.
+/// [`release_blocker`] answers the same question per stage set, with the
+/// reason, and drops `'cut'` rows the same way.
+pub(crate) fn release_candidate_predicate_sql(id_expr: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = {id_expr})
+        "EXISTS (
+             SELECT 1 FROM writes w
+             WHERE w.stage_set_id = {id_expr} AND w.status = 'completed'
+         )
          AND NOT EXISTS (
              SELECT 1 FROM writes w
-             WHERE w.stage_set_id = {id_expr} AND w.status <> 'completed'
+             WHERE w.stage_set_id = {id_expr} AND w.status NOT IN ('completed', 'cut')
          )"
     )
 }
@@ -103,13 +116,22 @@ fn release_candidate_predicate_sql(id_expr: &str) -> String {
 /// exactly what makes the interrupted write unrecoverable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReleaseBlocker {
-    /// Nothing blocks it: at least one `writes` row and all of them
-    /// `'completed'`. A bare clean releases it unless the unit is below
-    /// its policy's `min_copies`.
+    /// Nothing blocks it: at least one `writes` row is `'completed'` and
+    /// every other is `'completed'` or `'cut'`. A bare clean releases it
+    /// unless the unit is below its policy's `min_copies`.
     None,
-    /// No `writes` row at all — staged and never written anywhere. A bare
-    /// clean does not see it; only `--force` releases it.
+    /// No `writes` row at all — staged and never written. A bare clean does
+    /// not see it; only `--force` releases it.
     NeverWritten,
+    /// Only `'cut'` rows (1.6.0, issue #420; ADR-0012 item 112): the stage
+    /// set was planned onto `volume_label`, whose tape sealed short before
+    /// it, so it is written whole nowhere. A cut is no write: the next
+    /// ordinary `volume write` onto another cartridge writes the set whole
+    /// from these slices, and only then does a bare clean release them.
+    /// Until then, as for [`Self::NeverWritten`], only `--force` releases
+    /// them. `volume_label` is the volume that cut it (the latest, when
+    /// several did).
+    Cut { volume_label: Option<String> },
     /// A write session is live RIGHT NOW (`'planned'` or `'in_progress'`)
     /// and is reading these slices.
     WriteInFlight { volume_label: Option<String> },
@@ -141,14 +163,34 @@ pub(crate) enum ReleaseBlocker {
 /// can disagree. A live session outranks a recoverable one, which outranks
 /// an abandoned one: the worst thing to be wrong about is telling someone
 /// to delete slices something is still using.
+///
+/// `'cut'` rows are dropped before any of that, as
+/// [`release_candidate_predicate_sql`] drops them: a cut is no write
+/// (ADR-0012 item 112), so it is never a blocker beside another row -- nor
+/// what the fall-through below would otherwise make of it, an abandoned
+/// session whose remedy is `--force`. Only a set with nothing but `'cut'`
+/// rows reads [`ReleaseBlocker::Cut`], so its refusal can name the volume
+/// that cut it and the write that finishes it.
 pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
     let statuses: Vec<String> = conn
-        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1")?
+        .prepare("SELECT status FROM writes WHERE stage_set_id = ?1 AND status <> 'cut'")?
         .query_map(params![stage_set_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if statuses.is_empty() {
-        return Ok(ReleaseBlocker::NeverWritten);
+        let cut_on: Option<Option<String>> = conn
+            .query_row(
+                "SELECT v.label FROM writes w LEFT JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND w.status = 'cut'
+                 ORDER BY w.id DESC LIMIT 1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(match cut_on {
+            Some(volume_label) => ReleaseBlocker::Cut { volume_label },
+            None => ReleaseBlocker::NeverWritten,
+        });
     }
     if statuses.iter().all(|s| s == "completed") {
         return Ok(ReleaseBlocker::None);
@@ -213,9 +255,11 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 ///   `writes` row referencing it; there is no "wait for every planned copy"
 ///   invariant to protect, unlike the `'staged'` guard below.
 ///
-/// The `'staged'` default guard requires (a) at least one `writes` row
-/// exists for the stage_set (it was actually planned onto some volume), AND
-/// (b) no `writes` row for it is anything other than `'completed'`. This is
+/// The `'staged'` default guard requires (a) at least one `writes` row for
+/// the stage_set is `'completed'` (it was actually written whole somewhere),
+/// AND (b) no `writes` row for it is anything other than `'completed'` or
+/// `'cut'` -- a `'cut'` row (1.6.0, issue #420) is no write, see
+/// [`release_candidate_predicate_sql`]. This is
 /// stricter than "at least one completed write": a stage_set batched onto
 /// two cartridges (2 copies) with one sealed and the other still
 /// `'planned'`/`'in_progress'`/`'interrupted'` — or terminally `'aborted'`/
@@ -696,8 +740,8 @@ pub struct CleanReport {
     /// separately because a count alone does not say *which* file.
     pub stranded: Vec<std::path::PathBuf>,
     /// `sessions/*` directories removed because every `writes` row
-    /// referencing them reached a terminal state (`completed`, `failed`,
-    /// `aborted`) — see `reclaim_session_dirs`.
+    /// referencing them reached a terminal state (`completed`, `cut`,
+    /// `failed`, `aborted`) — see `reclaim_session_dirs`.
     pub session_dirs_reclaimed: usize,
     /// `sessions/*` directories left untouched because at least one
     /// referencing `writes` row is still `planned`, `in_progress`, or
@@ -763,8 +807,10 @@ pub struct CleanReport {
 ///   those are the only statuses that must block reclamation.
 /// - **RECLAIM** (remove recursively, size added to `bytes_freed`) once at
 ///   least one row references the dir and every one of them is
-///   `completed`, `failed`, or `aborted` — none of those states leave a
-///   resumable session behind — EXCEPT (issue #402) an `aborted` session
+///   `completed`, `cut`, `failed`, or `aborted` — none of those states leave
+///   a resumable session behind (a `cut` row's volume sealed short and was
+///   confirmed; the slices it did write stay recorded in `write_positions`,
+///   not here) — EXCEPT (issue #402) an `aborted` session
 ///   on a sealed volume that `volume resume` would re-confirm after a clean
 ///   full verify (`session::aborted_session_reconfirmable_after_verify`):
 ///   adoption loads its frozen Layout from this directory, so it is kept
@@ -1003,6 +1049,12 @@ fn remove_leftover(path: &Path, report: &mut CleanReport) {
     }
 }
 
+/// The `writes.status` values that keep a session directory: a session that
+/// is live (`planned`, `in_progress`) or resumable (`interrupted`). Every
+/// other status -- `completed`, `cut`, `failed`, `aborted` -- leaves no
+/// resumable session behind (see [`reclaim_session_dirs_and_lockfiles`]).
+const SESSION_NON_TERMINAL: [&str; 3] = ["planned", "in_progress", "interrupted"];
+
 fn reclaim_session_dirs(
     conn: &Connection,
     config: &Config,
@@ -1014,8 +1066,6 @@ fn reclaim_session_dirs(
         Ok(e) => e,
         Err(_) => return Ok(()), // no sessions dir yet — nothing to do
     };
-
-    const NON_TERMINAL: [&str; 3] = ["planned", "in_progress", "interrupted"];
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1042,7 +1092,7 @@ fn reclaim_session_dirs(
             continue;
         }
 
-        let any_non_terminal = statuses.iter().any(|s| NON_TERMINAL.contains(s));
+        let any_non_terminal = statuses.iter().any(|s| SESSION_NON_TERMINAL.contains(s));
         if any_non_terminal {
             report.session_dirs_retained += 1;
             continue;
@@ -1080,7 +1130,7 @@ fn reclaim_session_dirs(
             }
         }
 
-        // Every referencing row is completed/failed/aborted — reclaim.
+        // Every referencing row is completed/cut/failed/aborted — reclaim.
         remove_dir_and_account(&path, report);
         report.session_dirs_reclaimed += 1;
     }
@@ -1866,6 +1916,159 @@ mod tests {
             );
             assert!(path.exists());
         }
+    }
+
+    // --- `cut` (1.6.0, issue #420; ADR-0012 item 112) ---
+
+    /// A `cut` row for `stage_set_id` on a volume that sealed short at
+    /// `ended_after`: the only shape the spec allows a `cut` row in.
+    fn seed_cut(conn: &Connection, stage_set_id: i64, label: &str, ended_after: i64) {
+        seed_write(conn, stage_set_id, label, "cut");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', sealed_at = datetime('now'), ended_after = ?2
+             WHERE label = ?1",
+            params![label, ended_after],
+        )
+        .unwrap();
+    }
+
+    /// A `cut` row is no write: a stage set whose only row is `cut` was
+    /// never written whole, and the next `volume write` rewrites it from
+    /// these slices, so a bare clean keeps it. The positive control is the
+    /// same row `completed`, which the same call releases.
+    #[test]
+    fn default_guard_keeps_a_set_whose_only_write_is_cut() {
+        let (conn, stage_set_id, path, dir) = seed_stage_set();
+        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 0, "a cut-only set must stay staged");
+        assert!(path.exists());
+
+        conn.execute("UPDATE writes SET status = 'completed'", [])
+            .unwrap();
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
+        assert_eq!(
+            report.sets_cleaned, 1,
+            "positive control: completed releases"
+        );
+        assert!(!path.exists());
+    }
+
+    /// Once the cut set is written whole on another cartridge, the `cut` row
+    /// does not hold its staging the way an unfinished write would: it is
+    /// released by the same rule as any other.
+    #[test]
+    fn default_guard_releases_a_cut_set_once_it_is_completed_elsewhere() {
+        let (conn, stage_set_id, path, dir) = seed_stage_set();
+        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
+
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 1);
+        assert_eq!(report.files_removed, 1);
+        assert!(!path.exists());
+    }
+
+    /// A `cut` row excuses nothing else: beside a completed copy, any other
+    /// row that is not `completed` still keeps the staging, exactly as it
+    /// does without the cut.
+    #[test]
+    fn a_cut_row_does_not_excuse_an_unfinished_or_abandoned_write_elsewhere() {
+        for other in ["planned", "in_progress", "interrupted", "aborted", "failed"] {
+            let (conn, stage_set_id, path, dir) = seed_stage_set();
+            seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+            seed_write(&conn, stage_set_id, "V-SEALED", "completed");
+            seed_write(&conn, stage_set_id, "V-OTHER", other);
+
+            let report =
+                clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
+            assert_eq!(report.sets_cleaned, 0, "must not clean beside '{other}'");
+            assert!(path.exists(), "staged file must survive beside '{other}'");
+        }
+    }
+
+    /// `release_blocker` drops `cut` rows before it classifies, as the guard
+    /// does: cut-only reads as cut, naming the volume that cut it (the next
+    /// `volume write` onto another cartridge is the remedy), cut beside a
+    /// completed copy reads as releasable, and a cut never turns an
+    /// interrupted session into an abandoned one -- the fall-through a `cut`
+    /// row would otherwise take, whose advice is `--force`.
+    #[test]
+    fn release_blocker_treats_a_cut_row_as_no_write() {
+        let (conn, stage_set_id, _path, _dir) = seed_stage_set();
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::NeverWritten,
+            "positive control: no row at all is never written"
+        );
+        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::Cut {
+                volume_label: Some("V-SHORT".into())
+            }
+        );
+        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::None
+        );
+
+        let (conn, stage_set_id, _path, _dir) = seed_stage_set();
+        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+        seed_write(&conn, stage_set_id, "V-PAUSED", "interrupted");
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::Interrupted {
+                volume_label: Some("V-PAUSED".into())
+            }
+        );
+
+        let (conn, stage_set_id, _path, _dir) = seed_stage_set();
+        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
+        seed_write(&conn, stage_set_id, "V-DEAD", "aborted");
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::Abandoned { reconfirm_on: None },
+            "the aborted row is the blocker, not the cut one"
+        );
+    }
+
+    /// A short-sealed session is finished with its directory: its volume is
+    /// sealed and confirmed, and the slices a `cut` row did write stay in
+    /// `write_positions`. So `cut`, like `completed`, frees the directory.
+    #[test]
+    fn session_dir_reclaimed_when_write_is_cut() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "cut");
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+
+        assert!(!session_dir.exists());
+        assert_eq!(report.session_dirs_reclaimed, 1);
+        assert_eq!(report.session_dirs_retained, 0);
+    }
+
+    /// Every `writes.status` the schema admits is either one that keeps a
+    /// session directory ([`SESSION_NON_TERMINAL`]) or one this module
+    /// treats as finished with it. A status added to the schema fails here
+    /// until someone decides which it is (`live_status_check`'s reason).
+    #[test]
+    fn session_dir_statuses_cover_every_write_status() {
+        let finished = ["completed", "cut", "failed", "aborted"];
+        let mut covered: Vec<String> = SESSION_NON_TERMINAL
+            .iter()
+            .chain(finished.iter())
+            .map(|s| s.to_string())
+            .collect();
+        covered.sort();
+        assert_eq!(covered, crate::db::live_status_check("writes"));
     }
 
     #[test]

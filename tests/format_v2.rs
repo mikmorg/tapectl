@@ -22,22 +22,25 @@
 mod common;
 
 use std::io::Read;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use common::{generate_collection, MicroSpec, UnitFixture, MICRO_BLOCK};
+use tapectl::config::Config;
 use tapectl::crypto::keys::{generate_keypair, GeneratedKeypair};
 use tapectl::db;
 use tapectl::policy::coverage::IndexThisTape;
 use tapectl::staging;
-use tapectl::store::{MemStore, MismatchKind, Store, Tier};
+use tapectl::store::{ConfirmPlan, MemStore, MismatchKind, Store, Tier};
+use tapectl::tape::contact::{ContactSite, Medium, Operation};
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
 use tapectl::volume::format;
 use tapectl::volume::index;
 use tapectl::volume::layout_model::{KeyAvailability, Layout, SliceCheck, ZoneKind};
-use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
+use tapectl::volume::rebuild;
+use tapectl::volume::session::{ConfirmOutcome, Ending, ExecuteOutcome, SealedSession};
 
 /// Format constant (never scaled, per `v2-open-questions.md` §8) — reused
 /// from the T3 fixture module rather than redeclared.
@@ -83,7 +86,11 @@ struct UnitPlain {
     /// The `sha256_plain` the catalog recorded for the unit's one slice: the
     /// real hash of `plaintext` when the build asked for it
     /// ([`HarnessSpec::real_plaintext_hash`]), else the harness placeholder.
+    /// With several slices ([`HarnessSpec::slices_per_unit`]), the first's.
     sha256_plain: String,
+    /// Every slice's recorded `sha256_plain`, in slice order: each the hash
+    /// of its own part of `plaintext` when the build asked for real ones.
+    slice_sha256_plain: Vec<String>,
 }
 
 /// What a sealed-harness build is made of beyond its fixture units: the names
@@ -110,6 +117,11 @@ struct HarnessSpec<'a> {
     /// the second the second tenant's last): what the cross-volume index
     /// (§1.5) lists beyond this tape, and what must not cross tenants.
     history: [&'a str; 2],
+    /// The staged slices each unit is cut into: its plaintext in this many
+    /// contiguous parts, each age-encrypted on its own (a dar slice each,
+    /// as staging makes them). 1 for every tape but the short one, whose cut
+    /// unit has a slice on the tape and a slice past its end (#420).
+    slices_per_unit: usize,
 }
 
 impl Default for HarnessSpec<'_> {
@@ -120,6 +132,7 @@ impl Default for HarnessSpec<'_> {
             real_plaintext_hash: false,
             escrow: false,
             history: ["T7HIST-ALPHA", "T7HIST-BRAVO"],
+            slices_per_unit: 1,
         }
     }
 }
@@ -297,6 +310,168 @@ fn build_sealed_harness_from(
     spec: &HarnessSpec<'_>,
     volume_uuid: &str,
 ) -> Harness {
+    let p = prepare_harness(fixtures, spec, volume_uuid);
+    let run = run_session(
+        &p.conn,
+        p.built,
+        &p.keys,
+        p.volume_id,
+        &p.build_units,
+        MemStore::new(BS as usize),
+    );
+    match run.outcome {
+        ConfirmOutcome::Sealed(_) => {}
+        ConfirmOutcome::Quarantined(q) => {
+            panic!("harness must end Sealed, got Quarantined: {:?}", q.reason)
+        }
+        ConfirmOutcome::Inconclusive(inc) => {
+            panic!(
+                "harness must end Sealed, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            )
+        }
+    }
+    Harness {
+        operator: p.operator,
+        escrow: p.escrow,
+        layout: run.layout,
+        store: run.store,
+        tenants: p.tenants,
+        units: p.units,
+        history: p.history,
+    }
+}
+
+/// A harness's catalog, keys, staged slices and built Layout, before any
+/// session ran over them: what [`build_sealed_harness_from`] seals in full
+/// and [`build_short_harness`] seals short. The directories hold the catalog,
+/// the staged slices, the index's work files and the session's
+/// materialized files, and live as long as this does.
+struct Prepared {
+    conn: rusqlite::Connection,
+    operator: TenantFixture,
+    escrow: Option<GeneratedKeypair>,
+    tenants: Vec<TenantFixture>,
+    units: Vec<UnitPlain>,
+    history: Vec<(String, i64, String)>,
+    build_units: Vec<BuildUnit>,
+    built: BuiltLayout,
+    keys: KeyAvailability,
+    volume_id: i64,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+/// What one session run over a [`Prepared`] harness ended with.
+struct SessionRun {
+    /// The sealed Layout, cloned before the typestate consumed it.
+    layout: Layout,
+    store: MemStore,
+    /// The seal this session wrote: [`ExecuteOutcome::Ready`]'s ending.
+    ending: Ending,
+    outcome: ConfirmOutcome,
+}
+
+/// The FULL v2 write session — build's Layout -> validate -> plan -> execute
+/// -> seal -> confirm at `Tier::Integrity` — over `store`. Panics unless
+/// execute reaches a seal: every caller is a harness that needs one.
+fn run_session(
+    conn: &rusqlite::Connection,
+    built: BuiltLayout,
+    keys: &KeyAvailability,
+    volume_id: i64,
+    build_units: &[BuildUnit],
+    mut store: MemStore,
+) -> SessionRun {
+    // Snapshot BEFORE the typestate chain below consumes `built` — see the
+    // `Harness::layout` doc comment; `confirm`'s success arm does not hand
+    // the Layout back.
+    let layout = built.layout.clone();
+    let validated = built
+        .into_validated(keys, SliceCheck::Size, &mut store)
+        .expect("validate should pass for a well-formed microcosm build");
+    let planned = validated
+        .plan(conn, volume_id, build_units)
+        .expect("plan should insert writes/write_positions rows");
+    let ready = match planned
+        .execute(conn, &mut store)
+        .expect("execute should not error")
+    {
+        ExecuteOutcome::Ready(r) => r,
+        ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption building the harness"),
+        ExecuteOutcome::Aborted(a) => panic!("unexpected abort building the harness: {}", a.reason),
+    };
+    let ending = ready.ending();
+    let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+    let outcome = sealed_pending
+        .confirm(conn, &mut store, Tier::Integrity)
+        .expect("confirm should not error");
+    SessionRun {
+        layout,
+        store,
+        ending,
+        outcome,
+    }
+}
+
+/// The build inputs of a harness tape labelled `label`, whose chip serial is
+/// `serial`: the microcosm's fixed figures, `units`, the tenants', operator's
+/// and escrow recipient's keys, and the cross-volume index.
+#[allow(clippy::too_many_arguments)]
+fn harness_inputs(
+    label: &str,
+    volume_uuid: &str,
+    serial: &str,
+    units: Vec<BuildUnit>,
+    tenants: &[TenantFixture],
+    operator: &TenantFixture,
+    escrow_public_key: Option<String>,
+    index: Option<index::IndexFiles>,
+) -> BuildInputs {
+    BuildInputs {
+        label: label.to_string(),
+        volume_uuid: volume_uuid.to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "0.1.0-test".to_string(),
+        created_at: "2026-07-22T20:09:00Z".to_string(),
+        block_size: BS,
+        // Comfortably above the worst case (n_units * <15M) at microcosm
+        // scale; not the property under test here (T5b/T6 own capacity math).
+        usable_bytes: 256 * 1024 * 1024,
+        enospc_buffer: 8 * 1024 * 1024, // matches common::MICRO_ENOSPC
+        nominal_capacity: 2_400_000_000, // matches common::MICRO_TAPE_NOMINAL
+        mam_capacity: 2_400_000_000,
+        mam_manufacturer: "TAPECTL-TEST".to_string(),
+        mam_serial: serial.to_string(),
+        // A chip-reported serial (issue #192): the sealed harness stands in
+        // for a volume bound from MAM, so File 0 must attest "mam" and an
+        // heir reading the recorded bytes alone must be able to see that.
+        cartridge_identity_source: Some("mam".to_string()),
+        mam_length: 0,
+        mam_loads: 0,
+        units,
+        tenants: tenants
+            .iter()
+            .map(|t| TenantInfo {
+                tenant_id: t.tenant_id,
+                tenant_name: t.name.clone(),
+                public_keys: vec![t.public_key.clone()],
+            })
+            .collect(),
+        operator_public_keys: vec![operator.public_key.clone()],
+        escrow_public_key,
+        catalog_db_path: None,
+        index,
+    }
+}
+
+/// [`build_sealed_harness_from`]'s first half: the catalog rows, keys,
+/// staged slices and built Layout of `fixtures`, named and keyed as `spec`
+/// says, ready for a session.
+fn prepare_harness(
+    fixtures: &[UnitFixture],
+    spec: &HarnessSpec<'_>,
+    volume_uuid: &str,
+) -> Prepared {
     // `db::open_memory` is `#[cfg(test)]`-gated (unit-test-only), so it does
     // not exist in the normal rlib an integration test links against. A real
     // temp-file DB via the unconditionally-`pub` `db::open` is functionally
@@ -372,42 +547,61 @@ fn build_sealed_harness_from(
         // `escrow_recipient_present: None` below opts the check out).
         let mut recipients = vec![tenant.public_key.clone(), operator.public_key.clone()];
         recipients.extend(escrow_public_key.clone());
-        let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
-        // sha256_plain is never read back by any of this suite's assertions
-        // or by the validate/execute/confirm code paths under test (only
-        // `sha256_encrypted` is — `volume-format-v2.md` §3's front index
-        // carries ciphertext hashes only); a placeholder skips a second full
-        // ~N MiB debug-mode hash pass per unit purely for test wall-clock,
-        // matching `build.rs`'s own test fixture's identical shortcut
-        // (`sha_hex(b"plaintext hash is not exercised by this fixture")`).
-        let sha_plain = if spec.real_plaintext_hash {
-            sha256_hex(&plaintext)
-        } else {
-            sha256_hex(b"plaintext hash is not exercised by this harness")
-        };
-        let sha_enc = sha256_hex(&encrypted);
+        // Each part of the plaintext is one slice, encrypted on its own; with
+        // one slice per unit (every harness but the short one) the part is
+        // the whole plaintext.
+        let part_len = plaintext.len().div_ceil(spec.slices_per_unit.max(1)).max(1);
+        let mut slices = Vec::new();
+        let mut slice_sha256_plain = Vec::new();
+        for (n, part) in plaintext.chunks(part_len).enumerate() {
+            let encrypted = staging::encrypt_data(part, &recipients).unwrap();
+            // sha256_plain is never read back by any of this suite's assertions
+            // or by the validate/execute/confirm code paths under test (only
+            // `sha256_encrypted` is — `volume-format-v2.md` §3's front index
+            // carries ciphertext hashes only); a placeholder skips a second full
+            // ~N MiB debug-mode hash pass per unit purely for test wall-clock,
+            // matching `build.rs`'s own test fixture's identical shortcut
+            // (`sha_hex(b"plaintext hash is not exercised by this fixture")`).
+            let sha_plain = if spec.real_plaintext_hash {
+                sha256_hex(part)
+            } else {
+                sha256_hex(b"plaintext hash is not exercised by this harness")
+            };
+            let sha_enc = sha256_hex(&encrypted);
 
-        conn.execute(
-            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                        sha256_plain, sha256_encrypted)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                stage_set_id,
-                plaintext.len() as i64,
-                encrypted.len() as i64,
-                sha_plain,
-                sha_enc
-            ],
-        )
-        .unwrap();
-        let slice_id = conn.last_insert_rowid();
-        let slice_path = slices_dir.path().join(format!("slice_{slice_id}.age"));
-        std::fs::write(&slice_path, &encrypted).unwrap();
-        conn.execute(
-            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-            rusqlite::params![slice_path.to_string_lossy(), slice_id],
-        )
-        .unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                            sha256_plain, sha256_encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    stage_set_id,
+                    n as i64 + 1,
+                    part.len() as i64,
+                    encrypted.len() as i64,
+                    sha_plain,
+                    sha_enc
+                ],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            let slice_path = slices_dir.path().join(format!("slice_{slice_id}.age"));
+            std::fs::write(&slice_path, &encrypted).unwrap();
+            conn.execute(
+                "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+                rusqlite::params![slice_path.to_string_lossy(), slice_id],
+            )
+            .unwrap();
+            slices.push(BuildSlice {
+                slice_id,
+                slice_number: n as i64 + 1,
+                size_bytes: part.len() as i64,
+                encrypted_bytes: encrypted.len() as i64,
+                sha256_plain: sha_plain.clone(),
+                sha256_encrypted: sha_enc,
+                staging_path: slice_path,
+            });
+            slice_sha256_plain.push(sha_plain);
+        }
 
         build_units.push(BuildUnit {
             stage_set_id,
@@ -419,15 +613,7 @@ fn build_sealed_harness_from(
             dar_command: None,
             catalog_path: None,
             snapshot_version: 1,
-            slices: vec![BuildSlice {
-                slice_id,
-                slice_number: 1,
-                size_bytes: plaintext.len() as i64,
-                encrypted_bytes: encrypted.len() as i64,
-                sha256_plain: sha_plain.clone(),
-                sha256_encrypted: sha_enc,
-                staging_path: slice_path,
-            }],
+            slices,
         });
         units_plain.push(UnitPlain {
             unit_name: fixture.folder_name.clone(),
@@ -440,7 +626,8 @@ fn build_sealed_harness_from(
                 .map(|(n, _)| sha256_hex(&std::fs::read(fixture.path.join(n)).unwrap()))
                 .collect(),
             plaintext,
-            sha256_plain: sha_plain,
+            sha256_plain: slice_sha256_plain[0].clone(),
+            slice_sha256_plain,
         });
     }
 
@@ -517,51 +704,22 @@ fn build_sealed_harness_from(
     )
     .unwrap();
 
-    let inputs = BuildInputs {
-        label: "T7MICRO".to_string(),
-        volume_uuid: volume_uuid.to_string(),
-        media_type: "LTO-6".to_string(),
-        tapectl_version: "0.1.0-test".to_string(),
-        created_at: "2026-07-22T20:09:00Z".to_string(),
-        block_size: BS,
-        // Comfortably above the worst case (n_units * <15M) at microcosm
-        // scale; not the property under test here (T5b/T6 own capacity math).
-        usable_bytes: 256 * 1024 * 1024,
-        enospc_buffer: 8 * 1024 * 1024, // matches common::MICRO_ENOSPC
-        nominal_capacity: 2_400_000_000, // matches common::MICRO_TAPE_NOMINAL
-        mam_capacity: 2_400_000_000,
-        mam_manufacturer: "TAPECTL-TEST".to_string(),
-        mam_serial: "T7SERIAL".to_string(),
-        // A chip-reported serial (issue #192): the sealed harness stands in
-        // for a volume bound from MAM, so File 0 must attest "mam" and an
-        // heir reading the recorded bytes alone must be able to see that.
-        cartridge_identity_source: Some("mam".to_string()),
-        mam_length: 0,
-        mam_loads: 0,
-        units: build_units.clone(),
-        tenants: tenants
-            .iter()
-            .map(|t| TenantInfo {
-                tenant_id: t.tenant_id,
-                tenant_name: t.name.clone(),
-                public_keys: vec![t.public_key.clone()],
-            })
-            .collect(),
-        operator_public_keys: vec![operator.public_key.clone()],
-        escrow_public_key: escrow_public_key.clone(),
-        catalog_db_path: None,
-        index: Some(index_files),
-    };
+    let inputs = harness_inputs(
+        "T7MICRO",
+        volume_uuid,
+        "T7SERIAL",
+        build_units.clone(),
+        &tenants,
+        &operator,
+        escrow_public_key.clone(),
+        Some(index_files),
+    );
 
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
     // The index is plaintext until it is in an envelope: none of it may be in
     // the directory `build()` fills (staging's stand-in), under any name.
     assert_no_index_plaintext(session_dir.path());
-    // Snapshot BEFORE the typestate chain below consumes `built` — see the
-    // `Harness::layout` doc comment; `confirm`'s success arm does not hand
-    // the Layout back.
-    let layout_snapshot = built.layout.clone();
 
     let keys = KeyAvailability {
         tenant_ids: tenants.iter().map(|t| t.tenant_id).collect(),
@@ -571,46 +729,18 @@ fn build_sealed_harness_from(
         stage_sets_lacking_escrow: None,
     };
 
-    let mut store = MemStore::new(BS as usize);
-    let validated = built
-        .into_validated(&keys, SliceCheck::Size, &mut store)
-        .expect("validate should pass for a well-formed microcosm build");
-    let planned = validated
-        .plan(&conn, volume_id, &build_units)
-        .expect("plan should insert writes/write_positions rows");
-    let ready = match planned
-        .execute(&conn, &mut store)
-        .expect("execute should not error")
-    {
-        ExecuteOutcome::Ready(r) => r,
-        ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption building the harness"),
-        ExecuteOutcome::Aborted(a) => panic!("unexpected abort building the harness: {}", a.reason),
-    };
-    let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
-    let outcome = sealed_pending
-        .confirm(&conn, &mut store, Tier::Integrity)
-        .expect("confirm should not error");
-    match outcome {
-        ConfirmOutcome::Sealed(_) => {}
-        ConfirmOutcome::Quarantined(q) => {
-            panic!("harness must end Sealed, got Quarantined: {:?}", q.reason)
-        }
-        ConfirmOutcome::Inconclusive(inc) => {
-            panic!(
-                "harness must end Sealed, got Inconclusive: {:?}",
-                inc.evidence.mismatches
-            )
-        }
-    }
-
-    Harness {
+    Prepared {
+        conn,
         operator,
         escrow,
-        layout: layout_snapshot,
-        store,
         tenants,
         units: units_plain,
         history,
+        build_units,
+        built,
+        keys,
+        volume_id,
+        _dirs: vec![db_dir, slices_dir, index_work, session_dir],
     }
 }
 
@@ -1548,7 +1678,13 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
     let h = shared_harness();
     let last = h.store.files.len() - 1;
     let seal = String::from_utf8_lossy(&h.store.files[last]).to_string();
-    assert!(seal.contains("\nrequires = []\n"), "a 1.1.0 seal states it");
+    // Every seal 1.6.0 writes states `requires = ["short-seal"]` (ADR-0012
+    // item 111); a 1.1.0 to 1.5.0 seal stated `requires = []`.
+    let stated = "requires = [\"short-seal\"]";
+    assert!(
+        seal.contains(&format!("\n{stated}\n")),
+        "a 1.6.0 seal states it"
+    );
 
     let with = |s: String| {
         let mut store = MemStore::new(BS as usize);
@@ -1561,12 +1697,13 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
             .expect("Store::confirm reports via Evidence, never Err")
     };
 
-    let evidence = with(seal.replacen("requires = []", "requires = [\"short-seal\"]", 1));
+    let evidence = with(seal.replacen(stated, "requires = [\"unknown-feature\"]", 1));
     assert!(
         evidence
             .mismatches
             .iter()
-            .any(|m| m.kind == MismatchKind::SealUnreadable && m.actual.contains("\"short-seal\"")),
+            .any(|m| m.kind == MismatchKind::SealUnreadable
+                && m.actual.contains("\"unknown-feature\"")),
         "{:?}",
         evidence.mismatches
     );
@@ -1574,34 +1711,42 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
 
     // Control: an unknown key that is not required changes nothing (the
     // padded seal bytes are not hashed by anything on the tape).
-    let evidence = with(seal.replacen("requires = []", "requires = []\nended_after = 7", 1));
+    let evidence = with(seal.replacen(stated, &format!("{stated}\nfuture_key = 7"), 1));
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
 }
 
-/// ADR-0012 2026-10-16 item 73, from a REAL `build()`: the 1.2.0 re-pin
-/// changes generated text, not what a reader must understand. File 0 and the
-/// seal marker still say `requires = []`, and the File 2 the build wrote still
-/// knows no feature and still names "tapectl 1.1.0" as the version a newer
-/// tape would need.
+/// ADR-0012 item 111, from a REAL `build()`: every tape 1.6.0 writes fences
+/// out older readers. File 0 states `requires = ["short-seal"]` on the line
+/// after `layout_version`, File 3 states `may_end_early = true`
+/// (`volume-format-v2.md` §1.7), and the File 2 the
+/// build wrote knows `short-seal` and names "tapectl 1.6.0" as the version a
+/// newer tape would need (§6 "Since 1.6.0"). (Until 1.6.0 this test pinned
+/// item 73's fixed points: `requires = []` and "tapectl 1.1.0". The seal's
+/// own `requires` is the seal generator's, and is pinned with it.)
 #[test]
-fn the_re_pin_leaves_requires_empty_and_the_newer_tape_text_at_1_1_0() {
+fn a_built_tape_requires_short_seal_and_its_restore_sh_knows_it() {
     let h = shared_harness();
     let text_of = |pos: usize| {
         String::from_utf8_lossy(&h.store.files[pos])
             .trim_end_matches('\0')
             .to_string()
     };
-    let last = h.store.files.len() - 1;
-    assert!(text_of(0).contains("\nrequires = []\n"), "File 0");
-    assert!(text_of(last).contains("\nrequires = []\n"), "seal marker");
-    let restore_sh = text_of(2);
     assert!(
-        restore_sh.contains("\nKNOWN_FEATURES=\"\"\n"),
-        "RESTORE.sh knows no feature"
+        text_of(0).contains("\nlayout_version = 2\nrequires = [\"short-seal\"]\n"),
+        "File 0"
     );
     assert!(
-        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely"),
-        "die_newer_needed says 1.1.0"
+        text_of(3).contains("\nlayout_version = 2\nmay_end_early = true\n"),
+        "File 3"
+    );
+    let restore_sh = text_of(2);
+    assert!(
+        restore_sh.contains("\nKNOWN_FEATURES=\"short-seal\"\n"),
+        "RESTORE.sh knows short-seal"
+    );
+    assert!(
+        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely"),
+        "die_newer_needed says 1.6.0"
     );
 }
 
@@ -1708,6 +1853,12 @@ fn plaintext_zone_needles(h: &Harness, fixtures: &[UnitFixture]) -> Vec<String> 
         }
     }
     needles.extend(h.units.iter().map(|u| u.sha256_plain.clone()));
+    // A unit in several slices records each part's plaintext hash.
+    needles.extend(
+        h.units
+            .iter()
+            .flat_map(|u| u.slice_sha256_plain.iter().cloned()),
+    );
     // The labels of the OTHER volumes the cross-volume index names (§1.5):
     // encrypted in the envelopes, and nowhere in the clear.
     needles.extend(h.history.iter().map(|(label, _, _)| label.clone()));
@@ -1741,6 +1892,7 @@ fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
         real_plaintext_hash: true,
         escrow: true,
         history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+        ..HarnessSpec::default()
     };
     let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
     let needles = plaintext_zone_needles(&h, &fixtures);
@@ -2240,6 +2392,7 @@ fn the_history_labels_are_on_the_tape_only_inside_the_operator_envelope() {
         real_plaintext_hash: false,
         escrow: true,
         history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+        ..HarnessSpec::default()
     };
     let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
     let labels = [NEEDLE_VOLUME_A.to_string(), NEEDLE_VOLUME_B.to_string()];
@@ -2308,4 +2461,884 @@ fn the_history_labels_are_on_the_tape_only_inside_the_operator_envelope() {
         "the operator's map names a path"
     );
     assert_eq!(find_needles(map.as_bytes(), &units_ab).len(), 2);
+}
+
+// ── #420: a tape the drive's early warning ended (`volume-format-v2.md` §4.1-§4.3) ──
+
+/// A short-sealed tape (§4.1): the full session against a `MemStore` whose
+/// early warning comes inside one unit's first slice, so the session writes
+/// that slice whole, writes no further data entry and seals short after it
+/// (§4.3 W4). Kept with it is everything the later legs need: the catalog
+/// (behind a lock, so the tape is shared like [`shared_harness`]'s), the
+/// staged slices the next write reads, and how the session ended.
+struct ShortHarness {
+    /// The tape, its Layout (the plan), and the fixture's keys and plaintext,
+    /// as the full-tape assertions above read them.
+    tape: Harness,
+    conn: Mutex<rusqlite::Connection>,
+    build_units: Vec<BuildUnit>,
+    volume_id: i64,
+    /// K: the data slice the early warning came in, the last tape file
+    /// before the short seal at K+1.
+    ended_after: u32,
+    /// M: the planned seal position, File 0's `seal_marker`.
+    planned_seal: u32,
+    /// What confirm returned: the ending, and the units it made `cut`.
+    sealed: SealedSession,
+    /// The indices into `tape.units` (and `build_units`) the tape cut, in
+    /// plan order: the unit the warning interrupted, then every one after.
+    cut: Vec<usize>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+/// The Layout position of `unit`'s slice `n` (0-based).
+fn slice_position(layout: &Layout, unit: &BuildUnit, n: usize) -> u32 {
+    let id = unit.slices[n].slice_id;
+    layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::Slice { stage_slice_id } if stage_slice_id == id))
+        .expect("every staged slice is planned")
+        .position as u32
+}
+
+/// The padded on-tape bytes of every Layout entry before `position`: what a
+/// store opened at the beginning of the tape has written when that file
+/// starts.
+fn bytes_before(layout: &Layout, position: u32) -> u64 {
+    layout
+        .entries
+        .iter()
+        .filter(|e| (e.position as u32) < position)
+        .map(|e| {
+            e.on_tape_bytes(BS)
+                .expect("every entry before the seal is sized")
+        })
+        .sum()
+}
+
+/// [`prepare_harness`] then the full session over a `MemStore` whose early
+/// warning comes one byte into the first slice of unit `cut_unit`. Panics
+/// unless the session seals short at that slice, confirms `Sealed`, and the
+/// plan cut exactly `cut_unit` and every unit after it.
+fn build_short_harness(
+    fixtures: &[UnitFixture],
+    spec: &HarnessSpec<'_>,
+    volume_uuid: &str,
+    cut_unit: usize,
+) -> ShortHarness {
+    assert!(
+        spec.slices_per_unit >= 2,
+        "a cut unit needs a slice on the tape and a slice past its end"
+    );
+    let p = prepare_harness(fixtures, spec, volume_uuid);
+    let layout = &p.built.layout;
+    let k = slice_position(layout, &p.build_units[cut_unit], 0);
+    let planned_seal = layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+        .expect("a planned seal")
+        .position as u32;
+    // The doubles model st (`MediumEnd`): the block that reaches the warning
+    // is written and arms a refusal of the NEXT block write, so a warning
+    // shows only inside an entry that has a block after the one reaching it.
+    let k_size = layout
+        .entries
+        .iter()
+        .find(|e| e.position as u32 == k)
+        .and_then(|e| e.size_bytes)
+        .unwrap();
+    assert!(
+        k_size > BS,
+        "slice {k} must span two blocks for the warning to come in it"
+    );
+    let store = MemStore::new(BS as usize).with_early_warning_after(bytes_before(layout, k) + 1);
+
+    let run = run_session(
+        &p.conn,
+        p.built,
+        &p.keys,
+        p.volume_id,
+        &p.build_units,
+        store,
+    );
+    assert_eq!(
+        run.ending,
+        Ending::Short { ended_after: k },
+        "the warning came in slice {k}, before the last data slice"
+    );
+    assert!(run.store.early_warning().is_some(), "and the store saw it");
+    let sealed = match run.outcome {
+        ConfirmOutcome::Sealed(s) => s,
+        ConfirmOutcome::Quarantined(q) => {
+            panic!(
+                "a short tape must confirm Sealed, got Quarantined: {:?}",
+                q.reason
+            )
+        }
+        ConfirmOutcome::Inconclusive(inc) => panic!(
+            "a short tape must confirm Sealed, got Inconclusive: {:?}",
+            inc.evidence.mismatches
+        ),
+    };
+    // §4.2: a unit with any slice planned past K is cut.
+    let n = p.build_units.len();
+    let cut: Vec<usize> = (0..n)
+        .filter(|&u| {
+            (0..p.build_units[u].slices.len())
+                .any(|s| slice_position(&run.layout, &p.build_units[u], s) > k)
+        })
+        .collect();
+    assert_eq!(
+        cut,
+        (cut_unit..n).collect::<Vec<_>>(),
+        "the fixture's plan is in its unit order: the interrupted unit and every one after"
+    );
+    ShortHarness {
+        tape: Harness {
+            operator: p.operator,
+            escrow: p.escrow,
+            layout: run.layout,
+            store: run.store,
+            tenants: p.tenants,
+            units: p.units,
+            history: p.history,
+        },
+        conn: Mutex::new(p.conn),
+        build_units: p.build_units,
+        volume_id: p.volume_id,
+        ended_after: k,
+        planned_seal,
+        sealed,
+        cut,
+        _dirs: p._dirs,
+    }
+}
+
+const N_UNITS_SHORT: usize = 6;
+const SEED_SHORT: u64 = 420_420;
+const VOLUME_UUID_SHORT: &str = "5e0a1b2c-3d4e-4f60-8172-839405a6b7c8";
+const VOLUME_UUID_NEXT: &str = "6f1b2c3d-4e5f-4061-9283-94a5b6c7d8e9";
+const VOLUME_UUID_NEEDLES_SHORT: &str = "7a2c3d4e-5f60-4172-a394-a5b6c7d8e9f0";
+/// The unit the early warning interrupts: units 0-2 are the first tenant's
+/// and 3-5 the second's, so each tenant keeps a whole unit, unit 4 is cut
+/// with its first slice on the tape, and unit 5 is cut with nothing on it.
+const CUT_UNIT: usize = 4;
+
+static SHORT: OnceLock<ShortHarness> = OnceLock::new();
+
+/// One short tape, shared read-only like [`shared_harness`]'s; a test that
+/// writes to its catalog copies it first.
+fn shared_short() -> &'static ShortHarness {
+    SHORT.get_or_init(|| {
+        let root = tempfile::tempdir().unwrap();
+        let fixtures = generate_collection(
+            root.path(),
+            &MicroSpec {
+                n_units: N_UNITS_SHORT,
+                seed: SEED_SHORT,
+            },
+        );
+        let spec = HarnessSpec {
+            slices_per_unit: 2,
+            ..HarnessSpec::default()
+        };
+        build_short_harness(&fixtures, &spec, VOLUME_UUID_SHORT, CUT_UNIT)
+    })
+}
+
+/// A unit restored the heir's way, from recorded bytes and one tenant key:
+/// trial-decrypt the tenant envelopes, find the one whose MANIFEST.toml lists
+/// `unit_uuid`, and decrypt its slices in order, each checked against File
+/// 3's keyless hash first. `ended_after` is the seal's: a unit with a slice
+/// past it is cut and is refused (§4.2 R4), naming the slice, before any
+/// slice of it is read.
+fn restore_whole_unit(
+    files: &[Vec<u8>],
+    entries: &[format::ParsedIndexEntry],
+    identity: &age::x25519::Identity,
+    unit_uuid: &str,
+    ended_after: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    let manifest = entries
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .filter_map(|e| envelope_members(files, e, identity))
+        .filter_map(|m| member(&m, "MANIFEST.toml").map(str::to_string))
+        .map(|text| toml::from_str::<ManifestDoc>(&text).expect("MANIFEST.toml parses"))
+        .find(|m| m.units.iter().any(|u| u.uuid == unit_uuid))
+        .ok_or_else(|| format!("no envelope this key opens lists {unit_uuid}"))?;
+    let unit = manifest.units.iter().find(|u| u.uuid == unit_uuid).unwrap();
+    if let Some(k) = ended_after {
+        if let Some(past) = unit.slices.iter().find(|s| s.tape_position as u32 > k) {
+            return Err(format!(
+                "cut: its slice at tape file {} is past ended_after = {k}",
+                past.tape_position
+            ));
+        }
+    }
+    let mut plaintext = Vec::new();
+    for slice in &unit.slices {
+        let claim = entries
+            .iter()
+            .find(|e| e.position == slice.tape_position)
+            .ok_or_else(|| format!("File 3 lists no tape file {}", slice.tape_position))?;
+        let size = claim.size_bytes.unwrap() as usize;
+        let bytes = files
+            .get(slice.tape_position as usize)
+            .and_then(|f| f.get(..size))
+            .ok_or_else(|| format!("tape file {} is not on the tape", slice.tape_position))?;
+        if Some(sha256_hex(bytes)) != claim.sha256_encrypted {
+            return Err(format!("tape file {} fails its hash", slice.tape_position));
+        }
+        let decryptor = age::Decryptor::new(bytes).map_err(|e| e.to_string())?;
+        let mut reader = decryptor
+            .decrypt(std::iter::once(identity as &dyn age::Identity))
+            .map_err(|e| e.to_string())?;
+        reader
+            .read_to_end(&mut plaintext)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(plaintext)
+}
+
+/// `volume-format-v2.md` §4.1 and §4.2 from the recorded bytes alone, as an
+/// heir with `mt`, `dd` and `sha256sum` and no key reads a short tape. File 0
+/// and File 3 are the plan (M+1 files) and say the tape may end early; the
+/// tape holds K+2 files and nothing after the short seal; the seal, the last
+/// file, states `file_count = K+2` and `ended_after = K`, binds File 3, and
+/// carries File 3's entries 0 to K and its own bare entry; and every file at
+/// or before K except File 3 hashes to File 3's claim. Then the production
+/// chain walk: clean when told the ending, and when not told it (a reader
+/// that expects the full seal at M), unsealed but never medium damage.
+#[test]
+fn a_short_tape_is_sealed_and_its_keyless_chain_holds_to_ended_after() {
+    let sh = shared_short();
+    let h = &sh.tape;
+    let files = &h.store.files;
+    let k = sh.ended_after as usize;
+    let text = |pos: usize| {
+        String::from_utf8_lossy(&files[pos])
+            .trim_end_matches('\0')
+            .to_string()
+    };
+
+    // The plan: File 0 names M and M+1 files, and requires short-seal.
+    let file0 = text(0);
+    assert!(file0.contains("\nlayout_version = 2\nrequires = [\"short-seal\"]\n"));
+    let pointers = format::parse_id_thunk_layout_pointers(&file0).unwrap();
+    assert_eq!(pointers.seal_marker as u32, sh.planned_seal);
+    assert_eq!(pointers.total_files as u32, sh.planned_seal + 1);
+    assert!(
+        k + 2 < pointers.total_files as usize,
+        "the tape ended before the plan"
+    );
+    assert_eq!(
+        files.len(),
+        k + 2,
+        "files 0 to K, then the short seal, and nothing after it"
+    );
+
+    // The seal: the last file, short, at K+1.
+    let seal = format::parse_seal_marker(&text(k + 1)).expect("the short seal parses (S1-S6)");
+    assert!(seal.requires_short_seal());
+    assert_eq!(seal.file_count as usize, k + 2, "S1");
+    assert_eq!(seal.ended_after, Some(k as u64));
+    assert_eq!(
+        seal.ending(pointers.total_files as u64),
+        format::SealEnding::Short {
+            ended_after: k as u64
+        }
+    );
+
+    // It binds File 3, the plan, which says the tape may end early.
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    let fi_bytes = &files[fi_pos][..fi_true_len];
+    assert_eq!(sha256_hex(fi_bytes), seal.front_index_sha256);
+    let front = format::parse_front_index_document(&String::from_utf8_lossy(fi_bytes)).unwrap();
+    assert!(front.may_end_early, "§1.7");
+    let planned = &front.files;
+    assert_eq!(planned.len(), pointers.total_files as usize);
+    assert_eq!(planned[k].type_label, "data_slice");
+    assert_eq!(
+        planned[k + 1].type_label,
+        "data_slice",
+        "File 3 plans a slice where the seal is"
+    );
+
+    // The copy: File 3's entries 0 to K, File 3's own filled in, then the
+    // seal's own bare entry.
+    assert_eq!(seal.files.len(), k + 2, "S4");
+    for (copy, plan) in seal.files[..=k].iter().zip(&planned[..=k]) {
+        assert_eq!(
+            (copy.position, &copy.type_label),
+            (plan.position, &plan.type_label)
+        );
+        if plan.type_label == "front_index" {
+            assert_eq!(copy.size_bytes, Some(fi_true_len as u64));
+            assert_eq!(
+                copy.sha256_encrypted.as_ref(),
+                Some(&seal.front_index_sha256)
+            );
+        } else {
+            assert_eq!(
+                (copy.size_bytes, &copy.sha256_encrypted),
+                (plan.size_bytes, &plan.sha256_encrypted),
+                "position {}",
+                plan.position
+            );
+        }
+    }
+    let own = &seal.files[k + 1];
+    assert_eq!(
+        (
+            own.position as usize,
+            own.type_label.as_str(),
+            own.size_bytes
+        ),
+        (k + 1, "seal_marker", None)
+    );
+
+    // The keyless chain over files 0 to K.
+    for e in planned[..=k]
+        .iter()
+        .filter(|e| e.type_label != "front_index")
+    {
+        let size = e.size_bytes.unwrap() as usize;
+        assert_eq!(
+            Some(sha256_hex(&files[e.position as usize][..size])),
+            e.sha256_encrypted,
+            "tape file {} against File 3",
+            e.position
+        );
+    }
+
+    // The production walk, told the ending, finds nothing wrong.
+    let mut store = MemStore::new(BS as usize);
+    store.files = files.clone();
+    let evidence = store
+        .confirm_with(
+            &h.layout,
+            ConfirmPlan::new(Tier::Integrity).with_ending(Some(sh.ended_after)),
+        )
+        .unwrap();
+    assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+    // Not told it, it does not find the seal at M; that is no evidence the
+    // medium is bad (ADR-0012: a sound cartridge is never quarantined on a
+    // reader's mistake).
+    let unaware = store.confirm(&h.layout, Tier::Integrity).unwrap();
+    assert!(!unaware.mismatches.is_empty());
+    assert!(!unaware.proves_medium_bad(), "{:?}", unaware.mismatches);
+}
+
+/// §4.2's promises on a short tape, from recorded bytes and the tenants' own
+/// keys: every unit wholly at or before `ended_after` restores to its
+/// plaintext; every unit with a slice past it is cut, and the heir's reading
+/// (the manifest's tape positions against the seal) and tapectl's
+/// (`SealedSession::cut_units`) name the same units. The interrupted unit's
+/// first slice IS on the tape and hashes right, and still the unit is not
+/// restored from this tape. The catalog says the same: `completed` and a
+/// `current` snapshot for each whole unit, `cut` and an unpromoted snapshot
+/// for each cut one (ADR-0012 item 112).
+#[test]
+fn every_whole_unit_restores_from_a_short_tape_and_every_cut_unit_is_named() {
+    let sh = shared_short();
+    let h = &sh.tape;
+    let files = &h.store.files;
+    let k = sh.ended_after;
+    let entries = recorded_entries(h);
+
+    let (mut restored, mut refused) = (Vec::new(), Vec::new());
+    for u in &h.units {
+        let tenant = h
+            .tenants
+            .iter()
+            .find(|t| t.tenant_id == u.tenant_id)
+            .unwrap();
+        let identity: age::x25519::Identity = tenant.secret_key.parse().unwrap();
+        match restore_whole_unit(files, &entries, &identity, &u.unit_uuid, Some(k)) {
+            Ok(plaintext) => {
+                assert_eq!(plaintext, u.plaintext, "{} restored", u.unit_name);
+                restored.push(u.unit_name.clone());
+            }
+            Err(why) => {
+                assert!(why.starts_with("cut: "), "{}: {why}", u.unit_name);
+                refused.push(u.unit_name.clone());
+            }
+        }
+    }
+    let names = |set: &mut dyn Iterator<Item = usize>| -> Vec<String> {
+        set.map(|i| h.units[i].unit_name.clone()).collect()
+    };
+    let cut = names(&mut sh.cut.iter().copied());
+    let whole = names(&mut (0..h.units.len()).filter(|i| !sh.cut.contains(i)));
+    assert_eq!(refused, cut, "the heir refuses exactly the cut units");
+    assert_eq!(restored, whole, "and restores every other one");
+    assert!(!whole.is_empty() && cut.len() >= 2);
+    assert_eq!(sh.sealed.ending, Ending::Short { ended_after: k });
+    assert_eq!(
+        sh.sealed.cut_units, cut,
+        "tapectl names the same units, in plan order"
+    );
+    assert!(
+        sh.sealed
+            .short_ending_report()
+            .unwrap()
+            .contains(&cut.join(", ")),
+        "and the operator is told them"
+    );
+
+    // The interrupted unit: its first slice is on the tape, whole and
+    // hashing right; its second is past the end. The heir refused it above
+    // before reading either.
+    let interrupted = &sh.build_units[sh.cut[0]];
+    assert_eq!(slice_position(&h.layout, interrupted, 0), k);
+    assert!(slice_position(&h.layout, interrupted, 1) > k);
+    let claim = &entries[k as usize];
+    assert_eq!(
+        Some(sha256_hex(
+            &files[k as usize][..claim.size_bytes.unwrap() as usize]
+        )),
+        claim.sha256_encrypted
+    );
+    // Without the seal's word, an heir reading the plan would try it and
+    // find the second slice missing: the cut is the seal's to say.
+    let tenant = h
+        .tenants
+        .iter()
+        .find(|t| t.tenant_id == h.units[sh.cut[0]].tenant_id)
+        .unwrap();
+    let identity: age::x25519::Identity = tenant.secret_key.parse().unwrap();
+    let blind = restore_whole_unit(
+        files,
+        &entries,
+        &identity,
+        &h.units[sh.cut[0]].unit_uuid,
+        None,
+    )
+    .unwrap_err();
+    assert!(blind.contains("is not on the tape"), "{blind}");
+
+    // The catalog, as the confirm left it.
+    let conn = sh.conn.lock().unwrap();
+    for (i, bu) in sh.build_units.iter().enumerate() {
+        let (write, snapshot): (String, String) = conn
+            .query_row(
+                "SELECT w.status, s.status FROM writes w JOIN snapshots s ON s.id = w.snapshot_id
+                 WHERE w.stage_set_id = ?1 AND w.volume_id = ?2",
+                rusqlite::params![bu.stage_set_id, sh.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let want = if sh.cut.contains(&i) {
+            ("cut", "staged")
+        } else {
+            ("completed", "current")
+        };
+        assert_eq!(
+            (write.as_str(), snapshot.as_str()),
+            want,
+            "{}",
+            h.units[i].unit_name
+        );
+    }
+}
+
+/// The next write picks the cut units up and writes them whole (§4.2: "the
+/// unit is written whole on another cartridge", ADR-0012 items 9 and 112).
+/// On a copy of the short tape's catalog: the stage sets whose only write is
+/// `cut` are exactly the cut units'; a full session onto a second tape writes
+/// them and seals full; each restores to its plaintext from the second tape;
+/// the catalog keeps the short tape's rows `cut` and adds `completed` ones;
+/// and the second tape's index names it, and never the short tape, as a
+/// holder of the cut versions (§1.5 lists only completed writes).
+#[test]
+fn the_next_write_writes_every_cut_unit_whole() {
+    let sh = shared_short();
+    let h = &sh.tape;
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("next.db");
+    sh.conn
+        .lock()
+        .unwrap()
+        .execute("VACUUM INTO ?1", [copy.to_string_lossy()])
+        .unwrap();
+    let conn = db::open(&copy).unwrap();
+
+    let next: Vec<i64> = conn
+        .prepare(
+            "SELECT ss.id FROM stage_sets ss
+             WHERE EXISTS (SELECT 1 FROM writes w WHERE w.stage_set_id = ss.id AND w.status = 'cut')
+               AND NOT EXISTS (SELECT 1 FROM writes w
+                               WHERE w.stage_set_id = ss.id AND w.status = 'completed')
+             ORDER BY ss.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let units: Vec<BuildUnit> = sh.cut.iter().map(|&i| sh.build_units[i].clone()).collect();
+    let want: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    assert_eq!(next, want, "what is left to write is the cut units");
+
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('T7NEXT', 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
+        [],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+    let owners: Vec<&TenantFixture> = h
+        .tenants
+        .iter()
+        .filter(|t| units.iter().any(|u| u.tenant_id == t.tenant_id))
+        .collect();
+    let index_dir = tempfile::tempdir().unwrap();
+    let index_files = index::generate_files(
+        &conn,
+        &IndexThisTape {
+            label: "T7NEXT",
+            uuid: VOLUME_UUID_NEXT,
+            cartridge_serial: "T7SERIAL2",
+            generation: "LTO-6",
+        },
+        &want,
+        &index_dir.path().join("index"),
+    )
+    .unwrap();
+    let owner_fixtures: Vec<TenantFixture> = owners
+        .iter()
+        .map(|t| TenantFixture {
+            tenant_id: t.tenant_id,
+            name: t.name.clone(),
+            public_key: t.public_key.clone(),
+            fingerprint: t.fingerprint.clone(),
+            secret_key: t.secret_key.clone(),
+        })
+        .collect();
+    let inputs = harness_inputs(
+        "T7NEXT",
+        VOLUME_UUID_NEXT,
+        "T7SERIAL2",
+        units.clone(),
+        &owner_fixtures,
+        &h.operator,
+        h.escrow.as_ref().map(|e| e.public_key.clone()),
+        Some(index_files),
+    );
+    let session_dir = tempfile::tempdir().unwrap();
+    let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+    let keys = KeyAvailability {
+        tenant_ids: owners.iter().map(|t| t.tenant_id).collect(),
+        tenants_with_active_key: owners.iter().map(|t| t.tenant_id).collect(),
+        operator_key_present: true,
+        escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
+    };
+    let run = run_session(
+        &conn,
+        built,
+        &keys,
+        volume_id,
+        &units,
+        MemStore::new(BS as usize),
+    );
+    assert_eq!(run.ending, Ending::Full);
+    match &run.outcome {
+        ConfirmOutcome::Sealed(s) => assert!(s.cut_units.is_empty()),
+        _ => panic!("the next write must confirm Sealed"),
+    }
+
+    // The second tape: a full seal, its keyless chain whole, every cut unit
+    // restoring to its plaintext with its tenant's key.
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&run.layout);
+    let ChainWalkVerdict::Sealed { parsed_front_index } =
+        keyless_chain_walk(&run.store.files, fi_pos, fi_true_len)
+    else {
+        panic!("the next tape's keyless chain must hold");
+    };
+    for &i in &sh.cut {
+        let u = &h.units[i];
+        let tenant = owners.iter().find(|t| t.tenant_id == u.tenant_id).unwrap();
+        let identity: age::x25519::Identity = tenant.secret_key.parse().unwrap();
+        let plaintext = restore_whole_unit(
+            &run.store.files,
+            &parsed_front_index,
+            &identity,
+            &u.unit_uuid,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{} from the next tape: {e}", u.unit_name));
+        assert_eq!(plaintext, u.plaintext, "{}", u.unit_name);
+    }
+
+    // The catalog: the short tape's rows stay cut; the new ones completed.
+    for (i, bu) in sh.cut.iter().map(|&i| (i, &sh.build_units[i])) {
+        let statuses: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT v.label, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 ORDER BY v.label",
+            )
+            .unwrap()
+            .query_map([bu.stage_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                ("T7MICRO".to_string(), "cut".to_string()),
+                ("T7NEXT".to_string(), "completed".to_string())
+            ],
+            "{}",
+            h.units[i].unit_name
+        );
+        let snapshot: String = conn
+            .query_row(
+                "SELECT status FROM snapshots WHERE id = ?1",
+                [bu.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot, "current", "{}", h.units[i].unit_name);
+    }
+
+    // The second tape's index: the cut versions are on this tape, and the
+    // short tape holds none of them.
+    let op: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+    let primary = parsed_front_index
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap();
+    let members = envelope_members(&run.store.files, primary, &op).unwrap();
+    let rows = index::parse_units(member(&members, "index/units.tsv").unwrap()).unwrap();
+    for &i in &sh.cut {
+        let u = &h.units[i];
+        let holders: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.unit_uuid == u.unit_uuid && r.version == 1)
+            .map(|r| (r.volume.as_str(), r.state.as_str()))
+            .collect();
+        assert_eq!(holders, [("T7NEXT", "this-tape")], "{}", u.unit_name);
+    }
+    // Control: the index does read the short tape's catalog rows. Its whole
+    // units are listed on it, as a sealed holder; only the cut ones are not.
+    for (i, u) in h.units.iter().enumerate() {
+        let on_short = rows
+            .iter()
+            .any(|r| r.unit_uuid == u.unit_uuid && r.volume == "T7MICRO" && r.state == "sealed");
+        assert_eq!(on_short, !sh.cut.contains(&i), "{}: {rows:?}", u.unit_name);
+    }
+}
+
+/// `catalog rebuild --from-volume` of a short tape (§4.2, "tapectl, in
+/// 1.6.0"; `volume::rebuild` locates the seal by §1.2 rule 6): with the
+/// operator key and nothing but the recorded bytes, the rebuilt catalog
+/// records the volume's `ended_after`, `completed` for exactly the stage sets
+/// wholly at or before it and `cut` for the rest, and the same written
+/// positions the write recorded. Pinned against the write's own rows, so the
+/// two cannot drift apart.
+#[test]
+fn a_catalog_rebuilt_from_a_short_tape_records_what_the_write_recorded() {
+    let sh = shared_short();
+    let h = &sh.tape;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db::open(&dir.path().join("rebuilt.db")).unwrap();
+    let mut store = MemStore::new(BS as usize);
+    store.files = h.store.files.clone();
+    let identity: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    rebuild::rebuild_from_store(
+        &conn,
+        &mut store,
+        &[identity],
+        Some("T7MICRO"),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        ContactSite::new(
+            &config,
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::NoBackend,
+        ),
+    )
+    .expect("a short tape rebuilds");
+
+    let ended_after: Option<i64> = conn
+        .query_row(
+            "SELECT ended_after FROM volumes WHERE label = 'T7MICRO'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ended_after, Some(i64::from(sh.ended_after)));
+
+    // By unit uuid: each write's status; by (unit uuid, slice): the slice's
+    // tape position and whether it is recorded written.
+    type Rows = (Vec<(String, String)>, Vec<(String, i64, i64, bool)>);
+    let rows = |c: &rusqlite::Connection| -> Rows {
+        let writes = c
+            .prepare(
+                "SELECT u.uuid, w.status FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 JOIN stage_sets ss ON ss.id = w.stage_set_id
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE v.label = 'T7MICRO' ORDER BY u.uuid",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let positions = c
+            .prepare(
+                "SELECT u.uuid, sl.slice_number, CAST(wp.position AS INTEGER), wp.status = 'written'
+                 FROM write_positions wp
+                 JOIN writes w ON w.id = wp.write_id
+                 JOIN volumes v ON v.id = w.volume_id
+                 JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                 JOIN stage_sets ss ON ss.id = w.stage_set_id
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE v.label = 'T7MICRO' ORDER BY u.uuid, sl.slice_number",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (writes, positions)
+    };
+    let (rebuilt_writes, rebuilt_positions) = rows(&conn);
+    let (written_writes, written_positions) = rows(&sh.conn.lock().unwrap());
+    assert_eq!(rebuilt_writes, written_writes, "each stage set's status");
+    assert!(
+        written_writes.iter().any(|(_, s)| s == "cut")
+            && written_writes.iter().any(|(_, s)| s == "completed"),
+        "the comparison covers both: {written_writes:?}"
+    );
+    assert_eq!(
+        rebuilt_positions, written_positions,
+        "each slice's position"
+    );
+    for (uuid, slice, position, written) in &written_positions {
+        assert_eq!(
+            *written,
+            *position <= i64::from(sh.ended_after),
+            "{uuid} slice {slice} at {position}"
+        );
+    }
+}
+
+/// A [`needle_unit`] with one more file of filler, so each of its two slices
+/// spans more than one tape block: the early warning shows only inside an
+/// entry with a block after the one that reaches it. The filler's name is a
+/// needle like every file name; its bytes are a hash chain, so they hold no
+/// needle.
+fn needle_unit_with_filler(root: &std::path::Path, name: &str, files: &[&str]) -> UnitFixture {
+    let filler_name = format!("filler-{name}.bin");
+    let mut unit = needle_unit(root, name, files);
+    let mut body = Vec::with_capacity(3 * BS as usize);
+    let mut block = Sha256::digest(name.as_bytes());
+    while body.len() < 3 * BS as usize {
+        body.extend_from_slice(&block);
+        block = Sha256::digest(block);
+    }
+    std::fs::write(unit.path.join(&filler_name), &body).unwrap();
+    unit.total_bytes += body.len() as u64;
+    unit.files.push((filler_name, body.len() as u64));
+    unit
+}
+
+/// Issue #450's isolation scan on a short tape (§4.1 "No unit identity"):
+/// the short seal at K+1 is a plaintext zone like File 0 to 3, it is the
+/// file the scan reads as the seal, and neither it nor any other plaintext
+/// zone names a tenant, a unit (the cut one included), a file, a plaintext
+/// hash, a key or another volume. Everything else on the tape is age
+/// ciphertext. With the same controls as the full tape's scan: a needle
+/// planted in the short seal is found there and only there.
+#[test]
+fn no_plaintext_zone_of_a_short_tape_reveals_a_tenant_unit_file_hash_or_key() {
+    let root = tempfile::tempdir().unwrap();
+    let fixtures = vec![
+        needle_unit_with_filler(root.path(), NEEDLE_UNIT_A, &NEEDLE_FILES_A),
+        needle_unit_with_filler(root.path(), NEEDLE_UNIT_B, &NEEDLE_FILES_B),
+    ];
+    let spec = HarnessSpec {
+        operator: NEEDLE_OPERATOR,
+        tenants: [NEEDLE_TENANT_A, NEEDLE_TENANT_B],
+        real_plaintext_hash: true,
+        escrow: true,
+        history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+        slices_per_unit: 2,
+    };
+    let sh = build_short_harness(&fixtures, &spec, VOLUME_UUID_NEEDLES_SHORT, 1);
+    let h = &sh.tape;
+    let needles = plaintext_zone_needles(h, &fixtures);
+    assert!(
+        needles.iter().all(|n| n.len() >= 15),
+        "a short needle matches ordinary vocabulary: {needles:?}"
+    );
+    assert_eq!(
+        sh.sealed.cut_units,
+        [NEEDLE_UNIT_B],
+        "the second unit is cut"
+    );
+    for want in [NEEDLE_UNIT_B, NEEDLE_TENANT_B, NEEDLE_FILES_B[0]] {
+        assert!(needles.iter().any(|n| n == want), "{want} is not a needle");
+    }
+    for u in &h.units {
+        assert_eq!(u.slice_sha256_plain.len(), 2);
+        for hash in &u.slice_sha256_plain {
+            assert!(
+                needles.contains(hash),
+                "each slice's plaintext hash is a needle"
+            );
+        }
+    }
+
+    let files = &h.store.files;
+    let seal = sh.ended_after as usize + 1;
+    assert_eq!(seal, files.len() - 1, "the short seal is the last file");
+    assert!(
+        String::from_utf8_lossy(&files[seal])
+            .contains(&format!("\nended_after = {}\n", sh.ended_after)),
+        "and it is the short seal the scan reads"
+    );
+    let plaintext_zones = [0usize, 1, 2, 3, seal];
+    let leaks = leaks_in(files, &plaintext_zones, &needles);
+    assert!(leaks.is_empty(), "plaintext zones reveal: {leaks:?}");
+
+    // Control: a needle planted in the short seal is found there, and only
+    // there.
+    let mut tampered = files.clone();
+    let mid = tampered[seal].len() / 2;
+    tampered[seal].splice(mid..mid, NEEDLE_UNIT_B.bytes());
+    assert_eq!(
+        leaks_in(&tampered, &plaintext_zones, &needles),
+        vec![(seal, NEEDLE_UNIT_B.to_string())],
+        "a cut unit's name planted into the short seal must be the one leak"
+    );
+
+    // Everything else is age ciphertext, and holds no needle either.
+    let age_magic = b"age-encryption.org/v1";
+    for (pos, data) in files.iter().enumerate() {
+        if plaintext_zones.contains(&pos) {
+            continue;
+        }
+        assert!(
+            data.starts_with(age_magic),
+            "File {pos} is not age-encrypted"
+        );
+        assert!(
+            find_needles(data, &needles).is_empty(),
+            "encrypted File {pos} holds a needle in the clear"
+        );
+    }
 }
