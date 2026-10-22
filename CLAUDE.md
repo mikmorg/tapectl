@@ -295,8 +295,9 @@ a third pins the short seal. The test hook `TAPECTL_TEST_EARLY_WARNING_AT` fakes
 warning; the gate's `heir_short_*` legs run RESTORE.sh on a short tape. #488's first build rides
 it: ring's SHA-256 behind `pass_count::Sha256`, the HP page-0x34 repositions figure in
 `write_feed_ratio` events, `TAPECTL_PIPELINE_TRACE=1`, and the `research` cargo feature's knobs.
-The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) proves the readback
-past the warning on the real drive before the tag.
+The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) passed all seven steps
+on 2026-10-22, reading back the slice past the warning and the short seal on the real drive
+(`docs/runs/2026-10-21-1.6.0-acceptance.md`); 1.6.0 is tagged `v1.6.0` on `c9c5877`.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

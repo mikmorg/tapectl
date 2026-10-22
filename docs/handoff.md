@@ -394,7 +394,9 @@ from step 1, losing whatever the catalog recorded in between.
 
 **First, the acceptance run** (items 110, 115, 117), on the 1.6.0 candidate the coordinator names,
 before the tag. It must read the post-warning slice and the seal back before 1.6.0 ships; a
-failed readback stops #420 and does not re-scope it.
+failed readback stops #420 and does not re-scope it. **Done: it passed all seven steps on
+2026-10-22** (`docs/runs/2026-10-21-1.6.0-acceptance.md`, whose "Afterwards" says how to clean the
+cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
 - **What it does:** `scripts/short-seal-acceptance.sh`, in a throwaway home, on test cartridge
   EW7VWMVKF6 only. It fills to the drive's early warning with a synthetic stage set (item 115),
   then checks:
