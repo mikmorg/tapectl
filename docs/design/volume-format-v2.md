@@ -67,6 +67,14 @@ still describe the plan; the short seal says where the tape really ended
 (`ended_after = K`). A short tape loses only trailing slices, as the bulk-zone
 note says, and every unit wholly at or before K is on it whole (§4.2).
 
+**A unit across tapes (since 1.7.0, §4.4).** A unit that allows spanning may have
+only a run of its stage set's slices on a tape: a **range** (CONTEXT.md "Range").
+Its `[[units]]` block in each envelope's `MANIFEST.toml` lists every slice of the
+set and gives a tape position only to the slices this tape plans, and the seal's
+`ended_after` trims that run as it trims any plan. Such a tape states `requires =
+["short-seal", "spanning"]` (§1.2). The zones are unchanged: one unit's slices on
+one tape are still contiguous and in slice order.
+
 **Rationale for the order** (full derivation in ADR-0007 / the research note
 `docs/research/2026-07-21-ontape-format-and-write-design.md`):
 
@@ -146,17 +154,54 @@ or later writes, whether the tape sealed full or short:
 requires = ["short-seal"]
 ```
 
-The line is spelled exactly so: one feature, double-quoted, no spaces inside
-the brackets, on the line after `layout_version` as before. `short-seal` means:
-this tape may end before the last file its plan lists; its seal states
-`ended_after`, the last file before the seal; and a reader finds the seal by
-rule 6 and trusts it over the plan (§4.1, §4.2). A reader that knows the
-feature lists it: `KNOWN_FEATURES = &["short-seal"]` in `format.rs`,
-`KNOWN_FEATURES="short-seal"` in RESTORE.sh.
+`short-seal` means: this tape may end before the last file its plan lists;
+its seal states `ended_after`, the last file before the seal; and a reader
+finds the seal by rule 6 and trusts it over the plan (§4.1, §4.2).
 
-**A reader that does not know `short-seal` refuses the tape at File 0, by
-name** (rule 1). RESTORE.sh has since 1.1.0, and so has every tapectl reader
-rule 1 lists, the restore and verify readers since #476 (1.3.0): tapectl's
+**From 1.7.0, a tape whose plan holds a slice of a spannable set also
+requires `spanning`** (ADR-0012 item 124, #478). A *spannable set* is a stage
+set whose write may span tapes. Whether it may is frozen into its `writes` row
+when the write is planned (`writes.may_span`, ADR-0012 item 121;
+`layout-session.md`, "Spanning"), and a `volume rewrite` never sets it
+(ADR-0012 item 142). Every tape whose plan holds at least one slice of such a
+set states, in File 0's `[volume]` and in the seal's `[seal]`:
+
+```toml
+requires = ["short-seal", "spanning"]
+```
+
+It does so whether the tape's plan holds the set whole (item 93's middle tape)
+or a run of it, and whether or not the tape ended before any of the set's
+slices: the fence follows the plan, because the plan is all that is known when
+File 0 is written. Every other tape 1.7.0 writes states `requires =
+["short-seal"]`, as 1.6.0 did. Fencing every 1.7.0 tape, and fencing only the
+tapes that continue a span, were considered and not chosen (item 124).
+
+`spanning` means: a `[[units]]` block of this tape's `MANIFEST.toml` may state
+`may_span = true`, and such a block lists slices that are not on this tape,
+with no `tape_position` (§4.4). A run of a set's slices that starts after
+slice 1, or that `ended_after` ends before the set's last slice, is then a
+range of a version held across tapes: not damage, and not a cut unit. A reader
+that does not know the feature would misread a slice with no position
+(tapectl 1.6.0's manifest reader requires every `tape_position`), so the
+feature fences it (rule 3).
+
+**The spelling of the line is normative** (ADR-0012 item 124). Each feature
+is double-quoted. Two features are separated by a comma and one space, in the
+order shown. There is no space after `[` or before `]`, and the line is the
+one after `layout_version`, as before. RESTORE.sh reads the list by deleting
+brackets, quotes and commas and splitting what is left at spaces
+(`check_requires`), so without the space it would read the one feature
+`short-sealspanning` and refuse the tape by that name.
+
+A reader that knows the features lists them: `KNOWN_FEATURES = &["short-seal",
+"spanning"]` in `format.rs` and `KNOWN_FEATURES="short-seal spanning"` in
+RESTORE.sh, from 1.7.0 (1.6.0 lists `short-seal` alone).
+
+**A reader that does not know `short-seal`, or `spanning` on a span tape,
+refuses the tape at File 0, by name** (rule 1). RESTORE.sh has since 1.1.0,
+and so has every tapectl reader rule 1 lists, the restore and verify readers
+since #476 (1.3.0): tapectl's
 `FormatClaims::refusal` and RESTORE.sh's `check_requires` name the feature and
 send the reader to the RESTORE.sh at the tape's own file 2, or to a newer
 tapectl. It never half-reads the tape. When File 0 is unreadable, the same
@@ -191,7 +236,8 @@ seal's) and RESTORE.sh's
    on. A writer that adds anything a 1.1.0 reader would *misread* — not
    merely not know — lists a feature for it in `requires` (the short seal,
    #420, is `requires = ["short-seal"]` with an `ended_after` field: 1.6.0,
-   §4.1). A
+   §4.1; a range, #478, is `spanning`, with slices listed without a
+   `tape_position`: 1.7.0, §4.4). A
    change no `requires` can fence (a different byte layout of the slices,
    say #370's "tapectl cuts the slices") bumps `layout_version` and `magic`.
 4. **A key's meaning never changes.** New meaning, new key.
@@ -411,7 +457,7 @@ catalog.
 | `unit_uuid` | the unit's uuid |
 | `version` | the version's ordinal (CONTEXT.md "Version") |
 | `num_slices` | the number of slices of this version's stage set |
-| `first_slice`, `last_slice` | the range of those slices this volume holds: `1` and `num_slices` for a whole version. Under spanning (ADR-0012 items 82-87, not built) a volume holds one range of a spanning version, and the version is as covered as its least-covered range (item 76) |
+| `first_slice`, `last_slice` | the run of those slices this volume holds: `1` and `num_slices` for a whole version. For a range (1.7.0, ADR-0012 items 121-126, §4.4), the first and the last slice of that volume's run, which is one unbroken run in slice order. On another volume's row they are the slices the catalog records `written` there. On the `this-tape` row they are the run this tape's plan holds, which the seal's `ended_after` may end sooner (§4.2, §4.4) |
 | `version_bytes` | the stage set's ciphertext bytes, all slices |
 | `volume` | the holding volume's label |
 | `volume_uuid` | its uuid (File 0's `uuid`) |
@@ -430,6 +476,19 @@ sealed, unretired volumes holding a completed write of it, quarantined ones incl
 and this tape. Unsealed, retired and erased volumes are not listed; reclaimable and purged
 versions are not listed. Where a cartridge is kept is never on a tape (§2): find it from the
 label or serial.
+
+**Ranges** (1.7.0, ADR-0012 items 121, 126 and 141). From 1.7.0 a `range` write counts where a
+completed one does: the versions are every current version with at least one `completed` or
+`range` write on a sealed, unretired volume, plus every version this write carries, and the
+holders are the sealed, unretired volumes holding a `completed` or `range` write of it. A spanning
+version becomes current only once every slice of a stage set of it is on a sealed volume (item
+128, `layout-session.md`). Until then it is listed only on a tape that carries it, where its
+earlier holders are listed with their runs; a tape written meanwhile that does not carry it does
+not list it. A holder of a range holds only its run, and no row is a copy on its own (item 127).
+`units.tsv` names no stage set, so two stagings of one version (item 102) are not told apart in
+it: a reader never joins runs by the index, and takes a slice from another tape only by its hash
+(§4.4 R8). File 1's query of the Heir Kit's catalogue lists `range` writes with their slice runs
+beside whole copies (item 141, §4.4).
 
 **`index/paths.tsv`** (tenant envelopes only, item 79): one row per path of each version listed
 in that tenant's `units.tsv`. Sorted by `unit`, `version`, then `path` (bytewise).
@@ -460,6 +519,8 @@ tape carries it twice, §1.3).
   with no limit: for each unit (keyed by tenant, name and unit uuid) its newest version by number,
   whether the loaded tape holds it, and every version's holders, after a summary and the units
   whose newest version the loaded tape does not hold. All three read the envelopes the key opens.
+  From 1.7.0 they print a holder's slice run when it is not the whole version, and a holder of a
+  range does not count on its own as holding the version (§4.4).
 - RESTORE.sh `--restore` and `--fill-from`: after each unit is extracted, read the `sha256`
   column of the `paths.tsv` of the tenant envelope that lists the unit and version (an escrow or
   operator key finds it among the envelopes the walk opened; the operator envelope has none), check
@@ -469,6 +530,8 @@ tape carries it twice, §1.3).
 - `catalog rebuild --from-volume` reads the operator envelope's `units.tsv` and reports the
   volumes it names that the catalog lacks, as a to-do list for disaster recovery. It never
   creates a row from it (item 78; ADR-0001: a claim about a tape needs contact with that tape).
+  From 1.7.0 the to-do list also names a spanning version's slices the rebuilt tapes do not
+  hold, and the tapes that hold them where an index names them (item 130, §4.4).
 
 **Older tapes and readers.** A tape written before 1.3.0 has no `index/` members and is read as
 before. A reader that does not know them (RESTORE.sh before 1.3.0; tapectl reads envelope members
@@ -548,14 +611,32 @@ table and before the first unit's section, that says:
 4. The rule for a unit: when the last tape file of a unit (its "Tape files" column) is after
    `ended_after`, this tape does not hold the unit whole. Do not start reading its slices: it is
    restorable only from another tape. The index (`index/units.tsv`, §1.5) and RESTORE.sh's
-   `--where` name the tapes that hold it.
+   `--where` name the tapes that hold it. (From 1.7.0, a unit whose block states `may_span =
+   true` may hold a range here instead, restorable with the tapes that hold its other slices:
+   §4.4, and the range section below.)
 5. RESTORE.sh does all of this by itself: `--info` and `--verify` report where the tape ended.
 
 **File 1** (the system guide) says the same for the heir: what `requires = ["short-seal"]` means
 (its glossary entry for `requires` stops saying the list is empty); that the seal's
 `ended_after` says where the tape ended; how to read it by hand (the four lines above); that a
 unit whose slices run past it is not on this tape whole and where to look for it; and that
-RESTORE.sh prints `NOT ON TAPE` for each planned file past the end (§4.2).
+RESTORE.sh marks the planned files past the end `NOT ON TAPE` (§4.2; from 1.7.0 in one line,
+ADR-0012 item 140).
+
+**What a span tape declares (1.7.0, ADR-0012 items 124-126 and 135).** A tape whose plan holds
+a slice of a spannable set (§1.2) keeps every declaration of the table above and adds these:
+
+| File | Declaration | Where |
+|---|---|---|
+| File 0 | `requires = ["short-seal", "spanning"]` | `[volume]`, the line after `layout_version` (§1.2) |
+| each envelope's `MANIFEST.toml` that lists a spannable set | `may_span = true`; every slice of the set listed; `tape_position` only on the slices this tape plans | that set's `[[units]]` block, the line after `stage_set_id` (§4.4) |
+| each such envelope's `RECOVERY.md` | a section on a unit across tapes | text (§4.4) |
+| the seal | the same `requires` as File 0 | `[seal]` (§4.1) |
+
+File 3 declares nothing new: it has no new entry type, and its `[index]` table and header are
+1.6.0's. The seal's grammar and rules S1-S6 are 1.6.0's too; only its `requires` value follows
+File 0's (item 126). File 1 gains its 1.7.0 text on every tape 1.7.0 writes, span tape or not
+(§4.4).
 
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
@@ -599,7 +680,9 @@ a third:
    key and standard tools — `mt`, `dd`, `age`, `dar`, `sha256sum` and a few
    coreutils (§6) — with no tapectl and no database (`RESTORE.sh`, tape file 2). This is the heir path
    and it is proven on real hardware. On a tape that ended early, "every unit on it" is every
-   unit wholly at or before the seal's `ended_after` (§4.2).
+   unit wholly at or before the seal's `ended_after` (§4.2). A spanning version of which a tape
+   holds only a range (1.7.0) is restorable from that tape together with the tapes that hold its
+   other slices, and from no tape alone (§4.4).
 2. **Catalog.** With the operator or escrow key, `catalog rebuild --from-volume`
    reconstructs everything the catalog knew about this write *at staging
    time*: volume identity, units, snapshots, the slice map and plaintext
@@ -609,7 +692,9 @@ a third:
    `catalog.db` without ownership or receipts; the rebuild takes ownership
    from the tenant envelopes and reports the receipt as unknown. Tapes
    written before 1.1.0 record no file kinds or link targets; the rebuild
-   records their non-directories as regular files.
+   records their non-directories as regular files. A rebuild from one tape
+   of a span records what that tape shows: every slice of the set, and
+   positions only for its own (1.7.0, §4.4).
 3. **Never on the tape:** where the cartridge is, whether it has been
    verified and when, what policy applies to a unit, warehouse deposits, the
    cleaning-cartridge registry and its events, each write's feed ratio
@@ -800,7 +885,7 @@ crash can seal lower, when the medium lost files the catalog had recorded writte
 [seal]
 volume = "{label}"
 layout_version = 2
-requires = ["short-seal"]
+requires = {requires}
 file_count = {file_count}
 ended_after = {ended_after}
 sealed_at = "{sealed_at}"
@@ -811,7 +896,9 @@ front_index_sha256 = "{front_index_sha256}"
   bound to (rule S1 below).
 - `requires = ["short-seal"]` is on **every** 1.6.0 seal, full or short, as it is in File
   0 (§1.2). The seal has always repeated File 0's `layout_version` and `requires`. It is
-  the fence when File 0 cannot be read.
+  the fence when File 0 cannot be read. From 1.7.0 the seal of a span tape states
+  `requires = ["short-seal", "spanning"]`, File 0's line, spelled as §1.2 rules (ADR-0012
+  item 124). No other line of the grammar changes for a span tape (item 126).
 - `front_index_sha256` is the hash of File 3's exact bytes (the byte contract below), on
   both kinds. File 3 is the plan and never changes: a short seal binds the same front index
   a full one would have.
@@ -856,7 +943,8 @@ exactly the placeholder's length, as before 1.6.0. A short seal is never longer:
 `file_count` (K+2 ≤ M+1) and `ended_after` (K ≤ M-1) have no more digits, its own entry's
 `position` (K+1 ≤ M) has no more digits, and it carries at least one data-slice entry fewer.
 The writer checks that a short seal is no longer than the placeholder, never that it is
-equal.
+equal. The placeholder states the tape's `requires` (§1.2), as the real seal will, so on a span
+tape the second feature's bytes are in both.
 
 **Parse rules.** Every reader that knows `short-seal` (`format.rs`, RESTORE.sh) keeps these:
 
@@ -904,14 +992,17 @@ envelope the reader can open tells that (§2). The leak scan covers it (§2).
   and every unit planned after it. Nothing of a cut unit counts on this tape, and no reader
   restores it from this tape, even though its slices at or before `ended_after` are present
   and hash correctly. The catalog records its row `cut` (ADR-0012 item 112), and the unit is
-  written whole on another cartridge (item 9).
+  written whole on another cartridge (item 9). From 1.7.0 a spannable set (its block states
+  `may_span = true`) with at least one slice at or before `ended_after` is not cut: this tape
+  holds a range of it (§4.4).
 - **Everything written before the slices is the plan.** File 0, File 3, every envelope's
   `MANIFEST.toml`, `RECOVERY.md`, `PLAN.toml` and `catalog.db`, and the `index/` members
   (§1.5) list the cut units and the positions after `ended_after`. The seal withdraws those
   claims. In particular, an `index/units.tsv` row whose `state` is `this-tape` names a cut
   version that this tape does not hold. A reader checks a version's slices against
   `ended_after` before it calls this tape a holder. The indexes of later tapes never name a
-  cut write as a holder: §1.5 lists only completed writes.
+  cut write as a holder: §1.5 lists only completed writes (from 1.7.0, completed and `range`
+  writes).
 - File 3's hashes for positions after `ended_after` describe files that are not on this tape.
   No reader compares them with anything on it.
 - **Nothing follows the seal.** End of data comes directly after its closing filemark.
@@ -926,7 +1017,7 @@ envelope the reader can open tells that (§2). The leak scan covers it (§2).
   it.
 - **R3. Never read a position after `ended_after` for data.** Report it as not on this tape.
 - **R4. Name a cut unit; never restore it from this tape.** Say where its copies are when the
-  index says (§1.5).
+  index says (§1.5). A range is not a cut unit: §4.4's rules R6-R9 read it.
 - **R5. A second tape is read the same way.** A reader that takes slices or files from
   another tape (RESTORE.sh's `--swap-tapes`, `--slices-from` and `--fill-from`, tapectl's
   read-from-another-copy, #480) reads that tape's seal first and takes nothing from past its
@@ -946,20 +1037,27 @@ RESTORE.sh's modes, in 1.6.0:
   a holder, and the loaded tape does not count as holding that version.
 - `--find-envelope`: unchanged. Every envelope is before the first data slice.
 
+From 1.7.0, `--info`'s file map and `--verify` print **one** `NOT ON TAPE` line for the planned
+files past the end of every short tape, span or not, instead of one line per position (ADR-0012
+item 140). The line names the first and the last planned position after `ended_after` (K+1 and
+M, the planned seal) and says that the seal is file K+1. It is still not a failure. RESTORE.sh's
+other modes on a range are §4.4's.
+
 tapectl, in 1.6.0:
 - The chain walk (confirm, `volume verify`) covers files 0 to `ended_after` (§5).
 - Every reader that reads slices by the catalog (`restore`, `volume read-slices`, `volume
   compact-read`, `volume rewrite`) never reads a `cut` write, so none reads a cut unit from
   this tape. (`restore` and `volume rewrite` read only `completed` writes; `volume read-slices`
   keeps its 1.5.0 rule of any written position, minus `cut` ones.) `restore volume` names the
-  cut units.
+  cut units. (From 1.7.0 `restore` also reads `range` writes, across cartridges: §4.4.)
 - `restore raw-volume` reports the positions after `ended_after` as not on this tape. On a
   tape with no seal it accepts, END OF DATA proven by the drive at a planned position ends the
   dump there (R2): that position and every later one are not on the tape (`--json`:
   `end_of_data_at`). Any other read failure fails the dump.
 - `catalog rebuild` and the adoption of a lost write (`volume::adopt_lost`) locate the seal
   by §1.2 rule 6. They record `completed` only for a stage set wholly at or before
-  `ended_after`, and `cut` for every other.
+  `ended_after`, and `cut` for every other. (From 1.7.0 a spannable set takes §4.4's split:
+  `completed`, `range` or `cut`.)
 
 ### 4.3 The writer at the early warning (normative)
 
@@ -1010,6 +1108,216 @@ A plan may reach past the fill ceiling. It may list whole units up to 100% of th
 nominal capacity, but only when the drive declares `post_warning_bytes` (ADR-0012 item 113).
 Units planned past the warning's point are cut (§4.2). Without that key the plan stops at the
 fill ceiling. An unexpected early warning still seals short.
+
+From 1.7.0 a tape that holds a spannable set plans the rest of that set past item 113's bound,
+and the early warning ends its range (ADR-0012 items 84 and 123): W4 applies unchanged, and the
+slice in flight finishes before the short seal. This too needs `post_warning_bytes`. Without it,
+a spannable set that would pass the fill ceiling is refused, and the refusal names the key.
+Whole units planned after a span's tail keep item 113's bound. The plan order is
+`layout-session.md`'s ("Spanning").
+
+### 4.4 A range (normative, tapectl 1.7.0)
+
+Ruled 2026-10-16 to 2026-10-21 (ADR-0012 items 82-95 and 121-143, #478). A unit that allows
+spanning may have its version's slices on more than one tape. The run of one stage set's slices
+on one volume is a **range** (CONTEXT.md "Range"). A volume holds at most one unbroken range of
+a stage set, in slice order and at consecutive positions (item 122). Only a spannable set
+(§1.2: its write was planned with `writes.may_span` set) is ever held as ranges. The writer's
+side, the plan order and the catalog's records, is `layout-session.md`'s ("Spanning"). The drive's
+early warning ends a range as it ends any tape (§4.3, item 84).
+
+**Without a key, nothing new is readable** (item 126). A range's slices are `data_slice` entries
+of File 3 like any other. The front index has no new entry type, and the seal, its grammar,
+rules S1-S6 and the short seal's golden pin are 1.6.0's. The one plaintext difference is
+`spanning` in the `requires` of File 0 and the seal (§1.2). It says that the tape's plan holds a
+slice of a set that may span, never which set, which slices or whose. The leak scan (§2) covers
+a span tape as it covers any other.
+
+**The `[[units]]` block of a spannable set** (items 124-125). Every envelope that lists the set
+(tenant and operator envelopes, and their backups, which are byte copies, §1.3) carries this
+block on every tape whose plan holds a slice of the set. On a tape whose plan holds slices K+1
+to N, it reads:
+
+```toml
+[[units]]
+name = "{unit}"
+uuid = "{unit_uuid}"
+snapshot_version = {version}
+stage_set_id = {stage_set_id}
+may_span = true
+dar_version = "{dar_version}"
+dar_command = "{dar_command}"
+
+[[units.slices]]
+number = 1
+size_bytes = {size_bytes}
+encrypted_bytes = {encrypted_bytes}
+sha256_plain = "{sha256_plain}"
+sha256_encrypted = "{sha256_encrypted}"
+
+(slices 2 to K the same way, with no tape_position)
+
+[[units.slices]]
+number = {K+1}
+tape_position = {position}
+size_bytes = {size_bytes}
+encrypted_bytes = {encrypted_bytes}
+sha256_plain = "{sha256_plain}"
+sha256_encrypted = "{sha256_encrypted}"
+
+(slices K+2 to N the same way, each with its tape_position)
+```
+
+- `may_span = true` is the literal line, directly after `stage_set_id` and before the optional
+  `dar_version` and `dar_command`. It is in the block of every spannable set on every tape whose
+  plan holds a slice of it, whether that plan holds the whole set or a run of it. Absent means
+  false. A block without it is a whole-unit block, byte-identical to 1.6.0's, and every slice in
+  it has a `tape_position` (item 125).
+- The block lists **every slice of the stage set**, 1 to N, in slice order, each with its
+  `size_bytes`, `encrypted_bytes`, `sha256_plain` and `sha256_encrypted`. So any tape of a span
+  gives every slice's ciphertext hash: a reader can accept any other tape of the span by hash
+  (item 88), and a rebuild records every slice (item 130).
+- **`tape_position` is given only to the slices this tape's plan holds**, as each slice's second
+  key, where a whole block has it. For every other slice the line is absent: never `0` (File 0's
+  position) and never empty. The slices given a position are one unbroken run in slice order, at
+  consecutive tape positions.
+- The name `may_span` collides with no other key of the manifest, so RESTORE.sh's table-blind
+  `toml_val` and its awk readers cannot take it for another (as for `may_end_early`, §1.7).
+- `[manifest]` is 1.6.0's, `may_end_early = true` included. A second pinned case in
+  `tests/on_tape_golden.rs` covers a range block (item 125), and the pin of whole blocks does not
+  move.
+
+**What a tape holds of a spannable set.** With a key, a reader takes the set's slices that have
+a `tape_position` at or before the seal's `ended_after` (item 126; on a full seal `ended_after`
+is M-1, §4.1). Then:
+- **All N slices of the set:** the tape holds the version **whole**, as it holds a whole unit.
+  The version restores from this tape alone, and the tape is a copy of it
+  (`writes.status = 'completed'`). Item 93's middle tape is this case.
+- **Some, not all:** the tape holds a **range**, the run from the lowest of them to the highest
+  (`writes.status = 'range'`). The other slices are on other tapes: those with no
+  `tape_position` were never planned on this one, and those after `ended_after` were planned but
+  the tape ended first.
+- **None:** the set is **cut** on this tape (§4.2), and nothing of it is on the tape.
+
+A block without `may_span` keeps §4.2's rule: whole when its last slice is at or before
+`ended_after`, cut otherwise. This split is what confirm records (`layout-session.md`, "Confirm
+of a short ending"). `catalog rebuild` and the adoption of a lost write record the same split,
+so a rebuild records what confirm did (ADR-0012 item 136's proof 1 expects a `completed` row on
+item 93's middle tape). Item 130's "the row is `range` when the block says `may_span`" is read
+this way: `range` when the tape holds some of the set's slices, `completed` when it holds all,
+`cut` when it holds none.
+
+**What a range promises.**
+- Every slice of the range is on the tape, and the keyless chain covers it (seal, File 3, each
+  slice: §4).
+- A range is not a copy on its own. Copies are counted slice by slice, and a version is as
+  covered as its least-covered slice (items 76 and 127; `layout-session.md`). A tape that holds
+  a range restores the version only together with tapes that hold its other slices.
+- A tape never names a tape written after it (ADR-0001, item 126). The first tape of a span says
+  only that the rest of the set is on a later tape: its envelope lists the slices, and its index
+  cannot say where they are. A later tape's `index/units.tsv` names the earlier holders, with
+  their runs (§1.5).
+
+**Reader rules for a range** (tapectl and RESTORE.sh alike, beside §4.2's R1-R5):
+- **R6. A slice with no `tape_position` is on another tape.** It is never read from this tape
+  and never reported as damage. A slice whose position is after `ended_after` is not on this
+  tape either (R3).
+- **R7. A range is restored only with the version's other slices.** A reader restores a spanning
+  version from one tape that holds it whole, or from several tapes in slice order, slice 1
+  first. It never runs dar over one tape's range alone.
+- **R8. Another tape is accepted for slice S by hash alone, without a key.** It supplies slice S
+  only when its front index (File 3) lists a `data_slice` whose `sha256_encrypted` equals slice
+  S's in the manifest, at a position at or before that tape's own `ended_after`, read from its
+  seal before any slice (R5). A tape with no readable seal, or whose seal does not cover that
+  position, is not accepted (ADR-0012 item 132). The reader then takes slices S+1, S+2 and on
+  from that tape for as long as its front index lists each by the same rule. A tape's label, its
+  index or another envelope's claims never stand in for the hash. The tape that supplies a slice
+  need not hold a range: a tape that holds the version whole supplies any slice of it (item
+  139).
+- **R9. Every slice is checked against the front index of the tape it was read from** before it
+  is used, as every slice is (§4).
+
+**RESTORE.sh** (items 88, 132 and 140; ADR-0012 item 135 authorizes the re-pin):
+- **Where a restore starts.** A spanning unit is restored (`--restore`, with `--unit NAME` or as
+  the lone unit) starting from a tape that holds its slice 1: one that holds the version whole,
+  or one whose range starts at slice 1. Started on a tape whose range starts after slice 1,
+  RESTORE.sh refuses before it reads a slice, names the first slice this tape holds, and names
+  the holders of slice 1 when an index the key opens names them (`--where`). The tapes are then
+  read in slice order. A tape that holds the version whole restores it alone, as any whole
+  unit, with no swap and no scratch.
+- **The default mode keeps ciphertext in scratch** (item 132). For each tape in turn, RESTORE.sh
+  reads that tape's slices of the version, checks each by R9, and keeps it still encrypted in
+  the scratch directory (inside `--to`, or `--scratch DIR`, the area `--path` already uses). When
+  the tape's run ends before slice N, it names the slice it needs next and the holders that an
+  index it has opened names, and waits for the heir to load another cartridge and press ENTER,
+  as `--swap-tapes` does. It accepts that cartridge only by R8, and otherwise says why and asks
+  again. When slices 1 to N are all in scratch, it decrypts them in slice order into one dar run,
+  through pipes as on one tape (§6 step 5), so only ciphertext is ever at rest.
+  - Before the first slice is read, the space check counts the version's whole ciphertext for
+    the scratch (the sum of every slice's `encrypted_bytes` in the manifest), as well as the
+    files for `--to`. When the room is not there it refuses and names `--stream-tapes`. It never
+    chooses the stream itself: item 88 leaves that to the heir.
+  - The mode is one run of the script. It waits at each swap for as long as the heir takes, and
+    a run that is killed leaves its scratch directory to be removed by hand, as any killed
+    restore does.
+- **`--stream-tapes`** feeds one dar run through pipes across the swaps instead: no slice is
+  kept on disk, and the script pauses at each tape's end for the next cartridge, accepted by R8.
+  Whether dar waits on a pipe across a cartridge change, for as long as a swap takes, is
+  unverified. The mhvtl gate's span leg settles it (items 132 and 136).
+- `--restore --path` of a spanning unit reads the slices its catalogue names for the path, and
+  the last, in slice order, from whichever tapes hold them, accepting each tape by R8.
+- `--restore --all` restores every unit this tape holds whole, and names each spanning unit of
+  which it holds only a range, with the `--restore --unit` command that restores it across tapes
+  (item 88).
+- `--list` lists a spanning unit's files from its catalogue, as for any unit, and says which of
+  its slices this tape holds.
+- `--where` and `--find` print a holder's slice run when it is not the whole version. A holder of
+  a range does not count on its own as holding the version, as a cut `this-tape` row does not
+  (§4.2).
+- `--slices-from` and `--swap-tapes` (#480) accept a replacement slice from any tape by R8, a
+  range included. `--fill-from` takes files only from a tape that holds the version whole: a
+  range is never a fill source, and the refusal says why (item 143).
+- `--info` and `--verify` read without a key and see a range only as data slices. They are
+  unchanged but for item 140's one `NOT ON TAPE` line (§4.2).
+
+**tapectl** (items 89, 101, 121 and 127-133):
+- `restore unit` and `restore file` of a spanning version choose the fewest cartridges in slice
+  order, a live volume that holds the version whole first. They ask for each cartridge by label,
+  sticker and chip serial (the `supply` machinery and `holders_of`, which include `range` writes
+  from 1.7.0) and stream across the swaps (item 131). `--from` must name a cartridge that holds
+  slice 1; with no `--from`, the loaded tape must hold it. A version with any slice on no live
+  volume is refused, by name, before the first cartridge is asked for. `--spool` goes through
+  scratch space first instead, as it does on one tape.
+- `restore volume` restores the whole units on one tape and names the spanning units of which
+  the tape holds only a range (item 89).
+- A damaged slice is read from another holder of the same slice, a range included (item 101). A
+  damaged file is filled only from a whole copy (item 143).
+- `catalog rebuild --from-volume` of one tape of a span records what that tape shows (item 130):
+  every slice row of the set from the manifest, the write `completed`, `range` or `cut` by the
+  split above, and positions only for the slices this tape's plan holds. The version reads no
+  copies until its other tapes are rebuilt, and stays as confirm would leave it (item 128,
+  `layout-session.md`). The to-do list names the slices the rebuilt tapes do not hold, and their
+  tapes when a newer index names them (§1.5). The adoption of a lost write (#360) accepts a
+  `range` row.
+- `volume verify` marks a `range` write read back in full as it marks a `completed` one (item
+  127). `volume rewrite` refuses a volume that holds a range, naming the range (item 133), and
+  never writes a range itself (item 142). Compaction (`volume compact-read`, `volume
+  compact-finish`, `volume compact`) refuses a volume that holds a range in the same way.
+
+**File 1 and RECOVERY.md** (item 135):
+- **File 1**, on every tape 1.7.0 writes (any tape of a box may be part of a span): its glossary
+  entry for `requires` names both features. A section on a unit across tapes says what a range
+  is; that a restore needs every slice from 1 to N, in slice order; how RESTORE.sh's two modes do
+  it and what each needs (scratch for the unit's whole ciphertext, or the cartridges at hand for
+  the stream); that the restore starts from the tape holding slice 1, which `--where` on the
+  newest tape names; and that a tape is accepted by hash. Its query of the Heir Kit's catalogue
+  lists `range` writes, with their slice runs, beside whole copies (item 141).
+- **RECOVERY.md**, in an envelope that lists a block stating `may_span = true`: a section on a
+  unit across tapes, after the section on reading the seal (§1.7). It says which slices of each
+  such unit this tape's plan holds; that the slices with no tape position, and those after
+  `ended_after`, are on other tapes; that a restore needs every slice, in slice order, from the
+  tapes that hold them, matched by the slices' `sha256_encrypted`; and that RESTORE.sh does it.
+  The unit's own section gives the manual steps for the slices this tape holds.
 
 ## 5. What "confirm" verifies (byte level)
 
@@ -1110,7 +1418,9 @@ any doubt is a rewind). The manual steps below read in that order.
    itself, and skips a backup whose primary already opened.
 5. For each slice position in your manifest, in order (first checking that the
    unit's last slice is at or before the seal's `ended_after`; if it is not, the
-   unit is cut and not on this tape whole, §4.2): `dd bs=512k` it out;
+   unit is cut and not on this tape whole, §4.2; from 1.7.0, a block stating
+   `may_span = true` may hold only a range here, and its other slices come from
+   other tapes, §4.4): `dd bs=512k` it out;
    `head -c size_bytes` to trim padding; `sha256sum` vs the front index's
    `sha256_encrypted` (**keyless** integrity) and/or the envelope's value;
    `age -d -i KEY` → `base.N.dar`. RESTORE.sh streams this: `dd | head | tee
@@ -1227,6 +1537,30 @@ MANIFEST.toml move). A tape may end early, at the drive's early warning, with a 
   own RESTORE.sh refuses a 1.6.0 tape given to it as a second tape (`--swap-tapes`,
   `--fill-from`) by the same rule.
 
+**Since 1.7.0** (ADR-0012 items 121-143, #478; RESTORE.sh's golden pin moves, and a second
+MANIFEST.toml case is pinned). A unit that allows spanning may have its slices on more than one
+tape, as ranges (§4.4).
+- **On tape.** A tape whose plan holds a slice of a spannable set states `requires =
+  ["short-seal", "spanning"]` in File 0 and the seal, spelled as §1.2 rules; every other tape
+  states `["short-seal"]` as in 1.6.0 (item 124). A spannable set's `[[units]]` block states
+  `may_span = true`, lists every slice of the set, and gives `tape_position` only to the slices
+  the tape plans (item 125). RECOVERY.md gains a section on a unit across tapes, and File 1 a
+  glossary entry and a section on it, with range writes in its Heir Kit query (items 135 and
+  141; §1.7, §4.4). File 3, the seal grammar, the short seal's pin and whole-unit blocks do not
+  move (items 126 and 135).
+- **RESTORE.sh.** `KNOWN_FEATURES="short-seal spanning"`, and the "this tape needs tapectl" text
+  (`die_newer_needed`) moves to "tapectl 1.7.0", because a new required feature arrived. A
+  spanning unit restores across tapes from the tape holding its slice 1: by default through
+  scratch space holding only ciphertext, or with `--stream-tapes` through pipes, each further
+  tape accepted by slice hash (§4.4). `--where`, `--find`, `--list` and `--restore --all` name
+  ranges. Every short tape gets one `NOT ON TAPE` line for its planned files past the end,
+  instead of one per file (item 140, §4.2).
+- **Compatibility.** 1.7.0 reads every tape before it. A tape with no spannable set states what a
+  1.6.0 tape states and holds only whole blocks, so a 1.6.0 reader reads it. A 1.6.0 reader
+  refuses a span tape at File 0 and names `spanning` (§1.2), and its RESTORE.sh refuses one given
+  to it as a second tape by the same rule. The Heir Kit is regenerated when 1.7.0 is installed
+  (item 135).
+
 ## 7. Block mode
 
 Fixed-block mode, 512 KB (decision D7). Plan-first depends on deterministic block
@@ -1248,7 +1582,9 @@ LTO-6 validation session, not a format question.
   2026-07-20 drill) and was a source of the audit's HIGH-severity defects. Since 1.6.0
   the drive's early warning ends the tape with a **short seal** (§4.1–§4.3). That is
   not the salvage: nothing is overwritten or sacrificed, no unit is split, and only
-  whole units count. The hard end inside a slice is still the clean abort. The
+  whole units count. (From 1.7.0 a unit that allows spanning may end a tape as a range
+  (§4.4); it counts slice by slice and needs its other tapes, and nothing of it is
+  overwritten or sacrificed either.) The hard end inside a slice is still the clean abort. The
   `writes.eot_recovery` and `writes.sacrificed_slice_id` columns become inert schema
   reserve (documented dead in `docs/design-errata.md`; not dropped, per the repo's
   inert-reserve convention).
