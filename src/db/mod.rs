@@ -5862,8 +5862,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(released, None, "no slice was released slice by slice before 039");
-        assert_eq!(allow, None, "NULL: the archive set defers to the next layer");
+        assert_eq!(
+            released, None,
+            "no slice was released slice by slice before 039"
+        );
+        assert_eq!(
+            allow, None,
+            "NULL: the archive set defers to the next layer"
+        );
         conn.execute(
             "UPDATE stage_slices SET staging_path = NULL, released_at = '2026-10-22 00:00:00'
               WHERE id = 880",
