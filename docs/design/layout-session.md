@@ -697,7 +697,9 @@ that fits on one tape keeps item 83's place (item 95).
 each has a `written` position in a `completed` or `range` row on a volume
 whose status is `sealed`, the volume being sealed counted. Confirm, the
 adoption of a lost write and `catalog rebuild` promote by this rule, in the
-transaction that records the seal or the rebuild. Until then the version stays
+transaction that records the seal or the rebuild. For a rebuild this is the
+status of the snapshot row it creates: `catalog rebuild` still never changes a
+volume's status. Until then the version stays
 `staged`, and the retire floor protects it: `versions_at_stake` holds a version
 that has a `range` row on an eligible volume at stake when that volume is the
 only holder of any of its slices (`sole_slices`, widened to match). `audit`
