@@ -204,7 +204,11 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// reached the tape are on it. It is never a copy, but the volume holds bytes
 /// tapectl knows about and is no write target, whatever its status says (a
 /// rebuild or an adoption can leave a short tape's rows on an `initialized`
-/// row exactly as it leaves `completed` ones). `session::SealedPending::confirm` moves
+/// row exactly as it leaves `completed` ones). So does `'range'` (#478;
+/// ADR-0012 item 121): the run of a spannable set's slices that the early
+/// warning ended on this tape. A range is on the tape, so a volume holding
+/// one holds known bytes and is no write target, for the same reason as a
+/// cut. `session::SealedPending::confirm` moves
 /// every `writes` row of a session to `completed` in the SAME transaction
 /// that flips `volumes.status` to `sealed`, so in NORMAL operation
 /// `completed` and `initialized` never coexist on one volume — only the
@@ -232,7 +236,7 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes
-                       WHERE volume_id = ?1 AND status IN ('completed', 'cut'))",
+                       WHERE volume_id = ?1 AND status IN ('completed', 'cut', 'range'))",
         params![volume_id],
         |row| row.get(0),
     )?)
@@ -374,13 +378,24 @@ pub fn holds_bytes_to_verify(volume_alias: &str) -> String {
 /// [`condition_ok`]/[`holds_sealed_bytes`]) and `planned` (never reached
 /// the tape) are deliberately excluded.
 ///
+/// `range` (#478; ADR-0012 item 121) is confirm's outcome for a spannable
+/// set the early warning ended inside: its written slices are on this tape,
+/// and for some of them this may be the only tape. Item 121 puts it here so
+/// the retire floor sees it, and `volume rewrite`'s consent with it, since
+/// that reads [`versions_at_stake`] through `cli::operations::retire_impacts`.
+/// What a range is a copy OF is item 127's per-slice count, not this
+/// predicate's question.
+///
 /// One `pub fn`, not a hand-copy at each call site, for the reason
 /// [`status_in`] itself exists: [`versions_at_stake`] (the gate) and
 /// `cli::operations::retire_impacts` (its own display) must never drift on
 /// what "physically on tape" means — issue #276's own requirement is that
 /// the display is never narrower than the gate.
 pub fn write_reaches_tape(write_alias: &str) -> String {
-    status_in(write_alias, &["completed", "in_progress", "interrupted"])
+    status_in(
+        write_alias,
+        &["completed", "range", "in_progress", "interrupted"],
+    )
 }
 
 /// True when `volume_label` is sealed-but-unconfirmed right now: the seal
@@ -1471,11 +1486,12 @@ pub struct VersionAtStake {
 ///    `--force` is that statement in so many words) and the floor does not
 ///    protect what has been given up.
 /// 2. The volume carries a write of that snapshot that REACHED THE TAPE
-///    ([`write_reaches_tape`]: `completed`, `in_progress`, or
+///    ([`write_reaches_tape`]: `completed`, `range`, `in_progress`, or
 ///    `interrupted` — issue #276. `in_progress`/`interrupted` are the same
 ///    physical fact as `completed` here: bytes `seal()`ed onto tape whose
 ///    confirm outcome the catalog has not recorded either way, see
-///    [`write_reaches_tape`]'s own doc for why). Coverage it never held
+///    [`write_reaches_tape`]'s own doc for why; `range` is a spannable
+///    set's slices on this tape, ADR-0012 item 121). Coverage it never held
 ///    cannot be coverage it removes.
 /// 3. The volume itself HOLDS SEALED BYTES right now
 ///    ([`holds_sealed_bytes`], issue #276 — a strict superset of
@@ -3284,6 +3300,19 @@ pub(crate) mod tests {
             has_completed_write(&conn, volume_id).unwrap(),
             "a `cut` writes row must disqualify"
         );
+
+        // #478 (ADR-0012 item 121): a `range` row is the run of a spannable
+        // set's slices this tape holds. A volume holding only one holds bytes
+        // tapectl knows about and is no write target.
+        conn.execute(
+            "UPDATE writes SET status = 'range', may_span = 1 WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        assert!(
+            has_completed_write(&conn, volume_id).unwrap(),
+            "a `range` writes row must disqualify"
+        );
     }
 
     /// #420 (ADR-0012 item 112), on the shared short-tape fixture: a `cut`
@@ -3599,6 +3628,37 @@ pub(crate) mod tests {
             .unwrap();
         let rows = versions_at_stake(&conn, unit_id, away).unwrap();
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #478 (ADR-0012 item 121): a `range` write is physically on the tape,
+    /// so a current version whose only write on a sealed volume is a range
+    /// is at stake when that volume is retired. The control: the same row as
+    /// `aborted` (confirm's proves-medium-bad branch) is not. What
+    /// `copies_after` counts for a range is item 127's per-slice count, not
+    /// asked here.
+    #[test]
+    fn at_stake_sees_a_range_write_on_a_sealed_volume() {
+        let (conn, unit_id, here) = setup_at_stake(false);
+        let set = |status: &str| {
+            conn.execute(
+                "UPDATE writes SET status = ?1, may_span = 1 WHERE volume_id = ?2",
+                params![status, here],
+            )
+            .unwrap();
+        };
+        set("aborted");
+        assert!(
+            versions_at_stake(&conn, unit_id, here).unwrap().is_empty(),
+            "control: an aborted write never reached the floor"
+        );
+        set("range");
+        let rows = versions_at_stake(&conn, unit_id, here).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a range on a sealed volume is on the tape, so retiring it is at stake: {rows:?}"
+        );
+        assert_eq!(rows[0].version, 1);
     }
 
     // ── the floor sees a sealed-but-unconfirmed volume (issue #276) ──
