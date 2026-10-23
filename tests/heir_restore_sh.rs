@@ -12076,3 +12076,219 @@ fn swap_tapes_reads_a_1_5_0_second_cartridges_seal_and_takes_nothing_from_one_wi
         }
     }
 }
+
+// ---- L2's residuals (#478 L3): a refusal relayed from an offered cartridge,
+// a catalogue refused after a swap under --stream-tapes, a cartridge with no
+// readable seal, and one taken through rung 2 ----
+
+/// L2 residual (a): a cartridge offered for a unit held across tapes that this
+/// script cannot read (a feature it does not know, another layout) is refused
+/// in words that fit a restore that goes on: nothing is taken from it, load
+/// another; never "use the RESTORE.sh stored on THIS tape", which would name
+/// the cartridge just refused as the way on. The prompt asks again each time.
+#[test]
+fn a_refusal_relayed_from_an_offered_cartridge_says_the_restore_goes_on() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+    let text_of = |p: &Path| -> String {
+        String::from_utf8(
+            std::fs::read(p)
+                .unwrap()
+                .into_iter()
+                .filter(|b| *b != 0)
+                .collect(),
+        )
+        .unwrap()
+    };
+    let f = copy_cart(&h, "SPAN03", "SPAN03F");
+    let f0 = text_of(&f.join("0"));
+    std::fs::write(
+        f.join("0"),
+        padded(
+            with_requires(
+                &f0,
+                "requires = [\"short-seal\", \"spanning\", \"zz-future\"]",
+            )
+            .into_bytes(),
+        ),
+    )
+    .unwrap();
+    let l = copy_cart(&h, "SPAN03", "SPAN03L");
+    assert_eq!(f0.matches("\nlayout_version = 2\n").count(), 1, "{f0}");
+    std::fs::write(
+        l.join("0"),
+        padded(
+            f0.replace("\nlayout_version = 2\n", "\nlayout_version = 3\n")
+                .into_bytes(),
+        ),
+    )
+    .unwrap();
+    let offers = ["SPAN03F", "SPAN03L", "SPAN03"];
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &[]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        assert!(k <= offers.len(), "asked too often");
+        h.load(offers[k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    assert_eq!(text.matches(SPAN_PROMPT).count(), 3, "{text}");
+    let flat_text = flat(&text);
+    for needle in [
+        "NOTE: this tape requires feature(s) zz-future, which this script does not know",
+        "This script cannot read that cartridge safely and will not guess, so nothing is taken from it, and the restore goes on: load another that holds the slice.",
+        "NOTE: this tape is layout_version 3; this script reads layout v2 only, so nothing is taken from it, and the restore goes on: load another that holds the slice.",
+        "To read that cartridge on its own, use the RESTORE.sh stored on it, at file 2",
+    ] {
+        assert!(flat_text.contains(needle), "{needle:?}:\n{text}");
+    }
+    assert_eq!(
+        text.matches(
+            "Nothing is taken from this cartridge: its file map cannot be used (see above)."
+        )
+        .count(),
+        2,
+        "{text}"
+    );
+    for word in [
+        "Use the RESTORE.sh stored on THIS tape",
+        "cannot read it safely",
+        "FATAL",
+    ] {
+        assert!(!text.contains(word), "{word:?}:\n{text}");
+    }
+    assert!(
+        text.contains(&format!("It gives slice(s) 3 to {n} of 'big'")),
+        "{text}"
+    );
+    // The positive control: the same tape on its own is refused the usual way.
+    let h = Heir::of_box(&b.of(&["SPAN01"]), 0);
+    let g = copy_cart(&h, "SPAN01", "SPAN01F");
+    let g0 = text_of(&g.join("0"));
+    std::fs::write(
+        g.join("0"),
+        padded(
+            with_requires(
+                &g0,
+                "requires = [\"short-seal\", \"spanning\", \"zz-future\"]",
+            )
+            .into_bytes(),
+        ),
+    )
+    .unwrap();
+    h.load("SPAN01F");
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("Use the RESTORE.sh stored on THIS tape"),
+        "{text}"
+    );
+}
+
+/// dar -x with the envelope's catalogue (-A): it reads slices 1 to 3 off
+/// their pipes and then refuses the catalogue, as dar refuses a re-staged
+/// snapshot's (#419), so the refusal comes after the cartridge change slice 3
+/// needs. Every other run is the host's dar.
+const DAR_REFUSES_AFTER_SLICE_3: &str = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -x "*" -A "*)
+    for n in 1 2 3; do cat "$2.$n.dar" >/dev/null; done
+    echo "Error: the archive and the isolated catalogue do not correspond to the same data"
+    exit 1 ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+
+/// L2 residual (b): with `--stream-tapes`, a catalogue dar refuses (#419)
+/// after a cartridge change ends the run with the #419 text and the way to
+/// restore the unit; it never asks for slice 1 again, which is on a cartridge
+/// already taken out. Nothing is restored.
+#[test]
+fn a_catalogue_refused_after_a_swap_ends_a_streamed_restore_with_the_419_text() {
+    let b = span_box();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+    h.stub("dar", DAR_REFUSES_AFTER_SLICE_3);
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &["--stream-tapes"]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, text| {
+        assert_eq!(k, 1, "one cartridge change, for slice 3:\n{text}");
+        h.load("SPAN03");
+        Some(String::new())
+    });
+    assert_eq!(code, 1, "{text}");
+    let fatal = flat(text.split("FATAL:").nth(1).expect("a FATAL"));
+    for needle in [
+        "dar refused the envelope's catalogue for 'big': it belongs to another staging run of the same snapshot (#419). Nothing was written.",
+        "would start again from slice 1, on a cartridge this run has taken out of the drive, so the run ends here.",
+        "Run the same command again without --stream-tapes",
+    ] {
+        assert!(fatal.contains(needle), "{needle:?}:\n{fatal}");
+    }
+    assert!(text.contains("needs slice 3 of"), "{text}");
+    assert!(!text.contains("needs slice 1 of"), "{text}");
+    assert!(
+        !text.contains("restoring\n      'big' without it"),
+        "{text}"
+    );
+    assert!(rel_files(Path::new(&dest)).is_empty(), "nothing restored");
+}
+
+/// L2 residual (c), R8: a cartridge whose seal marker cannot be read gives
+/// nothing (ADR-0012 item 132), and says why, and the prompt asks again; a
+/// cartridge whose front index (File 3) cannot be read is read by rung 2, the
+/// seal's copy of the front index, and is taken by it. Tape 1's ciphertext
+/// waits in scratch all the while.
+#[test]
+fn a_cartridge_with_no_readable_seal_is_refused_and_one_read_by_rung_2_is_taken() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+    let s = copy_cart(&h, "SPAN03", "SPAN03S");
+    garble(&s, last_file(&s));
+    let r = copy_cart(&h, "SPAN03", "SPAN03R");
+    garble(&r, 3);
+    let offers = ["SPAN03S", "SPAN03R"];
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &[]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        assert!(k <= offers.len(), "asked too often");
+        assert_scratch_holds(&dest, b, 2, &format!("prompt {k}"));
+        h.load(offers[k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    assert_eq!(text.matches(SPAN_PROMPT).count(), 2, "{text}");
+    for needle in [
+        "WARNING: this tape requires short-seal, and no valid seal marker was found as its last file",
+        "Its seal marker cannot be read, so nothing is taken from it: a cartridge gives a slice only at a",
+        "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it.",
+    ] {
+        assert!(text.contains(needle), "{needle:?}:\n{text}");
+    }
+    assert_eq!(
+        text.matches(&format!("It gives slice(s) 3 to {n} of 'big'"))
+            .count(),
+        1,
+        "{text}"
+    );
+    let t3 = unit_of(b.t("SPAN03"), "big");
+    let by_tape = reads_by_cartridge(&h);
+    assert_eq!(by_tape.len(), 3, "{:#?}", h.ops());
+    assert!(
+        by_tape[1].iter().all(|p| !t3.positions.contains(p)),
+        "the cartridge with no seal: no slice: {:?}",
+        by_tape[1]
+    );
+    for p in &t3.positions {
+        assert!(
+            by_tape[2].contains(p),
+            "rung 2's cartridge: {:?}",
+            by_tape[2]
+        );
+    }
+}

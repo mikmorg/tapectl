@@ -3319,6 +3319,11 @@ check_layout_version() { # <layout_version as File 0 states it>
     return 0
   fi
   [ "$v" != 2 ] || return 0
+  if [ "$SPAN_OFFERED" = 1 ]; then
+    die "this tape is layout_version $(safe_str "$v"); this script reads layout v2 only, so nothing
+       is taken from it, and the restore goes on: load another that holds the slice. To read
+       that cartridge on its own, use the RESTORE.sh stored on it, at file 2."
+  fi
   die "this tape is layout_version $(safe_str "$v"); this script reads layout v2 only.
        Use the RESTORE.sh stored on THIS tape — every tape carries the script
        that reads it, at file 2:
@@ -3341,7 +3346,19 @@ check_layout_version() { # <layout_version as File 0 states it>
 # tape (volume-format-v2.md 4.4).
 KNOWN_FEATURES="short-seal spanning"
 
+# 1 while span_accept reads a cartridge offered for a unit held across tapes,
+# in a subshell: a refusal there is relayed as a NOTE and the restore goes on
+# with another cartridge, so it does not send the heir to that one's script.
+SPAN_OFFERED=0
+
 die_newer_needed() { # <what> <detail>
+  if [ "$SPAN_OFFERED" = 1 ]; then
+    die "$2
+       This script cannot read that cartridge safely and will not guess, so nothing
+       is taken from it, and the restore goes on: load another that holds the slice.
+       To read that cartridge on its own, use the RESTORE.sh stored on it, at file 2,
+       or a newer tapectl ($1 names what it needs)."
+  fi
   die "$2
        This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely, and
        will not guess. Use the RESTORE.sh stored on THIS tape — every tape
@@ -4373,6 +4390,12 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       # takes (volume-format-v2.md 4.4, R8).
       tpos=$(span_pos "$num")
       if [ -z "$tpos" ]; then
+        # A dar already gone (its catalogue refused, #419, or worse) is said
+        # before a cartridge is asked for that it would never read.
+        if ! kill -0 "$DAR_PID" 2>/dev/null; then
+          die_dar "$destdir"
+          return 0
+        fi
         span_swap "$num"
         tpos=$(span_pos "$num")
       fi
@@ -4558,6 +4581,17 @@ restore_unit_plain() { # <slices file> <destination> <unit> <version>
   if [ -n "$cat" ] && dar_at_least 2.7.9; then
     stream_unit "$list" "$destdir" "$cat"
     [ "$STREAM_REFUSED" = 1 ] || return 0
+    # With --stream-tapes, once a cartridge has changed, a restore without the
+    # catalogue would start again from slice 1, on a cartridge already taken
+    # out: the run ends instead (#419), and says how to restore the unit.
+    if [ "$SPAN_RESTORE" = stream ] && [ "$SPAN_SWAPPED" = 1 ]; then
+      die "dar refused the envelope's catalogue for '$unit': it belongs to another
+       staging run of the same snapshot (#419). Nothing was written. Restoring '$unit'
+       without it would start again from slice 1, on a cartridge this run has taken out
+       of the drive, so the run ends here. Run the same command again without
+       --stream-tapes: the slices then wait, still encrypted, in scratch space, and a
+       dar 2.7.21 or later restores '$unit' from them without the catalogue."
+    fi
     echo "NOTE: dar refused the envelope's catalogue for '$unit': it belongs to another" >&2
     echo "      staging run of the same snapshot (#419). Nothing was written; restoring" >&2
     echo "      '$unit' without it." >&2
@@ -4957,6 +4991,8 @@ SPAN_UNIT=""
 SPAN_VER=""
 SPAN_N=0
 SPAN_NEED=""
+# 1 once a cartridge other than the first has been taken.
+SPAN_SWAPPED=0
 
 # The tape file of slice $1 on the cartridge in the drive, or nothing when it
 # does not give that slice.
@@ -5027,7 +5063,9 @@ span_accept() {
   # layout, a feature it does not know, a File 0 that will not read) stops
   # the subshell, not this restore. The head is unknown after it.
   rm -f "$WORK/other.vars"
+  SPAN_OFFERED=1
   (other_tape_map && printf '%s|%s\n' "$OTHER_END" "$OTHER_LABEL" >"$WORK/other.vars") 2>"$WORK/other.err" || rc=$?
+  SPAN_OFFERED=0
   CUR=""
   # A subshell stopped part way has not put back the first tape's file map.
   [ ! -f "$WORK/tape1.files" ] || cp "$WORK/tape1.files" "$FILES_TXT"
@@ -5101,6 +5139,7 @@ span_swap() { # <slice number>
   SPAN_NEED=$1
   swap_loop
   SPAN_NEED=""
+  SPAN_SWAPPED=1
 }
 
 # The default way (item 132), and --path's: every slice $WORK/span.all lists
