@@ -53,7 +53,9 @@
 #
 # A FAIL STOPS THE RUN and leaves the cartridge as the failed step left it: no later step, no
 # exit trap, ever writes the medium a failed step measured (#420's lost readback). The exit
-# trap only ends the held RESTORE.sh run, which writes nothing to the medium. The run
+# trap only ends the held RESTORE.sh run, which writes nothing to the medium, after recording
+# each file its scratch holds with its size and sha256 (RESTORE.sh's own cleanup removes the
+# scratch directory when it is ended). The run
 # directory keeps every command's output, the catalog, and the drive's sysfs options and
 # counters, MAM and log pages 0x02 0x03 0x0c 0x17 before and after every step.
 #
@@ -479,30 +481,49 @@ held_alive() {
     s="$(held_state)"
     [ -n "$s" ] && [ "$s" != Z ] && [ "$s" != X ]
 }
-# Ends the held run: never the medium. TERM to its process group, then KILL. Its scratch
-# directory is left for the operator (RESTORE.sh: "a run that is killed leaves its scratch
-# directory"), holding only ciphertext.
+# What the held run's scratch holds, file by file: path, size, sha256. RESTORE.sh's own exit
+# trap removes its scratch directory when it ends on TERM, INT or HUP, or by itself (only a
+# KILL, a crash or a power loss leaves it), so this is the evidence of the spool a FAIL keeps.
+# On home2 it hashes up to the whole range, which takes minutes.
+HELD_LIST=""
+record_scratch() {
+    HELD_LIST="$RUN/held-scratch-at-end.tsv"
+    {
+        printf 'file\tbytes\tsha256\n'
+        find "$SCRATCH" -type f -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
+            printf '%s\t%s\t%s\n' "${f#"$SCRATCH"/}" "$(stat -c %s "$f" 2>/dev/null)" \
+                "$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+        done
+    } > "$HELD_LIST" 2>/dev/null || echo "span-acceptance: the scratch listing could not be written ($HELD_LIST)" >&2
+}
+# Ends the held run: never the medium. The scratch is recorded first, then TERM goes to the
+# run's process group, which ends it through its own cleanup (the scratch directory removed),
+# and KILL follows when it has not ended 10 s later (the directory may then remain).
+# HELD_END_NOTE says which, for RESULT.txt.
+HELD_END_NOTE=""
 end_held() {
     held_alive || return 0
-    echo "span-acceptance: ending the held RESTORE.sh run (pid $HELD_PID); its scratch directory under $SCRATCH stays (encrypted slices only): remove it by hand" >&2
+    echo "span-acceptance: ending the held RESTORE.sh run (pid $HELD_PID); recording what its scratch holds first" >&2
+    record_scratch
     kill -TERM -- "-$HELD_PID" 2>/dev/null || kill -TERM "$HELD_PID" 2>/dev/null || true
     local n
     for n in 1 2 3 4 5 6 7 8 9 10; do
-        held_alive || return 0
+        if ! held_alive; then
+            HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) was ended with TERM; its own cleanup removed its scratch directory. What the scratch held (each file's size and sha256) is in $HELD_LIST."
+            echo "span-acceptance: $HELD_END_NOTE" >&2
+            return 0
+        fi
         sleep 1
     done
-    echo "span-acceptance: the held run did not end after TERM (${n}s): KILL" >&2
     kill -KILL -- "-$HELD_PID" 2>/dev/null || kill -KILL "$HELD_PID" 2>/dev/null || true
+    HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) did not end on TERM within ${n}s and was killed, so its scratch directory under $SCRATCH may remain, holding encrypted slices only: remove it by hand once the failure is read. What it held is listed in $HELD_LIST."
+    echo "span-acceptance: $HELD_END_NOTE" >&2
 }
 trap 'end_held' EXIT
 
 STEP=""; STEP_DIR="$RUN"
 fail() {
     log "FAIL (step $STEP): $*"
-    local held_note=""
-    if held_alive; then
-        held_note="The held RESTORE.sh run (pid $HELD_PID) was ended; its scratch directory under $SCRATCH holds encrypted slices only: remove it once the failure is read."
-    fi
     end_held || true
     {
         echo "RESULT: FAIL"
@@ -511,7 +532,8 @@ fail() {
         echo "The run stopped here. The cartridge is as this step left it: read the failure"
         echo "before anything writes it again. Everything is in $RUN; the copy, staging and"
         echo "restore are in $WORK."
-        [ -z "$held_note" ] || echo "$held_note"
+        [ -z "$HELD_END_NOTE" ] || echo "$HELD_END_NOTE"
+        [ -n "$HELD_END_NOTE" ] || [ -z "$HELD_LIST" ] || echo "What the held RESTORE.sh run's scratch held before it ended is in $HELD_LIST."
         [ -z "$FILLER_DIR" ] || [ ! -e "$FILLER_DIR" ] || echo "The filler's slice file is kept in $FILLER_DIR (RAM, on a tmpfs): remove it once the failure is read."
     } > "$RUN/RESULT.txt"
     snapshot_drive "$STEP_DIR" "at-fail" || true
@@ -1227,6 +1249,8 @@ printf '\n' >&8
 T5="$(date +%s)"
 while held_alive; do
     if [ "$(grep -cF "$PROMPT" "$HELD_OUT" || true)" -gt 1 ]; then
+        # "quit" ends it through its own cleanup, which removes the scratch: record it first.
+        record_scratch
         printf 'quit\n' >&8
         sleep 5
         fail "RESTORE.sh did not take $LABEL2 and asked again ($HELD_OUT)"

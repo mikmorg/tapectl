@@ -385,8 +385,12 @@ About 5.5 hours of drive time; staging is most of the rest.
       step's `.err` and `.out` files, `held.out`, `drive-at-fail/`), and keep the cartridge
       unwritten until it is understood. Then:
   - On a FAIL in 1c or 2, `catalog-at-fail.db` and tape 1 are the evidence.
-  - On a FAIL in 2 to 5 the held run is ended, and its scratch directory under `<work>/scratch`
-    stays, holding encrypted slices only. Remove it once it is read.
+  - On a FAIL in 2 to 5 the held run is ended with TERM. RESTORE.sh's own cleanup then removes
+    its scratch directory, so the script first records each spooled file's size and sha256 in
+    `held-scratch-at-end.tsv` in the run directory (minutes for a full range on home2). Only if
+    the run does not end on TERM is it killed, and then its scratch directory under
+    `<work>/scratch` may remain, holding encrypted slices only: `RESULT.txt` says which, and a
+    remaining directory is removed by hand once the failure is read.
   - A FAIL in 4a after the filemark leaves the cartridge with File 0 EMPTY: tape 1's data is
     gone, and the run cannot be resumed. Start again from 1a in a fresh home.
 - [ ] Afterwards the cartridge holds `SPN-0002` (`spn-span` whole), owned by the throwaway home.
