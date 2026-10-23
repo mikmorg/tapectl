@@ -2581,6 +2581,7 @@ prompts = [e for e in ev if "prompt" in e]
 assert len(prompts) == 1, f"{len(prompts)} prompts, want one cartridge change: {prompts}"
 p = prompts[0]
 assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
+# An absence; its positive control is span_heir_stream_swap, where the same reading finds the one dar run.
 assert p["dar_at_prompt"] == [], f"dar ran before every slice was in scratch: {p}"
 k1 = int(sys.argv[3])
 assert f"holds slice {k1 + 1} into" in p["line"], f"the prompt is {p['line']!r}, want slice {k1 + 1}"
@@ -2957,14 +2958,24 @@ PY
 }
 check span_three_tapes step_span_three_tapes
 
-# The gate's own cartridge back in the drive, and the leg's bulk (sources, staging, restores)
-# removed: the logs, JSON reports and catalogs stay.
+# The gate's own cartridge back in the drive. When every span check passed, the leg's bulk
+# (sources, staging, restored trees) is removed and the logs, JSON reports and catalogs stay;
+# after a failure all of it is kept, so the failure can be read from what it left.
 if [ -z "$SP_PREP" ]; then
     if [ -n "$SP_ORIG" ]; then
         sp_swap "$SP_ORIG" >/dev/null || echo "gate: span leg: could not put the gate's cartridge back from slot $SP_ORIG"
     fi
-    rm -rf "$SP"/{a,c,f}/src "$SP"/{a,c,f}/home/staging "$SP"/a/heir/from-1-3 "$SP"/a/heir/stream \
-        "$SP"/a/heir2/from-2 "$SP"/a/restore/attended "$SP"/c/heir/restored
+    sp_all_passed=1
+    for sp_name in span_rows span_heir_tapes_1_3 span_heir_tape_2 span_heir_stream_swap span_restore_unit \
+        span_retire_floors span_floor_target_1 span_rebuild_tape_3 span_three_tapes; do
+        [ "${RESULT[$sp_name]:-}" = PASS ] || sp_all_passed=0
+    done
+    if [ "$sp_all_passed" = 1 ]; then
+        rm -rf "$SP"/{a,c,f}/src "$SP"/{a,c,f}/home/staging "$SP"/a/heir/from-1-3 "$SP"/a/heir/stream \
+            "$SP"/a/heir2/from-2 "$SP"/a/restore/attended "$SP"/c/heir/restored
+    else
+        echo "gate: span leg: a span check failed; its sources, staging and restored trees are kept in $SP"
+    fi
 fi
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
