@@ -2018,6 +2018,17 @@ impl Heir {
     fn run_prompted(
         &self,
         args: &[&str],
+        on_prompt: impl FnMut(usize, &str) -> Option<String>,
+    ) -> (i32, String) {
+        self.run_prompted_at(args, SPAN_PROMPT, on_prompt)
+    }
+
+    /// `run_prompted`, watching for `prompt` (`--swap-tapes` asks in other
+    /// words than a restore across tapes).
+    fn run_prompted_at(
+        &self,
+        args: &[&str],
+        prompt: &str,
         mut on_prompt: impl FnMut(usize, &str) -> Option<String>,
     ) -> (i32, String) {
         use std::io::Write;
@@ -2048,7 +2059,7 @@ impl Heir {
         let code = loop {
             let done = child.try_wait().unwrap();
             let text = std::fs::read_to_string(&out_path).unwrap_or_default();
-            let asked = text.matches(SPAN_PROMPT).count();
+            let asked = text.matches(prompt).count();
             while answered < asked {
                 answered += 1;
                 match on_prompt(answered, &text) {
@@ -11871,4 +11882,197 @@ fn a_path_across_tapes_keeps_only_ciphertext_until_every_slice_is_read() {
     let probe = h.dir.join("tmp").join("probe.dar");
     std::fs::write(&probe, &good_slice(b.t("SPAN02"), &b.big(), 1)[32..]).unwrap();
     assert_eq!(plain_slice_files(&h, b), vec![probe]);
+}
+
+// ---- --swap-tapes and a cartridge's seal (volume-format-v2.md §4.2 R5, §4.4
+// R8 and its RESTORE.sh bullet; ADR-0012 items 101, 132, 139; #478 L3) ----
+
+/// What `--swap-tapes` prints when it waits for another cartridge.
+const SWAP_PROMPT: &str = "Load a cartridge that holds copies of these slices";
+
+/// A copy of the cartridge `from` in the box as `to`, label, uuid and all.
+fn copy_cart(h: &Heir, from: &str, to: &str) -> PathBuf {
+    let d = h.dir.join("cart").join(to);
+    copy_dir(&h.dir.join("cart").join(from), &d);
+    d
+}
+
+/// The last file on a cartridge directory: its seal marker, when it has one.
+fn last_file(d: &Path) -> i64 {
+    std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<i64>().ok()))
+        .max()
+        .unwrap()
+}
+
+/// Overwrite one file of a cartridge directory with text that is no zone this
+/// script reads: a seal marker or a front index that does not parse.
+fn garble(d: &Path, pos: i64) {
+    std::fs::write(
+        d.join(pos.to_string()),
+        padded(b"this is not a zone of a tape\n".to_vec()),
+    )
+    .unwrap();
+}
+
+/// R5 and R8 for `--swap-tapes` (§4.4: "`--slices-from` and `--swap-tapes`
+/// accept a replacement slice from any tape by R8, a range included"). A
+/// restore from tape 2, the whole copy, whose slice 4 fails its hash: tape 1
+/// lists slice 4 in its plan, after the end its short seal states, and gives
+/// nothing; a copy of tape 3 whose seal does not parse gives nothing either, in
+/// span_accept's words; tape 3, which holds a range 3..N under a full seal,
+/// gives slice 4 by its sha256 (item 139: any tape that holds the slice). Each
+/// refusal reads nothing of the cartridge but File 0, File 3 and its seal.
+#[test]
+fn swap_tapes_takes_a_slice_from_a_range_only_at_a_position_its_seal_covers() {
+    let b = span_box();
+    let big = b.big();
+    let h = Heir::of_box(&b.of(&["SPAN02", "SPAN01", "SPAN03"]), 0);
+    let t1 = unit_of(b.t("SPAN01"), "big");
+    let t2 = unit_of(b.t("SPAN02"), "big");
+    let t3 = unit_of(b.t("SPAN03"), "big");
+    let f = h.dir.join(format!("cart/SPAN02/{}", t2.positions[3]));
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[100] ^= 0xff;
+    std::fs::write(&f, bytes).unwrap();
+    let s = copy_cart(&h, "SPAN03", "SPAN03S");
+    garble(&s, last_file(&s));
+    let offers = ["SPAN01", "SPAN03S", "SPAN03"];
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &["--swap-tapes"]);
+    let (code, text) = h.run_prompted_at(&strs(&args), SWAP_PROMPT, |k, _| {
+        assert!(k <= offers.len(), "asked too often");
+        h.load(offers[k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    assert_eq!(text.matches(SWAP_PROMPT).count(), 3, "{text}");
+    for needle in [
+        format!(
+            "unit 'big' slice 4, {} bytes, sha256 {}",
+            big.sizes[3], big.hashes[3]
+        ),
+        format!(
+            "This cartridge ended early, after file {} (its seal marker says so): nothing after that is read from it.",
+            t1.positions[1]
+        ),
+        "No file in the front index of this cartridge has the sha256 of a slice still needed at a position\n>>> its seal marker covers.".to_string(),
+        format!(
+            "Its front index lists such a slice at tape file(s) {}, after file {}, where the tape ended\n>>> (its seal marker says so): that is not on it. Nothing is taken from it.",
+            t1.positions[3], t1.positions[1]
+        ),
+        "Its seal marker cannot be read, so nothing is taken from it: a cartridge gives a slice only at a".to_string(),
+        format!(
+            "Tape file {} of this cartridge lists sha256 {}..., a slice still needed",
+            t3.positions[1],
+            &big.hashes[3][..16]
+        ),
+    ] {
+        assert!(text.contains(&needle), "{needle:?}:\n{text}");
+    }
+    let by_tape = reads_by_cartridge(&h);
+    assert_eq!(by_tape.len(), 4, "{:#?}", h.ops());
+    let seal1 = t1.positions[2];
+    assert!(
+        by_tape[1].iter().all(|p| [0, 3, seal1].contains(p)),
+        "tape 1: File 0, File 3 and its seal only: {:?}",
+        by_tape[1]
+    );
+    assert!(
+        by_tape[2].iter().all(|p| !t3.positions.contains(p)),
+        "the copy with no seal: no slice: {:?}",
+        by_tape[2]
+    );
+    assert!(by_tape[3].contains(&t3.positions[1]), "{:?}", by_tape[3]);
+    assert!(
+        t3.positions
+            .iter()
+            .filter(|p| **p != t3.positions[1])
+            .all(|p| !by_tape[3].contains(p)),
+        "tape 3: slice 4 only: {:?}",
+        by_tape[3]
+    );
+}
+
+/// R5 for a second cartridge that does not require short-seal (a tape written
+/// before 1.6.0): its seal is read first too, now that every second-tape read
+/// learns where the tape ends. Sealed, it gives its slices as before; with a
+/// seal that does not parse it gives none, says why, and the restore goes on
+/// without them.
+#[test]
+fn swap_tapes_reads_a_1_5_0_second_cartridges_seal_and_takes_nothing_from_one_without() {
+    let t = template();
+    let photos = unit("photos/2019");
+    let all: Vec<Vec<u8>> = (0..photos.positions.len())
+        .map(|i| good_slice(t, &photos, i))
+        .collect();
+    for sealed in [true, false] {
+        let h = Heir::new();
+        flip_in_tape(&h, photos.positions[1]);
+        second_tape(&h, "COPY15", "c0c0c0c0-0015-4000-8000-000000000015", &all);
+        let d = h.dir.join("tape2");
+        let text_of = |p: &Path| -> String {
+            String::from_utf8(
+                std::fs::read(p)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|b| *b != 0)
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let f0 = d.join("0");
+        std::fs::write(&f0, padded(era_file0(Era::V150, text_of(&f0)).into_bytes())).unwrap();
+        let seal_at = last_file(&d);
+        let seal = d.join(seal_at.to_string());
+        if sealed {
+            std::fs::write(
+                &seal,
+                padded(era_seal(Era::V150, &text_of(&seal)).into_bytes()),
+            )
+            .unwrap();
+        } else {
+            garble(&d, seal_at);
+        }
+        let dest = h.sub("restored");
+        let (code, text) = run_with(
+            &h,
+            &restore_args(&h, "photos/2019", &dest),
+            &["--swap-tapes"],
+            "\ndone\n",
+            &[("FAKE_SWAP_ON_SETBLK", "2")],
+        );
+        assert!(
+            text.contains("This cartridge identifies as: COPY15"),
+            "{text}"
+        );
+        let swap = h.ops().iter().position(|l| l == "swap").unwrap();
+        assert!(
+            h.ops()[swap..].iter().any(|l| l == "mt eod"),
+            "its seal is looked for at the end of its data: {:#?}",
+            h.ops()
+        );
+        if sealed {
+            assert_eq!(code, 0, "{text}");
+            assert!(text.contains("RESTORE COMPLETE"), "{text}");
+            assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+            assert!(!text.contains("Its seal marker cannot be read"), "{text}");
+        } else {
+            assert_eq!(code, 1, "{text}");
+            assert!(
+                text.contains("Its seal marker cannot be read, so nothing is taken from it"),
+                "{text}"
+            );
+            assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+            let second = reads_in(&h.ops()[swap..]);
+            assert!(
+                second.iter().all(|p| !(5..seal_at).contains(p)),
+                "no slice of it is read: {second:?}"
+            );
+        }
+    }
 }

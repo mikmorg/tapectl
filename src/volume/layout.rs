@@ -2658,9 +2658,9 @@ KEYS=()
 # the operator's, catalog.db) until the run ends; --all keeps every one it
 # opens. These grow with the number of files on the tape. A data slice never
 # lands here — a slice is up to 10 GiB and /tmp is RAM on many systems.
-# SCRATCH is for the one mode that keeps slices on disk (--path, which reads
-# only a few), a directory created inside --to or --scratch once its size is
-# known.
+# SCRATCH is for the modes that keep slices on disk (--path, which reads only
+# a few; a unit held across tapes, its slices still encrypted; a replacement
+# slice), a directory created inside --to or --scratch once its size is known.
 SCRATCH=""
 SCRATCH_PARENT=""
 SKIP_SPACE_CHECK=0
@@ -2675,7 +2675,9 @@ FILL_FROM=""
 # slice 1, asking for each further cartridge. SPAN_RESTORE is scratch (the
 # default: each tape's slices are kept, still encrypted, in SCRATCH until all
 # are read, and dar runs once over them) or stream (--stream-tapes: one dar
-# run fed across the swaps, no slice on disk) while such a restore runs.
+# run fed across the swaps, no slice on disk) while such a restore runs, and
+# path while --path reads the slices it needs of such a unit (into SCRATCH,
+# still encrypted, as by default).
 STREAM_TAPES=0
 SPAN_RESTORE=""
 
@@ -5037,11 +5039,7 @@ span_accept() {
   IFS='|' read -r OTHER_END OTHER_LABEL <"$WORK/other.vars"
   info "This cartridge identifies as: ${OTHER_LABEL:-<unreadable>}"
   IFS='|' read -r _ _ eb sha < <(awk -F'|' -v n="$SPAN_NEED" '$1 == n' "$WORK/span.all")
-  if [ -z "$OTHER_END" ]; then
-    info "Its seal marker cannot be read, so nothing is taken from it: a cartridge gives a slice only at a"
-    info "position its seal marker says the tape holds (volume-format-v2.md 4.4, R8)."
-    return 1
-  fi
+  sealed_other || return 1
   # The slices still needed, from SPAN_NEED on, in the order span.all lists
   # them (every slice for --restore; for --path, the ones it needs): those
   # already in the scratch directory are not asked of this cartridge again.
@@ -5085,6 +5083,16 @@ span_accept() {
   info "It gives slice(s) $what of '$SPAN_UNIT': its front index lists each one's sha256, at"
   info "positions its seal marker covers."
   return 0
+}
+
+# A cartridge gives a slice only at a position its seal marker covers (R5,
+# R8): one whose seal cannot be read (OTHER_END is empty) gives nothing, and
+# says so. span_accept and swap_fetch both ask.
+sealed_other() {
+  [ -z "$OTHER_END" ] || return 0
+  info "Its seal marker cannot be read, so nothing is taken from it: a cartridge gives a slice only at a"
+  info "position its seal marker says the tape holds (volume-format-v2.md 4.4, R8)."
+  return 1
 }
 
 # Ask for the cartridge that gives slice $1, until one does (R8) or the heir
@@ -5709,6 +5717,9 @@ dir_sum() { # <file> <bytes>
 # is a candidate by its size alone (the slice's exact size, or that rounded up
 # to the tape block as dd copies it off a tape) and is USED only if the sha256
 # of its first <bytes> bytes is the one wanted. The file is left in DIR_HIT.
+# --slices-from reads files, not tapes: there is no seal to read first (R5 is
+# for a tape), so the hash alone decides, whatever tape, range or whole, the
+# file was copied off.
 DIR_HIT=""
 DIR_NOTED=""
 dir_find() { # <slice number> <bytes> <sha256>
@@ -6215,11 +6226,12 @@ print_needs() { # <job: its missing file is read, or - to print $WORK/needed.txt
 # and nothing after its ended_after is taken from it (R5): its map keeps only
 # the files on it.
 # OTHER_END is the last file before the cartridge's seal, as a valid seal
-# marker says, and empty when none was read: a unit held across tapes takes
-# nothing from a cartridge without one (R8). A cartridge that does not require
-# short-seal never ends early, and its seal is read for that only. The plan as
-# its front index lists it, before the files after the end are dropped, is
-# kept in $WORK/other.plan, so a refusal can say why.
+# marker says, and empty when none was read: nothing is taken from a cartridge
+# without one, by a restore across tapes (span_accept) or by --swap-tapes
+# (swap_fetch), and nothing from past it (R5, R8). A cartridge that does not
+# require short-seal never ends early, and its seal is read for that only. The
+# plan as its front index lists it, before the files after the end are
+# dropped, is kept in $WORK/other.plan, so a refusal can say why.
 OTHER_TAPE=0
 OTHER_LABEL=""
 OTHER_END=""
@@ -6243,7 +6255,7 @@ other_tape_map() {
     learn_end
     if [ -n "$ENDED_AFTER" ]; then
       OTHER_END=$ENDED_AFTER
-    elif [ -n "$SPAN_RESTORE" ] && [ "$TAPE_SHORT_SEAL" = 0 ] && try_seal_copy; then
+    elif [ "$TAPE_SHORT_SEAL" = 0 ] && try_seal_copy; then
       OTHER_END=$SEAL_LAST
     fi
   elif try_seal_copy; then
@@ -6269,11 +6281,15 @@ other_tape_map() {
 
 # Read the cartridge now in the drive for the slices still needed (the file
 # $WORK/needed.txt), by sha256 only, in the order they lie on it: one rewind,
-# then forward. In restore mode each is read into the scratch area, checked
-# against the sha256 the first tape's front index gave, and decrypted into the
-# slice directory of every job short of it; in verify mode it is only hashed.
+# then forward. Its seal is read first, and it gives a slice only at a position
+# at or before its OTHER_END (R5, R8): any tape that holds the slice, one that
+# holds a range of a unit held across tapes or the version whole included
+# (ADR-0012 item 139). In restore mode each is read into the scratch area,
+# checked against the sha256 the first tape's front index gave, and decrypted
+# into the slice directory of every job short of it; in verify mode it is only
+# hashed.
 swap_fetch() {
-  local pos sha size job num rest
+  local pos sha size job num rest past
   if ! (tape_init) 2>"$WORK/swap.err"; then
     echo "NOTE: the drive is not ready: $(head -n 1 "$WORK/swap.err" 2>/dev/null)" >&2
     echo "      Wait until the cartridge is loaded, then press ENTER again." >&2
@@ -6281,12 +6297,22 @@ swap_fetch() {
   fi
   other_tape_map || return 1
   info "This cartridge identifies as: $(safe_str "${OTHER_LABEL:-<unreadable>}")"
-  awk -F'|' '
+  sealed_other || return 1
+  awk -F'|' -v end="$OTHER_END" '
     FILENAME == ARGV[1] { need[$4] = $3; next }
-    $2 == "data_slice" && ($4 in need) && $3 == need[$4] && !($4 in seen) { seen[$4] = 1; print $1 "|" $4 "|" $3 }
+    $2 == "data_slice" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && ($4 in need) && $3 == need[$4] && !($4 in seen) { seen[$4] = 1; print $1 "|" $4 "|" $3 }
   ' "$WORK/needed.txt" "$WORK/other.files" >"$WORK/fetch.plan"
   if [ ! -s "$WORK/fetch.plan" ]; then
-    info "No file in the front index of this cartridge has the sha256 of a slice still needed."
+    info "No file in the front index of this cartridge has the sha256 of a slice still needed at a position"
+    info "its seal marker covers."
+    past=$(awk -F'|' -v end="$OTHER_END" '
+      FILENAME == ARGV[1] { need[$4] = 1; next }
+      $2 == "data_slice" && ($4 in need) && $1 + 0 > end + 0 { printf "%s%s", sep, $1; sep = ", " }
+    ' "$WORK/needed.txt" "$WORK/other.plan" 2>/dev/null || true)
+    if [ -n "$past" ]; then
+      info "Its front index lists such a slice at tape file(s) $past, after file $OTHER_END, where the tape ended"
+      info "(its seal marker says so): that is not on it. Nothing is taken from it."
+    fi
     return 1
   fi
   : >"$WORK/fetched.txt"
@@ -7233,7 +7259,9 @@ case "${1:-}" in
   echo "  --swap-tapes   (--restore, --verify) When slices are still missing after this tape has"
   echo "      been read, say which (their number and sha256), wait for ENTER with another cartridge"
   echo "      in the drive, and read just those slices from it: any tape whose front index lists the"
-  echo "      same sha256 values. Each tape is read forward from one rewind. Type done and ENTER to"
+  echo "      same sha256 values at positions its seal marker covers (its seal is read first; a tape"
+  echo "      whose seal cannot be read gives none), a tape holding part of a unit held across tapes"
+  echo "      included. Each tape is read forward from one rewind. Type done and ENTER to"
   echo "      go on without them. Needs the input to be a terminal, or a line of input per swap."
   echo "      Either option restores the way an older dar does, a slice at a time onto disk, so --to"
   echo "      needs about twice the unit's size (--scratch DIR puts the slices on another disk)."
