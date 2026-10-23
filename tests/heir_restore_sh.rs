@@ -9972,8 +9972,8 @@ fn list_names_the_run_of_a_unit_held_across_tapes() {
 /// holds a range of that does not start at slice 1 stops before any slice is
 /// read and before dar runs, naming the run here, every slice it needs, and
 /// the holders of slice 1 the index names with their runs (OTHER02, not this
-/// tape); `--path` into it stops the same way, as `--path` reads one tape.
-/// Nothing is restored. A slice with no tape position is never read, and
+/// tape). (`--path` has no such start rule: it reads across tapes, from any of
+/// them, and the `--path` tests below prove it.) Nothing is restored. A slice with no tape position is never read, and
 /// never as file 0: the run reads File 0 once, at the start, and nothing at
 /// or after the first slice.
 #[test]
@@ -9989,64 +9989,56 @@ fn a_restore_of_a_range_stops_before_dar_and_names_the_tapes_it_needs() {
         .unwrap();
     let h = Heir::of(t, &[("dar", DAR_SPY)]);
     let alice = h.key("alice");
-    for extra in [vec![], vec!["--path", "file0.bin"]] {
-        let dest = h.sub(&format!("restored-{}", extra.len()));
-        let mut args = vec!["--restore", "--key", &alice, "--unit", "big", "--to", &dest];
-        args.extend(extra.iter().copied());
-        let (code, text) = h.run(&args);
-        assert_eq!(code, 1, "{extra:?}: {text}");
-        let (here, other) = tail_rows(n);
-        let mut needles = vec![
-            "unit 'big' (version 2) is held across tapes, and this tape holds only part of it:"
-                .to_string(),
-            format!(
-                "slices 3 to {n} of its {n}, at tape files {} to {}.",
-                big.positions[0],
-                big.positions.last().unwrap()
-            ),
-            format!("every slice, 1 to {n}, in slice order, never from one tape's slices alone."),
-            "--where 'big' --key ".to_string(),
-            "No slice has been read.".to_string(),
-        ];
-        if extra.is_empty() {
-            needles.push("and the run on this tape starts at slice 3.".to_string());
-            needles.push("names these tapes as holding slice 1".to_string());
-            needles.push(other);
-            assert!(
-                !text.contains(&here),
-                "only the holders of slice 1:\n{text}"
-            );
-        } else {
-            needles.push("--path reads one tape. Restore the whole unit instead".to_string());
-        }
-        for needle in needles {
-            assert!(text.contains(&needle), "{extra:?}: {needle:?}:\n{text}");
-        }
-        assert_eq!(
-            reads(&h).iter().filter(|p| **p == 0).count(),
-            1,
-            "{extra:?}: File 0 once, at the start:\n{:#?}",
-            h.ops()
-        );
-        // Past the wind to the seal (R1), nothing at or after the first slice.
-        assert!(
-            walk(&h).0.iter().all(|p| *p < first_slice),
-            "{extra:?}: no slice is read:\n{:#?}",
-            h.ops()
-        );
-        assert!(
-            !h.dir.join("dar.args").exists()
-                || !std::fs::read_to_string(h.dir.join("dar.args"))
-                    .unwrap()
-                    .contains("-x"),
-            "{extra:?}: dar never extracts"
-        );
-        assert_eq!(
-            std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0),
-            0,
-            "{extra:?}: nothing restored"
-        );
+    let dest = h.sub("restored");
+    let args = ["--restore", "--key", &alice, "--unit", "big", "--to", &dest];
+    let (code, text) = h.run(&args);
+    assert_eq!(code, 1, "{text}");
+    let (here, other) = tail_rows(n);
+    for needle in [
+        "unit 'big' (version 2) is held across tapes, and this tape holds only part of it:"
+            .to_string(),
+        format!(
+            "slices 3 to {n} of its {n}, at tape files {} to {}.",
+            big.positions[0],
+            big.positions.last().unwrap()
+        ),
+        format!("every slice, 1 to {n}, in slice order, never from one tape's slices alone."),
+        "--where 'big' --key ".to_string(),
+        "No slice has been read.".to_string(),
+        "and the run on this tape starts at slice 3.".to_string(),
+        "names these tapes as holding slice 1".to_string(),
+        other,
+    ] {
+        assert!(text.contains(&needle), "{needle:?}:\n{text}");
     }
+    assert!(
+        !text.contains(&here),
+        "only the holders of slice 1:\n{text}"
+    );
+    assert_eq!(
+        reads(&h).iter().filter(|p| **p == 0).count(),
+        1,
+        "File 0 once, at the start:\n{:#?}",
+        h.ops()
+    );
+    // Past the wind to the seal (R1), nothing at or after the first slice.
+    assert!(
+        walk(&h).0.iter().all(|p| *p < first_slice),
+        "no slice is read:\n{:#?}",
+        h.ops()
+    );
+    assert!(
+        !h.dir.join("dar.args").exists()
+            || !std::fs::read_to_string(h.dir.join("dar.args"))
+                .unwrap()
+                .contains("-x"),
+        "dar never extracts"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0),
+        0,
+        "nothing restored"
+    );
 }
 
 /// §4.4: `--restore --all` restores every unit the tape holds whole and names
@@ -11316,8 +11308,10 @@ fn quitting_at_the_prompt_restores_nothing_and_says_so() {
 
 /// What a restore across tapes refuses before it reads a slice, each by name:
 /// a dar that cannot read slices through pipes (no decrypted fallback, only
-/// ciphertext on disk), `--slices-from`/`--swap-tapes`, a second `--unit`,
-/// `--path` into the range, and the usage errors of `--stream-tapes`.
+/// ciphertext on disk), `--slices-from`/`--swap-tapes` (with `--path` too:
+/// it takes each slice by its sha256 from the cartridges it asks for), a
+/// second `--unit`, and the usage errors of `--stream-tapes`, which takes no
+/// `--path`.
 #[test]
 fn what_a_restore_across_tapes_refuses_before_it_reads_a_slice() {
     let b = span_box();
@@ -11336,8 +11330,12 @@ fn what_a_restore_across_tapes_refuses_before_it_reads_a_slice() {
             "so it takes no\n       --slices-from or --swap-tapes",
         ),
         (
-            vec!["--path", "file0.bin"],
-            "--path reads one tape. Restore the whole unit instead",
+            vec!["--path", "file0.bin", "--swap-tapes"],
+            "so it takes no --slices-from or --swap-tapes. Run the same command without them.",
+        ),
+        (
+            vec!["--path", "file0.bin", "--slices-from", dir.as_str()],
+            "so it takes no --slices-from or --swap-tapes. Run the same command without them.",
         ),
         (vec!["--unit", "big"], "restore it on its own"),
     ] {
@@ -11548,4 +11546,329 @@ fn a_cartridge_the_script_cannot_read_is_named_and_the_prompt_asks_again() {
         assert!(text.contains(needle), "{needle:?}:\n{text}");
     }
     assert!(!text.contains("FATAL"), "{text}");
+}
+
+// ---- --restore --path of a unit across tapes (volume-format-v2.md §4.4
+// "RESTORE.sh", R8, R9; ADR-0012 items 132, 139; #478 L3) ----
+
+/// The slices that hold each of `big`'s files, 1-based and inclusive, from its
+/// dar catalogue (`dar -l -Tslice`, as RESTORE.sh asks it). dar lays files out
+/// in the order the directory lists them, so a test asks rather than assumes.
+fn big_slice_ranges(b: &SpanBox) -> BTreeMap<String, (usize, usize)> {
+    let cat = b
+        .t("SPAN02")
+        .dir
+        .parent()
+        .unwrap()
+        .join("work")
+        .join(format!("{BIG_UUID}-v2"))
+        .join(format!("{}_v2", &BIG_UUID[..8]));
+    let out = Command::new("dar")
+        .args(["-l", cat.to_str().unwrap(), "-N", "-Q", "-Tslice"])
+        .env("HOME", "/nonexistent")
+        .output()
+        .expect("dar must be on PATH (issue #43)");
+    assert!(out.status.success(), "{out:?}");
+    let mut ranges = BTreeMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let (a, z) = first.split_once('-').unwrap_or((first, first));
+        let (Ok(a), Ok(z)) = (a.parse::<usize>(), z.parse::<usize>()) else {
+            continue;
+        };
+        ranges.insert(words.last().unwrap().to_string(), (a, z));
+    }
+    assert!(ranges.len() >= 4, "{ranges:?}");
+    ranges
+}
+
+/// A file of `big` whose data lies wholly in slices 1 and 2 (SPAN01's run),
+/// so a `--path` of it needs slices 1 and 2 and the last.
+fn file_on_tape_1(b: &SpanBox) -> String {
+    big_slice_ranges(b)
+        .into_iter()
+        .find(|(name, (_, z))| name.ends_with(".bin") && *z <= 2)
+        .map(|(name, _)| name)
+        .expect("a file in slices 1-2: the first one dar wrote")
+}
+
+/// Every file of the heir's directory, the cartridges and tools aside, that
+/// holds a DECRYPTED slice of `big` (the plaintext after the stub age's
+/// 32-byte header), whole or as the start of it. What never sits on disk
+/// across a cartridge change.
+fn plain_slice_files(h: &Heir, b: &SpanBox) -> Vec<PathBuf> {
+    let t = b.t("SPAN02");
+    let big = b.big();
+    let plains: Vec<Vec<u8>> = (0..big.positions.len())
+        .map(|i| good_slice(t, &big, i)[32..].to_vec())
+        .collect();
+    let mut found = Vec::new();
+    let mut stack = vec![h.dir.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name();
+            let ft = e.file_type().unwrap();
+            if ft.is_dir() {
+                if !["cart", "keys", "bin", "hostbin"].contains(&name.to_str().unwrap_or("")) {
+                    stack.push(p);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            if plains.iter().any(|pl| {
+                let k = pl.len().min(4096);
+                bytes.len() >= k && bytes[..k] == pl[..k]
+            }) {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// At a prompt of a `--path` across tapes: the scratch directory holds only
+/// `slice.N.enc` files, each still ciphertext (the stub age's header first),
+/// and no decrypted slice is anywhere on disk.
+fn assert_only_ciphertext_waits(h: &Heir, b: &SpanBox, dest: &str, what: &str) {
+    let (dir, _) =
+        scratch_slices(dest).unwrap_or_else(|| panic!("{what}: no scratch directory in {dest}"));
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = e.file_name().to_str().unwrap().to_string();
+        assert!(
+            name.starts_with("slice.") && name.ends_with(".enc"),
+            "{what}: only encrypted slices wait in {}: {name}",
+            dir.display()
+        );
+        assert!(
+            std::fs::read(e.path()).unwrap().starts_with(b"STUBAGE:"),
+            "{what}: {name} is ciphertext"
+        );
+    }
+    assert!(
+        plain_slice_files(h, b).is_empty(),
+        "{what}: a decrypted slice is on disk: {:?}",
+        plain_slice_files(h, b)
+    );
+}
+
+/// §4.4: `--restore --path` of a spanning unit reads the slices its catalogue
+/// names for the path, and the last, from whichever tapes hold them. Started on
+/// tape 1, a file in slices 1-2 is read from tape 1 with no swap but for the
+/// last slice, which item 93's layout puts on tape 3: one prompt, for it, and
+/// nothing else of tape 3 is read. The file is byte for byte, and nothing else
+/// of the unit is restored.
+#[test]
+fn a_path_across_tapes_reads_tape_1_and_asks_only_for_the_last_slice() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let file = file_on_tape_1(b);
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 0);
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &["--path", &file]);
+    let mut asked = Vec::new();
+    let (code, text) = h.run_prompted(&strs(&args), |k, text| {
+        asked.push(k);
+        assert!(
+            text.contains(&format!("needs slice {n} of {n} next")),
+            "prompt {k}:\n{text}"
+        );
+        assert_only_ciphertext_waits(&h, b, &dest, "at the prompt");
+        h.load("SPAN03");
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(
+        asked,
+        vec![1],
+        "one cartridge change, for slice {n}:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(Path::new(&dest).join(&file)).unwrap(),
+        std::fs::read(big.src.join(&file)).unwrap(),
+        "{text}"
+    );
+    let restored: Vec<PathBuf> = rel_files(Path::new(&dest))
+        .into_iter()
+        .filter(|p| !p.starts_with(".tapectl-damaged-files.txt"))
+        .collect();
+    assert_eq!(
+        restored,
+        vec![PathBuf::from(&file)],
+        "only the path: {text}"
+    );
+    for needle in [
+        format!("'big' (version 2) is held across tapes: this tape holds slices 1 to 2 of {n}."),
+        format!("It gives slice(s) {n} to {n} of 'big'"),
+        "Every slice --path needs is in the scratch directory".to_string(),
+    ] {
+        assert!(text.contains(&needle), "{needle:?}:\n{text}");
+    }
+    let by_tape = reads_by_cartridge(&h);
+    assert_eq!(by_tape.len(), 2, "{:#?}", h.ops());
+    let t1 = unit_of(b.t("SPAN01"), "big");
+    let t3 = unit_of(b.t("SPAN03"), "big");
+    for p in &t1.positions[..2] {
+        assert!(by_tape[0].contains(p), "tape 1's slices: {:#?}", h.ops());
+    }
+    let last = *t3.positions.last().unwrap();
+    assert!(
+        by_tape[1].contains(&last),
+        "tape 3's last slice: {:#?}",
+        h.ops()
+    );
+    assert!(
+        t3.positions[..t3.positions.len() - 1]
+            .iter()
+            .all(|p| !by_tape[1].contains(p)),
+        "nothing else of tape 3: {:#?}",
+        h.ops()
+    );
+    assert!(scratch_slices(&dest).is_none(), "the scratch is gone");
+}
+
+/// No start rule for `--path` (§4.4): started on tape 3, whose run starts at
+/// slice 3, it takes the last slice from the tape it started on first, then
+/// asks for slice 1, naming the holders tape 3's index names for it, and takes
+/// slices 1 and 2 from tape 1. One prompt, for slice 1, after tape 3's last
+/// slice was read.
+#[test]
+fn a_path_started_on_tape_3_takes_its_last_slice_there_and_asks_for_tape_1() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let file = file_on_tape_1(b);
+    let t1 = unit_of(b.t("SPAN01"), "big");
+    let t3 = unit_of(b.t("SPAN03"), "big");
+    let last = *t3.positions.last().unwrap();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 2);
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &["--path", &file]);
+    let mut asked = Vec::new();
+    let (code, text) = h.run_prompted(&strs(&args), |k, text| {
+        let wanted = text
+            .lines()
+            .filter_map(|l| l.split("needs slice ").nth(1))
+            .last()
+            .and_then(|r| r.split(' ').next())
+            .unwrap()
+            .to_string();
+        asked.push(wanted);
+        assert!(
+            reads_in(&h.ops()).contains(&last),
+            "tape 3's last slice is read before the prompt: {:#?}",
+            h.ops()
+        );
+        assert_only_ciphertext_waits(&h, b, &dest, &format!("prompt {k}"));
+        h.load("SPAN01");
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(
+        asked,
+        vec!["1".to_string()],
+        "the prompts, in order:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(Path::new(&dest).join(&file)).unwrap(),
+        std::fs::read(big.src.join(&file)).unwrap(),
+        "{text}"
+    );
+    for needle in [
+        format!("'big' (version 2) is held across tapes: this tape holds slices 3 to {n} of {n}."),
+        format!("'big' (version 2) needs slice 1 of {n} next"),
+        "names these tapes as holding slice 1".to_string(),
+        format!("    tape SPAN01  (sealed 2026-09-01T10:00:00Z, a range: not the whole version)  slices 1-2 of {n}"),
+        "It gives slice(s) 1 to 2 of 'big'".to_string(),
+    ] {
+        assert!(text.contains(&needle), "{needle:?}:\n{text}");
+    }
+    assert!(
+        !text.contains("and the run on this tape starts at slice"),
+        "{text}"
+    );
+    let by_tape = reads_by_cartridge(&h);
+    assert_eq!(by_tape.len(), 2, "{:#?}", h.ops());
+    assert!(by_tape[0].contains(&last), "{:#?}", h.ops());
+    assert!(
+        t3.positions[..t3.positions.len() - 1]
+            .iter()
+            .all(|p| !by_tape[0].contains(p)),
+        "only the last slice of tape 3: {:#?}",
+        h.ops()
+    );
+    for p in &t1.positions[..2] {
+        assert!(by_tape[1].contains(p), "tape 1's slices: {:#?}", h.ops());
+    }
+}
+
+/// The coordinator's ruling on where `--path`'s slices wait (item 132's reason
+/// applied to `--path`): at every prompt only ciphertext is in the scratch
+/// directory, `slice.N.enc` and nothing else, and no decrypted slice is on disk
+/// anywhere; the fake `dd` logs every read, and none wrote into `--to` but into
+/// the scratch directory. Then a version some of whose needed slices are not at
+/// hand ends at the quit, with the `--path` wording and nothing restored.
+#[test]
+fn a_path_across_tapes_keeps_only_ciphertext_until_every_slice_is_read() {
+    let b = span_box();
+    let n = b.n;
+    let file = file_on_tape_1(b);
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 2);
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &["--path", &file]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        let what = format!("prompt {k}");
+        assert_only_ciphertext_waits(&h, b, &dest, &what);
+        let (dir, slices) = scratch_slices(&dest).unwrap();
+        assert_eq!(
+            slices.keys().copied().collect::<Vec<_>>(),
+            vec![n],
+            "{what}: tape 3's last slice waits"
+        );
+        for line in dd_into(&h, &dest) {
+            assert!(
+                line.contains(&format!("of={}/slice.", dir.display())),
+                "{what}: a dd into --to writes an encrypted slice to scratch only: {line}"
+            );
+        }
+        // Then stop: the tapes that hold slices 1 and 2 are not at hand.
+        Some("quit".to_string())
+    });
+    assert_eq!(code, 1, "{text}");
+    let fatal = flat(text.split("FATAL:").nth(1).expect("a FATAL"));
+    for needle in [
+        format!("stopped before slice 1 of 'big' (version 2), of {n}."),
+        "--path restores only from every slice it needs (those that hold the paths, and the last), so nothing was restored".to_string(),
+        "--where names them.".to_string(),
+    ] {
+        assert!(fatal.contains(&needle), "{needle:?}:\n{fatal}");
+    }
+    assert!(
+        text.contains("input) to stop: nothing is restored without every slice --path needs."),
+        "{text}"
+    );
+    assert!(scratch_slices(&dest).is_none(), "the scratch is removed");
+    assert_eq!(
+        std::fs::read_dir(&dest).unwrap().count(),
+        0,
+        "nothing restored"
+    );
+    // The positive control: a decrypted slice on disk is found.
+    let probe = h.dir.join("tmp").join("probe.dar");
+    std::fs::write(&probe, &good_slice(b.t("SPAN02"), &b.big(), 1)[32..]).unwrap();
+    assert_eq!(plain_slice_files(&h, b), vec![probe]);
 }

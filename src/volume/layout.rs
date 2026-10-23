@@ -1803,8 +1803,13 @@ named `.tapectl-restore.` and some letters and holding encrypted slices
 only: remove it by hand before you run the restore again. A dar older than
 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit)
 cannot read slices this way, and RESTORE.sh says so before it reads one.
-`--path` reads one tape: for a unit held across tapes, restore the whole
-unit.
+
+`--restore --unit UNIT --path PATH` reads across tapes too, and needs only
+the slices that hold the path and the last one. It can start on any tape of
+the unit that your key opens: it takes the slices that tape holds first,
+then asks for each further cartridge in slice order, taken by hash in the
+same way. They wait, still encrypted, in the scratch directory until all
+are read, and only then are they decrypted for dar.
 
 ## Did the restore get everything?
 
@@ -2573,14 +2578,20 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # for the whole unit's encrypted slices as well as its files, checked first.
 # --stream-tapes feeds one dar run from each tape in turn instead, keeping no
 # slice on disk. Either way the run waits at each cartridge change for as long
-# as it takes, reading its answer from the input. --all restores the units this
+# as it takes, reading its answer from the input. --path reads only the slices
+# it needs (those that hold the paths, and the last) from whichever tapes hold
+# them, starting on any tape the key opens: the ones that tape holds first,
+# then each further cartridge, taken the same way; they wait, still encrypted,
+# in the scratch directory until all are read. --all restores the units this
 # tape holds whole and names the others.
 #
 # A slice that fails its hash, or will not read, can be taken from another copy
 # of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
 # front index, and that is the only way one is matched: --slices-from DIR names
 # a directory of slice files copied off another tape (any names), and
-# --swap-tapes asks for another cartridge after this one has been read. Either
+# --swap-tapes asks for another cartridge after this one has been read, and
+# takes a slice from it only at a position its seal marker covers (a tape that
+# holds part of a unit held across tapes gives the slices it holds). Either
 # one restores the way an older dar does, slice by slice onto disk (about twice
 # the unit's size), because a stream cannot take a slice back from dar.
 #
@@ -4893,16 +4904,15 @@ $holders"
        No slice has been read."
 }
 
-# --path into a unit this tape holds only a range of. This script reads such a
-# unit across tapes whole, from the tape that holds its slice 1; --path reads
-# one tape.
+# --path into a unit this tape holds only a range of reads the slices it needs
+# across tapes (span_path_spool), each by its sha256, and asks again for one
+# that fails: it takes no replacement slice. (--stream-tapes and --fill-from
+# take no --path at all, and are refused before the tape is read.)
 die_range_path() { # <unit> <version>
-  die "$(range_text "$1" "$2")
-       --path reads one tape. Restore the whole unit instead, starting from the tape
-       that holds its slice 1 (--restore --unit '$1', without --path; it asks for each
-       further cartridge), or give --path on a tape that holds the unit whole.
-       The tapes that hold it:
-         $0 --where '$1' $(keys_args)
+  die "unit '$1' (version ${2:-unknown}) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST
+       of its $PICKED_COUNT. --path reads the slices it needs of it from this tape and from each
+       cartridge it asks for, taking each by its sha256, and asks again for one that fails,
+       so it takes no --slices-from or --swap-tapes. Run the same command without them.
        No slice has been read."
 }
 
@@ -4971,11 +4981,21 @@ span_ask() {
   info "Load the cartridge that holds slice $SPAN_NEED into $DEVICE, wait until the drive is ready, then press ENTER."
   info "A cartridge is taken only when its front index lists that sha256 at a position its seal marker covers:"
   info "its label is never taken for it. This waits for as long as you take. Type quit and ENTER (or end the"
-  info "input) to stop: nothing of the unit is restored without every slice."
+  if [ "$SPAN_RESTORE" = path ]; then
+    info "input) to stop: nothing is restored without every slice --path needs."
+  else
+    info "input) to stop: nothing of the unit is restored without every slice."
+  fi
 }
 
 # The heir stopped at a prompt.
 span_stop() {
+  if [ "$SPAN_RESTORE" = path ]; then
+    die "stopped before slice $SPAN_NEED of '$SPAN_UNIT' (version $SPAN_VER), of $SPAN_N. --path restores
+       only from every slice it needs (those that hold the paths, and the last), so nothing was restored,
+       and the encrypted slices read so far are removed with the scratch directory. Run the same command
+       again, with the cartridges that hold those slices at hand: --where names them."
+  fi
   if [ "$SPAN_RESTORE" = stream ]; then
     die "stopped before slice $SPAN_NEED of '$SPAN_UNIT' (version $SPAN_VER), of $SPAN_N. dar has already
        restored to $RESTORE_TO what the slices before it hold: those files are part of the unit only,
@@ -4995,7 +5015,7 @@ span_stop() {
 # script cannot read at all is said so, and the prompt asks again. On success
 # the slices it gives are in $WORK/span.take; otherwise it says why.
 span_accept() {
-  local eb sha pos last rc=0
+  local eb sha pos rc=0 have num what
   if ! (tape_init) 2>"$WORK/swap.err"; then
     echo "NOTE: the drive is not ready: $(head -n 1 "$WORK/swap.err" 2>/dev/null)" >&2
     echo "      Wait until the cartridge is loaded, then press ENTER again." >&2
@@ -5022,17 +5042,26 @@ span_accept() {
     info "position its seal marker says the tape holds (volume-format-v2.md 4.4, R8)."
     return 1
   fi
-  awk -F'|' -v from="$SPAN_NEED" -v end="$OTHER_END" '
+  # The slices still needed, from SPAN_NEED on, in the order span.all lists
+  # them (every slice for --restore; for --path, the ones it needs): those
+  # already in the scratch directory are not asked of this cartridge again.
+  have=" "
+  if [ -n "$SCRATCH" ]; then
+    while IFS='|' read -r num _; do
+      [ ! -f "$SCRATCH/slice.$num.enc" ] || have="$have$num "
+    done <"$WORK/span.all"
+  fi
+  awk -F'|' -v from="$SPAN_NEED" -v end="$OTHER_END" -v have="$have" '
     FILENAME == ARGV[1] {
-      if ($1 + 0 >= from + 0) { sz[$1 + 0] = $3; sh[$1 + 0] = $4; if ($1 + 0 > top) top = $1 + 0 }
+      if ($1 + 0 >= from + 0 && index(have, " " $1 " ") == 0) { n++; num[n] = $1 + 0; sz[n] = $3; sh[n] = $4 }
       next
     }
     $2 == "data_slice" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && !(($4 "|" $3) in at) { at[$4 "|" $3] = $1 }
     END {
-      for (s = from + 0; s <= top; s++) {
-        k = sh[s] "|" sz[s]
+      for (i = 1; i <= n; i++) {
+        k = sh[i] "|" sz[i]
         if (!(k in at)) break
-        print s "|" at[k] "|" sz[s] "|" sh[s]
+        print num[i] "|" at[k] "|" sz[i] "|" sh[i]
       }
     }
   ' "$WORK/span.all" "$WORK/other.files" >"$WORK/span.offer"
@@ -5048,8 +5077,12 @@ span_accept() {
     return 1
   fi
   cp "$WORK/span.offer" "$WORK/span.take"
-  last=$(tail -n 1 "$WORK/span.take" | cut -d'|' -f1)
-  info "It gives slice(s) $SPAN_NEED to $last of '$SPAN_UNIT': its front index lists each one's sha256, at"
+  what=$(awk -F'|' '{ n[++k] = $1 } END {
+    if (n[k] - n[1] == k - 1) { print n[1] " to " n[k]; exit }
+    for (i = 1; i <= k; i++) printf "%s%s", (i == 1 ? "" : (i == k ? " and " : ", ")), n[i]
+    print ""
+  }' "$WORK/span.take")
+  info "It gives slice(s) $what of '$SPAN_UNIT': its front index lists each one's sha256, at"
   info "positions its seal marker covers."
   return 0
 }
@@ -5062,56 +5095,49 @@ span_swap() { # <slice number>
   SPAN_NEED=""
 }
 
-# The default way (item 132): every slice into SCRATCH, still encrypted, in
-# slice order. The lowest slice not yet read comes next, from the tape in the
-# drive when it gives it, or else from the cartridge span_swap asks for. A
-# slice that fails its hash or will not read is asked for the same way, from
-# another cartridge that holds it. The tape is opened by each mt and dd only,
-# so nothing holds the drive while the prompt waits.
+# The default way (item 132), and --path's: every slice $WORK/span.all lists
+# into SCRATCH, still encrypted, in slice order. The tape in the drive gives
+# every one of them it holds first; then the lowest slice not yet read comes
+# from the cartridge span_swap asks for, and so on. For --restore the tape in
+# the drive holds slice 1, so that is slice order from 1 to N. A slice that
+# fails its hash or will not read is asked for the same way, from another
+# cartridge that holds it. The tape is opened by each mt and dd only, so
+# nothing holds the drive while the prompt waits.
 span_spool() {
-  local need=1 num pos size sha line
+  local need num pos size sha line
   local -a take=()
-  while [ "$need" -le "$SPAN_N" ]; do
+  while true; do
     take=()
     while IFS= read -r line; do take+=("$line"); done <"$WORK/span.take"
     for line in ${take[@]+"${take[@]}"}; do
       IFS='|' read -r num pos size sha <<<"$line"
-      [ "$num" -ge "$need" ] || continue
-      [ "$num" = "$need" ] || break
+      [ ! -f "$SCRATCH/slice.$num.enc" ] || continue
       info "Slice $num of $SPAN_N — tape file $pos"
       if read_slice_checked "$pos" "$size" "$sha" "$SCRATCH/slice.$num.enc"; then
         info "  checksum verified against front index; kept, still encrypted, in the scratch directory"
-        need=$((need + 1))
       else
         info "  slice $num (tape file $pos) $SLICE_WHY: another cartridge that holds it is asked for"
         break
       fi
     done
-    [ "$need" -le "$SPAN_N" ] || break
+    need=""
+    while IFS='|' read -r num _; do
+      [ -f "$SCRATCH/slice.$num.enc" ] || {
+        need=$num
+        break
+      }
+    done <"$WORK/span.all"
+    [ -n "$need" ] || break
     span_swap "$need"
   done
 }
 
-# Restore one version of a unit that this tape holds a range of, starting at
-# slice 1 (the caller has checked that it does): by default through SCRATCH,
-# with --stream-tapes through pipes. Both modes refuse, before any slice is
-# read, what they cannot finish: a dar that cannot read slices through pipes
-# (only ciphertext is ever kept on disk, so there is no decrypted fallback),
-# and, by default, a disk without room for the whole unit's ciphertext.
-restore_across_tapes() { # <manifest> <unit> <version> <destination>
-  local manifest=$1 unit=$2 ver=$3 destdir=$4 cat bytes k="" num tpos eb sha ty isize ihash last
-  if [ "$SALVAGE" = 1 ]; then
-    die "'$unit' is held across tapes: its restore takes every slice by its sha256 from
-       the cartridges it asks for, and asks again for one that fails, so it takes no
-       --slices-from or --swap-tapes. Run the same command without them.
-       No slice has been read."
-  fi
-  cp "$WORK/picked.txt" "$WORK/span.all"
-  SPAN_N=$(wc -l <"$WORK/span.all")
-  awk -F'|' '$1 != NR || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9a-f]+$/ { bad = 1 } END { exit bad }' "$WORK/span.all" ||
-    die "the envelope's manifest does not list the slices of '$unit' as 1 to $SPAN_N, each with its
-       encrypted_bytes and sha256_encrypted, so it cannot be read across tapes. No slice has been read."
-  # The run this tape gives, each slice checked against the file map (R9).
+# The slices of $WORK/span.all that the tape in the drive gives, into
+# $WORK/span.take (number|tape file|bytes|sha256): each with a tape position
+# here (R6), at or before the end of the tape (R3), and listed in its file map
+# as a data slice of the size and sha256 the manifest gives (R9).
+span_take_here() { # <unit>
+  local k="" num tpos eb sha ty isize ihash
   ! tape_is_short || k=$ENDED_AFTER
   : >"$WORK/span.take"
   while IFS='|' read -r num tpos eb sha; do
@@ -5121,12 +5147,71 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
     isize=$(file_size_at "$tpos" "$FILES_TXT")
     ihash=$(file_hash_at "$tpos" "$FILES_TXT")
     if [ "$ty" != data_slice ] || [ "$isize" != "$eb" ] || [ "$ihash" != "$sha" ]; then
-      die "slice $num of '$unit' (tape file $tpos): the envelope manifest and the file map disagree on it
+      die "slice $num of '$1' (tape file $tpos): the envelope manifest and the file map disagree on it
        (a ${ty:-missing} entry, $isize bytes) — refusing to trust either. The tape may be tampered or
        damaged. No slice has been read."
     fi
     echo "$num|$tpos|$eb|$sha" >>"$WORK/span.take"
   done <"$WORK/span.all"
+}
+
+# A unit held across tapes is read by the manifest's list of its slices,
+# $WORK/picked.txt from pick_slices: 1 to N in order, each with the
+# encrypted_bytes and sha256_encrypted a cartridge is taken by (R8). Sets
+# SPAN_N.
+span_list() { # <unit>
+  SPAN_N=$(wc -l <"$WORK/picked.txt")
+  awk -F'|' '$1 != NR || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9a-f]+$/ { bad = 1 } END { exit bad }' "$WORK/picked.txt" ||
+    die "the envelope's manifest does not list the slices of '$1' as 1 to $SPAN_N, each with its
+       encrypted_bytes and sha256_encrypted, so it cannot be read across tapes. No slice has been read."
+}
+
+# --path into a unit held across tapes (volume-format-v2.md 4.4): the slices
+# it needs ($WORK/path.slices: those its catalogue names for the paths, and
+# the last) are read from whichever tapes hold them, the tape in the drive
+# first, then each cartridge span_swap asks for (R8). Each goes into SCRATCH
+# still encrypted, checked against the front index of its own tape (R9). Only
+# once every one is there are they decrypted, for dar: nothing decrypted is on
+# disk across a cartridge change. --path has no start rule: it starts on any
+# tape whose envelope the key opens.
+span_path_spool() { # <unit> <version> <slices of the version>
+  local num
+  cp "$WORK/path.slices" "$WORK/span.all"
+  SPAN_UNIT=$1
+  SPAN_VER=$2
+  SPAN_N=$3
+  span_take_here "$1"
+  info "'$1' (version $2) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of $3."
+  info "  The slices --path needs are read from this tape, then from each cartridge you are asked for, and"
+  info "  wait, still encrypted, in $SCRATCH until all are read."
+  SPAN_RESTORE=path
+  span_spool
+  SPAN_RESTORE=""
+  info "Every slice --path needs is in the scratch directory; each is decrypted there for dar"
+  while IFS='|' read -r num _; do
+    decrypt_slice "$SCRATCH/slice.$num.enc" "$SCRATCH/restore.$num.dar" "$num"
+    rm -f "$SCRATCH/slice.$num.enc"
+  done <"$WORK/span.all"
+}
+
+# Restore one version of a unit that this tape holds a range of, starting at
+# slice 1 (the caller has checked that it does): by default through SCRATCH,
+# with --stream-tapes through pipes. Both modes refuse, before any slice is
+# read, what they cannot finish: a dar that cannot read slices through pipes
+# (only ciphertext is ever kept on disk, so there is no decrypted fallback),
+# and, by default, a disk without room for the whole unit's ciphertext.
+restore_across_tapes() { # <manifest> <unit> <version> <destination>
+  local manifest=$1 unit=$2 ver=$3 destdir=$4 cat bytes last
+  if [ "$SALVAGE" = 1 ]; then
+    die "'$unit' is held across tapes: its restore takes every slice by its sha256 from
+       the cartridges it asks for, and asks again for one that fails, so it takes no
+       --slices-from or --swap-tapes. Run the same command without them.
+       No slice has been read."
+  fi
+  span_list "$unit"
+  cp "$WORK/picked.txt" "$WORK/span.all"
+  # The run this tape gives, each slice checked against the file map (R9).
+  span_take_here "$unit"
   last=$(tail -n 1 "$WORK/span.take" | cut -d'|' -f1)
   cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
   if ! { [ -n "$cat" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then
@@ -5223,7 +5308,14 @@ do_restore() {
     info "Parsing slices for unit: ${targets[0]}"
     pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
     [ "$PICKED_CUT" = 0 ] || die_cut "${targets[0]}" "$PICKED_VERSION" "$PICKED_LAST"
-    [ "$PICKED_RANGE" = 0 ] || die_range_path "${targets[0]}" "$PICKED_VERSION"
+    if [ "$PICKED_RANGE" = 1 ]; then
+      # One this tape holds a range of (volume-format-v2.md 4.4): --path
+      # reads the slices it needs from whichever tapes hold them, starting
+      # here, whatever slice this tape's run starts at.
+      [ "$SALVAGE" = 0 ] || die_range_path "${targets[0]}" "$PICKED_VERSION"
+      span_list "${targets[0]}"
+      cp "$WORK/picked.txt" "$WORK/slices.0"
+    fi
     info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
     restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
     restore_end
@@ -5405,7 +5497,9 @@ do_list() {
 # --restore --path: dar's catalogue says which slices hold each path and the
 # directories above it (dar -l -T slice); those, and the last slice, which
 # carries the archive's own catalogue, are read from the tape, checked,
-# decrypted into scratch, and dar extracts just the paths from them.
+# decrypted into scratch, and dar extracts just the paths from them. Of a unit
+# held across tapes they are read from whichever tapes hold them, still
+# encrypted, and decrypted once all are in scratch (span_path_spool).
 RESTORE_PATHS=()
 restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> <scratch parent>
   local list=$1 env=$2 unit=$3 ver=$4 destdir=$5 scr=$6 base p range lo hi last
@@ -5466,7 +5560,11 @@ restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> 
   fi
   SCRATCH="$(mktemp -d "$scr/.tapectl-restore.XXXXXX")" ||
     die "cannot create a scratch directory in $scr"
-  spool_slices "$WORK/path.slices"
+  if [ "$PICKED_RANGE" = 1 ]; then
+    span_path_spool "$unit" "$ver" "$last"
+  else
+    spool_slices "$WORK/path.slices"
+  fi
   local -a dar_opts=(-O -Q -N)
   local rc=0
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
@@ -7078,7 +7176,11 @@ case "${1:-}" in
   echo "               [--version N] [--scratch DIR]"
   echo "      Restore only P (a file or folder, as --list prints it), reading"
   echo "      just the slices that hold it and the last. Those wait in a scratch"
-  echo "      directory inside --to, or in --scratch DIR."
+  echo "      directory inside --to, or in --scratch DIR. Of a unit held across"
+  echo "      tapes it reads them from whichever tapes hold them, starting on any"
+  echo "      of them: the ones this tape holds first, then it asks for each further"
+  echo "      cartridge as a restore across tapes does (below), keeping them still"
+  echo "      encrypted until all are read."
   echo "  $0 --list --key KEYFILE [--unit U] [--version N]"
   echo "      A unit's files, from the dar catalogue in the envelope: no slice"
   echo "      is read."
@@ -7170,7 +7272,8 @@ case "${1:-}" in
   echo "  A tape written since version 1.7.0 may hold part of a unit held across tapes (a range,"
   echo "      one run of its slices; File 0 requires spanning). --list says which of its slices this"
   echo "      tape holds, and --where and --find print a tape's run of slices when it is not the"
-  echo "      whole version. --all restores the units this tape holds whole and names the others."
+  echo "      whole version. --all restores the units this tape holds whole and names the others,"
+  echo "      and --path reads the slices it needs across tapes, starting on any of them."
   echo "  $0 --restore --key KEYFILE --to DIR --unit U [--stream-tapes] [--scratch DIR]"
   echo "      A unit held across tapes, restored with every slice, 1 to the last, in slice order."
   echo "      Start with a tape that holds its slice 1 (on any other this refuses before it reads a"
@@ -8660,7 +8763,9 @@ mod tests {
             "A slice that fails its hash or will not read is asked for again, by default, from another cartridge that holds it; with `--stream-tapes` it ends the run.",
             "A run that is killed leaves its scratch directory inside `--to` (or `--scratch DIR`), named `.tapectl-restore.` and some letters and holding encrypted slices only: remove it by hand",
             "A dar older than 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit) cannot read slices this way, and RESTORE.sh says so before it reads one.",
-            "`--path` reads one tape: for a unit held across tapes, restore the whole unit.",
+            "`--restore --unit UNIT --path PATH` reads across tapes too, and needs only the slices that hold the path and the last one.",
+            "It can start on any tape of the unit that your key opens: it takes the slices that tape holds first, then asks for each further cartridge in slice order, taken by hash in the same way.",
+            "They wait, still encrypted, in the scratch directory until all are read, and only then are they decrypted for dar.",
         ] {
             assert!(sec.contains(needle), "{needle:?}: {sec}");
         }
