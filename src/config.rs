@@ -831,6 +831,10 @@ pub struct ArchiveSetConfig {
     pub preserve_acls: Option<bool>,
     pub preserve_fsa: Option<bool>,
     pub dirty_on_metadata_change: Option<bool>,
+    /// #478 (ADR-0012 item 82): whether this set's units may span tapes.
+    /// Absent means the set does not say, and `[defaults]` decides; `sync`
+    /// writes the catalog column only when the table names it.
+    pub allow_spanning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -896,6 +900,12 @@ pub struct DefaultsConfig {
     /// that switches the clock off (a very large number comes closest).
     #[serde(default = "default_verify_interval_days")]
     pub verify_interval_days: i64,
+    /// Whether a unit may span tapes by its slices (#478, ADR-0012 item 82),
+    /// as the bottom layer of the policy chain: an `[[archive_sets]]` entry's
+    /// `allow_spanning`, then a unit's dotfile, overrides it. Off when the key
+    /// is absent: every unit is written whole on one tape, as before 1.7.0.
+    #[serde(default)]
+    pub allow_spanning: bool,
 }
 
 /// The `[defaults] verify_interval_days` in force when the key is absent: a
@@ -957,6 +967,7 @@ impl Default for DefaultsConfig {
             min_locations: default_min_locations(),
             warehouse_copies: 0,
             verify_interval_days: DEFAULT_VERIFY_INTERVAL_DAYS,
+            allow_spanning: false,
         }
     }
 }
@@ -4567,6 +4578,65 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("archive_sets[0]"), "{msg}");
         assert!(msg.contains("slice_size"), "{msg}");
+    }
+
+    /// #478 (ADR-0012 item 82): `allow_spanning` is a `[defaults]` key, off
+    /// when absent, and an `[[archive_sets]]` key, `None` ("the set does not
+    /// say") when absent. `config check`'s lenient read finds nothing to
+    /// report about either.
+    #[test]
+    fn allow_spanning_loads_in_defaults_and_an_archive_set_and_is_off_when_absent() {
+        assert!(!Config::default().defaults.allow_spanning);
+        assert!(!load_text("[defaults]\n").unwrap().defaults.allow_spanning);
+
+        let text = "[defaults]\nallow_spanning = true\n\n\
+                    [[archive_sets]]\nname = \"whole\"\nallow_spanning = false\n\n\
+                    [[archive_sets]]\nname = \"silent\"\nmin_copies = 3\n";
+        let cfg = load_text(text).unwrap();
+        assert!(cfg.defaults.allow_spanning);
+        assert_eq!(cfg.archive_sets[0].allow_spanning, Some(false));
+        assert_eq!(cfg.archive_sets[1].allow_spanning, None);
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        let report = crate::policy::lenient_config::check(text, &path);
+        assert!(report.valid, "{:?}", report.problems);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    /// #478: a misspelling of the spanning key is refused by name, in
+    /// `[defaults]` and in an `[[archive_sets]]` table, by the load every
+    /// command runs and by `config check` (ADR-0012: unknown keys are errors
+    /// everywhere).
+    #[test]
+    fn a_misspelled_allow_spanning_is_refused_by_name_in_defaults_and_an_archive_set() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for bad in ["allow_span", "allowSpanning"] {
+            for (text, key) in [
+                (format!("[defaults]\n{bad} = true\n"), format!("defaults.{bad}")),
+                (
+                    format!("[[archive_sets]]\nname = \"a\"\n{bad} = true\n"),
+                    format!("archive_sets[0].{bad}"),
+                ),
+            ] {
+                let msg = load_text(&text).unwrap_err();
+                assert!(msg.contains(bad), "{key}: {msg}");
+                assert!(msg.contains("unknown field"), "{key}: {msg}");
+                std::fs::write(&path, &text).unwrap();
+                let report = crate::policy::lenient_config::check(&text, &path);
+                assert!(!report.valid, "{key}");
+                assert!(
+                    report
+                        .problems
+                        .iter()
+                        .any(|p| p == &format!("unknown key: {key}")),
+                    "{key}: {:?}",
+                    report.problems
+                );
+            }
+        }
     }
 
     #[test]

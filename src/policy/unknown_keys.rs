@@ -49,6 +49,7 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "min_locations",
     "warehouse_copies",
     "verify_interval_days",
+    "allow_spanning",
 ];
 
 /// Every unknown key in the `[defaults]` table of `toml_text`.

@@ -1495,6 +1495,7 @@ fi
             preserve_acls: None,
             preserve_fsa: None,
             dirty_on_metadata_change: None,
+            allow_spanning: None,
         }
     }
 
