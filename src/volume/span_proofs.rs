@@ -1593,7 +1593,10 @@ fn scan_every_tape(h: &Home) {
         let mid = planted.len() / 2;
         planted.splice(mid..mid, TENANT_ONE.bytes());
         assert_eq!(found(&planted, &others), [TENANT_ONE]);
-        assert_eq!(found(&files[0], &[label.clone()]), [label.as_str()]);
+        assert_eq!(
+            found(&files[0], std::slice::from_ref(label)),
+            [label.as_str()]
+        );
         assert!(
             String::from_utf8_lossy(crate::volume::format::without_nul_padding(&files[seal]))
                 .contains("[seal]"),
@@ -1656,6 +1659,7 @@ fn write_completed(conn: &Connection, label: &str) -> String {
 ///   position, RECOVERY.md has no section on a unit across tapes; and the
 ///   two volumes agree byte for byte on every whole unit's slices, front
 ///   index entries and MANIFEST block.
+///
 /// The next write writes the cut units whole, as 1.6.0's does.
 #[test]
 fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
