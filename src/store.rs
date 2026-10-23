@@ -3739,6 +3739,7 @@ mod tests {
                 available_bytes: 1000 * BS,
                 reserve_bytes: BS,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries,
         };
@@ -4404,6 +4405,7 @@ mod tests {
                 available_bytes: 1,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,
@@ -4428,6 +4430,7 @@ mod tests {
                 available_bytes: 1,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,
@@ -5397,6 +5400,7 @@ mod tests {
                         available_bytes: 1000 * SBS as u64,
                         reserve_bytes: SBS as u64,
                         plan_bound_bytes: None,
+                        span_tail_from: None,
                     },
                     entries,
                 },

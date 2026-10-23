@@ -234,6 +234,7 @@ pub fn past_ceiling_units(batch: &Batch, fill_bytes: u64) -> &[selector::Pending
         available_bytes: fill_bytes,
         reserve_bytes: 0,
         plan_bound_bytes: Some(u64::MAX),
+        span_tail_from: None,
     }
     .split(0, &padded);
     &batch.units[split.past_ceiling()]

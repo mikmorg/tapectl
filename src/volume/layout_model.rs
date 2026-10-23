@@ -206,12 +206,25 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 /// resume revalidates against the bound the plan was made with. Absent from
 /// that file when `None` — a sidecar written before 1.6.0 reads as `None`,
 /// and one written without the key is byte for byte what 1.5.0 wrote.
+///
+/// **The span's tail** (ADR-0012 item 123; `layout-session.md` "Spanning").
+/// `span_tail_from` is the position of the first slice of the plan's last
+/// unit when that unit may span: the one unit the gate lets pass the plan
+/// bound ([`Layout::capacity_errors_with_tail`]). The plan order puts the
+/// tail last ([`CapacityBudget::place`]), so the last unit of a span tape
+/// is the only one that can be it. Frozen with the bound, so a resume
+/// revalidates the tail the plan was made with. Absent from `layout.json`
+/// when `None`, so a tape with no unit that may span writes the 1.6.0
+/// sidecar byte for byte, and a sidecar written before 1.7.0 reads as no
+/// tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityBudget {
     pub available_bytes: u64,
     pub reserve_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_bound_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_tail_from: Option<i32>,
 }
 
 /// How a plan's units sit against its [`CapacityBudget`] (ADR-0012 item
@@ -1030,12 +1043,14 @@ impl Layout {
     /// The capacity gate of [`Self::validate`] with another fill budget in
     /// place of the budget's own `available_bytes` — the live
     /// `Store::capacity()` read at contact (`BuiltLayout::into_validated`) —
-    /// and the budget's own reserve and plan bound. Empty when the Layout
-    /// fits, and when an entry is unsized ([`Self::validate`] reports that).
-    /// One gate, so the contact check cannot refuse a plan past the fill
-    /// ceiling that the pre-flight accepted.
+    /// and the budget's own reserve, plan bound and span tail
+    /// ([`CapacityBudget::span_tail_from`], [`Self::capacity_errors_with_tail`]).
+    /// Empty when the Layout fits, and when an entry is unsized
+    /// ([`Self::validate`] reports that). One gate, so the contact check
+    /// cannot refuse a plan past the fill ceiling, or a span's tail past the
+    /// bound, that the pre-flight accepted.
     pub fn capacity_errors_against(&self, available_bytes: u64) -> Vec<LayoutError> {
-        self.capacity_errors_with_tail(available_bytes, None)
+        self.capacity_errors_with_tail(available_bytes, self.budget.span_tail_from)
     }
 
     /// [`Self::capacity_errors_against`] for a plan whose last unit is a
@@ -1047,8 +1062,9 @@ impl Layout {
     /// beyond it). Today's committed gate still applies (the files that are
     /// not slices, plus the reserve, within the fill budget). Without a plan
     /// bound a tail is refused by name ([`LayoutError::SpanNeedsPostWarningBytes`]).
-    /// `None`, or a position after every slice, is exactly
-    /// [`Self::capacity_errors_against`].
+    /// `None`, or a position after every slice, is 1.6.0's gate exactly.
+    /// [`Self::capacity_errors_against`] passes the budget's own
+    /// [`CapacityBudget::span_tail_from`].
     pub fn capacity_errors_with_tail(
         &self,
         available_bytes: u64,
@@ -1447,6 +1463,7 @@ mod tests {
                 available_bytes: available,
                 reserve_bytes: reserve,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries,
         }
@@ -1531,6 +1548,7 @@ mod tests {
             available_bytes: available,
             reserve_bytes: reserve,
             plan_bound_bytes: bound,
+            span_tail_from: None,
         }
     }
 
@@ -1744,7 +1762,54 @@ mod tests {
         let some = budget(7, 1, Some(9));
         let json = serde_json::to_string(&some).unwrap();
         assert!(json.contains(r#""plan_bound_bytes":9"#), "{json}");
+        assert!(!json.contains("span_tail_from"), "{json}");
         assert_eq!(serde_json::from_str::<CapacityBudget>(&json).unwrap(), some);
+        // A span tape's tail (ADR-0012 item 123) round-trips with the bound,
+        // and a sidecar written before 1.7.0 reads as no tail.
+        let span = CapacityBudget {
+            span_tail_from: Some(12),
+            ..some
+        };
+        let json = serde_json::to_string(&span).unwrap();
+        assert_eq!(
+            json,
+            r#"{"available_bytes":7,"reserve_bytes":1,"plan_bound_bytes":9,"span_tail_from":12}"#
+        );
+        assert_eq!(serde_json::from_str::<CapacityBudget>(&json).unwrap(), span);
+        let pre_1_7: CapacityBudget =
+            serde_json::from_str(r#"{"available_bytes":7,"reserve_bytes":1,"plan_bound_bytes":9}"#)
+                .unwrap();
+        assert_eq!(pre_1_7.span_tail_from, None);
+    }
+
+    /// The gate is wired to the frozen tail: a span Layout whose tail crosses
+    /// the bound passes `capacity_errors_against` and `validate`, and the
+    /// same Layout without `span_tail_from` is refused by the bound, as a
+    /// whole-unit plan is. The frozen Layout's JSON round trip keeps it.
+    #[test]
+    fn the_wired_gate_lets_a_frozen_span_layouts_tail_pass_the_bound() {
+        // three_unit_layout: File 0, A (positions 1-2, 4 blocks), B (3, 3
+        // blocks), C (4, 1 block), the seal; ten blocks. B and C are the tail
+        // from position 3; everything else takes 6 blocks, the bound.
+        let mut b = budget(5 * BS, 0, Some(6 * BS));
+        b.span_tail_from = Some(3);
+        let (span, _) = three_unit_layout(b);
+        let frozen: Layout = serde_json::from_str(&serde_json::to_string(&span).unwrap()).unwrap();
+        assert_eq!(frozen, span);
+        assert!(frozen.capacity_errors_against(5 * BS).is_empty());
+        assert!(frozen.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+
+        let mut whole = frozen.clone();
+        whole.budget.span_tail_from = None;
+        let refused = vec![LayoutError::PlanBoundExceeded {
+            needed: 10 * BS,
+            bound: 6 * BS,
+        }];
+        assert_eq!(whole.capacity_errors_against(5 * BS), refused);
+        assert_eq!(
+            whole.validate(&keys_ok(&[]), SliceCheck::Size).unwrap_err(),
+            refused
+        );
     }
 
     // ── the plan order (ADR-0012 items 83, 94, 95, 99, 113, 122 and 123) ──

@@ -4288,6 +4288,7 @@ fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64
         available_bytes: tape.bytes,
         reserve_bytes: 0,
         plan_bound_bytes: Some(bound),
+        span_tail_from: None,
     }
     .split(0, &padded);
     let past = &units[split.past_ceiling()];

@@ -468,6 +468,7 @@ fn record_adoption(
             available_bytes: 0,
             reserve_bytes: 0,
             plan_bound_bytes: None,
+            span_tail_from: None,
         },
         // #420: only the files at or before a short seal's `ended_after` are
         // on the tape, and they are what the write's figures count.

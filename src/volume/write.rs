@@ -5619,6 +5619,7 @@ fn verify_contacted(
             available_bytes: 0,
             reserve_bytes: 0,
             plan_bound_bytes: None,
+            span_tail_from: None,
         },
         entries,
     };
@@ -7404,6 +7405,7 @@ pub(crate) fn write_catalog_preflight_in(
             available_bytes: u64::MAX,
             reserve_bytes: 0,
             plan_bound_bytes: None,
+            span_tail_from: None,
         },
         entries: Vec::new(),
     };
@@ -9596,6 +9598,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![LayoutEntry {
                 position: 4,
@@ -13055,6 +13058,7 @@ mod tests {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![],
         };
@@ -13151,6 +13155,7 @@ mod tests {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -15152,6 +15157,7 @@ mod tests {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -15343,6 +15349,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -15437,6 +15444,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![
                 entry(0, ZoneKind::IdThunk, 100),
@@ -15482,6 +15490,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![],
         };
@@ -15520,6 +15529,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![],
         };
@@ -15608,6 +15618,7 @@ mod tests {
                 available_bytes: 0,
                 reserve_bytes: 0,
                 plan_bound_bytes: None,
+                span_tail_from: None,
             },
             entries: vec![],
         };

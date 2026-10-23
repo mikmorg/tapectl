@@ -266,7 +266,10 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
 /// spannable sets, and which units wait for a later tape) is decided before
 /// the build, by [`CapacityBudget::place`], because only the caller knows an
 /// owed run from a fresh spannable set and a deferred unit must not reach
-/// the envelopes; [`BuiltLayout::place`] reads the built plan back.
+/// the envelopes; [`BuiltLayout::place`] reads the built plan back. When the
+/// last unit may span, its first slice's position is frozen as the budget's
+/// [`CapacityBudget::span_tail_from`]: the tail the capacity gate lets pass
+/// the plan bound (ADR-0012 item 123).
 pub fn build_with_plan_bound(
     inputs: &BuildInputs,
     plan_bound_bytes: Option<u64>,
@@ -664,6 +667,17 @@ pub fn build_with_plan_bound(
 
     entries.sort_by_key(|e| e.position);
 
+    // The span's tail (ADR-0012 item 123, `CapacityBudget::span_tail_from`):
+    // the last unit, when it may span, is the one unit the capacity gate lets
+    // pass the plan bound. The plan order puts the tail last
+    // (`CapacityBudget::place`), and a whole unit last is never a tail.
+    let span_tail_from = inputs
+        .units
+        .last()
+        .filter(|u| u.span.is_some())
+        .and_then(|u| u.slices.first())
+        .map(|s| slice_positions[&s.slice_id]);
+
     let layout = Layout {
         label: inputs.label.clone(),
         volume_uuid: inputs.volume_uuid.clone(),
@@ -673,6 +687,7 @@ pub fn build_with_plan_bound(
             available_bytes: inputs.usable_bytes,
             reserve_bytes: inputs.enospc_buffer,
             plan_bound_bytes,
+            span_tail_from,
         },
         entries,
     };
@@ -2894,6 +2909,83 @@ mod tests {
                 .check_parse_rules()
                 .unwrap();
         }
+    }
+
+    /// ADR-0012 item 123 through `build`: the last unit, when it may span, is
+    /// frozen as the span's tail, and only it may pass the plan bound. Built
+    /// in the plan order (the whole unit, then the span), a bound that the
+    /// tail crosses validates; with the span first nothing is frozen and the
+    /// same bound refuses the plan. Neither sidecar names a tail it lacks.
+    #[test]
+    fn build_freezes_the_last_units_span_as_the_tail_the_gate_lets_pass() {
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let span = span_unit(src.path());
+        let whole = BuildUnit {
+            stage_set_id: 20,
+            snapshot_id: 20,
+            unit_name: "unit-whole".to_string(),
+            unit_uuid: "dddddddd-1111-4222-8333-444444444444".to_string(),
+            snapshot_version: 1,
+            slices: vec![fake_slice(src.path(), 21, 1, b"whole slice one")],
+            span: None,
+            ..span.clone()
+        };
+        let inputs = |units: Vec<BuildUnit>| {
+            base_inputs(
+                "550e8400-e29b-41d4-a716-4466554400b5",
+                vec![TenantInfo {
+                    tenant_id: 1,
+                    tenant_name: "alpha".to_string(),
+                    public_keys: vec![kp.public_key.clone()],
+                }],
+                units,
+            )
+        };
+        let in_order = inputs(vec![whole.clone(), span.clone()]);
+        let probe = tempfile::tempdir().unwrap();
+        let probe = build(&in_order, probe.path()).unwrap().layout;
+        let total = probe.on_tape_bytes().unwrap();
+        let first = slice_position(&probe, 12);
+        assert_eq!(probe.budget.span_tail_from, Some(first));
+        // Under a fill budget of the fixed files, the whole unit and the
+        // reserve, a bound one block short of the plan's end: the span's
+        // last slice passes it.
+        let fixed = probe.fixed_on_tape_bytes();
+        let mut in_order = in_order;
+        in_order.usable_bytes = fixed + BS + in_order.enospc_buffer;
+        let bound = total - BS;
+
+        let session = tempfile::tempdir().unwrap();
+        let built = build_with_plan_bound(&in_order, Some(bound), session.path()).unwrap();
+        assert_eq!(built.layout.budget.span_tail_from, Some(first));
+        built
+            .validate(&ok_keys(&in_order), SliceCheck::Size)
+            .unwrap();
+        let sidecar = std::fs::read_to_string(session.path().join(LAYOUT_SIDECAR)).unwrap();
+        assert!(
+            sidecar.contains(&format!("\"span_tail_from\": {first}")),
+            "{sidecar}"
+        );
+        let frozen: Layout = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(frozen, built.layout, "a resume revalidates the same tail");
+
+        // The span first: no tail is frozen, and the bound refuses the plan.
+        let mut span_first = inputs(vec![span, whole]);
+        span_first.usable_bytes = in_order.usable_bytes;
+        let session = tempfile::tempdir().unwrap();
+        let built = build_with_plan_bound(&span_first, Some(bound), session.path()).unwrap();
+        assert_eq!(built.layout.budget.span_tail_from, None);
+        let errs = built
+            .validate(&ok_keys(&span_first), SliceCheck::Size)
+            .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, LayoutError::PlanBoundExceeded { .. })),
+            "{errs:?}"
+        );
+        let sidecar = std::fs::read_to_string(session.path().join(LAYOUT_SIDECAR)).unwrap();
+        assert!(!sidecar.contains("span_tail_from"), "{sidecar}");
     }
 
     /// [`BuiltLayout::place`] reads a built plan back in the plan order,
