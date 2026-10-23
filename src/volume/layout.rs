@@ -8007,13 +8007,25 @@ hold it. `RESTORE.sh` (tape file 2) does all of this by itself: `--info` and
 /// 102, tapectl 1.3.0): the two RESTORE.sh commands and the rule that only
 /// the same unit at the same version is used. Like the index section it
 /// serves every kind of envelope, and so it names no dar catalogue (#449).
+/// Since the fresh read of File 1 for a span (#478; ADR-0012 items 135 and
+/// 143): same slices only within one staging run, no `--slices-from` or
+/// `--swap-tapes` for a unit this tape holds part of (with the routes that
+/// do work, [`RECOVERY_DAMAGE_SPAN`]), and a fill only from a tape that holds
+/// the version whole ([`RECOVERY_DAMAGE_REST`]). This const is the section's
+/// head, to the replacement-slice commands.
 const RECOVERY_DAMAGE_SECTION: &str = r##"## If a slice or a file is damaged
 
 Another tape that holds this unit at the same version holds the same slices,
-byte for byte: its front index (File 3) lists the same `sha256_encrypted`
+byte for byte, when both tapes were written from one staging run of it: its
+front index (File 3) lists the same `sha256_encrypted`
 for each, at whatever tape file and under whatever number that tape puts
 it. Only the same unit at the same version is a copy; another version may
-differ in the very files that are damaged.
+differ in the very files that are damaged. A tape written from another
+staging run of the same version holds the same files but other ciphertext:
+its slices have other `sha256_encrypted` values, so none of them is ever
+taken for a slice of this tape (it is refused by hash), but a tape that
+holds the version whole that way restores it alone, with its own
+`RESTORE.sh`.
 
 A slice that fails its `sha256sum -c` above is damaged: do not decrypt it.
 Take it from the other tape instead, found by its `sha256_encrypted` and by
@@ -8027,7 +8039,36 @@ one:
 ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --swap-tapes --to /destination/UNIT
 ```
 
-With no other copy, leave the failed slice out of the steps above: do not
+"##;
+
+/// The paragraph of RECOVERY.md's damage section on a unit held across tapes
+/// (the fresh read of File 1, #478; `volume-format-v2.md` §4.4): RESTORE.sh
+/// takes no `--slices-from` or `--swap-tapes` for a unit this tape holds part
+/// of, and the routes that do work with no good copy of a slice. Only in an
+/// envelope that lists a block stating `may_span = true`, as
+/// [`recovery_span_section`] is.
+const RECOVERY_DAMAGE_SPAN: &str = r##"Neither applies to a unit held across tapes that this tape holds only part
+of (its block in MANIFEST.toml states `may_span = true` and gives some
+slices no tape position): `RESTORE.sh` refuses `--slices-from` and
+`--swap-tapes` for it. Its restore across tapes asks for the next tape at a
+prompt, and asks there again for a slice that fails, from another cartridge
+that holds it (with `--stream-tapes`, a slice that fails ends the run). With
+no good copy of that slice anywhere, `RESTORE.sh` restores nothing of the
+unit, and `done` at the prompt stops the restore. What does work then:
+`--restore --unit UNIT --path PATH` for a folder or a file whose slices all
+avoid the failed one (it reads only the slices that hold the path, and the
+last slice, which must therefore be good); tapectl's own restore, which
+reads a unit across tapes and reads around a damaged 64 KiB piece of a
+slice (File 1, "tapectl itself"); and the steps above by hand, for each
+tape's slices of the unit, all into one directory, with the failed slice
+left out as below.
+
+"##;
+
+/// The rest of RECOVERY.md's damage section, after the replacement-slice
+/// commands (and [`RECOVERY_DAMAGE_SPAN`] where it is): no other copy, the
+/// damaged-file list and the fill, and the sha256 check of restored files.
+const RECOVERY_DAMAGE_REST: &str = r##"With no other copy, leave the failed slice out of the steps above: do not
 decrypt it, and do not put an empty file in its place. The other slices keep
 their numbers (`restore.1.dar`, `restore.2.dar`, `restore.4.dar` ..., a gap
 where the failed one was), and dar, run as above into an empty directory
@@ -8047,7 +8088,8 @@ unit restored into `/destination/UNIT`, that is
 `/destination/UNIT/.tapectl-damaged-files.txt`; a restore of one unit with
 `--all` puts the files straight into `--to`, and the list is
 `--to/.tapectl-damaged-files.txt`). Load a tape that holds the
-same unit at the same version and run that tape's own `RESTORE.sh`, with that
+same unit at the same version WHOLE (a tape that holds only some of its
+slices is refused) and run that tape's own `RESTORE.sh`, with that
 list and that directory: it restores exactly those files over their damaged
 copies, leaves everything else in the directory alone, and refuses a tape
 that holds another unit or another version:
@@ -8313,6 +8355,10 @@ pub fn generate_recovery_md(
 
     s.push_str(RECOVERY_INDEX_SECTION);
     s.push_str(RECOVERY_DAMAGE_SECTION);
+    if units.iter().any(|u| u.may_span) {
+        s.push_str(RECOVERY_DAMAGE_SPAN);
+    }
+    s.push_str(RECOVERY_DAMAGE_REST);
     s.push_str(
         "## Troubleshooting\n\n\
          - **age: \"unexpected data\" / decryption fails** — the slice still has 512KB\n\
@@ -9329,6 +9375,97 @@ mod tests {
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
+    }
+
+    /// The fresh read's findings, in RECOVERY.md (in every envelope) as in
+    /// File 1 (#478, the coordinator's follow-up): its damage section said a
+    /// copy holds the same slices byte for byte (only within one staging
+    /// run), offered `--slices-from` and `--swap-tapes` with no exception for
+    /// a unit held across tapes (refused by restore_across_tapes and
+    /// die_range_path), and sent a fill to any tape of the same version (a
+    /// range is never a fill source, item 143). The first and the last are
+    /// in every envelope; the paragraph on a unit held across tapes only in
+    /// one that lists a block stating `may_span = true`, as the section on a
+    /// unit across tapes is. RESTORE.sh embeds none of it.
+    #[test]
+    fn fresh_read_478_recovery_md_damage_section_says_staging_run_span_and_whole() {
+        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
+            number,
+            tape_position,
+            size_bytes: 10,
+            encrypted_bytes: 30 + number,
+            sha256_plain: "p".into(),
+            sha256_encrypted: format!("e{number}").repeat(32),
+        };
+        let whole = ManifestUnit {
+            name: "alpha".into(),
+            uuid: "11111111-aaaa".into(),
+            snapshot_version: 1,
+            stage_set_id: 7,
+            may_span: false,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![slice(1, Some(10))],
+        };
+        let big = ManifestUnit {
+            name: "big".into(),
+            uuid: "88888888-9999".into(),
+            stage_set_id: 8,
+            may_span: true,
+            slices: vec![slice(1, None), slice(2, Some(11))],
+            ..whole.clone()
+        };
+        let plain = generate_recovery_md("RM01", "alice", std::slice::from_ref(&whole), &[]);
+        let span = generate_recovery_md("RM01", "alice", &[whole, big], &[]);
+        // In every envelope: 1, byte for byte only within one staging run;
+        // 3, a fill only from a tape that holds the version whole.
+        for r in [&plain, &span] {
+            let sec = flat_text(guide_section(r, "If a slice or a file is damaged"));
+            for needle in [
+                "Another tape that holds this unit at the same version holds the same slices, byte for byte, when both tapes were written from one staging run of it: its front index (File 3) lists the same `sha256_encrypted` for each",
+                "A tape written from another staging run of the same version holds the same files but other ciphertext: its slices have other `sha256_encrypted` values, so none of them is ever taken for a slice of this tape (it is refused by hash), but a tape that holds the version whole that way restores it alone, with its own `RESTORE.sh`.",
+                "Load a tape that holds the same unit at the same version WHOLE (a tape that holds only some of its slices is refused) and run that tape's own `RESTORE.sh`",
+            ] {
+                assert!(sec.contains(needle), "{needle:?}: {sec}");
+            }
+            assert!(
+                !sec.contains("holds the same slices, byte for byte: its front index"),
+                "{sec}"
+            );
+        }
+        // 2, in an envelope that lists a unit that may span: no --slices-from
+        // or --swap-tapes across tapes, and the routes that work. An envelope
+        // with no such block says nothing of tapes held in part, as before.
+        let sec = flat_text(guide_section(&span, "If a slice or a file is damaged"));
+        for needle in [
+            "Neither applies to a unit held across tapes that this tape holds only part of (its block in MANIFEST.toml states `may_span = true` and gives some slices no tape position): `RESTORE.sh` refuses `--slices-from` and `--swap-tapes` for it.",
+            "Its restore across tapes asks for the next tape at a prompt, and asks there again for a slice that fails, from another cartridge that holds it (with `--stream-tapes`, a slice that fails ends the run).",
+            "With no good copy of that slice anywhere, `RESTORE.sh` restores nothing of the unit, and `done` at the prompt stops the restore.",
+            "What does work then: `--restore --unit UNIT --path PATH` for a folder or a file whose slices all avoid the failed one (it reads only the slices that hold the path, and the last slice, which must therefore be good); tapectl's own restore, which reads a unit across tapes and reads around a damaged 64 KiB piece of a slice (File 1, \"tapectl itself\"); and the steps above by hand, for each tape's slices of the unit, all into one directory, with the failed slice left out as below.",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        // It sits between the replacement-slice commands and "With no other copy".
+        let cmds = span.find("--swap-tapes --to /destination/UNIT\n```\n\nNeither applies");
+        let rest = span.find("left out as below.\n\nWith no other copy, leave the failed slice out");
+        assert!(cmds.is_some() && rest.is_some(), "{span}");
+        assert!(!plain.contains("Neither applies"), "{plain}");
+        assert!(
+            plain.contains("--swap-tapes --to /destination/UNIT\n```\n\nWith no other copy, leave the failed slice out"),
+            "{plain}"
+        );
+        // File 1 names the section the text points to.
+        let g = generate_system_guide_v2_for_media("RM01", 20, "LTO-6");
+        assert!(g.contains("\n## tapectl itself\n"));
+        // What the text describes is what the script does.
+        let script = generate_restore_script_v2("RM01", 20);
+        for does in [
+            "--slices-from or --swap-tapes. Run the same command without them.",
+            "A fill takes files only from a tape that holds the version whole, and a range is never",
+        ] {
+            assert!(script.contains(does), "{does:?}");
+        }
+        assert!(!script.contains("when both tapes were written from one staging run"));
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
