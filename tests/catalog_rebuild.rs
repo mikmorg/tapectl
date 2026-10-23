@@ -5765,6 +5765,7 @@ fn write_span_tape(
 /// Stage one unit at version 7 for `tenant`: `slices` slices of `bytes`
 /// each, every block's bytes distinct, encrypted to the tenant, the
 /// operator and the escrow recipient.
+#[allow(clippy::too_many_arguments)]
 fn stage_span_fixture_unit(
     conn: &rusqlite::Connection,
     name: &str,
