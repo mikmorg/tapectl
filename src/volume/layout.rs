@@ -3189,12 +3189,16 @@ check_layout_version() { # <layout_version as File 0 states it>
 # and any key a table carries that this script does not know is ignored
 # unless `requires` names it. short-seal (every tape written since version
 # 1.6.0): the tape may end before the last file its plan lists, and its seal
-# marker, the last file, says where (volume-format-v2.md 4.1, 4.2).
-KNOWN_FEATURES="short-seal"
+# marker, the last file, says where (volume-format-v2.md 4.1, 4.2). spanning
+# (a tape written since version 1.7.0 whose plan holds a slice of a unit that
+# may run across tapes): an envelope block that states may_span = true lists
+# every slice of the unit, and a slice with no tape_position is on another
+# tape (volume-format-v2.md 4.4).
+KNOWN_FEATURES="short-seal spanning"
 
 die_newer_needed() { # <what> <detail>
   die "$2
-       This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely, and
+       This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely, and
        will not guess. Use the RESTORE.sh stored on THIS tape — every tape
        carries the script that reads it, at file 2:
          mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
@@ -7683,15 +7687,19 @@ mod tests {
         assert!(g.contains("\n## The rest of the box"), "{g}");
     }
 
-    /// RESTORE.sh knows `short-seal`, and the text that says a tape needs a
-    /// newer reader names 1.6.0, the only tapectl version the script names
-    /// (§6 "Since 1.6.0").
+    /// RESTORE.sh knows `short-seal` and `spanning` (`volume-format-v2.md`
+    /// §1.2: `KNOWN_FEATURES="short-seal spanning"` from 1.7.0), and the text
+    /// that says a tape needs a newer reader names 1.7.0, the only tapectl
+    /// version the script names (ADR-0012 item 135).
     #[test]
-    fn restore_sh_knows_short_seal_and_says_it_is_1_6_0() {
+    fn restore_sh_knows_short_seal_and_spanning_and_says_it_is_1_7_0() {
         let s = generate_restore_script_v2("SS03", 20);
-        assert_eq!(s.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(), 1);
         assert_eq!(
-            s.matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
+            s.matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n").count(),
+            1
+        );
+        assert_eq!(
+            s.matches("This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely")
                 .count(),
             1
         );

@@ -1742,13 +1742,16 @@ fn a_built_tape_requires_short_seal_and_its_restore_sh_knows_it() {
         "File 3"
     );
     let restore_sh = text_of(2);
+    // From 1.7.0 the script knows `spanning` too, and names 1.7.0 (ADR-0012
+    // items 124 and 135); a tape with no spannable set still requires
+    // `short-seal` alone.
     assert!(
-        restore_sh.contains("\nKNOWN_FEATURES=\"short-seal\"\n"),
-        "RESTORE.sh knows short-seal"
+        restore_sh.contains("\nKNOWN_FEATURES=\"short-seal spanning\"\n"),
+        "RESTORE.sh knows short-seal and spanning"
     );
     assert!(
-        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely"),
-        "die_newer_needed says 1.6.0"
+        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely"),
+        "die_newer_needed says 1.7.0"
     );
 }
 

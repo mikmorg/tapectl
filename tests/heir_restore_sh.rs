@@ -2846,9 +2846,11 @@ fn a_new_tape_states_short_seal_in_file_0_and_the_seal() {
     );
     let script = generate_restore_script_v2(LABEL, t.total_files);
     assert_eq!(
-        script.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(),
+        script
+            .matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n")
+            .count(),
         1,
-        "RESTORE.sh knows short-seal"
+        "RESTORE.sh knows short-seal and spanning"
     );
     let old = template_150();
     let f0 = std::fs::read_to_string(old.dir.join("tape/0")).unwrap();
@@ -2856,16 +2858,17 @@ fn a_new_tape_states_short_seal_in_file_0_and_the_seal() {
 }
 
 /// §6 "Since 1.6.0": the text that tells an heir a tape is newer than the
-/// script, fixed at "tapectl 1.1.0" since 2026-10-06 item 20, moves to
-/// "tapectl 1.6.0", because a new required feature arrived. Pinned in the
-/// generated text and in what the heir actually reads when the script refuses
-/// a tape.
+/// script, fixed at "tapectl 1.1.0" since 2026-10-06 item 20, moved to
+/// "tapectl 1.6.0" when a new required feature arrived, and to "tapectl
+/// 1.7.0" with the next (`spanning`, ADR-0012 items 124 and 135). Pinned in
+/// the generated text and in what the heir actually reads when the script
+/// refuses a tape.
 #[test]
-fn the_newer_tape_refusal_says_tapectl_1_6_0() {
+fn the_newer_tape_refusal_says_tapectl_1_7_0() {
     let script = generate_restore_script_v2(LABEL, template().total_files);
     assert_eq!(
         script
-            .matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
+            .matches("This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely")
             .count(),
         1,
         "die_newer_needed's text"
@@ -2882,7 +2885,7 @@ fn the_newer_tape_refusal_says_tapectl_1_6_0() {
     let (code, text) = h.run(&["--info"]);
     assert_ne!(code, 0, "{text}");
     assert!(
-        text.contains("(layout v2, tapectl 1.6.0) cannot read it safely"),
+        text.contains("(layout v2, tapectl 1.7.0) cannot read it safely"),
         "{text}"
     );
 }
