@@ -3744,10 +3744,7 @@ struct VolumeInfo {
     cut_units: Vec<String>,
     /// The units this volume holds as a range (#478, `writes.status =
     /// 'range'`), each with the run of its slices written here: not a copy
-    /// on its own (ADR-0012 item 127). Empty when it holds none. Human
-    /// output only for now: `tests/cli_smoke.rs` pins `--json`'s keys, and
-    /// adding `range_units` there is the pin owner's edit.
-    #[serde(skip)]
+    /// on its own (ADR-0012 item 127). Empty when it holds none.
     range_units: Vec<write::RecordedRange>,
     notes: Option<String>,
     unit_count: i64,
