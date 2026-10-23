@@ -229,7 +229,8 @@ THE STEPS, and the time each takes on home2 (the write at ~152 MiB/s and the rea
                  no global excludes), the source copied, both units staged, a sha256 manifest
                  of the copy, the filler's rows. stage create of 100 GB takes about 7.5 h with
                  a debug build (1.6.0's run encrypted at ~3.9 MiB/s); a release build is
-                 faster. The copy and the manifest take about 30 min.
+                 faster. The copy and the manifest take about 30 min; a source file you
+                 cannot read fails the copy here, before any tape moves.
   1b init        whatever the cartridge holds erased by this home's cartridge erase, then
                  $LABEL1 initialised.                                                ~5 min
   1c write       $LABEL1 with --keep-staging: the filler to the 2.425 TB ceiling, then
