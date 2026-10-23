@@ -9793,7 +9793,11 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert_eq!(dry.to_string(), msg, "the dry run refuses as the delete does");
+        assert_eq!(
+            dry.to_string(),
+            msg,
+            "the dry run refuses as the delete does"
+        );
 
         let left: i64 = conn
             .query_row(

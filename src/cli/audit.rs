@@ -2154,7 +2154,13 @@ fn slice_runs(numbers: &std::collections::BTreeSet<i64>) -> String {
         }
     }
     runs.iter()
-        .map(|&(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") })
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -5226,7 +5232,11 @@ mod tests {
             c.range(set, t1, 1, 2, 6);
             c.range(set, t3, 3, 6, 6);
             read_back(&c, t1, 2);
-            assert_eq!(c.unit_copies(), 1, "precondition: the two ranges are one copy");
+            assert_eq!(
+                c.unit_copies(),
+                1,
+                "precondition: the two ranges are one copy"
+            );
             assert_eq!(
                 messages(&c),
                 ["not verified within 30 days (last: never)"],

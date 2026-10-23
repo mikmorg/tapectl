@@ -6924,7 +6924,10 @@ Read error counter page  [0x3]
                 summary.text_lines()
             );
             let json = summary.json();
-            assert_eq!((json["writes"].as_i64(), json["ranges"].as_i64()), (Some(1), Some(2)));
+            assert_eq!(
+                (json["writes"].as_i64(), json["ranges"].as_i64()),
+                (Some(1), Some(2))
+            );
 
             // Positive control: with no range, the line reads as before.
             c.conn
@@ -7024,7 +7027,12 @@ Read error counter page  [0x3]
                 ("failed", None, "staged", "2026-10-01 10:00:00"),
                 ("cleaned", None, "staged", "2026-10-02 09:00:00"),
                 ("failed", None, "staged", "2026-10-03 08:00:00"),
-                ("cleaned", Some("2026-10-04 12:00:00"), "staged", "2026-10-04 08:00:00"),
+                (
+                    "cleaned",
+                    Some("2026-10-04 12:00:00"),
+                    "staged",
+                    "2026-10-04 08:00:00",
+                ),
                 ("staging", None, "staged", "2026-10-05 08:00:00"),
                 ("cleaned", None, "rebuilt", "2026-10-06 08:00:00"),
             ]);
