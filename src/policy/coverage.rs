@@ -1652,20 +1652,38 @@ pub struct ExistingCopy {
     /// The existing copy is a recorded warehouse deposit (ADR-0006), not the
     /// tape itself.
     pub deposit: bool,
+    /// The run of slices the volume holds, `(first, last)`, when it holds a
+    /// `range` of the version rather than the whole of it (#478); `None` for
+    /// a whole copy.
+    pub range: Option<(i64, i64)>,
 }
 
 impl ExistingCopy {
     fn describe(&self) -> String {
-        if self.deposit {
-            format!(
+        let slices = self.range.map(|(first, last)| {
+            if first == last {
+                format!("slice {first}")
+            } else {
+                format!("slices {first}-{last}")
+            }
+        });
+        match (self.deposit, slices) {
+            (true, None) => format!(
                 "{} v{} (a warehouse deposit of volume \"{}\")",
                 self.unit, self.version, self.volume
-            )
-        } else {
-            format!(
+            ),
+            (false, None) => format!(
                 "{} v{} (volume \"{}\")",
                 self.unit, self.version, self.volume
-            )
+            ),
+            (true, Some(slices)) => format!(
+                "{} v{} ({slices}, in a warehouse deposit of volume \"{}\")",
+                self.unit, self.version, self.volume
+            ),
+            (false, Some(slices)) => format!(
+                "{} v{} ({slices} on volume \"{}\")",
+                self.unit, self.version, self.volume
+            ),
         }
     }
 }
@@ -1758,10 +1776,25 @@ impl Distinctness {
 /// **The location** is the destination's `location_id` against the same
 /// union [`location_count_expr`] counts: an eligible copy's own
 /// `location_id`, and a warehouse deposit of it. A destination with no
-/// location shares none. A volume holding a `range` of the version counts
-/// here as a whole copy's volume does (#478): [`location_count_expr`] counts
-/// a range holder's place for the slices it holds, so a destination at that
-/// place gets the same warning.
+/// location shares none.
+///
+/// **A set that spans (#478; ADR-0012 items 122, 127 and 134).** Two holders
+/// of the SAME slice must not share a place (item 127's per-slice location
+/// count); two tapes holding different runs of one set are one copy, and item
+/// 134 wants them kept together. So when the stage set being written has a
+/// `range` row on an [`eligible`] volume, the destination takes the set's
+/// least-covered slices next (the planner continues from the lowest per-slice
+/// shortfall, item 122): those whose [`slice_copies`] equals the set's
+/// minimum. A holder of the set at the destination's place is named only when
+/// it holds one of them: a whole copy always does, and a range does when its
+/// run meets them. A range holding none of them is the same copy's other part
+/// and draws no warning. Item 93's tape 3 (owed slices K+1..N) beside tape 2
+/// (whole) is warned; beside tape 1 (slices 1..K) it is not. A set with no
+/// range row, or whose slices all have the same copies, keeps the rule above:
+/// every slice is next. A holder of ANOTHER stage set of the version holds
+/// different bytes of the same version (slices of two stage sets never
+/// combine, item 102), and is named as before. A range holder is named with
+/// its slice run.
 pub fn copy_distinctness(
     conn: &Connection,
     dest_volume_id: i64,
@@ -1795,51 +1828,145 @@ pub fn copy_distinctness(
     );
     // The location union `location_count_expr` counts: the tape's own
     // shelf, and a warehouse deposit of it; a whole copy's or a range's
-    // (`holds_slices`, the counts' own reading of a holder).
+    // (`holds_slices`, the counts' own reading of a holder). Each row also
+    // carries the holder's stage set and write, and whether it is a range,
+    // for the spanning rule above.
     let holds = holds_slices("cw");
+    let range = status_in("cw", &["range"]);
     let shared_location = format!(
         "{} UNION {}",
         copies_of(
             &holds,
             "JOIN locations l ON l.id = d.location_id",
             "cv.location_id = d.location_id",
-            "u.name, cs.version, cv.label, l.name, 0",
+            &format!("u.name, cs.version, cv.label, l.name, 0, css.id, cw.id, {range}"),
         ),
         copies_of(
             &holds,
             "JOIN locations l ON l.id = d.location_id
              JOIN volume_deposits cd ON cd.volume_id = cv.id",
             "cd.location_id = d.location_id",
-            "u.name, cs.version, cv.label, l.name, 1",
+            &format!("u.name, cs.version, cv.label, l.name, 1, css.id, cw.id, {range}"),
         ),
     );
 
-    let collect = |sql: &str| -> crate::error::Result<Vec<ExistingCopy>> {
-        let mut stmt = conn.prepare(sql)?;
-        let mut out = Vec::new();
-        for &ss in stage_set_ids {
-            let rows = stmt.query_map(params![ss, dest_volume_id], |r| {
-                Ok(ExistingCopy {
-                    unit: r.get(0)?,
-                    version: r.get(1)?,
-                    volume: r.get(2)?,
-                    shared: r.get(3)?,
-                    deposit: r.get(4)?,
-                })
-            })?;
-            for row in rows {
-                out.push(row?);
+    let copy = |r: &rusqlite::Row| -> rusqlite::Result<ExistingCopy> {
+        Ok(ExistingCopy {
+            unit: r.get(0)?,
+            version: r.get(1)?,
+            volume: r.get(2)?,
+            shared: r.get(3)?,
+            deposit: r.get(4)?,
+            range: None,
+        })
+    };
+    let mut same: Vec<ExistingCopy> = Vec::new();
+    let mut stmt = conn.prepare(&same_cartridge)?;
+    for &ss in stage_set_ids {
+        for row in stmt.query_map(params![ss, dest_volume_id], copy)? {
+            same.push(row?);
+        }
+    }
+
+    let mut shared: Vec<ExistingCopy> = Vec::new();
+    let mut stmt = conn.prepare(&shared_location)?;
+    for &ss in stage_set_ids {
+        // The slices the destination takes next, when the set spans.
+        let next = next_slices_of_a_spanning_set(conn, ss)?;
+        let rows = stmt
+            .query_map(params![ss, dest_volume_id], |r| {
+                Ok((
+                    copy(r)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, bool>(7)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (mut existing, holder_set, write_id, is_range) in rows {
+            let held = if is_range {
+                Some(range_held(conn, write_id)?)
+            } else {
+                None
+            };
+            let keep = match (&next, &held) {
+                (Some(next), Some(held)) if holder_set == ss => {
+                    held.iter().any(|(id, _)| next.contains(id))
+                }
+                _ => true,
+            };
+            if keep {
+                existing.range = held.and_then(|held| {
+                    let first = held.first()?.1;
+                    let last = held.last()?.1;
+                    Some((first, last))
+                });
+                shared.push(existing);
             }
         }
-        // Two stage sets of one version find the same copies.
+    }
+    // Two stage sets of one version find the same copies.
+    for out in [&mut same, &mut shared] {
         out.sort();
         out.dedup();
-        Ok(out)
-    };
+    }
     Ok(Distinctness {
-        same_cartridge: collect(&same_cartridge)?,
-        shared_location: collect(&shared_location)?,
+        same_cartridge: same,
+        shared_location: shared,
     })
+}
+
+/// The slices a write of the stage set `stage_set_id` takes next when the set
+/// spans (it has a `range` row on an [`eligible`] volume): its least-covered
+/// slices, those whose [`slice_copies`] equals the set's minimum (item 122).
+/// `None` when the set has no such range row (every slice is next then).
+fn next_slices_of_a_spanning_set(
+    conn: &Connection,
+    stage_set_id: i64,
+) -> crate::error::Result<Option<std::collections::BTreeSet<i64>>> {
+    // `writes` reads only the set, the status and eligibility; the
+    // partition is item 138's, for the counts, and is not read here.
+    let ranges = SliceCount {
+        set: "?1",
+        partition: Partition::Version("NULL"),
+        exclude: None,
+        counted: Counted::Copies,
+    }
+    .writes("range", "");
+    let spans: bool = conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 {ranges})"),
+        params![stage_set_id],
+        |r| r.get(0),
+    )?;
+    if !spans {
+        return Ok(None);
+    }
+    let slices = slice_copies(conn, stage_set_id)?;
+    let least = slices.iter().map(|s| s.copies).min();
+    Ok(Some(
+        slices
+            .iter()
+            .filter(|s| Some(s.copies) == least)
+            .map(|s| s.stage_slice_id)
+            .collect(),
+    ))
+}
+
+/// The slices the `range` write `write_id` holds (`written`, as
+/// [`range_holds`] reads them), as `(stage_slice_id, slice_number)` in slice
+/// order.
+fn range_held(conn: &Connection, write_id: i64) -> crate::error::Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT cl.id, cl.slice_number
+         FROM writes cw JOIN stage_slices cl ON cl.stage_set_id = cw.stage_set_id
+         WHERE cw.id = ?1 AND {}
+         ORDER BY cl.slice_number",
+        range_holds("cl.id")
+    ))?;
+    let rows = stmt
+        .query_map(params![write_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
@@ -2719,6 +2846,7 @@ pub(crate) mod tests {
             volume: volume.into(),
             shared: shared.into(),
             deposit,
+            range: None,
         }
     }
 
@@ -2789,33 +2917,117 @@ pub(crate) mod tests {
             .contains("a warehouse deposit of volume \"L6-0003\""));
     }
 
-    /// #478: a volume holding a `range` of the version is a holder of it
-    /// at its place, as `location_count_expr` counts it, so a destination at
-    /// that place gets the same warning a whole copy's place gives. A `cut`
-    /// write left nothing there, and is no copy at the place.
+    // ── copy_distinctness for a set that spans (#478; items 122, 127, 134) ──
+
+    /// Item 93's layout at tape 3's plan: SPAN-1 holds slices 1-2 at `home`,
+    /// SPAN-2 holds the version whole at `vault`, and the destination SPAN-3
+    /// (initialised, nothing written) is at `dest_place`. Slices 1-2 have two
+    /// copies, 3-6 one, so 3-6 are next. Returns the catalog, the destination
+    /// and the set.
+    fn tape_3_of_item_93(dest_place: &str) -> (SpanCatalog, i64, i64) {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("home"));
+        let t2 = c.volume("SPAN-2", Some("vault"));
+        c.range(set, t1, 1, 2, 6);
+        c.whole(set, 6, t2);
+        let dest = c.volume("SPAN-3", Some(dest_place));
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'initialized', sealed_at = NULL WHERE id = ?1",
+                params![dest],
+            )
+            .unwrap();
+        (c, dest, set)
+    }
+
+    fn span_copy(volume: &str, shared: &str, range: Option<(i64, i64)>) -> ExistingCopy {
+        ExistingCopy {
+            unit: "span".into(),
+            version: 1,
+            volume: volume.into(),
+            shared: shared.into(),
+            deposit: false,
+            range,
+        }
+    }
+
+    /// Tape 3 takes slices 3-6. Beside tape 1 (slices 1-2) it is the same
+    /// copy's other part, kept together (item 134): no warning. Beside tape
+    /// 2, which holds slices 3-6 too, two holders of one slice share a place
+    /// (item 127): the warning, its text a whole copy's, byte for byte.
     #[test]
-    fn a_destination_at_a_range_holders_place_gets_the_same_warning() {
-        let (conn, dest, ss) = distinctness_fixture(Some("home"), "BC1", "BC2");
-        conn.execute(
-            "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
-            params![ss],
-        )
-        .unwrap();
-        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
-        assert_eq!(d.shared_location, vec![copy("L6-0003", "home", false)]);
-        let warning = d.warning("L6-0009").unwrap();
+    fn tape_3_beside_tape_1_is_one_copy_and_beside_tape_2_is_warned() {
+        let (c, dest, set) = tape_3_of_item_93("home");
+        let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
+        assert_eq!(d, Distinctness::default(), "{d:?}");
+        assert_eq!(d.warning("SPAN-3"), None);
+
+        let (c, dest, set) = tape_3_of_item_93("vault");
+        let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
+        assert_eq!(d.shared_location, vec![span_copy("SPAN-2", "vault", None)]);
+        assert_eq!(
+            d.warning("SPAN-3").unwrap(),
+            "warning: volume \"SPAN-3\" is at location \"vault\", where these versions \
+             already have a copy: span v1 (volume \"SPAN-2\"). Copies in one place are lost \
+             together. Writing anyway: location policy is advisory (ADR-0004), and `tapectl \
+             audit` reports any required location still without a copy."
+        );
+    }
+
+    /// A set with no range row keeps the whole-copy rule: a holder at the
+    /// destination's place is named, whatever the slices' copies.
+    #[test]
+    fn a_set_with_no_range_is_warned_as_before() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t2 = c.volume("SPAN-2", Some("home"));
+        c.whole(set, 6, t2);
+        let dest = c.volume("SPAN-3", Some("home"));
+        let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
+        assert_eq!(d.shared_location, vec![span_copy("SPAN-2", "home", None)]);
+        assert!(d
+            .warning("SPAN-3")
+            .unwrap()
+            .contains("span v1 (volume \"SPAN-2\")"));
+    }
+
+    /// Every slice with the same copies (one each, on two ranges): every
+    /// slice is next, so a range holder at the destination's place is warned
+    /// as a whole copy is, named with its slice run. A `cut` write left
+    /// nothing on its tape and is no holder.
+    #[test]
+    fn a_set_with_equal_copies_on_every_slice_warns_naming_the_range() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("home"));
+        let t3 = c.volume("SPAN-3", Some("vault"));
+        let w1 = c.range(set, t1, 1, 2, 6);
+        c.range(set, t3, 3, 6, 6);
+        let dest = c.volume("SPAN-4", Some("home"));
+        let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
+        assert_eq!(
+            d.shared_location,
+            vec![span_copy("SPAN-1", "home", Some((1, 2)))]
+        );
         assert!(
-            warning.contains("location \"home\"")
-                && warning.contains("photos v1 (volume \"L6-0003\")"),
-            "{warning}"
+            d.warning("SPAN-4")
+                .unwrap()
+                .contains("already have a copy: span v1 (slices 1-2 on volume \"SPAN-1\")."),
+            "{:?}",
+            d.warning("SPAN-4")
         );
 
-        conn.execute(
-            "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
-            params![ss],
-        )
-        .unwrap();
-        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        c.conn
+            .execute(
+                "UPDATE writes SET status = 'cut' WHERE id = ?1",
+                params![w1],
+            )
+            .unwrap();
+        let d = copy_distinctness(&c.conn, dest, &[set]).unwrap();
         assert!(d.shared_location.is_empty(), "{d:?}");
     }
 
