@@ -3,8 +3,11 @@
 //! Copies are written from one staging, so every copy of a stage set carries
 //! the same ciphertext for a slice, and the catalog records the same
 //! `sha256_encrypted` for it. A slice that is damaged on one cartridge can be
-//! read from any other cartridge whose completed write holds a slice with
-//! that hash: matched by the hash, never by position or number.
+//! read from any other cartridge whose write holds a slice with that hash:
+//! matched by the hash, never by position or number. From 1.7.0 (#478) a
+//! holder is a `completed` write or a `range` write with the slice
+//! `written` (item 101 sees ranges; `volume-format-v2.md` §4.4 R8), so the
+//! same answer serves a damaged slice and a version read across cartridges.
 //!
 //! "Held" and "live" are `policy::coverage`'s predicates, composed here and
 //! never spelled out again ([`coverage::in_service`] for a cartridge nothing
@@ -32,18 +35,36 @@ pub enum Standing {
 }
 
 /// The slice at `wp.position` lies on its volume's tape: at or before the
-/// volume's `ended_after` when the tape sealed short (#420). A repair source
-/// is only ever a slice of a `completed` write, which holds every slice at
-/// or before `ended_after` by construction; this says so in the query too,
-/// so a catalog that broke that (which `audit` names) sends no read past
-/// the seal of the other tape (`volume-format-v2.md` §4.2 R5). A `cut`
-/// write's slices are never a source, even those at or before
+/// volume's `ended_after` when the tape sealed short (#420). A source is
+/// only ever a `written` slice of a `completed` write, which holds every
+/// slice at or before `ended_after` by construction, or of a `range` write,
+/// whose slices are `written` up to the tape's end and `pending` past it
+/// (#478, item 121). This says so in the query too, so a catalog that broke
+/// that (which `audit` names) sends no read past the seal of the other tape:
+/// tapectl takes `ended_after` from the catalog, which recorded the tape's
+/// seal when it sealed or was rebuilt (`volume-format-v2.md` §4.2 R1 and
+/// R5). A `cut` write's slices are never a source, even those at or before
 /// `ended_after`: §4.2 "Nothing of a cut unit counts on this tape, and no
 /// reader restores it from this tape, even though its slices at or before
 /// `ended_after` are present and hash correctly".
 const ON_TAPE: &str = "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
 
-/// One volume holding a completed, written copy of a slice.
+/// The one test of "the volume `v` holds the slice `wp` of the write `w`",
+/// over the aliases `w`, `wp` and `v`: a `completed` or `range` write, the
+/// position `written` and on the tape ([`ON_TAPE`]), and a volume in service
+/// or, as a last resort, quarantined but still holding its bytes. Every
+/// question this module answers about a slice's holders is asked with it.
+fn holds() -> String {
+    format!(
+        "w.status IN ('completed', 'range') AND wp.status = 'written' AND {ON_TAPE}
+         AND ({in_service} OR {bytes})",
+        in_service = coverage::in_service("v"),
+        bytes = coverage::holds_bytes_to_verify("v"),
+    )
+}
+
+/// One volume holding a written copy of a slice, in a completed write or a
+/// range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holder {
     pub volume_id: i64,
@@ -53,9 +74,10 @@ pub struct Holder {
     pub standing: Standing,
 }
 
-/// Every volume that holds a completed write of a slice whose ciphertext
-/// hashes to `sha256_encrypted`, in-service ones first, each tier in volume
-/// order. A volume the catalog has given up (retired, erased) holds nothing.
+/// Every volume that holds a slice whose ciphertext hashes to
+/// `sha256_encrypted` ([`holds`]: a completed write, or a range with the
+/// slice written), in-service ones first, each tier in volume order. A
+/// volume the catalog has given up (retired, erased) holds nothing.
 pub fn holders_of(conn: &Connection, sha256_encrypted: &str) -> Result<Vec<Holder>> {
     let in_service = coverage::in_service("v");
     let mut stmt = conn.prepare(&format!(
@@ -65,12 +87,9 @@ pub fn holders_of(conn: &Connection, sha256_encrypted: &str) -> Result<Vec<Holde
            JOIN stage_slices sl ON sl.id = wp.stage_slice_id
            JOIN volumes v ON v.id = w.volume_id
           WHERE sl.sha256_encrypted = ?1
-            AND w.status = 'completed' AND wp.status = 'written'
-            AND {on_tape}
-            AND ({in_service} OR {bytes})
+            AND {holds}
           ORDER BY (NOT {in_service}), v.id",
-        on_tape = ON_TAPE,
-        bytes = coverage::holds_bytes_to_verify("v"),
+        holds = holds(),
     ))?;
     let rows = stmt.query_map(params![sha256_encrypted], |r| {
         Ok((
@@ -101,14 +120,13 @@ pub fn holders_of(conn: &Connection, sha256_encrypted: &str) -> Result<Vec<Holde
     Ok(holders)
 }
 
-/// Whether any live volume other than `volume_id` holds a completed copy of
-/// any slice of `stage_set_id` (by ciphertext hash): the question a restore
-/// asks once, before it reads, to know whether a damaged slice has anywhere
-/// else to come from. When nothing does, it can take what authenticates in
-/// the one pass; when something does, it reads strictly so the swap can be
-/// offered.
+/// Whether any live volume other than `volume_id` holds any slice of
+/// `stage_set_id` (by ciphertext hash, [`holds`]: a range included): the
+/// question a restore asks once, before it reads, to know whether a damaged
+/// slice has anywhere else to come from. When nothing does, it can take what
+/// authenticates in the one pass; when something does, it reads strictly so
+/// the swap can be offered.
 pub fn other_copies_exist(conn: &Connection, stage_set_id: i64, volume_id: i64) -> Result<bool> {
-    let in_service = coverage::in_service("v");
     Ok(conn.query_row(
         &format!(
             "SELECT EXISTS(
@@ -118,15 +136,125 @@ pub fn other_copies_exist(conn: &Connection, stage_set_id: i64, volume_id: i64) 
                    JOIN writes w ON w.id = wp.write_id
                    JOIN volumes v ON v.id = w.volume_id
                   WHERE mine.stage_set_id = ?1 AND w.volume_id <> ?2
-                    AND w.status = 'completed' AND wp.status = 'written'
-                    AND {on_tape}
-                    AND ({in_service} OR {bytes}))",
-            on_tape = ON_TAPE,
-            bytes = coverage::holds_bytes_to_verify("v"),
+                    AND {holds})",
+            holds = holds(),
         ),
         params![stage_set_id, volume_id],
         |r| r.get(0),
     )?)
+}
+
+/// One slice of a stage set and a volume holding it ([`holders_of_set`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceHolder {
+    pub slice_number: i64,
+    pub holder: Holder,
+}
+
+/// Every holder of every slice of `stage_set_id`, by each slice's ciphertext
+/// hash and [`holds`], as [`holders_of`] answers for one slice: in slice
+/// order, and within a slice in-service volumes first, each tier in volume
+/// order. One statement for the whole set: what a restore across cartridges
+/// plans from (#478, ADR-0012 item 131). A slice no live volume holds has no
+/// row.
+pub fn holders_of_set(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceHolder>> {
+    let in_service = coverage::in_service("v");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT mine.slice_number, v.id, v.label, wp.position, {in_service} AS in_service
+           FROM stage_slices mine
+           JOIN stage_slices sl ON sl.sha256_encrypted = mine.sha256_encrypted
+           JOIN write_positions wp ON wp.stage_slice_id = sl.id
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+          WHERE mine.stage_set_id = ?1
+            AND {holds}
+          ORDER BY mine.slice_number, (NOT {in_service}), v.id",
+        holds = holds(),
+    ))?;
+    let rows = stmt.query_map(params![stage_set_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    })?;
+    let mut held = Vec::new();
+    for row in rows {
+        let (slice_number, volume_id, label, position, in_service) = row?;
+        let Ok(position) = position.parse::<u32>() else {
+            continue;
+        };
+        let holder = Holder {
+            volume_id,
+            label,
+            position,
+            standing: if in_service {
+                Standing::InService
+            } else {
+                Standing::Quarantined
+            },
+        };
+        // One volume holds a slice once; a second row would be the same
+        // ciphertext recorded twice on it.
+        if !held.iter().any(|h: &SliceHolder| {
+            h.slice_number == slice_number && h.holder.volume_id == volume_id
+        }) {
+            held.push(SliceHolder {
+                slice_number,
+                holder,
+            });
+        }
+    }
+    Ok(held)
+}
+
+/// Where the catalog last saw a slice of a stage set that no live volume
+/// holds ([`traces_of_set`]): one write's record of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceTrace {
+    pub slice_number: i64,
+    pub label: String,
+    /// `volumes.status`.
+    pub volume_status: String,
+    /// `volumes.observed_condition`.
+    pub condition: String,
+    /// `writes.status`.
+    pub write_status: String,
+    /// `write_positions.status`: `written`, or `pending` for a slice planned
+    /// on a tape that ended before it.
+    pub position_status: String,
+}
+
+/// Every write that recorded a slice of `stage_set_id` (by ciphertext hash),
+/// whatever became of it: what a refusal names when a slice has no holder
+/// (#478, "say what would hold them"). In slice order, then volume order.
+pub fn traces_of_set(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceTrace>> {
+    let mut stmt = conn.prepare(
+        "SELECT mine.slice_number, v.label, v.status, COALESCE(v.observed_condition, 'ok'),
+                w.status, wp.status
+           FROM stage_slices mine
+           JOIN stage_slices sl ON sl.sha256_encrypted = mine.sha256_encrypted
+           JOIN write_positions wp ON wp.stage_slice_id = sl.id
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+          WHERE mine.stage_set_id = ?1
+          ORDER BY mine.slice_number, v.id",
+    )?;
+    let rows = stmt
+        .query_map(params![stage_set_id], |r| {
+            Ok(SliceTrace {
+                slice_number: r.get(0)?,
+                label: r.get(1)?,
+                volume_status: r.get(2)?,
+                condition: r.get(3)?,
+                write_status: r.get(4)?,
+                position_status: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// What the operator needs to pick a cartridge off the shelf: the sticker
@@ -185,6 +313,11 @@ pub struct StageHolder {
 /// (ADR-0012 item 102): the same files, cut into different slices. Newest
 /// stage set first; its volumes in-service first. A stage set no volume
 /// holds is not listed.
+///
+/// Completed writes only, never a `range` (ADR-0012 item 143, #478): a
+/// damaged file is filled only from a copy held whole on one tape. The
+/// ranges this leaves out are [`ranges_of_version`]'s, which the fill names
+/// in its refusal.
 pub fn other_copies_of_version(
     conn: &Connection,
     snapshot_id: i64,
@@ -231,6 +364,53 @@ pub fn other_copies_of_version(
         }
     }
     Ok(copies)
+}
+
+/// One `range` write of another stage set of a version: what the fill names
+/// when it cannot use it (ADR-0012 item 143).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeCopy {
+    pub stage_set_id: i64,
+    pub label: String,
+    /// The first and last slice the range holds written.
+    pub first: i64,
+    pub last: i64,
+}
+
+/// The `range` writes, on live volumes, of the OTHER stage sets of
+/// `snapshot_id` than `except_stage_set_id`, with the run each holds: the
+/// copies [`other_copies_of_version`] leaves out because a range is never a
+/// fill source (ADR-0012 item 143). Newest stage set first, then volume
+/// order.
+pub fn ranges_of_version(
+    conn: &Connection,
+    snapshot_id: i64,
+    except_stage_set_id: i64,
+) -> Result<Vec<RangeCopy>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT w.stage_set_id, v.label, MIN(sl.slice_number), MAX(sl.slice_number)
+           FROM writes w
+           JOIN stage_sets ss ON ss.id = w.stage_set_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN write_positions wp ON wp.write_id = w.id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+          WHERE ss.snapshot_id = ?1 AND ss.id <> ?2
+            AND w.status = 'range' AND {holds}
+          GROUP BY w.id
+          ORDER BY w.stage_set_id DESC, v.id",
+        holds = holds(),
+    ))?;
+    let rows = stmt
+        .query_map(params![snapshot_id, except_stage_set_id], |r| {
+            Ok(RangeCopy {
+                stage_set_id: r.get(0)?,
+                label: r.get(1)?,
+                first: r.get(2)?,
+                last: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -391,6 +571,171 @@ mod tests {
         assert!(
             !other_copies_exist(&conn, 1, 1).unwrap(),
             "retired holds nothing"
+        );
+    }
+
+    /// Stage set 1 gets a second slice (`cccc`), and V3 holds a `range` of it:
+    /// slice 2 written, slice 1 planned but `pending` (its tape ended first).
+    fn with_a_range(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted)
+               VALUES (3, 1, 2, 10, 20, 'p3', 'cccc');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+               VALUES (4, 'V4', 'lto', 'p', 1000, 'sealed');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
+               VALUES (4, 1, 1, 4, 'range', 1);
+             INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+               VALUES (4, 3, '5', 'written');
+             INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+               VALUES (4, 1, '6', 'pending');",
+        )
+        .unwrap();
+    }
+
+    /// Item 101 sees ranges (#478): a range's written slice is held, its
+    /// pending one is not, and one past its tape's end is not either.
+    #[test]
+    fn a_range_holds_its_written_slices_and_nothing_else() {
+        let conn = catalog();
+        with_a_range(&conn);
+        assert_eq!(
+            labels(&holders_of(&conn, "cccc").unwrap()),
+            vec![("V4", 5, Standing::InService)],
+            "the range's written slice"
+        );
+        assert_eq!(
+            labels(&holders_of(&conn, "aaaa").unwrap()),
+            vec![
+                ("V1", 4, Standing::InService),
+                ("V2", 7, Standing::InService)
+            ],
+            "the slice the range planned but never wrote is not on V4"
+        );
+        // The range's tape ended before position 5 (a catalog `audit` names):
+        // nothing past the seal is a source.
+        conn.execute("UPDATE volumes SET ended_after = 4 WHERE id = 4", [])
+            .unwrap();
+        assert!(holders_of(&conn, "cccc").unwrap().is_empty());
+    }
+
+    /// A range is another copy of the slices it holds, for the restore's
+    /// one question too.
+    #[test]
+    fn other_copies_exist_counts_a_range() {
+        let conn = catalog();
+        with_a_range(&conn);
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id IN (1, 2)",
+            [],
+        )
+        .unwrap();
+        // Nothing live holds stage set 1 but V4's range, so from V4 there is
+        // no other copy, and from V1 there is (V4).
+        assert!(!other_copies_exist(&conn, 1, 4).unwrap());
+        assert!(other_copies_exist(&conn, 1, 1).unwrap());
+        // The positive control: without the range nothing live holds it.
+        conn.execute("UPDATE writes SET status = 'cut' WHERE id = 4", [])
+            .unwrap();
+        assert!(!other_copies_exist(&conn, 1, 1).unwrap());
+    }
+
+    /// The whole set's holders in one answer, slice by slice, the same
+    /// tiers as [`holders_of`].
+    #[test]
+    fn holders_of_set_lists_every_slices_holders_in_slice_order() {
+        let conn = catalog();
+        with_a_range(&conn);
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let held = holders_of_set(&conn, 1).unwrap();
+        let held: Vec<(i64, &str, u32, Standing)> = held
+            .iter()
+            .map(|h| {
+                (
+                    h.slice_number,
+                    h.holder.label.as_str(),
+                    h.holder.position,
+                    h.holder.standing,
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (1, "V2", 7, Standing::InService),
+                (1, "V1", 4, Standing::Quarantined),
+                (2, "V4", 5, Standing::InService),
+            ]
+        );
+        assert!(holders_of_set(&conn, 99).unwrap().is_empty());
+    }
+
+    /// Item 143: the fill's copies are whole writes only, and the ranges it
+    /// leaves out are listed for its refusal.
+    #[test]
+    fn a_range_is_never_a_fill_copy_and_is_listed_as_a_range() {
+        let conn = catalog();
+        // Stage set 2's only holder becomes a range of it.
+        conn.execute(
+            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        assert!(other_copies_of_version(&conn, 1, 1).unwrap().is_empty());
+        assert_eq!(
+            ranges_of_version(&conn, 1, 1).unwrap(),
+            vec![RangeCopy {
+                stage_set_id: 2,
+                label: "V3".into(),
+                first: 1,
+                last: 1,
+            }]
+        );
+        // Seen from stage set 2 itself, its own range is not "another".
+        assert!(ranges_of_version(&conn, 1, 2).unwrap().is_empty());
+    }
+
+    /// Where a slice no live volume holds was last seen.
+    #[test]
+    fn traces_name_every_write_of_a_slice_whatever_became_of_it() {
+        let conn = catalog();
+        with_a_range(&conn);
+        conn.execute("UPDATE volumes SET status = 'retired' WHERE id = 2", [])
+            .unwrap();
+        let traces: Vec<(i64, String, String, String, String)> = traces_of_set(&conn, 1)
+            .unwrap()
+            .into_iter()
+            .map(|t| {
+                (
+                    t.slice_number,
+                    t.label,
+                    t.volume_status,
+                    t.write_status,
+                    t.position_status,
+                )
+            })
+            .collect();
+        let row = |n, l: &str, vs: &str, ws: &str, ps: &str| {
+            (
+                n,
+                l.to_string(),
+                vs.to_string(),
+                ws.to_string(),
+                ps.to_string(),
+            )
+        };
+        assert_eq!(
+            traces,
+            vec![
+                row(1, "V1", "sealed", "completed", "written"),
+                row(1, "V2", "retired", "completed", "written"),
+                row(1, "V4", "sealed", "range", "pending"),
+                row(2, "V4", "sealed", "range", "written"),
+            ]
         );
     }
 
