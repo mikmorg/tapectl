@@ -2137,6 +2137,46 @@ pub struct IndexThisTape<'a> {
     pub generation: &'a str,
 }
 
+/// One stage set a write carries, and the run of its slices this tape's plan
+/// holds: what the `this-tape` row of the index says in `first_slice` and
+/// `last_slice` (`volume-format-v2.md` §1.5; ADR-0012 item 126). A whole set
+/// is the run 1 to its number of slices; a spannable set's range is the one
+/// unbroken run this tape plans (item 122), which the seal's `ended_after`
+/// may end sooner (§4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexRun {
+    pub stage_set_id: i64,
+    /// The first and last slice of the run, by slice number; `None` for the
+    /// whole set.
+    pub slices: Option<(i64, i64)>,
+}
+
+impl IndexRun {
+    /// `stage_set_id`, whole.
+    pub fn whole(stage_set_id: i64) -> Self {
+        IndexRun {
+            stage_set_id,
+            slices: None,
+        }
+    }
+
+    /// Each of `stage_set_ids`, whole: the runs of a write that carries no
+    /// range.
+    pub fn whole_sets(stage_set_ids: &[i64]) -> Vec<Self> {
+        stage_set_ids.iter().copied().map(IndexRun::whole).collect()
+    }
+}
+
+/// The run of a whole stage set of `num_slices` slices: 1 to `num_slices`,
+/// or `(0, 0)` ("not known") for a set with none recorded.
+fn whole_run(num_slices: i64) -> (i64, i64) {
+    if num_slices > 0 {
+        (1, num_slices)
+    } else {
+        (0, 0)
+    }
+}
+
 /// One (version, holding volume) pair of the index: a row of `units.tsv`
 /// before it is formatted. Facts only; the file's sort order and spelling are
 /// `volume::index`'s.
@@ -2154,6 +2194,13 @@ pub struct IndexVersionRow {
     pub num_slices: i64,
     /// Their ciphertext bytes, all slices.
     pub version_bytes: i64,
+    /// The run of those slices the volume holds, by slice number (§1.5): `1`
+    /// and `num_slices` for a whole (`completed`) write; for a `range` write
+    /// the first and last slice the catalog records `written` there; on this
+    /// tape's row the run its plan holds ([`IndexRun`]). `0` when not known:
+    /// a stage set with no slices recorded, or a range with no slice written.
+    pub first_slice: i64,
+    pub last_slice: i64,
     pub volume: String,
     pub volume_uuid: String,
     pub cartridge_serial: String,
@@ -2164,29 +2211,47 @@ pub struct IndexVersionRow {
     pub sealed_at: String,
 }
 
+/// [`index_versions_for_runs`] for a write that carries each of
+/// `write_stage_sets` whole: this tape's rows say 1 to each set's number of
+/// slices.
+pub fn index_versions(
+    conn: &Connection,
+    this: &IndexThisTape<'_>,
+    write_stage_sets: &[i64],
+) -> crate::error::Result<Vec<IndexVersionRow>> {
+    index_versions_for_runs(conn, this, &IndexRun::whole_sets(write_stage_sets))
+}
+
 /// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v2.md`
 /// §1.5): every version the index lists, with each volume that holds it.
 ///
-/// The versions are every CURRENT version with at least one completed write
-/// on an [`index_holder`] volume, plus every version `write_stage_sets`
-/// carries — by id, never by status: at build time this write's snapshots are
-/// `staged`, not yet `current`. The holders of a listed version are its
-/// completed writes on [`index_holder`] volumes (quarantined ones marked),
-/// and this tape, as [`IndexHolderState::ThisTape`], for each version
-/// `write_stage_sets` carries. Unsealed, retired and erased volumes hold
-/// nothing here, and a reclaimable or purged version is listed only when
-/// this write itself carries it.
+/// The versions are every CURRENT version with at least one `completed` or
+/// `range` write on an [`index_holder`] volume, plus every version
+/// `write_runs` carries — by id, never by status: at build time this write's
+/// snapshots are `staged`, not yet `current`. The holders of a listed version
+/// are its `completed` and `range` writes on [`index_holder`] volumes
+/// (quarantined ones marked), each with the run of slices it holds, and this
+/// tape, as [`IndexHolderState::ThisTape`], for each version `write_runs`
+/// carries, with the run its plan holds (§1.5 "Ranges", 1.7.0; ADR-0012 items
+/// 121, 126 and 141). A holder of a range is listed with its run and is no
+/// copy on its own (item 127): the index never joins runs, a reader takes a
+/// slice from another tape only by its hash (§4.4 R8). A spanning version is
+/// current only once every slice of a stage set of it is on a sealed volume
+/// (item 128), so until then it is listed only by a write that carries it.
+/// Unsealed, retired and erased volumes hold nothing here, and a reclaimable
+/// or purged version is listed only when this write itself carries it.
 ///
 /// ONE statement for the holders and one for this tape's own rows, for every
 /// tenant at once (the caller splits by `tenant_id`), however many units
 /// there are. One row per (snapshot, volume): a snapshot with two stage sets
 /// on one volume reports the lower stage set id's. Unordered;
 /// `volume::index` sorts.
-pub fn index_versions(
+pub fn index_versions_for_runs(
     conn: &Connection,
     this: &IndexThisTape<'_>,
-    write_stage_sets: &[i64],
+    write_runs: &[IndexRun],
 ) -> crate::error::Result<Vec<IndexVersionRow>> {
+    let write_stage_sets: Vec<i64> = write_runs.iter().map(|r| r.stage_set_id).collect();
     // ?1 is this tape's label; ?2.. are the write's stage sets.
     let in_list = (0..write_stage_sets.len())
         .map(|i| format!("?{}", i + 2))
@@ -2199,13 +2264,24 @@ pub fn index_versions(
                WHERE sl.stage_set_id = {stage_set})"
         )
     };
+    // A range's run: the lowest and highest slice it has `written`.
+    let written_run = |end: &str| {
+        format!(
+            "(SELECT {end}(sl.slice_number) FROM write_positions wp
+               JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+              WHERE wp.write_id = w.id AND wp.status = 'written')"
+        )
+    };
     let holders_sql = format!(
         "SELECT t.id, t.name, u.id, u.name, u.uuid, s.id, s.version,
                 {holder_slices},
                 v.label, COALESCE(v.uuid, ''), COALESCE(c.serial_number, ''),
                 COALESCE(v.media_type, ''),
                 COALESCE(v.sealed_at, ''),
-                CASE WHEN {condition_ok} THEN 0 ELSE 1 END, w.stage_set_id
+                CASE WHEN {condition_ok} THEN 0 ELSE 1 END, w.stage_set_id,
+                w.status = 'range',
+                CASE WHEN w.status = 'range' THEN {first} END,
+                CASE WHEN w.status = 'range' THEN {last} END
          FROM writes w
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
@@ -2217,11 +2293,14 @@ pub fn index_versions(
          -- would drop the serial of a sealed volume whose mount has closed.
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
-         WHERE w.status = 'completed' AND {holder} AND v.label <> ?1
+         WHERE {holds} AND {holder} AND v.label <> ?1
            AND (s.status = 'current'
                 OR s.id IN (SELECT snapshot_id FROM stage_sets WHERE id IN ({in_list})))",
         holder_slices = slices("w.stage_set_id"),
         condition_ok = condition_ok("v"),
+        first = written_run("MIN"),
+        last = written_run("MAX"),
+        holds = holds_slices("w"),
         holder = index_holder("v"),
     );
     let this_sql = format!(
@@ -2237,6 +2316,10 @@ pub fn index_versions(
 
     let mut bound: Vec<rusqlite::types::Value> = vec![this.label.to_string().into()];
     bound.extend(write_stage_sets.iter().map(|id| (*id).into()));
+    let planned: std::collections::HashMap<i64, Option<(i64, i64)>> = write_runs
+        .iter()
+        .map(|r| (r.stage_set_id, r.slices))
+        .collect();
 
     // (row, the stage set it came from: the tie-break below).
     let mut rows: Vec<(IndexVersionRow, i64)> = Vec::new();
@@ -2244,6 +2327,15 @@ pub fn index_versions(
         let mut stmt = conn.prepare(&holders_sql)?;
         let mapped = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |r| {
             let quarantined: i64 = r.get(14)?;
+            let num_slices: i64 = r.get(7)?;
+            let (first_slice, last_slice) = if r.get::<_, bool>(16)? {
+                (
+                    r.get::<_, Option<i64>>(17)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(18)?.unwrap_or(0),
+                )
+            } else {
+                whole_run(num_slices)
+            };
             Ok((
                 IndexVersionRow {
                     tenant_id: r.get(0)?,
@@ -2253,8 +2345,10 @@ pub fn index_versions(
                     unit_uuid: r.get(4)?,
                     snapshot_id: r.get(5)?,
                     version: r.get(6)?,
-                    num_slices: r.get(7)?,
+                    num_slices,
                     version_bytes: r.get(8)?,
+                    first_slice,
+                    last_slice,
                     volume: r.get(9)?,
                     volume_uuid: r.get(10)?,
                     cartridge_serial: r.get(11)?,
@@ -2276,6 +2370,12 @@ pub fn index_versions(
     if !write_stage_sets.is_empty() {
         let mut stmt = conn.prepare(&this_sql)?;
         let mapped = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+            let num_slices: i64 = r.get(7)?;
+            let stage_set_id: i64 = r.get(9)?;
+            let (first_slice, last_slice) = match planned.get(&stage_set_id).copied().flatten() {
+                Some(run) => run,
+                None => whole_run(num_slices),
+            };
             Ok((
                 IndexVersionRow {
                     tenant_id: r.get(0)?,
@@ -2285,8 +2385,10 @@ pub fn index_versions(
                     unit_uuid: r.get(4)?,
                     snapshot_id: r.get(5)?,
                     version: r.get(6)?,
-                    num_slices: r.get(7)?,
+                    num_slices,
                     version_bytes: r.get(8)?,
+                    first_slice,
+                    last_slice,
                     volume: this.label.to_string(),
                     volume_uuid: this.uuid.to_string(),
                     cartridge_serial: this.cartridge_serial.to_string(),
@@ -2294,7 +2396,7 @@ pub fn index_versions(
                     state: IndexHolderState::ThisTape,
                     sealed_at: String::new(),
                 },
-                r.get::<_, i64>(9)?,
+                stage_set_id,
             ))
         })?;
         for row in mapped {
@@ -4638,6 +4740,34 @@ pub(crate) mod tests {
                 .unwrap();
         }
 
+        /// A `range` write of `stage_set_id` to `volume_id` (planned
+        /// spannable) holding the slices `written`, with every later slice
+        /// of the set planned but `pending` (the tape ended first).
+        pub(crate) fn range(
+            &self,
+            stage_set_id: i64,
+            volume_id: i64,
+            written: std::ops::RangeInclusive<i64>,
+        ) {
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                     SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+                    params![stage_set_id, volume_id],
+                )
+                .unwrap();
+            let write_id = self.conn.last_insert_rowid();
+            self.conn
+                .execute(
+                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                     SELECT ?1, id, CAST(5 + slice_number AS TEXT),
+                            CASE WHEN slice_number <= ?4 THEN 'written' ELSE 'pending' END
+                       FROM stage_slices WHERE stage_set_id = ?2 AND slice_number >= ?3",
+                    params![write_id, stage_set_id, written.start(), written.end()],
+                )
+                .unwrap();
+        }
+
         /// `(path, kind, size)` entries as the paths of `snapshot_id`.
         pub(crate) fn paths(
             &self,
@@ -5643,5 +5773,172 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(numbers(t1), vec![1, 2], "not 3..6: planned, never written");
         assert_eq!(numbers(t3), vec![3, 4, 5, 6]);
+    }
+
+    /// `(unit, version, volume, state, first_slice, last_slice)` of each row,
+    /// sorted.
+    fn index_runs(rows: &[IndexVersionRow]) -> Vec<(String, i64, String, &'static str, i64, i64)> {
+        let mut runs: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.unit.clone(),
+                    r.version,
+                    r.volume.clone(),
+                    r.state.as_str(),
+                    r.first_slice,
+                    r.last_slice,
+                )
+            })
+            .collect();
+        runs.sort();
+        runs
+    }
+
+    /// §1.5 from 1.7.0 (ADR-0012 items 121, 126, 141): a `range` write is a
+    /// holder, listed with the run of slices the catalog records `written`
+    /// there; a whole write's run is 1..N; this tape's row carries the run
+    /// its plan holds; a `cut` write holds nothing. A spanning version that is
+    /// not yet current is listed only by a write that carries it.
+    #[test]
+    fn the_index_names_each_holders_run_of_slices() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let docs = c.unit("bravo", "docs");
+        let at = Some("2026-10-21 10:00:00");
+        let whole = c.volume("L6-0001", "sealed", "ok", at);
+        let head = c.volume("L6-0002", "sealed", "ok", at);
+        let tail = c.volume("L6-0003", "sealed", "ok", at);
+        let cut = c.volume("L6-0004", "sealed", "ok", at);
+        let unsealed = c.volume("L6-0006", "initialized", "ok", at);
+
+        let (_, p1) = c.version(photos, 1, "current", &[10, 10, 10, 10]);
+        c.write(p1, whole, "completed");
+        c.range(p1, head, 1..=2);
+        c.range(p1, tail, 3..=4);
+        c.write(p1, cut, "cut");
+        c.range(p1, unsealed, 1..=4);
+
+        // docs v1: a span in progress, staged, on one tape so far.
+        let span = c.volume("L6-0005", "sealed", "ok", at);
+        let (_, d1) = c.version(docs, 1, "staged", &[10, 10, 10]);
+        c.range(d1, span, 1..=2);
+
+        let photos_rows = vec![
+            (
+                "photos".to_string(),
+                1,
+                "L6-0001".to_string(),
+                "sealed",
+                1,
+                4,
+            ),
+            (
+                "photos".to_string(),
+                1,
+                "L6-0002".to_string(),
+                "sealed",
+                1,
+                2,
+            ),
+            (
+                "photos".to_string(),
+                1,
+                "L6-0003".to_string(),
+                "sealed",
+                3,
+                4,
+            ),
+        ];
+        assert_eq!(
+            index_runs(&index_versions(&c.conn, &THIS, &[]).unwrap()),
+            photos_rows,
+            "docs is not current and this write does not carry it"
+        );
+
+        // This write carries photos' slices 3..4 and the rest of docs.
+        let rows = index_versions_for_runs(
+            &c.conn,
+            &THIS,
+            &[
+                IndexRun {
+                    stage_set_id: p1,
+                    slices: Some((3, 4)),
+                },
+                IndexRun {
+                    stage_set_id: d1,
+                    slices: Some((3, 3)),
+                },
+            ],
+        )
+        .unwrap();
+        let mut want = vec![
+            ("docs".to_string(), 1, "L6-0005".to_string(), "sealed", 1, 2),
+            (
+                "docs".to_string(),
+                1,
+                "L6-0100".to_string(),
+                "this-tape",
+                3,
+                3,
+            ),
+        ];
+        want.extend(photos_rows);
+        want.push((
+            "photos".to_string(),
+            1,
+            "L6-0100".to_string(),
+            "this-tape",
+            3,
+            4,
+        ));
+        want.sort();
+        assert_eq!(index_runs(&rows), want);
+
+        // The whole form: this tape's run is every slice.
+        let rows = index_versions(&c.conn, &THIS, &[d1]).unwrap();
+        let this = rows
+            .iter()
+            .find(|r| r.state == IndexHolderState::ThisTape)
+            .unwrap();
+        assert_eq!(
+            (this.num_slices, this.first_slice, this.last_slice),
+            (3, 1, 3)
+        );
+    }
+
+    /// A range with no slice `written` (a row no session leaves) states no run,
+    /// and a stage set with no slices recorded states none either.
+    #[test]
+    fn an_index_run_the_catalog_does_not_know_is_zero() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let tape = c.volume("L6-0001", "sealed", "ok", Some("2026-10-21 10:00:00"));
+        let (_, p1) = c.version(photos, 1, "current", &[10, 10]);
+        c.range(p1, tape, 3..=2);
+        let (_, p2) = c.version(photos, 2, "current", &[]);
+        c.write(p2, tape, "completed");
+        let rows = index_runs(&index_versions(&c.conn, &THIS, &[]).unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "photos".to_string(),
+                    1,
+                    "L6-0001".to_string(),
+                    "sealed",
+                    0,
+                    0
+                ),
+                (
+                    "photos".to_string(),
+                    2,
+                    "L6-0001".to_string(),
+                    "sealed",
+                    0,
+                    0
+                ),
+            ]
+        );
     }
 }

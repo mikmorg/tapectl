@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::error::{Result, TapectlError};
-use crate::policy::coverage::{self, IndexThisTape, IndexVersionRow};
+use crate::policy::coverage::{self, IndexRun, IndexThisTape, IndexVersionRow};
 
 /// The tar member names, in the tenant and operator envelopes.
 pub const UNITS_MEMBER: &str = "index/units.tsv";
@@ -200,15 +200,18 @@ fn write_units_row<W: Write + ?Sized>(
     field(w, &r.unit)?;
     field(w, &r.unit_uuid)?;
     write!(w, "{}\t", r.version)?;
-    // A whole version holds slices 1..=num_slices; a stage set with none
-    // recorded has no range and no size to state (an empty field is "not
-    // known").
+    // The run of the slices this volume holds (§1.5): 1..=num_slices for a
+    // whole version, a range's own run (1.7.0, §4.4). A stage set with none
+    // recorded has no run and no size to state, and a run the catalog does
+    // not know is not stated either (an empty field is "not known").
     if r.num_slices > 0 {
-        write!(
-            w,
-            "{}\t1\t{}\t{}\t",
-            r.num_slices, r.num_slices, r.version_bytes
-        )?;
+        write!(w, "{}\t", r.num_slices)?;
+        if r.first_slice > 0 && r.last_slice > 0 {
+            write!(w, "{}\t{}\t", r.first_slice, r.last_slice)?;
+        } else {
+            w.write_all(b"\t\t")?;
+        }
+        write!(w, "{}\t", r.version_bytes)?;
     } else {
         w.write_all(b"\t\t\t\t")?;
     }
@@ -365,18 +368,20 @@ pub struct TenantIndexFiles {
     pub paths: PathBuf,
 }
 
-/// Generate the index for the write that carries `write_stage_sets`, handing
-/// each file to the writer `open` returns for it. Facts: [`coverage::index_versions`];
-/// per tenant, the paths of the versions it lists. A tenant gets files only
-/// when this write carries one of its units, since only such a tenant has an
-/// envelope on this tape; the operator's `units.tsv` lists every tenant.
+/// Generate the index for the write that carries `write_runs` (each stage set
+/// and the run of its slices this tape's plan holds, which this tape's rows
+/// state: §1.5, ADR-0012 item 126), handing each file to the writer `open`
+/// returns for it. Facts: [`coverage::index_versions_for_runs`]; per tenant,
+/// the paths of the versions it lists. A tenant gets files only when this
+/// write carries one of its units, since only such a tenant has an envelope
+/// on this tape; the operator's `units.tsv` lists every tenant.
 pub fn generate(
     conn: &Connection,
     this: &IndexThisTape<'_>,
-    write_stage_sets: &[i64],
+    write_runs: &[IndexRun],
     open: &mut dyn FnMut(Member) -> io::Result<Box<dyn Write>>,
 ) -> Result<Generated> {
-    let mut rows = coverage::index_versions(conn, this, write_stage_sets)?;
+    let mut rows = coverage::index_versions_for_runs(conn, this, write_runs)?;
     rows.sort_by(units_order);
 
     let mut generated = Generated::default();
@@ -444,12 +449,24 @@ pub fn generate(
     Ok(generated)
 }
 
-/// [`generate`] into files under `dir` (created if absent): what `volume
-/// write` hands `build()`. `dir` belongs in the tapectl home's work dir.
+/// [`generate_files_for_runs`] for a write that carries each of
+/// `write_stage_sets` whole (this tape's rows say 1 to each set's number of
+/// slices): what `volume write` hands `build()` for a write with no range.
 pub fn generate_files(
     conn: &Connection,
     this: &IndexThisTape<'_>,
     write_stage_sets: &[i64],
+    dir: &Path,
+) -> Result<IndexFiles> {
+    generate_files_for_runs(conn, this, &IndexRun::whole_sets(write_stage_sets), dir)
+}
+
+/// [`generate`] into files under `dir` (created if absent): what `volume
+/// write` hands `build()`. `dir` belongs in the tapectl home's work dir.
+pub fn generate_files_for_runs(
+    conn: &Connection,
+    this: &IndexThisTape<'_>,
+    write_runs: &[IndexRun],
     dir: &Path,
 ) -> Result<IndexFiles> {
     std::fs::create_dir_all(dir)?;
@@ -457,7 +474,7 @@ pub fn generate_files(
     // work directory it sits in already is.
     crate::config::secure_path(dir, 0o700);
     let mut paths: BTreeMap<Member, PathBuf> = BTreeMap::new();
-    let generated = generate(conn, this, write_stage_sets, &mut |member| {
+    let generated = generate(conn, this, write_runs, &mut |member| {
         let name = match member {
             Member::OperatorUnits => "operator_units.tsv".to_string(),
             Member::TenantUnits(id) => format!("tenant_{id}_units.tsv"),
@@ -494,17 +511,26 @@ pub fn generate_files(
     })
 }
 
-/// The size of the index [`generate`] would write for `write_stage_sets`,
-/// by running the real generator into a sink: nothing is written to disk, but
-/// every row is read (one pass over the listed versions' paths).
+/// [`measure_for_runs`] for a write that carries each of `write_stage_sets`
+/// whole: `volume plan`'s estimate, which counts everything staged as one
+/// tape.
 pub fn measure(
     conn: &Connection,
     this: &IndexThisTape<'_>,
     write_stage_sets: &[i64],
 ) -> Result<Generated> {
-    generate(conn, this, write_stage_sets, &mut |_| {
-        Ok(Box::new(io::sink()))
-    })
+    measure_for_runs(conn, this, &IndexRun::whole_sets(write_stage_sets))
+}
+
+/// The size of the index [`generate`] would write for `write_runs`, by
+/// running the real generator into a sink: nothing is written to disk, but
+/// every row is read (one pass over the listed versions' paths).
+pub fn measure_for_runs(
+    conn: &Connection,
+    this: &IndexThisTape<'_>,
+    write_runs: &[IndexRun],
+) -> Result<Generated> {
+    generate(conn, this, write_runs, &mut |_| Ok(Box::new(io::sink())))
 }
 
 // ── reading ──
@@ -772,6 +798,8 @@ mod tests {
             version,
             num_slices: 3,
             version_bytes: 1_572_864,
+            first_slice: 1,
+            last_slice: 3,
             volume: volume.to_string(),
             volume_uuid: "5e6f7a8b-0000-4000-8000-000000000001".to_string(),
             cartridge_serial: "HUM12345".to_string(),
@@ -1363,5 +1391,98 @@ mod tests {
             "paths is not read by index:\n{plan}"
         );
         assert!(plan.contains("SEARCH fv USING PRIMARY KEY"), "{plan}");
+    }
+
+    /// §1.5 from 1.7.0: a range holder's row states its own run, this tape's
+    /// row the run its plan holds, and both read back through the parser; a
+    /// whole holder's row is 1..N, as in 1.6.0.
+    #[test]
+    fn a_range_is_written_with_its_run_and_reads_back() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let at = Some("2026-10-21 10:00:00");
+        let head = c.volume("L6-0001", "sealed", "ok", at);
+        let whole = c.volume("L6-0002", "sealed", "ok", at);
+        let (s1, p1) = c.version(photos, 1, "current", &[100, 100, 100, 100, 100]);
+        c.paths(s1, &[("a.jpg", Regular, 10)]);
+        c.range(p1, head, 1..=2);
+        c.write(p1, whole, "completed");
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = generate_files_for_runs(
+            &c.conn,
+            &THIS,
+            &[IndexRun {
+                stage_set_id: p1,
+                slices: Some((3, 5)),
+            }],
+            dir.path(),
+        )
+        .unwrap();
+        let alpha = c.tenant("alpha");
+        let units = read(&files.tenants[&alpha].units);
+        let runs: Vec<(String, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> =
+            parse_units(&units)
+                .unwrap()
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.volume,
+                        r.num_slices,
+                        r.first_slice,
+                        r.last_slice,
+                        r.version_bytes,
+                    )
+                })
+                .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("L6-0001".to_string(), Some(5), Some(1), Some(2), Some(500)),
+                ("L6-0002".to_string(), Some(5), Some(1), Some(5), Some(500)),
+                ("L6-0100".to_string(), Some(5), Some(3), Some(5), Some(500)),
+            ]
+        );
+        assert!(
+            units.contains("\nphotos\tuuid-photos\t1\t5\t1\t2\t500\tL6-0001\t"),
+            "{units}"
+        );
+        // The operator's form carries the same runs.
+        let op = parse_units(&read(&files.operator_units)).unwrap();
+        assert_eq!(
+            op.iter()
+                .map(|r| (r.first_slice, r.last_slice))
+                .collect::<Vec<_>>(),
+            vec![(Some(1), Some(2)), (Some(1), Some(5)), (Some(3), Some(5))]
+        );
+        // The whole-set form of the same write: this tape holds 1..5.
+        let whole_files = generate_to(dir.path(), &c, &[p1]);
+        let this = parse_units(&read(&whole_files.operator_units))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.state == "this-tape")
+            .unwrap();
+        assert_eq!((this.first_slice, this.last_slice), (Some(1), Some(5)));
+    }
+
+    #[test]
+    fn a_run_the_catalog_does_not_know_is_stated_as_not_known() {
+        let mut r = row("docs", 3, "L6-0002", coverage::IndexHolderState::Sealed);
+        r.first_slice = 0;
+        r.last_slice = 0;
+        let mut line = Vec::new();
+        write_units_row(&mut line, false, &r).unwrap();
+        let line = String::from_utf8(line).unwrap();
+        assert!(line.contains("\t3\t3\t\t\t1572864\t"), "{line:?}");
+        let parsed = parse_units(&format!("{}\n{line}", UNITS_COLUMNS.join("\t"))).unwrap();
+        assert_eq!(
+            (
+                parsed[0].num_slices,
+                parsed[0].first_slice,
+                parsed[0].last_slice,
+                parsed[0].version_bytes
+            ),
+            (Some(3), None, None, Some(1_572_864))
+        );
     }
 }
