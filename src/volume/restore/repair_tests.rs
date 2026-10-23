@@ -2560,6 +2560,40 @@ mod tests {
         );
     }
 
+    /// Item 143: lost files are never filled from a range. The version's other
+    /// staging is held only as two ranges; the fill does not ask for either,
+    /// and the incomplete restore names both and says why.
+    #[test]
+    fn fill_from_a_range_is_refused_by_name() {
+        let mut fx = Fixture::new(&[A, B, C], tree());
+        let one = fx.stage(&tree(), "150k", true);
+        let two = fx.stage(&tree(), "90k", true);
+        fx.write(&one, A);
+        let k = two.slices() / 2;
+        fx.write_range(&two, B, 1..=k, two.slices());
+        fx.write_range(&two, C, k + 1..=two.slices(), two.slices());
+        fx.corrupt(A, &one, 3, 1);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        for label in [B, C] {
+            assert!(
+                err.contains(&format!(
+                    "{label} (stage set {}) holds only",
+                    two.stage_set_id
+                )),
+                "{label}: {err}"
+            );
+        }
+        assert!(err.contains("a range is never a fill source"), "{err}");
+        assert!(err.contains("item 143"), "{err}");
+        assert!(bay.asked.is_empty(), "no range is asked for");
+    }
+
     /// A version held whole restores as in 1.6.0 though ranges of it exist
     /// elsewhere: no prompt, and the tape moves exactly as a clean restore's
     /// does (one rewind, File 0, a space to slice 1, each slice read once).

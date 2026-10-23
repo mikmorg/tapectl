@@ -35,6 +35,11 @@
 //! The cartridge is asked for as in substitution (by label and chip serial;
 //! with no terminal, refused by name, listing the holders), and the copies
 //! are tried in turn until the unit is whole or none is left.
+//!
+//! **Only a copy held whole on one tape is a source** (ADR-0012 item 143,
+//! #478): a stage set of the version held only as ranges across cartridges
+//! is never read for a fill, and the restore that is left incomplete names
+//! each such range and says why.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -399,6 +404,21 @@ fn fill(
             notes.unavailable.push(format!(
                 "{} (stage set {}): {e}",
                 holder.label, copy.stage_set_id
+            ));
+        }
+    }
+    if !lost.is_empty() {
+        // Item 143: a range is never a fill source. Each one of another
+        // staging of this version is named, and why, so the tapes that hold
+        // it are not taken for copies that were overlooked.
+        for r in slice_holders::ranges_of_version(ctx.conn, snapshot_id, ctx.stage_set_id)? {
+            notes.unavailable.push(format!(
+                "{} (stage set {}) holds only {} of this version, a range of a copy held across \
+                 cartridges: a damaged file is filled only from a copy held whole on one tape, \
+                 and a range is never a fill source (ADR-0012 item 143)",
+                r.label,
+                r.stage_set_id,
+                super::span::slices_phrase(r.first, r.last)
             ));
         }
     }
