@@ -609,15 +609,21 @@ pub(crate) const AWK_INDEX_ALL: &str = r##"
 /// `--where` prints it (`AWK_INDEX_COMMON`'s `holder`), for the refusal of a
 /// unit held across tapes (`volume-format-v2.md` sec 4.4): the tapes that hold
 /// its other slices, with each one's run. `CHK_UNIT`, `CHK_VER` and `CHK_UUID`
-/// name the version as `AWK_FILE_CHECK_LISTED` takes them. Exit status 0 when
-/// the file names the version, 1 when it does not, 2 when it lacks the `unit`
-/// or `version` column.
+/// name the version as `AWK_FILE_CHECK_LISTED` takes them. With `CHK_SLICE`
+/// set, only the holders whose run holds that slice are printed (the tape to
+/// start a restore across tapes from holds slice 1; the one asked for next
+/// holds the next slice): a run is the `first_slice` and `last_slice` columns,
+/// or, on the `this-tape` row of a range, the run this tape really holds
+/// (`INDEX_RANGE`), and a row with no run known is not printed. Exit status 0
+/// when the file names a holder (of that slice, with `CHK_SLICE`), 1 when it
+/// does not, 2 when it lacks the `unit` or `version` column.
 pub(crate) const AWK_INDEX_HOLDERS: &str = r##"
     BEGIN {
       FS = "\t"
       unit = ENVIRON["CHK_UNIT"]
       ver = ENVIRON["CHK_VER"] + 0
       uuid = ENVIRON["CHK_UUID"]
+      want = ENVIRON["CHK_SLICE"]
     }
     NR == 1 {
       header($0, h)
@@ -630,6 +636,14 @@ pub(crate) const AWK_INDEX_HOLDERS: &str = r##"
       if (val(f, h, "version") + 0 != ver) next
       u = val(f, h, "unit_uuid")
       if (uuid != "" && u != "" && u != uuid) next
+      if (want != "") {
+        lo = val(f, h, "first_slice")
+        hi = val(f, h, "last_slice")
+        run = range_here(f, h)
+        if (run != "") { split(run, q, "\t"); lo = q[1]; hi = q[2] }
+        if (lo !~ /^[0-9]+$/ || hi !~ /^[0-9]+$/) next
+        if (want + 0 < lo + 0 || want + 0 > hi + 0) next
+      }
       found = 1
       print holder(f, h)
     }
