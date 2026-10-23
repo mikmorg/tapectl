@@ -30,7 +30,7 @@ use super::format;
 use super::layout;
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, Placed, Placement,
-    PlanClass, PlanSplit, SliceCheck, ZoneKind,
+    PlanClass, PlanItem, PlanSplit, SliceCheck, ZoneKind,
 };
 use super::loaded;
 use super::session::{
@@ -1717,6 +1717,93 @@ fn plan_rank(class: PlanClass) -> u8 {
     }
 }
 
+/// The order a span tape's plan takes `units` in, as indices: grouped by
+/// class as [`CapacityBudget::place`] groups them (owed runs, whole units,
+/// spannable sets), the caller's order within each, except that a spannable
+/// set larger than one tape (its slices, block-padded, more than `room`: the
+/// plan bound less the volume's own files) goes ahead of those that fit, so
+/// item 94's early start is not deferred behind a fitting set's tail (X13,
+/// the coordinator's ruling). `room` `None` (no plan bound) groups only.
+fn take_in_plan_order(
+    units: &[BuildUnit],
+    classes: &[PlanClass],
+    room: Option<u64>,
+    block_size: u64,
+) -> Vec<usize> {
+    let larger_than_tape = |u: &BuildUnit| {
+        room.is_some_and(|room| room > 0 && padded_slice_bytes(u, block_size) > room)
+    };
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    order.sort_by_key(|&i| {
+        let first = classes[i] == PlanClass::Spannable && larger_than_tape(&units[i]);
+        (plan_rank(classes[i]), !first)
+    });
+    order
+}
+
+/// The slices `unit` plans on this tape, block-padded: its size to the plan.
+fn padded_slice_bytes(unit: &BuildUnit, block_size: u64) -> u64 {
+    unit.slices
+        .iter()
+        .map(|s| {
+            crate::volume::layout_model::pad_to_blocks(s.encrypted_bytes.max(0) as u64, block_size)
+        })
+        .sum()
+}
+
+/// What `volume plan` shows of a write's plan when a staged set may span
+/// (#478): one write of everything staged, planned as `volume write` plans
+/// it ([`find_staged_data`], [`take_in_plan_order`],
+/// [`CapacityBudget::place`]) on the slices' sizes alone, the volume's own
+/// files not counted, as `volume plan`'s other figures are estimates.
+/// `units[i]` and `classes[i]` are the placement's caller's units.
+pub(crate) struct PlanPreview {
+    pub units: Vec<BuildUnit>,
+    pub classes: Vec<PlanClass>,
+    pub placement: Placement,
+}
+
+/// [`PlanPreview`] of everything staged against a fill budget of
+/// `available_bytes` and the plan bound `plan_bound_bytes`; `None` when no
+/// staged set may span, so the plan is 1.6.0's. A refusal the plan of a span
+/// raises from the catalog (a released slice it would plan, a policy that
+/// cannot be resolved) is the `Err`.
+pub(crate) fn plan_preview(
+    conn: &Connection,
+    config: &Config,
+    available_bytes: u64,
+    plan_bound_bytes: Option<u64>,
+    block_size: u64,
+) -> Result<Option<PlanPreview>> {
+    let batch = find_staged_data(conn, Spanning::ByPolicy(config), None)?;
+    if !batch.spans() {
+        return Ok(None);
+    }
+    let order = take_in_plan_order(&batch.units, &batch.classes, plan_bound_bytes, block_size);
+    let units: Vec<BuildUnit> = order.iter().map(|&i| batch.units[i].clone()).collect();
+    let classes: Vec<PlanClass> = order.iter().map(|&i| batch.classes[i]).collect();
+    let items: Vec<PlanItem> = units
+        .iter()
+        .zip(&classes)
+        .map(|(u, &class)| PlanItem {
+            class,
+            bytes: padded_slice_bytes(u, block_size),
+        })
+        .collect();
+    let placement = CapacityBudget {
+        available_bytes,
+        reserve_bytes: 0,
+        plan_bound_bytes,
+        span_tail_from: None,
+    }
+    .place(0, &items);
+    Ok(Some(PlanPreview {
+        units,
+        classes,
+        placement,
+    }))
+}
+
 /// [`build_write_layout`] for a batch that holds a set whose write may span
 /// (`layout-session.md` "The plan order"). The plan order is decided BEFORE
 /// the build, because a deferred unit must not reach the envelopes, the
@@ -1755,10 +1842,8 @@ fn build_span_layout(
     let bound = w.plan_bound_bytes;
     let StagedBatch { units, classes } = batch;
 
-    // 1. The probe, grouped by class (a stable sort keeps the caller's order
-    // within each).
-    let mut grouped: Vec<usize> = (0..units.len()).collect();
-    grouped.sort_by_key(|&i| plan_rank(classes[i]));
+    // 1. The probe, grouped by class (the caller's order within each).
+    let grouped = take_in_plan_order(&units, &classes, None, block_size);
     let probe_classes: Vec<PlanClass> = grouped.iter().map(|&i| classes[i]).collect();
     let probe_units: Vec<BuildUnit> = grouped.iter().map(|&i| units[i].clone()).collect();
     let probe_ids: Vec<i64> = probe_units.iter().map(|u| u.stage_set_id).collect();
@@ -1777,25 +1862,7 @@ fn build_span_layout(
     // 2. Larger-than-tape spannable sets first (X13).
     let fixed = probe.layout.fixed_on_tape_bytes();
     let room = bound.map(|b| b.saturating_sub(fixed));
-    let padded = |u: &BuildUnit| -> u64 {
-        u.slices
-            .iter()
-            .map(|s| {
-                crate::volume::layout_model::pad_to_blocks(
-                    s.encrypted_bytes.max(0) as u64,
-                    block_size,
-                )
-            })
-            .sum()
-    };
-    let larger_than_tape = |u: &BuildUnit| room.is_some_and(|room| room > 0 && padded(u) > room);
-    let mut taken: Vec<usize> = (0..probe_inputs.units.len()).collect();
-    taken.sort_by_key(|&i| {
-        (
-            plan_rank(probe_classes[i]),
-            !(probe_classes[i] == PlanClass::Spannable && larger_than_tape(&probe_inputs.units[i])),
-        )
-    });
+    let taken = take_in_plan_order(&probe_inputs.units, &probe_classes, room, block_size);
     let ordered: Vec<BuildUnit> = taken
         .iter()
         .map(|&i| probe_inputs.units[i].clone())
@@ -2092,7 +2159,7 @@ fn build_write_layout(
 }
 
 /// `slices 1-2`, or `slice 3` for a run of one: a range as a message names it.
-fn slice_run(first: i64, last: i64) -> String {
+pub(crate) fn slice_run(first: i64, last: i64) -> String {
     if first == last {
         format!("slice {first}")
     } else {

@@ -66,6 +66,8 @@ Once the volume is sealed and confirmed, staging is released if every unit writt
 
 A further copy in one command (ADR-0012 2026-10-15 item 59): `tapectl volume write L6-0003 --init --full-confirm --move-to offsite` initialises the loaded cartridge, writes the volume, reads every file back, and moves the sealed volume (and its cartridge) to `offsite`. Each step keeps its own checks and the command stops at the first one that fails: an init that refuses writes nothing, and nothing moves unless the write sealed and confirmed.
 
+A unit that allows spanning (`allow_spanning`, ADR-0012 item 82) may have its slices on more than one tape. The write lays out first the slices still owed of a span in progress, then whole units, then units that may span, last; the drive's early warning, not the plan, ends such a unit on the tape (items 84, 122 and 123), which needs the drive's `post_warning_bytes`. The write names each unit the tape holds as a range of slices, the whole units it leaves for the next tape (still staged), and, once a range completes a copy across tapes, the tapes to keep together (item 134). A span continues only onto a cartridge of the generation it began on (item 86).
+
 Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 
 ```text
@@ -256,6 +258,8 @@ tapectl volume compact-write [OPTIONS] --destination <DESTINATION>
 ### tapectl volume plan
 
 Show bin-packing plan for pending staged data
+
+When a staged unit may span (`allow_spanning`), it also shows the order one write of everything staged takes (owed runs of a span in progress, whole units, units that may span), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume's own files are not counted.
 
 ```text
 tapectl volume plan [OPTIONS]

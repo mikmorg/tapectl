@@ -90,6 +90,17 @@ pub enum VolumeCommands {
     /// the first one that fails: an init that refuses writes nothing, and
     /// nothing moves unless the write sealed and confirmed.
     ///
+    /// A unit that allows spanning (`allow_spanning`, ADR-0012 item 82) may
+    /// have its slices on more than one tape. The write lays out first the
+    /// slices still owed of a span in progress, then whole units, then units
+    /// that may span, last; the drive's early warning, not the plan, ends
+    /// such a unit on the tape (items 84, 122 and 123), which needs the
+    /// drive's `post_warning_bytes`. The write names each unit the tape holds
+    /// as a range of slices, the whole units it leaves for the next tape
+    /// (still staged), and, once a range completes a copy across tapes, the
+    /// tapes to keep together (item 134). A span continues only onto a
+    /// cartridge of the generation it began on (item 86).
+    ///
     /// Exit status, shared by every command that writes a tape: 0 = sealed
     /// and confirmed. 2 = an error with the medium untouched: nothing was
     /// written (or a usage error). 3 = the confirm was inconclusive: the
@@ -422,6 +433,13 @@ pub enum VolumeCommands {
     },
 
     /// Show bin-packing plan for pending staged data
+    ///
+    /// When a staged unit may span (`allow_spanning`), it also shows the
+    /// order one write of everything staged takes (owed runs of a span in
+    /// progress, whole units, units that may span), the slices each plans,
+    /// where each sits against the fill ceiling, and the units that would
+    /// wait for the next tape. An estimate: the volume's own files are not
+    /// counted.
     Plan {
         /// Number of copies to plan
         #[arg(long, default_value = "1")]
@@ -850,11 +868,18 @@ pub enum StagingRelease {
     /// `--keep-staging`: nothing was looked at, nothing released.
     Kept,
     /// Every unit written now meets its resolved `min_copies`: the report of
-    /// the release (which may count zero sets when none was eligible).
+    /// the release (which may count zero sets when none was eligible), the
+    /// per-slice release of the sets that hold a range absorbed into it
+    /// (#478: `slices_released`, `slices_short`).
     Released(crate::staging::clean::CleanReport),
     /// At least one unit written is still short: staging was kept, and these
-    /// are the units that keep it.
-    Retained(Vec<crate::staging::release::CopyProgress>),
+    /// are the units that keep it. `slices` is the per-slice release of the
+    /// stage sets that hold a range (#478, ADR-0012 item 129), made whatever
+    /// the whole-set gate decided (X15): it may have released slices.
+    Retained {
+        units: Vec<crate::staging::release::CopyProgress>,
+        slices: crate::staging::clean::CleanReport,
+    },
     /// The volume has no unit with a completed write: nothing to judge.
     NothingWritten,
     /// The release failed after the copy stood (ADR-0012 2026-10-07 item
@@ -887,9 +912,18 @@ pub fn release_staging_after_write(
     });
     match outcome {
         Ok(None) => StagingRelease::NothingWritten,
+        // #478: the per-slice release is reported with the whole-set one,
+        // never dropped (its stranded paths are the operator's only notice
+        // of files no later `staging clean` can find, issue #108).
         Ok(Some(o)) => match o.cleaned {
-            Some(cleaned) => StagingRelease::Released(cleaned),
-            None => StagingRelease::Retained(o.under_copied),
+            Some(mut cleaned) => {
+                cleaned.absorb(o.slices);
+                StagingRelease::Released(cleaned)
+            }
+            None => StagingRelease::Retained {
+                units: o.under_copied,
+                slices: o.slices,
+            },
         },
         Err(e) => StagingRelease::Failed(crate::error::unfinished_after_seal(
             label,
@@ -906,16 +940,18 @@ pub fn release_staging_after_write(
 /// exists: `staging_released`, `stage_sets_released`, `bytes_freed`,
 /// `under_copied` (empty unless a unit kept the staging), `keep_staging`
 /// and `release_warning` (null unless the release failed).
-fn staging_release_json(
+pub(crate) fn staging_release_json(
     mut base: serde_json::Value,
     release: &StagingRelease,
 ) -> serde_json::Value {
     let (released, sets, bytes) = match release {
         StagingRelease::Released(c) => (true, c.sets_cleaned, c.bytes_freed),
+        // #478: slices released while the whole-set release kept the rest.
+        StagingRelease::Retained { slices, .. } => (false, 0, slices.bytes_freed),
         _ => (false, 0, 0),
     };
     let under: Vec<serde_json::Value> = match release {
-        StagingRelease::Retained(units) => units
+        StagingRelease::Retained { units, .. } => units
             .iter()
             .map(|p| {
                 serde_json::json!({
@@ -931,11 +967,25 @@ fn staging_release_json(
         StagingRelease::Failed(w) => Some(w.as_str()),
         _ => None,
     };
+    // #478, additive: the per-slice release of the sets that hold a range,
+    // `[{"stage_set_id", "slices": [..]}]`, empty when none does.
+    let per_set = |sets: &[(i64, Vec<i64>)]| -> serde_json::Value {
+        sets.iter()
+            .map(|(id, slices)| serde_json::json!({"stage_set_id": id, "slices": slices}))
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let (slices_released, slices_short) = match release_slices(release) {
+        Some(r) => (per_set(&r.slices_released), per_set(&r.slices_short)),
+        None => (per_set(&[]), per_set(&[])),
+    };
     if let Some(obj) = base.as_object_mut() {
         obj.insert("staging_released".into(), released.into());
         obj.insert("stage_sets_released".into(), sets.into());
         obj.insert("bytes_freed".into(), bytes.into());
         obj.insert("under_copied".into(), under.into());
+        obj.insert("slices_released".into(), slices_released);
+        obj.insert("slices_short".into(), slices_short);
         obj.insert(
             "keep_staging".into(),
             matches!(release, StagingRelease::Kept).into(),
@@ -945,67 +995,142 @@ fn staging_release_json(
     base
 }
 
-/// The human lines for [`StagingRelease`], printed after the write's own
-/// "write completed" line (which the gate greps and stays unchanged).
-/// Problems — a failed release, a file that could not be unlinked — go to
-/// stderr, as warnings.
-fn print_staging_release(label: &str, release: &StagingRelease) {
+/// The report of a release that may have released slices one by one
+/// (#478): the whole-set report (into which the per-slice one was absorbed)
+/// or the per-slice report kept beside a retained staging.
+fn release_slices(release: &StagingRelease) -> Option<&crate::staging::clean::CleanReport> {
     match release {
-        StagingRelease::Kept => println!(
-            "staging kept (--keep-staging); `tapectl staging clean` releases it when you want it gone"
+        StagingRelease::Released(r) => Some(r),
+        StagingRelease::Retained { slices, .. } => Some(slices),
+        _ => None,
+    }
+}
+
+/// The lines naming a per-slice release (#478, ADR-0012 item 129), in
+/// `staging clean`'s words: per stage set that holds a range, the slices
+/// released (each has its copies) and the slices kept, short of copies,
+/// which continue its span. Empty when no set holds a range.
+fn slice_release_lines(r: &crate::staging::clean::CleanReport) -> Vec<String> {
+    use crate::staging::clean::describe_slice_numbers;
+    let released = r.slices_released.iter().map(|(id, slices)| {
+        format!(
+            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
+             cartridges and is released slice by slice)",
+            describe_slice_numbers(slices)
+        )
+    });
+    let short = r.slices_short.iter().map(|(id, slices)| {
+        format!(
+            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
+             span; `tapectl volume write <LABEL>` onto another cartridge of the same generation \
+             writes them",
+            describe_slice_numbers(slices)
+        )
+    });
+    released.chain(short).collect()
+}
+
+/// The warning for staged files a release could not remove (issue #108):
+/// `staging_path` is nulled before the unlink, so no later `staging clean`
+/// can find them, and these lines are the operator's only notice.
+fn stranded_lines(label: &str, stranded: &[std::path::PathBuf]) -> Vec<String> {
+    if stranded.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} \
+         staged file(s) could NOT be removed and no later `staging clean` can find them. Remove \
+         by hand:",
+        stranded.len()
+    )];
+    lines.extend(stranded.iter().map(|p| format!("  {}", p.display())));
+    lines
+}
+
+/// The human lines for [`StagingRelease`], printed after the write's own
+/// "write completed" line (which the gate greps and stays unchanged): what
+/// goes to stdout, and the problems — a failed release, a file that could
+/// not be unlinked — that go to stderr, as warnings. A release with no set
+/// that holds a range says what it said in 1.6.0, word for word.
+pub(crate) fn render_staging_release(
+    label: &str,
+    release: &StagingRelease,
+) -> (Vec<String>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    match release {
+        StagingRelease::Kept => out.push(
+            "staging kept (--keep-staging); `tapectl staging clean` releases it when you want it \
+             gone"
+                .to_string(),
         ),
         StagingRelease::NothingWritten => {}
-        StagingRelease::Retained(units) => {
-            println!(
+        StagingRelease::Retained { units, slices } => {
+            out.push(
                 "staging kept: not every unit written has its policy's copies yet, and the next \
                  copy reuses these staged slices:"
+                    .to_string(),
             );
-            for p in units {
-                println!("  {}", p.describe());
-            }
-            println!(
+            out.extend(units.iter().map(|p| format!("  {}", p.describe())));
+            out.push(
                 "  write another copy with `tapectl volume write <label>`; `tapectl staging \
                  clean` releases the units that are covered"
+                    .to_string(),
             );
+            out.extend(slice_release_lines(slices));
+            err.extend(stranded_lines(label, &slices.stranded));
         }
         StagingRelease::Released(r) => {
-            if r.sets_cleaned == 0 {
-                println!("staging: no stage set was eligible for release");
-            } else {
-                println!(
+            if r.sets_cleaned == 0 && r.slices_released.is_empty() {
+                out.push("staging: no stage set was eligible for release".to_string());
+            } else if r.sets_cleaned == 0 {
+                out.push(format!(
+                    "staging released in part: {} freed, slice by slice",
+                    crate::util::format_bytes_binary(r.bytes_freed),
+                ));
+            } else if r.slices_short.is_empty() {
+                out.push(format!(
                     "staging released: {} stage set(s), {} freed (every unit written has its \
                      policy's copies)",
                     r.sets_cleaned,
                     crate::util::format_bytes_binary(r.bytes_freed),
-                );
+                ));
+            } else {
+                out.push(format!(
+                    "staging released: {} stage set(s), {} freed; a unit that spans cartridges \
+                     keeps the slices still short of copies",
+                    r.sets_cleaned,
+                    crate::util::format_bytes_binary(r.bytes_freed),
+                ));
             }
             for (id, labels) in &r.held_by_live_session {
-                println!(
+                out.push(format!(
                     "  stage set {id} kept: a live session is using it on volume(s) {}",
                     labels.join(", ")
-                );
+                ));
             }
             for (id, hold) in &r.held_by_pending_rewrite {
-                println!("  {}", hold.describe(*id));
+                out.push(format!("  {}", hold.describe(*id)));
             }
-            if !r.stranded.is_empty() {
-                // `staging_path` is nulled before the unlink (issue #108), so
-                // no later `staging clean` can find these: name them.
-                eprintln!(
-                    "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, \
-                     but {} staged file(s) could NOT be removed and no later `staging clean` \
-                     can find them. Remove by hand:",
-                    r.stranded.len()
-                );
-                for p in &r.stranded {
-                    eprintln!("  {}", p.display());
-                }
-            }
+            out.extend(slice_release_lines(r));
+            err.extend(stranded_lines(label, &r.stranded));
         }
         StagingRelease::Failed(warning) => {
-            println!("staging NOT released");
-            eprintln!("{warning}");
+            out.push("staging NOT released".to_string());
+            err.push(warning.clone());
         }
+    }
+    (out, err)
+}
+
+/// Print [`render_staging_release`]'s lines.
+fn print_staging_release(label: &str, release: &StagingRelease) {
+    let (out, err) = render_staging_release(label, release);
+    for line in out {
+        println!("{line}");
+    }
+    for line in err {
+        eprintln!("{line}");
     }
 }
 
@@ -1466,6 +1591,14 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             "ending": done.ending.kind(),
             "ended_after": done.ending.ended_after,
             "cut_units": done.ending.cut_units,
+            // #478, additive, empty when nothing may span: the units this
+            // tape holds as a range with their slice runs, the staged units
+            // it did not take (they wait for the next tape), and the tapes
+            // that make up each whole copy across tapes a range here
+            // completes (ADR-0012 item 134).
+            "range_units": done.ending.range_units,
+            "deferred_units": done.ending.deferred_units,
+            "keep_together": done.ending.keep_together,
         }),
         &done.release,
     );
@@ -2248,6 +2381,13 @@ pub fn run(
 
             let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
             let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
+            // #478: the plan order of a write whose batch holds a unit that
+            // may span; `None` (the output is 1.6.0's) when none may.
+            let span = if rows.is_empty() {
+                None
+            } else {
+                plan_span_preview(conn, config, generation.as_deref(), device.as_deref())
+            };
             // The cross-volume index (#418 R4, `volume-format-v2.md` §1.5)
             // every envelope of a tape written from this will carry.
             let index = if rows.is_empty() {
@@ -2286,6 +2426,8 @@ pub fn run(
                         // #418 R4: an estimate, see `planned_index_bytes`.
                         "index_bytes": index,
                         "index_bytes_on_tape": index.map(|n| 2 * n),
+                        // #478, additive: null unless a staged unit may span.
+                        "spanning": span.as_ref().map(plan_span_json),
                     })
                 );
             } else if rows.is_empty() {
@@ -2328,6 +2470,11 @@ pub fn run(
                 in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
                 for line in plan_bound_lines(&tape, &in_write_order) {
                     println!("{line}");
+                }
+                if let Some(span) = &span {
+                    for line in plan_span_lines(span) {
+                        println!("{line}");
+                    }
                 }
                 if let Some(index) = index {
                     println!("{}", plan_index_line(index));
@@ -3443,7 +3590,8 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
     let copy_expr = crate::policy::coverage::copy_count_expr(&scope);
     // "Copies" here is the WORST current coverage (ADR-0012: a unit is as
     // covered as its least-covered live version) among every unit this
-    // volume carries ANY completed write for — not just its current
+    // volume carries ANY completed or range write for (#478: losing a tape
+    // that holds a range thins its unit too) — not just its current
     // snapshot's writes, so a volume holding only a superseded version
     // still shows a real number rather than "—", which must mean "no data
     // at all" (a blank/initialized tape), a genuinely different fact.
@@ -3458,7 +3606,7 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                     JOIN stage_sets css2 ON css2.id = cw2.stage_set_id
                     JOIN snapshots cs2 ON cs2.id = css2.snapshot_id
                     JOIN units cu ON cu.id = cs2.unit_id
-                    WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
+                    WHERE cw2.volume_id = v.id AND cw2.status IN ('completed', 'range')
                  ) per) AS copies,
                 (SELECT MAX({dated}) FROM verification_sessions vs
                   WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
@@ -3594,6 +3742,10 @@ struct VolumeInfo {
     /// The units this volume cut (`writes.status = 'cut'`): planned, past
     /// the drive's early warning, so not on this tape and never a copy here.
     cut_units: Vec<String>,
+    /// The units this volume holds as a range (#478, `writes.status =
+    /// 'range'`), each with the run of its slices written here: not a copy
+    /// on its own (ADR-0012 item 127). Empty when it holds none.
+    range_units: Vec<write::RecordedRange>,
     notes: Option<String>,
     unit_count: i64,
     unit_total_bytes: i64,
@@ -3723,6 +3875,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         )?
         .query_map(rusqlite::params![vol_id], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
+    let range_units = write::recorded_ranges(conn, label)?;
 
     // Units carried: one row per unit, aggregated across every completed
     // write of it that landed on THIS volume. Sorted largest-first so the
@@ -3878,6 +4031,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         sealed_at,
         ended_after,
         cut_units,
+        range_units,
         notes,
         unit_count,
         unit_total_bytes,
@@ -3989,6 +4143,24 @@ fn render_ending_line(
     ))
 }
 
+/// `volume info`'s range line (#478): the units this volume holds as a
+/// range, each with its run of slices. Not "Units carried", which counts
+/// whole copies: a range is a copy only together with the tapes that hold
+/// the unit's other slices (ADR-0012 item 127). `None` when it holds none.
+fn render_range_line(ranges: &[write::RecordedRange]) -> Option<String> {
+    (!ranges.is_empty()).then(|| {
+        format!(
+            "  Ranges:      {} (runs of a unit's slices, each a copy only with the tapes that \
+             hold the rest)",
+            ranges
+                .iter()
+                .map(write::RecordedRange::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// `volume info`'s verification-history section, one line per session.
 /// Both ends of each verify are printed and named (issue #392): this showed
 /// the start alone while `report verify-status` showed the completion, so
@@ -4058,6 +4230,9 @@ fn print_volume_info(info: &VolumeInfo) {
     println!("{}", render_sealed_line(info.sealed_at.as_deref()));
     if let Some(ending) = render_ending_line(info.ended_after, &info.cut_units, info.unit_count) {
         println!("{ending}");
+    }
+    if let Some(ranges) = render_range_line(&info.range_units) {
+        println!("{ranges}");
     }
     print!(
         "{}",
@@ -4306,6 +4481,155 @@ fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64
     lines
 }
 
+/// The plan order `volume plan` shows when a staged unit may span (#478,
+/// `layout-session.md` "The plan order"), against the planned generation's
+/// tape budget: `None` when no staged set may span (the output is then
+/// 1.6.0's) or no drive is configured to plan against; `Err` carries the
+/// refusal a write of the batch would raise from the catalog.
+fn plan_span_preview(
+    conn: &Connection,
+    config: &Config,
+    generation: Option<&str>,
+    device: Option<&str>,
+) -> Option<std::result::Result<write::PlanPreview, String>> {
+    let backend = crate::config::resolve_lto_backend(config, device).ok()?;
+    let tape = backend.planning_tape_budget(generation).ok()?;
+    match write::plan_preview(
+        conn,
+        config,
+        tape.bytes,
+        tape.plan_bound_bytes,
+        DEFAULT_BLOCK_SIZE as u64,
+    ) {
+        Ok(preview) => preview.map(Ok),
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
+/// One unit of a [`write::PlanPreview`]: its name, what it is to the plan,
+/// the slices one tape plans of it, and where the plan puts it.
+fn plan_span_unit(preview: &write::PlanPreview, i: usize) -> (String, &'static str, i64, i64) {
+    use crate::volume::layout_model::PlanClass;
+    let u = &preview.units[i];
+    let first = u.slices.first().map_or(0, |s| s.slice_number);
+    let last = u.slices.last().map_or(0, |s| s.slice_number);
+    let class = match preview.classes[i] {
+        PlanClass::Owed => "owed run",
+        PlanClass::Spannable => "may span",
+        PlanClass::Whole => "whole",
+    };
+    (
+        format!("{} v{}", u.unit_name, u.snapshot_version),
+        class,
+        first,
+        last,
+    )
+}
+
+/// What a placement means, in `volume plan`'s words.
+fn placed_words(placed: crate::volume::layout_model::Placed, may_span: bool) -> &'static str {
+    use crate::volume::layout_model::Placed;
+    match (placed, may_span) {
+        (Placed::Committed, _) => "under the fill ceiling",
+        (Placed::PastCeiling, true) => "past the fill ceiling; the tape may end inside it",
+        (Placed::PastCeiling, false) => "past the fill ceiling; the tape may end before it",
+        (Placed::Tail, _) => {
+            "past the cartridge's nominal capacity, to its end; the drive's early warning ends \
+             it on the tape"
+        }
+        (Placed::Deferred, _) => "waits for the next tape",
+        (Placed::Refused, _) => "refused",
+    }
+}
+
+/// `volume plan`'s lines for a write whose batch holds a unit that may span
+/// (#478): the units in the order one write of everything staged takes
+/// them, each with the slices it plans and where the plan puts it, the
+/// units that wait for the next tape, and what it refuses. An estimate, as
+/// the tape count above it is.
+fn plan_span_lines(span: &std::result::Result<write::PlanPreview, String>) -> Vec<String> {
+    let preview = match span {
+        Ok(preview) => preview,
+        Err(refusal) => {
+            return vec![format!(
+                "spanning: a write of everything staged would refuse: {refusal}"
+            )]
+        }
+    };
+    let mut lines = vec![
+        "spanning: one write of everything staged plans these, in this order (an estimate: each \
+         unit's slices block-padded, the volume's own files not counted; a unit that may span \
+         is ended on the tape by the drive's early warning, ADR-0012 items 83, 94 and 123):"
+            .to_string(),
+    ];
+    for &i in &preview.placement.order {
+        let (name, class, first, last) = plan_span_unit(preview, i);
+        let what = if class == "whole" {
+            class.to_string()
+        } else {
+            format!("{class}, {}", write::slice_run(first, last))
+        };
+        lines.push(format!(
+            "  {name}: {what}, {}",
+            placed_words(preview.placement.placed[i], class != "whole")
+        ));
+    }
+    let deferred = preview.placement.deferred();
+    if !deferred.is_empty() {
+        lines.push(format!(
+            "  waits for the next tape (not on this one, still staged): {}",
+            deferred
+                .iter()
+                .map(|&i| plan_span_unit(preview, i).0)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for e in &preview.placement.errors {
+        lines.push(format!("  refused: {e}"));
+    }
+    lines
+}
+
+/// `volume plan --json`'s `spanning` object (#478): `{"units": [{"unit",
+/// "version", "class", "first_slice", "last_slice", "placed"}], "deferred":
+/// [..], "refused": [..]}` in the plan's order, or `{"refusal": ".."}`.
+fn plan_span_json(span: &std::result::Result<write::PlanPreview, String>) -> serde_json::Value {
+    use crate::volume::layout_model::Placed;
+    let preview = match span {
+        Ok(preview) => preview,
+        Err(refusal) => return serde_json::json!({ "refusal": refusal }),
+    };
+    let unit = |i: usize| {
+        let u = &preview.units[i];
+        let (_, class, first, last) = plan_span_unit(preview, i);
+        serde_json::json!({
+            "unit": u.unit_name,
+            "version": u.snapshot_version,
+            "class": class,
+            "first_slice": first,
+            "last_slice": last,
+            "placed": match preview.placement.placed[i] {
+                Placed::Committed => "committed",
+                Placed::PastCeiling => "past_ceiling",
+                Placed::Tail => "tail",
+                Placed::Deferred => "deferred",
+                Placed::Refused => "refused",
+            },
+        })
+    };
+    serde_json::json!({
+        "units": preview.placement.order.iter().map(|&i| unit(i)).collect::<Vec<_>>(),
+        "deferred": preview.placement.deferred().into_iter().map(unit).collect::<Vec<_>>(),
+        "refused": preview
+            .placement
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn staged_plan_rows(
     conn: &Connection,
     config: &Config,
@@ -4465,6 +4789,217 @@ mod tests {
         assert!(line.contains("an estimate"), "{line}");
     }
 
+    /// #478 (`layout-session.md` "Spanning"): what the CLI shows of a span.
+    mod spanning {
+        use super::*;
+        use crate::volume::build::{BuildSlice, BuildUnit, UnitSpan};
+        use crate::volume::layout_model::{Placed, Placement, PlanClass};
+        use crate::volume::write::{CopyTape, KeepTogether, RecordedEnding, RecordedRange};
+
+        fn unit(name: &str, slices: std::ops::RangeInclusive<i64>, span: bool) -> BuildUnit {
+            BuildUnit {
+                stage_set_id: 1,
+                snapshot_id: 1,
+                unit_name: name.into(),
+                unit_uuid: name.into(),
+                tenant_id: 1,
+                dar_version: None,
+                dar_command: None,
+                catalog_path: None,
+                snapshot_version: 1,
+                slices: slices
+                    .map(|n| BuildSlice {
+                        slice_id: n,
+                        slice_number: n,
+                        size_bytes: 1,
+                        encrypted_bytes: 1,
+                        sha256_plain: String::new(),
+                        sha256_encrypted: String::new(),
+                        staging_path: std::path::PathBuf::new(),
+                    })
+                    .collect(),
+                span: span.then(|| UnitSpan { slices: Vec::new() }),
+            }
+        }
+
+        /// `volume plan` names the order one write of everything staged
+        /// takes when a unit may span: the owed run first, the whole units,
+        /// the unit that may span last, each with the slices it plans and
+        /// where it sits, and the units that wait; `--json` carries the same.
+        #[test]
+        fn the_plan_shows_the_placement_of_a_span() {
+            let preview = write::PlanPreview {
+                units: vec![
+                    unit("old", 4..=6, true),
+                    unit("a", 1..=1, false),
+                    unit("c", 1..=1, false),
+                    unit("big", 1..=9, true),
+                ],
+                classes: vec![
+                    PlanClass::Owed,
+                    PlanClass::Whole,
+                    PlanClass::Whole,
+                    PlanClass::Spannable,
+                ],
+                placement: Placement {
+                    order: vec![0, 1, 3],
+                    placed: vec![
+                        Placed::Committed,
+                        Placed::Committed,
+                        Placed::Deferred,
+                        Placed::Tail,
+                    ],
+                    errors: Vec::new(),
+                },
+            };
+            let span = Ok(preview);
+            assert_eq!(
+                plan_span_lines(&span)[1..],
+                [
+                    "  old v1: owed run, slices 4-6, under the fill ceiling",
+                    "  a v1: whole, under the fill ceiling",
+                    "  big v1: may span, slices 1-9, past the cartridge's nominal capacity, to \
+                     its end; the drive's early warning ends it on the tape",
+                    "  waits for the next tape (not on this one, still staged): c v1",
+                ]
+            );
+            assert!(plan_span_lines(&span)[0].starts_with("spanning: one write of everything"));
+            let json = plan_span_json(&span);
+            assert_eq!(json["units"][0]["class"], "owed run");
+            assert_eq!(json["units"][0]["first_slice"], 4);
+            assert_eq!(json["units"][2]["placed"], "tail");
+            assert_eq!(json["deferred"][0]["unit"], "c");
+            assert_eq!(json["refused"], serde_json::json!([]));
+
+            let refused: std::result::Result<write::PlanPreview, String> =
+                Err("refusing to write: ...".into());
+            assert_eq!(
+                plan_span_lines(&refused),
+                ["spanning: a write of everything staged would refuse: refusing to write: ..."]
+            );
+            assert_eq!(
+                plan_span_json(&refused)["refusal"],
+                "refusing to write: ..."
+            );
+        }
+
+        /// `volume write --json` carries the units the tape holds as a range,
+        /// the units that wait for the next tape and the tapes to keep
+        /// together (item 134); all three are empty arrays on a write with
+        /// no span, beside the keys it always had.
+        #[test]
+        fn the_write_json_names_ranges_deferred_units_and_tapes_to_keep_together() {
+            let done = |ending| WriteDone {
+                loaded: false,
+                initialized: None,
+                ending,
+                release: StagingRelease::NothingWritten,
+                moved: MoveAfterWrite::NotAsked,
+            };
+            let span = done(RecordedEnding {
+                ended_after: None,
+                cut_units: Vec::new(),
+                range_units: vec![RecordedRange {
+                    unit: "b".into(),
+                    version: 1,
+                    first_slice: 3,
+                    last_slice: 3,
+                }],
+                deferred_units: vec!["c".into()],
+                keep_together: vec![KeepTogether {
+                    unit: "b".into(),
+                    version: 1,
+                    tapes: vec![
+                        CopyTape {
+                            label: "SP-1".into(),
+                            first_slice: 1,
+                            last_slice: 2,
+                        },
+                        CopyTape {
+                            label: "SP-3".into(),
+                            first_slice: 3,
+                            last_slice: 3,
+                        },
+                    ],
+                }],
+            });
+            let json = write_done_json("SP-3", &span);
+            assert_eq!(json["ending"], "full");
+            assert_eq!(
+                json["range_units"],
+                serde_json::json!([{"unit": "b", "version": 1, "first_slice": 3, "last_slice": 3}])
+            );
+            assert_eq!(json["deferred_units"], serde_json::json!(["c"]));
+            assert_eq!(
+                json["keep_together"],
+                serde_json::json!([{"unit": "b", "version": 1, "tapes": [
+                    {"label": "SP-1", "first_slice": 1, "last_slice": 2},
+                    {"label": "SP-3", "first_slice": 3, "last_slice": 3},
+                ]}])
+            );
+
+            let whole = write_done_json("W-1", &done(RecordedEnding::default()));
+            for key in [
+                "range_units",
+                "deferred_units",
+                "keep_together",
+                "slices_released",
+            ] {
+                assert_eq!(whole[key], serde_json::json!([]), "{key}: {whole}");
+            }
+        }
+
+        /// A volume that holds a range shows it in `volume info`, on a line
+        /// and in a `--json` key of its own, never among the units carried
+        /// whole; and `volume list` counts its unit's copies, so the tape does
+        /// not read as holding no data.
+        #[test]
+        fn info_and_list_show_a_range_the_volume_holds() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, ended_after)
+                     VALUES ('L6-R1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 9);
+                 INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     SELECT 'b', 'b', id, 'mtime_size', 1, 'active' FROM tenants WHERE name = 't';
+                 INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     SELECT id, 1, 'full', 'staged', '/x' FROM units WHERE name = 'b';
+                 INSERT INTO stage_sets (snapshot_id, status, slice_size, total_encrypted_size)
+                     SELECT id, 'staged', 524288, 30 FROM snapshots;
+                 INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted)
+                     SELECT ss.id, n.n, 10, 10, 'p' || n.n, 'e' || n.n
+                     FROM stage_sets ss, (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3) n;
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'range', 1 FROM stage_sets ss, volumes v;
+                 INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                     SELECT w.id, sl.id, CAST(7 + sl.slice_number AS TEXT),
+                            CASE WHEN sl.slice_number <= 2 THEN 'written' ELSE 'pending' END
+                     FROM writes w JOIN stage_slices sl ON sl.stage_set_id = w.stage_set_id;",
+            )
+            .unwrap();
+
+            let info = volume_info(&conn, "L6-R1", false).unwrap();
+            assert_eq!(info.unit_count, 0, "a range is not a unit carried whole");
+            assert_eq!(
+                render_range_line(&info.range_units).unwrap(),
+                "  Ranges:      \"b\" v1 (slices 1-2) (runs of a unit's slices, each a copy only \
+                 with the tapes that hold the rest)"
+            );
+            let json = serde_json::to_value(&info).unwrap();
+            assert_eq!(
+                json["range_units"],
+                serde_json::json!([{"unit": "b", "version": 1, "first_slice": 1, "last_slice": 2}])
+            );
+            assert_eq!(render_range_line(&[]), None);
+
+            let rows = volume_rows(&conn, None).unwrap();
+            let row = rows.iter().find(|r| r.label == "L6-R1").unwrap();
+            assert_eq!(row.copies, Some(0), "its unit is short, not absent");
+        }
+    }
+
     /// Issue #440: what `volume write` and `volume resume` do about staging
     /// once the copy is sealed and confirmed. The write itself needs a tape
     /// drive, so these drive the release step on a catalog that looks as it
@@ -4520,7 +5055,7 @@ mod tests {
 
             let release = release_staging_after_write(&conn, &config, &s.volumes[0], false);
 
-            let StagingRelease::Retained(units) = &release else {
+            let StagingRelease::Retained { units, .. } = &release else {
                 panic!("one copy of two must keep the staging: {release:?}");
             };
             assert_eq!(

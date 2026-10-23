@@ -7,6 +7,8 @@ tapectl\-volume\-plan \- Show bin\-packing plan for pending staged data
 \fBtapectl volume plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-policy\-aware\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show bin\-packing plan for pending staged data
+.PP
+When a staged unit may span (`allow_spanning`), it also shows the order one write of everything staged takes (owed runs of a span in progress, whole units, units that may span), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume\*(Aqs own files are not counted.
 .SH OPTIONS
 .TP
 \fB\-\-copies\fR \fI<COPIES>\fR [default: 1]
