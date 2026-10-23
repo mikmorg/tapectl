@@ -5567,3 +5567,892 @@ fn rebuilding_a_listed_tape_takes_it_off_the_list() {
         .collect();
     assert_eq!(labels, ["HIST-Q"]);
 }
+
+// ── spanning (#478, ADR-0012 items 93, 121, 128 and 130) ─────────────────────
+
+/// The three tapes of item 93's span, by label, in the order they were
+/// written.
+const SPAN_LABELS: [&str; 3] = ["SPAN-T1", "SPAN-T2", "SPAN-T3"];
+const SPAN_UUIDS: [&str; 3] = [
+    "47800000-0000-4000-8000-000000000001",
+    "47800000-0000-4000-8000-000000000002",
+    "47800000-0000-4000-8000-000000000003",
+];
+/// The unit that may span: four slices, N.
+const SPAN_UNIT: &str = "video/archive";
+const SPAN_SLICES: usize = 4;
+/// A whole unit planned before the span on tape 1, as item 83 orders it.
+const WHOLE_UNIT: &str = "docs/letters";
+/// Three blocks less a little: a slice the early warning can come in (the
+/// block that reaches the warning arms a refusal of the next block, so a
+/// warning shows only in an entry with a block after the one that reached
+/// it).
+const SPAN_SLICE_BYTES: usize = 3 * BS as usize - 100;
+
+/// Item 93's layout at a copy target of 2, written by the real session into
+/// ONE catalog, one session per tape:
+/// - tape 1: `docs/letters` whole, then `video/archive` planned whole and
+///   cut by the drive's early warning inside its slice 2, so the tape seals
+///   short after it: the span's range 1..2, slices 3..4 `pending`;
+/// - tape 2: the owed run is the whole set (1..2 owe one more copy, 3..4
+///   two), planned whole and sealed full: `completed`, a copy;
+/// - tape 3: the owed run 3..4, its span listing all four slices, sealed
+///   full: a `range`, whose index names tapes 1 and 2 with their runs.
+struct SpanTapes {
+    /// The catalog that wrote all three. Declared before its directory.
+    conn: rusqlite::Connection,
+    /// Each tape's label and medium, in [`SPAN_LABELS`] order.
+    tapes: Vec<(String, MemStore)>,
+    /// K: the file tape 1 ended after.
+    k: i64,
+    operator_secret: String,
+    escrow_secret: String,
+    escrow_public: String,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+/// One tape of [`span_tapes`]: `units` built onto a new volume of `conn`'s
+/// catalog, its index generated for `runs`, written by the production
+/// session into a `MemStore` (its early warning one byte into Layout
+/// position `warning_in` of the slice id named), sealed and confirmed.
+#[allow(clippy::too_many_arguments)]
+fn write_span_tape(
+    conn: &rusqlite::Connection,
+    n: usize,
+    units: &[BuildUnit],
+    runs: &[tapectl::policy::coverage::IndexRun],
+    tenants: &[&TenantFixture],
+    operator: &TenantFixture,
+    escrow_public: &str,
+    warning_in: Option<i64>,
+    dirs: &mut Vec<tempfile::TempDir>,
+) -> (MemStore, Option<i64>) {
+    let (label, uuid) = (SPAN_LABELS[n], SPAN_UUIDS[n]);
+    conn.execute(
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES (?1, ?2, 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
+        rusqlite::params![label, uuid],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+
+    let work = tempfile::tempdir().unwrap();
+    let catalog_db = work.path().join("catalog.db");
+    let sets: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    db::catalog_snapshot::build_catalog_snapshot(conn, &sets, &catalog_db).unwrap();
+    let index = tapectl::volume::index::generate_files_for_runs(
+        conn,
+        &tapectl::policy::coverage::IndexThisTape {
+            label,
+            uuid,
+            cartridge_serial: "",
+            generation: "LTO-6",
+        },
+        runs,
+        &work.path().join("index"),
+    )
+    .unwrap();
+    let inputs = BuildInputs {
+        label: label.to_string(),
+        volume_uuid: uuid.to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "0.1.0-test".to_string(),
+        created_at: "2026-10-21T00:00:00Z".to_string(),
+        block_size: BS,
+        usable_bytes: 64 * 1024 * 1024,
+        enospc_buffer: 1024 * 1024,
+        nominal_capacity: 2_400_000_000,
+        mam_capacity: 2_400_000_000,
+        mam_manufacturer: "TAPECTL-TEST".to_string(),
+        mam_serial: String::new(),
+        cartridge_identity_source: None,
+        mam_length: 0,
+        mam_loads: 0,
+        units: units.to_vec(),
+        tenants: tenants
+            .iter()
+            .map(|t| TenantInfo {
+                tenant_id: t.tenant_id,
+                tenant_name: t.name.clone(),
+                public_keys: vec![t.public_key.clone()],
+            })
+            .collect(),
+        operator_public_keys: vec![operator.public_key.clone()],
+        escrow_public_key: Some(escrow_public.to_string()),
+        catalog_db_path: Some(catalog_db),
+        index: Some(index),
+    };
+    let session_dir = tempfile::tempdir().unwrap();
+    let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+
+    // The warning one byte into the slice's Layout entry: its first block
+    // reaches it, and the session seals short after it.
+    let warned_at: Option<i64> = warning_in.map(|slice_id| {
+        built
+            .layout
+            .entries
+            .iter()
+            .find(|e| {
+                matches!(e.kind, tapectl::volume::layout_model::ZoneKind::Slice { stage_slice_id }
+                    if stage_slice_id == slice_id)
+            })
+            .expect("the warned slice is planned")
+            .position as i64
+    });
+    let mut store = match warned_at {
+        Some(k) => {
+            let before: u64 = built
+                .layout
+                .entries
+                .iter()
+                .filter(|e| (e.position as i64) < k)
+                .map(|e| e.on_tape_bytes(BS).unwrap())
+                .sum();
+            MemStore::new(BS as usize).with_early_warning_after(before + 1)
+        }
+        None => MemStore::new(BS as usize),
+    };
+    let keys = KeyAvailability {
+        tenant_ids: tenants.iter().map(|t| t.tenant_id).collect(),
+        tenants_with_active_key: tenants.iter().map(|t| t.tenant_id).collect(),
+        operator_key_present: true,
+        escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
+    };
+    let validated = built
+        .into_validated(&keys, SliceCheck::Size, &mut store)
+        .expect("validate");
+    let planned = validated
+        .plan(conn, volume_id, units)
+        .expect("plan")
+        .with_post_warning_bytes(Some(64 * 1024 * 1024));
+    let ready = match planned.execute(conn, &mut store).expect("execute") {
+        ExecuteOutcome::Ready(r) => r,
+        ExecuteOutcome::Interrupted(_) => panic!("{label}: must reach Ready, got Interrupted"),
+        ExecuteOutcome::Aborted(a) => {
+            panic!("{label}: must reach Ready, got Aborted: {}", a.reason)
+        }
+    };
+    let sealed = ready.seal(&mut store).expect("seal");
+    let ended_after = sealed.ending().recorded_ended_after();
+    assert_eq!(
+        ended_after.map(i64::from),
+        warned_at,
+        "{label}: the tape ends where the fixture put the warning"
+    );
+    // What `write::finish_session` records once `seal()` returns.
+    conn.execute(
+        "UPDATE volumes SET sealed_at = datetime('now'), ended_after = ?2 WHERE id = ?1",
+        rusqlite::params![volume_id, ended_after],
+    )
+    .unwrap();
+    match sealed
+        .confirm(conn, &mut store, Tier::Integrity)
+        .expect("confirm")
+    {
+        ConfirmOutcome::Sealed(_) => {}
+        ConfirmOutcome::Quarantined(q) => panic!("{label}: must seal, got {:?}", q.reason),
+        ConfirmOutcome::Inconclusive(inc) => {
+            panic!("{label}: must seal, got {:?}", inc.evidence.mismatches)
+        }
+    }
+    dirs.push(work);
+    dirs.push(session_dir);
+    (store, warned_at)
+}
+
+/// Stage one unit at version 7 for `tenant`: `slices` slices of `bytes`
+/// each, every block's bytes distinct, encrypted to the tenant, the
+/// operator and the escrow recipient.
+fn stage_span_fixture_unit(
+    conn: &rusqlite::Connection,
+    name: &str,
+    uuid: &str,
+    tenant: &TenantFixture,
+    operator: &TenantFixture,
+    escrow_public: &str,
+    slices: usize,
+    bytes: usize,
+    slices_dir: &Path,
+) -> BuildUnit {
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES (?1, ?2, ?3, '/src/data', 'active')",
+        rusqlite::params![uuid, name, tenant.tenant_id],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+         VALUES (?1, 7, 'staged', ?2, 1, ?3)",
+        rusqlite::params![unit_id, format!("/src/{name}"), (slices * bytes) as i64],
+    )
+    .unwrap();
+    let snapshot_id = conn.last_insert_rowid();
+    db::files::fixture::insert(
+        conn,
+        snapshot_id,
+        &format!("{name}/file.bin"),
+        (slices * bytes) as i64,
+        "regular",
+        Some(&sha256_hex(name.as_bytes())),
+    );
+    let recipients = vec![
+        tenant.public_key.clone(),
+        operator.public_key.clone(),
+        escrow_public.to_string(),
+    ];
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size, key_fingerprints)
+         VALUES (?1, 'staged', ?2, ?3)",
+        rusqlite::params![
+            snapshot_id,
+            bytes as i64,
+            serde_json::to_string(&recipients).unwrap()
+        ],
+    )
+    .unwrap();
+    let stage_set_id = conn.last_insert_rowid();
+    let mut built = Vec::new();
+    for slice_number in 1..=slices as i64 {
+        let plaintext: Vec<u8> = (0..bytes)
+            .map(|o| (o / BS as usize + 31 * slice_number as usize + name.len()) as u8)
+            .collect();
+        let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
+        let (sha_plain, sha_enc) = (sha256_hex(&plaintext), sha256_hex(&encrypted));
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                stage_set_id,
+                slice_number,
+                plaintext.len() as i64,
+                encrypted.len() as i64,
+                sha_plain,
+                sha_enc
+            ],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        let path = slices_dir.join(format!("slice_{slice_id}.age"));
+        std::fs::write(&path, &encrypted).unwrap();
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+            rusqlite::params![path.to_string_lossy(), slice_id],
+        )
+        .unwrap();
+        built.push(BuildSlice {
+            slice_id,
+            slice_number,
+            size_bytes: plaintext.len() as i64,
+            encrypted_bytes: encrypted.len() as i64,
+            sha256_plain: sha_plain,
+            sha256_encrypted: sha_enc,
+            staging_path: path,
+        });
+    }
+    conn.execute(
+        "UPDATE stage_sets SET num_slices = ?2 WHERE id = ?1",
+        rusqlite::params![stage_set_id, slices as i64],
+    )
+    .unwrap();
+    BuildUnit {
+        stage_set_id,
+        snapshot_id,
+        unit_name: name.to_string(),
+        unit_uuid: uuid.to_string(),
+        tenant_id: tenant.tenant_id,
+        dar_version: Some("2.7.20".to_string()),
+        dar_command: None,
+        catalog_path: None,
+        snapshot_version: 7,
+        slices: built,
+        span: None,
+    }
+}
+
+/// See [`SpanTapes`]. `volume write`'s span planning is not wired here (it
+/// is its own task): each tape's `BuildUnit.span` is set as the planner sets
+/// it, from the slices the tape plans and every slice of the set.
+fn span_tapes() -> SpanTapes {
+    let db_dir = tempfile::tempdir().unwrap();
+    let conn = db::open(&db_dir.path().join("src.db")).unwrap();
+    let keys = FixtureKeys::fresh();
+    let operator = insert_tenant_keyed(&conn, "operator", true, copy_keypair(&keys.operator));
+    let alpha = insert_tenant_keyed(&conn, "alpha", false, copy_keypair(&keys.alpha));
+    let escrow = copy_keypair(&keys.escrow);
+    let slices_dir = tempfile::tempdir().unwrap();
+
+    let whole = stage_span_fixture_unit(
+        &conn,
+        WHOLE_UNIT,
+        "47800000-0000-4000-8000-0000000000a1",
+        &alpha,
+        &operator,
+        &escrow.public_key,
+        1,
+        2_000,
+        slices_dir.path(),
+    );
+    let mut span = stage_span_fixture_unit(
+        &conn,
+        SPAN_UNIT,
+        "47800000-0000-4000-8000-0000000000a2",
+        &alpha,
+        &operator,
+        &escrow.public_key,
+        SPAN_SLICES,
+        SPAN_SLICE_BYTES,
+        slices_dir.path(),
+    );
+    let every_slice = build::UnitSpan {
+        slices: span.slices.iter().map(build::SpanSlice::from).collect(),
+    };
+    span.span = Some(every_slice);
+    let set = span.stage_set_id;
+    let run = |first, last| tapectl::policy::coverage::IndexRun {
+        stage_set_id: set,
+        slices: Some((first, last)),
+    };
+    let n = SPAN_SLICES as i64;
+
+    let mut dirs = Vec::new();
+    // Tape 1: the whole unit, then the span planned to its end (item 123),
+    // the early warning inside its slice 2.
+    let (t1, k) = write_span_tape(
+        &conn,
+        0,
+        &[whole.clone(), span.clone()],
+        &[
+            tapectl::policy::coverage::IndexRun::whole(whole.stage_set_id),
+            run(1, n),
+        ],
+        &[&alpha],
+        &operator,
+        &escrow.public_key,
+        Some(span.slices[1].slice_id),
+        &mut dirs,
+    );
+    // Tape 2: the owed run is the whole set; sealed full.
+    let (t2, _) = write_span_tape(
+        &conn,
+        1,
+        std::slice::from_ref(&span),
+        &[run(1, n)],
+        &[&alpha],
+        &operator,
+        &escrow.public_key,
+        None,
+        &mut dirs,
+    );
+    // Tape 3: the owed run 3..4, the span still listing all four slices.
+    let tail = BuildUnit {
+        slices: span.slices[2..].to_vec(),
+        ..span.clone()
+    };
+    let (t3, _) = write_span_tape(
+        &conn,
+        2,
+        &[tail],
+        &[run(3, n)],
+        &[&alpha],
+        &operator,
+        &escrow.public_key,
+        None,
+        &mut dirs,
+    );
+    dirs.push(slices_dir);
+    dirs.push(db_dir);
+    SpanTapes {
+        conn,
+        tapes: vec![
+            (SPAN_LABELS[0].to_string(), t1),
+            (SPAN_LABELS[1].to_string(), t2),
+            (SPAN_LABELS[2].to_string(), t3),
+        ],
+        k: k.expect("tape 1 ended early"),
+        operator_secret: operator.secret_key,
+        escrow_secret: escrow.secret_key,
+        escrow_public: escrow.public_key,
+        _dirs: dirs,
+    }
+}
+
+impl SpanTapes {
+    /// `catalog rebuild --from-volume` of tape `n` into `conn`, with `secret`.
+    fn rebuild(
+        &mut self,
+        conn: &rusqlite::Connection,
+        n: usize,
+        secret: &str,
+    ) -> rebuild::RebuildReport {
+        let identity: age::x25519::Identity = secret.parse().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let (label, store) = &mut self.tapes[n];
+        rebuild::rebuild_from_store(
+            conn,
+            store,
+            &[identity],
+            Some(label.as_str()),
+            "recovered",
+            Some("lto0"),
+            scratch.path(),
+            "memstore",
+            ContactSite::new(
+                cfg(),
+                Operation::CatalogRebuild,
+                "memstore",
+                Medium::NoBackend,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("rebuild of {label}: {e}"))
+    }
+}
+
+/// Per volume label, in label then unit order: `(label, unit, writes.status,
+/// writes.may_span, completed_at recorded, snapshots.status)`.
+type SpanWriteRow = (String, String, String, bool, bool, String);
+
+fn span_write_rows(conn: &rusqlite::Connection) -> Vec<SpanWriteRow> {
+    conn.prepare(
+        "SELECT v.label, u.name, w.status, w.may_span, w.completed_at IS NOT NULL, s.status
+           FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          ORDER BY v.label, u.name",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// Every position: `(label, unit, slice number, tape position, status)`.
+type SpanPositionRow = (String, String, i64, i64, String);
+
+fn span_positions(conn: &rusqlite::Connection) -> Vec<SpanPositionRow> {
+    conn.prepare(
+        "SELECT v.label, u.name, sl.slice_number, CAST(wp.position AS INTEGER), wp.status
+           FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          ORDER BY v.label, u.name, sl.slice_number",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// The span unit's stage set(s): `(slice number, sha256_encrypted,
+/// sha256_plain, size_bytes, encrypted_bytes)` of each slice row.
+fn span_slice_rows(conn: &rusqlite::Connection) -> Vec<(i64, String, String, i64, i64)> {
+    conn.prepare(
+        "SELECT sl.slice_number, sl.sha256_encrypted, sl.sha256_plain, sl.size_bytes,
+                sl.encrypted_bytes
+           FROM stage_slices sl
+           JOIN stage_sets ss ON ss.id = sl.stage_set_id
+           JOIN snapshots s ON s.id = ss.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          WHERE u.name = ?1 ORDER BY sl.slice_number",
+    )
+    .unwrap()
+    .query_map([SPAN_UNIT], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// The span unit's copies, as `audit` counts a unit's current versions.
+fn span_unit_copies(conn: &rusqlite::Connection) -> i64 {
+    let unit_id: i64 = conn
+        .query_row("SELECT id FROM units WHERE name = ?1", [SPAN_UNIT], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    conn.query_row(
+        &format!(
+            "SELECT {}",
+            tapectl::policy::coverage::copy_count_expr(
+                &tapectl::policy::coverage::CoverageQuery::current_unit("?1")
+            )
+        ),
+        [unit_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn span_snapshot_status(conn: &rusqlite::Connection) -> String {
+    conn.query_row(
+        "SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+        [SPAN_UNIT],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// The fixture is item 93's layout: the writing catalog's rows are `range`,
+/// `completed` and `range`, each written position where the session put it,
+/// and the version is current with two copies.
+#[test]
+fn the_span_fixture_is_item_93s_three_tapes() {
+    let s = span_tapes();
+    let rows = span_write_rows(&s.conn);
+    let row = |label: &str, unit: &str, status: &str, may_span: bool, snapshot: &str| {
+        (
+            label.to_string(),
+            unit.to_string(),
+            status.to_string(),
+            may_span,
+            true,
+            snapshot.to_string(),
+        )
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row("SPAN-T1", WHOLE_UNIT, "completed", false, "current"),
+            row("SPAN-T1", SPAN_UNIT, "range", true, "current"),
+            row("SPAN-T2", SPAN_UNIT, "completed", true, "current"),
+            row("SPAN-T3", SPAN_UNIT, "range", true, "current"),
+        ]
+    );
+    let t1: Vec<(i64, String)> = span_positions(&s.conn)
+        .into_iter()
+        .filter(|p| p.0 == "SPAN-T1" && p.1 == SPAN_UNIT)
+        .map(|p| (p.2, p.4))
+        .collect();
+    assert_eq!(
+        t1,
+        vec![
+            (1, "written".to_string()),
+            (2, "written".to_string()),
+            (3, "pending".to_string()),
+            (4, "pending".to_string()),
+        ]
+    );
+    assert_eq!(span_unit_copies(&s.conn), 2);
+}
+
+/// Item 130 and X24: tape 3 rebuilt alone records what it shows. Its write is
+/// a `range`, its block's four slice rows are all recorded with the hashes
+/// the writing catalog staged, positions are recorded for slices 3 and 4
+/// only (`written`, where the session put them), and the version stays
+/// `staged`, reading 0 copies, because slices 1 and 2 are on no sealed
+/// volume of this catalog.
+#[test]
+fn tape_3_of_a_span_rebuilt_alone_is_a_range_and_its_version_stays_staged() {
+    let mut s = span_tapes();
+    let secret = s.operator_secret.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(dir.path());
+    let report = s.rebuild(&fresh, 2, &secret);
+
+    assert_eq!(report.unsealed_reason, None);
+    assert_eq!(report.ended_after, None, "tape 3 sealed full");
+    assert!(report.cut_units.is_empty(), "{:?}", report.cut_units);
+    assert_eq!(
+        report.range_units,
+        vec![rebuild::RebuiltRange {
+            unit: SPAN_UNIT.to_string(),
+            version: 7,
+            first_slice: 3,
+            last_slice: 4,
+            num_slices: 4,
+        }]
+    );
+    assert_eq!(
+        span_write_rows(&fresh),
+        vec![(
+            "SPAN-T3".to_string(),
+            SPAN_UNIT.to_string(),
+            "range".to_string(),
+            true,
+            true,
+            "staged".to_string()
+        )]
+    );
+    assert_eq!(
+        span_slice_rows(&fresh),
+        span_slice_rows(&s.conn),
+        "all N slice rows, each with the hashes the writing catalog staged"
+    );
+    let stage_sets: i64 = fresh
+        .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stage_sets, 1);
+    let num_slices: i64 = fresh
+        .query_row("SELECT num_slices FROM stage_sets", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(num_slices, SPAN_SLICES as i64);
+    let written_on_t3: Vec<SpanPositionRow> = span_positions(&s.conn)
+        .into_iter()
+        .filter(|p| p.0 == "SPAN-T3")
+        .collect();
+    assert_eq!(
+        span_positions(&fresh),
+        written_on_t3,
+        "positions for slices 3 and 4 only, where the session put them"
+    );
+    assert_eq!(
+        written_on_t3.iter().map(|p| p.2).collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert_eq!(span_snapshot_status(&fresh), "staged");
+    assert_eq!(span_unit_copies(&fresh), 0, "the version reads 0 copies");
+    let set: i64 = fresh
+        .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+        .unwrap();
+    let per_slice: Vec<(i64, i64)> = tapectl::policy::coverage::slice_copies(&fresh, set)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.slice_number, c.copies))
+        .collect();
+    assert_eq!(per_slice, [(1, 0), (2, 0), (3, 1), (4, 1)]);
+    assert!(report.versions_promoted.is_empty());
+
+    // A second run adds nothing, and says the same.
+    let again = s.rebuild(&fresh, 2, &secret);
+    assert!(again.is_noop(), "{again:?}");
+    assert_eq!(again.range_units, report.range_units);
+    assert_eq!(again.spans_in_progress, report.spans_in_progress);
+}
+
+/// Item 130's to-do list (`volume-format-v2.md` §1.5): tape 3 alone names
+/// the slices the catalog still lacks, 1 and 2, and the tapes its index says
+/// hold them, tape 1 (its range 1..2) and tape 2 (the whole set), beside the
+/// index's list of volumes the catalog lacks.
+#[test]
+fn tape_3_rebuilt_alone_names_tapes_1_and_2_and_the_slices_they_hold() {
+    let mut s = span_tapes();
+    let secret = s.operator_secret.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(dir.path());
+    let report = s.rebuild(&fresh, 2, &secret);
+
+    assert!(report.had_index, "tape 3 carries an index");
+    let missing: Vec<&str> = report
+        .index_volumes_missing
+        .iter()
+        .map(|v| v.label.as_str())
+        .collect();
+    assert_eq!(missing, ["SPAN-T1", "SPAN-T2"]);
+
+    assert_eq!(report.spans_in_progress.len(), 1, "{report:?}");
+    let span = &report.spans_in_progress[0];
+    assert_eq!((span.unit.as_str(), span.version), (SPAN_UNIT, 7));
+    assert_eq!(span.num_slices, 4);
+    assert_eq!(span.missing, [1, 2], "slices 1..K");
+    assert_eq!(span.describe_missing(), "slices 1-2");
+    let holders: Vec<(String, Option<i64>, Option<i64>)> = span
+        .holders
+        .iter()
+        .map(|h| (h.label.clone(), h.first_slice, h.last_slice))
+        .collect();
+    assert_eq!(
+        holders,
+        vec![
+            ("SPAN-T1".to_string(), Some(1), Some(2)),
+            ("SPAN-T2".to_string(), Some(1), Some(4)),
+        ]
+    );
+    assert_eq!(span.holders[0].uuid, SPAN_UUIDS[0]);
+    assert_eq!(span.holders[0].describe(), "SPAN-T1 (slices 1-2)");
+
+    // The provenance event says what the tape holds and what is missing.
+    let detail: String = fresh
+        .query_row(
+            "SELECT details FROM events WHERE action = 'catalog_rebuild'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        detail.contains(
+            "held as a range (not a copy on its own): video/archive v7 (slices 3-4 of 4)"
+        ),
+        "{detail}"
+    );
+    assert!(detail.contains("video/archive v7 (slices 1-2)"), "{detail}");
+
+    // Tape 1 alone: its index cannot name the later tapes (ADR-0001), so its
+    // missing slices 3..4 have no holder.
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(dir.path());
+    let report = s.rebuild(&fresh, 0, &secret);
+    assert_eq!(report.ended_after, Some(s.k as u64));
+    assert_eq!(report.range_units.len(), 1);
+    assert_eq!(
+        (
+            report.range_units[0].first_slice,
+            report.range_units[0].last_slice
+        ),
+        (1, 2)
+    );
+    assert_eq!(report.spans_in_progress.len(), 1);
+    assert_eq!(report.spans_in_progress[0].missing, [3, 4]);
+    assert!(report.spans_in_progress[0].holders.is_empty());
+    assert!(report.index_volumes_missing.is_empty());
+}
+
+/// Item 130 and X24 together: the three tapes rebuilt in any order give the
+/// rows the writing catalog holds: the same statuses (`range`, `completed`,
+/// `range`, and the whole unit's `completed`), the same positions and their
+/// statuses (tape 1's slices 3 and 4 `pending`), one stage set, and the
+/// version `current` with two copies once its last tape is in.
+#[test]
+fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
+    let mut s = span_tapes();
+    let secret = s.operator_secret.clone();
+    let written_rows = span_write_rows(&s.conn);
+    let written_positions = span_positions(&s.conn);
+    let orders: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = fresh_db(dir.path());
+        let mut promoted: Vec<String> = Vec::new();
+        for (i, &n) in order.iter().enumerate() {
+            let report = s.rebuild(&fresh, n, &secret);
+            promoted.extend(report.versions_promoted.clone());
+            // Before the last tape the version is staged exactly while some
+            // slice is still on no rebuilt tape: tape 2 alone holds it whole.
+            let whole_yet =
+                order[..=i].contains(&1) || (order[..=i].contains(&0) && order[..=i].contains(&2));
+            assert_eq!(
+                span_snapshot_status(&fresh),
+                if whole_yet { "current" } else { "staged" },
+                "order {order:?}, after tape {}",
+                n + 1
+            );
+            assert_eq!(
+                report.spans_in_progress.is_empty(),
+                whole_yet,
+                "order {order:?}, after tape {}: {:?}",
+                n + 1,
+                report.spans_in_progress
+            );
+        }
+        assert_eq!(span_write_rows(&fresh), written_rows, "order {order:?}");
+        assert_eq!(span_positions(&fresh), written_positions, "order {order:?}");
+        let stage_sets: i64 = fresh
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                   JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+                [SPAN_UNIT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stage_sets, 1,
+            "order {order:?}: the three tapes are one staging"
+        );
+        assert_eq!(span_unit_copies(&fresh), 2, "order {order:?}");
+        // The version was made current by the rebuild that completed it,
+        // unless the first tape rebuilt was tape 2, which inserted it so.
+        let expect_promoted: Vec<String> = if order[0] == 1 {
+            Vec::new()
+        } else {
+            vec![format!("{SPAN_UNIT} v7")]
+        };
+        assert_eq!(promoted, expect_promoted, "order {order:?}");
+    }
+}
+
+/// Attestation on a range tape (#137, item 130): the slice header read is the
+/// lowest-numbered slice THIS tape holds, slice 3 on tape 3, never slice 1,
+/// which it does not hold. The escrow key decrypts it and attests the set.
+#[test]
+fn attestation_on_a_range_tape_reads_the_first_slice_it_holds() {
+    let mut s = span_tapes();
+    let operator = s.operator_secret.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(dir.path());
+    s.rebuild(&fresh, 2, &operator);
+    // As for a tape whose catalog.db carried no receipt, with the original
+    // escrow key registered (the DR procedure's first step).
+    fresh
+        .execute("UPDATE stage_sets SET key_fingerprints = NULL", [])
+        .unwrap();
+    register_escrow(&fresh, &s.escrow_public);
+    let escrow = s.escrow_secret.clone();
+    let report = s.rebuild(&fresh, 2, &escrow);
+    assert!(report.key_is_escrow);
+    assert_eq!(report.escrow_attest_unreadable, 0, "{report:?}");
+    assert_eq!(report.escrow_attest_unparseable, 0, "{report:?}");
+    assert_eq!(report.attested, 1, "{report:?}");
+    assert_eq!(report.unknown_remaining, 0);
+}
+
+/// A tape with no spannable unit (1.6.0's) rebuilds exactly as before: no
+/// row may span, every write `completed`, every snapshot `current`, and the
+/// report and the ledger name no range, no promotion and no span.
+#[test]
+fn a_tape_with_no_spannable_unit_rebuilds_as_it_did_before() {
+    let mut vol = build_sealed_volume(true);
+    let secret = vol.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_db(dir.path());
+    let report = rebuild(&fresh, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(report.range_units.is_empty());
+    assert!(report.versions_promoted.is_empty());
+    assert!(report.spans_in_progress.is_empty());
+    let rows: Vec<(String, bool, String)> = fresh
+        .prepare(
+            "SELECT w.status, w.may_span, s.status FROM writes w
+               JOIN snapshots s ON s.id = w.snapshot_id ORDER BY w.id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), UNITS.len());
+    assert!(
+        rows.iter()
+            .all(|(w, may, s)| w == "completed" && !may && s == "current"),
+        "{rows:?}"
+    );
+    let detail: String = fresh
+        .query_row(
+            "SELECT details FROM events WHERE action = 'catalog_rebuild'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !detail.contains("held as a range")
+            && !detail.contains("made current")
+            && !detail.contains("spanning"),
+        "{detail}"
+    );
+}
