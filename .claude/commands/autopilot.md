@@ -60,11 +60,21 @@ the normative design set named in the Policy block below.
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
 
-  **#478 wave 1 is on `p478-span`** (`/scratch/tapectl-p478`, pushed to origin at a4def5e): T0, A
-  and D. Its gate is GREEN: golden 4/4 first, fmt, clippy with and without research, unit
-  4071/0/24, and the mhvtl gate 52/52 (2026-10-23). The branch is not releasable before wave 5
-  (plan.md), so it does not land on master until then. Next is wave 2: B (the policy key), C
-  (per-slice coverage) and L (layout text and RESTORE.sh), per plan.md §5 and its "Wave 1 notes".
+  **#478 waves 1-3 are on `p478-span`** (`/scratch/tapectl-p478`, pushed to origin at 71e69dd,
+  2026-10-23): T0, A, D; B, C, L1-L3 (RESTORE.sh across cartridges, re-pinned three times under
+  item 135, now 39d2535e); E1 (the plan order: `CapacityBudget::place`), E2 (confirm's
+  completed/range/cut split, item 128's promotion, the seal's `requires` from File 0), G
+  (per-slice staging release). Gate GREEN: golden 6/6, fmt, clippy ×2, 4205/0/24, and the whole
+  tape chain (chain44: mhvtl gate 52/52, fr414 17/0, lifecycle `--all` 487/472/0/15, erase-proof,
+  plaintext scan, short-seal acceptance). Wave 4 is running: E3 (`volume write` spans), H1
+  (tapectl's restore across cartridges), H2 (rebuild and adoption of a range tape). The plan, the
+  coordinator's forks (X1-X34, X12 amended 2026-10-23) and every worker's report and routing are in
+  the session scratchpad `p478/plan.md` §§12-14. The branch does not land on master before wave 5.
+  For the CTO's 1.7.0 notes: under `--swap-tapes` a seal-less second cartridge (an aborted 1.5.0
+  write) now gives nothing (R8, item 132); `allow_spanning` defers, never refuses, whole units a
+  queued set pushes past the ceiling (X12 as amended).
+  Since 2026-10-23 mhvtl's `/dev/nstN` also moves when needrestart restarts it (now blocked by
+  `/etc/needrestart/conf.d/mhvtl.conf`): chain scripts resolve by-id at start.
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
