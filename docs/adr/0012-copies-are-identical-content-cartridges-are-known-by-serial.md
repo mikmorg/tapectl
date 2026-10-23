@@ -2084,3 +2084,20 @@ Ruled 2026-10-21, on the forks #478's build plan found (scratchpad `p478/plan.md
 143. **Item 102's fill of a damaged file takes only a whole copy as its source in 1.7.0.** A range
      is never a fill source, and the refusal says why. Item 93's layout usually gives a spanning
      version a whole copy.
+
+Ruled 2026-10-23, on a fork #478's build found (task H2, `catalog rebuild` of a range tape):
+
+144. **`catalog rebuild` promotes a spanning version it finds `staged`.** When a rebuild records a
+     tape that completes a spanning version, it moves that version's snapshot from `staged` to
+     `current` by item 128's rule. That rule requires every slice of the stage set to have a
+     `written` position in a `completed` or `range` row on a volume the catalog records as
+     `sealed`. This is a narrow exception to the 2026-09-29 ruling that a rebuild "never changes a
+     status it finds":
+     - it applies to snapshots only, and only upward;
+     - a rebuild still never changes a volume's status, so its own tape counts only when the
+       rebuild itself records that volume `sealed`;
+     - the promotion is logged as confirm's is.
+     Without it, a span rebuilt tape by tape into an empty catalog stays `staged` for good, reading
+     0 copies, unless the tape that completes it happens to be rebuilt first. Nothing else would
+     promote it, because no later write touches the version. Considered and not chosen: keeping
+     the letter of the 2026-09-29 ruling and promoting by a separate command.

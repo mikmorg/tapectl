@@ -223,7 +223,8 @@ refusing it, on all of the following, refusing by the first unmet one:
 Adoption writes what a passing confirm writes — `status = 'sealed'`,
 `sealed_at` from the seal marker's own time, the write bookkeeping, the
 snapshot promotions and a `write_completed` event — in one transaction.
-`catalog rebuild` itself still never changes a status, and `volume write`
+`catalog rebuild` itself still never changes a volume's status (it may promote
+a spanning version's snapshot, ADR-0012 item 144), and `volume write`
 still refuses the same row as `VolumeHasRecordedWrite`.
 
 The retry-vs-UNIQUE fact: `writes` has `UNIQUE(stage_set_id, volume_id)` —
@@ -698,8 +699,10 @@ each has a `written` position in a `completed` or `range` row on a volume
 whose status is `sealed`, the volume being sealed counted. Confirm, the
 adoption of a lost write and `catalog rebuild` promote by this rule, in the
 transaction that records the seal or the rebuild. For a rebuild this is the
-status of the snapshot row it creates: `catalog rebuild` still never changes a
-volume's status. Until then the version stays
+status of the snapshot row it creates, and it also promotes a snapshot it finds
+`staged`, upward only (ADR-0012 item 144): its own tape counts only when the
+rebuild records that volume `sealed`, because `catalog rebuild` still never
+changes a volume's status. Until then the version stays
 `staged`, and the retire floor protects it: `versions_at_stake` holds a version
 that has a `range` row on an eligible volume at stake when that volume is the
 only holder of any of its slices (`sole_slices`, widened to match). `audit`
