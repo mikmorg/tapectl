@@ -684,6 +684,10 @@ row, and (positive control) resolved disks. It drives the pipeline directly, cal
 
 ## 10. Measurement protocol for the real-drive phase
 
+*It ran on 2026-10-22: `docs/runs/2026-10-22-488-drive-phase.md`. No load reproduced #426, the
+stop rule's fallback ran, and the excess that appeared came with the drive's page 0x02
+corrections, not with the feed. §11 and §12 are read against that record.*
+
 **Ground rules.**
 - Test cartridge **EW7VWMVKF6** only, with its chip serial checked before each run, on the
   operator's go-ahead. A scratch home.
