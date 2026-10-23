@@ -6,7 +6,9 @@ tapectl\-collection\-plan \- Show the batch plan (alphabetical next\-fit, §7) f
 .SH SYNOPSIS
 \fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-policy\-aware\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units
+Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units.
+.PP
+A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes last in its batch, and the plan names the unit that spans onto the next cartridge. It is refused when it is larger than the staging area, or, on a drive that does not declare `post_warning_bytes`, larger than the room under the fill ceiling.
 .SH OPTIONS
 .TP
 \fB\-\-copies\fR \fI<COPIES>\fR [default: 2]
