@@ -6514,10 +6514,15 @@ fn verify_contacted(
     // that sealed this copy left unrecorded, from the front index it just
     // proved and the catalog's own rows — in the same transaction, so the
     // figures and the event saying so stand or fall with this session.
+    // 1.7.0 (#478; `layout-session.md` "From 1.7.0", ADR-0012 item 127): a
+    // `range` write it read back in full is marked as a completed one is. The
+    // full readback walks the tape to its end, so every `written` slice of a
+    // range was read; its `pending` positions were never on the tape.
     let mut figures = None;
     if tier == Tier::Integrity && evidence.mismatches.is_empty() {
         tx.execute(
-            "UPDATE writes SET write_verified = 1 WHERE volume_id = ?1 AND status = 'completed'",
+            "UPDATE writes SET write_verified = 1
+             WHERE volume_id = ?1 AND status IN ('completed', 'range')",
             params![volume_id],
         )?;
         figures = super::figures::record_after_verify(&tx, volume_id, label, &layout, session_id)?;
@@ -7418,6 +7423,12 @@ pub(crate) fn refuse_range_holder(
     )))
 }
 
+/// Why compaction does not carry a range ([`refuse_range_holder`]).
+const COMPACTION_CARRIES_NO_RANGE: &str =
+    "Compaction carries a volume's live units to another tape whole, and a range is not a \
+     whole unit: carrying one forward is its own design, not built in 1.7.0 (ADR-0012 item \
+     133).";
+
 /// Compact-read: read live encrypted slices from a volume to staging.
 /// "Live" means the snapshot is NOT reclaimable or purged.
 ///
@@ -7488,6 +7499,17 @@ fn compact_read_contacted(
             |row| row.get(0),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // 1.7.0 (#478, X25; ADR-0012 item 133): a volume holding a range is
+    // refused by name from the catalog, before File 0 or a slice is read and
+    // before anything is staged. `volume compact` reads through here too.
+    refuse_range_holder(
+        conn,
+        label,
+        "volume compact-read",
+        COMPACTION_CARRIES_NO_RANGE,
+        "Nothing was read or staged.",
+    )?;
 
     // Corroborate at contact (ADR-0012, issue #193). `compact-read` is a
     // contact issue #193 did not name — it reads slices off a tape by
@@ -7831,6 +7853,10 @@ pub struct CompactFinishReport {
 ///
 /// Tier 1 (ADR-0004) is unchanged and never gates: evidence age for the
 /// units that DO retain coverage is shown at the moment consent is asked.
+///
+/// Before the gates (1.7.0, #478): a volume holding a range is refused by
+/// name, as `compact-read` refuses it ([`refuse_range_holder`], ADR-0012
+/// item 133), so no gate is asked about it.
 pub fn compact_finish(
     conn: &Connection,
     config: &crate::config::Config,
@@ -7853,6 +7879,17 @@ pub fn compact_finish(
         vol_id,
         label,
         &format!("retire volume \"{label}\" (compact-finish)"),
+    )?;
+
+    // 1.7.0 (#478, X25; ADR-0012 item 133): as `compact-read`, a volume
+    // holding a range is refused by name before anything is retired.
+    // `volume compact`'s step 3 is this function.
+    refuse_range_holder(
+        conn,
+        label,
+        "volume compact-finish",
+        COMPACTION_CARRIES_NO_RANGE,
+        "Nothing was changed.",
     )?;
 
     // Guard: verify all live slices exist on at least one other volume
@@ -8957,6 +8994,74 @@ mod tests {
             let conn = setup(true);
             compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
                 .expect("no at-risk unit means no gate, exactly as before #147");
+            assert_eq!(status_of(&conn, "L6-SRC"), "retired");
+        }
+
+        /// 1.7.0 (#478, X25; ADR-0012 item 133): a source that also holds a
+        /// range of another unit is refused by name before any gate, and
+        /// `--force`/`--yes` does not reach past it; nothing is retired and
+        /// no event is logged. Positive control: the same catalog without
+        /// the range retires with no consent, as the test above.
+        #[test]
+        fn a_volume_holding_a_range_is_refused_by_name_whatever_yes_says() {
+            let conn = setup(true);
+            conn.execute_batch(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     SELECT 'u2', 'spanner', id, 'mtime_size', 1, 'active' FROM tenants;
+                 INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     SELECT id, 3, 'full', 'staged', '/src2' FROM units WHERE name = 'spanner';
+                 INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                     SELECT s.id, 'staged', 524288 FROM snapshots s
+                     JOIN units u ON u.id = s.unit_id WHERE u.name = 'spanner';
+                 INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           sha256_plain, encrypted_bytes, sha256_encrypted)
+                     SELECT ss.id, n.n, 1024, 'p' || n.n, 1024, 'e' || n.n
+                     FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN units u ON u.id = s.unit_id,
+                     (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) n
+                     WHERE u.name = 'spanner';
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'range', 1
+                     FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                     JOIN units u ON u.id = s.unit_id, volumes v
+                     WHERE u.name = 'spanner' AND v.label = 'L6-SRC';
+                 INSERT INTO write_positions (write_id, stage_slice_id, position, status,
+                                              sha256_on_volume)
+                     SELECT w.id, sl.id, CAST(7 + sl.slice_number AS TEXT),
+                            CASE WHEN sl.slice_number <= 2 THEN 'written' ELSE 'pending' END,
+                            CASE WHEN sl.slice_number <= 2 THEN sl.sha256_encrypted END
+                     FROM writes w JOIN stage_slices sl ON sl.stage_set_id = w.stage_set_id
+                     WHERE w.status = 'range';",
+            )
+            .unwrap();
+            let events: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+
+            let err = compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", true)
+                .expect_err("a range is refused before any gate");
+            assert_eq!(
+                err.to_string(),
+                "volume compact-finish refused: volume \"L6-SRC\" holds a range, one run of \
+                 the slices of a unit that spans cartridges: \"spanner\" v3 (slices 1-2). \
+                 Compaction carries a volume's live units to another tape whole, and a range \
+                 is not a whole unit: carrying one forward is its own design, not built in \
+                 1.7.0 (ADR-0012 item 133). Nothing was changed."
+            );
+            assert_eq!(status_of(&conn, "L6-SRC"), "sealed");
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, events, "nothing was logged");
+
+            conn.execute_batch(
+                "DELETE FROM write_positions WHERE write_id IN
+                     (SELECT id FROM writes WHERE status = 'range');
+                 DELETE FROM writes WHERE status = 'range';",
+            )
+            .unwrap();
+            compact_finish(&conn, &crate::config::Config::default(), "L6-SRC", false)
+                .expect("without the range, no gate");
             assert_eq!(status_of(&conn, "L6-SRC"), "retired");
         }
 
@@ -18651,6 +18756,91 @@ mod tests {
         }
     }
 
+    /// 1.7.0 (#478, X25; `layout-session.md` "From 1.7.0", ADR-0012 item
+    /// 133): compaction refuses a volume that holds a range, by name.
+    /// `volume compact` runs `compact_read` as its step 1 and
+    /// `compact_finish` as its step 3 (pinned by `cli::volume`'s
+    /// `run_routes_to_through_the_swap_unconditionally` and
+    /// `the_compact_arm_routes_step_3_through_the_outcome`; `run` itself
+    /// refuses before step 1 under `cfg(test)`, which has no terminal), so
+    /// these two refusals are its refusal too.
+    mod compaction_of_a_range {
+        use super::*;
+        use crate::tape::fake::Op;
+
+        /// [`loaded_fixture`] with `lv-unit`'s write a range: the tape ended
+        /// in it, its slice 1 at file 4 written.
+        fn range_fixture(label: &str) -> (Connection, i64, crate::tape::fake::FakeTape) {
+            let (conn, volume_id, fake) = loaded_fixture(label);
+            conn.execute("UPDATE writes SET status = 'range', may_span = 1", [])
+                .unwrap();
+            (conn, volume_id, fake)
+        }
+
+        /// The refusal, read from the catalog: the store is asked nothing
+        /// past the open's rewind (no File 0, no slice), nothing is staged
+        /// and no compact directory is made. The contact is recorded
+        /// `failed`, as every refusal of a loaded tape's read is. Positive
+        /// control: the same tape with the write `completed` reads its slice.
+        #[test]
+        fn compact_read_refuses_a_volume_holding_a_range_before_reading_anything() {
+            let (conn, volume_id, fake) = range_fixture("RG-CR");
+            let mut store = fake_store(&fake);
+            let opened = fake.ops();
+            assert_eq!(opened, [Op::Rewind], "the store's open rewinds");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config::default();
+            config.staging.directory = tmp.path().to_string_lossy().into_owned();
+
+            let err = compact_read(
+                &conn,
+                &config,
+                "RG-CR",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .expect_err("a volume holding a range")
+            .to_string();
+            assert_eq!(
+                err,
+                "volume compact-read refused: volume \"RG-CR\" holds a range, one run of the \
+                 slices of a unit that spans cartridges: \"lv-unit\" v1 (slice 1). Compaction \
+                 carries a volume's live units to another tape whole, and a range is not a \
+                 whole unit: carrying one forward is its own design, not built in 1.7.0 \
+                 (ADR-0012 item 133). Nothing was read or staged."
+            );
+            assert_eq!(fake.ops(), opened, "nothing was read from the tape");
+            let staged: Option<String> = conn
+                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
+                .unwrap();
+            assert!(staged.is_none(), "nothing was staged: {staged:?}");
+            assert_eq!(
+                fs::read_dir(tmp.path()).unwrap().count(),
+                0,
+                "no compact directory was made"
+            );
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].0, "volume compact-read");
+            assert_eq!(contacts[0].1, Some(volume_id));
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+
+            conn.execute("UPDATE writes SET status = 'completed'", [])
+                .unwrap();
+            let mut store = fake_store(&fake);
+            let report = compact_read(
+                &conn,
+                &config,
+                "RG-CR",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .expect("the same tape, its write whole");
+            assert_eq!(report.slices_read, 1);
+            assert!(fake.ops().contains(&Op::Read(4)), "{:?}", fake.ops());
+        }
+    }
+
     // --- Per-call-site contact tests (ADR-0012, issues #193/#164) ----------
     //
     // The RULE's own branch tests live in `volume::binding`. These prove only
@@ -24693,6 +24883,150 @@ mod tests {
                         .expect("tape 2 continues it");
                     assert_eq!(writes_of(&f, "SL-2"), pairs(&[("b", "range")]));
                     assert_eq!(position_of(&f, "SL-2", "b", 3), 8);
+                }
+
+                // ── #478 H3: verify, read-slices and figures meet a range ──
+
+                /// `(unit, write_verified)` of every write on `label`, by name.
+                fn verified(f: &Fixture, label: &str) -> Vec<(String, bool)> {
+                    f.conn
+                        .prepare(
+                            "SELECT u.name, w.write_verified FROM writes w
+                             JOIN volumes v ON v.id = w.volume_id
+                             JOIN snapshots s ON s.id = w.snapshot_id
+                             JOIN units u ON u.id = s.unit_id
+                             WHERE v.label = ?1 ORDER BY u.name",
+                        )
+                        .unwrap()
+                        .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                }
+
+                /// `volume verify` of `label` at `tier` over `store`, which
+                /// must pass.
+                fn verify(
+                    f: &Fixture,
+                    label: &str,
+                    store: &mut dyn Store,
+                    tier: Tier,
+                ) -> VerifyReport {
+                    let r = volume_verify_with_store(
+                        &f.conn,
+                        store,
+                        label,
+                        volume_id(f, label),
+                        SBS,
+                        tier,
+                        site(Operation::VolumeVerify),
+                    )
+                    .expect("the verify ran");
+                    assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
+                    r
+                }
+
+                /// `(staging_path, released_at)` of `unit`'s slice `n`.
+                fn slice_row(f: &Fixture, unit: &str, n: i64) -> (Option<String>, Option<String>) {
+                    f.conn
+                        .query_row(
+                            "SELECT staging_path, released_at FROM stage_slices
+                             WHERE stage_set_id = ?1 AND slice_number = ?2",
+                            params![stage_set_of(f, unit), n],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap()
+                }
+
+                /// Item 127 (`layout-session.md` "From 1.7.0"): a full `volume
+                /// verify` marks a `range` write `write_verified`, as it marks a
+                /// completed one, and a quick verify marks nothing. Tape 1 of a
+                /// span written with a quick confirm: `a` and `c` whole, `b`'s
+                /// range 1-2, every row unverified until the full readback.
+                #[test]
+                fn a_full_verify_marks_a_range_write_verified_and_a_quick_one_does_not() {
+                    let f = fixture(A_B3_C, &["SV-1"]);
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(11, warning);
+                    write(&f, "SV-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    assert_eq!(
+                        writes_of(&f, "SV-1"),
+                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                    );
+                    let none = vec![
+                        ("a".to_string(), false),
+                        ("b".to_string(), false),
+                        ("c".to_string(), false),
+                    ];
+                    assert_eq!(verified(&f, "SV-1"), none, "a quick confirm");
+
+                    verify(&f, "SV-1", &mut store, Tier::Navigable);
+                    assert_eq!(verified(&f, "SV-1"), none, "a quick verify");
+
+                    verify(&f, "SV-1", &mut store, Tier::Integrity);
+                    assert_eq!(
+                        verified(&f, "SV-1"),
+                        [
+                            ("a".to_string(), true),
+                            ("b".to_string(), true),
+                            ("c".to_string(), true),
+                        ],
+                        "the full readback read the range too"
+                    );
+                }
+
+                /// `layout-session.md` "Per-slice release": `volume
+                /// read-slices` from a range tape stages its released slices
+                /// again and clears their `released_at`. At a copy target of 1
+                /// tape 1's range 1-2 has slices 1 and 2 released and slice 3
+                /// kept; a read of `b` v1 from tape 1 stages 1 and 2 again and
+                /// leaves slice 3 as it was. With the target raised to 2 the
+                /// next write takes the whole set, as X18's remedy promises.
+                #[test]
+                fn read_slices_from_a_range_tape_restages_its_released_slices() {
+                    let mut f = fixture(B3, &["SQ-1", "SQ-2"]);
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SQ-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    assert_eq!(writes_of(&f, "SQ-1"), pairs(&[("b", "range")]));
+                    release_slices(&f, "b", &[1, 2]);
+                    for n in [1, 2] {
+                        let (path, released) = slice_row(&f, "b", n);
+                        assert!(path.is_none() && released.is_some(), "slice {n} released");
+                    }
+                    let kept = slice_row(&f, "b", 3);
+                    assert!(kept.0.is_some() && kept.1.is_none());
+
+                    let report = read_slices(
+                        &f.conn,
+                        &f.config,
+                        "SQ-1",
+                        "b",
+                        Some(1),
+                        &mut store,
+                        site(Operation::VolumeReadSlices),
+                    )
+                    .expect("the range reads back");
+                    assert_eq!(report.slices_read, 2, "the range's two slices");
+                    for n in [1, 2] {
+                        let (path, released) = slice_row(&f, "b", n);
+                        let path = path.expect("staged again");
+                        assert!(Path::new(&path).is_file(), "{path}");
+                        assert_eq!(released, None, "slice {n}'s release is cleared");
+                    }
+                    assert_eq!(slice_row(&f, "b", 3), kept, "slice 3 untouched");
+
+                    f.config.defaults.min_copies = 2;
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SQ-2", &mut store, false)
+                        .0
+                        .expect("staged again, the owed run is written");
+                    assert_eq!(writes_of(&f, "SQ-2"), pairs(&[("b", "completed")]));
+                    assert_eq!(position_of(&f, "SQ-2", "b", 1), 8);
                 }
 
                 /// The units of a hand-made span plan, `a` whole, `b` may span
