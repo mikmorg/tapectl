@@ -7384,6 +7384,40 @@ pub struct StagedSlice {
     pub prior: Option<String>,
 }
 
+/// Refuse `command` on the volume labelled `label` when it holds a range
+/// (1.7.0, #478; `layout-session.md` "From 1.7.0", ADR-0012 item 133):
+/// `volume rewrite` and compaction (`compact-read`, `compact-finish`, and
+/// `volume compact` through them) refuse such a volume, naming each range,
+/// its unit, version and the run of slices the volume holds. `why` says why
+/// the command does not carry a range; `outcome` what was left as it was.
+///
+/// Catalog only, so every caller asks it before the tape is read and before
+/// anything is staged or changed. Any `range` row the volume holds refuses,
+/// whatever its version's status: carrying a range forward is its own design
+/// and nothing needs it yet (item 133).
+pub(crate) fn refuse_range_holder(
+    conn: &Connection,
+    label: &str,
+    command: &str,
+    why: &str,
+    outcome: &str,
+) -> Result<()> {
+    let ranges = recorded_ranges(conn, label)?;
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = ranges.iter().map(RecordedRange::describe).collect();
+    let holds = if ranges.len() == 1 {
+        "a range, one run of the slices of a unit that spans cartridges"
+    } else {
+        "ranges, each one run of the slices of a unit that spans cartridges"
+    };
+    Err(TapectlError::Other(format!(
+        "{command} refused: volume \"{label}\" holds {holds}: {}. {why} {outcome}",
+        named.join(", ")
+    )))
+}
+
 /// Compact-read: read live encrypted slices from a volume to staging.
 /// "Live" means the snapshot is NOT reclaimable or purged.
 ///

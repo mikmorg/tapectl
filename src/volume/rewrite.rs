@@ -606,6 +606,20 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         )));
     }
 
+    // 1.7.0 (#478; ADR-0012 items 133 and 142): a source holding a range is
+    // refused by name, here, before the drive is asked anything and before a
+    // slice is staged. A rewrite plans every unit whole and never writes a
+    // range, because it may hold a unit's only copy.
+    write::refuse_range_holder(
+        conn,
+        source,
+        "volume rewrite",
+        "A rewrite may hold a unit's only copy, so it plans every unit whole to the fill \
+         ceiling and never writes a range (ADR-0012 item 142); carrying a range forward is \
+         its own design, not built in 1.7.0 (item 133).",
+        "Nothing was changed.",
+    )?;
+
     // An earlier rewrite of this volume that stopped before it retired
     // anything holds nothing but its staging: it is replaced. One that got
     // further is resumed, never restarted.
@@ -3192,6 +3206,91 @@ mod tests {
             .execute("UPDATE snapshots SET status = 'reclaimable'", [])
             .unwrap();
         assert!(refuse(&none, "SRC", "NEW").contains("no live slices"));
+    }
+
+    /// 1.7.0 (#478; `layout-session.md` "From 1.7.0", ADR-0012 items 133 and
+    /// 142): a source volume that holds a range is refused, naming the unit,
+    /// its version and the run of slices the volume holds, before the drive
+    /// is asked anything and before a slice is staged; `--dry-run`'s plan
+    /// refuses the same. Positive control: the same volume without the range
+    /// plans.
+    #[test]
+    fn a_source_holding_a_range_is_refused_naming_it_before_the_drive_is_asked() {
+        let s = scene(1);
+        let span = add_version(&s.w, "span", 1, "staged", &data("span", 3));
+        // The tape ended in it: slices 1-2 at files 8 and 9 are the range,
+        // and slice 3, planned past the end, is pending (item 121).
+        s.w.conn
+            .execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                 VALUES (?1, ?2, ?3, 'range', 1)",
+                params![span.stage_set_id, span.snapshot_id, s.src],
+            )
+            .unwrap();
+        let write_id = s.w.conn.last_insert_rowid();
+        for (i, (slice_id, bytes)) in span.slice_ids.iter().zip(&span.data).enumerate() {
+            let written = i < 2;
+            s.w.conn
+                .execute(
+                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status,
+                                                  sha256_on_volume)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        write_id,
+                        slice_id,
+                        (8 + i).to_string(),
+                        if written { "written" } else { "pending" },
+                        written.then(|| sha(bytes)),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let fake = Fake::new(&s);
+        let err = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .expect_err("a source holding a range")
+            .to_string();
+        assert_eq!(
+            err,
+            "volume rewrite refused: volume \"SRC\" holds a range, one run of the slices of a \
+             unit that spans cartridges: \"span\" v1 (slices 1-2). A rewrite may hold a unit's \
+             only copy, so it plans every unit whole to the fill ceiling and never writes a \
+             range (ADR-0012 item 142); carrying a range forward is its own design, not built \
+             in 1.7.0 (item 133). Nothing was changed."
+        );
+        assert!(fake.calls().is_empty(), "no drive step: {:?}", fake.calls());
+        assert!(
+            fake.asked.borrow().is_empty(),
+            "nothing was asked of the host or the drive: {:?}",
+            fake.asked.borrow()
+        );
+        assert!(staged_files(&s.w.config).is_empty(), "nothing was staged");
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<i64>(&s.w.conn, "SELECT COUNT(*) FROM pending_rewrites"),
+            0
+        );
+        assert_eq!(events_of(&s.w.conn, "rewrite_started"), 0);
+        assert_eq!(
+            plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW"))
+                .err()
+                .map(|e| e.to_string()),
+            Some(err),
+            "--dry-run refuses the same"
+        );
+
+        s.w.conn
+            .execute(
+                "DELETE FROM write_positions WHERE write_id = ?1",
+                params![write_id],
+            )
+            .unwrap();
+        s.w.conn
+            .execute("DELETE FROM writes WHERE id = ?1", params![write_id])
+            .unwrap();
+        plan(&s.w.conn, &s.w.config, &opts("SRC", "NEW")).expect("without the range it plans");
     }
 
     #[test]
