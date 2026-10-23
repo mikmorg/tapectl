@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-create \- Create a new archive set policy
 .SH SYNOPSIS
-\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-checksum\-mode\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-home\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-checksum\-mode\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-home\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create a new archive set policy
 .SH OPTIONS
@@ -109,6 +109,19 @@ false
 .TP
 \fB\-\-dirty\-on\-metadata\-change\fR \fI<DIRTY_ON_METADATA_CHANGE>\fR
 Treat a metadata\-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+true
+.IP \(bu 2
+false
+.RE
+.TP
+\fB\-\-allow\-spanning\fR \fI<ALLOW_SPANNING>\fR
+Let this set\*(Aqs units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
 .br
 
 .br
