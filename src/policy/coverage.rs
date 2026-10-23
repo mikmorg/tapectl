@@ -1758,23 +1758,26 @@ impl Distinctness {
 /// **The location** is the destination's `location_id` against the same
 /// union [`location_count_expr`] counts: an eligible copy's own
 /// `location_id`, and a warehouse deposit of it. A destination with no
-/// location shares none.
+/// location shares none. A volume holding a `range` of the version counts
+/// here as a whole copy's volume does (#478): [`location_count_expr`] counts
+/// a range holder's place for the slices it holds, so a destination at that
+/// place gets the same warning.
 pub fn copy_distinctness(
     conn: &Connection,
     dest_volume_id: i64,
     stage_set_ids: &[i64],
 ) -> crate::error::Result<Distinctness> {
-    // The existing copies of stage set ?1's version: completed writes of
-    // any stage set of the same snapshot, on an eligible volume other than
-    // the destination ?2. Aliases as the copy counts use them.
-    let copies_of = |extra_joins: &str, cond: &str, cols: &str| {
+    // The existing copies of stage set ?1's version: writes `holds` admits
+    // of any stage set of the same snapshot, on an eligible volume other
+    // than the destination ?2. Aliases as the copy counts use them.
+    let copies_of = |holds: &str, extra_joins: &str, cond: &str, cols: &str| {
         format!(
             "SELECT {cols}
              FROM stage_sets ss
              JOIN snapshots cs ON cs.id = ss.snapshot_id
              JOIN units u ON u.id = cs.unit_id
              JOIN stage_sets css ON css.snapshot_id = cs.id
-             JOIN writes cw ON cw.stage_set_id = css.id AND cw.status = 'completed'
+             JOIN writes cw ON cw.stage_set_id = css.id AND {holds}
              JOIN volumes cv ON cv.id = cw.volume_id
              JOIN volumes d ON d.id = ?2
              {extra_joins}
@@ -1783,6 +1786,7 @@ pub fn copy_distinctness(
         )
     };
     let same_cartridge = copies_of(
+        "cw.status = 'completed'",
         "JOIN cartridge_volumes cm ON cm.volume_id = cv.id
          JOIN cartridge_volumes dm ON dm.volume_id = d.id AND dm.unmounted_at IS NULL
          JOIN cartridges c ON c.id = dm.cartridge_id",
@@ -1790,15 +1794,19 @@ pub fn copy_distinctness(
         "u.name, cs.version, cv.label, c.barcode, 0",
     );
     // The location union `location_count_expr` counts: the tape's own
-    // shelf, and a warehouse deposit of it.
+    // shelf, and a warehouse deposit of it; a whole copy's or a range's
+    // (`holds_slices`, the counts' own reading of a holder).
+    let holds = holds_slices("cw");
     let shared_location = format!(
         "{} UNION {}",
         copies_of(
+            &holds,
             "JOIN locations l ON l.id = d.location_id",
             "cv.location_id = d.location_id",
             "u.name, cs.version, cv.label, l.name, 0",
         ),
         copies_of(
+            &holds,
             "JOIN locations l ON l.id = d.location_id
              JOIN volume_deposits cd ON cd.volume_id = cv.id",
             "cd.location_id = d.location_id",
@@ -2779,6 +2787,36 @@ pub(crate) mod tests {
             .warning("L6-0009")
             .unwrap()
             .contains("a warehouse deposit of volume \"L6-0003\""));
+    }
+
+    /// #478: a volume holding a `range` of the version is a holder of it
+    /// at its place, as `location_count_expr` counts it, so a destination at
+    /// that place gets the same warning a whole copy's place gives. A `cut`
+    /// write left nothing there, and is no copy at the place.
+    #[test]
+    fn a_destination_at_a_range_holders_place_gets_the_same_warning() {
+        let (conn, dest, ss) = distinctness_fixture(Some("home"), "BC1", "BC2");
+        conn.execute(
+            "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+            params![ss],
+        )
+        .unwrap();
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert_eq!(d.shared_location, vec![copy("L6-0003", "home", false)]);
+        let warning = d.warning("L6-0009").unwrap();
+        assert!(
+            warning.contains("location \"home\"")
+                && warning.contains("photos v1 (volume \"L6-0003\")"),
+            "{warning}"
+        );
+
+        conn.execute(
+            "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
+            params![ss],
+        )
+        .unwrap();
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert!(d.shared_location.is_empty(), "{d:?}");
     }
 
     /// Copies are counted per version (ADR-0012): another stage set of the
