@@ -797,6 +797,8 @@ fn dispatch(
                 // cut, and what was recorded of the ending on a found row.
                 obj["ended_after"] = serde_json::json!(report.ended_after);
                 obj["cut_units"] = serde_json::json!(report.cut_units);
+                // #478: additive. The cut units above that may span.
+                obj["cut_spanning_units"] = serde_json::json!(report.cut_spanning_units);
                 obj["ended_after_recorded"] = serde_json::json!(report.ended_after_recorded);
                 obj["volume_ended_after_mismatch"] =
                     serde_json::json!(report.volume_ended_after_mismatch);
@@ -1270,12 +1272,32 @@ fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
              after tape file {k}, and every file its plan lists after that is not on it \
              (volume-format-v2.md §4.2)"
         ));
-        if !report.cut_units.is_empty() {
+        // #478: a cut spannable unit is said apart from a cut whole unit.
+        // Its version restores from tapes whose ranges together hold every
+        // slice, in slice order, as well as from a whole copy (ADR-0012 items
+        // 101 and 131; volume-format-v2.md §4.4).
+        let whole: Vec<&str> = report
+            .cut_units
+            .iter()
+            .filter(|u| !report.cut_spanning_units.contains(u))
+            .map(String::as_str)
+            .collect();
+        if !whole.is_empty() {
             lines.push(format!(
                 "    cut by the early end, recorded \"cut\" and NOT a copy on this tape: {}. \
                  Each is restorable only from another tape that holds it whole; `tapectl \
                  catalog locate <UNIT>` names the ones this catalog knows",
-                report.cut_units.join(", ")
+                whole.join(", ")
+            ));
+        }
+        if !report.cut_spanning_units.is_empty() {
+            lines.push(format!(
+                "    spanning units cut by the early end, none of their slices on this tape, \
+                 recorded \"cut\" and NOT a copy on this tape: {}. Each is restorable from \
+                 another tape that holds it whole, or from tapes whose ranges together hold \
+                 every slice, read in slice order (volume-format-v2.md §4.4); `tapectl catalog \
+                 locate <UNIT>` names the holders this catalog knows",
+                report.cut_spanning_units.join(", ")
             ));
         }
         if report.ended_after_recorded {
@@ -1848,6 +1870,48 @@ mod tests {
         assert!(text.contains("tapectl volume verify L6-0042"), "{text}");
         assert!(text.contains("tapectl catalog locate <UNIT>"), "{text}");
         assert!(!text.contains("warning:"), "{text}");
+
+        // #478: a cut spannable unit is not said to need a whole copy; a
+        // whole unit cut on the same tape still is.
+        let spanning = RebuildReport {
+            label: "L6-0042".to_string(),
+            ended_after: Some(17),
+            cut_units: vec!["bravo v1".to_string(), "video v2".to_string()],
+            cut_spanning_units: vec!["video v2".to_string()],
+            ..Default::default()
+        };
+        let lines = super::short_tape_lines(&spanning);
+        let whole = lines
+            .iter()
+            .find(|l| l.contains("restorable only from another tape that holds it whole"))
+            .expect("the whole unit's line");
+        assert!(
+            whole.contains("bravo v1") && !whole.contains("video v2"),
+            "{whole}"
+        );
+        let span = lines
+            .iter()
+            .find(|l| l.contains("spanning units cut by the early end"))
+            .expect("the spanning unit's line");
+        assert!(
+            span.contains("video v2") && !span.contains("bravo v1"),
+            "{span}"
+        );
+        assert!(span.contains("ranges together hold every slice"), "{span}");
+        assert!(span.contains("NOT a copy"), "{span}");
+        assert!(!span.contains("only from"), "{span}");
+        let only_spanning = RebuildReport {
+            label: "L6-0042".to_string(),
+            ended_after: Some(17),
+            cut_units: vec!["video v2".to_string()],
+            cut_spanning_units: vec!["video v2".to_string()],
+            ..Default::default()
+        };
+        let text = super::short_tape_lines(&only_spanning).join("\n");
+        assert!(
+            !text.contains("restorable only from another tape that holds it whole"),
+            "{text}"
+        );
 
         let disagrees = RebuildReport {
             label: "L6-0042".to_string(),

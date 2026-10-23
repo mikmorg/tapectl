@@ -252,6 +252,12 @@ pub struct RebuildReport {
     /// `cut` (ADR-0012 item 112): never a copy, positions after the end not
     /// `written`. A tape fact, listed whether or not this run inserted rows.
     pub cut_units: Vec<String>,
+    /// The entries of [`Self::cut_units`] whose block states `may_span`
+    /// (#478): a spannable set the tape holds none of. Unlike a whole unit,
+    /// such a version restores from tapes whose ranges together hold every
+    /// slice, not only from a tape that holds it whole (ADR-0012 items 101
+    /// and 131).
+    pub cut_spanning_units: Vec<String>,
 
     // --- spanning (#478, ADR-0012 items 121, 128 and 130) -------------------
     //
@@ -2285,9 +2291,13 @@ fn insert_all(
         // ways instead, as confirm splits its row ([`tape_split`]).
         let written = tape_split(unit, sealed, ended_after);
         match written {
-            Written::Cut => report
-                .cut_units
-                .push(format!("{} v{}", unit.name, unit.snapshot_version)),
+            Written::Cut => {
+                let cut = format!("{} v{}", unit.name, unit.snapshot_version);
+                if unit.may_span {
+                    report.cut_spanning_units.push(cut.clone());
+                }
+                report.cut_units.push(cut);
+            }
             Written::Range {
                 first_slice,
                 last_slice,
