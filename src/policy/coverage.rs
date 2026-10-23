@@ -816,6 +816,11 @@ impl SliceCount<'_> {
         }
     }
 
+    /// The count at the slice `slice`: [`Self::whole`] plus [`Self::range_at`].
+    fn at_slice(&self, slice: &str) -> String {
+        format!("({} + {})", self.whole(), self.range_at(slice))
+    }
+
     /// The count at the set's least-covered slice. Its slices are walked only
     /// when it has a `range` row: otherwise every slice counts the whole
     /// holders alone, and so does a set with no slice rows (item 138).
@@ -1006,6 +1011,112 @@ pub fn location_count_expr(q: &CoverageQuery) -> String {
 /// versions it is taken across them all, as it has always been.
 pub fn deposit_count_expr(q: &CoverageQuery) -> String {
     scope_sum(q, Counted::Deposits)
+}
+
+// ── A stage set's slices, one by one (#478; ADR-0012 items 122, 127-129) ──
+
+/// One slice of a stage set and what holds it, counted as [`copy_count_expr`]
+/// and [`location_count_expr`] count it at that slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceCopies {
+    pub stage_slice_id: i64,
+    pub slice_number: i64,
+    /// The credited [`eligible`] volumes holding the slice, plus their
+    /// warehouse deposits.
+    pub copies: i64,
+    /// The distinct places holding it: an eligible holder's shelf, a
+    /// deposit's location.
+    pub locations: i64,
+}
+
+/// Every slice of `stage_set_id`, in slice order, with its copies and
+/// places: the per-slice view of the one derivation the counts above are made
+/// of. A version's copies are, per stage set, the least of these, summed over
+/// its stage sets; so for a version with one stage set, the fewest `copies`
+/// here IS its [`copy_count_expr`]. Item 138's credit is taken among the
+/// version's stage sets, as for the version's own count: a slice of a staging
+/// whose tape is credited to a lower staging reads short here exactly when the
+/// version's count does.
+///
+/// For the plan and the release (`layout-session.md` "Spanning"): a slice is
+/// OWED while its `copies` are below its set's copy floor ([`copy_floor`]),
+/// and a slice whose copies meet the floor is released from staging (item
+/// 129). A stage set with no slice rows has none to list, and an unknown id
+/// lists none.
+pub fn slice_copies(
+    conn: &Connection,
+    stage_set_id: i64,
+) -> crate::error::Result<Vec<SliceCopies>> {
+    let count = |counted| SliceCount {
+        set: "css.id",
+        partition: Partition::Version("css.snapshot_id"),
+        exclude: None,
+        counted,
+    };
+    let sql = format!(
+        "SELECT cl.id, cl.slice_number, {}, {}
+         FROM stage_sets css JOIN stage_slices cl ON cl.stage_set_id = css.id
+         WHERE css.id = ?1
+         ORDER BY cl.slice_number",
+        count(Counted::Copies).at_slice("cl.id"),
+        count(Counted::Places).at_slice("cl.id"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![stage_set_id], |r| {
+            Ok(SliceCopies {
+                stage_slice_id: r.get(0)?,
+                slice_number: r.get(1)?,
+                copies: r.get(2)?,
+                locations: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// A SQL boolean: every slice of the stage set `set_expr` is on a SEALED
+/// volume. This is ADR-0012 item 128's promotion rule (`layout-session.md`
+/// "Promotion and the retire floor"): a spanning version becomes `current`
+/// once every slice of one of its stage sets is on a sealed volume. Confirm,
+/// the adoption of a lost write and `catalog rebuild` ask it in the
+/// transaction that records the seal or the rebuild.
+///
+/// A slice is on a volume when the volume holds it as the counts above read
+/// a holder: a `completed` write of the set, or a `range` write with the
+/// slice `written`. "Sealed" is the volume's status alone (coordinator fork
+/// X33): a verify's quarantine does not undo a seal, and the rule asks what
+/// the tapes hold, not what counts as a copy.
+///
+/// `also_sealed` is SQL for one volume id counted as sealed whatever its
+/// status says, "the volume being sealed counted": `catalog rebuild` records
+/// a tape's seal without ever changing a volume's status (item 130), so a
+/// rebuilt tape on an `initialized` row names itself here. `None` when the
+/// caller has already moved the status in its transaction.
+///
+/// A stage set with no slice rows has nothing on any tape and never meets
+/// the rule: a whole write is promoted by confirm's own rule, not this one.
+/// Embeds the aliases `ql`, `qw`, `qv` and `qp`; `set_expr` is the caller's.
+pub fn every_slice_on_sealed_volume_sql(set_expr: &str, also_sealed: Option<&str>) -> String {
+    let sealed = match also_sealed {
+        Some(volume) => format!("({} OR qv.id = {volume})", status_in("qv", &["sealed"])),
+        None => status_in("qv", &["sealed"]),
+    };
+    format!(
+        "(EXISTS (SELECT 1 FROM stage_slices ql WHERE ql.stage_set_id = {set_expr})
+          AND NOT EXISTS (
+            SELECT 1 FROM stage_slices ql
+             WHERE ql.stage_set_id = {set_expr}
+               AND NOT EXISTS (
+                 SELECT 1 FROM writes qw JOIN volumes qv ON qv.id = qw.volume_id
+                  WHERE qw.stage_set_id = {set_expr} AND {sealed}
+                    AND (qw.status = 'completed'
+                         OR (qw.status = 'range'
+                             AND EXISTS (SELECT 1 FROM write_positions qp
+                                          WHERE qp.write_id = qw.id
+                                            AND qp.stage_slice_id = ql.id
+                                            AND qp.status = 'written'))))))"
+    )
 }
 
 // ── Named required locations (issue #348; ADR-0012 2026-10-07 items 15, 34) ──
@@ -5202,5 +5313,156 @@ pub(crate) mod tests {
             1,
             "each slice is at one place, though no one place holds them all"
         );
+    }
+
+    /// `(slice_number, copies, locations)` of each slice of `set`.
+    fn per_slice(c: &SpanCatalog, set: i64) -> Vec<(i64, i64, i64)> {
+        slice_copies(&c.conn, set)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.slice_number, s.copies, s.locations))
+            .collect()
+    }
+
+    /// `slice_copies` on item 93's layout: every slice on two tapes, its
+    /// fewest copies the version's count; with tape 3 away, slices 3..6
+    /// owe a copy. Deposits count for the slices of their volume, places
+    /// once each per slice.
+    #[test]
+    fn slice_copies_counts_each_slice_as_the_version_count_does() {
+        let (c, snap, set, [_t1, t2, t3]) = item_93();
+        let both = per_slice(&c, set);
+        assert_eq!(
+            both,
+            (1..=6).map(|n| (n, 2, 1)).collect::<Vec<_>>(),
+            "two tapes, one place, at every slice"
+        );
+        assert_eq!(
+            both.iter().map(|s| s.1).min(),
+            Some(c.copies(snap)),
+            "the least-covered slice is the version's count"
+        );
+
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![t3],
+            )
+            .unwrap();
+        c.deposit(t2, "glacier");
+        assert_eq!(
+            per_slice(&c, set),
+            vec![
+                (1, 3, 2),
+                (2, 3, 2),
+                (3, 2, 2),
+                (4, 2, 2),
+                (5, 2, 2),
+                (6, 2, 2),
+            ],
+            "tape 2 and its deposit at every slice, tape 1 at 1..2 only"
+        );
+        assert_eq!(c.copies(snap), 2);
+        assert_eq!(c.places(snap), 2);
+    }
+
+    /// The empty answers: a set nothing holds lists every slice at zero, a set
+    /// with no slice rows (and an unknown id) lists nothing.
+    #[test]
+    fn slice_copies_of_a_set_nothing_holds_is_every_slice_at_zero() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "staged");
+        let set = c.stage_set(snap, 3);
+        assert_eq!(per_slice(&c, set), vec![(1, 0, 0), (2, 0, 0), (3, 0, 0)]);
+        let empty = c.stage_set(snap, 0);
+        assert!(slice_copies(&c.conn, empty).unwrap().is_empty());
+        assert!(slice_copies(&c.conn, 9999).unwrap().is_empty());
+    }
+
+    /// Item 138 at the slice: a staging whose tape is credited to a lower
+    /// staging reads no copy there, as the version's count does.
+    #[test]
+    fn slice_copies_takes_item_138s_credit() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 2);
+        let s2 = c.stage_set(snap, 2);
+        let tape = c.volume("BOTH", Some("home"));
+        c.whole(s1, 2, tape);
+        c.whole(s2, 2, tape);
+        assert_eq!(per_slice(&c, s1), vec![(1, 1, 1), (2, 1, 1)]);
+        assert_eq!(per_slice(&c, s2), vec![(1, 0, 0), (2, 0, 0)]);
+        assert_eq!(c.copies(snap), 1);
+    }
+
+    fn promoted(c: &SpanCatalog, set: i64, also: Option<i64>) -> bool {
+        let also = also.map(|v| v.to_string());
+        c.conn
+            .query_row(
+                &format!(
+                    "SELECT {}",
+                    every_slice_on_sealed_volume_sql("?1", also.as_deref())
+                ),
+                params![set],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Item 128's promotion rule, both ways: tape 1's range alone does not
+    /// promote; with tape 3's range on a sealed volume it does, and only once
+    /// tape 3 is sealed (or named as the volume being sealed). A quarantined
+    /// condition does not unseal a tape (X33); a retired one holds nothing.
+    #[test]
+    fn every_slice_on_a_sealed_volume_is_items_128_rule() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "staged");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", None);
+        c.range(set, t1, 1, 2, 6);
+        assert!(!promoted(&c, set, None), "slices 3..6 are on no tape");
+
+        let t3 = c.volume("SPAN-3", None);
+        c.range(set, t3, 3, 6, 6);
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+                params![t3],
+            )
+            .unwrap();
+        assert!(!promoted(&c, set, None), "tape 3 is not sealed yet");
+        assert!(
+            promoted(&c, set, Some(t3)),
+            "the volume being sealed counted"
+        );
+        assert!(
+            !promoted(&c, set, Some(t1)),
+            "naming another volume does not"
+        );
+
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'sealed', observed_condition = 'quarantined'
+                  WHERE id = ?1",
+                params![t3],
+            )
+            .unwrap();
+        assert!(promoted(&c, set, None), "sealed, whatever its condition");
+
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![t1],
+            )
+            .unwrap();
+        assert!(!promoted(&c, set, None), "1..2 were only on tape 1");
+        let t2 = c.volume("SPAN-2", None);
+        c.whole(set, 6, t2);
+        assert!(promoted(&c, set, None), "a whole write holds every slice");
+
+        // A set with no slice rows is never promoted by this rule.
+        let empty = c.stage_set(snap, 0);
+        c.whole(empty, 0, t2);
+        assert!(!promoted(&c, empty, None));
     }
 }
