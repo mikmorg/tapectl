@@ -1808,7 +1808,11 @@ keeps no slice on disk: it feeds dar from each tape in turn, so it needs
 every cartridge at hand, loaded when asked.
 
 Either way it waits at each change of cartridge for as long as you take,
-reading your answer from its input, and `quit` stops it. A slice that fails
+reading your answer from its input, and `quit` stops it. So does `done`:
+here it does not go on without the slice, as it does after `--swap-tapes`
+("If a slice or a file is damaged"); either one ends the restore and
+discards the slices read so far (with `--stream-tapes`, the files dar has
+written are only part of the unit). A slice that fails
 its hash or will not read is asked for again, by default, from another
 cartridge that holds it; with `--stream-tapes` it ends the run. A run that
 is killed leaves its scratch directory inside `--to` (or `--scratch DIR`),
@@ -5049,6 +5053,14 @@ span_pos() { # <slice number>
   awk -F'|' -v n="$1" '$1 == n { print $2; exit }' "$WORK/span.take"
 }
 
+# Said at each prompt for another cartridge, before "Load ...": the one in the
+# drive comes out first. No tape device is open while a prompt waits, so mt
+# offline from another terminal is safe then.
+eject_first() {
+  info "First eject the cartridge now in the drive: its eject button, or mt -f $DEVICE offline in another"
+  info "terminal, which is safe while this waits (no tape device is held open)."
+}
+
 # What the prompt for the next cartridge says: the slice needed, the tapes an
 # index this run opened names for it, and how a cartridge is taken.
 span_ask() {
@@ -5065,6 +5077,7 @@ span_ask() {
     info "after it): --where on the newest tape you hold names the tapes, and the slices each holds."
   fi
   HOLDER_SLICE=""
+  eject_first
   info "Load the cartridge that holds slice $SPAN_NEED into $DEVICE, wait until the drive is ready, then press ENTER."
   info "A cartridge is taken only when its front index lists that sha256 at a position its seal marker covers:"
   info "its label is never taken for it. This waits for as long as you take. Type quit and ENTER (or end the"
@@ -5072,6 +5085,15 @@ span_ask() {
     info "input) to stop: nothing is restored without every slice --path needs."
   else
     info "input) to stop: nothing of the unit is restored without every slice."
+  fi
+  # done, here, is quit: a restore across tapes cannot go on without a slice
+  # (swap_loop, span_stop), unlike --swap-tapes, where done goes on.
+  if [ "$SPAN_RESTORE" = stream ]; then
+    info "done or quit STOPS this restore: it does not go on without the slice, and the files dar has"
+    info "written so far are only part of the unit."
+  else
+    info "done or quit STOPS this restore and discards the slices read so far, with the scratch directory:"
+    info "it does not go on without the slice."
   fi
 }
 
@@ -6462,6 +6484,7 @@ swap_loop() {
       fi
       [ -s "$WORK/needed.txt" ] || return 0
       print_needs -
+      eject_first
       info "Load a cartridge that holds copies of these slices into $DEVICE (any tape whose front index lists"
       info "the sha256 values above; it need not be a copy of the whole tape), wait until the drive is ready,"
       info "then press ENTER. Type done and ENTER (or end the input) to go on without them."
@@ -7397,7 +7420,7 @@ case "${1:-}" in
   echo "      which slice it needs next and waits, for as long as you take, for you to load another"
   echo "      cartridge and press ENTER. It takes that cartridge only when its front index lists the"
   echo "      slice's sha256 at a position its seal marker covers, never by its label, and otherwise"
-  echo "      says why and asks again; quit stops it. By default each tape's slices are kept, still"
+  echo "      says why and asks again; done or quit stops it. By default each tape's slices are kept, still"
   echo "      encrypted, in a scratch directory inside --to (or --scratch DIR) until all are read,"
   echo "      and dar then runs once over them: the disk needs room for the whole unit's encrypted"
   echo "      slices as well as its files, checked before a slice is read; a run that is killed"
@@ -9037,6 +9060,47 @@ mod tests {
         ] {
             assert!(script.contains(does), "{does:?}");
         }
+    }
+
+    /// The fresh read, m1: at the prompt of a restore across tapes `done` is
+    /// `quit` (swap_loop calls span_stop for both), and the exit trap removes
+    /// the scratch with the slices read. File 1 taught `done` as "go on
+    /// without"; the prompt, the help and File 1 now say that it stops.
+    #[test]
+    fn fresh_read_478_m1_done_at_the_cross_tape_prompt_stops_the_restore() {
+        let g = generate_system_guide_v2_for_media("FR03", 20, "LTO-6");
+        let sec = flat_text(guide_section(&g, "A unit across tapes"));
+        assert!(
+            sec.contains("and `quit` stops it. So does `done`: here it does not go on without the slice, as it does after `--swap-tapes` (\"If a slice or a file is damaged\"); either one ends the restore and discards the slices read so far (with `--stream-tapes`, the files dar has written are only part of the unit)."),
+            "{sec}"
+        );
+        let script = generate_restore_script_v2("FR03", 20);
+        for said in [
+            "    info \"done or quit STOPS this restore: it does not go on without the slice, and the files dar has\"\n    info \"written so far are only part of the unit.\"\n",
+            "    info \"done or quit STOPS this restore and discards the slices read so far, with the scratch directory:\"\n    info \"it does not go on without the slice.\"\n",
+            "says why and asks again; done or quit stops it.",
+            // What it describes: both words reach span_stop.
+            "    [dD]one | DONE | q | quit)\n      [ -z \"$SPAN_NEED\" ] || span_stop\n",
+        ] {
+            assert_eq!(script.matches(said).count(), 1, "{said:?}");
+        }
+    }
+
+    /// The fresh read, m10: neither prompt for another cartridge said to
+    /// eject the one in the drive. Both now say it first, with the drive's
+    /// button or `mt offline` from another terminal, which is safe because
+    /// no tape device is open while a prompt waits.
+    #[test]
+    fn fresh_read_478_m10_each_cartridge_prompt_says_to_eject_first() {
+        let script = generate_restore_script_v2("FR04", 20);
+        for said in [
+            "eject_first() {\n  info \"First eject the cartridge now in the drive: its eject button, or mt -f $DEVICE offline in another\"\n  info \"terminal, which is safe while this waits (no tape device is held open).\"\n}\n",
+            "  eject_first\n  info \"Load the cartridge that holds slice $SPAN_NEED into $DEVICE,",
+            "      eject_first\n      info \"Load a cartridge that holds copies of these slices into $DEVICE",
+        ] {
+            assert_eq!(script.matches(said).count(), 1, "{said:?}");
+        }
+        assert_eq!(script.matches("eject_first").count(), 3);
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query

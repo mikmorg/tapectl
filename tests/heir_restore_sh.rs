@@ -2107,6 +2107,10 @@ impl Heir {
 /// next slice of a unit held across tapes.
 const SPAN_PROMPT: &str = "Load the cartridge that holds slice ";
 
+/// The line before each prompt for another cartridge (the fresh read of File
+/// 1, #478 m10), as `Heir::run_prompted_at` sets `TAPE_DEVICE`.
+const EJECT_FIRST: &str = "First eject the cartridge now in the drive: its eject button, or mt -f /dev/nst-fake offline in another";
+
 fn unit(name: &str) -> UnitOnTape {
     template()
         .units
@@ -11292,13 +11296,32 @@ fn the_prompt_waits_without_a_time_limit_and_holds_no_device() {
 #[test]
 fn quitting_at_the_prompt_restores_nothing_and_says_so() {
     let b = span_box();
-    for (stream, reply) in [(false, Some("quit")), (false, None), (true, Some("quit"))] {
+    // `done` is `quit` here (the fresh read of File 1, #478 m1): a restore
+    // across tapes does not go on without a slice, and the prompt says so.
+    for (stream, reply) in [
+        (false, Some("quit")),
+        (false, Some("done")),
+        (false, None),
+        (true, Some("quit")),
+        (true, Some("done")),
+    ] {
         let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
         let dest = h.sub("restored");
         let extra: &[&str] = if stream { &["--stream-tapes"] } else { &[] };
         let args = big_args(&h, &dest, extra);
         let (code, text) = h.run_prompted(&strs(&args), |_, _| reply.map(str::to_string));
         assert_eq!(code, 1, "{stream} {reply:?}: {text}");
+        let says = if stream {
+            "done or quit STOPS this restore: it does not go on without the slice, and the files dar has"
+        } else {
+            "done or quit STOPS this restore and discards the slices read so far, with the scratch directory:"
+        };
+        assert!(text.contains(says), "{stream} {reply:?}: {text}");
+        // And to eject the cartridge in the drive before loading the next (m10).
+        let eject = text
+            .find(EJECT_FIRST)
+            .unwrap_or_else(|| panic!("the eject line: {text}"));
+        assert!(eject < text.find(SPAN_PROMPT).unwrap(), "{text}");
         let fatal = flat(text.split("FATAL:").nth(1).expect("a FATAL"));
         assert!(
             fatal.contains("stopped before slice 3 of 'big' (version 2)"),
@@ -12009,6 +12032,8 @@ fn swap_tapes_takes_a_slice_from_a_range_only_at_a_position_its_seal_covers() {
     assert!(text.contains("RESTORE COMPLETE"), "{text}");
     assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
     assert_eq!(text.matches(SWAP_PROMPT).count(), 3, "{text}");
+    // Each prompt says to eject the cartridge in the drive first (#478 m10).
+    assert_eq!(text.matches(EJECT_FIRST).count(), 3, "{text}");
     for needle in [
         format!(
             "unit 'big' slice 4, {} bytes, sha256 {}",
