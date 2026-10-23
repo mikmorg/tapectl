@@ -7424,7 +7424,7 @@ pub(crate) fn refuse_range_holder(
 }
 
 /// Why compaction does not carry a range ([`refuse_range_holder`]).
-const COMPACTION_CARRIES_NO_RANGE: &str =
+pub(crate) const COMPACTION_CARRIES_NO_RANGE: &str =
     "Compaction carries a volume's live units to another tape whole, and a range is not a \
      whole unit: carrying one forward is its own design, not built in 1.7.0 (ADR-0012 item \
      133).";

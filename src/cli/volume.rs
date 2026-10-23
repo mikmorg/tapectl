@@ -2494,6 +2494,15 @@ pub fn run(
                 ));
             }
             let device = read_device(config, device.as_deref())?;
+            // #478 (ADR-0012 item 133): a volume holding a range is refused
+            // from the catalog alone, before the drive is opened at all.
+            write::refuse_range_holder(
+                conn,
+                label,
+                "volume compact-read",
+                write::COMPACTION_CARRIES_NO_RANGE,
+                "Nothing was read or staged.",
+            )?;
             // Issue #166: same fact check as `Identify`, before the store
             // is opened.
             let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeCompactRead);
@@ -2636,6 +2645,15 @@ pub fn run(
                 crate::cli::consent::stdin_is_terminal(),
                 label,
                 to.as_deref(),
+            )?;
+            // #478 (ADR-0012 item 133): a volume holding a range is refused
+            // from the catalog alone, before step 1 opens the drive.
+            write::refuse_range_holder(
+                conn,
+                label,
+                "volume compact",
+                write::COMPACTION_CARRIES_NO_RANGE,
+                "Nothing was read or staged.",
             )?;
             // Issue #166: step 1 only reads, so it gets the same fact check
             // as every other read path, before its store is opened.
