@@ -16,7 +16,7 @@ Output in JSON format
 Unit name
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
-Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive
+Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
 .TP
 \fB\-\-to\fR \fI<TO>\fR
 Destination directory
@@ -56,7 +56,7 @@ Restore into a destination that already holds files, replacing any that collide.
 Skip the free\-space check (the unit\*(Aqs size when it streams; about twice that when its slices are spooled, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
 .TP
 \fB\-\-spool\fR
-Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit\*(Aqs size with the scratch directory and \-\-to on one disk
+Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit\*(Aqs size with the scratch directory and \-\-to on one disk. Across cartridges too: a version held across cartridges is read from each in turn into the scratch directory, and dar extracts once the last is read; without it the slices stream into one extraction across the swaps
 .TP
 \fB\-\-key\fR \fI<FILE>\fR
 An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in this command only; repeat for several. It is added to the home\*(Aqs own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild \-\-from\-volume \-\-key`. A file that is not an identity is refused, naming it, before the drive is opened

@@ -22,7 +22,7 @@ Show what would be done without making changes. Commands that cannot preview ref
 Unit name
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
-Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
+Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1, as for `restore unit`; the others are asked for in slice order
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

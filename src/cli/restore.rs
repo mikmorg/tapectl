@@ -20,7 +20,11 @@ pub enum RestoreCommands {
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
         /// refused, naming what File 0 says. Not with --dry-run, which
-        /// opens no drive
+        /// opens no drive. For a version held across cartridges (a range
+        /// on this tape), this tape (or the loaded one) must hold its slice
+        /// 1: the others are asked for in slice order, by label, sticker
+        /// and chip serial, and a tape that does not hold slice 1 is
+        /// refused, naming the ones that do
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
@@ -59,7 +63,11 @@ pub enum RestoreCommands {
         /// Decrypt every slice to the scratch directory before dar extracts
         /// them, even when the unit could stream (its isolated catalogue
         /// on disk). Needs about twice the unit's size with the scratch
-        /// directory and --to on one disk
+        /// directory and --to on one disk. Across cartridges too: a version
+        /// held across cartridges is read from each in turn into the
+        /// scratch directory, and dar extracts once the last is read;
+        /// without it the slices stream into one extraction across the
+        /// swaps
         #[arg(long)]
         spool: bool,
         /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
@@ -99,7 +107,10 @@ pub enum RestoreCommands {
         /// A unit to restore; repeat for several. Without it, every unit
         /// the volume holds whole: on a tape that ended early (a short
         /// seal), the units the end cut are named, with a volume that holds
-        /// each whole, and left out
+        /// each whole, and left out; so is a unit of which the tape holds
+        /// only a range (a version held across cartridges), with the
+        /// `restore unit` that reads it. A unit named that the tape does not
+        /// hold whole is refused before the drive is opened
         #[arg(long = "unit", value_name = "NAME")]
         units: Vec<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
@@ -157,7 +168,10 @@ pub enum RestoreCommands {
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
-        /// refused, naming what File 0 says
+        /// refused, naming what File 0 says. For a version held across
+        /// cartridges (a range on this tape), this tape (or the loaded one)
+        /// must hold its slice 1, as for `restore unit`; the others are
+        /// asked for in slice order
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
