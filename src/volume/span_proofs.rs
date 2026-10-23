@@ -1170,3 +1170,206 @@ fn item_131_restore_crosses_three_written_ranges() {
     assert_restored(&h, W94, dest.path());
     assert!(b.asked.is_empty());
 }
+
+// ── catalog rebuild of each tape (items 130 and 144) ──
+
+/// Every write: `(label, unit, status, may_span, snapshot status)`.
+type WriteRow = (String, String, String, bool, String);
+
+fn write_rows(conn: &Connection) -> Vec<WriteRow> {
+    conn.prepare(
+        "SELECT v.label, u.name, w.status, w.may_span, s.status FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          ORDER BY v.label, u.name",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// Every position: `(label, unit, slice, position, status)`.
+type PositionRow = (String, String, i64, i64, String);
+
+fn position_rows(conn: &Connection) -> Vec<PositionRow> {
+    conn.prepare(
+        "SELECT v.label, u.name, sl.slice_number, CAST(wp.position AS INTEGER), wp.status
+           FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          ORDER BY v.label, u.name, sl.slice_number",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// Every slice row: `(unit, slice, size, encrypted size, sha256_plain,
+/// sha256_encrypted)`.
+type SliceRow = (String, i64, i64, i64, String, String);
+
+fn slice_rows(conn: &Connection) -> Vec<SliceRow> {
+    conn.prepare(
+        "SELECT u.name, sl.slice_number, sl.size_bytes, sl.encrypted_bytes, sl.sha256_plain,
+                sl.sha256_encrypted
+           FROM stage_slices sl
+           JOIN stage_sets ss ON ss.id = sl.stage_set_id
+           JOIN snapshots s ON s.id = ss.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          ORDER BY u.name, sl.slice_number",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// Every volume: `(label, sealed, ended_after)`.
+fn volume_rows(conn: &Connection) -> Vec<(String, bool, Option<i64>)> {
+    conn.prepare("SELECT label, sealed_at IS NOT NULL, ended_after FROM volumes ORDER BY label")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// `catalog rebuild --from-volume` of `label` into `fresh`, with the
+/// operator's key, from a copy of the recorded medium.
+fn rebuild(h: &Home, fresh: &Connection, label: &str) -> crate::volume::rebuild::RebuildReport {
+    let scratch = TempDir::new().unwrap();
+    let mut store = copy_of(&h.tapes[label]);
+    crate::volume::rebuild::rebuild_from_store(
+        fresh,
+        &mut store,
+        &h.operator_identities(),
+        Some(label),
+        "recovered",
+        Some(BACKEND),
+        scratch.path(),
+        "memstore",
+        ContactSite::new(
+            &h.config,
+            Operation::CatalogRebuild,
+            "memstore",
+            Medium::NoBackend,
+        ),
+    )
+    .unwrap_or_else(|e| panic!("rebuild of {label}: {e}"))
+}
+
+/// Items 130 and 144 on item 93's tapes, written by the real write: each
+/// tape rebuilt into an empty catalog, in every order, gives the writing
+/// catalog's rows: the writes (`range`, `completed`, `range` and the whole
+/// units'), every position and its status, every slice row with the hashes
+/// staged, and each volume's ending. The spanning version is `staged`
+/// exactly while no rebuilt set of sealed volumes holds every slice, and
+/// the rebuild that completes it promotes it (item 144); at the end it has
+/// its two copies.
+#[test]
+fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_rows() {
+    let h = written_93();
+    let (writes, positions, slices, volumes) = (
+        write_rows(&h.conn),
+        position_rows(&h.conn),
+        slice_rows(&h.conn),
+        volume_rows(&h.conn),
+    );
+    let orders: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let dir = TempDir::new().unwrap();
+        let fresh = crate::db::open(&dir.path().join("rebuilt.db")).unwrap();
+        for (i, &n) in order.iter().enumerate() {
+            let report = rebuild(&h, &fresh, T93[n]);
+            let rebuilt = &order[..=i];
+            let whole = rebuilt.contains(&1) || (rebuilt.contains(&0) && rebuilt.contains(&2));
+            assert_eq!(
+                snapshot_status(&fresh, B93),
+                if whole { "current" } else { "staged" },
+                "{order:?} after {}",
+                T93[n]
+            );
+            let before = &order[..i];
+            let whole_before = before.contains(&1) || (before.contains(&0) && before.contains(&2));
+            // Promoted by the rebuild that completes it, unless tape 2 came
+            // first: that rebuild inserts the version current.
+            let promoted_now = whole && !whole_before && i > 0;
+            assert_eq!(
+                report.versions_promoted,
+                if promoted_now {
+                    vec![format!("{B93} v1")]
+                } else {
+                    Vec::new()
+                },
+                "{order:?} after {}",
+                T93[n]
+            );
+        }
+        assert_eq!(write_rows(&fresh), writes, "{order:?}");
+        assert_eq!(position_rows(&fresh), positions, "{order:?}");
+        assert_eq!(slice_rows(&fresh), slices, "{order:?}");
+        assert_eq!(volume_rows(&fresh), volumes, "{order:?}");
+        assert_eq!(slice_copies(&fresh, B93), [2, 2, 2], "{order:?}");
+        assert_eq!(unit_copies(&fresh, B93), 2, "{order:?}");
+    }
+}
+
+/// Items 130 and 144 on item 94's tapes: rebuilt one by one into an empty
+/// catalog, last tape first, the version is `staged` until the third, and
+/// the three give the writing catalog's rows.
+#[test]
+fn items_130_and_144_item_94s_tapes_rebuilt_give_the_writing_catalogs_rows() {
+    let h = written_94();
+    let dir = TempDir::new().unwrap();
+    let fresh = crate::db::open(&dir.path().join("rebuilt.db")).unwrap();
+    for (i, label) in [T94[2], T94[0], T94[1]].into_iter().enumerate() {
+        let report = rebuild(&h, &fresh, label);
+        assert_eq!(
+            snapshot_status(&fresh, S94),
+            if i < 2 { "staged" } else { "current" },
+            "after {label}"
+        );
+        assert_eq!(
+            report.versions_promoted,
+            if i < 2 {
+                Vec::new()
+            } else {
+                vec![format!("{S94} v1")]
+            }
+        );
+    }
+    assert_eq!(write_rows(&fresh), write_rows(&h.conn));
+    assert_eq!(position_rows(&fresh), position_rows(&h.conn));
+    assert_eq!(slice_rows(&fresh), slice_rows(&h.conn));
+    assert_eq!(volume_rows(&fresh), volume_rows(&h.conn));
+    assert_eq!(unit_copies(&fresh, S94), 1);
+}
