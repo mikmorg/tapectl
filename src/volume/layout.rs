@@ -1718,8 +1718,12 @@ and restores as usual.
 
 RESTORE.sh does all of this by itself, reading the seal marker before any
 slice (one wind to the end of the tape and a rewind). `--info` says where
-the tape ended (the verdict stays SEALED), and `--verify` prints `NOT ON
-TAPE` for each planned file after `ended_after`, which is not a failure.
+the tape ended (the verdict stays SEALED), and `--info` and `--verify` print
+one `NOT ON TAPE` line for the planned files after `ended_after`, naming
+the first and the last of them, which is not a failure:
+
+    NOT ON TAPE  files 12 to 15  (planned; the tape ended after file 11, and its seal marker is file 12)
+
 `--restore` refuses a unit the end of the tape cut, by name (`--all`
 restores the others and names it), `--list` says so, and `--where` marks
 this tape `CUT` for that version.
@@ -2466,8 +2470,8 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # tape whole, named and never restored from it (another tape holds it). So on
 # such a tape every mode that reads slices or says which units it holds reads
 # the seal first, right after the front index: one wind to the end of the data
-# and a rewind. --info says where the tape ended, and --verify prints NOT ON
-# TAPE for each planned file after it.
+# and a rewind. --info says where the tape ended, and --info and --verify print
+# one NOT ON TAPE line for the planned files after it.
 #
 # A slice that fails its hash, or will not read, can be taken from another copy
 # of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
@@ -3557,6 +3561,14 @@ establish_files() { # [--no-seal]
   exit 1
 }
 
+# The one line for the planned files after the end of a short tape (ADR-0012
+# item 140, volume-format-v2.md 4.2): the first and the last planned position
+# after ended_after (the last is the planned seal), and where the seal really
+# is. It is not a failure. --info indents it as its file map; --verify does not.
+not_on_tape_line() { # <indent> <first planned file after the end> <last>
+  printf "%sNOT ON TAPE  files %d to %d  (planned; the tape ended after file %d, and its seal marker is file %d)\n" "$1" "$2" "$3" "$ENDED_AFTER" "$((ENDED_AFTER + 1))"
+}
+
 # ---- --info ----
 
 do_info() {
@@ -3619,15 +3631,21 @@ do_info() {
 
   if [ -n "$table_file" ]; then
     echo "File map (source: $table_source):"
-    local gone=0
+    local gone=0 gone_first="" gone_last=""
     [ "$table_file" != "$WORK/files_from_index.txt" ] || ! tape_is_short || gone=1
     while IFS='|' read -r pos type size hash; do
       if [ "$gone" = 1 ] && [ "$pos" -gt "$ENDED_AFTER" ]; then
-        printf "  %3d  %-24s  %8s bytes  %s  (planned; NOT ON TAPE)\n" "$pos" "$type" "${size:--}" "${hash:+${hash:0:16}...}"
+        [ -n "$gone_first" ] || gone_first=$pos
+        gone_last=$pos
         continue
       fi
       printf "  %3d  %-24s  %8s bytes  %s\n" "$pos" "$type" "${size:--}" "${hash:+${hash:0:16}...}"
     done <"$table_file"
+    # The planned files after the end of a short tape are one line, on every
+    # short tape, a span tape or not (ADR-0012 item 140).
+    if [ -n "$gone_first" ]; then
+      not_on_tape_line "  " "$gone_first" "$gone_last"
+    fi
   else
     echo "No usable file map: both the front index and the seal marker's"
     echo "embedded copy are unreadable."
@@ -3723,18 +3741,16 @@ do_verify() {
   echo "=== keyless integrity walk: $LABEL ==="
   echo ""
 
-  local overall_ok=1 not_on_tape=0
+  local overall_ok=1 not_on_tape=0 gone_first="" gone_last=""
 
   while IFS='|' read -r pos type size hash; do
     # A planned file after the end of a short tape is not on it (R3): it is
-    # named and never read. Only the front index lists one.
+    # never read, and the planned files after the end are named in one line
+    # below the walk (ADR-0012 item 140). Only the front index lists one.
     if [ "$fi_ok" -eq 1 ] && tape_is_short && is_uint "$pos" &&
       [ "$pos" -gt "$ENDED_AFTER" ]; then
-      if [ "$type" = seal_marker ]; then
-        printf "NOT ON TAPE  file %3d  %-24s  (planned; the seal marker is file %d)\n" "$pos" "$type" "$((ENDED_AFTER + 1))"
-      else
-        printf "NOT ON TAPE  file %3d  %-24s\n" "$pos" "$type"
-      fi
+      [ -n "$gone_first" ] || gone_first=$pos
+      gone_last=$pos
       not_on_tape=$((not_on_tape + 1))
       continue
     fi
@@ -3764,6 +3780,7 @@ do_verify() {
       overall_ok=0
     fi
   done <"$files_file"
+  [ "$not_on_tape" = 0 ] || not_on_tape_line "" "$gone_first" "$gone_last"
 
   # The seal marker, last. File 3 vs the seal binding is the one entry the
   # per-file loop above cannot check when the list came from the front index
@@ -6445,10 +6462,11 @@ case "${1:-}" in
   echo "      that is already there and reports success. --overwrite replaces"
   echo "      such files, to finish a restore of the same unit that stopped."
   echo "  A tape written since version 1.6.0 may end early, at the end of its medium: its seal"
-  echo "      marker, the last file, says where (ended_after). --info says so, --verify prints"
-  echo "      NOT ON TAPE for each planned file after it (not a failure), and a unit with a slice"
-  echo "      after it is not on that tape whole: --restore refuses it by name (--all restores the"
-  echo "      rest and names it), --list says so, and --where marks that tape CUT for it."
+  echo "      marker, the last file, says where (ended_after). --info says so, and --info and"
+  echo "      --verify print one NOT ON TAPE line for the planned files after it (not a failure)."
+  echo "      A unit with a slice after it is not on that tape whole: --restore refuses it by name"
+  echo "      (--all restores the rest and names it), --list says so, and --where marks that tape"
+  echo "      CUT for it."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -7668,7 +7686,8 @@ mod tests {
             "Every tape file the front index lists after `ended_after` is not on this tape",
             "is not on this tape whole: do not start reading its slices",
             "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`",
-            "`--verify` prints `NOT ON TAPE` for each planned file after `ended_after`, which is not a failure",
+            "`--info` and `--verify` print one `NOT ON TAPE` line for the planned files after `ended_after`, naming the first and the last of them, which is not a failure",
+            "NOT ON TAPE files 12 to 15 (planned; the tape ended after file 11, and its seal marker is file 12)",
             "`--restore` refuses a unit the end of the tape cut, by name",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");

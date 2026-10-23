@@ -8613,8 +8613,9 @@ fn planned_seal() -> i64 {
 
 /// `--info` on a short tape: the verdict stays SEALED, a line says after which
 /// file the tape ended and which files of the plan are not on it, the plan's
-/// later files are marked, and the normal short ending draws no warning that
-/// the seal is not where File 0 points (rule 6).
+/// later files are one NOT ON TAPE line in the file map (ADR-0012 item 140),
+/// and the normal short ending draws no warning that the seal is not where
+/// File 0 points (rule 6).
 #[test]
 fn a_short_tape_is_sealed_and_info_says_where_it_ended() {
     let (h, k) = short_heir();
@@ -8635,12 +8636,29 @@ fn a_short_tape_is_sealed_and_info_says_where_it_ended() {
         !text.contains("WARNING: File 0 says the seal marker"),
         "the normal short ending draws no warning:\n{text}"
     );
-    let marked: Vec<i64> = text
+    let marked: Vec<&str> = text
         .lines()
-        .filter(|l| l.ends_with("(planned; NOT ON TAPE)"))
-        .map(|l| l.split_whitespace().next().unwrap().parse().unwrap())
+        .filter(|l| l.trim_start().starts_with("NOT ON TAPE"))
         .collect();
-    assert_eq!(marked, (k + 1..=m).collect::<Vec<_>>(), "{text}");
+    assert_eq!(
+        marked,
+        vec![format!(
+            "  NOT ON TAPE  files {} to {m}  (planned; the tape ended after file {k}, and its seal marker is file {})",
+            k + 1,
+            k + 1
+        )],
+        "one line, from K+1 to the planned seal:\n{text}"
+    );
+    let listed: Vec<i64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert_eq!(
+        listed,
+        (0..=k).collect::<Vec<_>>(),
+        "the file map lists the files on the tape, and no planned one after them:\n{text}"
+    );
     assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
 
     // The positive control: the full tape says neither.
@@ -8650,9 +8668,10 @@ fn a_short_tape_is_sealed_and_info_says_where_it_ended() {
     assert!(!text.contains("NOT ON TAPE"), "{text}");
 }
 
-/// `--verify` on a short tape hashes files 0 to `ended_after`, prints NOT ON
-/// TAPE for every planned file after it, which is not a failure, and reads
-/// nothing past the end (R3). The seal is read before any slice (R1), once.
+/// `--verify` on a short tape hashes files 0 to `ended_after`, prints one NOT
+/// ON TAPE line for the planned files after it (ADR-0012 item 140), which is
+/// not a failure, and reads nothing past the end (R3). The seal is read before
+/// any slice (R1), once.
 #[test]
 fn verify_on_a_short_tape_hashes_what_is_on_it_and_names_the_rest_not_on_tape() {
     let (h, k) = short_heir();
@@ -8665,12 +8684,19 @@ fn verify_on_a_short_tape_hashes_what_is_on_it_and_names_the_rest_not_on_tape() 
         k + 1,
         "files 0 to {k}, File 3 by the seal's binding:\n{text}"
     );
-    let gone: Vec<i64> = text
+    let gone: Vec<&str> = text
         .lines()
-        .filter_map(|l| l.strip_prefix("NOT ON TAPE  file "))
-        .map(|l| l.split_whitespace().next().unwrap().parse().unwrap())
+        .filter(|l| l.starts_with("NOT ON TAPE"))
         .collect();
-    assert_eq!(gone, (k + 1..=m).collect::<Vec<_>>(), "{text}");
+    assert_eq!(
+        gone,
+        vec![format!(
+            "NOT ON TAPE  files {} to {m}  (planned; the tape ended after file {k}, and its seal marker is file {})",
+            k + 1,
+            k + 1
+        )],
+        "one line, from K+1 to the planned seal:\n{text}"
+    );
     assert!(!text.contains("FAIL"), "{text}");
     assert!(
         text.contains(&format!(
@@ -9324,11 +9350,15 @@ fn the_generators_own_short_seal_is_read_by_restore_sh() {
 
     let (code, text) = h.run(&["--verify"]);
     assert_eq!(code, 0, "{text}");
-    let gone = text
+    let gone: Vec<&str> = text
         .lines()
         .filter(|l| l.starts_with("NOT ON TAPE"))
-        .count() as i64;
-    assert_eq!(gone, m - k, "{text}");
+        .collect();
+    assert_eq!(gone.len(), 1, "one line (item 140):\n{text}");
+    assert!(
+        gone[0].starts_with(&format!("NOT ON TAPE  files {} to {m}  ", k + 1)),
+        "{text}"
+    );
 
     let (code, text) = h.run(&[
         "--restore",

@@ -2221,9 +2221,15 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
         out.contains("VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after"),
         "{out}"
     );
+    // One line for the planned files after the end (ADR-0012 item 140).
     assert!(
-        out.contains(&format!("NOT ON TAPE  file {:3}", k + 1)),
-        "the planned file at K+1 is not on the tape: {out}"
+        out.contains(&format!("NOT ON TAPE  files {} to ", k + 1)),
+        "the planned files from K+1 are not on the tape: {out}"
+    );
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("NOT ON TAPE")).count(),
+        1,
+        "{out}"
     );
     assert!(!out.contains("FAIL "), "{out}");
     let alice_key = h.paths.keys_dir.join("alice-primary.age.key");
