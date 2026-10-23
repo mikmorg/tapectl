@@ -988,3 +988,81 @@ fn the_pinned_short_seal_parses_short_and_fits_the_full_seals_room() {
         full.len()
     );
 }
+
+// ── a span tape's seal (#478, ADR-0012 items 124 and 126) ───────────────────
+
+/// The span variant of the pin above (`volume-format-v2.md` §4.1, "From 1.7.0
+/// the seal of a span tape states `requires = ["short-seal", "spanning"]`"): a
+/// short seal stating both features, cut from the same golden plan, parses
+/// short by rules S1-S6 and fits a full placeholder stating both, which is how
+/// `build` sizes a span tape's seal. Every byte of it but the `requires` line
+/// is the pinned short seal's (item 126: nothing new is readable without a
+/// key), and the pinned bytes themselves do not move.
+#[test]
+fn a_span_tapes_short_seal_parses_short_and_fits_a_span_placeholder() {
+    use tapectl::volume::layout::{
+        generate_seal_marker_requiring, generate_short_seal_marker_requiring, REQUIRES_SPAN,
+    };
+    let plan = golden_seal_plan();
+    let k = GOLDEN_ENDED_AFTER as usize;
+    let short = generate_short_seal_marker_requiring(
+        "GOLD01",
+        GOLDEN_ENDED_AFTER,
+        GOLDEN_FRONT_INDEX_SHA256,
+        &plan[..=k],
+        REQUIRES_SPAN,
+    );
+    let full = generate_seal_marker_requiring(
+        "GOLD01",
+        plan.len() as i32,
+        GOLDEN_FRONT_INDEX_SHA256,
+        &plan,
+        REQUIRES_SPAN,
+    );
+
+    // The one line that differs from the pin, spelled as §1.2 rules it.
+    let normalised = normalise_sealed_at(&short);
+    assert_eq!(
+        normalised.replace(
+            "\nrequires = [\"short-seal\", \"spanning\"]\n",
+            "\nrequires = [\"short-seal\"]\n"
+        ),
+        SHORT_SEAL_EXPECTED,
+        "a span tape's short seal is the pinned one but for its requires line"
+    );
+
+    let parsed = format::parse_seal_marker(&short).expect("the span short seal parses (S1-S6)");
+    parsed.check_parse_rules().expect("and keeps every rule");
+    assert_eq!(
+        parsed.requires,
+        vec!["short-seal".to_string(), "spanning".to_string()]
+    );
+    assert!(parsed.requires_short_seal());
+    assert_eq!(parsed.refusal(), None, "1.7.0 knows both features");
+    assert_eq!(parsed.file_count, GOLDEN_ENDED_AFTER + 2, "S1");
+    assert_eq!(parsed.ended_after, Some(k as u64), "S1");
+    assert_eq!(
+        parsed.ending(plan.len() as u64),
+        format::SealEnding::Short {
+            ended_after: k as u64
+        }
+    );
+    assert_eq!(parsed.files.len(), k + 2, "S4");
+    assert_eq!(parsed.files[k].type_label, "data_slice", "S5");
+
+    let parsed_full = format::parse_seal_marker(&full).expect("the span full seal parses");
+    parsed_full.check_parse_rules().expect("and keeps every rule");
+    assert_eq!(parsed_full.requires, parsed.requires);
+    assert_eq!(
+        parsed_full.ending(plan.len() as u64),
+        format::SealEnding::Full
+    );
+    let header = |s: &str| s[..s.find("[seal]").expect("a [seal] table")].to_string();
+    assert_eq!(header(&short), header(&full), "one header for both kinds");
+    assert!(
+        short.len() <= full.len(),
+        "a span tape's short seal is never longer than its full placeholder: {} > {}",
+        short.len(),
+        full.len()
+    );
+}

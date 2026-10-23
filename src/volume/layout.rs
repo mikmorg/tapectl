@@ -68,7 +68,53 @@ pub struct IdThunkV2Params<'a> {
 /// unknown at init time); the write session rewrites File 0 from BOT with
 /// the real `total_files`/`seal_marker` once the layout is built (sheet
 /// §2.3 — resume must not try to preserve init's File 0).
+///
+/// It states `requires = ["short-seal"]` ([`REQUIRES_WHOLE`]), as every
+/// 1.6.0 tape and every 1.7.0 tape that holds no slice of a spannable set
+/// does. A span tape's File 0 comes from [`generate_id_thunk_v2_requiring`].
 pub fn generate_id_thunk_v2(params: &IdThunkV2Params) -> String {
+    generate_id_thunk_v2_requiring(params, REQUIRES_WHOLE)
+}
+
+/// `requires` on a tape whose plan holds no slice of a spannable set: the
+/// tape may end early (`volume-format-v2.md` §1.2; ADR-0012 item 111).
+pub const REQUIRES_WHOLE: &[&str] = &[crate::volume::format::SHORT_SEAL];
+
+/// `requires` on a tape whose plan holds a slice of a spannable set
+/// (`volume-format-v2.md` §1.2; ADR-0012 item 124): the two features, in this
+/// order.
+pub const REQUIRES_SPAN: &[&str] = &[
+    crate::volume::format::SHORT_SEAL,
+    crate::volume::format::SPANNING,
+];
+
+/// The features a tape states in File 0 and in its seal, by whether its plan
+/// holds a slice of a spannable set (ADR-0012 item 124). File 0, the seal's
+/// placeholder and the seal written at execute time must all take it from
+/// the same fact, or the real seal will not fit the placeholder.
+pub fn tape_requires(holds_a_span: bool) -> &'static [&'static str] {
+    if holds_a_span {
+        REQUIRES_SPAN
+    } else {
+        REQUIRES_WHOLE
+    }
+}
+
+/// The `requires` value as File 0 and the seal spell it (`volume-format-v2.md`
+/// §1.2, normative): each feature double-quoted, two separated by a comma and
+/// one space, no space inside the brackets. RESTORE.sh's `check_requires`
+/// splits the list at spaces, so `["short-seal","spanning"]` would read as one
+/// unknown feature.
+fn requires_value(features: &[&str]) -> String {
+    let quoted: Vec<String> = features.iter().map(|f| format!("\"{f}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// File 0 stating `features` in `requires` (ADR-0012 item 124): `build` gives
+/// it [`tape_requires`]'s answer. Every other byte is
+/// [`generate_id_thunk_v2`]'s.
+pub fn generate_id_thunk_v2_requiring(params: &IdThunkV2Params, features: &[&str]) -> String {
+    let requires = requires_value(features);
     let IdThunkV2Params {
         label,
         uuid,
@@ -143,7 +189,7 @@ magic = "tapectl-volume-v2"
 label = "{label}"
 uuid = "{uuid}"
 layout_version = 2
-requires = ["short-seal"]
+requires = {requires}
 tapectl_version = "{tapectl_version}"
 media_type = "{media_type}"
 nominal_capacity_bytes = {nominal_capacity}
@@ -6614,11 +6660,27 @@ pub fn generate_seal_marker(
     front_index_sha256: &str,
     files: &[FrontIndexFile],
 ) -> String {
+    generate_seal_marker_requiring(label, file_count, front_index_sha256, files, REQUIRES_WHOLE)
+}
+
+/// The full seal stating `features` in `requires`, as File 0 of the same tape
+/// states them (`volume-format-v2.md` §4.1: "From 1.7.0 the seal of a span
+/// tape states `requires = ["short-seal", "spanning"]`"; ADR-0012 item 124).
+/// `build` sizes the placeholder with it; the seal written at execute time
+/// must state the same features, or it is not the placeholder's length.
+pub fn generate_seal_marker_requiring(
+    label: &str,
+    file_count: i32,
+    front_index_sha256: &str,
+    files: &[FrontIndexFile],
+    features: &[&str],
+) -> String {
     let mut s = seal_document(
         label,
         file_count,
         i64::from(file_count) - 2,
         front_index_sha256,
+        features,
     );
     append_files_entries(&mut s, files);
     s
@@ -6644,6 +6706,25 @@ pub fn generate_short_seal_marker(
     front_index_sha256: &str,
     files_through_k: &[FrontIndexFile],
 ) -> String {
+    generate_short_seal_marker_requiring(
+        label,
+        ended_after,
+        front_index_sha256,
+        files_through_k,
+        REQUIRES_WHOLE,
+    )
+}
+
+/// The short seal stating `features` in `requires` (a span tape's: ADR-0012
+/// item 124). The grammar, rules S1-S6 and every other byte are
+/// [`generate_short_seal_marker`]'s (item 126).
+pub fn generate_short_seal_marker_requiring(
+    label: &str,
+    ended_after: i32,
+    front_index_sha256: &str,
+    files_through_k: &[FrontIndexFile],
+    features: &[&str],
+) -> String {
     debug_assert!(
         files_through_k
             .last()
@@ -6655,6 +6736,7 @@ pub fn generate_short_seal_marker(
         ended_after.saturating_add(2),
         i64::from(ended_after),
         front_index_sha256,
+        features,
     );
     append_files_entries(&mut s, files_through_k);
     append_files_entries(
@@ -6678,7 +6760,9 @@ fn seal_document(
     file_count: i32,
     ended_after: i64,
     front_index_sha256: &str,
+    features: &[&str],
 ) -> String {
+    let requires = requires_value(features);
     // FIXED-WIDTH timestamp, deliberately: the build step sizes the seal
     // marker with a placeholder and the seal step regenerates it with the
     // real `sealed_at`, which is only sound if both render at identical
@@ -6715,7 +6799,7 @@ verify any entry by hashing the file it describes.
 [seal]
 volume = "{label}"
 layout_version = 2
-requires = ["short-seal"]
+requires = {requires}
 file_count = {file_count}
 ended_after = {ended_after}
 sealed_at = "{now}"
@@ -7176,6 +7260,255 @@ mod tests {
         assert_eq!(claims.refusal("File 0"), None, "1.6.0 reads its own tape");
         // File 0 is the plan: its pointers are the planned seal and count.
         assert!(t.contains("\nseal_marker = 8\ntotal_files = 9\n"), "{t}");
+    }
+
+    fn span_thunk_params() -> IdThunkV2Params<'static> {
+        IdThunkV2Params {
+            label: "SP01",
+            uuid: "u",
+            media_type: "LTO-6",
+            tapectl_version: "1.7.0",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 9,
+            mam_manufacturer: "m",
+            mam_serial: "s",
+            mam_length: 1,
+            mam_loads: 1,
+            created_at: "2026-10-23T00:00:00Z",
+            cartridge_identity_source: None,
+        }
+    }
+
+    /// ADR-0012 item 124, `volume-format-v2.md` §1.2: File 0 states exactly
+    /// one `requires` line, the line after `layout_version`, spelled as the
+    /// spec rules it: `["short-seal", "spanning"]` on a span tape (each
+    /// feature quoted, a comma and ONE space between), `["short-seal"]` on
+    /// every other. The old generator is the whole-tape sibling, byte for byte.
+    #[test]
+    fn file_0_states_one_requires_line_with_the_tapes_features() {
+        let p = span_thunk_params();
+        for (holds_a_span, line, features) in [
+            (
+                false,
+                "requires = [\"short-seal\"]",
+                vec!["short-seal".to_string()],
+            ),
+            (
+                true,
+                "requires = [\"short-seal\", \"spanning\"]",
+                vec!["short-seal".to_string(), "spanning".to_string()],
+            ),
+        ] {
+            let t = generate_id_thunk_v2_requiring(&p, tape_requires(holds_a_span));
+            assert_eq!(t.matches("requires").count(), 1, "{t}");
+            assert_eq!(
+                t.matches(&format!("\nlayout_version = 2\n{line}\ntapectl_version = "))
+                    .count(),
+                1,
+                "{t}"
+            );
+            let claims = crate::volume::format::parse_id_thunk_claims(&t).unwrap();
+            assert_eq!(claims.requires, features);
+            assert_eq!(claims.refusal("File 0"), None, "1.7.0 reads its own tape");
+        }
+        assert_eq!(
+            generate_id_thunk_v2(&p),
+            generate_id_thunk_v2_requiring(&p, REQUIRES_WHOLE),
+            "the old generator is the whole tape's"
+        );
+        // The span line is the whole line plus `, "spanning"` and nothing else.
+        let whole = generate_id_thunk_v2(&p);
+        let span = generate_id_thunk_v2_requiring(&p, REQUIRES_SPAN);
+        assert_eq!(
+            span,
+            whole.replace(
+                "requires = [\"short-seal\"]",
+                "requires = [\"short-seal\", \"spanning\"]"
+            )
+        );
+    }
+
+    /// `volume-format-v2.md` §4.1 "Length" and item 124: a seal stating both
+    /// features keeps rules S1-S6 (full and short), the short one is no longer
+    /// than a full placeholder stating the same features, and the full one is
+    /// exactly that placeholder's length. A seal stating `short-seal` alone is
+    /// `, "spanning"` (12 bytes) shorter than a span tape's placeholder, so the
+    /// seal written at execute time must state the features File 0 states.
+    #[test]
+    fn a_two_feature_seal_keeps_the_rules_and_fits_its_placeholder() {
+        use crate::volume::format::{parse_seal_marker, SealEnding};
+        let fi = "ef".repeat(32);
+        let m = 9;
+        let planned = (m + 1) as u64;
+        let copy = planned_seal_copy(m);
+        let placeholder = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
+        let full = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
+        assert_eq!(full.len(), placeholder.len(), "the full seal is the placeholder's length");
+        assert_eq!(
+            full.matches("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = ")
+                .count(),
+            1,
+            "{full}"
+        );
+        let parsed = parse_seal_marker(&full).expect("a full span seal parses");
+        assert_eq!(parsed.check_parse_rules(), Ok(()));
+        assert_eq!(parsed.requires, vec!["short-seal", "spanning"]);
+        assert_eq!(parsed.refusal(), None);
+        assert_eq!(parsed.ending(planned), SealEnding::Full);
+
+        for k in 5..=m - 2 {
+            let short = generate_short_seal_marker_requiring(
+                "SPAN1",
+                k,
+                &fi,
+                &short_seal_copy(m, k),
+                REQUIRES_SPAN,
+            );
+            let p = parse_seal_marker(&short).unwrap_or_else(|e| panic!("K={k}: {e}"));
+            assert_eq!(p.check_parse_rules(), Ok(()), "K={k}");
+            assert_eq!(p.requires, vec!["short-seal", "spanning"], "K={k}");
+            assert_eq!(
+                p.ending(planned),
+                SealEnding::Short {
+                    ended_after: k as u64
+                }
+            );
+            assert!(short.len() <= placeholder.len(), "K={k}");
+            // Every byte but the requires line is the 1.6.0 short seal's (item
+            // 126), sealed_at aside.
+            let one = generate_short_seal_marker("SPAN1", k, &fi, &short_seal_copy(m, k));
+            let strip = |s: &str| {
+                s.lines()
+                    .filter(|l| !l.starts_with("sealed_at = ") && !l.starts_with("requires = "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_eq!(strip(&short), strip(&one), "K={k}");
+        }
+
+        let whole = generate_seal_marker("SPAN1", m + 1, &fi, &copy);
+        assert_eq!(
+            placeholder.len() - whole.len(),
+            ", \"spanning\"".len(),
+            "a seal stating short-seal alone does not fill a span tape's placeholder"
+        );
+    }
+
+    /// `build` states the tape's features in File 0 and in the seal's
+    /// placeholder from one fact (ADR-0012 item 124): `spanning` beside
+    /// `short-seal` when a unit's MANIFEST block may span, and `short-seal`
+    /// alone when none does.
+    #[test]
+    fn build_states_spanning_in_file_0_and_the_placeholder_only_for_a_span() {
+        use crate::volume::build::{
+            build, BuildInputs, BuildSlice, BuildUnit, SpanSlice, TenantInfo, UnitSpan,
+        };
+        use crate::volume::layout_model::{ContentSource, ZoneKind};
+        let src = tempfile::tempdir().unwrap();
+        let slice = |id: i64, number: i64, bytes: &[u8]| {
+            let path = src.path().join(format!("slice-{id}"));
+            std::fs::write(&path, bytes).unwrap();
+            BuildSlice {
+                slice_id: id,
+                slice_number: number,
+                size_bytes: bytes.len() as i64,
+                encrypted_bytes: bytes.len() as i64,
+                sha256_plain: "aa".repeat(32),
+                // build() takes the hash as given and never recomputes it.
+                sha256_encrypted: format!("{id:064x}"),
+                staging_path: path,
+            }
+        };
+        let kp = crate::crypto::keys::generate_keypair();
+        let op = crate::crypto::keys::generate_keypair();
+        let inputs = |span: bool| {
+            let planned = vec![slice(12, 2, b"slice two")];
+            let mut all: Vec<SpanSlice> = planned.iter().map(SpanSlice::from).collect();
+            all.insert(
+                0,
+                SpanSlice {
+                    slice_id: 11,
+                    slice_number: 1,
+                    size_bytes: 9,
+                    encrypted_bytes: 9,
+                    sha256_plain: "bb".repeat(32),
+                    sha256_encrypted: "cc".repeat(32),
+                },
+            );
+            BuildInputs {
+                label: "SPANB1".into(),
+                volume_uuid: "550e8400-e29b-41d4-a716-4466554400c1".into(),
+                media_type: "LTO-6".into(),
+                tapectl_version: "1.7.0".into(),
+                created_at: "2026-10-23T00:00:00Z".into(),
+                block_size: 524_288,
+                usable_bytes: 100 * 524_288,
+                enospc_buffer: 524_288,
+                nominal_capacity: 2_400_000_000_000,
+                mam_capacity: 0,
+                mam_manufacturer: String::new(),
+                mam_serial: String::new(),
+                cartridge_identity_source: None,
+                mam_length: 0,
+                mam_loads: 0,
+                units: vec![BuildUnit {
+                    stage_set_id: 10,
+                    snapshot_id: 10,
+                    unit_name: "unit-span".into(),
+                    unit_uuid: "cccccccc-1111-4222-8333-444444444444".into(),
+                    tenant_id: 1,
+                    dar_version: None,
+                    dar_command: None,
+                    catalog_path: None,
+                    snapshot_version: 1,
+                    slices: if span {
+                        planned
+                    } else {
+                        vec![slice(11, 1, b"slice one"), slice(12, 2, b"slice two")]
+                    },
+                    span: span.then_some(UnitSpan { slices: all }),
+                }],
+                tenants: vec![TenantInfo {
+                    tenant_id: 1,
+                    tenant_name: "alpha".into(),
+                    public_keys: vec![kp.public_key.clone()],
+                }],
+                operator_public_keys: vec![op.public_key.clone()],
+                escrow_public_key: None,
+                catalog_db_path: None,
+                index: None,
+            }
+        };
+        let read_zone = |built: &crate::volume::build::BuiltLayout, want: fn(&ZoneKind) -> bool| {
+            let e = built
+                .layout
+                .entries
+                .iter()
+                .find(|e| want(&e.kind))
+                .expect("the zone");
+            match &e.source {
+                ContentSource::Materialized(p) => std::fs::read_to_string(p).unwrap(),
+                other => panic!("{other:?}"),
+            }
+        };
+        for (span, line) in [
+            (false, "requires = [\"short-seal\"]"),
+            (true, "requires = [\"short-seal\", \"spanning\"]"),
+        ] {
+            let session = tempfile::tempdir().unwrap();
+            let built = build(&inputs(span), session.path()).unwrap();
+            let file0 = read_zone(&built, |k| matches!(k, ZoneKind::IdThunk));
+            let seal = read_zone(&built, |k| matches!(k, ZoneKind::SealMarker));
+            for (what, text) in [("File 0", &file0), ("the seal placeholder", &seal)] {
+                assert_eq!(text.matches("requires = ").count(), 1, "{what}: {text}");
+                assert_eq!(
+                    text.matches(&format!("\nlayout_version = 2\n{line}\n")).count(),
+                    1,
+                    "span {span}, {what}: {text}"
+                );
+            }
+        }
     }
 
     /// File 3's `[index]` states `may_end_early = true` after

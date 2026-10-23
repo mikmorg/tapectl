@@ -1830,6 +1830,89 @@ mod short_seal_tests {
         parse_seal_marker(&Fixture::short(4, 8).text()).expect("K = the first data slice");
     }
 
+    /// A span tape's seal (ADR-0012 items 124 and 126): `requires =
+    /// ["short-seal", "spanning"]`, and the 1.6.0 grammar and rules otherwise.
+    /// Full and short, it parses and keeps S1-S6; it classifies against the
+    /// plan as a 1.6.0 seal does; breaking S1, S2 or S5 makes it unparseable
+    /// exactly as it makes a 1.6.0 seal; and `judge_seal` reads a good one as
+    /// sealed. The same seals stating `short-seal` alone parse to the same
+    /// fields but the feature.
+    #[test]
+    fn a_seal_stating_both_features_keeps_s1_to_s6() {
+        const SPAN: &str = "[\"short-seal\", \"spanning\"]";
+        let both = vec![SHORT_SEAL.to_string(), SPANNING.to_string()];
+        let full = Fixture {
+            requires: Some(SPAN),
+            ..Fixture::full(4)
+        };
+        let short = Fixture {
+            requires: Some(SPAN),
+            ..Fixture::short(4, 9)
+        };
+        assert!(
+            full.text().contains("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = 13\n"),
+            "{}",
+            full.text()
+        );
+        for (f, ending) in [
+            (&full, SealEnding::Full),
+            (&short, SealEnding::Short { ended_after: 9 }),
+        ] {
+            let seal = parse_seal_marker(&f.text()).expect("a span seal parses");
+            assert_eq!(seal.requires, both);
+            assert!(seal.requires_short_seal());
+            assert_eq!(seal.refusal(), None);
+            assert_eq!(seal.check_parse_rules(), Ok(()));
+            assert_eq!(seal.ending(13), ending);
+            let one = parse_seal_marker(
+                &Fixture {
+                    requires: Some(SHORT),
+                    file_count: f.file_count,
+                    ended_after: f.ended_after,
+                    entries: f.entries.clone(),
+                }
+                .text(),
+            )
+            .unwrap();
+            assert_eq!(
+                ParsedSeal {
+                    requires: both.clone(),
+                    ..one
+                },
+                seal,
+                "the same seal but the feature"
+            );
+        }
+        let SealVerdict::Sealed(seal) =
+            judge_seal(Ok(short.text().as_bytes()), FRONT_INDEX, 3, 10)
+        else {
+            panic!("a span short seal that keeps the rules is Sealed")
+        };
+        assert_eq!(seal.ended_after, Some(9));
+
+        Fixture {
+            ended_after: Some(8),
+            ..Fixture {
+                requires: Some(SPAN),
+                ..Fixture::short(4, 9)
+            }
+        }
+        .refused_naming("rule S1");
+        Fixture {
+            ended_after: None,
+            ..Fixture {
+                requires: Some(SPAN),
+                ..Fixture::full(4)
+            }
+        }
+        .refused_naming("rule S2");
+        Fixture {
+            requires: Some(SPAN),
+            ..Fixture::short(4, 7)
+        }
+        .refused_naming("rule S5");
+    }
+
     /// Rule S6, through the one seal judgement: a 1.6.0 seal that breaks a
     /// rule is `Unsealed`, naming the rule, even though it binds the front
     /// index in hand; one that keeps them is `Sealed`, with its

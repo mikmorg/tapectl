@@ -329,7 +329,13 @@ pub fn build_with_plan_bound(
         created_at: &inputs.created_at,
         cartridge_identity_source: inputs.cartridge_identity_source.as_deref(),
     };
-    let id_thunk_bytes = layout::generate_id_thunk_v2(&id_thunk_params);
+    // `requires` (ADR-0012 item 124, `volume-format-v2.md` §1.2): a tape whose
+    // plan holds a slice of a spannable set states `spanning` beside
+    // `short-seal`, in File 0 and in the seal (the placeholder below states the
+    // same). A unit with `span` set is exactly one whose MANIFEST block states
+    // `may_span = true` (`to_manifest_unit`), the block the fence is for.
+    let requires = layout::tape_requires(inputs.units.iter().any(|u| u.span.is_some()));
+    let id_thunk_bytes = layout::generate_id_thunk_v2_requiring(&id_thunk_params, requires);
     let (id_thunk_path, id_thunk_size, id_thunk_hash) =
         materialize(session_dir, "0000_id_thunk", id_thunk_bytes.as_bytes())?;
     entries.push(LayoutEntry {
@@ -605,10 +611,20 @@ pub fn build_with_plan_bound(
     // rather than a probabilistic canary: with a fixed-width timestamp ANY
     // length difference is a real defect (a changed generator, a non-UTC
     // clock), so failing the build here is correct.
-    let seal_bytes =
-        layout::generate_seal_marker(&inputs.label, total_files, &fi_hash, &seal_files);
-    let seal_bytes_recheck =
-        layout::generate_seal_marker(&inputs.label, total_files, &fi_hash, &seal_files);
+    let seal_bytes = layout::generate_seal_marker_requiring(
+        &inputs.label,
+        total_files,
+        &fi_hash,
+        &seal_files,
+        requires,
+    );
+    let seal_bytes_recheck = layout::generate_seal_marker_requiring(
+        &inputs.label,
+        total_files,
+        &fi_hash,
+        &seal_files,
+        requires,
+    );
     if seal_bytes.len() != seal_bytes_recheck.len() {
         return Err(TapectlError::Other(format!(
             "build: seal marker placeholder sizing broke — two generate_seal_marker calls \
