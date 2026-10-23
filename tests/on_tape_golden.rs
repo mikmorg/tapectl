@@ -269,6 +269,22 @@
 //! substring pinned before still occurs as often as it did, and no `TOOLS_*` line
 //! moved.
 //!
+//! **Moved a third time that day, still under item 135**, for the rest of §4.4's
+//! RESTORE.sh bullets (`7f1b7db0…` to `39d2535e…`; "`--restore --path`" and
+//! "`--slices-from` and `--swap-tapes`"; R5, R8, R9; items 132 and 139).
+//! `--restore --path` of a spanning unit reads the slices it needs (the paths'
+//! `-Tslice` range and the last) from whichever tapes hold them, the tape in the
+//! drive first, each still encrypted in scratch and checked against its own
+//! tape's front index, and decrypts them only once all are there; it has no
+//! start rule. `--swap-tapes` reads every offered cartridge's seal first and
+//! takes a slice only at a position the seal covers, a range tape included;
+//! `--slices-from` stays hash-only. A refusal relayed from an offered cartridge
+//! says the restore goes on, and with `--stream-tapes` a #419 refusal after a
+//! swap ends the run. Two substrings pinned before were replaced by the code
+//! they pinned (`OTHER_END` for every second tape; `die_range_path` only with a
+//! salvage flag), and their replacements are pinned; every other substring
+//! still occurs as often as it did, and no `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -295,7 +311,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "7f1b7db004118fc82a1e241ddeb632cbc564de3bbbc331297c7a89a1d9597195";
+const RESTORE_SH_SHA256: &str = "39d2535ee8e5fd929324001d479560fac0a3093a62c96231adad0ca6fb668e15";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -468,18 +484,38 @@ fn restore_sh_bytes_are_pinned() {
         "    if [ -z \"$SPAN_NEED\" ]; then\n      swap_fetch || true\n    elif span_accept; then\n      return 0\n    fi\n",
         "      [ -z \"$SPAN_NEED\" ] || span_stop\n",
         "(other_tape_map && printf '%s|%s\\n' \"$OTHER_END\" \"$OTHER_LABEL\" >\"$WORK/other.vars\") 2>\"$WORK/other.err\" || rc=$?",
-        "    elif [ -n \"$SPAN_RESTORE\" ] && [ \"$TAPE_SHORT_SEAL\" = 0 ] && try_seal_copy; then\n      OTHER_END=$SEAL_LAST\n",
         "check_space \"$destdir\" \"$SCRATCH_PARENT\" \"$bytes\" 0",
         "      if read_slice_checked \"$pos\" \"$size\" \"$sha\" \"$SCRATCH/slice.$num.enc\"; then\n",
         "    STREAM_FROM=$SCRATCH\n",
         "  restore_unit \"$WORK/span.all\" \"$destdir\" \"$unit\" \"$ver\"\n",
         "      [ \"$PICKED_RUN_FIRST\" = 1 ] || die_range \"${targets[$i]}\" \"$PICKED_VERSION\"\n",
-        "    [ \"$PICKED_RANGE\" = 0 ] || die_range_path \"${targets[0]}\" \"$PICKED_VERSION\"\n",
         "  if [ \"$SPAN_RESTORE\" = scratch ]; then\n    die \"not enough disk space in $1 to restore this unit across tapes:",
         "  [ -z \"$SPAN_RESTORE\" ] || die \"dar ${DAR_VERSION:-(of an unknown version)} cannot read '$unit' across tapes without its",
         "  if ! { [ -n \"$cat\" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then\n",
         "    info \"  (rm -rf \\\"$SCRATCH\\\") before running again.\"\n",
         "--stream-tapes reads one unit across tapes: give --unit U, not --all",
+        "span_take_here() { # <unit>\n",
+        "span_list() { # <unit>\n",
+        "span_path_spool() { # <unit> <version> <slices of the version>\n",
+        "    span_path_spool \"$unit\" \"$ver\" \"$last\"\n",
+        "      [ \"$SALVAGE\" = 0 ] || die_range_path \"${targets[0]}\" \"$PICKED_VERSION\"\n",
+        "      span_list \"${targets[0]}\"\n      cp \"$WORK/picked.txt\" \"$WORK/slices.0\"\n",
+        "      [ ! -f \"$SCRATCH/slice.$num.enc\" ] || continue\n",
+        "  SPAN_RESTORE=path\n  span_spool\n  SPAN_RESTORE=\"\"\n",
+        "    decrypt_slice \"$SCRATCH/slice.$num.enc\" \"$SCRATCH/restore.$num.dar\" \"$num\"\n",
+        "if ($1 + 0 >= from + 0 && index(have, \" \" $1 \" \") == 0) { n++; num[n] = $1 + 0; sz[n] = $3; sh[n] = $4 }",
+        "sealed_other() {\n",
+        "  info \"This cartridge identifies as: $(safe_str \"${OTHER_LABEL:-<unreadable>}\")\"\n  sealed_other || return 1\n",
+        "    elif [ \"$TAPE_SHORT_SEAL\" = 0 ] && try_seal_copy; then\n      OTHER_END=$SEAL_LAST\n",
+        "$2 == \"data_slice\" && $1 ~ /^[0-9]+$/ && $1 + 0 <= end + 0 && ($4 in need) && $3 == need[$4] && !($4 in seen)",
+        "  SPAN_OFFERED=1\n  (other_tape_map",
+        "  if [ \"$SPAN_OFFERED\" = 1 ]; then\n    die \"$2\n",
+        "  if [ \"$SPAN_OFFERED\" = 1 ]; then\n    die \"this tape is layout_version",
+        "  SPAN_SWAPPED=1\n}\n",
+        "        if ! kill -0 \"$DAR_PID\" 2>/dev/null; then\n          die_dar \"$destdir\"\n          return 0\n        fi\n        span_swap \"$num\"\n",
+        "    if [ \"$SPAN_RESTORE\" = stream ] && [ \"$SPAN_SWAPPED\" = 1 ]; then\n",
+        "  if [ \"$SPAN_RESTORE\" = path ]; then\n    die \"stopped before slice",
+        "nothing is restored without every slice --path needs.",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
