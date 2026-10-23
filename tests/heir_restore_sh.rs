@@ -11468,6 +11468,64 @@ fn where_and_find_on_each_of_item_93s_tapes_print_each_holders_run() {
     }
 }
 
+/// The fresh read of File 1 for a span (#478, S2): taking stock with
+/// `--find-envelope`, an heir counted two tapes that each hold part of `big`
+/// as two copies, because the table gave the full slice count and size on
+/// both. It now marks a unit this tape's plan holds only part of (the slices
+/// its block gives a `tape_position`, against the block's N), in every
+/// envelope's table that lists it, and says once per table what the mark
+/// means. Tape 3 of item 93 holds 3..N: marked. Tape 2 holds it whole: not.
+/// Tape 1's plan was 1..N and its seal ended it after slice 2: the table
+/// reads no seal (`find_envelope_on_a_short_tape_reads_no_seal`), so it shows
+/// the plan, unmarked, which is why File 1 sends the heir to `--list --unit`
+/// and `--where` to be sure.
+#[test]
+fn find_envelope_marks_a_unit_this_tapes_plan_holds_only_part_of() {
+    let b = span_box();
+    let n = b.n;
+    let footnote =
+        "    PART: a unit held across tapes, of which this tape's plan holds only the slices named";
+    let big_rows = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("    big "))
+            .map(str::to_string)
+            .collect()
+    };
+    for (label, part) in [
+        (
+            "SPAN03",
+            Some(format!("  PART: version 2, slices 3 to {n} of {n}")),
+        ),
+        ("SPAN02", None),
+        ("SPAN01", None),
+    ] {
+        let h = Heir::of_box(&b.of(&[label]), 0);
+        let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+        assert_eq!(code, 0, "{label}: {text}");
+        let rows = big_rows(&text);
+        assert_eq!(
+            rows.len(),
+            2,
+            "{label}: alice's envelope and the operator's:\n{text}"
+        );
+        for r in &rows {
+            let cols: Vec<&str> = r.split_whitespace().collect();
+            assert_eq!(
+                &cols[..3],
+                &["big", "2", n.to_string().as_str()],
+                "{label}: the Slices column counts the whole version: {r:?}"
+            );
+            match &part {
+                Some(p) => assert!(r.ends_with(p.as_str()), "{label}: {r:?}\n{text}"),
+                None => assert!(!r.contains("PART"), "{label}: {r:?}\n{text}"),
+            }
+        }
+        let want = if part.is_some() { 2 } else { 0 };
+        assert_eq!(text.matches(footnote).count(), want, "{label}:\n{text}");
+        assert_eq!(text.matches("PART: ").count(), 2 * want, "{label}:\n{text}");
+    }
+}
+
 /// The default mode takes a slice that fails from another cartridge: tape 3's
 /// slice 4 does not match its front index, so the restore stops reading tape
 /// 3 there and asks for slice 4, and tape 2, the whole copy, gives 4..N. Only

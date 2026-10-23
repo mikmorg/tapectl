@@ -1563,8 +1563,17 @@ To take stock of a box without relying on the index, load each tape in
 turn, run `./RESTORE.sh --info` (its label and when it was sealed) and
 `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` (its units, their
 versions, slices and sizes), and write them down. A unit that appears at
-the same version AND with the same unit uuid on two tapes has two copies:
-they are the same content, and either restores it. A name and a version
+the same version AND with the same unit uuid on two tapes has two copies
+only when each of the two tapes holds that version WHOLE: then they are the
+same content, and either restores it alone. A tape that holds only part of
+a unit across tapes ("A unit across tapes") is not a copy: two tapes that
+each hold part of a unit are ONE copy, and restore it only together. To
+tell, run `./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT` on the
+tape: it says "HELD ACROSS TAPES" when the tape holds only part of that
+version, and `--where UNIT` marks such a tape "a range". The table of
+`--find-envelope` marks such a unit `PART:` from the tape's plan alone; a
+tape that ended early ("Where the tape ended") can hold less than its plan,
+and `--list` and `--where` know it. A name and a version
 number alone prove nothing; the uuid is in MANIFEST.toml (`--find-envelope`
 with a tenant's key prints it) and, on a tape with an index, in `--where`.
 Cartridges are found by their label; the cartridge's chip serial is in
@@ -4174,12 +4183,28 @@ walk_envelopes() { # <on-open callback> [<resume after this position>]
   done < <(envelope_positions "$FILES_TXT")
 }
 
-# One line per unit an envelope lists: unit, versions, slices, size.
+# One line per unit an envelope lists: unit, versions, slices, size. A unit
+# held across tapes of which this tape's plan holds only some slices (those
+# given a tape_position, volume-format-v2.md 4.4) is marked PART, with the run
+# its plan holds: such a tape is not a copy of it on its own. This reads no
+# seal, so a tape that ended early may hold less; --list --unit says.
 units_table() { # <MANIFEST.toml>
+  local rows name versions nslices bytes part parted=0
+  rows=$(awk '__AWK_UNITS_TABLE__' "$1")
   printf "    %-32s  %-10s  %6s  %10s\n" "Unit" "Versions" "Slices" "Size"
-  awk '__AWK_UNITS_TABLE__' "$1" | while IFS='|' read -r name versions nslices bytes; do
-    printf "    %-32s  %-10s  %6s  %10s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")"
-  done
+  while IFS='|' read -r name versions nslices bytes part; do
+    [ -n "$name" ] || continue
+    if [ -z "$part" ]; then
+      printf "    %-32s  %-10s  %6s  %10s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")"
+      continue
+    fi
+    printf "    %-32s  %-10s  %6s  %10s  PART: %s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")" "$part"
+    parted=1
+  done <<<"$rows"
+  [ "$parted" = 1 ] || return 0
+  echo "    PART: a unit held across tapes, of which this tape's plan holds only the slices named (Slices"
+  echo "      and Size count the whole version). It is not a copy on its own: --list --unit UNIT says which"
+  echo "      slices this tape holds, and --where UNIT which tapes hold the others."
 }
 
 # ---- --find-envelope ----
@@ -8742,6 +8767,83 @@ mod tests {
         assert!(!plain.contains("across tapes"), "{plain}");
     }
 
+    /// The fresh read of File 1 for a span (#478, S2): `--find-envelope`'s
+    /// table marks a unit this tape's plan holds only part of, by the slices
+    /// its block gives a tape position, against the block's N, so the heir
+    /// does not count two halves as two copies. A whole block is unmarked, and
+    /// a unit in two versions is marked for the version held in part only.
+    /// Slices and bytes still count every slice the blocks list. Every awk on
+    /// the host agrees.
+    #[test]
+    fn units_table_marks_a_version_this_tapes_plan_holds_only_part_of() {
+        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
+            number,
+            tape_position,
+            size_bytes: 10,
+            encrypted_bytes: 30 + number,
+            sha256_plain: "p".into(),
+            sha256_encrypted: format!("e{number}").repeat(32),
+        };
+        let whole = ManifestUnit {
+            name: "alpha".into(),
+            uuid: "11111111-aaaa".into(),
+            snapshot_version: 1,
+            stage_set_id: 7,
+            may_span: false,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![slice(1, Some(10)), slice(2, Some(11))],
+        };
+        let big_v1 = ManifestUnit {
+            name: "big".into(),
+            uuid: "88888888-9999".into(),
+            snapshot_version: 1,
+            stage_set_id: 8,
+            may_span: true,
+            slices: vec![slice(1, Some(12))],
+            ..whole.clone()
+        };
+        let big_v2 = ManifestUnit {
+            snapshot_version: 2,
+            stage_set_id: 9,
+            slices: vec![
+                slice(1, None),
+                slice(2, None),
+                slice(3, Some(13)),
+                slice(4, Some(14)),
+            ],
+            ..big_v1.clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().join("MANIFEST.toml");
+        std::fs::write(
+            &m,
+            generate_manifest_toml("SPR2", "alice", &[whole, big_v1, big_v2]),
+        )
+        .unwrap();
+        let (code, out) = run_awk(false, AWK_UNITS_TABLE, &m, &[]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            out,
+            "alpha|1|2|63|\nbig|1,2|5|161|version 2, slices 3 to 4 of 4\n"
+        );
+        let script = generate_restore_script_v2("SPR2", 20);
+        assert_eq!(
+            script
+                .matches("printf \"    %-32s  %-10s  %6s  %10s  PART: %s\\n\"")
+                .count(),
+            1,
+            "the row of a unit held in part names the run"
+        );
+        assert_eq!(
+            script
+                .matches("PART: a unit held across tapes, of which this tape's plan holds only the slices named")
+                .count(),
+            1,
+            "and the table says what the mark means"
+        );
+    }
+
     /// File 1 says the same for the heir (§1.7): what `requires =
     /// ["short-seal"]` means (the glossary no longer says the list is empty),
     /// that the seal's `ended_after` says where the tape ended, the four
@@ -8854,6 +8956,34 @@ mod tests {
         );
         // The guide is the same on every tape 1.7.0 writes, a span tape or not.
         assert_eq!(g, generate_system_guide_v2_for_media("SP02", 20, "LTO-6"));
+    }
+
+    /// The fresh read of File 1 for a span (#478; ADR-0012 items 108 and
+    /// 135), S2: the stock-taking rule counted two tapes that each hold part
+    /// of a unit as two copies. A tape counts as a copy only when it holds the
+    /// version whole; `--list --unit` and `--where` tell, and the table of
+    /// `--find-envelope` marks a unit held in part from the plan alone.
+    #[test]
+    fn fresh_read_478_s2_two_halves_are_one_copy() {
+        let g = generate_system_guide_v2_for_media("FR01", 20, "LTO-6");
+        let bx = box_section(&g);
+        for needle in [
+            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies only when each of the two tapes holds that version WHOLE: then they are the same content, and either restores it alone.",
+            "A tape that holds only part of a unit across tapes (\"A unit across tapes\") is not a copy: two tapes that each hold part of a unit are ONE copy, and restore it only together.",
+            "run `./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT` on the tape: it says \"HELD ACROSS TAPES\" when the tape holds only part of that version, and `--where UNIT` marks such a tape \"a range\".",
+            "The table of `--find-envelope` marks such a unit `PART:` from the tape's plan alone; a tape that ended early (\"Where the tape ended\") can hold less than its plan, and `--list` and `--where` know it.",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+        // The words it sends the heir to look for are the script's own.
+        let script = generate_restore_script_v2("FR01", 20);
+        for said in [
+            "    HELD ACROSS TAPES: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of this version's $PICKED_COUNT",
+            ", a range: not the whole version",
+            "  PART: %s\\n\"",
+        ] {
+            assert!(script.contains(said), "{said:?}");
+        }
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query

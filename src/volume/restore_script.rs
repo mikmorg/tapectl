@@ -229,15 +229,30 @@ pub(crate) const AWK_MT_POSITION: &str = r##"
     END { if (f ~ /^-?[0-9]+$/ && b ~ /^-?[0-9]+$/) print f, b }
   "##;
 
-/// One `unit|versions|slices|bytes` line per unit in an envelope manifest,
-/// in first-seen order (issue #412 item 7): `--find-envelope` prints it as a
-/// table for every envelope it opens, which with an operator or escrow key
-/// is every unit on the tape. A unit stored in several snapshot versions is
-/// one line, its versions joined with commas; slices and bytes are summed
-/// over them.
+/// One `unit|versions|slices|bytes|part` line per unit in an envelope
+/// manifest, in first-seen order (issue #412 item 7): `--find-envelope`
+/// prints it as a table for every envelope it opens, which with an operator
+/// or escrow key is every unit on the tape. A unit stored in several snapshot
+/// versions is one line, its versions joined with commas; slices and bytes are
+/// summed over them.
+///
+/// `part` is empty unless a version block gives a `tape_position` to fewer of
+/// its slices than it lists: a unit held across tapes of which this tape's
+/// plan holds only a range (`volume-format-v2.md` §4.4; #478, the fresh read's
+/// S2). It then names each such version and the run its plan holds, as
+/// `version V, slices A to B of N`, joined with `; `. The plan only: this
+/// reads no seal, so a tape that ended early (§4.2) may hold less.
 pub(crate) const AWK_UNITS_TABLE: &str = r##"
-    /^\[\[units\]\]/ { in_head = 1; cur = ""; next }
-    /^\[\[units\.slices\]\]/ { in_head = 0; if (cur != "") n[cur]++; next }
+    function close_block() {
+      if (cur != "" && bn > 0 && bp < bn) {
+        if (bp == 0) r = "version " bv ", none of its " bn " slices"
+        else r = "version " bv ", slices " bf " to " bl " of " bn
+        part[cur] = (part[cur] == "") ? r : part[cur] "; " r
+      }
+      bn = 0; bp = 0; bf = ""; bl = ""; bv = ""; num = ""
+    }
+    /^\[\[units\]\]/ { close_block(); in_head = 1; cur = ""; next }
+    /^\[\[units\.slices\]\]/ { in_head = 0; num = ""; if (cur != "") n[cur]++; if (cur != "") bn++; next }
     /^\[/ { in_head = 0 }
     in_head && /^name = / {
       v = $3; gsub(/"/, "", v); cur = v
@@ -245,12 +260,16 @@ pub(crate) const AWK_UNITS_TABLE: &str = r##"
     }
     in_head && /^snapshot_version = / && cur != "" {
       vers[cur] = (vers[cur] == "") ? $3 : vers[cur] "," $3
+      bv = $3
     }
+    !in_head && /^number = / && cur != "" { num = $3 }
+    !in_head && /^tape_position = / && cur != "" { bp++; if (bf == "") bf = num; bl = num }
     /^encrypted_bytes = / && cur != "" { b[cur] += $3 }
     END {
+      close_block()
       for (i = 1; i <= k; i++) {
         u = order[i]
-        printf "%s|%s|%d|%.0f\n", u, vers[u], n[u], b[u]
+        printf "%s|%s|%d|%.0f|%s\n", u, vers[u], n[u], b[u], part[u]
       }
     }
   "##;
