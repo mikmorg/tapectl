@@ -5007,6 +5007,8 @@ span_accept() {
   rm -f "$WORK/other.vars"
   (other_tape_map && printf '%s|%s\n' "$OTHER_END" "$OTHER_LABEL" >"$WORK/other.vars") 2>"$WORK/other.err" || rc=$?
   CUR=""
+  # A subshell stopped part way has not put back the first tape's file map.
+  [ ! -f "$WORK/tape1.files" ] || cp "$WORK/tape1.files" "$FILES_TXT"
   sed 's/^FATAL: /NOTE: /' "$WORK/other.err" >&2 || true
   if [ "$rc" != 0 ] || [ ! -s "$WORK/other.vars" ]; then
     info "Nothing is taken from this cartridge: its file map cannot be used (see above)."
