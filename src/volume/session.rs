@@ -160,6 +160,23 @@ pub(crate) fn fixture_seal_files(ended_after: u32) -> Vec<layout::FrontIndexFile
 /// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
 #[cfg(test)]
 pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: &str) -> Vec<u8> {
+    fixture_seal_requiring(
+        label,
+        seal_position,
+        front_index_sha256,
+        layout::REQUIRES_WHOLE,
+    )
+}
+
+/// Test support (#478): [`fixture_seal`] stating `features` in `requires`
+/// (a span tape's seal states [`layout::REQUIRES_SPAN`], ADR-0012 item 124).
+#[cfg(test)]
+pub(crate) fn fixture_seal_requiring(
+    label: &str,
+    seal_position: u32,
+    front_index_sha256: &str,
+    features: &[&str],
+) -> Vec<u8> {
     let mut files = fixture_seal_files(seal_position - 1);
     files.push(layout::FrontIndexFile {
         position: seal_position as i32,
@@ -167,8 +184,14 @@ pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: 
         size_bytes: None,
         sha256_encrypted: None,
     });
-    layout::generate_seal_marker(label, seal_position as i32 + 1, front_index_sha256, &files)
-        .into_bytes()
+    layout::generate_seal_marker_requiring(
+        label,
+        seal_position as i32 + 1,
+        front_index_sha256,
+        &files,
+        features,
+    )
+    .into_bytes()
 }
 
 /// Test support (#420): a short 1.6.0 seal at `ended_after + 1` binding
@@ -179,11 +202,29 @@ pub(crate) fn fixture_short_seal(
     ended_after: u32,
     front_index_sha256: &str,
 ) -> Vec<u8> {
-    layout::generate_short_seal_marker(
+    fixture_short_seal_requiring(
+        label,
+        ended_after,
+        front_index_sha256,
+        layout::REQUIRES_WHOLE,
+    )
+}
+
+/// Test support (#478): [`fixture_short_seal`] stating `features` in
+/// `requires` (a span tape's: ADR-0012 item 124).
+#[cfg(test)]
+pub(crate) fn fixture_short_seal_requiring(
+    label: &str,
+    ended_after: u32,
+    front_index_sha256: &str,
+    features: &[&str],
+) -> Vec<u8> {
+    layout::generate_short_seal_marker_requiring(
         label,
         ended_after as i32,
         front_index_sha256,
         &fixture_seal_files(ended_after),
+        features,
     )
     .into_bytes()
 }
@@ -2568,6 +2609,11 @@ impl ReadyToSeal {
         let placeholder_len = seal_entry.size_bytes.ok_or_else(|| {
             TapectlError::Other("seal: seal_marker entry has no recorded size".into())
         })?;
+        // X7 (ADR-0012 item 124, `volume-format-v2.md` §1.2): the seal states
+        // the `requires` File 0 states, and `build` sized the placeholder
+        // with the same features. Read from the frozen File 0, so a session
+        // rehydrated after a restart states it too, and never resolved again.
+        let features = frozen_requires(&self.built.layout)?;
 
         // The embedded copy: File 3's own entry gets its real size+hash
         // (known now); the seal marker's own entry stays bare (self-reference)
@@ -2595,11 +2641,12 @@ impl ReadyToSeal {
 
         let real_seal_bytes = match self.ending {
             Ending::Full => {
-                let real = layout::generate_seal_marker(
+                let real = layout::generate_seal_marker_requiring(
                     &self.built.layout.label,
                     self.built.layout.entries.len() as i32,
                     &fi_hash,
                     &seal_files,
+                    features,
                 );
                 if real.len() as u64 != placeholder_len {
                     return Err(TapectlError::Other(format!(
@@ -2631,11 +2678,12 @@ impl ReadyToSeal {
                     .into_iter()
                     .filter(|f| f.position as u32 <= ended_after)
                     .collect();
-                let real = layout::generate_short_seal_marker(
+                let real = layout::generate_short_seal_marker_requiring(
                     &self.built.layout.label,
                     ended_after as i32,
                     &fi_hash,
                     &through_k,
+                    features,
                 );
                 // §4.1 "Length": never longer than the placeholder build
                 // sized; never required to be equal.
@@ -3708,6 +3756,61 @@ fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Res
         })?;
     }
     Ok(())
+}
+
+/// The features the session's frozen File 0 states in `requires`, which the
+/// seal must state too (`volume-format-v2.md` §1.2: File 0's `[volume]` and
+/// the seal's `[seal]` both state it; ADR-0012 item 124, coordinator ruling
+/// X7). `build` took File 0's and the seal placeholder's from one fact
+/// ([`layout::tape_requires`]: whether the plan holds a slice of a spannable
+/// set), so this is the placeholder's too, and the full seal fits it.
+///
+/// Read from the materialized File 0 `build` froze, never from a new Layout
+/// field (X7), so a session `rehydrate` rebuilt after a restart reads the
+/// same bytes the tape holds. Plain `std::fs`: this is not a staged-file
+/// read (`pass_count`). Fails closed: a File 0 that does not read, does not
+/// parse, or states a list this tapectl never writes is an error before the
+/// seal's first block, never a guess at one feature.
+fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'static str]> {
+    let entry = layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::IdThunk))
+        .ok_or_else(|| TapectlError::Other("seal: layout has no id_thunk entry".into()))?;
+    let ContentSource::Materialized(path) = &entry.source else {
+        return Err(TapectlError::Other(
+            "seal: the layout's File 0 is not a frozen file, so the seal cannot state the \
+             `requires` File 0 states"
+                .into(),
+        ));
+    };
+    let raw = std::fs::read(path).map_err(|e| {
+        TapectlError::Other(format!(
+            "seal: cannot read the frozen File 0 at {} for its `requires`: {e}",
+            path.display()
+        ))
+    })?;
+    let claims =
+        format::parse_id_thunk_claims(&String::from_utf8_lossy(format::without_nul_padding(&raw)))
+            .map_err(|e| {
+                TapectlError::Other(format!(
+                    "seal: the frozen File 0 at {} does not parse for its `requires`: {e}",
+                    path.display()
+                ))
+            })?;
+    let features = layout::tape_requires(claims.requires.iter().any(|f| f == format::SPANNING));
+    if !claims.requires.iter().map(String::as_str).eq(features.iter().copied()) {
+        return Err(TapectlError::Other(format!(
+            "seal: the frozen File 0 at {} states requires = {:?}, which is neither list this \
+             tapectl writes ({:?} or {:?}); the seal must state what File 0 states, so it is \
+             not written",
+            path.display(),
+            claims.requires,
+            layout::REQUIRES_WHOLE,
+            layout::REQUIRES_SPAN,
+        )));
+    }
+    Ok(features)
 }
 
 /// The planned seal position M: the Layout's `seal_marker` entry.
