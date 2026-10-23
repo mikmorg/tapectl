@@ -354,12 +354,24 @@ const CHECKS: &[Check] = &[
     },
     Check {
         // #420 (layout-session.md, `volumes.ended_after`): the two
-        // invariants of a short-sealed volume's rows. Umbrella name for one
-        // function (`short_seal_findings`) that emits `cut_without_ending`
-        // or `completed_past_ending`, one finding per volume and kind.
+        // invariants of a short-sealed volume's rows, and (#478, X27) the
+        // four of a `range` row. Umbrella name for one function
+        // (`short_seal_findings`) that emits `cut_without_ending`,
+        // `completed_past_ending`, `range_without_may_span`,
+        // `range_written_past_ending`, `range_not_one_run` or
+        // `range_without_written_slice`, one finding per volume and kind.
         name: "short_seal",
         scope: Scope::Archive {
             run: check_short_seal,
+        },
+    },
+    Check {
+        // #478 (ADR-0012 item 128; layout-session.md, "Promotion and the
+        // retire floor"): a spanning version not yet promoted, the slices it
+        // is missing and the tapes holding the rest.
+        name: "span_in_progress",
+        scope: Scope::Archive {
+            run: check_span_in_progress,
         },
     },
 ];
@@ -941,30 +953,15 @@ fn check_verify_age(
         // oldest checkpoint, when some of its files were last read.
         //
         // Only a readback of a volume that still counts as a copy of this
-        // unit (#454): `w.status = 'completed'` (the unit's bytes are on it)
-        // and `coverage::eligible` (not retired, erased or quarantined).
-        // Without them a fresh verify of a copy since retired kept the clock
-        // fresh while the only live copy went unread — the same gate
-        // `evidence::tape_rows(only_eligible: true)` applies.
+        // unit (#454): one holding the unit's bytes (a `completed` write, or
+        // a `range` with the slice `written`) and `coverage::eligible` (not
+        // retired, erased or quarantined). Without them a fresh verify of a
+        // copy since retired kept the clock fresh while the only live copy
+        // went unread — the same gate `evidence::tape_rows(only_eligible:
+        // true)` applies. Per slice from 1.7.0: [`verify_age_sql`].
         let last_verify: Option<String> = ctx
             .conn
-            .query_row(
-                &format!(
-                    "SELECT MAX({dated})
-                     FROM verification_sessions vs
-                     JOIN writes w ON w.volume_id = vs.volume_id
-                     JOIN volumes v ON v.id = w.volume_id
-                     JOIN stage_sets ss ON ss.id = w.stage_set_id
-                     JOIN snapshots s ON s.id = ss.snapshot_id
-                     WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
-                       AND vs.verify_type = 'full'
-                       AND w.status = 'completed' AND {eligible}",
-                    dated = policy::evidence::full_readback_date("vs"),
-                    eligible = policy::coverage::eligible("v"),
-                ),
-                params![unit.id],
-                |row| row.get(0),
-            )
+            .query_row(&verify_age_sql(), params![unit.id], |row| row.get(0))
             .ok()
             .flatten();
 
@@ -992,6 +989,73 @@ fn check_verify_age(
         }
     }
     Ok(f)
+}
+
+/// `verify_age`'s one statement for the unit `?1`: the newest passing FULL
+/// readback that still speaks for every byte of some stage set of it (#478,
+/// coordinator fork X26; ADR-0012 item 127, "audit's verify age is the oldest
+/// of each range's newest readback").
+///
+/// Per stage set:
+/// - a slice's date is the newest full readback among the [`eligible`]
+///   volumes holding it (a `completed` write of the set, or a `range` write
+///   with the slice `written`), dated by its start
+///   ([`policy::evidence::full_readback_date`]);
+/// - the set's date is the OLDEST of its slices' dates, and a slice no
+///   eligible holder has read back in full (or no eligible volume holds at
+///   all, a span in progress) makes the set read never (NULL): a range read
+///   yesterday says nothing about the slices on another tape;
+/// - a set with no `range` row on an eligible volume is judged by its whole
+///   holders alone, as 1.6.0 judged every set (every slice of it has the same
+///   holders), and so is a set with no slice rows (item 138's fallback).
+///
+/// The unit's date is the NEWEST of its sets' dates, as it was the newest of
+/// its copies' before: with whole writes only this is exactly 1.6.0's figure.
+/// Taking the oldest across versions instead would let a long-released
+/// version's tape hold the unit's clock back.
+///
+/// [`eligible`]: policy::coverage::eligible
+fn verify_age_sql() -> String {
+    // The newest full readback of an eligible holder `hw` of the set `css`
+    // that also satisfies `holds`.
+    let newest = |holds: &str| {
+        format!(
+            "(SELECT MAX({dated})
+                FROM writes hw
+                JOIN volumes hv ON hv.id = hw.volume_id
+                JOIN verification_sessions vs
+                  ON vs.volume_id = hv.id AND vs.outcome = 'passed'
+                 AND vs.verify_type = 'full'
+               WHERE hw.stage_set_id = css.id AND {eligible} AND {holds})",
+            dated = policy::evidence::full_readback_date("vs"),
+            eligible = policy::coverage::eligible("hv"),
+        )
+    };
+    let whole = newest("hw.status = 'completed'");
+    let at_slice = newest(
+        "(hw.status = 'completed'
+          OR (hw.status = 'range'
+              AND EXISTS (SELECT 1 FROM write_positions hp
+                           WHERE hp.write_id = hw.id AND hp.stage_slice_id = cl.id
+                             AND hp.status = 'written')))",
+    );
+    // `ORDER BY n IS NOT NULL, n`: a never-read slice (NULL) sorts first, so
+    // it is the set's date; otherwise the oldest slice's.
+    format!(
+        "SELECT MAX(set_date) FROM (
+           SELECT CASE
+                    WHEN EXISTS (SELECT 1 FROM writes rw JOIN volumes rv ON rv.id = rw.volume_id
+                                  WHERE rw.stage_set_id = css.id AND rw.status = 'range'
+                                    AND {range_eligible})
+                    THEN (SELECT {at_slice} AS n FROM stage_slices cl
+                           WHERE cl.stage_set_id = css.id
+                           ORDER BY n IS NOT NULL, n LIMIT 1)
+                    ELSE {whole}
+                  END AS set_date
+             FROM snapshots s JOIN stage_sets css ON css.snapshot_id = s.id
+            WHERE s.unit_id = ?1)",
+        range_eligible = policy::coverage::eligible("rv"),
+    )
 }
 
 // ESCROW COVERAGE (#125, follow-up to #115).
@@ -1879,7 +1943,7 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
 
 // SHORT SEAL (#420; ADR-0012 item 112; layout-session.md, "volumes.ended_after").
 //
-// The two invariants `audit` checks of a tape that ended early:
+// The invariants `audit` checks of a tape that ended early, and of a range:
 //
 // - `cut_without_ending`: a `cut` row exists only on a volume with
 //   `ended_after` set. A cut row elsewhere means the catalog does not record
@@ -1889,12 +1953,31 @@ fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
 //   `ended_after` set has all its slices at positions at or before it. One
 //   past it is a unit the tape does not hold whole counted as a copy.
 //
-// Confirm, `catalog rebuild` and the adoption of a lost write all keep both,
-// so either is a catalog someone edited, or a bug. Warnings, as every
-// archive-wide check (ADR-0004), named per volume. One statement for every
-// volume (the budget pin in `tests/catalog_budget.rs`). A short seal itself
-// draws no finding: it is a normal, successful end of a write, and a warning
-// for it would hold `audit` at exit 1 for the life of every such tape.
+// From 1.7.0 (#478, coordinator fork X27; ADR-0012 items 121 and 122,
+// `volume-format-v2.md` §4.4), four of a `range` row:
+//
+// - `range_without_may_span`: only a write planned as spannable is ever a
+//   range. Migration 039's row CHECK refuses the row, so it exists only where
+//   someone edited around the CHECK.
+// - `range_written_past_ending`: on a volume with `ended_after` set, a range's
+//   `written` positions are at or before it (confirm turns the ones after it
+//   `pending`). One past it is a slice the tape does not hold counted as a
+//   copy of that slice.
+// - `range_not_one_run`: a range's `written` slices are one unbroken run in
+//   slice order (item 122). A gap means the catalog does not say which slices
+//   the tape holds.
+// - `range_without_written_slice`: a range holds at least one slice; a write
+//   whose tape holds none of its set is `cut`.
+//
+// Confirm, `catalog rebuild` and the adoption of a lost write all keep every
+// one of them, so any finding is a catalog someone edited, or a bug. Warnings,
+// as every archive-wide check (ADR-0004), named per volume and kind. ONE
+// statement for every volume and every invariant (the budget pin in
+// `tests/catalog_budget.rs`), each branch reaching writes and positions from
+// the volumes by index, never through a derived table (which would be a pass
+// of its own). A short seal itself draws no finding: it is a normal,
+// successful end of a write, and a warning for it would hold `audit` at exit 1
+// for the life of every such tape.
 fn check_short_seal(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
@@ -1903,7 +1986,16 @@ fn check_short_seal(ctx: &Ctx<'_>) -> Result<Findings> {
 }
 
 fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
-    let mut stmt = conn.prepare(
+    // The written slices of the range `w`: their count, and the span of their
+    // slice numbers. Equal for one unbroken run; NULL span with none written.
+    let written = |what: &str| {
+        format!(
+            "(SELECT {what} FROM write_positions xp
+                JOIN stage_slices xl ON xl.id = xp.stage_slice_id
+               WHERE xp.write_id = w.id AND xp.status = 'written')"
+        )
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT 'cut_without_ending', v.label, NULL, COUNT(*), NULL
            FROM volumes v JOIN writes w ON w.volume_id = v.id
           WHERE w.status = 'cut' AND v.ended_after IS NULL
@@ -1920,8 +2012,37 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
           WHERE v.ended_after IS NOT NULL
             AND CAST(wp.position AS INTEGER) > v.ended_after
           GROUP BY v.id
+         UNION ALL
+         SELECT 'range_without_may_span', v.label, NULL, COUNT(*), NULL
+           FROM volumes v JOIN writes w ON w.volume_id = v.id
+          WHERE w.status = 'range' AND w.may_span = 0
+          GROUP BY v.id
+         UNION ALL
+         SELECT 'range_written_past_ending', v.label, v.ended_after,
+                COUNT(DISTINCT w.id), MAX(CAST(wp.position AS INTEGER))
+           FROM volumes v
+           CROSS JOIN writes w ON w.volume_id = v.id AND w.status = 'range'
+           CROSS JOIN write_positions wp ON wp.write_id = w.id AND wp.status = 'written'
+          WHERE v.ended_after IS NOT NULL
+            AND CAST(wp.position AS INTEGER) > v.ended_after
+          GROUP BY v.id
+         UNION ALL
+         SELECT 'range_not_one_run', v.label, NULL, COUNT(*), NULL
+           FROM volumes v JOIN writes w ON w.volume_id = v.id
+          WHERE w.status = 'range'
+            AND {count} <> {run}
+          GROUP BY v.id
+         UNION ALL
+         SELECT 'range_without_written_slice', v.label, NULL, COUNT(*), NULL
+           FROM volumes v JOIN writes w ON w.volume_id = v.id
+          WHERE w.status = 'range'
+            AND NOT EXISTS (SELECT 1 FROM write_positions xp
+                             WHERE xp.write_id = w.id AND xp.status = 'written')
+          GROUP BY v.id
          ORDER BY 2, 1",
-    )?;
+        count = written("COUNT(*)"),
+        run = written("MAX(xl.slice_number) - MIN(xl.slice_number) + 1"),
+    ))?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -1936,20 +2057,41 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     Ok(rows
         .into_iter()
         .map(|(check, label, ended_after, writes, last)| {
-            let message = if check == "cut_without_ending" {
-                format!(
+            let message = match check.as_str() {
+                "cut_without_ending" => format!(
                     "volume \"{label}\" has {writes} write(s) recorded `cut` but no \
                      `ended_after`: a cut row exists only on a volume that sealed short, so this \
                      catalog does not say where that tape ended"
-                )
-            } else {
-                format!(
+                ),
+                "completed_past_ending" => format!(
                     "volume \"{label}\" ended after tape file {}, but {writes} write(s) on it \
                      recorded `completed` have a slice past that (up to file {}): those units \
                      are not on this tape whole, yet they count as copies",
                     ended_after.unwrap_or_default(),
                     last.unwrap_or_default()
-                )
+                ),
+                "range_without_may_span" => format!(
+                    "volume \"{label}\" has {writes} write(s) recorded `range` with `may_span` \
+                     unset: only a write planned as spannable is ever a range, and the schema \
+                     refuses this row, so the catalog was edited around it"
+                ),
+                "range_written_past_ending" => format!(
+                    "volume \"{label}\" ended after tape file {}, but {writes} range write(s) on \
+                     it record a slice `written` past that (up to file {}): those slices are not \
+                     on this tape, yet they count as copies of those slices",
+                    ended_after.unwrap_or_default(),
+                    last.unwrap_or_default()
+                ),
+                "range_not_one_run" => format!(
+                    "volume \"{label}\" has {writes} range write(s) whose `written` slices are \
+                     not one unbroken run: a volume holds at most one unbroken range of a stage \
+                     set, so this catalog does not say which slices the tape holds"
+                ),
+                _ => format!(
+                    "volume \"{label}\" has {writes} write(s) recorded `range` with no slice \
+                     `written`: a range is the slices the tape holds, and a write whose tape \
+                     holds none of its set is `cut`"
+                ),
             };
             AuditFinding {
                 unit: format!("volume:{label}"),
@@ -1958,6 +2100,180 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 // A full verify reads the seal where the catalog says the tape
                 // ended and names any disagreement (`ended_after_disagrees`).
                 action: format!("tapectl volume verify {label}"),
+            }
+        })
+        .collect())
+}
+
+// SPAN IN PROGRESS (#478; ADR-0012 item 128; layout-session.md, "Promotion
+// and the retire floor": "`audit` names a span still in progress and the
+// slices it is missing").
+//
+// A spanning version becomes `current` once every slice of one of its stage
+// sets is on a sealed volume ([`policy::coverage::every_slice_on_sealed_volume_sql`],
+// the rule confirm, adoption and `catalog rebuild` promote by). Until then it
+// stays `staged` and counts no copy, however many of its slices are on tape,
+// and only the retire floor protects its ranges. This names each such set:
+// a version neither current nor released (`reclaimable`/`purged`) with a
+// `range` on a sealed volume, the slices that are on no sealed volume, and
+// the sealed volumes that hold the rest, each with its run. "Sealed" is the
+// volume's status alone ([`policy::coverage::index_holder`], the same test as
+// the promotion rule's, coordinator fork X33), so a quarantined holder is
+// named too: the index lists it, and the promotion rule counts it.
+//
+// A warning (ADR-0004): a span in progress is the normal state between two
+// tapes of a span. ONE statement for the whole catalog (the budget pin in
+// `tests/catalog_budget.rs`), driven from the `range` writes and reaching
+// everything else by index: rows of two kinds, each missing slice and each
+// sealed holder with its run, grouped here.
+fn check_span_in_progress(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: span_in_progress_findings(ctx.conn)?,
+    })
+}
+
+/// One span in progress, as [`span_in_progress_findings`] gathers it.
+#[derive(Default)]
+struct SpanInProgress {
+    unit: String,
+    version: i64,
+    slices: i64,
+    missing: std::collections::BTreeSet<i64>,
+    /// Each sealed holder's label and its run of `written` slices.
+    holders: std::collections::BTreeMap<String, (i64, i64)>,
+}
+
+/// `numbers` as runs: `[1, 2, 3, 5]` reads "1-3, 5".
+fn slice_runs(numbers: &std::collections::BTreeSet<i64>) -> String {
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for &n in numbers {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == n => *last = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs.iter()
+        .map(|&(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+    use std::collections::BTreeMap;
+    // The span: a range `w` on a sealed volume `v`, of a set `ss` whose
+    // version is neither promoted nor released and which some slice of is on
+    // no sealed volume. Driven from `writes` (the range rows), the rest by key.
+    let span = "FROM writes w
+         CROSS JOIN volumes v ON v.id = w.volume_id
+         CROSS JOIN stage_sets ss ON ss.id = w.stage_set_id
+         CROSS JOIN snapshots s ON s.id = ss.snapshot_id
+         CROSS JOIN units u ON u.id = s.unit_id";
+    let span_where = format!(
+        "w.status = 'range' AND {sealed}
+         AND s.status NOT IN ('current', 'reclaimable', 'purged')
+         AND NOT {promoted}",
+        sealed = policy::coverage::index_holder("v"),
+        promoted = policy::coverage::every_slice_on_sealed_volume_sql("ss.id", None),
+    );
+    let slices = "(SELECT COUNT(*) FROM stage_slices al WHERE al.stage_set_id = ss.id)";
+    let mut stmt = conn.prepare(&format!(
+        "SELECT ss.id, u.name, s.version, {slices}, 'missing', NULL, ml.slice_number, NULL
+         {span}
+         CROSS JOIN stage_slices ml ON ml.stage_set_id = ss.id
+         WHERE {span_where}
+           AND NOT EXISTS (
+             SELECT 1 FROM writes qw JOIN volumes qv ON qv.id = qw.volume_id
+              WHERE qw.stage_set_id = ss.id AND {holder_sealed}
+                AND (qw.status = 'completed'
+                     OR (qw.status = 'range'
+                         AND EXISTS (SELECT 1 FROM write_positions qp
+                                      WHERE qp.write_id = qw.id AND qp.stage_slice_id = ml.id
+                                        AND qp.status = 'written'))))
+         UNION ALL
+         SELECT ss.id, u.name, s.version, {slices}, 'holder', hv.label,
+                MIN(hl.slice_number), MAX(hl.slice_number)
+         {span}
+         CROSS JOIN writes hw ON hw.stage_set_id = ss.id
+         CROSS JOIN volumes hv ON hv.id = hw.volume_id
+         CROSS JOIN write_positions hp ON hp.write_id = hw.id AND hp.status = 'written'
+         CROSS JOIN stage_slices hl ON hl.id = hp.stage_slice_id
+         WHERE {span_where}
+           AND hw.status IN ('completed', 'range') AND {hv_sealed}
+         GROUP BY w.id, hw.id",
+        holder_sealed = policy::coverage::index_holder("qv"),
+        hv_sealed = policy::coverage::index_holder("hv"),
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut spans: BTreeMap<i64, SpanInProgress> = BTreeMap::new();
+    for (set, unit, version, slices, kind, label, first, last) in rows {
+        let span = spans.entry(set).or_default();
+        span.unit = unit;
+        span.version = version;
+        span.slices = slices;
+        if kind == "missing" {
+            span.missing.insert(first);
+        } else if let Some(label) = label {
+            span.holders.insert(label, (first, last.unwrap_or(first)));
+        }
+    }
+    // A set with no slice rows has nothing to name (and never meets the
+    // promotion rule either way).
+    let mut spans: Vec<SpanInProgress> = spans
+        .into_values()
+        .filter(|span| !span.missing.is_empty())
+        .collect();
+    spans.sort_by(|a, b| (&a.unit, a.version).cmp(&(&b.unit, b.version)));
+    Ok(spans
+        .into_iter()
+        .map(|span| {
+            let holders = span
+                .holders
+                .iter()
+                .map(|(label, (first, last))| {
+                    if first == last {
+                        format!("{label} (slice {first})")
+                    } else {
+                        format!("{label} (slices {first}-{last})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let holders = match span.holders.len() {
+                0 => "no sealed volume holds a written slice of it".to_string(),
+                1 => format!("{holders} holds the rest"),
+                _ => format!("{holders} hold the rest"),
+            };
+            AuditFinding {
+                unit: span.unit.clone(),
+                check: "span_in_progress".into(),
+                message: format!(
+                    "v{} is a span still in progress: slice(s) {} of {} are on no sealed \
+                     volume yet, and {holders}. The version stays `staged`, and counts no \
+                     copy, until every slice is on a sealed volume",
+                    span.version,
+                    slice_runs(&span.missing),
+                    span.slices,
+                ),
+                // The next write plans the slices the span still owes first
+                // (layout-session.md, "The plan order").
+                action: "load a fresh cartridge and run tapectl volume write <LABEL>: it writes \
+                         the slices the span still owes first"
+                    .to_string(),
             }
         })
         .collect())
@@ -4842,6 +5158,139 @@ mod tests {
         }
     }
 
+    /// #478 (coordinator fork X26; ADR-0012 item 127): a version spread over
+    /// ranges is as freshly read as its least freshly read slice, each slice
+    /// as fresh as its newest readback among the eligible volumes holding it.
+    mod verify_age_per_slice {
+        use super::*;
+        use crate::policy::coverage::tests::SpanCatalog;
+
+        fn days_ago(days: i64) -> String {
+            (chrono::Utc::now().naive_utc() - chrono::Duration::days(days))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        /// Unit `span` verifying every 30 days, v1 `current` with a 6-slice
+        /// set; returns the catalog and the set.
+        fn span() -> (SpanCatalog, i64) {
+            let c = SpanCatalog::new();
+            c.conn
+                .execute(
+                    "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('monthly', 30)",
+                    [],
+                )
+                .unwrap();
+            c.conn
+                .execute(
+                    "UPDATE units SET archive_set_id = last_insert_rowid() WHERE id = ?1",
+                    params![c.unit_id],
+                )
+                .unwrap();
+            let snap = c.version(1, "current");
+            let set = c.stage_set(snap, 6);
+            (c, set)
+        }
+
+        fn read_back(c: &SpanCatalog, volume: i64, days: i64) {
+            c.conn
+                .execute(
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, 'full', 'passed', ?2, ?2)",
+                    params![volume, days_ago(days)],
+                )
+                .unwrap();
+        }
+
+        fn messages(c: &SpanCatalog) -> Vec<String> {
+            let (_violations, warnings) =
+                collect_findings(&c.conn, &Config::default(), Some("span")).unwrap();
+            warnings
+                .into_iter()
+                .filter(|f| f.check == "verify_age")
+                .map(|f| f.message)
+                .collect()
+        }
+
+        /// Tape 1 holds slices 1-2, read back two days ago; tape 3 holds 3-6
+        /// and was never read back. The version reads never: tape 1's readback
+        /// says nothing about the slices on tape 3. Reading tape 3 back makes
+        /// it fresh (the positive control), and when tape 3's readback is the
+        /// older one, it is the version's date.
+        #[test]
+        fn a_version_is_as_fresh_as_its_least_freshly_read_range() {
+            let (c, set) = span();
+            let t1 = c.volume("SPAN-1", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            c.range(set, t3, 3, 6, 6);
+            read_back(&c, t1, 2);
+            assert_eq!(c.unit_copies(), 1, "precondition: the two ranges are one copy");
+            assert_eq!(
+                messages(&c),
+                ["not verified within 30 days (last: never)"],
+                "a fresh range does not speak for the slices on the other tape"
+            );
+
+            read_back(&c, t3, 3);
+            assert!(messages(&c).is_empty(), "every slice read back recently");
+
+            let (c, set) = span();
+            let t1 = c.volume("SPAN-1", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            c.range(set, t3, 3, 6, 6);
+            read_back(&c, t1, 2);
+            let old = days_ago(100);
+            c.conn
+                .execute(
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, 'full', 'passed', ?2, ?2)",
+                    params![t3, old],
+                )
+                .unwrap();
+            assert_eq!(
+                messages(&c),
+                [format!("not verified within 30 days (last: {old})")],
+                "the oldest of each range's newest readback"
+            );
+        }
+
+        /// Per slice, the NEWEST readback among its holders: a whole copy read
+        /// back yesterday covers every slice, whatever the ranges show; and a
+        /// range on a retired volume is no holder at all.
+        #[test]
+        fn a_slice_takes_its_newest_readback_among_eligible_holders() {
+            let (c, set) = span();
+            let t1 = c.volume("SPAN-1", None);
+            let t2 = c.volume("SPAN-2", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            c.whole(set, 6, t2);
+            c.range(set, t3, 3, 6, 6);
+            read_back(&c, t2, 1);
+            assert!(
+                messages(&c).is_empty(),
+                "item 93's whole tape speaks for every slice"
+            );
+
+            c.conn
+                .execute(
+                    "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                    params![t2],
+                )
+                .unwrap();
+            read_back(&c, t1, 1);
+            assert_eq!(
+                messages(&c),
+                ["not verified within 30 days (last: never)"],
+                "a retired holder's readback counts for nothing; slices 3-6 are unread"
+            );
+        }
+    }
+
     /// Issue #454 (ADR-0012 2026-10-15 (later) item 67): `volume_verify_age`
     /// judges each volume by its own newest full readback against the
     /// shortest `verify_interval_days` of the units on it, so a fresh home
@@ -5449,7 +5898,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 21 distinct `check` name literals this file's findings can
+        /// The 26 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -5476,6 +5925,11 @@ mod tests {
             "tape_alert",
             "cut_without_ending",
             "completed_past_ending",
+            "range_without_may_span",
+            "range_written_past_ending",
+            "range_not_one_run",
+            "range_without_written_slice",
+            "span_in_progress",
         ];
 
         #[test]
@@ -5491,14 +5945,15 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 8 archive-wide checks. `policy_unresolvable`
+            // 10 per-unit checks + 9 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), `escrow_kit_missing`/
             // `escrow_kit_stale` share one row, and so do
-            // `cut_without_ending`/`completed_past_ending` (#420).
+            // `cut_without_ending`/`completed_past_ending` (#420) and the
+            // four range invariants (#478, X27).
             assert_eq!(
                 names.len(),
-                18,
-                "expected 10 per-unit + 8 archive-wide CHECKS rows, got: {names:?}"
+                19,
+                "expected 10 per-unit + 9 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -5513,8 +5968,14 @@ mod tests {
                     // applies (or none) — never both.
                     "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
                     // The two invariants of a short-sealed volume's rows,
-                    // one `short_seal` row (#420).
-                    "cut_without_ending" | "completed_past_ending" => "short_seal",
+                    // and the four of a range (#478, X27): one `short_seal`
+                    // row, one statement (#420).
+                    "cut_without_ending"
+                    | "completed_past_ending"
+                    | "range_without_may_span"
+                    | "range_written_past_ending"
+                    | "range_not_one_run"
+                    | "range_without_written_slice" => "short_seal",
                     other => other,
                 };
                 assert!(
@@ -5789,8 +6250,14 @@ mod tests {
                 let canonical = match name {
                     "escrow_kit_missing" | "escrow_kit_stale" => "escrow_kit",
                     // The two invariants of a short-sealed volume's rows,
-                    // one `short_seal` row (#420).
-                    "cut_without_ending" | "completed_past_ending" => "short_seal",
+                    // and the four of a range (#478, X27): one `short_seal`
+                    // row, one statement (#420).
+                    "cut_without_ending"
+                    | "completed_past_ending"
+                    | "range_without_may_span"
+                    | "range_written_past_ending"
+                    | "range_not_one_run"
+                    | "range_without_written_slice" => "short_seal",
                     other => other,
                 };
                 CHECKS
@@ -6069,6 +6536,248 @@ mod tests {
                 "{}",
                 found[0].message
             );
+        }
+    }
+
+    /// #478 (coordinator fork X27): the four invariants of a `range` row,
+    /// folded into `short_seal`'s one statement. Each is silent on the rows
+    /// confirm leaves (item 93's layout, tape 1 sealed short) and fires on a
+    /// hand-made bad row, named by volume.
+    mod range_invariants {
+        use super::*;
+        use crate::policy::coverage::tests::SpanCatalog;
+
+        const RANGE_CHECKS: [&str; 4] = [
+            "range_without_may_span",
+            "range_written_past_ending",
+            "range_not_one_run",
+            "range_without_written_slice",
+        ];
+
+        /// Item 93's layout as confirm records it: SPAN-1 sealed short after
+        /// slice 2 (positions 6 and 7 `written`, 8-11 `pending`), SPAN-2 the
+        /// version whole, SPAN-3 the range 3-6. Returns the catalog and the
+        /// ids of tape 1's and tape 3's range writes.
+        fn item_93() -> (SpanCatalog, i64, i64) {
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "current");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            let t2 = c.volume("SPAN-2", None);
+            let t3 = c.volume("SPAN-3", None);
+            let w1 = c.range(set, t1, 1, 2, 6);
+            c.whole(set, 6, t2);
+            let w3 = c.range(set, t3, 3, 6, 6);
+            c.conn
+                .execute(
+                    "UPDATE volumes SET ended_after = 7 WHERE id = ?1",
+                    params![t1],
+                )
+                .unwrap();
+            (c, w1, w3)
+        }
+
+        /// `(check, unit)` of every range finding, through the whole audit
+        /// and through the statement itself (the same set).
+        fn found(c: &SpanCatalog) -> Vec<(String, String)> {
+            let (violations, warnings) =
+                collect_findings(&c.conn, &Config::default(), None).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .all(|f| !RANGE_CHECKS.contains(&f.check.as_str())),
+                "warnings only: {violations:?}"
+            );
+            let mut via_audit: Vec<(String, String)> = warnings
+                .into_iter()
+                .filter(|f| RANGE_CHECKS.contains(&f.check.as_str()))
+                .map(|f| (f.check, f.unit))
+                .collect();
+            via_audit.sort();
+            let mut direct: Vec<(String, String)> = short_seal_findings(&c.conn)
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.check, f.unit))
+                .collect();
+            direct.sort();
+            assert_eq!(via_audit, direct);
+            via_audit
+        }
+
+        fn one(check: &str, label: &str) -> Vec<(String, String)> {
+            vec![(check.to_string(), format!("volume:{label}"))]
+        }
+
+        #[test]
+        fn confirms_rows_draw_no_finding() {
+            let (c, _, _) = item_93();
+            assert!(found(&c).is_empty());
+            assert!(short_seal_findings(&c.conn).unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_range_without_may_span_is_named() {
+            let (c, w1, _) = item_93();
+            // Migration 039's row CHECK refuses this row; only an edit around
+            // it makes one.
+            c.conn
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            c.conn
+                .execute("UPDATE writes SET may_span = 0 WHERE id = ?1", params![w1])
+                .unwrap();
+            assert_eq!(found(&c), one("range_without_may_span", "SPAN-1"));
+        }
+
+        #[test]
+        fn a_range_slice_written_past_the_ending_is_named() {
+            let (c, w1, _) = item_93();
+            c.conn
+                .execute(
+                    "UPDATE write_positions SET status = 'written'
+                      WHERE write_id = ?1 AND position = '8'",
+                    params![w1],
+                )
+                .unwrap();
+            assert_eq!(found(&c), one("range_written_past_ending", "SPAN-1"));
+            let f = short_seal_findings(&c.conn).unwrap();
+            assert!(
+                f[0].message.contains("ended after tape file 7")
+                    && f[0].message.contains("up to file 8"),
+                "{}",
+                f[0].message
+            );
+            assert_eq!(f[0].action, "tapectl volume verify SPAN-1");
+        }
+
+        #[test]
+        fn a_range_that_is_not_one_run_is_named() {
+            let (c, _, w3) = item_93();
+            // Slices 3, 5 and 6 written, 4 not: two runs.
+            c.conn
+                .execute(
+                    "UPDATE write_positions SET status = 'pending'
+                      WHERE write_id = ?1 AND position = '7'",
+                    params![w3],
+                )
+                .unwrap();
+            assert_eq!(found(&c), one("range_not_one_run", "SPAN-3"));
+        }
+
+        #[test]
+        fn a_range_without_a_written_slice_is_named() {
+            let (c, _, w3) = item_93();
+            c.conn
+                .execute(
+                    "UPDATE write_positions SET status = 'pending' WHERE write_id = ?1",
+                    params![w3],
+                )
+                .unwrap();
+            assert_eq!(found(&c), one("range_without_written_slice", "SPAN-3"));
+        }
+    }
+
+    /// #478 (ADR-0012 item 128): `audit` names a span still in progress, the
+    /// slices it is missing and the sealed tapes that hold the rest, by the
+    /// promotion rule's own reading of "on a sealed volume".
+    mod span_in_progress {
+        use super::*;
+        use crate::policy::coverage::tests::SpanCatalog;
+
+        fn spans(c: &SpanCatalog) -> Vec<AuditFinding> {
+            let (violations, warnings) =
+                collect_findings(&c.conn, &Config::default(), None).unwrap();
+            assert!(
+                violations.iter().all(|f| f.check != "span_in_progress"),
+                "a warning, never a violation: {violations:?}"
+            );
+            warnings
+                .into_iter()
+                .filter(|f| f.check == "span_in_progress")
+                .collect()
+        }
+
+        /// Tape 1 of a span sealed short after slice 2: v1 is `staged`, and
+        /// slices 3-6 are on no sealed volume. One finding names the unit,
+        /// the missing slices and tape 1's run; a range on a volume that is
+        /// not sealed holds nothing the promotion rule counts.
+        #[test]
+        fn a_staged_span_names_its_missing_slices_and_its_holders() {
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "staged");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            c.range(set, t1, 1, 2, 6);
+            let t2 = c.volume("SPAN-2", None);
+            c.conn
+                .execute(
+                    "UPDATE volumes SET status = 'initialized', sealed_at = NULL WHERE id = ?1",
+                    params![t2],
+                )
+                .unwrap();
+            c.range(set, t2, 3, 4, 6);
+
+            let found = spans(&c);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].unit, "span");
+            assert_eq!(
+                found[0].message,
+                "v1 is a span still in progress: slice(s) 3-6 of 6 are on no sealed volume \
+                 yet, and SPAN-1 (slices 1-2) holds the rest. The version stays `staged`, and \
+                 counts no copy, until every slice is on a sealed volume"
+            );
+            assert!(
+                found[0].action.contains("tapectl volume write <LABEL>"),
+                "{}",
+                found[0].action
+            );
+        }
+
+        /// The span's last tape seals: every slice is on a sealed volume, and
+        /// once promoted (confirm, adoption, or a rebuild by item 144) it is
+        /// no span in progress. Item 93's layout draws nothing either; a
+        /// released version is not named.
+        #[test]
+        fn a_finished_or_released_span_draws_nothing() {
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "staged");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            assert_eq!(spans(&c).len(), 1, "positive control");
+            c.range(set, t3, 3, 6, 6);
+            assert!(spans(&c).is_empty(), "every slice on a sealed volume");
+            c.conn
+                .execute(
+                    "UPDATE snapshots SET status = 'current' WHERE id = ?1",
+                    params![snap],
+                )
+                .unwrap();
+            assert!(spans(&c).is_empty(), "promoted");
+
+            // A released span is not in progress, whatever it is missing.
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "staged");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            c.range(set, t1, 1, 2, 6);
+            assert_eq!(spans(&c).len(), 1, "positive control");
+            c.conn
+                .execute(
+                    "UPDATE snapshots SET status = 'reclaimable' WHERE id = ?1",
+                    params![snap],
+                )
+                .unwrap();
+            assert!(spans(&c).is_empty());
+        }
+
+        #[test]
+        fn slice_runs_compress_consecutive_numbers() {
+            let set = |v: &[i64]| v.iter().copied().collect();
+            assert_eq!(slice_runs(&set(&[1, 2, 3, 5, 7, 8])), "1-3, 5, 7-8");
+            assert_eq!(slice_runs(&set(&[4])), "4");
+            assert_eq!(slice_runs(&set(&[])), "");
         }
     }
 }
