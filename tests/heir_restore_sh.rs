@@ -11340,6 +11340,72 @@ fn quitting_at_the_prompt_restores_nothing_and_says_so() {
     }
 }
 
+/// The pid of the `bash` running this heir's RESTORE.sh (not the `timeout`
+/// around it), from `/proc`.
+fn script_pid(h: &Heir) -> String {
+    let script = h.dir.join("RESTORE.sh");
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(cmd) = std::fs::read(e.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+        if args.len() > 1
+            && args[0].ends_with(b"bash")
+            && args[1] == script.as_os_str().as_encoded_bytes()
+        {
+            return e.file_name().to_str().unwrap().to_string();
+        }
+    }
+    panic!("no bash running {}", script.display());
+}
+
+/// The fresh read of File 1 (#478, m2): File 1 said a killed run leaves its
+/// scratch directory, but the exit trap removes it, with every slice read,
+/// on Ctrl-C (SIGINT), a closed terminal (SIGHUP) and `kill` (SIGTERM); only
+/// a run with no chance to clean up leaves it. The signal comes at the
+/// prompt, the run ends before any answer is typed (it is not `quit`), and
+/// the scratch is gone. SIGKILL is the control: it leaves the scratch, as
+/// File 1 says, holding the slices read.
+#[test]
+fn ctrl_c_a_hangup_or_kill_at_the_prompt_removes_the_scratch() {
+    let b = span_box();
+    for sig in ["INT", "HUP", "TERM", "KILL"] {
+        let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+        let dest = h.sub("restored");
+        let args = big_args(&h, &dest, &[]);
+        let (code, text) = h.run_prompted(&strs(&args), |_, _| {
+            assert_scratch_holds(&dest, b, 2, &format!("SIG{sig} at the prompt"));
+            let pid = script_pid(&h);
+            let sent = Command::new("kill")
+                .args([format!("-{sig}"), pid.clone()])
+                .status()
+                .unwrap();
+            assert!(sent.success(), "kill -{sig} {pid}");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                assert!(std::time::Instant::now() < until, "SIG{sig}: still running");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Some(String::new())
+        });
+        assert_ne!(code, 0, "SIG{sig}: {text}");
+        assert!(!text.contains("stopped before slice"), "SIG{sig}: {text}");
+        if sig == "KILL" {
+            assert_scratch_holds(&dest, b, 2, "after SIGKILL, left for the heir to remove");
+            continue;
+        }
+        assert!(
+            scratch_slices(&dest).is_none(),
+            "SIG{sig}: the scratch is removed: {text}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "SIG{sig}: {text}"
+        );
+    }
+}
+
 /// What a restore across tapes refuses before it reads a slice, each by name:
 /// a dar that cannot read slices through pipes (no decrypted fallback, only
 /// ciphertext on disk), `--slices-from`/`--swap-tapes` (with `--path` too:

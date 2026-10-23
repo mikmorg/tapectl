@@ -1814,10 +1814,17 @@ here it does not go on without the slice, as it does after `--swap-tapes`
 discards the slices read so far (with `--stream-tapes`, the files dar has
 written are only part of the unit). A slice that fails
 its hash or will not read is asked for again, by default, from another
-cartridge that holds it; with `--stream-tapes` it ends the run. A run that
-is killed leaves its scratch directory inside `--to` (or `--scratch DIR`),
+cartridge that holds it; with `--stream-tapes` it ends the run.
+
+Ctrl-C, a closed terminal or a lost connection to the computer, and `kill`
+end the run too, and REMOVE its scratch directory with every slice read so
+far: a restore across tapes can take hours of cartridge changes, so run it
+inside `screen` or `tmux`, where a closed window or a lost connection does
+not end it. Only a run that had no chance to clean up (`kill -9`, a crash, a
+power cut) leaves its scratch directory inside `--to` (or `--scratch DIR`),
 named `.tapectl-restore.` and some letters and holding encrypted slices
-only: remove it by hand before you run the restore again. A dar older than
+only: remove it by hand before you run the restore again, which starts
+from the beginning. A dar older than
 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit)
 cannot read slices this way, and RESTORE.sh says so before it reads one.
 
@@ -5358,7 +5365,9 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
     SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
       die "cannot create a scratch directory in $SCRATCH_PARENT"
     info "  Its slices wait, still encrypted, in $SCRATCH until every one is read; then dar runs"
-    info "  once over all of them. If this run is killed, that directory stays: remove it by hand"
+    info "  once over all of them. Ctrl-C, a closed terminal or kill, like done or quit at a prompt, ends"
+    info "  this run and removes that directory with the slices read: run it in screen or tmux. A run"
+    info "  stopped with no chance to clean up (kill -9, a crash) leaves that directory: remove it by hand"
     info "  (rm -rf \"$SCRATCH\") before running again."
     span_spool
     info "Every slice of '$unit' is in the scratch directory; dar extracts it to $destdir ..."
@@ -7423,9 +7432,10 @@ case "${1:-}" in
   echo "      says why and asks again; done or quit stops it. By default each tape's slices are kept, still"
   echo "      encrypted, in a scratch directory inside --to (or --scratch DIR) until all are read,"
   echo "      and dar then runs once over them: the disk needs room for the whole unit's encrypted"
-  echo "      slices as well as its files, checked before a slice is read; a run that is killed"
-  echo "      leaves that directory, to remove by hand. A slice that fails is asked for again from"
-  echo "      another cartridge."
+  echo "      slices as well as its files, checked before a slice is read. Ctrl-C, a closed terminal or"
+  echo "      kill ends the run and removes that directory with the slices read, so run it in screen or"
+  echo "      tmux; only kill -9 or a crash leaves it, to remove by hand. A slice that fails is asked"
+  echo "      for again from another cartridge."
   echo "  --stream-tapes   (--restore --unit U) One dar run fed from each tape in turn, through"
   echo "      pipes: no slice is kept on disk, so the disk needs room for the files only, and every"
   echo "      cartridge must be at hand, loaded when asked. A slice that fails ends the run."
@@ -8977,7 +8987,9 @@ mod tests {
             // What L2 built (ADR-0012 item 132, the coordinator's prompt ruling).
             "Either way it waits at each change of cartridge for as long as you take, reading your answer from its input, and `quit` stops it.",
             "A slice that fails its hash or will not read is asked for again, by default, from another cartridge that holds it; with `--stream-tapes` it ends the run.",
-            "A run that is killed leaves its scratch directory inside `--to` (or `--scratch DIR`), named `.tapectl-restore.` and some letters and holding encrypted slices only: remove it by hand",
+            // The fresh read's m2 (#478): the exit trap removes it on Ctrl-C, a
+            // hangup or kill; only a run with no chance to clean up leaves it.
+            "Only a run that had no chance to clean up (`kill -9`, a crash, a power cut) leaves its scratch directory inside `--to` (or `--scratch DIR`), named `.tapectl-restore.` and some letters and holding encrypted slices only: remove it by hand",
             "A dar older than 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit) cannot read slices this way, and RESTORE.sh says so before it reads one.",
             "`--restore --unit UNIT --path PATH` reads across tapes too, and needs only the slices that hold the path and the last one.",
             "It can start on any tape of the unit that your key opens: it takes the slices that tape holds first, then asks for each further cartridge in slice order, taken by hash in the same way.",
@@ -9101,6 +9113,39 @@ mod tests {
             assert_eq!(script.matches(said).count(), 1, "{said:?}");
         }
         assert_eq!(script.matches("eject_first").count(), 3);
+    }
+
+    /// The fresh read, m2: "a run that is killed leaves its scratch
+    /// directory" was wrong for Ctrl-C and a closed terminal. The exit trap
+    /// (cleanup) runs on SIGINT, SIGHUP and SIGTERM and removes SCRATCH with
+    /// every slice read; only SIGKILL, a crash or a power cut leaves it. File
+    /// 1, the help and the run's own note say which exits leave it, and
+    /// advise screen or tmux.
+    #[test]
+    fn fresh_read_478_m2_which_exits_leave_the_scratch_and_screen_or_tmux() {
+        let g = generate_system_guide_v2_for_media("FR05", 20, "LTO-6");
+        let sec = flat_text(guide_section(&g, "A unit across tapes"));
+        for needle in [
+            "Ctrl-C, a closed terminal or a lost connection to the computer, and `kill` end the run too, and REMOVE its scratch directory with every slice read so far",
+            "so run it inside `screen` or `tmux`, where a closed window or a lost connection does not end it.",
+            "remove it by hand before you run the restore again, which starts from the beginning.",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        assert!(!sec.contains("A run that is killed leaves"), "{sec}");
+        let script = generate_restore_script_v2("FR05", 20);
+        for said in [
+            "cleanup() {",
+            "  [ -z \"$SCRATCH\" ] || rm -rf \"$SCRATCH\"\n}\ntrap cleanup EXIT\n",
+            "this run and removes that directory with the slices read: run it in screen or tmux. A run",
+            "stopped with no chance to clean up (kill -9, a crash) leaves that directory: remove it by hand",
+            "kill ends the run and removes that directory with the slices read, so run it in screen or",
+            "tmux; only kill -9 or a crash leaves it, to remove by hand.",
+        ] {
+            assert!(script.contains(said), "{said:?}");
+        }
+        assert!(!script.contains("If this run is killed, that directory stays"));
+        assert!(!script.contains("a run that is killed\""));
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
