@@ -3744,7 +3744,10 @@ struct VolumeInfo {
     cut_units: Vec<String>,
     /// The units this volume holds as a range (#478, `writes.status =
     /// 'range'`), each with the run of its slices written here: not a copy
-    /// on its own (ADR-0012 item 127). Empty when it holds none.
+    /// on its own (ADR-0012 item 127). Empty when it holds none. Human
+    /// output only for now: `tests/cli_smoke.rs` pins `--json`'s keys, and
+    /// adding `range_units` there is the pin owner's edit.
+    #[serde(skip)]
     range_units: Vec<write::RecordedRange>,
     notes: Option<String>,
     unit_count: i64,
@@ -4950,9 +4953,9 @@ mod tests {
         }
 
         /// A volume that holds a range shows it in `volume info`, on a line
-        /// and in a `--json` key of its own, never among the units carried
-        /// whole; and `volume list` counts its unit's copies, so the tape does
-        /// not read as holding no data.
+        /// of its own, never among the units carried whole; and `volume
+        /// list` counts its unit's copies, so the tape does not read as
+        /// holding no data.
         #[test]
         fn info_and_list_show_a_range_the_volume_holds() {
             let conn = crate::db::open_memory().unwrap();
@@ -4987,10 +4990,14 @@ mod tests {
                 "  Ranges:      \"b\" v1 (slices 1-2) (runs of a unit's slices, each a copy only \
                  with the tapes that hold the rest)"
             );
-            let json = serde_json::to_value(&info).unwrap();
             assert_eq!(
-                json["range_units"],
-                serde_json::json!([{"unit": "b", "version": 1, "first_slice": 1, "last_slice": 2}])
+                info.range_units,
+                [RecordedRange {
+                    unit: "b".into(),
+                    version: 1,
+                    first_slice: 1,
+                    last_slice: 2,
+                }]
             );
             assert_eq!(render_range_line(&[]), None);
 

@@ -1934,8 +1934,8 @@ fn build_span_layout(
         return Err(TapectlError::Other(format!(
             "volume \"{label}\": internal error: the built Layout does not place its units as \
              the plan made before the build did ({}; {}). Nothing was written and no session \
-             was recorded. Report this: the plan order of a span tape (#478) disagrees with \
-             itself",
+             was recorded. Report this: the plan order of a tape that holds a unit that may \
+             span disagrees with itself",
             if disagrees.is_empty() {
                 "a unit moved".to_string()
             } else {
