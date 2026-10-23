@@ -252,6 +252,35 @@ pub struct RebuildReport {
     /// `cut` (ADR-0012 item 112): never a copy, positions after the end not
     /// `written`. A tape fact, listed whether or not this run inserted rows.
     pub cut_units: Vec<String>,
+
+    // --- spanning (#478, ADR-0012 items 121, 128 and 130) -------------------
+    //
+    // `volume-format-v2.md` §4.4: a block that states `may_span` splits three
+    // ways, as confirm splits the row (`layout-session.md`, "A write that may
+    // span"): `completed` when the tape holds every slice of the set,
+    // `range` when it holds some, `cut` when it holds none.
+    /// The spannable sets this tape holds as a range: some, not all, of the
+    /// set's slices have a `tape_position` at or before `ended_after` (every
+    /// planned position, on a full seal). Their writes are `range`: never a
+    /// copy on their own (item 127). A tape fact, listed whether or not this
+    /// run inserted rows. Empty for every tape with no spannable set.
+    pub range_units: Vec<RebuiltRange>,
+    /// `<unit> v<N>` of each version whose snapshot this run FOUND `staged`
+    /// and made `current`, because with this tape every slice of a stage set
+    /// of it is on a sealed volume (item 128, the confirm rule;
+    /// `layout-session.md` "Promotion and the retire floor"). Only for a
+    /// spannable set: a snapshot row this run inserts is inserted with the
+    /// status the rule gives it, and a whole unit's found snapshot is left
+    /// as it was found, as before 1.7.0.
+    pub versions_promoted: Vec<String>,
+    /// The spannable versions on this tape that some slice of is still on
+    /// no tape this catalog records, after this run: the to-do list's span
+    /// half (item 130, `volume-format-v2.md` §1.5). Each names the missing
+    /// slices and the volumes this tape's cross-volume index says hold them.
+    /// Such a version stays `staged` and reads 0 copies until they are
+    /// rebuilt (item 128).
+    pub spans_in_progress: Vec<SpanInProgress>,
+
     /// Set when this label already had a row whose `ended_after` disagrees
     /// with the seal's (`"none"` when the row records a full seal or no seal
     /// and the tape is short, or the row's K otherwise). Report-only (#158):
@@ -414,6 +443,117 @@ pub struct IndexedUnit {
     pub versions: Vec<i64>,
 }
 
+/// A spannable set this tape holds as a range (#478, ADR-0012 item 121;
+/// `volume-format-v2.md` §4.4): the run of its stage set's slices on the tape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuiltRange {
+    pub unit: String,
+    pub version: i64,
+    /// The lowest slice number of the run (dar's, 1-based).
+    pub first_slice: i64,
+    /// The highest slice number of the run.
+    pub last_slice: i64,
+    /// N: the stage set's slices, every one listed in the manifest block.
+    pub num_slices: i64,
+}
+
+impl RebuiltRange {
+    /// `<unit> v<N> (slices F-L of N)`, or `(slice F of N)` for a run of one.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} v{} ({} of {})",
+            self.unit,
+            self.version,
+            describe_slices(&[(self.first_slice, self.last_slice)]),
+            self.num_slices
+        )
+    }
+}
+
+/// A spannable version some slices of which are on no tape this catalog
+/// records (#478, ADR-0012 item 130): a line of the disaster-recovery to-do
+/// list, as [`IndexedVolume`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanInProgress {
+    pub unit: String,
+    pub version: i64,
+    /// N: the stage set's slices.
+    pub num_slices: i64,
+    /// The slices no tape this catalog records holds, in slice order.
+    pub missing: Vec<i64>,
+    /// The volumes other than this tape that this tape's cross-volume index
+    /// (`index/units.tsv`, §1.5) names as holding one of [`Self::missing`],
+    /// with the run each holds. Empty when the tape has no index or its
+    /// index names none (a tape never names a tape written after it,
+    /// ADR-0001).
+    pub holders: Vec<SpanHolder>,
+}
+
+impl SpanInProgress {
+    /// The missing slices as runs: `slices 1-2`, `slices 1-2, 5`.
+    pub fn describe_missing(&self) -> String {
+        describe_slices(&slice_runs(&self.missing))
+    }
+}
+
+/// A volume an index names as holding slices of a [`SpanInProgress`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanHolder {
+    pub label: String,
+    pub uuid: String,
+    /// The chip serial of its cartridge; empty when none was read.
+    pub cartridge_serial: String,
+    /// `sealed` or `quarantined`, as the index marked it.
+    pub state: String,
+    /// The run it holds, as the index states it (`first_slice`,
+    /// `last_slice`); `None` where the index does not say.
+    pub first_slice: Option<i64>,
+    pub last_slice: Option<i64>,
+}
+
+impl SpanHolder {
+    /// `L6-0001 (slices 1-2)`, or the label alone when the run is unknown.
+    pub fn describe(&self) -> String {
+        match (self.first_slice, self.last_slice) {
+            (Some(first), Some(last)) => {
+                format!("{} ({})", self.label, describe_slices(&[(first, last)]))
+            }
+            _ => self.label.clone(),
+        }
+    }
+}
+
+/// Consecutive slice numbers as `(first, last)` runs, in order.
+pub fn slice_runs(numbers: &[i64]) -> Vec<(i64, i64)> {
+    let mut sorted = numbers.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for n in sorted {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == n => *last = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs
+}
+
+/// `slice 3`, `slices 1-2`, `slices 1-2, 5`.
+fn describe_slices(runs: &[(i64, i64)]) -> String {
+    let one = runs.len() == 1 && runs[0].0 == runs[0].1;
+    let parts: Vec<String> = runs
+        .iter()
+        .map(|&(first, last)| {
+            if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            }
+        })
+        .collect();
+    format!("slice{} {}", if one { "" } else { "s" }, parts.join(", "))
+}
+
 /// One unit with a completed write on a volume this rebuild displaced, and
 /// how many ADR-0004-eligible copies it still has ELSEWHERE — the count
 /// `cli::operations::retire_impacts` derives, taken BEFORE the displaced
@@ -478,6 +618,7 @@ impl RebuildReport {
             && !self.cartridge_bound
             && !self.serial_learned
             && !self.ended_after_recorded
+            && self.versions_promoted.is_empty()
             && self.displaced.is_empty()
     }
 }
@@ -862,7 +1003,17 @@ fn rebuild_contacted(
 
     // The cross-volume index (§1.5): after the rows above are committed, so
     // this tape itself is never listed as missing. Read-only on the catalog.
-    index_to_do(conn, operator, &ident.label, &ident.uuid, &mut report);
+    let index = index_to_do(conn, operator, &ident.label, &ident.uuid, &mut report);
+    // #478 (item 130): and the slices of a spanning version still on no tape
+    // this catalog records, with the tapes the index names for them.
+    span_to_do(
+        conn,
+        &inserted.sets,
+        &index,
+        &ident.label,
+        &ident.uuid,
+        &mut report,
+    );
 
     // The rows above are committed, so the provenance event is recorded even
     // when attestation fails partway (a busy catalog, say); its error is
@@ -897,15 +1048,18 @@ fn rebuild_contacted(
 /// has. A volume is known to the catalog by its uuid, or, for a catalog row
 /// that never recorded one, by its label. An index that cannot be read is
 /// reported and set aside: the rebuild it accompanies has already succeeded.
+///
+/// Returns the index's rows, for [`span_to_do`]: none for a tape without an
+/// index, or with one that could not be used.
 fn index_to_do(
     conn: &Connection,
     operator: &OpenedEnvelope,
     this_label: &str,
     this_uuid: &str,
     report: &mut RebuildReport,
-) {
+) -> Vec<crate::volume::index::UnitsRow> {
     let Some(path) = &operator.index_units else {
-        return;
+        return Vec::new();
     };
     report.had_index = true;
     let rows = std::fs::read_to_string(path)
@@ -916,7 +1070,7 @@ fn index_to_do(
         Err(why) => {
             tracing::warn!("rebuild: this tape's cross-volume index is unusable: {why}");
             report.index_problem = Some(why);
-            return;
+            return Vec::new();
         }
     };
 
@@ -924,11 +1078,8 @@ fn index_to_do(
     // volume, rebuilt above. Anything else is another tape.
     let mut by_volume: std::collections::BTreeMap<(String, String), IndexedVolume> =
         std::collections::BTreeMap::new();
-    for row in rows {
-        let is_this = row.state == "this-tape"
-            || row.volume == this_label
-            || (!row.volume_uuid.is_empty() && row.volume_uuid == this_uuid);
-        if is_this || row.volume.is_empty() {
+    for row in &rows {
+        if is_this_tape(row, this_label, this_uuid) || row.volume.is_empty() {
             continue;
         }
         let volume = by_volume
@@ -996,9 +1147,104 @@ fn index_to_do(
                 );
                 report.index_problem = Some(format!("cannot check the catalog: {e}"));
                 report.index_volumes_missing.clear();
-                return;
+                return rows;
             }
         }
+    }
+    rows
+}
+
+/// Whether an index row is this tape's own: `this-tape`, or this label or
+/// uuid.
+fn is_this_tape(row: &crate::volume::index::UnitsRow, this_label: &str, this_uuid: &str) -> bool {
+    row.state == "this-tape"
+        || row.volume == this_label
+        || (!row.volume_uuid.is_empty() && row.volume_uuid == this_uuid)
+}
+
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
+/// §1.5 and §4.4): for each spannable set on this tape, the slices no tape
+/// this catalog records holds after this rebuild, and the volumes this tape's
+/// index (`index`, its rows) names as holding them. A version with such a
+/// slice stays `staged` and reads 0 copies until they are rebuilt (item 128).
+///
+/// A slice is held when its copies ([`crate::policy::coverage::slice_copies`],
+/// the one per-slice derivation) are not 0, or when this tape holds it: the
+/// rebuild records this tape's seal without changing a found row's status
+/// (#360's lost write is `initialized`), so it is counted here as the
+/// promotion rule counts it. Reads the catalog, never writes it, and, as the
+/// index half, never adds a row from an index (ADR-0001). A tape never names a
+/// tape written after it, so the first tape of a span names no holder for its
+/// tail: [`SpanInProgress::holders`] is then empty.
+fn span_to_do(
+    conn: &Connection,
+    sets: &[RebuiltSet],
+    index: &[crate::volume::index::UnitsRow],
+    this_label: &str,
+    this_uuid: &str,
+    report: &mut RebuildReport,
+) {
+    for set in sets.iter().filter(|s| s.may_span) {
+        let copies = match crate::policy::coverage::slice_copies(conn, set.stage_set_id) {
+            Ok(copies) => copies,
+            Err(e) => {
+                tracing::warn!(
+                    unit = %set.unit_name,
+                    "rebuild: cannot read which slices of a spanning version are held: {e}"
+                );
+                continue;
+            }
+        };
+        let missing: Vec<i64> = copies
+            .iter()
+            .filter(|c| c.copies == 0 && !set.held_here.contains(&c.slice_number))
+            .map(|c| c.slice_number)
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut holders: Vec<SpanHolder> = Vec::new();
+        for row in index {
+            let same_unit = if row.unit_uuid.is_empty() {
+                row.unit == set.unit_name
+            } else {
+                row.unit_uuid == set.unit_uuid
+            };
+            if !same_unit
+                || row.version != set.version
+                || row.volume.is_empty()
+                || is_this_tape(row, this_label, this_uuid)
+            {
+                continue;
+            }
+            // A row that does not state its run may hold any of them.
+            let holds_one = match (row.first_slice, row.last_slice) {
+                (Some(first), Some(last)) => missing.iter().any(|n| (first..=last).contains(n)),
+                _ => true,
+            };
+            if holds_one
+                && !holders
+                    .iter()
+                    .any(|h| h.label == row.volume && h.uuid == row.volume_uuid)
+            {
+                holders.push(SpanHolder {
+                    label: row.volume.clone(),
+                    uuid: row.volume_uuid.clone(),
+                    cartridge_serial: row.cartridge_serial.clone(),
+                    state: row.state.clone(),
+                    first_slice: row.first_slice,
+                    last_slice: row.last_slice,
+                });
+            }
+        }
+        holders.sort_by(|a, b| (&a.label, &a.uuid).cmp(&(&b.label, &b.uuid)));
+        report.spans_in_progress.push(SpanInProgress {
+            unit: set.unit_name.clone(),
+            version: set.version,
+            num_slices: set.num_slices,
+            missing,
+            holders,
+        });
     }
 }
 
@@ -1065,8 +1311,13 @@ fn attest_escrow(
     // position after `ended_after` is read. A unit whose first slice lies
     // past it is not on this tape at all, and stays unknown here.
     //
-    // A first slice with no `tape_position` (a range's slice planned on
-    // another tape, ADR-0012 item 125) is not on this tape either.
+    // #478 (ADR-0012 items 125 and 130, `volume-format-v2.md` §4.4 R6): a
+    // slice with no `tape_position` (a range's slice planned on another
+    // tape) is not on this tape either, so the slice read is the lowest-
+    // numbered one THIS tape holds: slice 1 for a whole unit and for a range
+    // that starts at it, the first of the run for a range that starts later.
+    // Any slice of the set demonstrates the set: every slice of one staging
+    // is encrypted to the same recipients.
     let ended_after = report.ended_after;
     let on_tape =
         |position: i64| ended_after.is_none_or(|k| u64::try_from(position).is_ok_and(|p| p <= k));
@@ -1074,9 +1325,11 @@ fn attest_escrow(
         .units
         .iter()
         .filter_map(|unit| {
-            let first = unit.slices.iter().min_by_key(|s| s.number)?;
-            let position = first.tape_position.filter(|&p| on_tape(p))?;
-            Some((unit, first, position))
+            unit.slices
+                .iter()
+                .filter_map(|s| Some((s, s.tape_position.filter(|&p| on_tape(p))?)))
+                .min_by_key(|(s, _)| s.number)
+                .map(|(first, position)| (unit, first, position))
         })
         .collect();
     firsts.sort_by_key(|&(_, _, position)| position);
@@ -1996,7 +2249,32 @@ fn insert_all(
                 insert_unit(tx, unit, tenant_id, report)?
             }
         };
-        let snapshot_id = ensure_snapshot(tx, unit, unit_id, supplement, report)?;
+        // #420 (`volume-format-v2.md` §4.2; layout-session.md "Later
+        // contacts"): on a short tape a unit is on it whole only when every
+        // slice lies at or before `ended_after`, as a passing short confirm
+        // splits the rows; every other unit is cut. #478 (§4.4, ADR-0012
+        // items 121 and 130): a block that states `may_span` splits three
+        // ways instead, as confirm splits its row ([`tape_split`]).
+        let written = tape_split(unit, sealed, ended_after);
+        match written {
+            Written::Cut => report
+                .cut_units
+                .push(format!("{} v{}", unit.name, unit.snapshot_version)),
+            Written::Range {
+                first_slice,
+                last_slice,
+            } => report.range_units.push(RebuiltRange {
+                unit: unit.name.clone(),
+                version: unit.snapshot_version,
+                first_slice,
+                last_slice,
+                num_slices: unit.slices.len() as i64,
+            }),
+            Written::Completed | Written::Aborted => {}
+        }
+
+        let (snapshot_id, snapshot_inserted) =
+            ensure_snapshot(tx, unit, unit_id, supplement, report)?;
         let stage_set_id = ensure_stage_set(tx, unit, snapshot_id, volume_id, supplement, report)?;
 
         let mut slice_ids = Vec::with_capacity(unit.slices.len());
@@ -2004,30 +2282,33 @@ fn insert_all(
             slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
-        // #420 (`volume-format-v2.md` §4.2; layout-session.md "Later
-        // contacts"): on a short tape a unit is on it whole only when every
-        // slice lies at or before `ended_after`, as a passing short confirm
-        // splits the rows; every other unit is cut.
-        // A slice with no `tape_position` (a range's slice planned on
-        // another tape, ADR-0012 item 125) is not on this tape.
-        let on_tape = |s: &envelope::ManifestSlice| {
-            s.tape_position
-                .is_some_and(|p| ended_after.is_none_or(|k| p <= k))
-        };
-        let written = if !sealed {
-            Written::Aborted
-        } else if unit.slices.iter().all(on_tape) {
-            Written::Completed
-        } else {
-            report
-                .cut_units
-                .push(format!("{} v{}", unit.name, unit.snapshot_version));
-            Written::Cut
-        };
-        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
+        let write_id = ensure_write(
+            tx,
+            stage_set_id,
+            snapshot_id,
+            volume_id,
+            written,
+            unit.may_span,
+            report,
+        )?;
         for (slice, slice_id) in slice_ids {
-            let laid_down = sealed && on_tape(slice);
+            let laid_down = sealed && slice_on_tape(slice, ended_after);
             ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
+        }
+        // X24: after the positions, which are what the rule reads. Only on a
+        // tape whose seal was read: an unsealed tape counts as no sealed
+        // volume, and its rows (`aborted`) hold nothing the rule counts.
+        if unit.may_span && sealed {
+            promote_spanning_version(
+                tx,
+                unit,
+                written,
+                snapshot_id,
+                stage_set_id,
+                volume_id,
+                snapshot_inserted,
+                report,
+            )?;
         }
 
         ensure_files(tx, unit, snapshot_id, supplement, report)?;
@@ -2036,6 +2317,14 @@ fn insert_all(
             unit_name: unit.name.clone(),
             unit_uuid: unit.uuid.clone(),
             version: unit.snapshot_version,
+            may_span: unit.may_span,
+            num_slices: unit.slices.len() as i64,
+            held_here: unit
+                .slices
+                .iter()
+                .filter(|s| sealed && slice_on_tape(s, ended_after))
+                .map(|s| s.number)
+                .collect(),
         });
     }
 
@@ -2059,6 +2348,13 @@ struct RebuiltSet {
     /// by NAME may not share.
     unit_uuid: String,
     version: i64,
+    /// The block states `may_span` (#478).
+    may_span: bool,
+    /// N: the slices the block lists.
+    num_slices: i64,
+    /// The slice numbers this tape holds, on a tape whose seal was read: the
+    /// ones its rows record `written`.
+    held_here: Vec<i64>,
 }
 
 /// The tapectl home the catalog lives in, as `<home>/tapectl.db`'s directory
@@ -2307,19 +2603,20 @@ fn insert_unit(
     Ok(tx.last_insert_rowid())
 }
 
+/// The snapshot row of `unit`'s version, and whether this run inserted it.
 fn ensure_snapshot(
     tx: &Connection,
     unit: &envelope::ManifestUnit,
     unit_id: i64,
     supplement: &Supplement,
     report: &mut RebuildReport,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
     if let Some(id) = existing_id(
         tx,
         "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
         params![unit_id, unit.snapshot_version],
     )? {
-        return Ok(id);
+        return Ok((id, false));
     }
     let facts = supplement
         .snapshots
@@ -2337,10 +2634,17 @@ fn ensure_snapshot(
     // promotes each written snapshot to 'current' and never demotes its
     // predecessor, so several 'current' versions per unit is the normal
     // shape of this catalog, not an anomaly a rebuild introduces.
+    //
+    // #478 (ADR-0012 items 128 and 130, X24): a spannable set's version is
+    // `current` only once every slice of it is on a sealed volume, which
+    // only the positions inserted after this row can show. It is inserted
+    // `staged`, as the writing catalog holds it before its tapes seal, and
+    // [`promote_spanning_version`] makes it `current` when the rule holds.
+    let status = if unit.may_span { "staged" } else { "current" };
     tx.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
                                 total_size, file_count)
-         VALUES (?1, ?2, ?3, 'current', ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6)",
         params![
             unit_id,
             unit.snapshot_version,
@@ -2348,10 +2652,58 @@ fn ensure_snapshot(
             source_path,
             facts.and_then(|f| f.total_size),
             facts.and_then(|f| f.file_count),
+            status,
         ],
     )?;
     report.snapshots += 1;
-    Ok(tx.last_insert_rowid())
+    Ok((tx.last_insert_rowid(), true))
+}
+
+/// Item 128's promotion, for a rebuild (`layout-session.md` "Promotion and
+/// the retire floor"; ADR-0012 item 130, X24): a spanning version becomes
+/// `current` once every slice of one of its stage sets is on a sealed
+/// volume, this tape counted: the rebuild read its seal, and records it
+/// without changing the volume's status, so it is named
+/// ([`crate::policy::coverage::every_slice_on_sealed_volume_sql`]'s
+/// `also_sealed`). Asked of a snapshot this run inserted (`staged`) and of
+/// one it found, which an earlier rebuild of another tape of the span left
+/// `staged`: the rebuild of the span's last tape, in whichever order the
+/// tapes come, promotes it, as the confirm of the last tape to seal did.
+/// Guarded as confirm's update is: only from `created` or `staged`, and
+/// never a demotion. As confirm does, a set this tape holds whole
+/// (`completed`) promotes its version without asking the rule (which a set
+/// with no slice rows never meets). A found row it promotes is reported
+/// ([`RebuildReport::versions_promoted`]).
+#[allow(clippy::too_many_arguments)]
+fn promote_spanning_version(
+    tx: &Connection,
+    unit: &envelope::ManifestUnit,
+    written: Written,
+    snapshot_id: i64,
+    stage_set_id: i64,
+    volume_id: i64,
+    inserted: bool,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let promoted = tx.execute(
+        &format!(
+            "UPDATE snapshots SET status = 'current'
+              WHERE id = ?1 AND status IN ('created', 'staged') AND (?4 OR {})",
+            crate::policy::coverage::every_slice_on_sealed_volume_sql("?2", Some("?3"))
+        ),
+        params![
+            snapshot_id,
+            stage_set_id,
+            volume_id,
+            written == Written::Completed
+        ],
+    )?;
+    if promoted > 0 && !inserted {
+        report
+            .versions_promoted
+            .push(format!("{} v{}", unit.name, unit.snapshot_version));
+    }
+    Ok(())
 }
 
 fn ensure_stage_set(
@@ -2520,10 +2872,62 @@ fn ensure_slice(
 enum Written {
     /// The tape is sealed and holds the unit whole: `completed`.
     Completed,
-    /// The tape sealed short before the unit's last slice (#420): `cut`.
+    /// The tape is sealed and holds some, not all, of a spannable set's
+    /// slices (#478, ADR-0012 items 121 and 130): `range`, the run from
+    /// `first_slice` to `last_slice`. Only for a block that states
+    /// `may_span`.
+    Range { first_slice: i64, last_slice: i64 },
+    /// The tape sealed short before the unit's last slice (#420), or, for a
+    /// block that states `may_span`, holds none of its slices: `cut`.
     Cut,
     /// No seal marker sealed the tape (#458): `aborted`.
     Aborted,
+}
+
+/// Whether `slice` is on this tape (`volume-format-v2.md` §4.2 R3, §4.4 R6):
+/// it has a `tape_position` (a range's slice planned on another tape has
+/// none, ADR-0012 item 125), at or before a short seal's `ended_after`.
+fn slice_on_tape(slice: &envelope::ManifestSlice, ended_after: Option<i64>) -> bool {
+    slice
+        .tape_position
+        .is_some_and(|p| ended_after.is_none_or(|k| p <= k))
+}
+
+/// The row a sealed tape gives one manifest block, by the rule confirm
+/// records (`layout-session.md` "Confirm of a short ending" and "A write
+/// that may span"; `volume-format-v2.md` §4.2, §4.4).
+///
+/// - A tape with no seal it read: `aborted` (#458).
+/// - Every slice of the block on the tape: `completed`. For a block that
+///   states `may_span` that is every slice of the stage set, 1 to N (item
+///   93's middle tape); a set with no slices is whole, as confirm's
+///   `span_split` reads one.
+/// - Otherwise a whole unit's block is `cut` (#420), and a spannable set's
+///   is `range` when the tape holds some of its slices, the run from the
+///   lowest to the highest of them, and `cut` when it holds none (X2).
+fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i64>) -> Written {
+    if !sealed {
+        return Written::Aborted;
+    }
+    let held: Vec<i64> = unit
+        .slices
+        .iter()
+        .filter(|s| slice_on_tape(s, ended_after))
+        .map(|s| s.number)
+        .collect();
+    if held.len() == unit.slices.len() {
+        return Written::Completed;
+    }
+    if !unit.may_span {
+        return Written::Cut;
+    }
+    match (held.iter().min(), held.iter().max()) {
+        (Some(&first_slice), Some(&last_slice)) => Written::Range {
+            first_slice,
+            last_slice,
+        },
+        _ => Written::Cut,
+    }
 }
 
 fn ensure_write(
@@ -2532,6 +2936,9 @@ fn ensure_write(
     snapshot_id: i64,
     volume_id: i64,
     written: Written,
+    // The block's `may_span` (ADR-0012 item 121): frozen into the row as the
+    // writer froze it, so a later write of the set reads it from the row.
+    may_span: bool,
     report: &mut RebuildReport,
 ) -> Result<i64> {
     if let Some(id) = existing_id(
@@ -2554,10 +2961,20 @@ fn ensure_write(
     // #420 (ADR-0012 item 112): a unit the early end of a sealed tape cut is
     // `cut`, as a passing short confirm records it: never a copy, and with
     // no completion time either.
+    //
+    // #478 (item 121): a range is terminal like a completed write and gets
+    // its completion time as confirm gives it one. It is not a copy on its
+    // own: its slices count one by one (item 127).
     let (status, notes) = match written {
         Written::Completed => (
             "completed",
             "rebuilt from the volume itself; never verified by a read-back",
+        ),
+        Written::Range { .. } => (
+            "range",
+            "rebuilt from the volume itself; the tape holds a range of this spannable set's \
+             slices, not the whole set, so the write is not a copy on its own; never verified \
+             by a read-back",
         ),
         Written::Cut => (
             "cut",
@@ -2572,9 +2989,17 @@ fn ensure_write(
     };
     tx.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
-                             completed_at, notes)
-         VALUES (?1, ?2, ?3, ?4, 0, CASE WHEN ?4 = 'completed' THEN datetime('now') END, ?5)",
-        params![stage_set_id, snapshot_id, volume_id, status, notes],
+                             completed_at, notes, may_span)
+         VALUES (?1, ?2, ?3, ?4, 0,
+                 CASE WHEN ?4 IN ('completed', 'range') THEN datetime('now') END, ?5, ?6)",
+        params![
+            stage_set_id,
+            snapshot_id,
+            volume_id,
+            status,
+            notes,
+            may_span
+        ],
     )?;
     report.writes += 1;
     Ok(tx.last_insert_rowid())
@@ -2776,6 +3201,34 @@ fn record_event(
             }
         ),
     };
+    // #478 (ADR-0012 items 121, 128 and 130): what the tape holds of each
+    // spannable set, when it holds one. Absent for every other tape, whose
+    // ledger line is what it was before 1.7.0.
+    let mut span_clause = String::new();
+    if !report.range_units.is_empty() {
+        let ranges: Vec<String> = report.range_units.iter().map(|r| r.describe()).collect();
+        span_clause.push_str(&format!(
+            "; held as a range (not a copy on its own): {}",
+            ranges.join(", ")
+        ));
+    }
+    if !report.versions_promoted.is_empty() {
+        span_clause.push_str(&format!(
+            "; made current, every slice now on a sealed volume: {}",
+            report.versions_promoted.join(", ")
+        ));
+    }
+    if !report.spans_in_progress.is_empty() {
+        let spans: Vec<String> = report
+            .spans_in_progress
+            .iter()
+            .map(|s| format!("{} v{} ({})", s.unit, s.version, s.describe_missing()))
+            .collect();
+        span_clause.push_str(&format!(
+            "; spanning, staged until its other slices are rebuilt: {}",
+            spans.join(", ")
+        ));
+    }
     let unreadable_clause = if report.unreadable_tenant_envelopes.is_empty() {
         String::new()
     } else {
@@ -2789,7 +3242,7 @@ fn record_event(
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{unreadable_clause}{cartridge_clause}{displaced_clause}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{span_clause}{unreadable_clause}{cartridge_clause}{displaced_clause}",
         report.label,
         report.uuid,
         device,
