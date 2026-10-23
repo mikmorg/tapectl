@@ -1622,6 +1622,7 @@ tapectl report tape-only
 tapectl report capacity --per-volume
 tapectl report compaction-candidates
 tapectl report events --days 30
+tapectl report failed-stages
 ```
 
 ```text
@@ -1639,6 +1640,35 @@ tapectl summary
 The `Staging` line appears only while something is staged. When a stage set's
 version still has fewer copies than its unit needs, it reads
 `N stage set(s) held, M still owe a copy`, and `report pending` lists them.
+
+From 1.7.0 a unit that allows spanning may be held across cartridges, as
+ranges (runs of its slices, one per tape). A range is not a copy on its own,
+so when one exists the `Writes` line counts them apart:
+`Writes:     1 completed (each a version whole), 2 range(s) (part of a version across tapes)`.
+`report copies` lists a tape that holds a range of a unit's current version
+among its tapes, and names it on a `ranges:` line under the unit, with the
+slices it holds.
+
+`report failed-stages` lists every `stage create` that ended without staging
+its unit, and the time each cost. A failed stage restarts its unit from the
+beginning ([why](troubleshooting.md#why-a-failed-stage-starts-over); ADR-0012
+item 91), so this is the record to judge that cost by. It reads only what
+the catalog already keeps: when the attempt started, and the last moment it
+recorded (its phases, dar's report, its source check).
+
+```text
+$ tapectl report failed-stages
+failed stages (2):
+  <unit> v<n> (stage set <id>): started <time>, failed <time>: <h> hours lost
+  <unit> v<n> (stage set <id>): started <time>, no end recorded (the process stopped before it could record one): hours lost unknown
+total: <h> hours lost, not counting 1 stage(s) with no end recorded
+```
+
+An attempt that stopped before it recorded anything (a crash, a power loss)
+has no end, and is left out of the total. With none recorded it prints
+`no failed stages recorded`. `--json` gives `failed_stages` (each with
+`unit`, `version`, `stage_set_id`, `started`, `failed` and `hours_lost`),
+`count`, `total_hours_lost` and `without_recorded_end`.
 
 The full list of reports is in the [command reference](cli/report.md).
 
