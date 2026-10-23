@@ -1051,7 +1051,9 @@ fn a_span_tapes_short_seal_parses_short_and_fits_a_span_placeholder() {
     assert_eq!(parsed.files[k].type_label, "data_slice", "S5");
 
     let parsed_full = format::parse_seal_marker(&full).expect("the span full seal parses");
-    parsed_full.check_parse_rules().expect("and keeps every rule");
+    parsed_full
+        .check_parse_rules()
+        .expect("and keeps every rule");
     assert_eq!(parsed_full.requires, parsed.requires);
     assert_eq!(
         parsed_full.ending(plan.len() as u64),

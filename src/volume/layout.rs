@@ -7324,7 +7324,10 @@ V=1 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; n
 /// slice of a whole unit, and only the run this tape plans of a unit that may
 /// span (ADR-0012 item 125).
 fn slices_here(unit: &ManifestUnit) -> Vec<i64> {
-    unit.slices.iter().filter_map(|sl| sl.tape_position).collect()
+    unit.slices
+        .iter()
+        .filter_map(|sl| sl.tape_position)
+        .collect()
 }
 
 /// RECOVERY.md's section on a unit across tapes (`volume-format-v2.md` §4.4,
@@ -7716,7 +7719,11 @@ mod tests {
         let copy = planned_seal_copy(m);
         let placeholder = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
         let full = generate_seal_marker_requiring("SPAN1", m + 1, &fi, &copy, REQUIRES_SPAN);
-        assert_eq!(full.len(), placeholder.len(), "the full seal is the placeholder's length");
+        assert_eq!(
+            full.len(),
+            placeholder.len(),
+            "the full seal is the placeholder's length"
+        );
         assert_eq!(
             full.matches("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = ")
                 .count(),
@@ -7875,7 +7882,8 @@ mod tests {
             for (what, text) in [("File 0", &file0), ("the seal placeholder", &seal)] {
                 assert_eq!(text.matches("requires = ").count(), 1, "{what}: {text}");
                 assert_eq!(
-                    text.matches(&format!("\nlayout_version = 2\n{line}\n")).count(),
+                    text.matches(&format!("\nlayout_version = 2\n{line}\n"))
+                        .count(),
                     1,
                     "span {span}, {what}: {text}"
                 );
@@ -8081,7 +8089,10 @@ mod tests {
                 )),
                 "{unit_sec}"
             );
-            assert!(!unit_sec.contains(&format!("restore.{n}.dar.age\n")), "{unit_sec}");
+            assert!(
+                !unit_sec.contains(&format!("restore.{n}.dar.age\n")),
+                "{unit_sec}"
+            );
         }
         assert!(!unit_sec.contains("tape file 0"), "{unit_sec}");
         assert!(!unit_sec.contains("fsf 0"), "{unit_sec}");
@@ -8089,9 +8100,14 @@ mod tests {
             unit_sec.contains("# Slice 3 — tape file 12, 33 bytes\nmt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 12\n"),
             "{unit_sec}"
         );
-        assert!(unit_sec.contains("# Slice 4 — tape file 13, 34 bytes\ndd if="), "{unit_sec}");
         assert!(
-            unit_sec.contains("# This unit may run across tapes: run dar only once every slice, 1 to the\n"),
+            unit_sec.contains("# Slice 4 — tape file 13, 34 bytes\ndd if="),
+            "{unit_sec}"
+        );
+        assert!(
+            unit_sec.contains(
+                "# This unit may run across tapes: run dar only once every slice, 1 to the\n"
+            ),
             "{unit_sec}"
         );
 
@@ -8191,7 +8207,9 @@ mod tests {
         }
         let end = flat_text(guide_section(&g, "Where the tape ended"));
         assert!(
-            end.contains("with a slice at or before `ended_after` is not cut: this tape holds a range of it"),
+            end.contains(
+                "with a slice at or before `ended_after` is not cut: this tape holds a range of it"
+            ),
             "{end}"
         );
         let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
@@ -8218,7 +8236,10 @@ mod tests {
             .expect("the query of which tapes hold which units");
         let sqls = guide_sql(sec);
         let sql = &sqls[1];
-        assert!(sql.contains("WHERE w.status IN ('completed', 'range')"), "{sql}");
+        assert!(
+            sql.contains("WHERE w.status IN ('completed', 'range')"),
+            "{sql}"
+        );
 
         let conn = crate::db::open_memory().unwrap();
         conn.execute_batch(
@@ -8281,7 +8302,10 @@ mod tests {
             after.contains("`holds` is `completed` for a tape that holds that version whole and `range` for one that holds only the run `slices` names, of the version's `of_slices`"),
             "{after}"
         );
-        assert!(after.contains("A `range` tape is not a copy on its own"), "{after}");
+        assert!(
+            after.contains("A `range` tape is not a copy on its own"),
+            "{after}"
+        );
     }
 
     /// RESTORE.sh knows `short-seal` and `spanning` (`volume-format-v2.md`
@@ -8292,7 +8316,8 @@ mod tests {
     fn restore_sh_knows_short_seal_and_spanning_and_says_it_is_1_7_0() {
         let s = generate_restore_script_v2("SS03", 20);
         assert_eq!(
-            s.matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n").count(),
+            s.matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n")
+                .count(),
             1
         );
         assert_eq!(
@@ -9686,6 +9711,261 @@ sha256_encrypted = \"bbb\"
             "awks differ: {seen:?}"
         );
         seen.remove(0)
+    }
+
+    /// `volume-format-v2.md` §4.4 in the fragments, under every awk on the
+    /// host: what a MANIFEST block is on this tape. `AWK_CUT_VERSIONS` prints a
+    /// block as cut (a whole unit with a slice after `k`; a unit that may span
+    /// with no slice here) and reports a range (some slices here, the others
+    /// with no position or after `k`) with its run, never reading a missing
+    /// position as 0; with no `k` (a full or unsealed tape) only a run with
+    /// slices elsewhere is a range. `AWK_SELECT_VERSION` gives a slice with no
+    /// position an EMPTY field and reports the block's `may_span`.
+    /// `AWK_INDEX_HOLDERS` prints a version's holders, this tape's as the run
+    /// `INDEX_RANGE` gives and another's run marked a range, and notes it.
+    #[test]
+    fn the_range_fragments_read_alike_under_every_awk() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
+            number,
+            tape_position,
+            size_bytes: 10,
+            encrypted_bytes: 30 + number,
+            sha256_plain: "p".repeat(64),
+            sha256_encrypted: format!("{number:064x}"),
+        };
+        let unit =
+            |name: &str, version: i64, may_span: bool, slices: Vec<ManifestSlice>| ManifestUnit {
+                name: name.into(),
+                uuid: format!("uuid-{name}"),
+                snapshot_version: version,
+                stage_set_id: version,
+                may_span,
+                dar_version: None,
+                dar_command: None,
+                slices,
+            };
+        let manifest = generate_manifest_toml(
+            "AWKR1",
+            "alice",
+            &[
+                unit(
+                    "whole",
+                    1,
+                    false,
+                    vec![slice(1, Some(9)), slice(2, Some(10))],
+                ),
+                unit(
+                    "cutw",
+                    1,
+                    false,
+                    vec![slice(1, Some(12)), slice(2, Some(13))],
+                ),
+                unit(
+                    "tail",
+                    2,
+                    true,
+                    vec![
+                        slice(1, None),
+                        slice(2, None),
+                        slice(3, Some(4)),
+                        slice(4, Some(5)),
+                    ],
+                ),
+                unit(
+                    "head",
+                    3,
+                    true,
+                    vec![
+                        slice(1, Some(11)),
+                        slice(2, Some(12)),
+                        slice(3, Some(13)),
+                        slice(4, Some(14)),
+                    ],
+                ),
+                unit(
+                    "gone",
+                    1,
+                    true,
+                    vec![slice(1, Some(13)), slice(2, Some(14))],
+                ),
+                unit(
+                    "allspan",
+                    1,
+                    true,
+                    vec![slice(1, Some(6)), slice(2, Some(7))],
+                ),
+            ],
+        );
+        let man = d.join("MANIFEST.toml");
+        std::fs::write(&man, &manifest).unwrap();
+        let units = "unit\tunit_uuid\tversion\tnum_slices\tfirst_slice\tlast_slice\tvolume\tstate\tsealed_at\n\
+                     tail\tuuid-tail\t2\t4\t3\t4\tTHIS1\tthis-tape\t\n\
+                     tail\tuuid-tail\t2\t4\t1\t2\tOTHER2\tsealed\t2026-09-01T10:00:00Z\n\
+                     whole\tuuid-whole\t1\t2\t1\t2\tTHIS1\tthis-tape\t\n";
+        let uf = d.join("units.tsv");
+        std::fs::write(&uf, units).unwrap();
+        let ranges = d.join("range.here");
+        std::fs::write(&ranges, "uuid-tail\t2\t3\t4\t4\n").unwrap();
+        let holders_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_HOLDERS}");
+
+        let awks: &[(&str, &[&str])] = &[
+            ("awk", &[]),
+            ("gawk", &[]),
+            ("mawk", &[]),
+            ("nawk", &[]),
+            ("original-awk", &[]),
+            ("busybox", &["awk"]),
+        ];
+        let mut outputs: Vec<(String, String)> = Vec::new();
+        for (bin, pre) in awks {
+            let run =
+                |args: &[&str], env: &[(&str, &std::path::Path)]| -> Option<(String, String)> {
+                    let mut cmd = Command::new(bin);
+                    cmd.args(*pre).args(args).env("LC_ALL", "C");
+                    for (k, v) in env {
+                        cmd.env(k, v);
+                    }
+                    let o = cmd.output().ok()?;
+                    Some((
+                        format!(
+                            "exit {:?}\n{}",
+                            o.status.code(),
+                            String::from_utf8_lossy(&o.stdout)
+                        ),
+                        String::from_utf8_lossy(&o.stderr).to_string(),
+                    ))
+                };
+            let mut out = String::new();
+            let mut ok = true;
+            for k in ["12", ""] {
+                let rf = d.join(format!("ranges-{bin}-{k}"));
+                let Some((o, _)) = run(
+                    &[
+                        "-v",
+                        &format!("k={k}"),
+                        AWK_CUT_VERSIONS,
+                        man.to_str().unwrap(),
+                    ],
+                    &[("RANGE_OUT", &rf)],
+                ) else {
+                    ok = false;
+                    break;
+                };
+                out.push_str(&format!(
+                    "cut k={k}:\n{o}ranges:\n{}",
+                    std::fs::read_to_string(&rf).unwrap_or_default()
+                ));
+            }
+            if !ok {
+                continue;
+            }
+            for (u, want) in [("tail", ""), ("whole", ""), ("head", "3")] {
+                let (o, e) = run(
+                    &[
+                        "-v",
+                        &format!("unit={u}"),
+                        "-v",
+                        &format!("want={want}"),
+                        AWK_SELECT_VERSION,
+                        man.to_str().unwrap(),
+                    ],
+                    &[],
+                )
+                .unwrap();
+                out.push_str(&format!("select {u}:\n{o}stderr: {e}"));
+            }
+            let flag = d.join(format!("partial-{bin}"));
+            let mut cmd = Command::new(bin);
+            cmd.args(*pre)
+                .arg(&holders_prog)
+                .arg(&uf)
+                .env("LC_ALL", "C")
+                .env("CHK_UNIT", "tail")
+                .env("CHK_VER", "2")
+                .env("CHK_UUID", "uuid-tail")
+                .env("INDEX_RANGE", &ranges)
+                .env("INDEX_PARTIAL", &flag);
+            let h = cmd.output().unwrap();
+            out.push_str(&format!(
+                "holders exit {:?}:\n{}flag: {}",
+                h.status.code(),
+                String::from_utf8_lossy(&h.stdout),
+                std::fs::read_to_string(&flag).unwrap_or_default()
+            ));
+            outputs.push((bin.to_string(), out));
+        }
+        assert!(outputs.len() >= 2, "want two awks at least: {outputs:?}");
+        for w in outputs.windows(2) {
+            assert_eq!(w[0].1, w[1].1, "{} and {} differ", w[0].0, w[1].0);
+        }
+        let got = &outputs[0].1;
+        let want_cut_12 = "cut k=12:\nexit Some(0)\nuuid-cutw\t1\nuuid-gone\t1\n\
+                           ranges:\nuuid-tail\t2\t3\t4\t4\nuuid-head\t3\t1\t2\t4\n";
+        assert!(got.starts_with(want_cut_12), "{got}");
+        assert!(
+            got.contains("cut k=:\nexit Some(0)\nranges:\nuuid-tail\t2\t3\t4\t4\nselect"),
+            "with no ended_after only a run with slices elsewhere is a range:\n{got}"
+        );
+        let tail_sel = format!(
+            "select tail:\nexit Some(0)\n1||31|{}\n2||32|{}\n3|4|33|{}\n4|5|34|{}\nstderr: 2 1\n",
+            format!("{:064x}", 1),
+            format!("{:064x}", 2),
+            format!("{:064x}", 3),
+            format!("{:064x}", 4)
+        );
+        assert!(got.contains(&tail_sel), "{got}");
+        assert!(got.contains("stderr: 1 0\n"), "whole: may_span 0:\n{got}");
+        assert!(
+            got.contains("stderr: 3 1\n"),
+            "head: version 3, may_span 1:\n{got}"
+        );
+        assert!(
+            got.contains(
+                "holders exit Some(0):\n    tape THIS1  (this tape, a range: not the whole version)  slices 3-4 of 4\n"
+            ),
+            "{got}"
+        );
+        assert!(
+            got.contains("    tape OTHER2  (sealed 2026-09-01T10:00:00Z, a range: not the whole version)  slices 1-2 of 4\n"),
+            "{got}"
+        );
+        assert!(got.ends_with("flag: 1\n"), "{got}");
+    }
+
+    /// R6 in the script: `slice_here` passes a slice with a tape position and
+    /// stops, naming it, at one with none, so no consumer of a slice list can
+    /// seek to an empty position (bash would read `fsf ""` and `-gt ""` as
+    /// errors, and `$((tpos + 1))` as file 1).
+    #[test]
+    fn slice_here_refuses_a_slice_with_no_tape_position() {
+        let script = generate_restore_script_v2("SH01", 20);
+        let from = script.find("slice_here() {").expect("slice_here");
+        let body = &script[from..];
+        let body = &body[..body.find("\n}\n").unwrap() + 3];
+        let run = |pos: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "die() {{ echo \"FATAL: $*\"; exit 1; }}\n{body}slice_here 3 '{pos}' && echo PASSED"
+                ))
+                .output()
+                .unwrap()
+        };
+        let ok = run("12");
+        assert!(ok.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "PASSED\n");
+        let away = run("");
+        assert_eq!(away.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&away.stdout);
+        assert!(
+            text.starts_with(
+                "FATAL: slice 3 has no tape position on this tape: it is on another tape"
+            ),
+            "{text}"
+        );
     }
 
     /// ADR-0012 item 103: the three fragments of the file check, on text as the

@@ -1850,7 +1850,8 @@ mod short_seal_tests {
             ..Fixture::short(4, 9)
         };
         assert!(
-            full.text().contains("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = 13\n"),
+            full.text()
+                .contains("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = 13\n"),
             "{}",
             full.text()
         );
@@ -1883,8 +1884,7 @@ mod short_seal_tests {
                 "the same seal but the feature"
             );
         }
-        let SealVerdict::Sealed(seal) =
-            judge_seal(Ok(short.text().as_bytes()), FRONT_INDEX, 3, 10)
+        let SealVerdict::Sealed(seal) = judge_seal(Ok(short.text().as_bytes()), FRONT_INDEX, 3, 10)
         else {
             panic!("a span short seal that keeps the rules is Sealed")
         };
