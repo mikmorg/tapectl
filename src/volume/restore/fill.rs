@@ -493,7 +493,7 @@ fn fill_from(
             holder.standing == Standing::Quarantined,
             why,
             "the same files",
-            "go without it (those files stay damaged or missing)",
+            Some("go without it (those files stay damaged or missing)"),
         )? {
             Changed::Loaded => {}
             Changed::Declined => return Ok(()),

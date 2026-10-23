@@ -408,6 +408,81 @@ mod tests {
             }
         }
 
+        /// Write slices `run` of the staging to cartridge `label` as a RANGE
+        /// (#478): a `range` write (planned with `may_span`), the run's
+        /// positions `written`, and `pending` positions for the slices after
+        /// it up to `planned_to`, which the plan put on this tape and its end
+        /// came before. When there are any, the tape ended after the run, and
+        /// its `ended_after` says so. A run that does not start at slice 1 is
+        /// preceded by as many files of filler, so slice numbers and tape
+        /// files keep their offset (`corrupt` relies on it).
+        fn write_range(
+            &mut self,
+            st: &Staging,
+            label: &str,
+            run: std::ops::RangeInclusive<usize>,
+            planned_to: usize,
+        ) {
+            let volume_id = self.volume_ids[label];
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                     VALUES (?1, ?2, ?3, 'range', 1)",
+                    params![st.stage_set_id, self.snapshot_id, volume_id],
+                )
+                .unwrap();
+            let write_id = self.conn.last_insert_rowid();
+            let mem = self.mems.get_mut(label).unwrap();
+            self.first_position
+                .insert((label.to_string(), st.stage_set_id), mem.files.len());
+            for filler in 1..*run.start() {
+                mem.execute(&mut Cursor::new(vec![filler as u8; 64]), 64, false)
+                    .unwrap();
+            }
+            let slice_id = |n: usize| -> i64 {
+                self.conn
+                    .query_row(
+                        "SELECT id FROM stage_slices WHERE stage_set_id = ?1 AND slice_number = ?2",
+                        params![st.stage_set_id, n as i64],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            let mut last = 0;
+            for n in run.clone() {
+                let cipher = &st.ciphers[n - 1];
+                let position = mem.files.len();
+                mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                    .unwrap();
+                self.conn
+                    .execute(
+                        "INSERT INTO write_positions
+                            (write_id, stage_slice_id, position, status, sha256_on_volume)
+                         VALUES (?1, ?2, ?3, 'written', ?4)",
+                        params![write_id, slice_id(n), position.to_string(), sha_hex(cipher)],
+                    )
+                    .unwrap();
+                last = position;
+            }
+            for (i, n) in (run.end() + 1..=planned_to).enumerate() {
+                self.conn
+                    .execute(
+                        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                         VALUES (?1, ?2, ?3, 'pending')",
+                        params![write_id, slice_id(n), (last + 1 + i).to_string()],
+                    )
+                    .unwrap();
+            }
+            if planned_to > *run.end() {
+                self.conn
+                    .execute(
+                        "UPDATE volumes SET ended_after = ?1 WHERE id = ?2",
+                        params![last as i64, volume_id],
+                    )
+                    .unwrap();
+            }
+        }
+
         /// Bind volume `label` to a cartridge with this sticker and chip serial,
         /// as `volume init` does.
         fn bind(&self, label: &str, barcode: &str, serial: &str) {
@@ -2034,5 +2109,460 @@ mod tests {
                 .unwrap_or_else(|e| panic!("order {order:?}: {e}"));
             fx.assert_restored(dest.path());
         }
+    }
+
+    // ── #478: a version read across cartridges (ADR-0012 items 89, 101, 131, 143) ──
+
+    /// The sticker and chip serial each cartridge is bound to, for the prompts.
+    fn bind_all(fx: &Fixture, labels: &[&str]) {
+        for (i, label) in labels.iter().enumerate() {
+            fx.bind(label, &format!("STICKER-{i}"), &format!("CHIP-{i}"));
+        }
+    }
+
+    /// One staging of the tree held across `labels` as ranges: each label's
+    /// run in `runs`, the first tape's plan running to the last slice (its end
+    /// came first), each later one holding its run to the end of its plan.
+    fn spanned(labels: &[&str], cuts: &[usize], catalogue: bool) -> (Fixture, Staging) {
+        let mut fx = Fixture::new(labels, tree());
+        let st = fx.stage(&tree(), "150k", catalogue);
+        let n = st.slices();
+        assert!(n >= 4, "want a many-slice archive: {n}");
+        let mut start = 1;
+        for (i, label) in labels.iter().enumerate() {
+            let end = cuts.get(i).copied().unwrap_or(n);
+            fx.write_range(&st, label, start..=end, n);
+            start = end + 1;
+        }
+        assert_eq!(start, n + 1, "every slice is on some tape");
+        (fx, st)
+    }
+
+    /// THE acceptance test of item 131: a version held as two ranges restores
+    /// byte for byte from the cartridge holding slice 1, with the second asked
+    /// for once, by label, sticker and chip serial, when its first slice is
+    /// next; streamed into one extraction when the catalogue is on disk,
+    /// spooled when it is not. No slice is a substitution, and each cartridge
+    /// is a contact of its own.
+    #[test]
+    fn a_two_volume_span_restores_byte_identical() {
+        for catalogue in [true, false] {
+            let (fx, st) = spanned(&[A, B], &[2], catalogue);
+            bind_all(&fx, &[A, B]);
+            let n = st.slices();
+
+            // Streamed when it can be: the cartridges' tape order does not
+            // stop it.
+            let selection = select_write_positions(&fx.conn, &fx.unit, A, None).unwrap();
+            assert_eq!(
+                selection
+                    .positions
+                    .iter()
+                    .map(|wp| (wp.slice_number, wp.volume_id))
+                    .collect::<Vec<_>>(),
+                (1..=n as i64)
+                    .map(|s| (s, fx.volume_ids[if s <= 2 { A } else { B }]))
+                    .collect::<Vec<_>>(),
+                "every slice, in slice order, from the cartridge that holds it"
+            );
+            let scratch_parent = TempDir::new().unwrap();
+            let plan = plan_restore(
+                &fx.conn,
+                &Config::default(),
+                &selection,
+                RestoreTarget::Unit { dest_dir: "/x" },
+                &scratch_parent.path().join(SCRATCH_NAME),
+                false,
+            )
+            .unwrap();
+            assert_eq!(plan.stream.is_some(), catalogue, "catalogue={catalogue}");
+
+            let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+            let dest = TempDir::new().unwrap();
+            let report = fx
+                .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+                .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+            fx.assert_restored(dest.path());
+            assert_eq!(report.slices, n);
+            assert!(report.substitutions.is_empty(), "{report:?}");
+            assert_eq!(bay.asked_labels(), [B], "catalogue={catalogue}");
+            let prompt = &bay.asked[0].1;
+            assert!(
+                prompt.contains("held across cartridges")
+                    && prompt.contains("slice 3 is next")
+                    && prompt.contains(&format!("L6-0002 holds slices 3 to {n} of unit"))
+                    && prompt.contains("cartridge STICKER-1, chip serial CHIP-1"),
+                "{prompt}"
+            );
+            let contacts = fx.contacts();
+            assert_eq!(contacts.len(), 2, "{contacts:?}");
+            assert_eq!((contacts[0].0.as_str(), contacts[0].1.as_str()), (A, "ok"));
+            assert_eq!((contacts[1].0.as_str(), contacts[1].1.as_str()), (B, "ok"));
+            assert!(
+                contacts[0]
+                    .2
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("continues on L6-0002 at slice 3"),
+                "{contacts:?}"
+            );
+            assert!(!dest.path().join(SCRATCH_NAME).exists());
+            let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].outcome, "ok");
+        }
+    }
+
+    /// Three cartridges: asked for in slice order, each by its own label,
+    /// sticker and chip serial and the slices it holds, and the version comes
+    /// back byte for byte.
+    #[test]
+    fn a_three_volume_span_asks_in_slice_order_naming_each_cartridge() {
+        let (fx, st) = spanned(&[A, B, C], &[1, 3], true);
+        bind_all(&fx, &[A, B, C]);
+        let n = st.slices();
+        let mut bay = fx.bay(A, true, &[Reply::Load(B), Reply::Load(C)]);
+        let dest = TempDir::new().unwrap();
+        fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B, C]);
+        let (b, c) = (&bay.asked[0].1, &bay.asked[1].1);
+        assert!(
+            b.contains("slice 2 is next")
+                && b.contains("L6-0002 holds slices 2 to 3")
+                && b.contains("cartridge STICKER-1, chip serial CHIP-1"),
+            "{b}"
+        );
+        assert!(
+            c.contains("slice 4 is next")
+                && c.contains(&format!(
+                    "L6-0003 holds {}",
+                    span::slices_phrase(4, n as i64)
+                ))
+                && c.contains("cartridge STICKER-2, chip serial CHIP-2")
+                && c.contains("it is not on L6-0002"),
+            "{c}"
+        );
+        assert_eq!(fx.contacts().len(), 3);
+    }
+
+    /// `--spool` across a swap: each cartridge's slices are decrypted into
+    /// scratch in turn, and dar extracts once, after the last.
+    #[test]
+    fn spool_reads_every_cartridge_into_scratch_before_dar() {
+        let (fx, _st) = spanned(&[A, B], &[2], true);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let options = RestoreOptions {
+            spool: true,
+            ..RestoreOptions::default()
+        };
+        fx.restore(A, &mut bay, dest.path(), &options).unwrap();
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B]);
+        assert!(!dest.path().join(SCRATCH_NAME).exists());
+    }
+
+    /// Item 131's "a live whole copy first": tape 1 holds the start of the
+    /// version, and both a range of the rest (on the volume with the LOWER id)
+    /// and a whole copy hold the slices after it. The whole copy is asked for.
+    /// Started on the whole copy, the version restores from it alone, as in
+    /// 1.6.0.
+    #[test]
+    fn a_live_whole_copy_is_preferred_over_a_span() {
+        // Ids: A 1, C 2, B 3.
+        let mut fx = Fixture::new(&[A, C, B], tree());
+        let st = fx.stage(&tree(), "150k", true);
+        let n = st.slices();
+        fx.write_range(&st, A, 1..=2, n);
+        fx.write_range(&st, C, 3..=n, n);
+        fx.write(&st, B);
+        assert!(
+            fx.volume_ids[C] < fx.volume_ids[B],
+            "the range would win on id"
+        );
+
+        let selection = select_write_positions(&fx.conn, &fx.unit, A, None).unwrap();
+        let runs: Vec<i64> = span::runs(&selection.positions)
+            .iter()
+            .map(|r| r.volume_id)
+            .collect();
+        assert_eq!(runs, vec![fx.volume_ids[A], fx.volume_ids[B]]);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B]);
+
+        // From the whole copy: one cartridge, no prompt.
+        let mut bay = fx.bay(B, true, &[]);
+        let dest = TempDir::new().unwrap();
+        fx.restore(B, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert!(bay.asked.is_empty());
+    }
+
+    /// `--from` a cartridge that does not hold slice 1 is refused before the
+    /// drive is opened, naming the holders of slice 1 by label, sticker and
+    /// serial; and the loaded tape with no `--from` by the same rule (X21),
+    /// after File 0 and before any prompt or slice.
+    #[test]
+    fn a_restore_started_without_slice_1_is_refused_naming_its_holders() {
+        let (fx, _st) = spanned(&[A, B], &[2], true);
+        bind_all(&fx, &[A, B]);
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        // Named: the dry run is the path before the drive.
+        let err = restore_unit(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            B,
+            &dest_str,
+            "/nonexistent/tapectl-478-nst",
+            4096,
+            None,
+            true,
+            &RestoreOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        for needle in [
+            "volume \"L6-0002\" holds only slices 3 to",
+            "Slice 1 is on \"L6-0001\" (cartridge STICKER-0, chip serial CHIP-0)",
+            "--from L6-0001",
+            "Nothing was read from tape",
+        ] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+
+        // Loaded: File 0 names B.
+        fx.conn
+            .execute(
+                "UPDATE volumes SET uuid = 'aaaaaaaa-bbbb-cccc-dddd-000000000001' WHERE label = ?1",
+                params![B],
+            )
+            .unwrap();
+        let mut bay = fx.bay(B, true, &[Reply::Load(A)]);
+        let err = restore_unit_from_loaded_bay(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            RestoreTarget::Unit {
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            None,
+            &mut bay,
+            site(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Slice 1 is on \"L6-0001\"") && err.contains("--from L6-0001"),
+            "{err}"
+        );
+        assert!(bay.asked.is_empty(), "no cartridge is asked for");
+        assert!(files_in(dest.path()).is_empty());
+    }
+
+    /// A version with a slice on no live volume is refused before any prompt,
+    /// naming the slices and where the catalog saw them; the dry run says the
+    /// same.
+    #[test]
+    fn a_slice_on_no_live_volume_is_refused_before_any_prompt() {
+        let (fx, st) = spanned(&[A, B], &[2], true);
+        let n = st.slices() as i64;
+        fx.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE label = ?1",
+                params![B],
+            )
+            .unwrap();
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_err()
+            .to_string();
+        let slices = format!("slices 3 to {n} of it are on no live volume");
+        for needle in [
+            slices.as_str(),
+            "\"L6-0001\" planned it, but its tape ended before it",
+            "\"L6-0002\" is retired",
+            "catalog rebuild --from-volume",
+            "Nothing was read from tape",
+        ] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        assert!(bay.asked.is_empty(), "refused before any prompt");
+        assert!(files_in(dest.path()).is_empty());
+
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        let dry = restore_unit(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            &dest_str,
+            "/nonexistent/tapectl-478-nst",
+            4096,
+            None,
+            true,
+            &RestoreOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(dry.contains(&slices), "{dry}");
+    }
+
+    /// Nobody at the terminal: a restore that needs a second cartridge is
+    /// refused before a slice is read, naming each cartridge and its slices.
+    /// And a "skip" at the prompt for the next cartridge stops the restore:
+    /// it cannot go on without that cartridge's slices.
+    #[test]
+    fn a_span_needs_a_person_and_its_next_cartridge_cannot_be_skipped() {
+        let (fx, _st) = spanned(&[A, B], &[2], true);
+        bind_all(&fx, &[A, B]);
+        let mut bay = fx.bay(A, false, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("held across cartridges")
+                && err.contains("slices 1 to 2 from \"L6-0001\"")
+                && err.contains("from \"L6-0002\" (cartridge STICKER-1, chip serial CHIP-1)")
+                && err.contains("swaps no cartridge without a person"),
+            "{err}"
+        );
+        assert!(bay.asked.is_empty());
+        assert!(files_in(dest.path()).is_empty());
+
+        let mut bay = fx.bay(A, true, &[Reply::Skip]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped at the operator's request"), "{err}");
+        assert_eq!(bay.asked_labels(), [B]);
+        assert!(!dest.path().join(SCRATCH_NAME).exists());
+    }
+
+    /// `restore file` across a swap: a file in slice 1 needs slice 1 (on the
+    /// first cartridge) and the last (on the second, where dar reads its
+    /// catalogue); the second is asked for and the file placed whole.
+    #[test]
+    fn restore_file_reads_across_a_swap() {
+        let (fx, _st) = spanned(&[A, B], &[2], true);
+        let file = fx.files[0].0.clone();
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        restore_unit_from_bay(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            1,
+            RestoreTarget::File {
+                file_path: &file,
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            &mut bay,
+            site(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fs::read(dest.path().join(&file)).unwrap(), fx.files[0].1);
+        assert_eq!(bay.asked_labels(), [B]);
+    }
+
+    /// Item 101 sees ranges: a slice damaged on the whole copy is read from a
+    /// range that holds it, that cartridge serves the next slice it holds too,
+    /// and the restore goes back to the whole copy for the rest.
+    #[test]
+    fn a_damaged_slice_is_replaced_from_a_range_holder() {
+        let mut fx = Fixture::new(&[A, B], tree());
+        let st = fx.stage(&tree(), "150k", false);
+        let n = st.slices();
+        fx.write(&st, A);
+        fx.write_range(&st, B, 2..=3, n);
+        fx.corrupt(A, &st, 2, 0);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B), Reply::Load(A)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B, A]);
+        assert!(
+            bay.asked[0].1.contains("Slice 2") && bay.asked[0].1.contains("checksum mismatch"),
+            "{:?}",
+            bay.asked
+        );
+        assert!(
+            bay.asked[1].1.contains("Slice 4 of unit") && bay.asked[1].1.contains("is next"),
+            "{:?}",
+            bay.asked
+        );
+        assert_eq!(
+            report
+                .substitutions
+                .iter()
+                .map(|s| (s.slice_number, s.supplied_by.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, B)]
+        );
+    }
+
+    /// A version held whole restores as in 1.6.0 though ranges of it exist
+    /// elsewhere: no prompt, and the tape moves exactly as a clean restore's
+    /// does (one rewind, File 0, a space to slice 1, each slice read once).
+    #[test]
+    fn a_version_held_whole_restores_as_in_1_6_0_beside_its_ranges() {
+        let mut fx = Fixture::new(&[A, B, C], tree());
+        let st = fx.stage(&tree(), "150k", false);
+        let n = st.slices();
+        fx.write(&st, A);
+        fx.write_range(&st, B, 1..=2, n);
+        fx.write_range(&st, C, 3..=n, n);
+        let selection = select_write_positions(&fx.conn, &fx.unit, A, None).unwrap();
+        assert!(selection
+            .positions
+            .iter()
+            .all(|wp| wp.volume_id == fx.volume_ids[A]));
+        let (mut bay, fakes) = fx.fake_bay(A, &[]);
+        let dest = TempDir::new().unwrap();
+        fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert!(bay.asked.is_empty());
+        use crate::tape::fake::Op;
+        let first = FIRST as u32;
+        let mut want = vec![Op::Rewind, Op::ReadHead(0), Op::Space(first - 1)];
+        want.extend((0..n as u32).map(|i| Op::Read(first + i)));
+        assert_eq!(fakes[A].ops(), want);
+    }
+
+    /// Every entry under `dir`, recursively — empty for a restore that wrote
+    /// nothing.
+    fn files_in(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                out.push(e.path());
+            }
+        }
+        out
     }
 }

@@ -30,11 +30,12 @@
 //!    supply only what the first could not.
 //! 4. **Another cartridge is asked for** — by label, sticker and chip
 //!    serial — when a medium fault was the cause and the catalog knows
-//!    another holder ([`crate::volume::slice_holders`]). The cartridge in
-//!    the drive is kept as long as it holds what is wanted, so several bad
-//!    slices in a row cost one swap, not one each. A cartridge that failed
-//!    a slice at some offset is tried again only for what lies past that
-//!    offset has been delivered by another.
+//!    another holder ([`crate::volume::slice_holders`], a range included
+//!    from 1.7.0: item 101 sees ranges). The cartridge in the drive is kept
+//!    as long as it holds what is wanted, so several bad slices in a row
+//!    cost one swap, not one each. A cartridge that failed a slice at some
+//!    offset is tried again only for what lies past that offset has been
+//!    delivered by another.
 //! 5. **No terminal, no swap**: with nobody to load a cartridge the read
 //!    refuses by name, listing the holders, and `--yes` does not stand in
 //!    for a person (it cannot load a cartridge).
@@ -44,6 +45,22 @@
 //!    ranges are recorded, and the restore goes on. dar's own per-file CRCs
 //!    then name the files the holes fell in. Only what authenticates is ever
 //!    written; a hole is zeros.
+//!
+//! # A version across cartridges (#478)
+//!
+//! A restore of a version held across cartridges is planned before the first
+//! slice is read ([`super::span`]): each slice's position names the volume it
+//! is read from. When the next slice is planned on another cartridge than the
+//! one in the drive, and the one in the drive does not hold it, that
+//! cartridge is asked for as a substitute is (by label, sticker and chip
+//! serial), with no damage behind it: the drive is released before the
+//! prompt, the cartridge that is loaded is accepted only by its identity
+//! check, and a slice is read from it only at a position the catalog records
+//! at or before its tape's end (`volume-format-v2.md` §4.2 R1 and R5, through
+//! [`crate::volume::slice_holders::holders_of`]). The streamed restore keeps
+//! dar waiting on the next slice's named pipe across the swap, so the
+//! cartridges feed one extraction. Such a prompt offers no "skip": a restore
+//! needs every slice, in slice order (§4.4 R7).
 //!
 //! # What proves a slice whole
 //!
@@ -137,8 +154,10 @@ pub(crate) struct Want {
     pub label: String,
     /// The drive, as the operator named it.
     pub device: String,
-    /// What `Skip` would do, in the prompt's words.
-    pub skip_means: &'static str,
+    /// What `Skip` would do, in the prompt's words; `None` when the restore
+    /// cannot go on without the cartridge (the next one of a version read
+    /// across cartridges), and "skip" is then not offered.
+    pub skip_means: Option<&'static str>,
 }
 
 impl Want {
@@ -302,11 +321,19 @@ impl Bay for DeviceBay<'_> {
         for line in want.lines() {
             progress::stderr_println(&line);
         }
-        progress::stderr_println(&format!(
-            "Unload the cartridge in {} (`tapectl drive eject`), load {}, and press Enter. \
-             Type \"skip\" to {}, or \"stop\" to give up (what is restored so far stays).",
-            want.device, want.label, want.skip_means
-        ));
+        progress::stderr_println(&match want.skip_means {
+            Some(skip) => format!(
+                "Unload the cartridge in {} (`tapectl drive eject`), load {}, and press Enter. \
+                 Type \"skip\" to {skip}, or \"stop\" to give up (what is restored so far \
+                 stays).",
+                want.device, want.label
+            ),
+            None => format!(
+                "Unload the cartridge in {} (`tapectl drive eject`), load {}, and press Enter. \
+                 Type \"stop\" to give up (what is restored so far stays).",
+                want.device, want.label
+            ),
+        });
         let _wait = progress::wait(|| format!("for the operator to load {}", want.label));
         eprint!("> ");
         let _ = std::io::stderr().flush();
@@ -730,6 +757,11 @@ fn detail_of(notes: &[String], outcome: Option<&TapectlError>) -> Option<String>
 enum Choice {
     /// The cartridge in the drive, at this tape file.
     Here(u32),
+    /// The cartridge the plan reads this slice from, which is not the one in
+    /// the drive, and nothing has failed (#478): the next cartridge of a
+    /// version read across cartridges, or the one a substitution left to go
+    /// back to.
+    Next(Holder),
     /// Another cartridge, which has to be asked for.
     Elsewhere(Holder),
     /// No cartridge the catalog knows of that has not already failed.
@@ -834,6 +866,9 @@ pub(crate) struct Supply<'c, 's, 'b> {
     /// File 0's head, read to identify the loaded volume, for the first
     /// contact check.
     primed: Option<Vec<u8>>,
+    /// The restore's plan, `(stage set, slice, volume)` in slice order: what
+    /// a prompt for the next cartridge says it holds (#478).
+    route: Vec<(i64, i64, i64)>,
     pub(crate) substitutions: Vec<Substitution>,
     pub(crate) damage: Vec<Damage>,
 }
@@ -870,6 +905,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             sole: HashMap::new(),
             subject: String::new(),
             primed: None,
+            route: Vec::new(),
             substitutions: Vec::new(),
             damage: Vec::new(),
         }
@@ -904,6 +940,15 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
     /// Name what is being restored, for the prompt: `unit "photos" v2`.
     pub(crate) fn set_subject(&mut self, subject: impl Into<String>) {
         self.subject = subject.into();
+    }
+
+    /// The slices the restore reads, each with the volume it is read from:
+    /// what the prompt for a version's next cartridge names (#478).
+    pub(super) fn set_route(&mut self, positions: &[WritePositionInfo]) {
+        self.route = positions
+            .iter()
+            .map(|wp| (wp.stage_set_id, wp.slice_number, wp.volume_id))
+            .collect();
     }
 
     /// Whether a person can be asked to change the cartridge.
@@ -997,6 +1042,10 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         // settle it.
         let mut unproven: Option<(String, String)> = None;
         let mut tried = false;
+        // Where the slice was last read on the cartridge in the drive: this
+        // slice's own reads only, so a slice never tried here is never
+        // salvaged from the tape file of the one before it.
+        self.last_position = None;
         // With no other copy anywhere there is nothing to wait for: one pass,
         // holes where the chunks do not authenticate.
         let sole = self.sole_copy(wp)?;
@@ -1060,6 +1109,35 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         }
                     }
                 }
+                Choice::Next(holder) => {
+                    if !self.bay.attended() {
+                        let list = holders.clone().unwrap_or_default();
+                        return Err(self.refuse_unattended(wp, first.as_ref(), &list));
+                    }
+                    let (why, what) = self.why_next(wp, &holder);
+                    self.note_here(format!(
+                        "{} continues on {} at slice {}",
+                        self.subject, holder.label, wp.slice_number
+                    ));
+                    match self.change_to(
+                        holder.volume_id,
+                        &holder.label,
+                        holder.standing == Standing::Quarantined,
+                        why,
+                        &what,
+                        None,
+                    )? {
+                        Changed::Loaded => {}
+                        Changed::Declined => {
+                            return Err(TapectlError::Other(format!(
+                                "restore of {} stopped: slice {} is on {}, which was not \
+                                 loaded, and a restore needs every slice, in slice order. What \
+                                 was restored before this point stays where it is",
+                                self.subject, wp.slice_number, holder.label
+                            )))
+                        }
+                    }
+                }
                 Choice::Elsewhere(holder) => {
                     if !self.bay.attended() {
                         let list = holders.clone().unwrap_or_default();
@@ -1072,7 +1150,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         holder.standing == Standing::Quarantined,
                         why,
                         "an identical copy of it",
-                        "leave a hole where the slice is damaged",
+                        Some("leave a hole where the slice is damaged"),
                     )? {
                         Changed::Loaded => {}
                         Changed::Declined => break,
@@ -1350,6 +1428,20 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 return Ok(Choice::Here(h.position));
             }
         }
+        // The cartridge the plan reads this slice from (#478): asked for
+        // before any other holder, as the next one when nothing has failed.
+        if wp.volume_id != here {
+            if let Some(h) = all
+                .iter()
+                .find(|h| h.volume_id == wp.volume_id && usable(&self.bad, h.volume_id))
+            {
+                return Ok(if tried {
+                    Choice::Elsewhere(h.clone())
+                } else {
+                    Choice::Next(h.clone())
+                });
+            }
+        }
         Ok(
             match all
                 .iter()
@@ -1359,6 +1451,51 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 None => Choice::Nowhere,
             },
         )
+    }
+
+    /// Why the next cartridge of the plan is being asked for, and what it
+    /// holds, for the prompt (#478): the run of slices the plan reads from
+    /// it, by the restore's route.
+    fn why_next(&self, wp: &WritePositionInfo, holder: &Holder) -> (String, String) {
+        let run: Vec<i64> = self
+            .route
+            .iter()
+            .filter(|(set, _, volume)| *set == wp.stage_set_id && *volume == holder.volume_id)
+            .map(|(_, slice, _)| *slice)
+            .skip_while(|slice| *slice < wp.slice_number)
+            .scan(wp.slice_number - 1, |last, slice| {
+                (slice == *last + 1).then(|| {
+                    *last = slice;
+                    slice
+                })
+            })
+            .collect();
+        let last = run.last().copied().unwrap_or(wp.slice_number);
+        let slices = super::span::slices_phrase(wp.slice_number, last);
+        let here = self
+            .here_label()
+            .unwrap_or_else(|| "the cartridge in the drive".into());
+        let mut volumes: Vec<i64> = self
+            .route
+            .iter()
+            .filter(|(set, _, _)| *set == wp.stage_set_id)
+            .map(|(_, _, volume)| *volume)
+            .collect();
+        volumes.dedup();
+        let why = if volumes.len() > 1 {
+            format!(
+                "{} is held across cartridges and read in slice order \
+                 (volume-format-v2.md §4.4): slice {} is next, and it is not on {here}.",
+                capitalised(&self.subject),
+                wp.slice_number,
+            )
+        } else {
+            format!(
+                "Slice {} of {} is next, and it is not on {here}.",
+                wp.slice_number, self.subject
+            )
+        };
+        (why, format!("{slices} of {}", self.subject))
     }
 
     /// Why a cartridge is being asked for, for the prompt.
@@ -1634,7 +1771,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         quarantined: bool,
         why: String,
         what: &str,
-        skip_means: &'static str,
+        skip_means: Option<&'static str>,
     ) -> Result<Changed> {
         if self.here_volume() == Some(volume_id) {
             return Ok(Changed::Loaded);
@@ -1645,6 +1782,8 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
     /// Ask for `label`'s cartridge: close the one in the drive (its contact,
     /// its health reading), release the device, ask, and on "loaded" open
     /// the drive on what is there and check it is the cartridge asked for.
+    /// With no `skip_means` there is no going on without it: a "skip" stops,
+    /// as "stop" does.
     fn change_to(
         &mut self,
         volume_id: i64,
@@ -1652,7 +1791,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         quarantined: bool,
         why: String,
         what: &str,
-        skip_means: &'static str,
+        skip_means: Option<&'static str>,
     ) -> Result<Changed> {
         let previous = self.here.as_ref().map(|p| (p.volume_id, p.label.clone()));
         let saved_position = self.last_position;
@@ -1676,7 +1815,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         self.bay.release();
                     }
                 },
-                Answer::Skip => {
+                Answer::Skip if skip_means.is_some() => {
                     let Some((pv, pl)) = previous else {
                         return Err(TapectlError::Other(format!(
                             "restore of {} stopped: no cartridge to go on with",
@@ -1687,7 +1826,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                     self.last_position = saved_position;
                     return Ok(Changed::Declined);
                 }
-                Answer::Stop => {
+                Answer::Stop | Answer::Skip => {
                     return Err(TapectlError::Other(format!(
                         "restore of {} stopped at the operator's request while waiting for \
                          {label}. What was restored before this point stays where it is",
@@ -1717,7 +1856,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 holds: format!("{label} is {}.", shelf.describe()),
                 label: label.to_string(),
                 device: self.device.clone(),
-                skip_means: "give up (there is nothing else to go on with)",
+                skip_means: Some("give up (there is nothing else to go on with)"),
             };
             if self.bay.ask(&want) != Answer::Loaded {
                 return Err(e);
@@ -1800,6 +1939,15 @@ impl Raw {
             }),
             _ => None,
         }
+    }
+}
+
+/// `subject` with its first letter capitalised, to open a sentence.
+fn capitalised(subject: &str) -> String {
+    let mut chars = subject.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

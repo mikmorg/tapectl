@@ -19,6 +19,7 @@ use crate::volume::restore_record::{self, RestoreRecord};
 mod fill;
 #[cfg(test)]
 pub(crate) mod short_tape;
+mod span;
 mod supply;
 #[cfg(test)]
 use supply::FixedBay;
@@ -1307,6 +1308,23 @@ fn restore_unit_contacted(
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
     let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
 
+    // #478: a version read across cartridges needs a person to change them.
+    // Refused here, before a key is loaded or a slice read, rather than at
+    // the first swap with part of the unit already restored.
+    if !supply.attended() {
+        let runs = span::runs(&plan.positions);
+        if runs
+            .iter()
+            .any(|r| Some(r.volume_id) != supply.here_volume())
+        {
+            return Err(span::unattended_refusal(
+                conn,
+                &format!("unit \"{unit_name}\" version {version}"),
+                &runs,
+            ));
+        }
+    }
+
     let identities = load_identities(conn, paths, &tenant, &options.keys)?;
     let substitutions_before = supply.substitutions.len();
     restore_planned(
@@ -1638,9 +1656,12 @@ fn streamable(config: &Config, positions: &[WritePositionInfo], scratch: &Path) 
         }
         Err(_) => return false,
     }
+    // In slice order, and on each cartridge in tape order: a version read
+    // across cartridges (#478) starts again near the front of the next one.
     let in_slice_order = positions.windows(2).all(|w| {
         w[0].slice_number < w[1].slice_number
-            && w[0].position.parse::<u32>().ok() < w[1].position.parse::<u32>().ok()
+            && (w[0].volume_id != w[1].volume_id
+                || w[0].position.parse::<u32>().ok() < w[1].position.parse::<u32>().ok())
     });
     if !in_slice_order {
         info!("the slices are not on tape in slice order; they are spooled");
@@ -1698,6 +1719,9 @@ fn restore_planned(
     let archive_base = scratch.join("restore");
     // The holes this restore writes are the supply's from here on.
     let damage_before = supply.damage.len();
+    // Which cartridge each slice is read from, for the prompt that asks for
+    // the next one of a version read across cartridges (#478).
+    supply.set_route(&plan.positions);
     let extracted = scratch.join("extract");
 
     let streamed =
@@ -2510,7 +2534,10 @@ fn plan_units(
             .ok_or_else(|| TapectlError::UnitNotFound(req.unit.clone()))?;
         queries::get_tenant_by_id(conn, unit.tenant_id)?
             .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-        let selection = select_write_positions(conn, &req.unit, volume_label, req.version)?;
+        // A version this tape holds only a range of is refused by name
+        // (#478, ADR-0012 item 89): `restore volume` restores what one tape
+        // holds whole.
+        let selection = select(conn, &req.unit, volume_label, req.version, Across::Refuse)?;
         let target = RestoreTarget::Unit {
             dest_dir: &req.dest_dir,
         };
@@ -2807,8 +2834,24 @@ pub struct RestoreSelection {
     /// ascending — what a refusal names, and what an operator can pass to
     /// `--version`.
     pub versions_on_volume: Vec<i64>,
-    /// The selected stage set's slices, in slice order.
+    /// The selected stage set's slices, in slice order. For a version this
+    /// volume holds whole, all on it, in tape order. For one it holds a
+    /// range of (#478), every slice of the version, each with the volume it
+    /// is read from ([`WritePositionInfo::volume_id`]): this volume's range
+    /// first, then the other cartridges in slice order ([`span`]).
     pub positions: Vec<WritePositionInfo>,
+}
+
+/// What [`select`] does with a version the volume holds only a range of
+/// (#478, `volume-format-v2.md` §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Across {
+    /// Plan its restore across cartridges ([`span::plan_across`]): `restore
+    /// unit` and `restore file` (ADR-0012 item 131).
+    Plan,
+    /// Refuse it by name: `restore volume` restores the units one tape holds
+    /// whole (item 89).
+    Refuse,
 }
 
 /// Select the ONE snapshot version of `unit_name` to restore from
@@ -2841,30 +2884,53 @@ pub struct RestoreSelection {
 /// the one wrong answer. AWK breaks the same tie by manifest order (`>=`
 /// keeps the last block), which is equally arbitrary; any deterministic
 /// choice of ONE set matches it in what matters.
+///
+/// **A version this volume holds a range of** (#478, `volume-format-v2.md`
+/// §4.4) is named on the tape as a cut one is, and is then planned across
+/// cartridges ([`span::plan_across`]): this volume must hold its slice 1,
+/// every slice must be on a live volume, and the positions returned are
+/// every slice of the version, from the fewest cartridges in slice order.
+/// Either refusal comes before any cartridge is asked for. A version held
+/// whole costs the statements it did in 1.6.0 (`catalog_budget`'s
+/// `RestoreSelect`).
 pub fn select_write_positions(
     conn: &Connection,
     unit_name: &str,
     volume_label: &str,
     want: Option<i64>,
 ) -> Result<RestoreSelection> {
+    select(conn, unit_name, volume_label, want, Across::Plan)
+}
+
+/// [`select_write_positions`], with what to do about a range ([`Across`]).
+fn select(
+    conn: &Connection,
+    unit_name: &str,
+    volume_label: &str,
+    want: Option<i64>,
+    across: Across,
+) -> Result<RestoreSelection> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
     // Every (version, stage set) of this unit on this volume — newest
     // version first, later stage set first within one — whose write is a
-    // copy here (`completed`, with written slices) or was cut by the early
-    // end of the tape (#420, `cut`). A cut version is picked as RESTORE.sh
-    // picks it (the newest on the tape, or `--version`) and then refused by
-    // name: it is not on this tape whole (`volume-format-v2.md` §4.2 R4).
+    // copy here (`completed`, with written slices), a range of a version
+    // held across cartridges (#478, `range`, with written slices), or was
+    // cut by the early end of the tape (#420, `cut`). A cut version is
+    // picked as RESTORE.sh picks it (the newest on the tape, or `--version`)
+    // and then refused by name: it is not on this tape whole
+    // (`volume-format-v2.md` §4.2 R4). A range is picked the same way and
+    // read across cartridges (§4.4).
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.version, ss.id, w.status = 'cut', v.ended_after
+        "SELECT DISTINCT s.version, ss.id, w.status, v.ended_after
          FROM writes w
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN volumes v ON v.id = w.volume_id
          WHERE s.unit_id = ?1 AND v.label = ?2
            AND (w.status = 'cut'
-                OR (w.status = 'completed'
+                OR (w.status IN ('completed', 'range')
                     AND EXISTS (SELECT 1 FROM write_positions wp
                                  WHERE wp.write_id = w.id AND wp.status = 'written')))
          ORDER BY s.version DESC, ss.id DESC",
@@ -2874,7 +2940,7 @@ pub fn select_write_positions(
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
-                r.get::<_, bool>(2)?,
+                r.get::<_, String>(2)?,
                 r.get::<_, Option<i64>>(3)?,
             ))
         })?
@@ -2889,7 +2955,7 @@ pub fn select_write_positions(
     // The versions this volume holds whole: what `--version` may name.
     let mut versions_on_volume: Vec<i64> = candidates
         .iter()
-        .filter(|(_, _, cut, _)| !cut)
+        .filter(|(_, _, status, _)| status == "completed")
         .map(|(v, _, _, _)| *v)
         .collect();
     versions_on_volume.sort_unstable();
@@ -2900,20 +2966,35 @@ pub fn select_write_positions(
         None => candidates.first(),
         Some(want) => candidates.iter().find(|(v, _, _, _)| *v == want),
     };
-    let Some(&(version, stage_set_id, cut, ended_after)) = picked else {
+    let Some((version, stage_set_id, status, ended_after)) = picked else {
         let listed: Vec<String> = versions_on_volume.iter().map(i64::to_string).collect();
+        let mut ranges: Vec<String> = candidates
+            .iter()
+            .filter(|(_, _, status, _)| status == "range")
+            .map(|(v, _, _, _)| v.to_string())
+            .collect();
+        ranges.dedup();
         return Err(TapectlError::Other(format!(
             "unit \"{unit_name}\" has no version {} on volume \"{volume_label}\"; \
-             version(s) on it: {} — pass one of those with --version",
+             version(s) on it: {}{} — pass one of those with --version",
             want.unwrap_or_default(),
             if listed.is_empty() {
                 "none whole".to_string()
             } else {
                 listed.join(", ")
             },
+            if ranges.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; a range of version(s) {}, held across cartridges",
+                    ranges.join(", ")
+                )
+            },
         )));
     };
-    if cut {
+    let (version, stage_set_id, ended_after) = (*version, *stage_set_id, *ended_after);
+    if status == "cut" {
         return Err(cut_refusal(
             conn,
             unit_name,
@@ -2945,12 +3026,108 @@ pub fn select_write_positions(
             wp.slice_number, wp.position
         )));
     }
+    let positions = if status == "range" {
+        match across {
+            Across::Refuse => {
+                return Err(range_refusal(
+                    conn,
+                    unit_name,
+                    unit.id,
+                    volume_label,
+                    version,
+                    stage_set_id,
+                    &positions,
+                )?)
+            }
+            Across::Plan => span::plan_across(
+                conn,
+                unit_name,
+                version,
+                stage_set_id,
+                volume_label,
+                positions,
+            )?,
+        }
+    } else {
+        positions
+    };
     Ok(RestoreSelection {
         version,
         stage_set_id,
         versions_on_volume,
         positions,
     })
+}
+
+/// Where a version held across cartridges is restored from (#478): a volume
+/// in service that holds it whole, or else the live holder of its slice 1,
+/// which may be `volume_id` itself. `None` when no live volume holds slice 1.
+fn restore_from(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+    stage_set_id: i64,
+    volume_id: Option<i64>,
+) -> Result<Option<String>> {
+    if let Some(whole) = crate::policy::coverage::in_service_copy_of_version_excluding(
+        conn, unit_id, version, volume_id,
+    )? {
+        return Ok(Some(whole));
+    }
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT sha256_encrypted FROM stage_slices
+              WHERE stage_set_id = ?1 AND slice_number = 1",
+            params![stage_set_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match first {
+        Some(sha) => crate::volume::slice_holders::holders_of(conn, &sha)?
+            .into_iter()
+            .next()
+            .map(|h| h.label),
+        None => None,
+    })
+}
+
+/// The refusal `restore volume` gives a version `volume_label` holds only a
+/// range of (#478, ADR-0012 item 89): it restores the units a tape holds
+/// whole, and a range restores only with the version's other slices
+/// (`volume-format-v2.md` §4.4 R7). Names the run this tape holds and the
+/// `restore unit` that reads the version across cartridges.
+fn range_refusal(
+    conn: &Connection,
+    unit_name: &str,
+    unit_id: i64,
+    volume_label: &str,
+    version: i64,
+    stage_set_id: i64,
+    here: &[WritePositionInfo],
+) -> Result<TapectlError> {
+    let volume_id = here.first().map(|wp| wp.volume_id);
+    let run = match (
+        here.iter().map(|wp| wp.slice_number).min(),
+        here.iter().map(|wp| wp.slice_number).max(),
+    ) {
+        (Some(first), Some(last)) => span::slices_phrase(first, last),
+        _ => "some slices".to_string(),
+    };
+    let how = match restore_from(conn, unit_id, version, stage_set_id, volume_id)? {
+        Some(from) => format!(
+            "restore it across cartridges with `tapectl restore unit --unit {unit_name} --from \
+             {from} --version {version} --to <DIR>`"
+        ),
+        None => "no live volume holds its slice 1, so it cannot be restored from this \
+                 catalog's tapes yet"
+            .to_string(),
+    };
+    Ok(TapectlError::Other(format!(
+        "unit \"{unit_name}\" version {version} is not on volume \"{volume_label}\" whole: this \
+         tape holds only {run} of it, a range of a version held across cartridges \
+         (volume-format-v2.md §4.4). `restore volume` restores the units a tape holds whole; \
+         {how}. Nothing was read from tape."
+    )))
 }
 
 /// `volumes.ended_after` of `volume_label`: where its tape ended, when it
@@ -3169,7 +3346,9 @@ pub fn units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<Stri
     Ok(names)
 }
 
-/// The written slices of ONE stage set on one volume, in tape order.
+/// The written slices of ONE stage set on one volume, in tape order: of its
+/// completed write, or of its range (#478; a volume holds at most one write
+/// of a stage set, `UNIQUE(stage_set_id, volume_id)`).
 ///
 /// Tape order is slice order on every tape tapectl writes (a unit's slices
 /// are laid out contiguously, in `slice_number` order), so this is the order
@@ -3191,7 +3370,8 @@ fn get_write_positions(
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE sl.stage_set_id = ?1 AND v.label = ?2 AND w.status = 'completed' AND wp.status = 'written'
+         WHERE sl.stage_set_id = ?1 AND v.label = ?2 AND w.status IN ('completed', 'range')
+           AND wp.status = 'written'
          ORDER BY CAST(wp.position AS INTEGER), sl.slice_number",
     )?;
 
