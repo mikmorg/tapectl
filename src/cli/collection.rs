@@ -510,27 +510,105 @@ fn largest_unit_line(l: &collection::plan::LargestUnit) -> String {
     line
 }
 
-/// The units of `batch` planned past the fill ceiling (`fill_bytes`), by
-/// name (ADR-0012 item 113, [`collection::plan::past_ceiling_units`]): the
-/// tape may end before them. Empty when the batch fits under the ceiling, as
-/// every batch does unless the drive declares `post_warning_bytes`.
-fn past_ceiling_names(batch: &collection::selector::Batch, fill_bytes: u64) -> Vec<String> {
-    collection::plan::past_ceiling_units(batch, fill_bytes)
+/// The lines naming where a batch's units sit on its tape past the fill
+/// ceiling ([`collection::plan::BatchPlacement`]): the whole units past it
+/// (ADR-0012 item 113), the units that allow spanning past it (items 83 and
+/// 95), and the one that spans (items 94 and 123). None when the batch fits
+/// under the ceiling, as every batch does unless the drive declares
+/// `post_warning_bytes`.
+fn placement_lines(at: &collection::plan::BatchPlacement) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !at.past_ceiling.is_empty() {
+        lines.push(format!(
+            "past the fill ceiling (the tape may end before them; a unit it ends before is cut \
+             and stays staged for the next cartridge): {}",
+            at.past_ceiling.join(", ")
+        ));
+    }
+    if !at.may_span.is_empty() {
+        lines.push(format!(
+            "may span: last on its batch's tape, past the fill ceiling; if the tape ends inside \
+             it, continued on the next: {}",
+            at.may_span.join(", ")
+        ));
+    }
+    if let Some(unit) = &at.spans {
+        lines.push(format!(
+            "spans: last on its batch's tape, continued on the next: {unit}"
+        ));
+    }
+    lines
+}
+
+/// The line after `collection plan`'s cartridge count when a batch has a
+/// unit that spans (#478): its continuation takes room the count does not.
+const SPAN_COUNT_CAVEAT: &str = "the count is a minimum: a unit that spans continues on the next \
+                                 cartridge, ahead of the units planned there";
+
+/// The lines naming what the per-slice release did (#478; ADR-0012 item
+/// 129): each set's slices released, and each set's slices kept because they
+/// are short of copies. The words of `staging clean`'s
+/// (`cli::staging::slice_release_notice`, private to that module), kept
+/// identical. Empty when it did nothing.
+fn slice_release_notice(report: &crate::staging::clean::CleanReport) -> String {
+    let describe = crate::staging::clean::describe_slice_numbers;
+    let mut msg = String::new();
+    for (id, slices) in &report.slices_released {
+        msg.push_str(&format!(
+            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
+             cartridges and is released slice by slice)\n",
+            describe(slices)
+        ));
+    }
+    for (id, slices) in &report.slices_short {
+        msg.push_str(&format!(
+            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
+             span; `tapectl volume write <LABEL>` onto another cartridge of the same \
+             generation writes them (--force would leave the ranges already on tape unable \
+             to be continued)\n",
+            describe(slices)
+        ));
+    }
+    msg
+}
+
+/// `[{"stage_set_id": N, "slices": [..]}, ..]`, as `staging clean --json`
+/// gives its per-slice lists (#478).
+fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
+    runs.iter()
+        .map(|(id, slices)| serde_json::json!({ "stage_set_id": id, "slices": slices }))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Every file the run's release could not remove (issue #108): the
+/// whole-set release's and the per-slice release's. Their `staging_path`
+/// rows are already nulled, so no later `staging clean` can find them.
+fn stranded_paths(report: &collection::batch::BatchExecutionReport) -> Vec<&std::path::Path> {
+    report
+        .cleaned
         .iter()
-        .map(|u| u.name.clone())
+        .flat_map(|c| c.stranded.iter())
+        .chain(report.slices.stranded.iter())
+        .map(|p| p.as_path())
         .collect()
 }
 
-/// The line naming [`past_ceiling_names`], or `None` when there are none.
-fn past_ceiling_line(batch: &collection::selector::Batch, fill_bytes: u64) -> Option<String> {
-    let names = past_ceiling_names(batch, fill_bytes);
-    (!names.is_empty()).then(|| {
-        format!(
-            "past the fill ceiling (the tape may end before them; a unit it ends before is cut \
-             and stays staged for the next cartridge): {}",
-            names.join(", ")
-        )
-    })
+/// The stderr warning naming [`stranded_paths`], as `volume write` words it,
+/// or `None` when every file went.
+fn stranded_warning(label: &str, stranded: &[&std::path::Path]) -> Option<String> {
+    if stranded.is_empty() {
+        return None;
+    }
+    let mut msg = format!(
+        "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} staged \
+         file(s) could NOT be removed and no later `staging clean` can find them. Remove by hand:",
+        stranded.len()
+    );
+    for p in stranded {
+        msg.push_str(&format!("\n  {}", p.display()));
+    }
+    Some(msg)
 }
 
 fn cmd_plan(
@@ -550,7 +628,7 @@ fn cmd_plan(
     let mut rows = Vec::new();
     let mut any_refused = false;
     for lib in &config.collections {
-        let (batches, refused, tape) = collection::plan::plan_for_collection_with_budget(
+        let (packed, tape) = collection::plan::plan_for_collection_with_budget(
             conn,
             config,
             lib,
@@ -558,11 +636,11 @@ fn cmd_plan(
             device,
             policy_aware,
         )?;
-        any_refused |= !refused.is_empty();
+        any_refused |= !packed.refused.is_empty();
         // Issue #456: the largest unit beside the tape, so ADR-0012 item 69's
         // trigger (a unit above a tenth of a cartridge) is visible.
-        let largest = collection::plan::largest_unit(&batches, &tape);
-        rows.push((lib.name.clone(), batches, refused, largest, tape));
+        let largest = collection::plan::largest_unit(&packed.batches, &tape);
+        rows.push((lib.name.clone(), packed, largest, tape));
     }
     // `--policy-aware` (issue #144): what each prioritised unit falls short
     // of, printed beside it so the order explains itself.
@@ -570,7 +648,7 @@ fn cmd_plan(
         shortfalls(
             conn,
             config,
-            rows.iter().flat_map(|(_, b, _, _, _)| b.iter()),
+            rows.iter().flat_map(|(_, p, _, _)| p.batches.iter()),
         )?
     } else {
         std::collections::HashMap::new()
@@ -579,11 +657,14 @@ fn cmd_plan(
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, batches, refused, largest, tape)| {
+            .map(|(name, packed, largest, tape)| {
+                let batches = &packed.batches;
+                let refused = &packed.refused;
                 let batch_json: Vec<serde_json::Value> = batches
                     .iter()
                     .enumerate()
                     .map(|(i, b)| {
+                        let at = packed.placement(b);
                         serde_json::json!({
                             "index": i,
                             "units": b.unit_names(),
@@ -591,7 +672,12 @@ fn cmd_plan(
                             "padded_bytes": b.padded_bytes,
                             // ADR-0012 item 113: empty unless the drive
                             // declares post_warning_bytes.
-                            "past_ceiling": past_ceiling_names(b, tape.bytes),
+                            "past_ceiling": at.past_ceiling,
+                            // #478 (items 83, 94, 95 and 123): empty and
+                            // null unless a unit allows spanning, and the
+                            // drive declares post_warning_bytes.
+                            "may_span": at.may_span,
+                            "spans": at.spans,
                             "findings": b
                                 .unit_names()
                                 .into_iter()
@@ -618,7 +704,8 @@ fn cmd_plan(
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, batches, refused, largest, tape) in &rows {
+        for (name, packed, largest, tape) in &rows {
+            let (batches, refused) = (&packed.batches, &packed.refused);
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
             } else {
@@ -641,7 +728,7 @@ fn cmd_plan(
                             _ => println!("    {u}"),
                         }
                     }
-                    if let Some(line) = past_ceiling_line(b, tape.bytes) {
+                    for line in placement_lines(&packed.placement(b)) {
                         println!("    {line}");
                     }
                 }
@@ -650,6 +737,9 @@ fn cmd_plan(
                     batches.len(),
                     batches.len() as i64 * copies,
                 );
+                if batches.iter().any(|b| packed.placement(b).spans.is_some()) {
+                    println!("  {SPAN_COUNT_CAVEAT}");
+                }
                 if let Some(l) = largest {
                     println!("  {}", largest_unit_line(l));
                 }
@@ -713,8 +803,9 @@ fn cmd_run(
     // `batches` — the batch that follows only ever contains healthy units —
     // so nothing below needs to special-case them; they are only reported,
     // and their presence is what makes this command's exit code non-zero.
-    let (batches, budget, refused) =
+    let (packed, budget) =
         collection::plan::plan_for_run(conn, config, lib, device, labels, policy_aware)?;
+    let (batches, refused) = (&packed.batches, &packed.refused);
     let exit_code = refused_exit_code(!refused.is_empty());
 
     if !json_output {
@@ -736,7 +827,7 @@ fn cmd_run(
         if budget.plan_bound_bytes.is_some() {
             println!("  packing: {}", budget.describe());
         }
-        print_refused_plain(&refused);
+        print_refused_plain(refused);
     }
 
     let batch = batches.get(batch_idx).ok_or_else(|| {
@@ -747,11 +838,13 @@ fn cmd_run(
         ))
     })?;
     // ADR-0012 item 113: the units of this batch planned past the fill
-    // ceiling, named before anything is staged (`volume write` names the
-    // exact ones again before the tape moves). Empty without a plan bound.
-    let past_ceiling = past_ceiling_names(batch, budget.bytes);
+    // ceiling, and (#478, items 83, 94, 95 and 123) the units that allow
+    // spanning past it and the one that spans, named before anything is
+    // staged (`volume write` names the exact ones again before the tape
+    // moves). Empty without a plan bound.
+    let at = packed.placement(batch);
     if !json_output {
-        if let Some(line) = past_ceiling_line(batch, budget.bytes) {
+        for line in placement_lines(&at) {
             println!("  batch {batch_idx}: {line}");
         }
     }
@@ -777,13 +870,15 @@ fn cmd_run(
                     "budget_bytes": budget.bytes,
                     "budget_from": budget.binding_label,
                     "packing_bytes": budget.packing_bytes(),
-                    "past_ceiling": past_ceiling,
+                    "past_ceiling": at.past_ceiling,
+                    "may_span": at.may_span,
+                    "spans": at.spans,
                     "units": batch.unit_names(),
                     "labels": labels,
                     "dry_run": true,
                     "snapshot_command": lib.snapshot_command,
                     "release_command": lib.release_command,
-                    "refused": refused_json(&refused),
+                    "refused": refused_json(refused),
                     "warnings": budget.warnings,
                 })
             );
@@ -827,6 +922,16 @@ fn cmd_run(
         assume_yes,
     )?;
 
+    // Issue #108: a file the release could not remove is named, whatever
+    // else is printed — nothing will ever find it again.
+    let stranded = stranded_paths(&report);
+    let destination = labels.last().map(String::as_str).unwrap_or("?");
+    if let Some(warning) = stranded_warning(destination, &stranded) {
+        eprintln!("{warning}");
+    }
+    // A stage set released whole, or slice by slice to its last slice (#478).
+    let sets_released =
+        report.cleaned.as_ref().map_or(0, |c| c.sets_cleaned) + report.slices.sets_cleaned;
     if json_output {
         println!(
             "{}",
@@ -836,21 +941,31 @@ fn cmd_run(
                 "budget_bytes": budget.bytes,
                 "budget_from": budget.binding_label,
                 "packing_bytes": budget.packing_bytes(),
-                "past_ceiling": past_ceiling,
+                "past_ceiling": at.past_ceiling,
+                "may_span": at.may_span,
+                "spans": at.spans,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
                 "staging_released": report.cleaned.is_some(),
-                "stage_sets_released": report.cleaned.as_ref().map_or(0, |c| c.sets_cleaned),
+                "stage_sets_released": sets_released,
                 "held_by_pending_rewrite": report.cleaned.as_ref().map_or(0, |c| c.held_by_pending_rewrite.len()),
                 "under_copied": report.under_copied.iter().map(|p| serde_json::json!({
                     "unit": p.unit_name,
                     "copies": p.copies,
                     "min_copies": p.min_copies,
                 })).collect::<Vec<_>>(),
+                // #478 (ADR-0012 item 129): slices released on their own from
+                // sets that span cartridges, and those still short of copies.
+                // Always present, as `staging clean --json` gives them.
+                "slices_released": slice_runs_json(&report.slices.slices_released),
+                "slices_short": slice_runs_json(&report.slices.slices_short),
+                // Issue #108: the paths, not a count; nothing will find them
+                // again.
+                "stranded": stranded,
                 "release_warning": report.release_warning,
                 "snapshot_path": report.snapshot_path,
                 "snapshot_release_warning": report.snapshot_release_warning,
-                "refused": refused_json(&refused),
+                "refused": refused_json(refused),
             })
         );
     } else if let Some(warning) = &report.release_warning {
@@ -868,7 +983,7 @@ fn cmd_run(
                 println!(
                     "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
                      written, {} stage set(s) released",
-                    report.units_staged, report.copies_written, cleaned.sets_cleaned,
+                    report.units_staged, report.copies_written, sets_released,
                 );
                 // Issue #483: a pending `volume rewrite` holds its staged
                 // slices; say why a set was not released.
@@ -892,6 +1007,9 @@ fn cmd_run(
                 }
             }
         }
+        // #478 (ADR-0012 item 129): a set that spans cartridges is released
+        // slice by slice, whatever the whole-set release decided.
+        print!("{}", slice_release_notice(&report.slices));
     }
     Ok(exit_code)
 }
@@ -1378,15 +1496,136 @@ mod checksum_mode_tests {
             units: vec![unit("lib/a", 3), unit("lib/b", 3), unit("lib/c", 2)],
             ..Default::default()
         };
-        assert!(past_ceiling_line(&batch, 8 * bs).is_none(), "all under");
-        assert_eq!(past_ceiling_names(&batch, 8 * bs), Vec::<String>::new());
-        assert_eq!(past_ceiling_names(&batch, 4 * bs), ["lib/b", "lib/c"]);
-        let line = past_ceiling_line(&batch, 4 * bs).unwrap();
+        let lines = |fill: u64| {
+            let room = collection::selector::BatchRoom {
+                fill,
+                bound: Some(u64::MAX),
+            };
+            placement_lines(&collection::plan::placement(
+                &batch,
+                room,
+                &Default::default(),
+            ))
+        };
+        assert!(lines(8 * bs).is_empty(), "all under");
+        let lines = lines(4 * bs);
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            line.starts_with("past the fill ceiling (the tape may end before them;"),
-            "{line}"
+            lines[0].starts_with("past the fill ceiling (the tape may end before them;"),
+            "{lines:?}"
         );
-        assert!(line.ends_with(": lib/b, lib/c"), "{line}");
+        assert!(lines[0].ends_with(": lib/b, lib/c"), "{lines:?}");
+    }
+
+    /// #478 (ADR-0012 items 94, 95 and 123): the preview names the unit
+    /// that spans, last on its batch's tape and continued on the next, and
+    /// a unit that allows spanning past the fill ceiling as one that may. A
+    /// 10-block tape at a 6-block ceiling: `lib/a` (3) and `lib/m` (4,
+    /// spannable, past the ceiling, ending at 7) on one; `lib/z` (12,
+    /// spannable) alone crosses the bound.
+    #[test]
+    fn the_preview_names_the_unit_that_spans_and_one_that_may() {
+        let bs = 512 * 1024u64;
+        let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
+            name: name.into(),
+            size_bytes: blocks * bs,
+        };
+        let room = collection::selector::BatchRoom {
+            fill: 6 * bs,
+            bound: Some(10 * bs),
+        };
+        let spannable: std::collections::HashSet<String> =
+            ["lib/m".to_string(), "lib/z".to_string()].into();
+        let lines = |units: Vec<collection::selector::PendingUnit>| {
+            let batch = collection::selector::Batch {
+                units,
+                ..Default::default()
+            };
+            placement_lines(&collection::plan::placement(&batch, room, &spannable))
+        };
+        assert_eq!(
+            lines(vec![unit("lib/z", 12)]),
+            ["spans: last on its batch's tape, continued on the next: lib/z"]
+        );
+        assert_eq!(
+            lines(vec![unit("lib/a", 3), unit("lib/m", 4)]),
+            [
+                "may span: last on its batch's tape, past the fill ceiling; if the tape ends \
+                 inside it, continued on the next: lib/m"
+            ]
+        );
+        assert!(lines(vec![unit("lib/a", 1), unit("lib/m", 1)]).is_empty());
+    }
+
+    /// #478 (ADR-0012 item 129): `collection run` names each spanning set's
+    /// slices released and kept in `staging clean`'s words, and nothing
+    /// when there were none.
+    #[test]
+    fn the_run_names_the_per_slice_release_as_staging_clean_does() {
+        let report = crate::staging::clean::CleanReport {
+            slices_released: vec![(7, vec![1, 2, 3])],
+            slices_short: vec![(7, vec![4, 5])],
+            ..Default::default()
+        };
+        assert_eq!(
+            slice_release_notice(&report),
+            "  stage set 7: slice(s) 1-3 released, each now has its copies (the set spans \
+             cartridges and is released slice by slice)\n  stage set 7 kept in part: slice(s) \
+             4-5 are short of copies and continue its span; `tapectl volume write <LABEL>` \
+             onto another cartridge of the same generation writes them (--force would leave \
+             the ranges already on tape unable to be continued)\n"
+        );
+        assert!(slice_release_notice(&Default::default()).is_empty());
+        assert_eq!(
+            slice_runs_json(&report.slices_released),
+            serde_json::json!([{ "stage_set_id": 7, "slices": [1, 2, 3] }])
+        );
+    }
+
+    /// Issue #108 and #478: the files a run's release could not remove are
+    /// named on stderr, the whole-set release's and the per-slice release's
+    /// alike, and nothing is said when every file went.
+    #[test]
+    fn the_run_names_every_stranded_file_of_both_releases() {
+        let whole = crate::staging::clean::CleanReport {
+            stranded: vec!["/staging/a.age".into()],
+            ..Default::default()
+        };
+        let slices = crate::staging::clean::CleanReport {
+            stranded: vec!["/staging/span_2.age".into()],
+            ..Default::default()
+        };
+        let report = collection::batch::BatchExecutionReport {
+            units_staged: 2,
+            copies_written: 1,
+            cleaned: Some(whole),
+            under_copied: Vec::new(),
+            slices,
+            release_warning: None,
+            snapshot_path: None,
+            snapshot_release_warning: None,
+        };
+        let stranded = stranded_paths(&report);
+        assert_eq!(
+            stranded,
+            [
+                std::path::Path::new("/staging/a.age"),
+                std::path::Path::new("/staging/span_2.age")
+            ]
+        );
+        let warning = stranded_warning("L6-0003", &stranded).unwrap();
+        assert!(
+            warning.starts_with(
+                "warning: volume \"L6-0003\" is sealed and confirmed and counts as a copy, but 2 \
+                 staged file(s) could NOT be removed"
+            ),
+            "{warning}"
+        );
+        assert!(
+            warning.ends_with("Remove by hand:\n  /staging/a.age\n  /staging/span_2.age"),
+            "{warning}"
+        );
+        assert_eq!(stranded_warning("L6-0003", &[]), None);
     }
 
     /// `--json` carries the same facts, and `null` when nothing is pending.
