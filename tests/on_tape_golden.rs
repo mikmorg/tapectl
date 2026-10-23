@@ -256,6 +256,19 @@
 //! `--info` and `--verify` (item 140). A 1.6.0 or 1.5.0 tape reads as before. Neither
 //! MANIFEST.toml pin moved.
 //!
+//! **Moved again the same day, still under item 135**, for the read across
+//! cartridges (`16a21522…` to `7f1b7db0…`; §4.4 "Where a restore starts", "The
+//! default mode keeps ciphertext in scratch", "`--stream-tapes`"; items 88, 132,
+//! 139). `--restore --unit` of a spanning unit starts only on a tape holding slice
+//! 1 and names slice 1's holders otherwise; by default each tape's slices wait in
+//! scratch still encrypted, with the space check counting the whole ciphertext
+//! and naming `--stream-tapes`; `--stream-tapes` feeds one dar run across the swaps;
+//! the next cartridge is taken only by R8 (its seal read first, then the slice's
+//! sha256 and size at a position the seal covers); and the one swap prompt reads
+//! its answer from the input with no time limit and no device held open. Every
+//! substring pinned before still occurs as often as it did, and no `TOOLS_*` line
+//! moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -282,7 +295,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "16a21522cf5929840dc1077c3c20132fe9f1760b103580c3e9a4958668fcccae";
+const RESTORE_SH_SHA256: &str = "7f1b7db004118fc82a1e241ddeb632cbc564de3bbbc331297c7a89a1d9597195";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -438,6 +451,35 @@ fn restore_sh_bytes_are_pinned() {
         "is held across tapes, and this tape holds only part of it:",
         "HELD ACROSS TAPES: this tape holds only some of the slices of these unit(s), so they were not",
         "a range is never",
+        "STREAM_TAPES=0\nSPAN_RESTORE=\"\"\n",
+        "    --stream-tapes)\n      STREAM_TAPES=1\n      shift\n      ;;\n",
+        "slice_bytes() { # <slice number>\n",
+        "      slice_bytes \"$num\" |\n",
+        "restore_across_tapes() { # <manifest> <unit> <version> <destination>\n",
+        "span_pos() { # <slice number>\n",
+        "span_ask() {\n",
+        "span_stop() {\n",
+        "span_accept() {\n",
+        "span_swap() { # <slice number>\n",
+        "span_spool() {\n",
+        "die_range_path() { # <unit> <version>\n",
+        "HOLDER_SLICE=1\n",
+        "CHK_SLICE=\"$HOLDER_SLICE\"",
+        "    if [ -z \"$SPAN_NEED\" ]; then\n      swap_fetch || true\n    elif span_accept; then\n      return 0\n    fi\n",
+        "      [ -z \"$SPAN_NEED\" ] || span_stop\n",
+        "(other_tape_map && printf '%s|%s\\n' \"$OTHER_END\" \"$OTHER_LABEL\" >\"$WORK/other.vars\") 2>\"$WORK/other.err\" || rc=$?",
+        "    elif [ -n \"$SPAN_RESTORE\" ] && [ \"$TAPE_SHORT_SEAL\" = 0 ] && try_seal_copy; then\n      OTHER_END=$SEAL_LAST\n",
+        "check_space \"$destdir\" \"$SCRATCH_PARENT\" \"$bytes\" 0",
+        "      if read_slice_checked \"$pos\" \"$size\" \"$sha\" \"$SCRATCH/slice.$num.enc\"; then\n",
+        "    STREAM_FROM=$SCRATCH\n",
+        "  restore_unit \"$WORK/span.all\" \"$destdir\" \"$unit\" \"$ver\"\n",
+        "      [ \"$PICKED_RUN_FIRST\" = 1 ] || die_range \"${targets[$i]}\" \"$PICKED_VERSION\"\n",
+        "    [ \"$PICKED_RANGE\" = 0 ] || die_range_path \"${targets[0]}\" \"$PICKED_VERSION\"\n",
+        "  if [ \"$SPAN_RESTORE\" = scratch ]; then\n    die \"not enough disk space in $1 to restore this unit across tapes:",
+        "  [ -z \"$SPAN_RESTORE\" ] || die \"dar ${DAR_VERSION:-(of an unknown version)} cannot read '$unit' across tapes without its",
+        "  if ! { [ -n \"$cat\" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then\n",
+        "    info \"  (rm -rf \\\"$SCRATCH\\\") before running again.\"\n",
+        "--stream-tapes reads one unit across tapes: give --unit U, not --all",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
