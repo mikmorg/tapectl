@@ -1292,9 +1292,10 @@ fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> 
 // Check encryption compliance (design §2.20). Fires when policy requires
 // encryption but at least one `stage_sets` row written to an in-service
 // volume for the unit's current snapshot is unencrypted. The join mirrors
-// `copy_count_for_unit` exactly (writes -> stage_sets -> snapshots,
-// `s.status = 'current'`, `w.status = 'completed'`), scoped the same way
-// every other per-unit check in this file is.
+// `copy_count_for_unit` (writes -> stage_sets -> snapshots,
+// `s.status = 'current'`, a `completed` write or a `range` of one, #478:
+// a range's slices are on the tape as surely as a whole write's), scoped
+// the same way every other per-unit check in this file is.
 //
 // Known and accepted gap: a plaintext stage_set written under a
 // now-superseded (non-`current`) snapshot is still plaintext on a tape but
@@ -1323,7 +1324,8 @@ fn check_encryption(
                  JOIN stage_sets ss ON ss.id = w.stage_set_id
                  JOIN snapshots s ON s.id = ss.snapshot_id
                  JOIN volumes v ON v.id = w.volume_id
-                 WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                 WHERE s.unit_id = ?1 AND s.status = 'current'
+                   AND w.status IN ('completed', 'range')
                    AND ss.encrypted = 0 AND {}",
                 policy::coverage::in_service("v")
             );
@@ -1343,7 +1345,8 @@ fn check_encryption(
                      JOIN stage_sets ss ON ss.id = w.stage_set_id
                      JOIN snapshots s ON s.id = ss.snapshot_id
                      JOIN volumes v ON v.id = w.volume_id
-                     WHERE s.unit_id = ?1 AND s.status = 'current' AND w.status = 'completed'
+                     WHERE s.unit_id = ?1 AND s.status = 'current'
+                       AND w.status IN ('completed', 'range')
                        AND ss.encrypted = 0 AND {}
                      ORDER BY s.version",
                     policy::coverage::in_service("v")
@@ -1413,7 +1416,7 @@ fn escrow_identity_findings(conn: &Connection, escrow: Option<&str>) -> Result<V
     let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT ss.id, ss.key_fingerprints
            FROM stage_sets ss
-           JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
+           JOIN writes w ON w.stage_set_id = ss.id AND w.status IN ('completed', 'range')
            JOIN volumes v ON v.id = w.volume_id
           WHERE ss.encrypted = 1 AND ss.key_fingerprints IS NOT NULL AND {}",
         crate::policy::coverage::eligible("v")
@@ -1508,7 +1511,9 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 
     // Sealed AFTER the last kit. `sealed_at` is not a column, so this uses the
     // completion time of the write that sealed the volume — the moment the
-    // bytes the kit cannot reach came into existence.
+    // bytes the kit cannot reach came into existence. A `range` write (#478)
+    // is confirm's too, with its `completed_at` set in the same statement, so
+    // a volume holding only ranges is dated the same way.
     //
     // A NULL `completed_at` counts as STALE. `session.rs` sets it in the same
     // statement that sets `status = 'completed'`, so production rows always
@@ -1519,7 +1524,7 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     let stale_count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(DISTINCT v.id) FROM volumes v
-             JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+             JOIN writes w ON w.volume_id = v.id AND w.status IN ('completed', 'range')
              WHERE {} AND (w.completed_at IS NULL OR w.completed_at > ?1)",
             crate::policy::coverage::eligible("v")
         ),
@@ -1754,7 +1759,8 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 // holds a unit, so the home copy keeps the unit's clock fresh while the
 // offsite copy goes unread for years. This is the per-volume view: for each
 // volume that counts as a copy (`coverage::eligible`) and holds a completed
-// write, the newest passing FULL readback, dated by its start
+// write or a `range` (#478: a range's slices are on it), the newest passing
+// FULL readback, dated by its start
 // (`evidence::full_readback_date`, ADR-0012 2026-10-07 item 30), against the
 // shortest resolved `verify_interval_days` among the units on it (an archive
 // set's, else `[defaults] verify_interval_days`, #453). Past it, the volume is named with its
@@ -1791,7 +1797,8 @@ fn volume_verify_age_findings(
                    JOIN snapshots s2 ON s2.id = w2.snapshot_id
                    JOIN units u2 ON u2.id = s2.unit_id
                    LEFT JOIN archive_sets a ON a.id = u2.archive_set_id
-                  WHERE w2.volume_id = v.id AND w2.status = 'completed') AS interval_days
+                  WHERE w2.volume_id = v.id
+                    AND w2.status IN ('completed', 'range')) AS interval_days
            FROM volumes v
            JOIN verification_sessions vs
              ON vs.volume_id = v.id AND vs.outcome = 'passed' AND vs.verify_type = 'full'
@@ -1800,7 +1807,7 @@ fn volume_verify_age_findings(
            LEFT JOIN locations l ON l.id = v.location_id
           WHERE {eligible}
             AND EXISTS (SELECT 1 FROM writes w
-                         WHERE w.volume_id = v.id AND w.status = 'completed')
+                         WHERE w.volume_id = v.id AND w.status IN ('completed', 'range'))
           GROUP BY v.id
           ORDER BY v.label",
         dated = policy::evidence::full_readback_date("vs"),

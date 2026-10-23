@@ -2980,6 +2980,12 @@ impl CompactionRow {
 /// *finished* volume, so this is the ADR-0004 `sealed` predicate. The one
 /// derivation behind both `report compaction-candidates` and `audit`'s
 /// `compaction_candidate` check (issue #353) — never a second copy.
+///
+/// A volume that holds a `range` is no row at all (#478, coordinator fork
+/// X25): `volume rewrite` and every compaction command refuse it, naming the
+/// range (ADR-0012 item 133), so flagging it would send the operator to a
+/// command that refuses. The planner (`plan_candidates`) reads these rows, so
+/// it never groups one either.
 pub(crate) fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<CompactionRow>> {
     let sql = format!(
         "SELECT v.label,
@@ -2991,6 +2997,8 @@ pub(crate) fn compaction_candidate_rows(conn: &Connection) -> Result<Vec<Compact
          JOIN snapshots s ON s.id = sts.snapshot_id
          JOIN stage_slices ss ON ss.stage_set_id = sts.id
          WHERE {}
+           AND NOT EXISTS (SELECT 1 FROM writes rw
+                            WHERE rw.volume_id = v.id AND rw.status = 'range')
          GROUP BY v.id
          ORDER BY live_bytes * 1.0 / NULLIF(live_bytes + reclaimable_bytes, 0) ASC, v.label ASC",
         crate::policy::coverage::eligible("v")
@@ -4880,6 +4888,58 @@ mod tests {
             assert!(
                 !rows[0].is_candidate(0.99),
                 "no reclaimable data means nothing to compact, at any threshold"
+            );
+        }
+
+        /// #478 (coordinator fork X25): a volume holding a `range` is no
+        /// compaction row, however much of it is reclaimable: `volume
+        /// rewrite` and compaction refuse it (ADR-0012 item 133). So `audit`
+        /// does not flag it and the planner (`plan_candidates`, built from
+        /// these rows) never groups it. Its neighbour without a range stays.
+        #[test]
+        fn compaction_rows_exclude_a_volume_holding_a_range() {
+            let (conn, unit) = setup();
+            seed_written_volume(&conn, unit, "SPAN01", "sealed", 1000, 100, 900);
+            seed_written_volume(&conn, unit, "WHOLE01", "sealed", 1000, 100, 900);
+            let labels = |conn: &Connection| -> Vec<String> {
+                compaction_candidate_rows(conn)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.label)
+                    .collect()
+            };
+            assert_eq!(labels(&conn), ["SPAN01", "WHOLE01"], "positive control");
+
+            // A range of another live set on SPAN01.
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 99, 'full', 'staged', '/src')",
+                params![unit],
+            )
+            .unwrap();
+            let snap = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                 SELECT last_insert_rowid(), ?1, id, 'range', 1 FROM volumes WHERE label = 'SPAN01'",
+                params![snap],
+            )
+            .unwrap();
+
+            assert_eq!(labels(&conn), ["WHOLE01"]);
+            let config = Config::default();
+            assert_eq!(
+                plan_candidates(&conn, &config)
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.label)
+                    .collect::<Vec<_>>(),
+                ["WHOLE01"],
+                "the planner never groups a range volume"
             );
         }
 
