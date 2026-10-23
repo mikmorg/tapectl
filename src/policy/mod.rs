@@ -706,7 +706,10 @@ slice_size = "500M"
 
         // Off when nothing sets it.
         assert!(!resolved(&off, None, None), "default off");
-        assert!(!resolved(&off, Some(silent), None), "a NULL column is not on");
+        assert!(
+            !resolved(&off, Some(silent), None),
+            "a NULL column is not on"
+        );
         // `[defaults]` alone, and through a set that does not say.
         assert!(resolved(&on, None, None), "defaults alone");
         assert!(
@@ -715,7 +718,10 @@ slice_size = "500M"
         );
         // The archive set over `[defaults]`, either way.
         assert!(resolved(&off, Some(span), None), "set on over defaults off");
-        assert!(!resolved(&on, Some(whole), None), "set off over defaults on");
+        assert!(
+            !resolved(&on, Some(whole), None),
+            "set off over defaults on"
+        );
         // The dotfile over the archive set over `[defaults]`, either way.
         let span_here = dotfile("[policy]\nallow_spanning = true\n");
         let whole_here = dotfile("[policy]\nallow_spanning = false\n");

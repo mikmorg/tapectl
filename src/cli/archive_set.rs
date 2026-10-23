@@ -1722,7 +1722,14 @@ fi
     fn allow_spanning_reaches_its_column_and_null_means_not_set() {
         let conn = fresh_conn();
         let mut config = Config::default();
-        run(&conn, &config, &create_cmd("plain", None, None), false, false).unwrap();
+        run(
+            &conn,
+            &config,
+            &create_cmd("plain", None, None),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(column_i64(&conn, "plain", "allow_spanning"), None);
         config.archive_sets.push(set_config("plain"));
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();

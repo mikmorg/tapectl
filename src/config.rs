@@ -4615,7 +4615,10 @@ mod tests {
         let path = tmp.path().join("config.toml");
         for bad in ["allow_span", "allowSpanning"] {
             for (text, key) in [
-                (format!("[defaults]\n{bad} = true\n"), format!("defaults.{bad}")),
+                (
+                    format!("[defaults]\n{bad} = true\n"),
+                    format!("defaults.{bad}"),
+                ),
                 (
                     format!("[[archive_sets]]\nname = \"a\"\n{bad} = true\n"),
                     format!("archive_sets[0].{bad}"),

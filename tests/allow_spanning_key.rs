@@ -123,7 +123,10 @@ fn config_check_accepts_allow_spanning_in_each_place() {
     let all = text(&out);
     assert!(all.contains("config: valid"), "{all}");
     assert!(!all.contains("cannot be read"), "{all}");
-    assert!(!all.contains("allow_spanning"), "nothing to say about it: {all}");
+    assert!(
+        !all.contains("allow_spanning"),
+        "nothing to say about it: {all}"
+    );
 }
 
 /// A misspelled spanning key is refused by name in `[defaults]` and in an
@@ -190,7 +193,10 @@ fn unit_tag_and_unit_rename_keep_allow_spanning() {
 
         ok(home.path(), &["unit", "rename", "photos", "pictures"]);
         let raw = std::fs::read_to_string(dotfile(src.path())).unwrap();
-        assert!(raw.contains("name = \"pictures\""), "the rename landed: {raw}");
+        assert!(
+            raw.contains("name = \"pictures\""),
+            "the rename landed: {raw}"
+        );
         assert!(raw.contains(&line), "unit rename dropped it: {raw}");
     }
 }
@@ -208,24 +214,23 @@ fn archive_set_sync_carries_allow_spanning_and_leaves_it_null_when_unnamed() {
         "\n[[archive_sets]]\nname = \"span\"\nallow_spanning = true\n\
          \n[[archive_sets]]\nname = \"silent\"\nmin_copies = 3\n",
     );
-    let first = String::from_utf8_lossy(&ok(home.path(), &["archive-set", "sync"]).stdout)
-        .to_string();
+    let first =
+        String::from_utf8_lossy(&ok(home.path(), &["archive-set", "sync"]).stdout).to_string();
     assert!(first.contains("2 created"), "{first}");
     assert_eq!(archive_set_column(home.path(), "span"), Some(1));
     assert_eq!(archive_set_column(home.path(), "silent"), None);
 
-    let second = String::from_utf8_lossy(&ok(home.path(), &["archive-set", "sync"]).stdout)
-        .to_string();
+    let second =
+        String::from_utf8_lossy(&ok(home.path(), &["archive-set", "sync"]).stdout).to_string();
     assert!(
         second.contains("0 created, 0 updated, 2 unchanged"),
         "{second}"
     );
     assert_eq!(archive_set_column(home.path(), "silent"), None);
 
-    let info: serde_json::Value = serde_json::from_slice(
-        &ok(home.path(), &["--json", "archive-set", "info", "span"]).stdout,
-    )
-    .unwrap();
+    let info: serde_json::Value =
+        serde_json::from_slice(&ok(home.path(), &["--json", "archive-set", "info", "span"]).stdout)
+            .unwrap();
     assert_eq!(info["allow_spanning"], serde_json::json!(true), "{info}");
     let info: serde_json::Value = serde_json::from_slice(
         &ok(home.path(), &["--json", "archive-set", "info", "silent"]).stdout,
