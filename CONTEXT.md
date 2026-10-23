@@ -161,9 +161,10 @@ _Avoid_: chunk (age encrypts in 64 KiB chunks), block (the tape's 512 KiB unit),
 part
 
 **Spanning**:
-A Version whose slices run across more than one volume (ADR-0012 items 82-87:
-designed 2026-10-16, not built; it waits for #420's short seal). Only a unit
-that allows it may span; it is packed last on a volume and cut where the drive
+A Version whose slices run across more than one volume (ADR-0012 items 82-87
+and 121-144; built in 1.7.0 on #420's short seal). Only a unit that allows it
+(`allow_spanning`) may span, and only on a drive that declares
+`post_warning_bytes`; it is packed last on a volume and cut where the drive
 reports early warning, the slice in flight finishing first, and its remaining
 slices continue on the next cartridge of the same generation. A spanning
 version is as covered as its least-covered slice (item 127).
