@@ -1621,3 +1621,197 @@ fn no_tape_of_a_three_range_span_reveals_a_tenant_unit_file_hash_or_key() {
     assert_eq!(h.tapes.len(), 3);
     scan_every_tape(&h);
 }
+
+// ── allow_spanning off everywhere is 1.6.0's ──
+
+const A0: &str = "loquat-whole-alpha";
+const B0: &str = "loquat-whole-bravo";
+const C0: &str = "loquat-whole-charlie";
+const SET0: &str = "loquat-plain-set";
+const T0: [&str; 3] = ["OFF16-V1", "OFF16-V2", "OFF16-V3"];
+
+/// The `details` of the volume's `write_completed` event.
+fn write_completed(conn: &Connection, label: &str) -> String {
+    conn.query_row(
+        "SELECT e.details FROM events e JOIN volumes v ON v.id = e.entity_id
+          WHERE e.entity_type = 'volume' AND e.action = 'write_completed' AND v.label = ?1",
+        params![label],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A write with `allow_spanning` off at every layer is 1.6.0's. Volume 1 is
+/// written with the key absent everywhere (a home from before 1.7.0: the
+/// units' dotfiles and their archive set do not name it, `[defaults]` is
+/// off); volume 2 with it set `false` at every layer (dotfile, archive set,
+/// `[defaults]`). Each is cut by the early warning inside `b`, as 1.6.0's
+/// short seal cuts it.
+/// - The rows are 1.6.0's: whole units in the order staged (none moved),
+///   `a` completed and `b` and `c` cut, `may_span` unset, no range, no
+///   deferral, no tapes to keep together, and the `write_completed` event
+///   and recorded ending 1.6.0 wrote.
+/// - The bytes are 1.6.0's: File 0 and the seal state `requires =
+///   ["short-seal"]`, no block names `may_span`, every slice has a
+///   position, RECOVERY.md has no section on a unit across tapes; and the
+///   two volumes agree byte for byte on every whole unit's slices, front
+///   index entries and MANIFEST block.
+/// The next write writes the cut units whole, as 1.6.0's does.
+#[test]
+fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
+    let mut h = Home::new(None, 2, "64K");
+    crate::cli::archive_set::run(
+        &h.conn,
+        &h.config,
+        &crate::cli::archive_set::ArchiveSetCommands::Create {
+            name: SET0.into(),
+            policy: Default::default(),
+        },
+        false,
+        false,
+    )
+    .unwrap();
+    h.unit_in(
+        TENANT_ONE,
+        A0,
+        files("loquat-alpha", &[20_000], 11),
+        None,
+        Some(SET0),
+    );
+    h.unit_in(
+        TENANT_ONE,
+        B0,
+        files("loquat-bravo", &[50_000, 50_000, 50_000], 12),
+        None,
+        Some(SET0),
+    );
+    h.unit_in(
+        TENANT_TWO,
+        C0,
+        files("loquat-charlie", &[20_000], 13),
+        None,
+        Some(SET0),
+    );
+    for unit in [A0, B0, C0] {
+        h.stage(unit);
+    }
+    assert_eq!(num_slices(&h.conn, B0), 3);
+    for label in T0 {
+        h.volume(label);
+    }
+
+    // Volume 1: the key absent everywhere.
+    assert!(!h.config.defaults.allow_spanning);
+    h.write(T0[0], Warn::InSlice(B0, 2));
+
+    // Volume 2: the key `false` at every layer.
+    crate::cli::archive_set::run(
+        &h.conn,
+        &h.config,
+        &crate::cli::archive_set::ArchiveSetCommands::Edit {
+            name: SET0.into(),
+            policy: crate::cli::archive_set::PolicyArgs {
+                allow_spanning: Some(false),
+                ..Default::default()
+            },
+        },
+        false,
+        false,
+    )
+    .unwrap();
+    for unit in [A0, B0, C0] {
+        h.set_allow_spanning(unit, false);
+    }
+    h.config.defaults.allow_spanning = false;
+    h.write(T0[1], Warn::InSlice(B0, 2));
+
+    for label in &T0[..2] {
+        let c = &h.conn;
+        let a1 = position_of(c, label, A0, 1);
+        let b1 = position_of(c, label, B0, 1);
+        assert_eq!(
+            [b1, position_of(c, label, C0, 1)],
+            [a1 + 1, a1 + 4],
+            "{label}: the units in the order staged, none moved"
+        );
+        assert_eq!(sealing(c, label), (true, Some(b1 + 1)), "{label}");
+        assert_eq!(
+            writes_of(c, label),
+            rows(&[
+                (A0, "completed", false),
+                (B0, "cut", false),
+                (C0, "cut", false)
+            ]),
+            "{label}"
+        );
+        assert!(write::recorded_ranges(c, label).unwrap().is_empty());
+        assert!(write::keep_together(c, label).unwrap().is_empty());
+        assert_eq!(
+            write::recorded_ending(c, label).unwrap(),
+            write::RecordedEnding {
+                ended_after: Some(b1 + 1),
+                cut_units: vec![B0.into(), C0.into()],
+                ..write::RecordedEnding::default()
+            },
+            "{label}"
+        );
+        assert_eq!(
+            write_completed(c, label),
+            serde_json::json!({
+                "ending": "short",
+                "ended_after": b1 + 1,
+                "cut_units": [B0, C0],
+            })
+            .to_string(),
+            "{label}"
+        );
+        let files = h.files(label);
+        assert_eq!(
+            requires_line(files),
+            "requires = [\"short-seal\"]",
+            "{label}"
+        );
+        assert_eq!(
+            seal_requires_line(files),
+            "requires = [\"short-seal\"]",
+            "{label}"
+        );
+        let members = operator_envelope(&h, label);
+        let text = member(&members, "MANIFEST.toml");
+        assert!(!text.contains("may_span"), "{label}: {text}");
+        let manifest = crate::volume::envelope::parse_manifest(&text).unwrap();
+        for unit in &manifest.units {
+            assert!(!unit.may_span);
+            assert!(unit.slices.iter().all(|s| s.tape_position.is_some()));
+        }
+        let recovery = member(&members, "RECOVERY.md");
+        assert!(!recovery.contains("A unit across tapes"), "{label}");
+    }
+
+    // The two volumes agree byte for byte on the whole units' slices, their
+    // front index entries and their MANIFEST blocks.
+    let (v1, v2) = (h.files(T0[0]), h.files(T0[1]));
+    let ended_after = sealing(&h.conn, T0[0]).1.unwrap() as usize;
+    let first = position_of(&h.conn, T0[0], A0, 1) as usize;
+    for pos in first..=ended_after {
+        assert_eq!(v1[pos], v2[pos], "data file {pos}");
+    }
+    let slices_of = |files: &[Vec<u8>]| -> Vec<ParsedIndexEntry> {
+        front_index(files)
+            .into_iter()
+            .filter(|e| e.type_label == "data_slice")
+            .collect()
+    };
+    assert_eq!(slices_of(v1), slices_of(v2));
+    let block =
+        |label: &str| manifest_block(&member(&operator_envelope(&h, label), "MANIFEST.toml"), A0);
+    assert_eq!(block(T0[0]), block(T0[1]));
+
+    // The next write writes the cut units whole; a has its two copies.
+    h.write(T0[2], Warn::Never);
+    assert_eq!(
+        writes_of(&h.conn, T0[2]),
+        rows(&[(B0, "completed", false), (C0, "completed", false)])
+    );
+    assert_eq!(requires_line(h.files(T0[2])), "requires = [\"short-seal\"]");
+}
