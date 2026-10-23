@@ -2859,8 +2859,11 @@ impl SealedPending {
     /// walk), records a `verification_sessions` row (`verify_type`:
     /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then three
     /// outcomes, not two (ADR-0012's 2026-09-18 amendment, issues
-    /// #260/#267): pass => ONE transaction flipping `writes` 'completed',
-    /// `snapshots` 'current', `volumes` 'sealed'; a mismatch that
+    /// #260/#267): pass => ONE transaction flipping `writes` 'completed'
+    /// (on a short seal 'cut' for a set not wholly on the tape, #420; for a
+    /// write that may span 'range' when some of its set is here, #478),
+    /// `snapshots` 'current' (a range's only by ADR-0012 item 128),
+    /// `volumes` 'sealed'; a mismatch that
     /// `Evidence::proves_medium_bad` => `volumes.observed_condition`
     /// 'quarantined', `writes` 'aborted'; a mismatch that does NOT => nothing
     /// touched on `volumes`, `writes` 'interrupted' so `volume resume` can
@@ -3034,59 +3037,62 @@ impl SealedPending {
                 Ending::Short { ended_after } => ended_after,
                 Ending::Full => planned_seal_position(&self.built.layout)?.saturating_sub(1),
             };
-            let (promoted, cut_units, range_units) = busy::retry(BusyPolicy::DEFAULT, "the seal", || {
-                let tx = busy::immediate_tx(conn)?;
-                // #420 (`layout-session.md`, "Confirm of a short ending"): on
-                // a short seal a stage set is on this tape only when every
-                // slice of it is at or before `ended_after`; every other set
-                // of the session is `cut` — the one the warning interrupted
-                // and every one planned after it. `cut` is written here and
-                // nowhere else in the session.
-                //
-                // #478 (ADR-0012 item 121, "A write that may span"): a row
-                // whose `may_span` is set splits three ways instead, on either
-                // ending ([`span_split`]): `completed` when the whole set is
-                // here, `range` when some of it is, `cut` when none is. `range`
-                // too is written here and nowhere else.
-                let unit_name = |snapshot_id: i64| -> Result<String> {
-                    Ok(tx
-                        .query_row(
-                            "SELECT u.name FROM snapshots s JOIN units u ON u.id = s.unit_id
+            let (promoted, cut_units, range_units) =
+                busy::retry(BusyPolicy::DEFAULT, "the seal", || {
+                    let tx = busy::immediate_tx(conn)?;
+                    // #420 (`layout-session.md`, "Confirm of a short ending"): on
+                    // a short seal a stage set is on this tape only when every
+                    // slice of it is at or before `ended_after`; every other set
+                    // of the session is `cut` — the one the warning interrupted
+                    // and every one planned after it. `cut` is written here and
+                    // nowhere else in the session.
+                    //
+                    // #478 (ADR-0012 item 121, "A write that may span"): a row
+                    // whose `may_span` is set splits three ways instead, on either
+                    // ending ([`span_split`]): `completed` when the whole set is
+                    // here, `range` when some of it is, `cut` when none is. `range`
+                    // too is written here and nowhere else.
+                    let unit_name = |snapshot_id: i64| -> Result<String> {
+                        Ok(tx
+                            .query_row(
+                                "SELECT u.name FROM snapshots s JOIN units u ON u.id = s.unit_id
                              WHERE s.id = ?1",
-                            params![snapshot_id],
-                            |r| r.get(0),
-                        )
-                        .optional()?
-                        .unwrap_or_else(|| format!("snapshot {snapshot_id}")))
-                };
-                let mut whole_snapshots: Vec<i64> = Vec::with_capacity(self.write_ids.len());
-                let mut cut_units: Vec<String> = Vec::new();
-                let mut range_units: Vec<RangeUnit> = Vec::new();
-                let mut range_writes: Vec<(i64, i64)> = Vec::new();
-                for ((write_id, snapshot_id), (entered, may_span)) in
-                    self.write_ids.iter().zip(&entry_statuses)
-                {
-                    let split = if *may_span {
-                        span_split(&tx, *write_id, counted_through)?
-                    } else {
-                        let whole = match self.ending {
-                            Ending::Full => true,
-                            Ending::Short { ended_after } => last_slice_position(&tx, *write_id)?
-                                .is_none_or(|last| last <= i64::from(ended_after)),
-                        };
-                        if whole {
-                            Split::Completed
-                        } else {
-                            Split::Cut
-                        }
+                                params![snapshot_id],
+                                |r| r.get(0),
+                            )
+                            .optional()?
+                            .unwrap_or_else(|| format!("snapshot {snapshot_id}")))
                     };
-                    // ADR-0012 2026-10-06 item 24: `write_verified` means
-                    // fully read back — an Integrity confirm, never a quick one.
-                    // A range is terminal like a completed write (item 121),
-                    // and `volume verify` marks one read back in full as it
-                    // marks a completed one (item 127), so it is recorded the
-                    // same way.
-                    let completed = match split {
+                    let mut whole_snapshots: Vec<i64> = Vec::with_capacity(self.write_ids.len());
+                    let mut cut_units: Vec<String> = Vec::new();
+                    let mut range_units: Vec<RangeUnit> = Vec::new();
+                    let mut range_writes: Vec<(i64, i64)> = Vec::new();
+                    for ((write_id, snapshot_id), (entered, may_span)) in
+                        self.write_ids.iter().zip(&entry_statuses)
+                    {
+                        let split = if *may_span {
+                            span_split(&tx, *write_id, counted_through)?
+                        } else {
+                            let whole = match self.ending {
+                                Ending::Full => true,
+                                Ending::Short { ended_after } => {
+                                    last_slice_position(&tx, *write_id)?
+                                        .is_none_or(|last| last <= i64::from(ended_after))
+                                }
+                            };
+                            if whole {
+                                Split::Completed
+                            } else {
+                                Split::Cut
+                            }
+                        };
+                        // ADR-0012 2026-10-06 item 24: `write_verified` means
+                        // fully read back — an Integrity confirm, never a quick one.
+                        // A range is terminal like a completed write (item 121),
+                        // and `volume verify` marks one read back in full as it
+                        // marks a completed one (item 127), so it is recorded the
+                        // same way.
+                        let completed = match split {
                         Split::Completed => tx.execute(
                             "UPDATE writes SET status = 'completed', completed_at = datetime('now'),
                                     write_verified = ?3
@@ -3117,141 +3123,141 @@ impl SealedPending {
                             params![write_id, entered],
                         )?,
                     };
-                    if completed > 0 {
-                        match split {
-                            Split::Completed => whole_snapshots.push(*snapshot_id),
-                            Split::Range {
-                                first_slice,
-                                last_slice,
-                            } => {
-                                range_units.push(RangeUnit {
-                                    unit: unit_name(*snapshot_id)?,
+                        if completed > 0 {
+                            match split {
+                                Split::Completed => whole_snapshots.push(*snapshot_id),
+                                Split::Range {
                                     first_slice,
                                     last_slice,
-                                });
-                                range_writes.push((*write_id, *snapshot_id));
+                                } => {
+                                    range_units.push(RangeUnit {
+                                        unit: unit_name(*snapshot_id)?,
+                                        first_slice,
+                                        last_slice,
+                                    });
+                                    range_writes.push((*write_id, *snapshot_id));
+                                }
+                                Split::Cut => cut_units.push(unit_name(*snapshot_id)?),
                             }
-                            Split::Cut => cut_units.push(unit_name(*snapshot_id)?),
                         }
-                    }
-                    if completed == 0 {
-                        // Issue #376 (c): the row moved while confirm read the
-                        // tape — an operator's abort got there first. Dropping
-                        // `tx` rolls back; nothing is sealed over it.
-                        let now: Option<String> = tx
-                            .query_row(
-                                "SELECT status FROM writes WHERE id = ?1",
-                                params![write_id],
-                                |r| r.get(0),
-                            )
-                            .ok();
-                        return Err(TapectlError::Other(format!(
-                            "volume \"{}\": the confirm readback passed, but write session \
+                        if completed == 0 {
+                            // Issue #376 (c): the row moved while confirm read the
+                            // tape — an operator's abort got there first. Dropping
+                            // `tx` rolls back; nothing is sealed over it.
+                            let now: Option<String> = tx
+                                .query_row(
+                                    "SELECT status FROM writes WHERE id = ?1",
+                                    params![write_id],
+                                    |r| r.get(0),
+                                )
+                                .ok();
+                            return Err(TapectlError::Other(format!(
+                                "volume \"{}\": the confirm readback passed, but write session \
                              {write_id} changed while it ran (entered confirm `{entered}`, now \
                              `{}`) — most likely `tapectl volume abort`. The catalog was NOT \
                              updated to sealed over it: the volume stays `initialized` and \
                              does not count as a copy. The tape itself is sealed; see `tapectl \
                              volume resume` for re-confirming an aborted session.",
-                            self.built.layout.label,
-                            now.as_deref().unwrap_or("gone"),
-                        )));
-                    }
-                }
-                // Item 128 (`layout-session.md`, "Promotion and the retire
-                // floor"): a range promotes its version once every slice of
-                // its stage set is on a sealed volume, this one counted (it
-                // is still `initialized` here, so it is named). A version
-                // spread over several tapes is promoted at the last one's
-                // seal, whichever order they were written in.
-                for (write_id, snapshot_id) in &range_writes {
-                    let everywhere: bool = tx.query_row(
-                        &format!(
-                            "SELECT {} FROM writes w WHERE w.id = ?1",
-                            crate::policy::coverage::every_slice_on_sealed_volume_sql(
-                                "w.stage_set_id",
-                                Some("?2"),
-                            )
-                        ),
-                        params![write_id, self.volume_id],
-                        |r| r.get(0),
-                    )?;
-                    if everywhere {
-                        whole_snapshots.push(*snapshot_id);
-                    }
-                }
-                // Snapshot promotions, plus what each one needs for its audit
-                // row (issue #58). The pre-flip status is read BEFORE the
-                // update so the event records a real old->new transition
-                // rather than guessing, and so nothing is logged when the
-                // guard matches no row.
-                // Only a set this tape holds whole, or a range that makes its
-                // set whole on sealed volumes, promotes its snapshot: a cut
-                // one's version is not written yet (#420).
-                let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
-                for snapshot_id in &whole_snapshots {
-                    let before: Option<(String, String, i64)> = tx
-                        .query_row(
-                            "SELECT s.status, u.name, u.tenant_id
-                             FROM snapshots s JOIN units u ON u.id = s.unit_id
-                             WHERE s.id = ?1",
-                            params![snapshot_id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                        )
-                        .ok();
-
-                    let changed = tx.execute(
-                        "UPDATE snapshots SET status = 'current'
-                         WHERE id = ?1 AND status IN ('created', 'staged')",
-                        params![snapshot_id],
-                    )?;
-
-                    if changed > 0 {
-                        if let Some((old_status, unit_name, tenant_id)) = before {
-                            promoted.push((*snapshot_id, old_status, unit_name, tenant_id));
+                                self.built.layout.label,
+                                now.as_deref().unwrap_or("gone"),
+                            )));
                         }
                     }
-                }
-                // Issue #461: the same guard `adopt_lost` puts on this
-                // UPDATE. A write session's volume is `initialized` from
-                // `volume init` to this line (`is_write_target`), and a
-                // `volume retire` or `cartridge retire` that landed during
-                // an hours-long readback has moved it. Unguarded, this
-                // statement set the retired volume back to `sealed`, and
-                // it counted as a copy again. The `sealed_at IS NULL`
-                // clause `adopt_lost` also has is NOT here: the seal is
-                // already recorded on the row by the time confirm runs
-                // (issue #330).
-                // #420: `ended_after` is K on a short seal, NULL on a full
-                // one (migration 038), confirmed by this readback.
-                let sealed = tx.execute(
-                    "UPDATE volumes SET status = 'sealed', ended_after = ?2
-                     WHERE id = ?1 AND status = 'initialized'",
-                    params![self.volume_id, self.ending.recorded_ended_after()],
-                )?;
-                if sealed == 0 {
-                    // As for the `writes` guard above: dropping `tx` rolls
-                    // back the completed `writes` rows and the snapshot
-                    // promotions; nothing is recorded over the change.
-                    let now: Option<String> = tx
-                        .query_row(
-                            "SELECT status FROM volumes WHERE id = ?1",
-                            params![self.volume_id],
+                    // Item 128 (`layout-session.md`, "Promotion and the retire
+                    // floor"): a range promotes its version once every slice of
+                    // its stage set is on a sealed volume, this one counted (it
+                    // is still `initialized` here, so it is named). A version
+                    // spread over several tapes is promoted at the last one's
+                    // seal, whichever order they were written in.
+                    for (write_id, snapshot_id) in &range_writes {
+                        let everywhere: bool = tx.query_row(
+                            &format!(
+                                "SELECT {} FROM writes w WHERE w.id = ?1",
+                                crate::policy::coverage::every_slice_on_sealed_volume_sql(
+                                    "w.stage_set_id",
+                                    Some("?2"),
+                                )
+                            ),
+                            params![write_id, self.volume_id],
                             |r| r.get(0),
-                        )
-                        .ok();
-                    return Err(TapectlError::Other(format!(
-                        "volume \"{}\": the confirm readback passed, but the volume changed \
+                        )?;
+                        if everywhere {
+                            whole_snapshots.push(*snapshot_id);
+                        }
+                    }
+                    // Snapshot promotions, plus what each one needs for its audit
+                    // row (issue #58). The pre-flip status is read BEFORE the
+                    // update so the event records a real old->new transition
+                    // rather than guessing, and so nothing is logged when the
+                    // guard matches no row.
+                    // Only a set this tape holds whole, or a range that makes its
+                    // set whole on sealed volumes, promotes its snapshot: a cut
+                    // one's version is not written yet (#420).
+                    let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
+                    for snapshot_id in &whole_snapshots {
+                        let before: Option<(String, String, i64)> = tx
+                            .query_row(
+                                "SELECT s.status, u.name, u.tenant_id
+                             FROM snapshots s JOIN units u ON u.id = s.unit_id
+                             WHERE s.id = ?1",
+                                params![snapshot_id],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .ok();
+
+                        let changed = tx.execute(
+                            "UPDATE snapshots SET status = 'current'
+                         WHERE id = ?1 AND status IN ('created', 'staged')",
+                            params![snapshot_id],
+                        )?;
+
+                        if changed > 0 {
+                            if let Some((old_status, unit_name, tenant_id)) = before {
+                                promoted.push((*snapshot_id, old_status, unit_name, tenant_id));
+                            }
+                        }
+                    }
+                    // Issue #461: the same guard `adopt_lost` puts on this
+                    // UPDATE. A write session's volume is `initialized` from
+                    // `volume init` to this line (`is_write_target`), and a
+                    // `volume retire` or `cartridge retire` that landed during
+                    // an hours-long readback has moved it. Unguarded, this
+                    // statement set the retired volume back to `sealed`, and
+                    // it counted as a copy again. The `sealed_at IS NULL`
+                    // clause `adopt_lost` also has is NOT here: the seal is
+                    // already recorded on the row by the time confirm runs
+                    // (issue #330).
+                    // #420: `ended_after` is K on a short seal, NULL on a full
+                    // one (migration 038), confirmed by this readback.
+                    let sealed = tx.execute(
+                        "UPDATE volumes SET status = 'sealed', ended_after = ?2
+                     WHERE id = ?1 AND status = 'initialized'",
+                        params![self.volume_id, self.ending.recorded_ended_after()],
+                    )?;
+                    if sealed == 0 {
+                        // As for the `writes` guard above: dropping `tx` rolls
+                        // back the completed `writes` rows and the snapshot
+                        // promotions; nothing is recorded over the change.
+                        let now: Option<String> = tx
+                            .query_row(
+                                "SELECT status FROM volumes WHERE id = ?1",
+                                params![self.volume_id],
+                                |r| r.get(0),
+                            )
+                            .ok();
+                        return Err(TapectlError::Other(format!(
+                            "volume \"{}\": the confirm readback passed, but the volume changed \
                          while it ran (it was `initialized` when the session began, now `{}`) — \
                          most likely `tapectl volume retire` or `cartridge retire`. The catalog \
                          was NOT updated to sealed over it: the volume keeps the status it was \
                          given and does not count as a copy. The tape itself is sealed.",
-                        self.built.layout.label,
-                        now.as_deref().unwrap_or("gone"),
-                    )));
-                }
-                tx.commit()?;
-                Ok((promoted, cut_units, range_units))
-            })?;
+                            self.built.layout.label,
+                            now.as_deref().unwrap_or("gone"),
+                        )));
+                    }
+                    tx.commit()?;
+                    Ok((promoted, cut_units, range_units))
+                })?;
 
             // Audit rows are emitted AFTER the commit, deliberately, and a
             // failure here is warned about rather than propagated (issue #58).
@@ -3967,7 +3973,12 @@ fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'s
                 ))
             })?;
     let features = layout::tape_requires(claims.requires.iter().any(|f| f == format::SPANNING));
-    if !claims.requires.iter().map(String::as_str).eq(features.iter().copied()) {
+    if !claims
+        .requires
+        .iter()
+        .map(String::as_str)
+        .eq(features.iter().copied())
+    {
         return Err(TapectlError::Other(format!(
             "seal: the frozen File 0 at {} states requires = {:?}, which is neither list this \
              tapectl writes ({:?} or {:?}); the seal must state what File 0 states, so it is \
