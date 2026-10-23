@@ -217,6 +217,12 @@ struct LocationRow {
     version: i64,
     #[tabled(rename = "Slices")]
     slices: i64,
+    /// What of the version this volume holds (#478, ADR-0012 items 121 and
+    /// 127): `whole` for a `completed` write, a copy of it; `slices F-L` for
+    /// a `range` write, the run of the stage set's slices it holds, which is
+    /// not a copy on its own. `Slices` above is the set's count either way.
+    #[tabled(rename = "Holds")]
+    holds: String,
     #[tabled(rename = "Written")]
     written: String,
     /// Whether this volume can actually serve a restore, per ADR-0004's
@@ -271,7 +277,8 @@ struct LocationRow {
     /// A warehouse deposit (ADR-0006) is a different evidence class with
     /// its own `Warehouse` column above; it never populates this field,
     /// because a deposit has never been verified by tapectl and never will
-    /// be -- every row here comes from a completed tape `write` only.
+    /// be -- every row here comes from a completed (or, from 1.7.0, range)
+    /// tape `write` only.
     #[tabled(rename = "Verified", display_with = "display_verification_age")]
     last_verified: Option<String>,
 }
@@ -293,7 +300,11 @@ fn display_warehouse(v: &[String]) -> String {
 }
 
 /// Where a unit's completed writes live, and whether each can actually
-/// serve a restore (issue #57).
+/// serve a restore (issue #57). From 1.7.0 (#478, ADR-0012 items 121 and
+/// 127) a `range` write is listed too, with the run it holds (`Holds`): a
+/// spanning version's holders are its whole copies and its ranges, and a
+/// restore of it reads the ranges in slice order (`volume-format-v2.md`
+/// §4.4).
 ///
 /// Extracted from the `Locate` arm so it is directly testable, mirroring the
 /// `copies_rows`/`dirty_rows` split in `src/cli/report.rs` rather than
@@ -320,13 +331,20 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
                    FROM volume_deposits d
                    JOIN locations dl ON dl.id = d.location_id
                   WHERE d.volume_id = v.id),
-                ss.id
+                ss.id,
+                w.status,
+                (SELECT MIN(rl.slice_number) FROM write_positions rp
+                   JOIN stage_slices rl ON rl.id = rp.stage_slice_id
+                  WHERE rp.write_id = w.id AND rp.status = 'written'),
+                (SELECT MAX(rl.slice_number) FROM write_positions rp
+                   JOIN stage_slices rl ON rl.id = rp.stage_slice_id
+                  WHERE rp.write_id = w.id AND rp.status = 'written')
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
          JOIN volumes v ON v.id = w.volume_id
          LEFT JOIN locations l ON l.id = v.location_id
-         WHERE s.unit_id = ?1 AND w.status = 'completed'
+         WHERE s.unit_id = ?1 AND w.status IN ('completed', 'range')
          ORDER BY s.version DESC, v.label"
     );
 
@@ -368,12 +386,24 @@ fn locate_rows(conn: &Connection, unit_id: i64) -> Result<Vec<LocationRow>> {
             let serviceable: i64 = row.get(7)?;
             let stage_set_id: i64 = row.get(9)?;
             let last_verified = verification.get(&volume).cloned().flatten();
+            let write_status: String = row.get(10)?;
+            let holds = match (
+                write_status.as_str(),
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+            ) {
+                ("range", Some(first), Some(last)) if first == last => format!("slice {first}"),
+                ("range", Some(first), Some(last)) => format!("slices {first}-{last}"),
+                ("range", _, _) => "a range".to_string(),
+                _ => "whole".to_string(),
+            };
             Ok(LocationRow {
                 status: row.get(1)?,
                 condition: row.get(2)?,
                 location: row.get(3)?,
                 version: row.get(4)?,
                 slices: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                holds,
                 written: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 serviceable: serviceable == 1,
                 warehouse: row
@@ -770,6 +800,12 @@ fn dispatch(
                 obj["ended_after_recorded"] = serde_json::json!(report.ended_after_recorded);
                 obj["volume_ended_after_mismatch"] =
                     serde_json::json!(report.volume_ended_after_mismatch);
+                // #478 (ADR-0012 items 121, 128 and 130): additive. The
+                // spannable sets this tape holds as a range, the versions this
+                // run made current, and the to-do list's span half.
+                obj["range_units"] = range_units_json(&report);
+                obj["versions_promoted"] = serde_json::json!(report.versions_promoted);
+                obj["spans_in_progress"] = spans_in_progress_json(&report);
                 // Issue #451: additive. Tenant envelopes no copy of which
                 // could be read, which the rebuild went on without.
                 obj["unreadable_tenant_envelopes"] =
@@ -878,6 +914,11 @@ fn dispatch(
                 for line in short_tape_lines(&report) {
                     println!("{line}");
                 }
+                // #478, outside the is_noop() branch for the same reason: a
+                // range is a fact about the tape, said on every run.
+                for line in range_lines(&report) {
+                    println!("{line}");
+                }
                 // Outside the is_noop() branch on purpose: a second rebuild
                 // onto a row that is still non-sealed is a no-op for row
                 // counts and must still warn every time (issue #158). Not for
@@ -949,6 +990,9 @@ fn dispatch(
                     println!("{line}");
                 }
                 for line in index_lines(&report) {
+                    println!("{line}");
+                }
+                for line in span_to_do_lines(&report) {
                     println!("{line}");
                 }
                 if !report.units_without_tenant_envelope.is_empty() {
@@ -1373,6 +1417,122 @@ fn index_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
+/// What `catalog rebuild` says of the spannable sets on the tape (#478,
+/// ADR-0012 items 121 and 128; `volume-format-v2.md` §4.4): each one the tape
+/// holds as a range, with its run, and each version the run made current.
+/// Not under the short-seal lines: a range can end a tape that sealed full
+/// (the tail of a span). Empty for a tape with no spannable set.
+fn range_lines(report: &RebuildReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !report.range_units.is_empty() {
+        let ranges: Vec<String> = report.range_units.iter().map(|r| r.describe()).collect();
+        lines.push(format!(
+            "  note: volume \"{}\" holds a RANGE of each of these spanning units, not the \
+             whole of it: {}. Recorded \"range\": a range is not a copy on its own, its slices \
+             count one by one, and a restore needs the unit's other slices from the tapes \
+             that hold them (volume-format-v2.md §4.4)",
+            report.label,
+            ranges.join(", ")
+        ));
+    }
+    if !report.versions_promoted.is_empty() {
+        lines.push(format!(
+            "  made current: {} — with this tape, every slice of each is on a sealed volume \
+             (ADR-0012 item 128)",
+            report.versions_promoted.join(", ")
+        ));
+    }
+    lines
+}
+
+/// The to-do list's span half (#478, ADR-0012 item 130; `volume-format-v2.md`
+/// §1.5): each spanning version some slices of which are on no tape this
+/// catalog records, the slices, and the tapes this tape's index names for
+/// them. Like [`index_lines`], it lists and never adds. Empty when every
+/// spanning version on the tape is whole somewhere in the catalog.
+fn span_to_do_lines(report: &RebuildReport) -> Vec<String> {
+    if report.spans_in_progress.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "  spans in progress: these versions are spread over several tapes, and some of their \
+         slices are on no tape this catalog records. Each stays staged, reading 0 copies, until \
+         those slices' tapes are rebuilt too (ADR-0012 items 128 and 130):"
+            .to_string(),
+    ];
+    for span in &report.spans_in_progress {
+        lines.push(format!(
+            "    {} v{}: {} of {} on no tape this catalog records",
+            span.unit,
+            span.version,
+            span.describe_missing(),
+            span.num_slices
+        ));
+        if span.holders.is_empty() {
+            lines.push(
+                "      this tape's index names no tape holding them (a tape never names one \
+                 written after it): the newest tape of the unit's span names the others"
+                    .to_string(),
+            );
+        } else {
+            let holders: Vec<String> = span
+                .holders
+                .iter()
+                .map(|h| {
+                    if h.cartridge_serial.is_empty() {
+                        h.describe()
+                    } else {
+                        format!("{}, cartridge serial {}", h.describe(), h.cartridge_serial)
+                    }
+                })
+                .collect();
+            lines.push(format!(
+                "      this tape's index names: {}; load each and run `tapectl catalog rebuild \
+                 --from-volume --key <key>`",
+                holders.join("; ")
+            ));
+        }
+    }
+    lines
+}
+
+/// [`range_lines`]' ranges for `--json`, under `range_units`.
+fn range_units_json(report: &RebuildReport) -> serde_json::Value {
+    serde_json::json!(report
+        .range_units
+        .iter()
+        .map(|r| serde_json::json!({
+            "unit": r.unit,
+            "version": r.version,
+            "first_slice": r.first_slice,
+            "last_slice": r.last_slice,
+            "num_slices": r.num_slices,
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// [`span_to_do_lines`] for `--json`, under `spans_in_progress`.
+fn spans_in_progress_json(report: &RebuildReport) -> serde_json::Value {
+    serde_json::json!(report
+        .spans_in_progress
+        .iter()
+        .map(|s| serde_json::json!({
+            "unit": s.unit,
+            "version": s.version,
+            "num_slices": s.num_slices,
+            "missing_slices": s.missing,
+            "holders": s.holders.iter().map(|h| serde_json::json!({
+                "label": h.label,
+                "uuid": h.uuid,
+                "cartridge_serial": h.cartridge_serial,
+                "state": h.state,
+                "first_slice": h.first_slice,
+                "last_slice": h.last_slice,
+            })).collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>())
+}
+
 /// [`index_lines`] for `--json`: one object under `cross_volume_index`.
 fn index_json(report: &RebuildReport) -> serde_json::Value {
     serde_json::json!({
@@ -1697,6 +1857,94 @@ mod tests {
         let text = super::short_tape_lines(&disagrees).join("\n");
         assert!(text.contains("an end after file 12"), "{text}");
         assert!(text.contains("it sealed full"), "{text}");
+    }
+
+    /// #478 (ADR-0012 items 121, 128 and 130): the rebuild names a range with
+    /// its run on any ending (a span's tail seals full), each version it made
+    /// current, and the to-do list's span half: the missing slices and the
+    /// tapes the index names for them, or that it names none. Nothing is said
+    /// for a tape with no spannable set.
+    #[test]
+    fn a_range_and_a_span_in_progress_are_named_in_the_rebuild_report() {
+        use crate::volume::rebuild::{RebuildReport, RebuiltRange, SpanHolder, SpanInProgress};
+        let plain = RebuildReport {
+            label: "L6-0003".to_string(),
+            ..Default::default()
+        };
+        assert!(super::range_lines(&plain).is_empty());
+        assert!(super::span_to_do_lines(&plain).is_empty());
+        assert_eq!(super::range_units_json(&plain), serde_json::json!([]));
+        assert_eq!(super::spans_in_progress_json(&plain), serde_json::json!([]));
+
+        let holder = |label: &str, first, last| SpanHolder {
+            label: label.to_string(),
+            uuid: format!("uuid-{label}"),
+            cartridge_serial: String::new(),
+            state: "sealed".to_string(),
+            first_slice: Some(first),
+            last_slice: Some(last),
+        };
+        let tail = RebuildReport {
+            label: "L6-0003".to_string(),
+            range_units: vec![RebuiltRange {
+                unit: "video".to_string(),
+                version: 2,
+                first_slice: 3,
+                last_slice: 4,
+                num_slices: 4,
+            }],
+            versions_promoted: vec!["photos v1".to_string()],
+            spans_in_progress: vec![
+                SpanInProgress {
+                    unit: "video".to_string(),
+                    version: 2,
+                    num_slices: 4,
+                    missing: vec![1, 2],
+                    holders: vec![holder("L6-0001", 1, 2), holder("L6-0002", 1, 4)],
+                },
+                SpanInProgress {
+                    unit: "music".to_string(),
+                    version: 1,
+                    num_slices: 9,
+                    missing: vec![7, 8, 9],
+                    holders: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(super::short_tape_lines(&tail).is_empty(), "a full seal");
+        let text = super::range_lines(&tail).join("\n");
+        assert!(text.contains("holds a RANGE"), "{text}");
+        assert!(text.contains("video v2 (slices 3-4 of 4)"), "{text}");
+        assert!(text.contains("not a copy on its own"), "{text}");
+        assert!(text.contains("made current: photos v1"), "{text}");
+        let todo = super::span_to_do_lines(&tail).join("\n");
+        assert!(todo.contains("video v2: slices 1-2 of 4"), "{todo}");
+        assert!(
+            todo.contains("L6-0001 (slices 1-2); L6-0002 (slices 1-4)"),
+            "{todo}"
+        );
+        assert!(
+            todo.contains("tapectl catalog rebuild --from-volume --key <key>"),
+            "{todo}"
+        );
+        assert!(todo.contains("music v1: slices 7-9 of 9"), "{todo}");
+        assert!(todo.contains("names no tape holding them"), "{todo}");
+        assert!(todo.contains("stays staged"), "{todo}");
+
+        let json = super::range_units_json(&tail);
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "unit": "video", "version": 2, "first_slice": 3, "last_slice": 4,
+                "num_slices": 4,
+            }])
+        );
+        let spans = super::spans_in_progress_json(&tail);
+        assert_eq!(spans[0]["missing_slices"], serde_json::json!([1, 2]));
+        assert_eq!(spans[0]["holders"][1]["label"], "L6-0002");
+        assert_eq!(spans[0]["holders"][1]["last_slice"], 4);
+        assert_eq!(spans[1]["holders"], serde_json::json!([]));
     }
 
     /// Issue #458: a tape with no valid seal is said to be unsealed and not a
@@ -2043,6 +2291,7 @@ mod tests {
                 location: "unknown".to_string(),
                 version: 1,
                 slices: 3,
+                holds: "whole".to_string(),
                 written: "2026-07-01T00:00:00Z".to_string(),
                 serviceable: true,
                 warehouse: vec![],
@@ -2056,6 +2305,7 @@ mod tests {
                 location: "parents-house".to_string(),
                 version: 2,
                 slices: 0,
+                holds: "slices 1-2".to_string(),
                 written: String::new(),
                 serviceable: false,
                 warehouse: vec!["glacier".to_string(), "vault2".to_string()],
@@ -2066,7 +2316,7 @@ mod tests {
         let value = location_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"condition":"ok","escrow":"-","last_verified":"2026-06-01 00:00:00","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"condition":"quarantined","escrow":"?","last_verified":null,"location":"parents-house","serviceable":false,"slices":0,"status":"sealed","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
+            r#"[{"condition":"ok","escrow":"-","holds":"whole","last_verified":"2026-06-01 00:00:00","location":"unknown","serviceable":true,"slices":3,"status":"sealed","version":1,"volume":"L6-0001","warehouse_deposits":[],"written":"2026-07-01T00:00:00Z"},{"condition":"quarantined","escrow":"?","holds":"slices 1-2","last_verified":null,"location":"parents-house","serviceable":false,"slices":0,"status":"sealed","version":2,"volume":"L6-0002","warehouse_deposits":["glacier","vault2"],"written":""}]"#
         );
     }
 
@@ -2082,6 +2332,7 @@ mod tests {
             location: "unknown".to_string(),
             version: 1,
             slices: 3,
+            holds: "whole".to_string(),
             written: "2026-07-01T00:00:00Z".to_string(),
             serviceable: true,
             warehouse: vec![],
@@ -2107,6 +2358,75 @@ mod tests {
         // The new keys (issue #196's last_verified, issue #242's condition).
         assert_eq!(obj.get("last_verified").unwrap(), "2026-06-01 00:00:00");
         assert_eq!(obj.get("condition").unwrap(), "ok");
+    }
+
+    /// #478 (ADR-0012 items 121 and 127): `locate` lists a range holder
+    /// beside a whole copy, saying what each holds: `whole` for the
+    /// completed write, the run of written slices for the range. A `cut`
+    /// write holds nothing and is not listed.
+    #[test]
+    fn locate_lists_a_range_holder_with_its_run() {
+        let conn = setup_unit_on_two_volumes("span", "sealed");
+        let unit_id = unit_id_of(&conn, "span");
+        let (set, snap): (i64, i64) = conn
+            .query_row("SELECT id, snapshot_id FROM stage_sets", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        for n in 1..=3 {
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (?1, ?2, 1, 1, 'p', ?3)",
+                params![set, n, format!("e{n}")],
+            )
+            .unwrap();
+        }
+        for (label, status) in [("L6-RANGE", "range"), ("L6-CUT", "cut")] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            let volume = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span,
+                                     completed_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, '2026-10-21T00:00:00Z')",
+                params![set, snap, volume, status],
+            )
+            .unwrap();
+            let write = conn.last_insert_rowid();
+            // Slices 1 and 2 written, slice 3 planned past the end.
+            for (n, position, wp_status) in
+                [(1, 10, "written"), (2, 11, "written"), (3, 12, "pending")]
+            {
+                conn.execute(
+                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                     SELECT ?1, id, ?3, ?4 FROM stage_slices
+                      WHERE stage_set_id = ?2 AND slice_number = ?5",
+                    params![write, set, position.to_string(), wp_status, n],
+                )
+                .unwrap();
+            }
+        }
+        let rows = locate_rows(&conn, unit_id).unwrap();
+        let holds: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.volume.as_str(), r.holds.as_str()))
+            .collect();
+        assert_eq!(
+            holds,
+            [
+                ("L6-OTHER", "whole"),
+                ("L6-RANGE", "slices 1-2"),
+                ("L6-SEALED", "whole")
+            ]
+        );
+        let json = location_rows_to_json(&rows);
+        assert_eq!(json[1]["holds"], "slices 1-2");
     }
 
     /// A unit with completed writes to two volumes: one `sealed`, one in
