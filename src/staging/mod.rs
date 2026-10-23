@@ -661,7 +661,20 @@ fn stage_create_inner(
         )));
     }
     check_file_list_complete(conn, &snapshot, &unit.name)?;
-    check_unit_fits_one_tape(config, &unit.name, &snapshot)?;
+    // Resolve policy (dotfile > archive_set > defaults) — issue #47/#48:
+    // stage_create used to read config.defaults.* unconditionally, so an
+    // archive_set or dotfile override of slice_size/compression/preserve_*
+    // was silently discarded even where #48 gives archive_set_id a writer.
+    // Resolved before the size check (#478): whether the unit may span
+    // decides which limit it is held to.
+    let resolved = crate::policy::resolve(conn, config, &unit)?;
+    check_unit_fits_one_tape(
+        config,
+        &unit.name,
+        &snapshot,
+        resolved.allow_spanning,
+        notices,
+    )?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
@@ -701,12 +714,6 @@ fn stage_create_inner(
     // per slice (age draws a fresh file key each time); this one is only the
     // check.
     build_encryptor(&all_pubkeys)?;
-
-    // Resolve policy (dotfile > archive_set > defaults) — issue #47/#48:
-    // stage_create used to read config.defaults.* unconditionally, so an
-    // archive_set or dotfile override of slice_size/compression/preserve_*
-    // was silently discarded even where #48 gives archive_set_id a writer.
-    let resolved = crate::policy::resolve(conn, config, &unit)?;
 
     // Issue #479 (ADR-0012 2026-10-17 item 100): the slice size this unit
     // will be cut at must leave a slice and the seal inside half the
@@ -1696,27 +1703,46 @@ fn resolve_slice_size_string(
 }
 
 /// Refuse to stage a unit bigger than one tape (issue #395, ADR-0012
-/// 2026-10-06 item 17): a Layout and a write session are bounded to one
-/// cartridge and a unit is never split across cartridges, so such a unit
-/// could be staged — hours of dar and age, a cartridge's worth of staging
-/// disk — and then never written. Refused here, before the `stage_sets`
-/// INSERT and before dar, naming the limit for the cartridge generation.
+/// 2026-10-06 item 17) unless it allows spanning (#478, items 82 and 94),
+/// and one that allows spanning but is bigger than the staging area (items
+/// 85 and 94). Both are refused here, before the `stage_sets` INSERT and
+/// before dar: such a unit could be staged — hours of dar and age — and then
+/// never written.
+///
+/// - **A unit that does not allow spanning** (`allow_spanning`, resolved
+///   dotfile, archive set, `[defaults]`) is never split across cartridges,
+///   so it is refused above one tape, naming the limit for the cartridge
+///   generation and the key. The limit is the most any configured drive's
+///   native generation can take
+///   ([`crate::config::LtoBackendConfig::planning_tape_budget`]: capacity x
+///   fill ceiling - end-of-tape reserve); with no drive configured there is
+///   no generation to name and nothing is refused here — `volume write`'s
+///   pre-flight gate still refuses a layout that does not fit.
+/// - **A unit that allows spanning** may be any size against one tape (item
+///   94). But it is staged whole before its first tape is written, and its
+///   slices are released only as each tape gives them their copies (items 85
+///   and 129), so it must fit the staging area: one larger than the staging
+///   filesystem's TOTAL size (`f_blocks` x `f_frsize`, coordinator ruling
+///   X14) could never be staged, and is refused by name. Free space is the
+///   pre-stage space check's concern ([`check_staging_space`]), not this
+///   one's.
 ///
 /// The size is the snapshot's own `total_size` (the walk's sum of file
-/// sizes), the same figure `collection plan` sizes a unit by. The limit is
-/// the most any configured drive's native generation can take
-/// ([`crate::config::LtoBackendConfig::planning_tape_budget`]: capacity x
-/// fill ceiling - end-of-tape reserve); with no drive configured there is
-/// no generation to name and nothing is refused here — `volume write`'s
-/// pre-flight gate still refuses a layout that does not fit.
+/// sizes), the same figure `collection plan` sizes a unit by; it is checked
+/// before compression and errs toward refusing (2026-10-07 item 8).
 fn check_unit_fits_one_tape(
     config: &Config,
     unit_name: &str,
     snapshot: &models::Snapshot,
+    allow_spanning: bool,
+    notices: &mut dyn Write,
 ) -> Result<()> {
     let Some(size) = snapshot.total_size.map(|s| s.max(0) as u64) else {
         return Ok(());
     };
+    if allow_spanning {
+        return check_spannable_unit_fits_staging(config, unit_name, size, notices);
+    }
     let Some(limit) = config
         .backends
         .lto
@@ -1732,13 +1758,59 @@ fn check_unit_fits_one_tape(
     let over = size - limit.bytes;
     Err(TapectlError::Other(format!(
         "unit \"{unit_name}\" is {size} bytes ({}), {over} bytes ({}) more than one cartridge \
-         can take — {}. A unit is never split across cartridges (ADR-0012), so it cannot be \
-         written; nothing was staged. A unit this size waits for planned spanning, which is \
-         not built yet. The fill ceiling is the drive's `fill_ceiling` in its \
-         `[[backends.lto]]` entry of config.toml (default 97%).",
+         can take — {}. A unit that does not allow spanning (allow_spanning) is never split \
+         across cartridges (ADR-0012), so it cannot be written; nothing was staged. To let it \
+         span cartridges, set `allow_spanning = true` in the [policy] of its \
+         .tapectl-unit.toml, in its archive set or in [defaults]; a span is written only by a \
+         drive whose `[[backends.lto]]` entry declares `post_warning_bytes`. The fill ceiling \
+         is the drive's `fill_ceiling` in its `[[backends.lto]]` entry of config.toml (default \
+         97%).",
         crate::util::format_bytes_binary(i64::try_from(size).unwrap_or(i64::MAX)),
         crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
         limit.describe(),
+    )))
+}
+
+/// [`check_unit_fits_one_tape`]'s half for a unit that allows spanning: it
+/// must not be larger than the staging filesystem's total size (ADR-0012
+/// items 85 and 94, ruling X14). A size that cannot be read is said in
+/// `notices` and refuses nothing, as the free-space check does.
+fn check_spannable_unit_fits_staging(
+    config: &Config,
+    unit_name: &str,
+    size: u64,
+    notices: &mut dyn Write,
+) -> Result<()> {
+    use crate::util::format_bytes_binary as fmt;
+    let staging_dir = Path::new(&config.staging.directory);
+    let total = match staging_total_bytes(staging_dir) {
+        Ok(total) => total,
+        Err(e) => {
+            let _ = writeln!(
+                notices,
+                "warning: could not read the size of staging directory {} ({e}); staging \
+                 unit \"{unit_name}\", which allows spanning, without checking that it fits \
+                 the staging area",
+                staging_dir.display()
+            );
+            return Ok(());
+        }
+    };
+    if size <= total {
+        return Ok(());
+    }
+    let as_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    Err(TapectlError::Other(format!(
+        "unit \"{unit_name}\" allows spanning (allow_spanning) and is {size} bytes ({}), larger \
+         than the staging area: the filesystem of staging directory {} is {total} bytes ({}) in \
+         all. A unit that spans cartridges is staged whole before its first tape is written, \
+         and its slices are released only as each tape gives them their copies (ADR-0012 \
+         items 85 and 94), so it cannot be staged here; nothing was staged. It can be once the \
+         staging area is larger than the unit: grow that filesystem, or point `[staging] \
+         directory` in config.toml at a larger one.",
+        fmt(as_i64(size)),
+        staging_dir.display(),
+        fmt(as_i64(total)),
     )))
 }
 
@@ -2099,6 +2171,50 @@ impl Drop for FreeSpaceOverride {
     fn drop(&mut self) {
         STAGING_FREE_OVERRIDE.with(|c| c.set(None));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the total size `staging_total_bytes` reports on this
+    /// thread, so the spanning admission's refusal (ADR-0012 items 85 and
+    /// 94) can be driven without a filesystem smaller than a unit. `None` =
+    /// ask the filesystem.
+    static STAGING_TOTAL_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pretend the staging filesystem is `bytes` in all, on this
+/// test's thread, until dropped ([`FreeSpaceOverride`]'s twin).
+#[cfg(test)]
+pub(crate) struct TotalSpaceOverride;
+#[cfg(test)]
+impl TotalSpaceOverride {
+    pub(crate) fn set(bytes: u64) -> Self {
+        STAGING_TOTAL_OVERRIDE.with(|c| c.set(Some(bytes)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for TotalSpaceOverride {
+    fn drop(&mut self) {
+        STAGING_TOTAL_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
+/// The size of the filesystem staging is on, in all: `f_blocks` in units of
+/// `f_frsize`, as [`staging_free_bytes`] counts free space (#478, ruling
+/// X14: "larger than the staging area" is this, not the free space). The
+/// size check runs before `stage create` creates the staging directory, so
+/// it asks of the nearest directory that exists: the one `dir` will be
+/// created in.
+pub(crate) fn staging_total_bytes(dir: &Path) -> std::result::Result<u64, nix::Error> {
+    #[cfg(test)]
+    if let Some(total) = STAGING_TOTAL_OVERRIDE.with(|c| c.get()) {
+        return Ok(total);
+    }
+    let probe = dir.ancestors().find(|p| p.exists()).unwrap_or(dir);
+    let stat = nix::sys::statvfs::statvfs(probe)?;
+    Ok((stat.blocks() as u64).saturating_mul(stat.fragment_size()))
 }
 
 /// Bytes an unprivileged process can still write under `dir`:
@@ -6613,6 +6729,161 @@ mod tests {
         assert!(
             staged_slice_problems(&conn, 1).unwrap().is_empty(),
             "released slices are accepted, and slice 3's file is whole"
+        );
+    }
+
+    /// The one-drive config of the #478 admission tests: a virtual LTO-6 of
+    /// 1 MB at a 100% ceiling and no reserve, so a 2 MiB unit is larger than
+    /// one tape.
+    fn one_small_drive(config: &mut Config) {
+        config.backends.lto.push(crate::config::LtoBackendConfig {
+            name: "small".into(),
+            device_tape: "/dev/null".into(),
+            device_sg: "/dev/null".into(),
+            generation: "LTO-6".into(),
+            capacity_override: Some("1M".into()),
+            fill_ceiling: 1.0,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: None,
+        });
+    }
+
+    /// #478 (ADR-0012 items 82 and 94): a unit that does not allow spanning
+    /// is still refused above one tape, and the refusal now says why
+    /// (a unit that does not allow spanning is never split) and names the
+    /// key, instead of "waits for planned spanning, which is not built yet".
+    #[test]
+    fn stage_create_refuses_a_non_spannable_unit_larger_than_one_tape_naming_allow_spanning() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        one_small_drive(&mut config);
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("more than one cartridge can take"),
+            "positive control, the one-tape refusal: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "A unit that does not allow spanning (allow_spanning) is never split across \
+                 cartridges"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("`allow_spanning = true`"), "{msg}");
+        assert!(
+            !msg.contains("not built yet"),
+            "the stale text is gone: {msg}"
+        );
+        let stage_sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+    }
+
+    /// #478 (ADR-0012 item 94): a unit that allows spanning is admitted
+    /// whatever its size against one tape — here larger than the only
+    /// configured drive's cartridge, a staging area larger than it — and
+    /// stages.
+    #[test]
+    fn stage_create_admits_a_spannable_unit_larger_than_one_tape() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        one_small_drive(&mut config);
+        config.defaults.allow_spanning = true;
+        let _total = TotalSpaceOverride::set(1 << 40);
+
+        stage_create(&conn, &paths, &config, snap_id, false)
+            .expect("a spannable unit larger than one tape is admitted and staged");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE snapshot_id = ?1",
+                params![snap_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "staged");
+    }
+
+    /// #478 (ADR-0012 items 85 and 94, ruling X14): a unit that allows
+    /// spanning but is larger than the staging filesystem's TOTAL size is
+    /// refused by name, before the INSERT and before dar, saying why (it is
+    /// staged whole) and what would change it (staging grows). The positive
+    /// control is the same unit with a staging area one byte larger than it,
+    /// which passes this check (and dar, pointed nowhere, then fails).
+    #[test]
+    fn stage_create_refuses_a_spannable_unit_larger_than_the_staging_area() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        config.defaults.allow_spanning = true;
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+        let size: u64 = conn
+            .query_row(
+                "SELECT total_size FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+
+        let total = TotalSpaceOverride::set(size - 1);
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!(
+                "unit \"unit1\" allows spanning (allow_spanning) and is {size} bytes"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("larger than the staging area")
+                && msg.contains(&format!("is {} bytes", size - 1))
+                && msg.contains("in all"),
+            "names the staging area's total size: {msg}"
+        );
+        assert!(msg.contains("staged whole"), "says why: {msg}");
+        assert!(
+            msg.contains("once the staging area is larger than the unit"),
+            "says what would change it: {msg}"
+        );
+        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        let stage_sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+
+        drop(total);
+        let _total = TotalSpaceOverride::set(size);
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !msg.contains("larger than the staging area"),
+            "a unit no larger than the staging area passes the check: {msg}"
+        );
+    }
+
+    /// The real figure behind the override: the staging filesystem's total
+    /// size is at least its free space, and a directory not yet created is
+    /// measured by the one it will be created in.
+    #[test]
+    fn staging_total_bytes_reads_the_filesystem_of_the_nearest_existing_directory() {
+        let tmp = TempDir::new().unwrap();
+        let total = staging_total_bytes(tmp.path()).unwrap();
+        let free = staging_free_bytes(tmp.path()).unwrap();
+        assert!(total > 0 && total >= free, "total {total}, free {free}");
+        assert_eq!(
+            staging_total_bytes(&tmp.path().join("not/yet/made")).unwrap(),
+            total
         );
     }
 
