@@ -566,6 +566,20 @@ rctl() { # the rebuild's second home (no drive configured: the heir's case)
     env -u TAPECTL_TEST_EARLY_WARNING_AT "$TAPECTL_BIN" --home "$REBUILD_HOME" "$@" </dev/null
 }
 
+# Whether a write announced the store's test hook must match the run: the rehearsal's tape 1
+# write announces it (the regex's positive control) and no other write does; on the real drive,
+# none (a run with the hook proves nothing). grep's 2, an unreadable file, is never "no".
+HOOK_RE='TAPECTL_TEST_EARLY_WARNING_AT=[0-9]+ is set'
+assert_hook() { # <err file> <1: announced | 0: not>
+    local rc=0
+    grep -E "$HOOK_RE" "$1" >/dev/null || rc=$?
+    if [ "$2" = 1 ]; then
+        [ "$rc" = 0 ] || fail "the hooked write does not announce TAPECTL_TEST_EARLY_WARNING_AT ($1, grep rc=$rc)"
+    else
+        [ "$rc" = 1 ] || fail "a write run without the test hook announces it, or could not be searched ($1, grep rc=$rc)"
+    fi
+}
+
 begin_step() { # <id> <name> <what>
     STEP="$1 $2"
     STEP_DIR="$RUN/$1-$2"
@@ -923,6 +937,7 @@ fi
 K="$(json_get "$STEP_DIR/write.out" 'd["ended_after"]')"
 case "$K" in ''|*[!0-9]*) fail "the write reported ended_after '$K': it did not seal short" ;; esac
 grep -F "sealed short" "$STEP_DIR/write.err" >/dev/null || fail "the write's stderr does not report the short seal"
+assert_hook "$STEP_DIR/write.err" "$MHVTL"
 # The write's report, the rows, and the staging it kept.
 python3 - "$DB" "$STEP_DIR/write.out" "$LABEL1" "$UNIT_F" "$UNIT_S" "$K" "$N" <<'PY' > "$STEP_DIR/assert-write.txt" 2>&1 || fail "tape 1's write, rows or staging are not what item 137 expects ($STEP_DIR/assert-write.txt)"
 import json, os, sqlite3, sys
@@ -1171,6 +1186,7 @@ end_step
 # ------------------------------------------------------------
 begin_step 4b write "volume write $LABEL2: $UNIT_S whole, from the kept staging"
 run write2 0 tctl --json --yes volume write "$LABEL2" --device "$TAPE_DEV"
+assert_hook "$STEP_DIR/write2.err" 0
 python3 - "$DB" "$STEP_DIR/write2.out" "$LABEL2" "$UNIT_S" "$N" <<'PY' > "$STEP_DIR/assert-write2.txt" 2>&1 || fail "tape 2 is not a whole copy of $UNIT_S ($STEP_DIR/assert-write2.txt)"
 import json, sqlite3, sys
 db, out, label, us, n = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
