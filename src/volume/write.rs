@@ -25,12 +25,12 @@ use crate::store::{ConfirmPlan, OpenMode, Store, TapeStore, Tier};
 
 use super::adopt_lost;
 use super::binding;
-use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
+use super::build::{self, BuildInputs, BuildSlice, BuildUnit, SpanSlice, TenantInfo, UnitSpan};
 use super::format;
 use super::layout;
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, PlanSplit, SliceCheck,
-    ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, PlanClass, PlanSplit,
+    SliceCheck, ZoneKind,
 };
 use super::loaded;
 use super::session::{
@@ -1272,11 +1272,15 @@ fn volume_write_contacted<'c>(
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
     // them BEFORE it initialises a cartridge ([`write_catalog_preflight`]).
-    let units = checked_staged_units(conn, only_stage_sets)?;
+    let batch = checked_staged_units(
+        conn,
+        Spanning::for_write(config, only_stage_sets),
+        only_stage_sets,
+    )?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
-    announce_staged_selection(label, &units);
+    announce_staged_selection(label, &batch.units);
 
     // Copy distinctness at plan time (ADR-0012 2026-10-07 item 26, issue
     // #144), from the catalog alone, before a backend, the MAM or the drive
@@ -1296,7 +1300,7 @@ fn volume_write_contacted<'c>(
     // and the filtered catalog snapshot, issue #83); deriving it once is
     // deliberate, because two selections that can drift is exactly how
     // issue #96 happened.
-    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    let stage_set_ids = batch.stage_set_ids();
     let distinct = coverage::copy_distinctness(conn, volume_id, &stage_set_ids)?;
     if let Some(refusal) = distinct.refusal(label) {
         return Err(TapectlError::Other(refusal));
@@ -1313,7 +1317,7 @@ fn volume_write_contacted<'c>(
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
     let budget = write_budget(backend, nominal_capacity)?;
 
-    let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+    let session = assemble_keys_for_units(conn, &batch.units, &stage_set_ids)?;
 
     // An empty drive is refused here, at once, by name (issue #355) — after
     // every fact check above, so a write refused for its own reason still
@@ -1410,7 +1414,7 @@ fn volume_write_contacted<'c>(
             volume_media_type,
             nominal_capacity,
             budget,
-            units,
+            batch,
             stage_set_ids,
             session,
         },
@@ -1870,7 +1874,9 @@ pub(crate) fn rehearse_write_capacity(
         enospc_buffer,
         ..
     } = write_budget(backend, volume.capacity_bytes)?;
-    let units = checked_staged_units(conn, only)?;
+    // A rewrite never spans (ADR-0012 item 142): its rehearsal plans the
+    // batch as its write will, every set whole.
+    let units = checked_staged_units(conn, Spanning::Never, only)?.units;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
         keys,
@@ -1955,7 +1961,8 @@ struct StagedWrite<'a> {
     volume_media_type: Option<String>,
     nominal_capacity: i64,
     budget: WriteBudget,
-    units: Vec<BuildUnit>,
+    /// The staged batch, each set with its plan class (#478).
+    batch: StagedBatch,
     stage_set_ids: Vec<i64>,
     session: SessionKeys,
 }
@@ -1999,7 +2006,7 @@ fn volume_write_in_contact<'c>(
                 plan_bound_bytes,
                 post_warning_bytes,
             },
-        units,
+        batch,
         stage_set_ids,
         session:
             SessionKeys {
@@ -2118,7 +2125,7 @@ fn volume_write_in_contact<'c>(
             mam_loads: mam.load_count.unwrap_or(0),
             cartridge_identity,
         },
-        units,
+        batch.units,
         &stage_set_ids,
         tenants,
         operator_public_keys,
@@ -7311,17 +7318,21 @@ impl VerifyReport {
 /// MAM or the drive; [`write_catalog_preflight`] runs it, and then
 /// [`assemble_keys_for_units`], ahead of `volume write --init`'s `volume
 /// init` (issue #445).
-fn checked_staged_units(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<BuildUnit>> {
-    let units = find_staged_data(conn, only)?;
+fn checked_staged_units(
+    conn: &Connection,
+    spanning: Spanning<'_>,
+    only: Option<&[i64]>,
+) -> Result<StagedBatch> {
+    let batch = find_staged_data(conn, spanning, only)?;
     // Issue #402: every staged set whole, on disk, before anything below
     // touches a backend, a MAM or the drive.
     check_staged_slices(conn, only)?;
-    if units.is_empty() {
+    if batch.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
         ));
     }
-    Ok(units)
+    Ok(batch)
 }
 
 /// The session's keys and recipients for `units`' tenants and stage sets
@@ -7364,10 +7375,11 @@ fn assemble_keys_for_units(
 /// the built Layout), so they stay in the write.
 pub(crate) fn write_catalog_preflight(
     conn: &Connection,
+    config: &Config,
     label: &str,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    write_catalog_preflight_in(conn, label, allow_missing_escrow, None)
+    write_catalog_preflight_in(conn, config, label, allow_missing_escrow, None)
 }
 
 /// [`write_catalog_preflight`] for a write of only `only` (a `volume
@@ -7375,15 +7387,22 @@ pub(crate) fn write_catalog_preflight(
 /// rewrite asks it after its slices are staged and verified and BEFORE it
 /// retires anything: the write that follows the erase must not be able to
 /// refuse for a reason the catalog and the disk already knew.
+///
+/// The batch is planned as the write plans it ([`Spanning::for_write`]), so
+/// a refusal the plan of a span raises from the catalog alone (a released
+/// slice the tape would plan, a unit whose policy cannot be resolved) is
+/// raised here too. Item 86's generation refusal needs the volume, which
+/// does not exist yet: the write raises it.
 pub(crate) fn write_catalog_preflight_in(
     conn: &Connection,
+    config: &Config,
     label: &str,
     allow_missing_escrow: bool,
     only: Option<&[i64]>,
 ) -> Result<()> {
-    let units = checked_staged_units(conn, only)?;
-    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
-    let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+    let batch = checked_staged_units(conn, Spanning::for_write(config, only), only)?;
+    let stage_set_ids = batch.stage_set_ids();
+    let session = assemble_keys_for_units(conn, &batch.units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow
     // receipts; those verdicts need no Layout, so an empty one carries them.
     let keys_only = Layout {
@@ -7415,15 +7434,230 @@ pub(crate) fn write_catalog_preflight_in(
     Ok(())
 }
 
-/// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
-/// `ORDER BY u.name` stays — the alphabetical (next-fit) ordering ruled in
-/// sheet §7 (`docs/design/v2-open-questions.md`); `build()` never reorders
-/// its input, so this is where unit order is decided.
+/// Whether a write may plan a staged set to span cartridges (#478;
+/// `layout-session.md` "Spanning", "The frozen flag").
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Spanning<'a> {
+    /// By each unit's resolved policy (`allow_spanning`: dotfile, archive
+    /// set, `[defaults]`), and always for a stage set that already has a
+    /// `range` row, whatever the key now says, so a span in progress can
+    /// always finish (ADR-0012 item 121, X17).
+    ByPolicy(&'a Config),
+    /// Never: `volume rewrite` plans every write with `may_span` unset, so a
+    /// spannable unit it carries is planned whole and is cut, as in 1.6.0, if
+    /// the early warning comes (ADR-0012 item 142, X20).
+    Never,
+}
+
+impl<'a> Spanning<'a> {
+    /// `volume write`'s rule: a write scoped to `only` some stage sets is
+    /// `volume rewrite`'s ([`volume_write_scoped`]), which never spans.
+    fn for_write(config: &'a Config, only: Option<&[i64]>) -> Self {
+        if only.is_some() {
+            Spanning::Never
+        } else {
+            Spanning::ByPolicy(config)
+        }
+    }
+}
+
+/// The staged batch a write plans: each stage set as the build takes it,
+/// with what it is to the plan order ([`PlanClass`], `layout-session.md`
+/// "The plan order"). `classes[i]` is `units[i]`'s.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StagedBatch {
+    pub units: Vec<BuildUnit>,
+    pub classes: Vec<PlanClass>,
+}
+
+impl StagedBatch {
+    /// The batch holds a set whose write may span: the write is planned by
+    /// [`CapacityBudget::place`] rather than 1.6.0's split.
+    fn spans(&self) -> bool {
+        self.units.iter().any(|u| u.span.is_some())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Each unit's stage set, in the batch's order.
+    fn stage_set_ids(&self) -> Vec<i64> {
+        self.units.iter().map(|u| u.stage_set_id).collect()
+    }
+}
+
+/// One `stage_slices` row of a set whose write may span.
+struct SpanRow {
+    slice: SpanSlice,
+    staging_path: Option<String>,
+}
+
+/// How a set whose write may span is planned on this tape (`layout-session.md`
+/// "What the plan works from" and "The plan order"; ADR-0012 items 122 and
+/// 127; X16-X18): every slice of the set is in its span, and the slices this
+/// tape plans are
+///
+/// - **an owed run** ([`PlanClass::Owed`]) when the set has a `range` row on
+///   a sealed volume and slices still owed (a slice is owed while its copies,
+///   [`coverage::slice_copies`], are below the set's copy floor): from the
+///   lowest owed slice to the highest, inclusive, so a slice between them
+///   that is not owed is written too (a volume holds one unbroken run of a
+///   set, item 122);
+/// - otherwise **the whole set** ([`PlanClass::Spannable`]): a set with no
+///   range yet, and a set whose every slice already meets the floor (kept
+///   staged, say by `--keep-staging`), which a write copies again as 1.6.0
+///   copies a kept whole unit again.
+///
+/// A slice this tape plans whose staged file was released is refused, never
+/// skipped (X18), naming `volume read-slices --from` (#402's shape).
+fn plan_span_set(
+    conn: &Connection,
+    config: &Config,
+    stage_set_id: i64,
+    unit: &crate::db::models::Unit,
+    min_copies: i64,
+    version: i64,
+) -> Result<(Vec<BuildSlice>, UnitSpan, PlanClass)> {
+    let rows: Vec<SpanRow> = conn
+        .prepare(
+            "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                    sha256_encrypted, staging_path
+             FROM stage_slices WHERE stage_set_id = ?1
+             ORDER BY slice_number",
+        )?
+        .query_map(params![stage_set_id], |row| {
+            Ok(SpanRow {
+                slice: SpanSlice {
+                    slice_id: row.get(0)?,
+                    slice_number: row.get(1)?,
+                    size_bytes: row.get(2)?,
+                    encrypted_bytes: row.get(3)?,
+                    sha256_plain: row.get(4)?,
+                    sha256_encrypted: row.get(5)?,
+                },
+                staging_path: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let span_in_progress: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
+                        WHERE w.stage_set_id = ?1 AND w.status = 'range'
+                          AND v.status = 'sealed')",
+        params![stage_set_id],
+        |r| r.get(0),
+    )?;
+    let floor = coverage::copy_floor(config, min_copies, &unit.status);
+    let owed: Vec<i64> = if span_in_progress {
+        coverage::slice_copies(conn, stage_set_id)?
+            .into_iter()
+            .filter(|s| s.copies < floor)
+            .map(|s| s.slice_number)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (class, run) = match (owed.iter().min(), owed.iter().max()) {
+        (Some(&first), Some(&last)) => (PlanClass::Owed, Some((first, last))),
+        _ => (PlanClass::Spannable, None),
+    };
+    let in_run = |n: i64| run.is_none_or(|(first, last)| (first..=last).contains(&n));
+
+    let mut planned = Vec::new();
+    for row in rows.iter().filter(|r| in_run(r.slice.slice_number)) {
+        let Some(path) = &row.staging_path else {
+            return Err(TapectlError::Other(released_slice_refusal(
+                conn,
+                unit,
+                version,
+                stage_set_id,
+                &row.slice,
+            )?));
+        };
+        planned.push(BuildSlice {
+            slice_id: row.slice.slice_id,
+            slice_number: row.slice.slice_number,
+            size_bytes: row.slice.size_bytes,
+            encrypted_bytes: row.slice.encrypted_bytes,
+            sha256_plain: row.slice.sha256_plain.clone(),
+            sha256_encrypted: row.slice.sha256_encrypted.clone(),
+            staging_path: PathBuf::from(path),
+        });
+    }
+    let span = UnitSpan {
+        slices: rows.into_iter().map(|r| r.slice).collect(),
+    };
+    Ok((planned, span, class))
+}
+
+/// The refusal of a slice this tape plans whose staged file was released
+/// (X18; `layout-session.md` "Refusals"): never skipped, because a range
+/// that left it out would not be one unbroken run. It names `volume
+/// read-slices --from` a volume that holds the slice (#402's shape), and
+/// when none does, the remedy #402 gives an incomplete staged set.
+fn released_slice_refusal(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+    version: i64,
+    stage_set_id: i64,
+    slice: &SpanSlice,
+) -> Result<String> {
+    let holder: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT v.label FROM write_positions wp
+                 JOIN writes w ON w.id = wp.write_id
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE wp.stage_slice_id = ?1 AND wp.status = 'written'
+                   AND w.status IN ('completed', 'range') AND {}
+                   AND (v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)
+                 ORDER BY w.id DESC LIMIT 1",
+                coverage::in_service("v")
+            ),
+            params![slice.slice_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let remedy = match holder {
+        Some(from) => format!(
+            "tapectl volume read-slices --from {from} --unit {} --version {version}",
+            unit.name
+        ),
+        None => {
+            staging::incomplete_set_remedy(conn, unit.id, &unit.name, version, &unit.status, None)?
+        }
+    };
+    Ok(format!(
+        "refusing to write: \"{}\" v{version} (stage set {stage_set_id}) may span, and this \
+         tape plans its slice {}, whose staged file was released from staging. A range is one \
+         unbroken run of a unit's slices, so the slice is never skipped. Nothing was written \
+         and the drive was not touched. Stage it again, then write: {remedy}",
+        unit.name, slice.slice_number
+    ))
+}
+
+/// Gather the staged batch as `BuildUnit`s, ready for `build::build`, each
+/// with its [`PlanClass`]. `ORDER BY u.name` stays — the alphabetical
+/// (next-fit) ordering ruled in sheet §7 (`docs/design/v2-open-questions.md`);
+/// `build()` never reorders its input, and the plan order of a span tape
+/// (`CapacityBudget::place`) groups the units by class in this order.
+///
+/// A unit that may not span is today's: its staged slices, the block
+/// 1.6.0 wrote, [`PlanClass::Whole`]. A set whose write may span
+/// ([`Spanning`]) gets every slice of it in [`BuildUnit::span`] and the
+/// slices this tape plans in [`BuildUnit::slices`] ([`plan_span_set`]).
+/// Deciding that resolves each unit's policy, and a unit whose policy cannot
+/// be resolved refuses the write by name (issue #105's rule).
 ///
 /// `only` narrows the selection to those stage sets (`volume rewrite`, issue
 /// #483); `None` is every `staged` set. The order is the query's own either
 /// way: a scope drops sets from the list, it never reorders it.
-fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<BuildUnit>> {
+fn find_staged_data(
+    conn: &Connection,
+    spanning: Spanning<'_>,
+    only: Option<&[i64]>,
+) -> Result<StagedBatch> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
                 ss.dar_version, ss.dar_command, ss.catalog_path, s.version
@@ -7464,8 +7698,39 @@ fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<Build
         rows.retain(|r| only.contains(&r.0));
     }
 
-    let mut units = Vec::new();
+    let mut batch = StagedBatch::default();
     for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
+        if let Spanning::ByPolicy(config) = spanning {
+            let unit = queries::get_unit_by_uuid(conn, &uuid)?
+                .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+            let policy = crate::policy::resolve(conn, config, &unit)?;
+            let has_range: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range')",
+                params![ss_id],
+                |r| r.get(0),
+            )?;
+            if policy.allow_spanning || has_range {
+                let (slices, span, class) =
+                    plan_span_set(conn, config, ss_id, &unit, policy.min_copies, snap_ver)?;
+                if !slices.is_empty() {
+                    batch.units.push(BuildUnit {
+                        stage_set_id: ss_id,
+                        snapshot_id: snap_id,
+                        unit_name: name,
+                        unit_uuid: uuid,
+                        tenant_id,
+                        dar_version: dar_ver,
+                        dar_command: dar_cmd,
+                        catalog_path,
+                        snapshot_version: snap_ver,
+                        slices,
+                        span: Some(span),
+                    });
+                    batch.classes.push(class);
+                }
+                continue;
+            }
+        }
         let mut slice_stmt = conn.prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path
              FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
@@ -7487,7 +7752,7 @@ fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<Build
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         if !slices.is_empty() {
-            units.push(BuildUnit {
+            batch.units.push(BuildUnit {
                 stage_set_id: ss_id,
                 snapshot_id: snap_id,
                 unit_name: name,
@@ -7500,9 +7765,10 @@ fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<Build
                 slices,
                 span: None,
             });
+            batch.classes.push(PlanClass::Whole);
         }
     }
-    Ok(units)
+    Ok(batch)
 }
 
 /// Refuse the write when any `'staged'` set — the selection
@@ -10663,7 +10929,7 @@ mod tests {
         // `volume write --init` also calls, and the call sites are pinned
         // here in their stead.
         let last_fact = at("assemble_keys_for_units(conn,");
-        let staged = at("checked_staged_units(conn, only_stage_sets)?");
+        let staged = at("let batch = checked_staged_units(");
         let drive = at("crate::tape::media_detect::detect(device");
         assert!(
             staged < preflight && last_fact < preflight,
@@ -12553,7 +12819,9 @@ mod tests {
             .unwrap();
         }
 
-        let units = find_staged_data(&conn, None).unwrap();
+        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+            .unwrap()
+            .units;
         assert_eq!(units.len(), 2);
         assert_eq!(
             units[0].unit_name, "alpha",
@@ -12608,8 +12876,9 @@ mod tests {
             ids.insert(name, ss_id);
         }
         let names = |only: Option<&[i64]>| -> Vec<String> {
-            find_staged_data(&conn, only)
+            find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), only)
                 .unwrap()
+                .units
                 .into_iter()
                 .map(|u| u.unit_name)
                 .collect()
@@ -12784,7 +13053,9 @@ mod tests {
         )
         .unwrap();
 
-        let units = find_staged_data(&conn, None).unwrap();
+        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+            .unwrap()
+            .units;
         assert!(
             units.is_empty(),
             "a stage_set with no on-disk slices must not surface as staged data"
@@ -12944,7 +13215,7 @@ mod tests {
     #[test]
     fn the_init_preflight_refuses_what_the_catalog_alone_can_and_passes_otherwise() {
         let conn = crate::db::open_memory().unwrap();
-        let err = write_catalog_preflight(&conn, "PF-1", false)
+        let err = write_catalog_preflight(&conn, &Config::default(), "PF-1", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no staged data to write"), "{err}");
@@ -12963,7 +13234,7 @@ mod tests {
         // No escrow registered at all: not waivable, and refused before any
         // cartridge is touched.
         for waived in [false, true] {
-            let err = write_catalog_preflight(&conn, "PF-1", waived)
+            let err = write_catalog_preflight(&conn, &Config::default(), "PF-1", waived)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -12975,11 +13246,11 @@ mod tests {
         // A staged set encrypted without the registered escrow key: refused,
         // and waived by --allow-missing-escrow exactly as the write waives it.
         set_key_fingerprints(&conn, stage_set_id, Some("[]"));
-        let err = write_catalog_preflight(&conn, "PF-1", false)
+        let err = write_catalog_preflight(&conn, &Config::default(), "PF-1", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed pre-write validation"), "{err}");
-        write_catalog_preflight(&conn, "PF-1", true)
+        write_catalog_preflight(&conn, &Config::default(), "PF-1", true)
             .expect("--allow-missing-escrow waives a set the escrow key cannot open");
         set_key_fingerprints(
             &conn,
@@ -12989,7 +13260,7 @@ mod tests {
 
         // A staged slice that is not on the disk.
         std::fs::remove_file(&slice).unwrap();
-        let err = write_catalog_preflight(&conn, "PF-1", false)
+        let err = write_catalog_preflight(&conn, &Config::default(), "PF-1", false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -13004,7 +13275,7 @@ mod tests {
             params![tenant_id],
         )
         .unwrap();
-        let err = write_catalog_preflight(&conn, "PF-1", false)
+        let err = write_catalog_preflight(&conn, &Config::default(), "PF-1", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no active key"), "{err}");
@@ -13014,7 +13285,7 @@ mod tests {
         )
         .unwrap();
 
-        write_catalog_preflight(&conn, "PF-1", false)
+        write_catalog_preflight(&conn, &Config::default(), "PF-1", false)
             .expect("with the batch, the files and the keys, it passes");
         let volumes: i64 = conn
             .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
@@ -13584,7 +13855,9 @@ mod tests {
 
         // Positive control: the selection really does hand `build` a
         // one-slice unit — the defect this gate exists for.
-        let units = find_staged_data(&conn, None).unwrap();
+        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+            .unwrap()
+            .units;
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].slices.len(), 1, "only the path-bearing slice");
 
@@ -22765,7 +23038,9 @@ mod tests {
                 usable: u64,
                 bound: Option<u64>,
             ) -> (build::BuiltLayout, tempfile::TempDir) {
-                let units = checked_staged_units(&f.conn, None).unwrap();
+                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                    .unwrap()
+                    .units;
                 let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
                 let SessionKeys {
                     tenants,
@@ -22843,7 +23118,9 @@ mod tests {
                 budget(&mut f, "SE-P", capacity, fill, true);
 
                 let (layout, _dir) = built(&f, "SE-P", fill, Some(capacity));
-                let units = checked_staged_units(&f.conn, None).unwrap();
+                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                    .unwrap()
+                    .units;
                 let split = layout.split(&units);
                 assert_eq!((split.committed, split.planned, split.units), (1, 3, 3));
                 assert!(past_ceiling_refusal("SE-P", &split, &units).is_none());
@@ -24456,7 +24733,9 @@ mod tests {
         /// way a not-yet-existing volume can: another uuid and time, other
         /// chip strings, a real MAM length and load count.
         fn real_write_layout_errors(f: &Fixture, usable_bytes: u64) -> Vec<String> {
-            let units = checked_staged_units(&f.conn, None).unwrap();
+            let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                .unwrap()
+                .units;
             let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
             let SessionKeys {
                 keys,

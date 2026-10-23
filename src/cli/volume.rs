@@ -1237,7 +1237,7 @@ struct DriveWriteSteps<'a> {
 
 impl WriteSteps for DriveWriteSteps<'_> {
     fn preflight(&self, label: &str) -> Result<()> {
-        write::write_catalog_preflight(self.conn, label, self.allow_missing_escrow)
+        write::write_catalog_preflight(self.conn, self.config, label, self.allow_missing_escrow)
     }
 
     fn init(&self, label: &str, force: bool) -> Result<Initialized> {
@@ -4884,7 +4884,12 @@ mod tests {
             fn preflight(&self, label: &str) -> Result<()> {
                 self.log.borrow_mut().push("preflight".to_string());
                 if self.fail == Fail::Unstaged {
-                    return crate::volume::write::write_catalog_preflight(self.conn, label, false);
+                    return crate::volume::write::write_catalog_preflight(
+                        self.conn,
+                        &Config::default(),
+                        label,
+                        false,
+                    );
                 }
                 Ok(())
             }
