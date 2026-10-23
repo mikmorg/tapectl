@@ -56,10 +56,10 @@ pub const EVENT_FIGURES_RECORDED: &str = "write_figures_recorded";
 /// that command's figures), or every figure is already what the tape says.
 ///
 /// "Written by this catalog" is every completed (or, on a tape that ended
-/// early, cut: #420) write on the volume having a start: a write session
-/// stamps `writes.started_at` when it begins, and `catalog rebuild` inserts
-/// its rows with none. On a short tape the figures count only the slices at
-/// or before `volumes.ended_after`, the ones on the tape.
+/// early, cut: #420; or a range: #478) write on the volume having a start: a
+/// write session stamps `writes.started_at` when it begins, and `catalog
+/// rebuild` inserts its rows with none. On a short tape the figures count
+/// only the slices at or before `volumes.ended_after`, the ones on the tape.
 pub(crate) fn record_after_verify(
     conn: &Connection,
     volume_id: i64,
@@ -85,9 +85,12 @@ pub(crate) fn record_after_verify(
     // as much this catalog's write as a `completed` one, and a sealed volume
     // whose warning came inside its first unit holds only cut writes: its
     // figures are still the tape's. A cut write records no completion time.
+    // #478 (ADR-0012 item 127): so is a `range` write, whose slices on the
+    // tape are its `written` positions; a continuation tape may hold nothing
+    // else.
     let (written, begun_here, last_completed): (i64, i64, Option<String>) = conn.query_row(
         "SELECT COUNT(*), COUNT(started_at), MAX(completed_at)
-         FROM writes WHERE volume_id = ?1 AND status IN ('completed', 'cut')",
+         FROM writes WHERE volume_id = ?1 AND status IN ('completed', 'cut', 'range')",
         params![volume_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
@@ -261,9 +264,11 @@ struct TapeSlice<'a> {
 /// filled differently (the either-match `read_slices` uses, issue #86).
 ///
 /// On a tape that ended early (#420, `ended_after = Some(K)`), the slices
-/// this catalog wrote there are those of its `completed` and `cut` writes at
-/// or before K: a cut write's slices that reached the tape are on it (and
-/// stay recorded, ADR-0012 item 112), and its positions after K never were.
+/// this catalog wrote there are those of its `completed`, `cut` and `range`
+/// (#478) writes at or before K: a cut write's slices that reached the tape
+/// are on it (and stay recorded, ADR-0012 item 112), and its positions after
+/// K never were. A range's positions after K are `pending` (item 121): they
+/// never reached the tape either.
 fn disagreement(
     conn: &Connection,
     volume_id: i64,
@@ -276,7 +281,7 @@ fn disagreement(
              FROM write_positions wp
              JOIN writes w ON w.id = wp.write_id
              JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-             WHERE w.volume_id = ?1 AND w.status IN ('completed', 'cut')
+             WHERE w.volume_id = ?1 AND w.status IN ('completed', 'cut', 'range')
                AND (?2 IS NULL OR CAST(wp.position AS INTEGER) <= ?2)",
         )?
         .query_map(params![volume_id, ended_after], |r| {

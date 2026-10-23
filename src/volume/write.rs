@@ -25029,6 +25029,61 @@ mod tests {
                     assert_eq!(position_of(&f, "SQ-2", "b", 1), 8);
                 }
 
+                /// Item 127 (`volume::figures`): a full verify records the
+                /// figures a write left unrecorded on a tape that holds a
+                /// range, counting the range's slices on the tape, both on tape
+                /// 1 (`a` and `c` whole, `b`'s range 1-2) and on tape 2, the
+                /// continuation that holds only `b`'s range 3-3. What it
+                /// records is what the write recorded.
+                #[test]
+                fn a_full_verify_records_the_figures_of_a_tape_holding_a_range() {
+                    let f = fixture(A_B3_C, &["SG-1", "SG-2"]);
+                    allow_spanning(&f, "b");
+                    let mut tape1 = ArmedAt::new(11, warning);
+                    write(&f, "SG-1", &mut tape1, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    // a and c have their copy: the release cleans them.
+                    for unit in ["a", "c"] {
+                        f.conn
+                            .execute(
+                                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                                params![stage_set_of(&f, unit)],
+                            )
+                            .unwrap();
+                    }
+                    let mut tape2 = MemStore::new(SBS);
+                    write(&f, "SG-2", &mut tape2, false)
+                        .0
+                        .expect("tape 2 continues it");
+                    assert_eq!(writes_of(&f, "SG-2"), pairs(&[("b", "range")]));
+
+                    for (label, store, slices) in [
+                        ("SG-1", &mut tape1 as &mut dyn Store, 4),
+                        ("SG-2", &mut tape2 as &mut dyn Store, 1),
+                    ] {
+                        let written = figures(&f, label);
+                        assert_eq!(written, (slices * PADDED as i64, slices), "{label}");
+                        f.conn
+                            .execute(
+                                "UPDATE volumes SET bytes_written = 0, num_data_files = 0
+                                 WHERE label = ?1",
+                                params![label],
+                            )
+                            .unwrap();
+                        let r = verify(&f, label, store, Tier::Integrity);
+                        assert!(
+                            matches!(
+                                r.figures,
+                                Some(crate::volume::figures::Figures::Recorded(_))
+                            ),
+                            "{label}: {:?}",
+                            r.figures
+                        );
+                        assert_eq!(figures(&f, label), written, "{label}");
+                    }
+                }
+
                 /// The units of a hand-made span plan, `a` whole, `b` may span
                 /// (slices 1-3), `c` whole.
                 fn plan_units() -> Vec<BuildUnit> {
