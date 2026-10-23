@@ -430,12 +430,34 @@ fn staged_match(
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    // The last position a split counts, as confirm counts it
+    // (`layout-session.md` "A write that may span"): K on a short seal, M-1
+    // on a full one, M being the seal marker the front index lists.
+    let counted_through: u32 = match ended_after {
+        Some(k) => k,
+        None => entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    ZoneKind::from_type_label(&e.type_label),
+                    Some(ZoneKind::SealMarker)
+                )
+            })
+            .and_then(|e| u32::try_from(e.position).ok())
+            .map_or(u32::MAX, |m| m.saturating_sub(1)),
+    };
     for (write_id, stage_set_id, status, may_span, staged, here, last) in whole {
         if may_span {
             // #478 (ADR-0012 items 121 and 130, `volume-format-v2.md` §4.4):
-            // the three-way split, as confirm's `span_split` makes it.
-            if let Err(why) = span_matches(conn, write_id, stage_set_id, &status, staged, &on_tape)?
-            {
+            // the three-way split, by confirm's `span_split`.
+            if let Err(why) = span_matches(
+                conn,
+                write_id,
+                stage_set_id,
+                &status,
+                staged,
+                counted_through,
+            )? {
                 return Ok(Err(why));
             }
             continue;
@@ -475,21 +497,22 @@ fn staged_match(
 /// the row says what the tape holds of its stage set. The slices its rows
 /// plan (its `write_positions`) must be one unbroken run in slice order at
 /// consecutive tape positions (`volume-format-v2.md` §4.4: "a volume holds at
-/// most one unbroken range of a stage set"), and the row's status the split
-/// confirm makes (`span_split` in `volume::session`, mirrored here, as the
-/// rebuild's `tape_split` mirrors it from the manifest): of the `staged`
-/// slices of the set, those planned at or before the end (`on_tape`) — all
-/// of them `completed` (item 93's middle tape), some `range`, none `cut`.
-/// The front index and the hashes were matched position by position before
-/// this. `Ok(Err(why))` names the disagreement.
+/// most one unbroken range of a stage set"), and the row's status must be the
+/// split confirm makes, by confirm's own derivation
+/// ([`crate::volume::session::span_split`]): of every slice of the set, those
+/// `written` here at or before `counted_through` (K on a short seal, M-1 on a
+/// full one) — all of them `completed` (item 93's middle tape), some `range`,
+/// none `cut`. The front index and the hashes were matched position by
+/// position before this. `Ok(Err(why))` names the disagreement.
 fn span_matches(
     conn: &Connection,
     write_id: i64,
     stage_set_id: i64,
     status: &str,
     staged: i64,
-    on_tape: &dyn Fn(i64) -> bool,
+    counted_through: u32,
 ) -> Result<std::result::Result<(), String>> {
+    use crate::volume::session::Split;
     let planned: Vec<(i64, i64)> = conn
         .prepare(
             "SELECT sl.slice_number, CAST(wp.position AS INTEGER)
@@ -511,26 +534,23 @@ fn span_matches(
             pair[0].0, pair[0].1, pair[1].0, pair[1].1
         )));
     }
-    let held: Vec<i64> = planned
-        .iter()
-        .filter(|(_, position)| on_tape(*position))
-        .map(|(number, _)| *number)
-        .collect();
-    let expected = if held.len() as i64 == staged {
-        "completed"
-    } else if held.is_empty() {
-        "cut"
-    } else {
-        "range"
+    let split = crate::volume::session::span_split(conn, write_id, counted_through)?;
+    let (expected, holds) = match split {
+        Split::Completed => ("completed", format!("every one of its {staged} slices")),
+        Split::Range {
+            first_slice,
+            last_slice,
+        } if first_slice == last_slice => ("range", format!("slice {first_slice} of its {staged}")),
+        Split::Range {
+            first_slice,
+            last_slice,
+        } => (
+            "range",
+            format!("slices {first_slice}-{last_slice} of its {staged}"),
+        ),
+        Split::Cut => ("cut", "none of its slices".to_string()),
     };
     if status != expected {
-        let holds = match (held.first(), held.last()) {
-            (Some(first), Some(last)) if first == last => {
-                format!("slice {first} of its {staged}")
-            }
-            (Some(first), Some(last)) => format!("slices {first}-{last} of its {staged}"),
-            _ => "none of its slices".to_string(),
-        };
         return Ok(Err(format!(
             "stage set {stage_set_id} is recorded `{status}`, but the tape holds {holds}: it is \
              `{expected}`"

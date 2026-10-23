@@ -4015,7 +4015,7 @@ fn last_slice_position(conn: &Connection, write_id: i64) -> Result<Option<i64>> 
 
 /// What a passing confirm records for one `writes` row (#420, #478).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Split {
+pub(crate) enum Split {
     /// The tape holds the stage set whole: a copy of it.
     Completed,
     /// The tape holds some, not all, of the set's slices: the run from
@@ -4034,7 +4034,7 @@ enum Split {
 /// (item 93's middle tape). At least one: `range`, the run from the lowest
 /// to the highest of them. None: `cut`. A set with no slice rows has every
 /// slice here, as the 1.6.0 rule reads it.
-fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> Result<Split> {
+pub(crate) fn span_split(conn: &Connection, write_id: i64, ended_after: u32) -> Result<Split> {
     let (slices, held, first, last): (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT COUNT(DISTINCT sl.id), COUNT(DISTINCT wp.stage_slice_id),
                 MIN(CASE WHEN wp.id IS NOT NULL THEN sl.slice_number END),
