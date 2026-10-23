@@ -285,6 +285,21 @@
 //! salvage flag), and their replacements are pinned; every other substring
 //! still occurs as often as it did, and no `TOOLS_*` line moved.
 //!
+//! **Moved a fourth time that day, still under item 135**, for the fresh read
+//! of File 1 that item 135 asks for before the tag (`39d2535e…` to
+//! `707c5c87…`; ADR-0012 item 108's stopping rule; its two serious findings).
+//! `--find-envelope`'s unit table marks a unit this tape's plan holds only part
+//! of (`PART`: its block, item 125, gives a `tape_position` to fewer slices than
+//! it lists), so two tapes that each hold part of a unit are not read as two
+//! copies. The cross-tape prompts say to eject the cartridge in the drive first,
+//! and that `done` or `quit` stops the restore and discards the slices read; the
+//! notes and `--help` say an early end removes the scratch directory (screen or
+//! tmux), that a restore across tapes keeps its slices in scratch by default, and
+//! that a fill needs a tape holding the version WHOLE. Text only but for the
+//! table's mark; every first line of a prompt, refusal and verdict is unchanged,
+//! every substring pinned before still occurs as often as it did, and no
+//! `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -311,7 +326,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "39d2535ee8e5fd929324001d479560fac0a3093a62c96231adad0ca6fb668e15";
+const RESTORE_SH_SHA256: &str = "707c5c8763c514a557fd87b87c95bec25067f742976f105b749751de7efa1263";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -516,6 +531,21 @@ fn restore_sh_bytes_are_pinned() {
         "    if [ \"$SPAN_RESTORE\" = stream ] && [ \"$SPAN_SWAPPED\" = 1 ]; then\n",
         "  if [ \"$SPAN_RESTORE\" = path ]; then\n    die \"stopped before slice",
         "nothing is restored without every slice --path needs.",
+        "units_table() { # <MANIFEST.toml>\n  local rows name versions nslices bytes part parted=0\n",
+        "printf \"    %-32s  %-10s  %6s  %10s  PART: %s\\n\"",
+        "!in_head && /^tape_position = / && cur != \"\" { bp++; if (bf == \"\") bf = num; bl = num }",
+        "echo \"    PART: a unit held across tapes, of which this tape's plan holds only the slices named (Slices\"",
+        "eject_first() {\n",
+        "  eject_first\n  info \"Load the cartridge that holds slice $SPAN_NEED into $DEVICE,",
+        "      eject_first\n      info \"Load a cartridge that holds copies of these slices into $DEVICE",
+        "done or quit STOPS this restore and discards the slices read so far, with the scratch directory:",
+        "done or quit STOPS this restore: it does not go on without the slice, and the files dar has",
+        "It must hold this version WHOLE: a tape that holds only part of a unit held across tapes is",
+        "this run and removes that directory with the slices read: run it in screen or tmux. A run",
+        "tmux; only kill -9 or a crash leaves it, to remove by hand.",
+        "A unit across tapes (by default) keeps all of its slices there too, still",
+        "it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part",
+        "says why and asks again; done or quit stops it.",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
