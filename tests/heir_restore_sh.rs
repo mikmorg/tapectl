@@ -1985,7 +1985,10 @@ impl Heir {
     /// Put the cartridge `label` in the drive, as a heir does between prompts:
     /// the head at its start, and a line `swap` in `ops`.
     fn load(&self, label: &str) {
-        assert!(self.dir.join("cart").join(label).is_dir(), "no cartridge {label}");
+        assert!(
+            self.dir.join("cart").join(label).is_dir(),
+            "no cartridge {label}"
+        );
         std::fs::write(self.dir.join("loaded"), format!("cart/{label}")).unwrap();
         std::fs::write(self.dir.join("pos"), "0\n").unwrap();
         use std::io::Write;
@@ -10009,7 +10012,10 @@ fn a_restore_of_a_range_stops_before_dar_and_names_the_tapes_it_needs() {
             needles.push("and the run on this tape starts at slice 3.".to_string());
             needles.push("names these tapes as holding slice 1".to_string());
             needles.push(other);
-            assert!(!text.contains(&here), "only the holders of slice 1:\n{text}");
+            assert!(
+                !text.contains(&here),
+                "only the holders of slice 1:\n{text}"
+            );
         } else {
             needles.push("--path reads one tape. Restore the whole unit instead".to_string());
         }
@@ -10276,7 +10282,10 @@ fn a_range_the_early_warning_ended_is_named_by_its_run_and_not_as_cut() {
         )),
         "{text}"
     );
-    assert!(text.contains(&format!("needs slice 4 of {n} next")), "{text}");
+    assert!(
+        text.contains(&format!("needs slice 4 of {n} next")),
+        "{text}"
+    );
     assert!(
         flat(&text).contains("stopped before slice 4 of 'big' (version 2)"),
         "{text}"
@@ -10835,7 +10844,10 @@ fn assert_scratch_holds(dest: &str, b: &SpanBox, upto: usize, what: &str) {
         dir.display()
     );
     for (num, bytes) in &slices {
-        assert!(bytes.starts_with(b"STUBAGE:"), "{what}: slice {num} is ciphertext");
+        assert!(
+            bytes.starts_with(b"STUBAGE:"),
+            "{what}: slice {num} is ciphertext"
+        );
         assert_eq!(
             sha256_hex(bytes),
             big.hashes[num - 1],
@@ -10849,17 +10861,16 @@ fn dd_into(h: &Heir, dest: &str) -> Vec<String> {
     std::fs::read_to_string(h.dir.join("procs"))
         .unwrap_or_default()
         .lines()
-        .filter(|l| l.starts_with("start ") && l.contains(" dd ") && l.contains(&format!("of={dest}")))
+        .filter(|l| {
+            l.starts_with("start ") && l.contains(" dd ") && l.contains(&format!("of={dest}"))
+        })
         .map(str::to_string)
         .collect()
 }
 
 /// The reads of each cartridge of a run, split where `load` swapped them.
 fn reads_by_cartridge(h: &Heir) -> Vec<Vec<i64>> {
-    h.ops()
-        .split(|l| l == "swap")
-        .map(reads_in)
-        .collect()
+    h.ops().split(|l| l == "swap").map(reads_in).collect()
 }
 
 /// Item 93 and ADR-0012 item 136 proof 2: of two copies over three tapes, the
@@ -10886,7 +10897,10 @@ fn item_93s_two_copies_restore_from_tapes_1_and_3_or_from_tape_2_alone() {
     assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
     for needle in [
         format!("'big' (version 2) is held across tapes: this tape holds slices 1 to 2 of {n}."),
-        format!("'big' (version 2) needs slice 3 of {n} next: {} bytes, sha256 {}", big.sizes[2], big.hashes[2]),
+        format!(
+            "'big' (version 2) needs slice 3 of {n} next: {} bytes, sha256 {}",
+            big.sizes[2], big.hashes[2]
+        ),
         "This cartridge identifies as: SPAN03".to_string(),
         format!("It gives slice(s) 3 to {n} of 'big'"),
         "Every slice of 'big' is in the scratch directory".to_string(),
@@ -10923,6 +10937,23 @@ fn item_93s_two_copies_restore_from_tapes_1_and_3_or_from_tape_2_alone() {
     }
     assert!(scratch_slices(&dest).is_none(), "the scratch is gone");
 
+    // ADR-0012 item 139: tape 2, a whole copy, gives slices 3..N after tape
+    // 1's spool as well (a tape that holds the version whole gives any slice).
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 0);
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &[]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        assert_eq!(k, 1, "one cartridge change");
+        h.load("SPAN02");
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    assert!(
+        text.contains(&format!("It gives slice(s) 3 to {n} of 'big'")),
+        "{text}"
+    );
+
     let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 1);
     let dest = h.sub("restored");
     let args = big_args(&h, &dest, &[]);
@@ -10934,7 +10965,10 @@ fn item_93s_two_copies_restore_from_tapes_1_and_3_or_from_tape_2_alone() {
     for word in ["held across tapes", "scratch directory", "needs slice"] {
         assert!(!text.contains(word), "{word:?}:\n{text}");
     }
-    assert!(dd_into(&h, &dest).is_empty(), "no slice is written into --to");
+    assert!(
+        dd_into(&h, &dest).is_empty(),
+        "no slice is written into --to"
+    );
     assert_eq!(reads_by_cartridge(&h).len(), 1, "no swap");
 }
 
@@ -10956,18 +10990,28 @@ fn a_three_tape_span_restores_across_two_swaps_either_way() {
         let (code, text) = h.run_prompted(&strs(&args), |k, text| {
             let what = format!("stream {stream}, prompt {k}");
             if stream {
-                assert!(slice_files(&h, b).is_empty(), "{what}: {:?}", slice_files(&h, b));
+                assert!(
+                    slice_files(&h, b).is_empty(),
+                    "{what}: {:?}",
+                    slice_files(&h, b)
+                );
                 assert!(scratch_slices(&dest).is_none(), "{what}: no scratch");
             } else {
                 assert_scratch_holds(&dest, b, if k == 1 { 2 } else { n - 1 }, &what);
             }
             match k {
                 1 => {
-                    assert!(text.contains(&format!("needs slice 3 of {n} next")), "{what}");
+                    assert!(
+                        text.contains(&format!("needs slice 3 of {n} next")),
+                        "{what}"
+                    );
                     h.load("SPAN22");
                 }
                 2 => {
-                    assert!(text.contains(&format!("needs slice {n} of {n} next")), "{what}");
+                    assert!(
+                        text.contains(&format!("needs slice {n} of {n} next")),
+                        "{what}"
+                    );
                     h.load("SPAN23");
                 }
                 _ => panic!("{what}: two swaps\n{text}"),
@@ -10976,9 +11020,18 @@ fn a_three_tape_span_restores_across_two_swaps_either_way() {
         });
         assert_eq!(code, 0, "stream {stream}: {text}");
         assert!(text.contains("RESTORE COMPLETE"), "{text}");
-        assert!(same_tree(&big.src, Path::new(&dest)), "stream {stream}: {text}");
-        assert!(text.contains(&format!("It gives slice(s) 3 to {} of 'big'", n - 1)), "{text}");
-        assert!(text.contains(&format!("It gives slice(s) {n} to {n} of 'big'")), "{text}");
+        assert!(
+            same_tree(&big.src, Path::new(&dest)),
+            "stream {stream}: {text}"
+        );
+        assert!(
+            text.contains(&format!("It gives slice(s) 3 to {} of 'big'", n - 1)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("It gives slice(s) {n} to {n} of 'big'")),
+            "{text}"
+        );
         assert_eq!(reads_by_cartridge(&h).len(), 3, "{:#?}", h.ops());
         if stream {
             assert!(text.contains("--stream-tapes: one dar run"), "{text}");
@@ -11043,9 +11096,22 @@ fn a_cartridge_is_taken_only_by_the_next_slices_hash_at_a_position_its_seal_cove
         "Its front index lists no data slice with the sha256 of slice 3 ({s3}...), so it does\n>>> not hold that slice. Nothing is taken from it."
     );
     assert_eq!(text.matches(&past).count(), 2, "SPAN01 and SPAN11:\n{text}");
-    assert_eq!(text.matches(&none).count(), 2, "SPAN23 and SPAN03X:\n{text}");
-    assert_eq!(text.matches("This cartridge identifies as: SPAN03\n").count(), 2, "{text}");
-    assert_eq!(text.matches(&format!("It gives slice(s) 3 to {n} of 'big'")).count(), 1);
+    assert_eq!(
+        text.matches(&none).count(),
+        2,
+        "SPAN23 and SPAN03X:\n{text}"
+    );
+    assert_eq!(
+        text.matches("This cartridge identifies as: SPAN03\n")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches(&format!("It gives slice(s) 3 to {n} of 'big'"))
+            .count(),
+        1
+    );
     // Nothing but File 0, File 3 and the seal of a cartridge not taken.
     let by_tape = reads_by_cartridge(&h);
     assert_eq!(by_tape.len(), 6, "{:#?}", h.ops());
@@ -11092,7 +11158,10 @@ fn started_on_a_tape_without_slice_1_it_refuses_naming_slice_1s_holders() {
             format!("    tape SPAN02  (sealed 2026-09-01T10:00:00Z)  slices 1-{n} of {n}"),
         ];
         if named {
-            assert!(text.contains("names these tapes as holding slice 1"), "{text}");
+            assert!(
+                text.contains("names these tapes as holding slice 1"),
+                "{text}"
+            );
             for r in &rows {
                 assert!(text.contains(r), "{r:?}:\n{text}");
             }
@@ -11102,7 +11171,10 @@ fn started_on_a_tape_without_slice_1_it_refuses_naming_slice_1s_holders() {
                 "{text}"
             );
         }
-        assert!(!text.contains(&format!("    tape {label}  (this tape")), "{text}");
+        assert!(
+            !text.contains(&format!("    tape {label}  (this tape")),
+            "{text}"
+        );
         assert!(!text.contains(SPAN_PROMPT), "{text}");
         assert!(
             walk(&h).0.iter().all(|p| *p < first),
@@ -11173,9 +11245,16 @@ fn the_prompt_waits_without_a_time_limit_and_holds_no_device() {
         let extra: &[&str] = if stream { &["--stream-tapes"] } else { &[] };
         let args = big_args(&h, &dest, extra);
         let (code, text) = h.run_prompted(&strs(&args), |_, _| {
-            assert!(h.running().is_empty(), "running at the prompt: {:?}", h.running());
+            assert!(
+                h.running().is_empty(),
+                "running at the prompt: {:?}",
+                h.running()
+            );
             let before = std::fs::read_to_string(h.dir.join("procs")).unwrap();
-            assert!(before.lines().any(|l| l.contains(" dd ")), "the log is written");
+            assert!(
+                before.lines().any(|l| l.contains(" dd ")),
+                "the log is written"
+            );
             if !stream {
                 assert_scratch_holds(&dest, b, 2, "at the prompt");
             }
@@ -11192,8 +11271,14 @@ fn the_prompt_waits_without_a_time_limit_and_holds_no_device() {
             Some(String::new())
         });
         assert_eq!(code, 0, "stream {stream}: {text}");
-        assert!(same_tree(&big.src, Path::new(&dest)), "stream {stream}: {text}");
-        assert!(text.contains("This waits for as long as you take."), "{text}");
+        assert!(
+            same_tree(&big.src, Path::new(&dest)),
+            "stream {stream}: {text}"
+        );
+        assert!(
+            text.contains("This waits for as long as you take."),
+            "{text}"
+        );
     }
 }
 
@@ -11209,13 +11294,18 @@ fn quitting_at_the_prompt_restores_nothing_and_says_so() {
         let dest = h.sub("restored");
         let extra: &[&str] = if stream { &["--stream-tapes"] } else { &[] };
         let args = big_args(&h, &dest, extra);
-        let (code, text) =
-            h.run_prompted(&strs(&args), |_, _| reply.map(str::to_string));
+        let (code, text) = h.run_prompted(&strs(&args), |_, _| reply.map(str::to_string));
         assert_eq!(code, 1, "{stream} {reply:?}: {text}");
         let fatal = flat(text.split("FATAL:").nth(1).expect("a FATAL"));
-        assert!(fatal.contains("stopped before slice 3 of 'big' (version 2)"), "{fatal}");
+        assert!(
+            fatal.contains("stopped before slice 3 of 'big' (version 2)"),
+            "{fatal}"
+        );
         if stream {
-            assert!(fatal.contains("those files are part of the unit only"), "{fatal}");
+            assert!(
+                fatal.contains("those files are part of the unit only"),
+                "{fatal}"
+            );
         } else {
             assert!(fatal.contains("nothing of it was restored"), "{fatal}");
             assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0, "{text}");
@@ -11237,27 +11327,53 @@ fn what_a_restore_across_tapes_refuses_before_it_reads_a_slice() {
     let dir = h.sub("copies");
     std::fs::create_dir_all(&dir).unwrap();
     for (extra, needle) in [
-        (vec!["--slices-from", dir.as_str()], "so it takes no\n       --slices-from or --swap-tapes"),
-        (vec!["--swap-tapes"], "so it takes no\n       --slices-from or --swap-tapes"),
-        (vec!["--path", "file0.bin"], "--path reads one tape. Restore the whole unit instead"),
+        (
+            vec!["--slices-from", dir.as_str()],
+            "so it takes no\n       --slices-from or --swap-tapes",
+        ),
+        (
+            vec!["--swap-tapes"],
+            "so it takes no\n       --slices-from or --swap-tapes",
+        ),
+        (
+            vec!["--path", "file0.bin"],
+            "--path reads one tape. Restore the whole unit instead",
+        ),
         (vec!["--unit", "big"], "restore it on its own"),
     ] {
         let args = big_args(&h, &dest, &extra);
         let (code, text) = runv(&h, &args);
         assert_eq!(code, 1, "{extra:?}: {text}");
         assert!(text.contains(needle), "{extra:?}: {needle:?}:\n{text}");
-        assert!(text.contains("No slice has been read."), "{extra:?}: {text}");
-        assert!(walk(&h).0.iter().all(|p| *p < first), "{extra:?}: {:#?}", h.ops());
+        assert!(
+            text.contains("No slice has been read."),
+            "{extra:?}: {text}"
+        );
+        assert!(
+            walk(&h).0.iter().all(|p| *p < first),
+            "{extra:?}: {:#?}",
+            h.ops()
+        );
     }
     for (extra, needle) in [
-        (vec!["--stream-tapes", "--path", "file0.bin"], "--stream-tapes reads a whole unit across tapes: it takes no --path"),
-        (vec!["--stream-tapes", "--swap-tapes"], "--stream-tapes takes every slice by its sha256"),
+        (
+            vec!["--stream-tapes", "--path", "file0.bin"],
+            "--stream-tapes reads a whole unit across tapes: it takes no --path",
+        ),
+        (
+            vec!["--stream-tapes", "--swap-tapes"],
+            "--stream-tapes takes every slice by its sha256",
+        ),
     ] {
         let args = big_args(&h, &dest, &extra);
         let (code, text) = runv(&h, &args);
         assert_eq!(code, 1, "{extra:?}: {text}");
         assert!(text.contains(needle), "{extra:?}: {needle:?}:\n{text}");
-        assert!(reads(&h).is_empty(), "a usage error reads nothing: {:#?}", h.ops());
+        assert!(
+            reads(&h).is_empty(),
+            "a usage error reads nothing: {:#?}",
+            h.ops()
+        );
     }
     let (code, text) = h.run(&[
         "--restore",
@@ -11271,7 +11387,8 @@ fn what_a_restore_across_tapes_refuses_before_it_reads_a_slice() {
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("--stream-tapes reads one unit across tapes: give --unit U, not --all"));
 
-    let old = "#!/bin/sh\ncase \"$*\" in -V*) echo ' dar version 2.7.8, Copyright'; exit 0 ;; esac\n\
+    let old =
+        "#!/bin/sh\ncase \"$*\" in -V*) echo ' dar version 2.7.8, Copyright'; exit 0 ;; esac\n\
                exec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
     h.stub("dar", old);
     let args = big_args(&h, &dest, &[]);
@@ -11329,12 +11446,55 @@ fn where_and_find_on_each_of_item_93s_tapes_print_each_holders_run() {
         let holders = block(&found, "Tapes holding big version 2:");
         for r in &rows {
             assert!(text.contains(r), "{label}: {r:?}:\n{text}");
-            assert!(holders.iter().any(|l| l == r), "{label}: {r:?}:\n{holders:#?}");
+            assert!(
+                holders.iter().any(|l| l == r),
+                "{label}: {r:?}:\n{holders:#?}"
+            );
         }
         assert_eq!(
             text.matches("    tape ").count(),
             rows.len(),
             "{label}: no other holder:\n{text}"
         );
+    }
+}
+
+/// The default mode takes a slice that fails from another cartridge: tape 3's
+/// slice 4 does not match its front index, so the restore stops reading tape
+/// 3 there and asks for slice 4, and tape 2, the whole copy, gives 4..N. Only
+/// the slice's sha256 decides, and the restore is byte for byte.
+#[test]
+fn a_slice_that_fails_is_asked_for_again_from_another_cartridge() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN02", "SPAN03"]), 0);
+    let bad = unit_of(b.t("SPAN03"), "big").positions[1];
+    let f = h.dir.join(format!("cart/SPAN03/{bad}"));
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[100] ^= 0xff;
+    std::fs::write(&f, bytes).unwrap();
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &[]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        match k {
+            1 => h.load("SPAN03"),
+            2 => {
+                assert_scratch_holds(&dest, b, 3, "after tape 3's bad slice");
+                h.load("SPAN02");
+            }
+            _ => panic!("two cartridge changes"),
+        }
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    for needle in [
+        format!("slice 4 (tape file {bad}) does not match the front index"),
+        "another cartridge that holds it is asked for".to_string(),
+        format!("needs slice 4 of {n} next"),
+        format!("It gives slice(s) 4 to {n} of 'big'"),
+    ] {
+        assert!(text.contains(&needle), "{needle:?}:\n{text}");
     }
 }

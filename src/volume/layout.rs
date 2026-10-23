@@ -8651,6 +8651,12 @@ mod tests {
             "so that disk needs room for the whole unit's encrypted slices (the sum of their `encrypted_bytes`) besides the restored files",
             "when the room is not there it refuses and names `--stream-tapes`",
             "`--stream-tapes` keeps no slice on disk: it feeds dar from each tape in turn, so it needs every cartridge at hand",
+            // What L2 built (ADR-0012 item 132, the coordinator's prompt ruling).
+            "Either way it waits at each change of cartridge for as long as you take, reading your answer from its input, and `quit` stops it.",
+            "A slice that fails its hash or will not read is asked for again, by default, from another cartridge that holds it; with `--stream-tapes` it ends the run.",
+            "A run that is killed leaves its scratch directory inside `--to` (or `--scratch DIR`), named `.tapectl-restore.` and some letters and holding encrypted slices only: remove it by hand",
+            "A dar older than 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit) cannot read slices this way, and RESTORE.sh says so before it reads one.",
+            "`--path` reads one tape: for a unit held across tapes, restore the whole unit.",
         ] {
             assert!(sec.contains(needle), "{needle:?}: {sec}");
         }
