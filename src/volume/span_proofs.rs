@@ -1,0 +1,697 @@
+//! The span proofs (#478, tapectl 1.7.0): ADR-0012 items 93, 94, 127-131 and
+//! 144, and item 136's proofs as far as a medium in memory can show them,
+//! across the pieces different builds made (the planner, confirm, the
+//! per-slice release, restore and rebuild). The mhvtl gate's span leg proves
+//! the rest with a tape and the real `age` (item 136; RESTORE.sh's modes are
+//! the gate's, item 70).
+//!
+//! Everything is real but the drive. The tenants, their keys and the escrow
+//! recipient are made as `tapectl init` and `tenant add` make them; each unit
+//! is a folder of files registered by `unit init`, its policy edited in its
+//! dotfile as an operator edits it; `snapshot create` and `stage create` run
+//! the real dar and age. Each cartridge is registered and each volume made by
+//! the real `volume init` over a [`MemStore`], and each tape is written by the
+//! real `volume write` ([`write::volume_write_contacted`] with the store
+//! injected), followed by the release the CLI runs after it. The drive's
+//! early warning is MemStore's own ([`MemStore::with_early_warning_after`]),
+//! armed where a test puts it ([`Warn`]). No catalog row is made by hand.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection};
+use tempfile::TempDir;
+
+use crate::cli::cartridge::CartridgeCommands;
+use crate::cli::volume::StagingRelease;
+use crate::config::{Config, LtoBackendConfig, TapectlPaths};
+use crate::error::Result;
+use crate::store::{CapacityReport, EarlyWarning, MemStore, Store};
+use crate::tape::contact::ContactSlot;
+use crate::volume::write::{self, ContactStore, RecordedRange};
+
+/// The tape's block size: small, so a fixture's slices are a few blocks.
+const BS: usize = 4096;
+/// The drive: a path no device is at, so every fact check that reads the
+/// hardware finds nothing and the injected store is the medium.
+const DEVICE: &str = "/nonexistent/tapectl-span-proofs-nst";
+const DEVICE_SG: &str = "/nonexistent/tapectl-span-proofs-sg";
+const BACKEND: &str = "lto6span";
+
+/// The tenants, named so that no name is a word a tape could hold by chance
+/// (the isolation scan looks for each).
+const OPERATOR: &str = "quince-operator-main";
+const TENANT_ONE: &str = "persimmon-tenant-one";
+const TENANT_TWO: &str = "persimmon-tenant-two";
+
+/// Deterministic incompressible bytes, so dar's output is the input's size.
+fn noise(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 11) as u8
+        })
+        .collect()
+}
+
+/// One unit's files: `(name, bytes)`, each name prefixed by the unit's tag.
+type Files = Vec<(String, Vec<u8>)>;
+
+fn files(tag: &str, sizes: &[usize], seed: u32) -> Files {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            (
+                format!("{tag}-part-{:04}.bin", i + 1),
+                noise(len, seed + i as u32 * 7919),
+            )
+        })
+        .collect()
+}
+
+/// When the drive's early warning comes on a write.
+#[derive(Debug, Clone, Copy)]
+enum Warn {
+    /// Never: the tape seals full.
+    Never,
+    /// One byte into tape file of `unit`'s slice `n`, wherever the plan
+    /// puts it (looked up in the plan's `write_positions` when the session
+    /// starts writing): its first block reaches the warning.
+    InSlice(&'static str, i64),
+    /// After this many bytes on the medium: where the cartridge's nominal
+    /// capacity ends, the estimate item 94 plans by.
+    AtBytes(u64),
+}
+
+/// `m`'s files on a fresh medium whose early warning is after `at` bytes.
+fn rearmed(m: MemStore, at: u64) -> MemStore {
+    let mut armed = MemStore::new(BS).with_early_warning_after(at);
+    armed.files = m.files;
+    armed.syncs = m.syncs;
+    armed
+}
+
+/// The drive a write sees: the volume's medium, its early warning armed as
+/// [`Warn`] says.
+struct Drive<'c> {
+    medium: MemStore,
+    conn: &'c Connection,
+    label: String,
+    warn: Warn,
+}
+
+impl<'c> Drive<'c> {
+    fn new(conn: &'c Connection, label: &str, medium: MemStore, warn: Warn) -> Self {
+        let medium = match warn {
+            Warn::AtBytes(at) => rearmed(medium, at),
+            _ => medium,
+        };
+        Drive {
+            medium,
+            conn,
+            label: label.to_string(),
+            warn,
+        }
+    }
+}
+
+impl Store for Drive<'_> {
+    fn capacity(&mut self) -> Result<CapacityReport> {
+        self.medium.capacity()
+    }
+    fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        if let Warn::InSlice(unit, n) = self.warn {
+            let at = planned_position(self.conn, &self.label, unit, n);
+            if at == Some(self.medium.files.len() as i64) {
+                let before = self
+                    .medium
+                    .files
+                    .iter()
+                    .map(|f| f.len() as u64)
+                    .sum::<u64>();
+                let medium = std::mem::replace(&mut self.medium, MemStore::new(BS));
+                self.medium = rearmed(medium, before + 1);
+                self.warn = Warn::Never;
+            }
+        }
+        self.medium.execute(src, len, sync)
+    }
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.medium.early_warning()
+    }
+    fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+        self.medium.read_file(position, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+        self.medium.reposition_for_resume(file_index)
+    }
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        self.medium.reposition_at_most(file_index)
+    }
+    fn blank_at_bot(&mut self) -> Result<bool> {
+        self.medium.blank_at_bot()
+    }
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        self.medium.eod_at_or_before(position)
+    }
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        self.medium.files_on_medium()
+    }
+}
+
+/// A medium's recorded files on a fresh store (for a restore or a rebuild,
+/// which read and never write).
+fn copy_of(m: &MemStore) -> MemStore {
+    let mut copy = MemStore::new(BS);
+    copy.files = m.files.clone();
+    copy.syncs = m.syncs.clone();
+    copy
+}
+
+/// A tapectl home with its operator, two tenants and the escrow recipient,
+/// a drive that declares `post_warning_bytes` (a span needs it, item 123),
+/// and the volumes made in it, each medium as its last contact left it.
+struct Home {
+    conn: Connection,
+    paths: TapectlPaths,
+    config: Config,
+    sources: PathBuf,
+    tapes: BTreeMap<String, MemStore>,
+    escrow_public: String,
+    /// The files each unit was made of, by unit name.
+    units: BTreeMap<String, Files>,
+    _tmp: TempDir,
+}
+
+impl Home {
+    /// `capacity`: the drive's `capacity_override` (a virtual drive's small
+    /// cartridges), or `None` for LTO-6's own. `slice_size` is `[defaults]`.
+    fn new(capacity: Option<&str>, min_copies: i32, slice_size: &str) -> Home {
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        let staging = tmp.path().join("staging");
+        let sources = tmp.path().join("sources");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&sources).unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "dar".to_string();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.slice_size = slice_size.to_string();
+        config.defaults.min_copies = min_copies;
+        config.backends.lto.push(LtoBackendConfig {
+            name: BACKEND.into(),
+            device_tape: DEVICE.into(),
+            device_sg: DEVICE_SG.into(),
+            generation: "LTO-6".into(),
+            capacity_override: capacity.map(str::to_string),
+            fill_ceiling: crate::config::DEFAULT_FILL_CEILING,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: Some("64M".into()),
+        });
+
+        crate::tenant::add_tenant(&conn, &paths, OPERATOR, None, true).unwrap();
+        for tenant in [TENANT_ONE, TENANT_TWO] {
+            crate::tenant::add_tenant(&conn, &paths, tenant, None, false).unwrap();
+        }
+        let escrow = crate::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
+        Home {
+            conn,
+            paths,
+            config,
+            sources,
+            tapes: BTreeMap::new(),
+            escrow_public: escrow.keypair.public_key,
+            units: BTreeMap::new(),
+            _tmp: tmp,
+        }
+    }
+
+    /// `unit init` of a folder of `files` for `tenant`; `allow_spanning`
+    /// set in its dotfile's `[policy]` when given, as an operator edits it.
+    fn unit(&mut self, tenant: &str, name: &str, files: Files, allow_spanning: Option<bool>) {
+        let dir = self.sources.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        for (file, bytes) in &files {
+            fs::write(dir.join(file), bytes).unwrap();
+        }
+        crate::unit::init_unit_with_config(
+            &self.conn,
+            &self.config,
+            dir.to_str().unwrap(),
+            tenant,
+            Some(name),
+            &[],
+            None,
+        )
+        .unwrap();
+        if let Some(value) = allow_spanning {
+            let dotfile = dir.join(".tapectl-unit.toml");
+            let mut d = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+            d.allow_spanning = Some(value);
+            crate::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
+        }
+        self.units.insert(name.to_string(), files);
+    }
+
+    /// `snapshot create` then `stage create` of `unit`: its stage set.
+    fn stage(&self, unit: &str) -> i64 {
+        let snapshot = crate::staging::snapshot_create(&self.conn, unit, &self.config).unwrap();
+        crate::staging::stage_create(&self.conn, &self.paths, &self.config, snapshot, true)
+            .unwrap_or_else(|e| panic!("stage create {unit}: {e}"))
+    }
+
+    /// `cartridge register` of a blank LTO-6 cartridge, then `volume init`
+    /// of `label` on it (`--cartridge`: no chip serial can be read here).
+    fn volume(&mut self, label: &str) {
+        let barcode = format!("{label}-STK");
+        crate::cli::cartridge::run(
+            &self.conn,
+            &self.config,
+            &CartridgeCommands::Register {
+                barcode: barcode.clone(),
+                generation: "LTO-6".into(),
+                capacity: None,
+                serial: None,
+                notes: None,
+            },
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut medium = MemStore::new(BS);
+        let mut slot = ContactSlot::empty();
+        let r = write::volume_init_contacted(
+            &self.conn,
+            &self.config,
+            label,
+            DEVICE,
+            BS,
+            false,
+            None,
+            Some(&barcode),
+            &mut slot,
+            ContactStore::Injected(&mut medium),
+        );
+        slot.finish_result(r)
+            .unwrap_or_else(|e| panic!("volume init {label}: {e}"));
+        self.tapes.insert(label.to_string(), medium);
+    }
+
+    /// `volume write` of `label` with the drive's early warning as `warn`,
+    /// then the staging release `volume write` runs after a write that
+    /// stood.
+    fn write(&mut self, label: &str, warn: Warn) -> StagingRelease {
+        self.try_write(label, warn)
+            .unwrap_or_else(|e| panic!("volume write {label}: {e}"))
+    }
+
+    fn try_write(&mut self, label: &str, warn: Warn) -> Result<StagingRelease> {
+        let medium = self.tapes.remove(label).expect("the volume was made");
+        let mut drive = Drive::new(&self.conn, label, medium, warn);
+        let mut slot = ContactSlot::empty();
+        let r = write::volume_write_contacted(
+            &self.conn,
+            &self.paths,
+            &self.config,
+            label,
+            DEVICE,
+            BS,
+            false,
+            false,
+            false,
+            false,
+            true,
+            &mut slot,
+            ContactStore::Injected(&mut drive),
+            None,
+        );
+        let r = slot.finish_result(r);
+        self.tapes.insert(label.to_string(), drive.medium);
+        r?;
+        Ok(crate::cli::volume::release_staging_after_write(
+            &self.conn,
+            &self.config,
+            label,
+            false,
+        ))
+    }
+
+    fn files(&self, label: &str) -> &[Vec<u8>] {
+        &self.tapes[label].files
+    }
+
+    /// The operator's identities, as `catalog rebuild --key` reads them.
+    fn operator_identities(&self) -> Vec<age::x25519::Identity> {
+        let ids =
+            crate::crypto::keys::load_tenant_identities(&self.conn, &self.paths.keys_dir, OPERATOR)
+                .unwrap();
+        assert!(!ids.is_empty(), "the operator has a key");
+        ids
+    }
+}
+
+// ── catalog reads ──
+
+/// Where the plan put `unit`'s slice `n` on `label`, once it is planned.
+fn planned_position(conn: &Connection, label: &str, unit: &str, n: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT CAST(wp.position AS INTEGER) FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          WHERE v.label = ?1 AND u.name = ?2 AND sl.slice_number = ?3",
+        params![label, unit, n],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+fn position_of(conn: &Connection, label: &str, unit: &str, n: i64) -> i64 {
+    planned_position(conn, label, unit, n)
+        .unwrap_or_else(|| panic!("{unit} slice {n} is not planned on {label}"))
+}
+
+/// `(unit, writes.status, writes.may_span)` of the volume, by unit name.
+fn writes_of(conn: &Connection, label: &str) -> Vec<(String, String, bool)> {
+    conn.prepare(
+        "SELECT u.name, w.status, w.may_span FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          WHERE v.label = ?1 ORDER BY u.name",
+    )
+    .unwrap()
+    .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn rows(want: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+    let mut v: Vec<(String, String, bool)> = want
+        .iter()
+        .map(|(u, s, m)| (u.to_string(), s.to_string(), *m))
+        .collect();
+    v.sort();
+    v
+}
+
+fn stage_set_of(conn: &Connection, unit: &str) -> i64 {
+    conn.query_row(
+        "SELECT ss.id FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+           JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+        params![unit],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn stage_set_status(conn: &Connection, unit: &str) -> String {
+    conn.query_row(
+        "SELECT status FROM stage_sets WHERE id = ?1",
+        params![stage_set_of(conn, unit)],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn snapshot_status(conn: &Connection, unit: &str) -> String {
+    conn.query_row(
+        "SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+        params![unit],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn num_slices(conn: &Connection, unit: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
+        params![stage_set_of(conn, unit)],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Each slice's copies, in slice order (item 127).
+fn slice_copies(conn: &Connection, unit: &str) -> Vec<i64> {
+    crate::policy::coverage::slice_copies(conn, stage_set_of(conn, unit))
+        .unwrap()
+        .into_iter()
+        .map(|s| s.copies)
+        .collect()
+}
+
+/// The unit's copies as `audit` counts a unit's current versions.
+fn unit_copies(conn: &Connection, unit: &str) -> i64 {
+    let id: i64 = conn
+        .query_row("SELECT id FROM units WHERE name = ?1", [unit], |r| r.get(0))
+        .unwrap();
+    conn.query_row(
+        &format!(
+            "SELECT {}",
+            crate::policy::coverage::copy_count_expr(
+                &crate::policy::coverage::CoverageQuery::current_unit("?1")
+            )
+        ),
+        [id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// The slices of `unit` whose staged file was released (item 129): the
+/// release recorded, the path cleared and the file gone, all three together.
+fn released_slices(conn: &Connection, unit: &str) -> Vec<i64> {
+    let rows: Vec<(i64, Option<String>, Option<String>)> = conn
+        .prepare(
+            "SELECT slice_number, released_at, staging_path
+               FROM stage_slices WHERE stage_set_id = ?1 ORDER BY slice_number",
+        )
+        .unwrap()
+        .query_map(params![stage_set_of(conn, unit)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let mut released = Vec::new();
+    for (n, released_at, path) in rows {
+        match (released_at, path) {
+            (Some(_), None) => released.push(n),
+            (None, Some(p)) => assert!(
+                Path::new(&p).exists(),
+                "{unit} slice {n} is kept, so its staged file is there: {p}"
+            ),
+            (released_at, path) => {
+                panic!("{unit} slice {n}: released_at {released_at:?} with staging_path {path:?}")
+            }
+        }
+    }
+    released
+}
+
+/// File 0's `requires` line, as the tape holds it.
+fn requires_line(files: &[Vec<u8>]) -> String {
+    String::from_utf8_lossy(&files[0])
+        .lines()
+        .find(|l| l.starts_with("requires = "))
+        .expect("File 0 states requires")
+        .to_string()
+}
+
+fn range(unit: &str, first_slice: i64, last_slice: i64) -> RecordedRange {
+    RecordedRange {
+        unit: unit.into(),
+        version: 1,
+        first_slice,
+        last_slice,
+    }
+}
+
+/// The volume's `(sealed, ended_after)`.
+fn sealing(conn: &Connection, label: &str) -> (bool, Option<i64>) {
+    conn.query_row(
+        "SELECT sealed_at IS NOT NULL, ended_after FROM volumes WHERE label = ?1",
+        params![label],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+// ── item 93: two copies over three tapes ──
+
+const A93: &str = "kumquat-whole-alpha";
+const B93: &str = "kumquat-span-bravo";
+const C93: &str = "kumquat-whole-charlie";
+const T93: [&str; 3] = ["SPN93-T1", "SPN93-T2", "SPN93-T3"];
+
+/// Item 93's catalog: `a` and `c` whole, `b` spannable in three slices, at a
+/// copy target of 2, three blank volumes; nothing written yet.
+fn home_93() -> Home {
+    let mut h = Home::new(None, 2, "64K");
+    h.unit(TENANT_ONE, A93, files("alpha-ledger", &[20_000], 1), None);
+    h.unit(
+        TENANT_ONE,
+        B93,
+        files("bravo-reel", &[50_000, 50_000, 50_000], 2),
+        Some(true),
+    );
+    h.unit(TENANT_TWO, C93, files("charlie-notes", &[20_000], 3), None);
+    for unit in [A93, B93, C93] {
+        h.stage(unit);
+    }
+    assert_eq!(num_slices(&h.conn, A93), 1);
+    assert_eq!(num_slices(&h.conn, B93), 3, "b is three slices");
+    assert_eq!(num_slices(&h.conn, C93), 1);
+    for label in T93 {
+        h.volume(label);
+    }
+    h
+}
+
+/// THE item 93 proof, from the real write: two copies of a spannable `b`
+/// over three tapes. Tape 1 holds the whole units first and `b` last, and
+/// the early warning inside `b`'s slice 2 ends its range at 1-2. Tape 2
+/// begins with `b`'s owed run, the whole set, and holds it whole. Tape 3
+/// begins with the owed run 3-3 and seals full. The rows are `range`,
+/// `completed`, `range`; every slice is on two volumes; the version is
+/// `current` once one sealed volume set holds every slice (item 128); and
+/// staging is released slice by slice as each slice meets the floor (item
+/// 129), the whole units' sets as each meets it.
+#[test]
+fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
+    let mut h = home_93();
+
+    // Tape 1: a and c whole first, b last; the warning one byte into b's
+    // slice 2 ends the tape after it.
+    let release = h.write(T93[0], Warn::InSlice(B93, 2));
+    let c = &h.conn;
+    let a1 = position_of(c, T93[0], A93, 1);
+    let c1 = position_of(c, T93[0], C93, 1);
+    let b1 = position_of(c, T93[0], B93, 1);
+    assert_eq!(
+        [c1, b1],
+        [a1 + 1, a1 + 2],
+        "whole units first, the spannable set last (item 83)"
+    );
+    assert_eq!(
+        sealing(c, T93[0]),
+        (true, Some(b1 + 1)),
+        "ended after slice 2"
+    );
+    assert_eq!(
+        writes_of(c, T93[0]),
+        rows(&[
+            (A93, "completed", false),
+            (B93, "range", true),
+            (C93, "completed", false)
+        ])
+    );
+    assert_eq!(
+        requires_line(h.files(T93[0])),
+        "requires = [\"short-seal\", \"spanning\"]"
+    );
+    assert_eq!(
+        write::recorded_ranges(c, T93[0]).unwrap(),
+        [range(B93, 1, 2)]
+    );
+    assert_eq!(
+        snapshot_status(c, B93),
+        "staged",
+        "a range alone (item 128)"
+    );
+    assert_eq!(slice_copies(c, B93), [1, 1, 0]);
+    assert_eq!(unit_copies(c, B93), 0, "a range is not a copy on its own");
+    assert!(
+        matches!(release, StagingRelease::Retained { .. }),
+        "{release:?}"
+    );
+    assert!(
+        released_slices(c, B93).is_empty(),
+        "no slice has two copies"
+    );
+    for unit in [A93, B93, C93] {
+        assert_eq!(stage_set_status(c, unit), "staged", "{unit}");
+    }
+
+    // Tape 2: b's owed run is the whole set (1-2 owe one copy, 3 two), first.
+    let release = h.write(T93[1], Warn::Never);
+    let c = &h.conn;
+    let first = position_of(c, T93[1], B93, 1);
+    assert!(
+        first < position_of(c, T93[1], A93, 1) && first < position_of(c, T93[1], C93, 1),
+        "the owed run first (item 122)"
+    );
+    assert_eq!(sealing(c, T93[1]), (true, None), "a full seal");
+    assert_eq!(
+        writes_of(c, T93[1]),
+        rows(&[
+            (A93, "completed", false),
+            (B93, "completed", true),
+            (C93, "completed", false)
+        ])
+    );
+    assert!(write::recorded_ranges(c, T93[1]).unwrap().is_empty());
+    assert_eq!(
+        snapshot_status(c, B93),
+        "current",
+        "tape 2 holds every slice on a sealed volume (item 128)"
+    );
+    assert_eq!(slice_copies(c, B93), [2, 2, 1]);
+    assert_eq!(unit_copies(c, B93), 1, "tape 2's whole copy");
+    // The release: a and c have their two copies; b's slices 1 and 2 have
+    // theirs and are released, slice 3 is kept (item 129).
+    assert!(
+        matches!(release, StagingRelease::Released(_)),
+        "{release:?}"
+    );
+    assert_eq!(stage_set_status(c, A93), "cleaned");
+    assert_eq!(stage_set_status(c, C93), "cleaned");
+    assert_eq!(stage_set_status(c, B93), "staged");
+    assert_eq!(released_slices(c, B93), [1, 2]);
+
+    // Tape 3: the owed run 3-3, first and alone; a full seal, still a range.
+    h.write(T93[2], Warn::Never);
+    let c = &h.conn;
+    assert_eq!(sealing(c, T93[2]), (true, None));
+    assert_eq!(writes_of(c, T93[2]), rows(&[(B93, "range", true)]));
+    assert_eq!(
+        write::recorded_ranges(c, T93[2]).unwrap(),
+        [range(B93, 3, 3)]
+    );
+    assert_eq!(
+        slice_copies(c, B93),
+        [2, 2, 2],
+        "every slice on two volumes"
+    );
+    assert_eq!(unit_copies(c, B93), 2, "item 127: the least-covered slice");
+    assert_eq!(snapshot_status(c, B93), "current");
+    assert_eq!(released_slices(c, B93), [1, 2, 3]);
+    let keep = write::keep_together(c, T93[2]).unwrap();
+    let tapes: Vec<&str> = keep[0].tapes.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(
+        (keep.len(), tapes),
+        (1, vec![T93[0], T93[2]]),
+        "tapes 1 and 3 are one copy (item 134)"
+    );
+    for (label, holds) in [(T93[0], [1, 2]), (T93[2], [3, 3])] {
+        assert_eq!(
+            requires_line(h.files(label)),
+            "requires = [\"short-seal\", \"spanning\"]",
+            "{label} holds {holds:?}"
+        );
+    }
+}

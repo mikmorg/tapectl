@@ -240,7 +240,7 @@ pub enum ContactStore<'s> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn volume_init_contacted<'c>(
+pub(crate) fn volume_init_contacted<'c>(
     conn: &'c Connection,
     config: &Config,
     label: &str,
@@ -1160,7 +1160,7 @@ pub fn volume_write_scoped(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn volume_write_contacted<'c>(
+pub(crate) fn volume_write_contacted<'c>(
     conn: &'c Connection,
     // The tapectl home: where the write's plaintext `catalog.db` is built
     // (ADR-0012 2026-10-06 item 4), never under staging.

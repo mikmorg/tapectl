@@ -20,4 +20,6 @@ pub(crate) mod restore_script;
 pub mod rewrite;
 pub mod session;
 pub mod slice_holders;
+#[cfg(test)]
+mod span_proofs;
 pub mod write;
