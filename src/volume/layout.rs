@@ -803,9 +803,12 @@ which RESTORE.sh cannot read around: "tapectl itself".
   tape may end before the last file the front index plans, and its seal
   marker says where ("Where the tape ended"). Older tapes state it empty
   (`requires = []`, from 1.1.0 to 1.5.0) or have no such line, which means
-  nothing special is needed. A RESTORE.sh that meets a feature it does not
-  know refuses by name and points to the RESTORE.sh stored on that tape, or
-  a newer tapectl.
+  nothing special is needed. A tape written by tapectl 1.7.0 or later that
+  holds a slice of a unit allowed to run across tapes states `requires =
+  ["short-seal", "spanning"]`: some slices of that unit may be on other
+  tapes ("A unit across tapes"). A RESTORE.sh that meets a feature it does
+  not know refuses by name and points to the RESTORE.sh stored on that tape,
+  or a newer tapectl.
 - **Unit**: one archived folder tree, the thing you restore by name (for
   example `photos/2019`). A unit can be stored in several versions, one
   each time it was archived again after its contents had changed. Unless
@@ -871,7 +874,10 @@ which RESTORE.sh cannot read around: "tapectl itself".
 - **Slice**: a unit is archived by dar in numbered pieces called slices.
   Each slice is encrypted on its own and stored as one tape file, and one
   unit's slices lie together on the tape. Restoring a unit means reading
-  all of its slices, in order.
+  all of its slices, in order. A unit allowed to run across tapes (tapectl
+  1.7.0 or later) can have its slices on more than one tape: a tape then
+  holds a **range** of it, one unbroken run of its slices in order ("A unit
+  across tapes").
 - **Index**: two different things. The FRONT index is File 3 (the seal
   marker, the last file, carries a copy): a plain-text map of THIS tape,
   with every tape file's position, type, size and hash. The index, with no
@@ -1596,19 +1602,33 @@ serial, generation, state, when it was sealed and where it was kept:
       LEFT JOIN locations l ON l.id = v.location_id
       ORDER BY v.label;"
 
-Which tapes hold which units, version by version. To look for one unit,
-add `AND u.name LIKE '%word%'` before `ORDER BY`; for one tape, add `AND
-v.label = 'TAPE'`:
+Which tapes hold which units, version by version, with the slices each
+holds. To look for one unit, add `AND u.name LIKE '%word%'` before `ORDER
+BY`; for one tape, add `AND v.label = 'TAPE'`:
 
     sqlite3 -header -column catalog.db "SELECT u.name AS unit, u.uuid, s.version,
-      v.label AS tape, v.status, v.observed_condition AS condition
+      v.label AS tape, v.status, v.observed_condition AS condition,
+      w.status AS holds,
+      (SELECT MIN(sl.slice_number) || '-' || MAX(sl.slice_number)
+         FROM write_positions wp JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+        WHERE wp.write_id = w.id AND wp.status = 'written') AS slices,
+      (SELECT COUNT(*) FROM stage_slices sl
+        WHERE sl.stage_set_id = w.stage_set_id) AS of_slices
       FROM writes w
       JOIN stage_sets ss ON ss.id = w.stage_set_id
       JOIN snapshots s ON s.id = ss.snapshot_id
       JOIN units u ON u.id = s.unit_id
       JOIN volumes v ON v.id = w.volume_id
-      WHERE w.status = 'completed'
+      WHERE w.status IN ('completed', 'range')
       ORDER BY u.name, s.version, v.label;"
+
+`holds` is `completed` for a tape that holds that version whole and `range`
+for one that holds only the run `slices` names, of the version's
+`of_slices` (a unit across tapes, from tapectl 1.7.0: "A unit across
+tapes"). A `range` tape is not a copy on its own: the version restores only
+with every slice, 1 to `of_slices`, from the tapes that hold them, and its
+rows together say which tapes those are. A kit made before 1.7.0 has no
+`range` rows.
 
 A tape holds a good copy when its `status` is `sealed` and its `condition`
 is `ok`. `erased` is a wiped tape and `retired` one taken out of service:
@@ -1714,7 +1734,10 @@ first slices are there and hash correctly, the rest are not, and it is
 restored only from another tape that holds it whole. The index names that
 tape: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` ("The rest of the
 box"). Every unit wholly at or before `ended_after` is on this tape whole
-and restores as usual.
+and restores as usual. A unit allowed to run across tapes (its block in
+MANIFEST.toml states `may_span = true`) with a slice at or before
+`ended_after` is not cut: this tape holds a range of it, and its other
+slices are on other tapes by design ("A unit across tapes").
 
 RESTORE.sh does all of this by itself, reading the seal marker before any
 slice (one wind to the end of the tape and a rewind). `--info` says where
@@ -1727,6 +1750,49 @@ the first and the last of them, which is not a failure:
 `--restore` refuses a unit the end of the tape cut, by name (`--all`
 restores the others and names it), `--list` says so, and `--where` marks
 this tape `CUT` for that version.
+
+## A unit across tapes
+
+From tapectl 1.7.0 a unit that was allowed to run across tapes can have its
+slices on more than one tape. A tape that holds only some of them holds a
+RANGE: one unbroken run of the unit's slices, in slice order. Such a tape
+states `requires = ["short-seal", "spanning"]` in File 0 and its seal
+marker, and so does a tape that holds the whole of such a unit, which
+restores from that one tape as any unit does. A range is not damage, and it
+is not a copy of the unit on its own.
+
+What one tape shows. Its envelope's MANIFEST.toml lists EVERY slice of the
+unit, 1 to N, each with its `encrypted_bytes` and its `sha256_encrypted`,
+and gives a `tape_position` only to the slices this tape's plan holds. A
+slice with no `tape_position` is on another tape: it is never at tape file
+0. The seal marker's `ended_after` can end the run sooner, as it ends any
+tape ("Where the tape ended"), and a slice after it is on another tape too.
+`--info` and `--verify` need no key and see the range as data slices like
+any other. `--list` says which slices of the unit this tape holds.
+`--restore --all` restores the units this tape holds whole and names each
+one it holds only a range of. `--where` and `--find` print the run of
+slices each tape holds when it is not the whole version, marked "a range".
+
+What a restore needs: every slice, 1 to N, in slice order, from the tapes
+that hold them. dar never runs over one tape's slices alone. Start from the
+tape that holds slice 1: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`
+on the NEWEST tape names the tapes and the slices each holds (a tape never
+names a tape written after it, so the first tape of a unit across tapes
+cannot name the rest). Run THAT tape's RESTORE.sh with `--restore --unit
+UNIT`. When the tape's run ends before slice N, it names the slice it needs
+next and the tapes an index names for it, and waits for you to load another
+cartridge and press ENTER. It takes a cartridge only when that tape's front
+index lists the next slice's `sha256_encrypted`, at a position its own seal
+marker covers; a label or an index never stands in for the hash. Otherwise
+it says why and asks again.
+
+By default it keeps each tape's slices, still encrypted, in a scratch
+directory inside `--to` (or `--scratch DIR`), so that disk needs room for
+the whole unit's encrypted slices (the sum of their `encrypted_bytes`)
+besides the restored files; it checks before it reads a slice, and when the
+room is not there it refuses and names `--stream-tapes`. `--stream-tapes`
+keeps no slice on disk: it feeds dar from each tape in turn, so it needs
+every cartridge at hand, loaded when asked.
 
 ## Did the restore get everything?
 
@@ -2117,7 +2183,12 @@ exact size with `truncate` instead, never with `tr`.
    newest, unless you want an older one. On a tape that ended early (step
    4), check first that the `tape_position` of the unit's last slice is at
    or before the seal marker's `ended_after`: if it is after, the tape does
-   not hold the unit whole, so do not start ("Where the tape ended"). Put the tape at the first slice,
+   not hold the unit whole, so do not start ("Where the tape ended"). A
+   block that states `may_span = true` is a unit across tapes: a slice with
+   no `tape_position` is on another tape, so read each tape's slices of it
+   this way, matching each by its `sha256_encrypted`, all into the one
+   directory, and run dar only once every slice, 1 to the last, is there ("A
+   unit across tapes"). Put the tape at the first slice,
    once. `fsf N` moves forward N files from where the head is, so from the
    start of the tape it reaches File N: the `tape_position` of the first
    slice, from the manifest (FIRST_TAPE_POSITION below).
@@ -7249,6 +7320,60 @@ V=1 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; n
 
 "##;
 
+/// The tape positions a unit's MANIFEST block gives, in slice order: every
+/// slice of a whole unit, and only the run this tape plans of a unit that may
+/// span (ADR-0012 item 125).
+fn slices_here(unit: &ManifestUnit) -> Vec<i64> {
+    unit.slices.iter().filter_map(|sl| sl.tape_position).collect()
+}
+
+/// RECOVERY.md's section on a unit across tapes (`volume-format-v2.md` §4.4,
+/// "File 1 and RECOVERY.md"; ADR-0012 item 135), after the section on where
+/// the tape ended, in an envelope that lists a block stating `may_span =
+/// true`: which slices of each such unit this tape's plan holds, that the
+/// others are on other tapes, that a restore needs every slice in slice order
+/// matched by `sha256_encrypted`, and that RESTORE.sh does it.
+fn recovery_span_section(units: &[ManifestUnit]) -> String {
+    let mut s = String::from(
+        "## A unit across tapes\n\n\
+         These units may run across tapes (their blocks in MANIFEST.toml state\n\
+         `may_span = true`). Each block lists every slice of the unit, and this\n\
+         tape's plan holds the slices given a tape position:\n\n\
+         | Unit | Snapshot | Slices on this tape | Tape files | Slices in all |\n\
+         |------|----------|---------------------|------------|---------------|\n",
+    );
+    for unit in units.iter().filter(|u| u.may_span) {
+        let held: Vec<(i64, i64)> = unit
+            .slices
+            .iter()
+            .filter_map(|sl| sl.tape_position.map(|p| (sl.number, p)))
+            .collect();
+        let (run, files) = match (held.first(), held.last()) {
+            (Some(f), Some(l)) => (format!("{} to {}", f.0, l.0), format!("{}..{}", f.1, l.1)),
+            _ => ("none".to_string(), "none".to_string()),
+        };
+        s.push_str(&format!(
+            "| {} | v{} | {run} | {files} | {} |\n",
+            unit.name,
+            unit.snapshot_version,
+            unit.slices.len(),
+        ));
+    }
+    s.push_str(
+        "\nThe slices with no tape position, and any after the seal marker's\n\
+         `ended_after` (\"Where this tape ended\", above), are on other tapes. A\n\
+         restore needs every slice, 1 to the last, in slice order, from the tapes\n\
+         that hold them: take each from a tape whose front index (File 3) lists the\n\
+         slice's `sha256_encrypted` (MANIFEST.toml gives every slice's, and the unit's\n\
+         section below repeats it), and by nothing else. `RESTORE.sh` (tape file 2)\n\
+         does it: run it with `--restore --unit UNIT` on the tape that holds slice 1,\n\
+         which `RESTORE.sh --where UNIT` on the newest tape names, and it asks for the\n\
+         next. The unit's section below gives the steps for the slices this tape\n\
+         holds.\n\n",
+    );
+    s
+}
+
 /// Generate RECOVERY.md for an envelope. `catalogue_members` are the bare
 /// names of the `catalogs/` members the envelope actually holds: a unit's
 /// section names its dar catalogue (`dar -l`, `-A`) only when the envelope
@@ -7291,25 +7416,36 @@ pub fn generate_recovery_md(
          |------|----------|--------|------------|\n"
     );
     for unit in units {
-        // A whole unit's every slice has a position. `None` (a range's slice
-        // on another tape, ADR-0012 item 125) reads as 0, as `build` wrote it
-        // before positions were optional; #478's RECOVERY.md range section
-        // replaces this.
-        let (first, last) = match (unit.slices.first(), unit.slices.last()) {
-            (Some(f), Some(l)) => (f.tape_position.unwrap_or(0), l.tape_position.unwrap_or(0)),
-            _ => (0, 0),
+        // A whole unit's every slice has a position. A unit that may span
+        // lists every slice of its set, and only the slices this tape plans
+        // have one (ADR-0012 item 125): a slice with none is on another tape,
+        // never at tape file 0, so its row counts and spans only those.
+        let here = slices_here(unit);
+        let (count, files) = if unit.may_span {
+            (
+                format!("{} of {}", here.len(), unit.slices.len()),
+                match (here.first(), here.last()) {
+                    (Some(f), Some(l)) => format!("{f}..{l}"),
+                    _ => "none".to_string(),
+                },
+            )
+        } else {
+            let (first, last) = match (here.first(), here.last()) {
+                (Some(f), Some(l)) => (*f, *l),
+                _ => (0, 0),
+            };
+            (unit.slices.len().to_string(), format!("{first}..{last}"))
         };
         s.push_str(&format!(
-            "| {} | v{} | {} | {}..{} |\n",
-            unit.name,
-            unit.snapshot_version,
-            unit.slices.len(),
-            first,
-            last,
+            "| {} | v{} | {count} | {files} |\n",
+            unit.name, unit.snapshot_version,
         ));
     }
     s.push('\n');
     s.push_str(RECOVERY_END_SECTION);
+    if units.iter().any(|u| u.may_span) {
+        s.push_str(&recovery_span_section(units));
+    }
 
     for unit in units {
         let stem = catalogue_stem(unit);
@@ -7349,8 +7485,18 @@ pub fn generate_recovery_md(
         );
         let mut next: Option<i64> = None;
         for slice in &unit.slices {
-            // See the table above: `None` reads as 0 until #478's range section.
-            let tape_position = slice.tape_position.unwrap_or(0);
+            // A slice with no position is on another tape (ADR-0012 item 125):
+            // named, with what matches it there, and never read from this one.
+            let Some(tape_position) = slice.tape_position else {
+                s.push_str(&format!(
+                    "# Slice {n} — on another tape (no tape position here): {eb} bytes,\n\
+                     # sha256_encrypted {sha}\n\n",
+                    n = slice.number,
+                    eb = slice.encrypted_bytes,
+                    sha = slice.sha256_encrypted,
+                ));
+                continue;
+            };
             // The number in `restore.N.dar` MUST be dar's slice number, and the
             // slices MUST share the base name `restore` — this is dar's required
             // `base.N.dar` convention. `truncate` trims the 512KB block padding
@@ -7379,6 +7525,13 @@ pub fn generate_recovery_md(
                 eb = slice.encrypted_bytes,
                 sha = slice.sha256_encrypted,
             ));
+        }
+        if unit.may_span {
+            s.push_str(
+                "# This unit may run across tapes: run dar only once every slice, 1 to the\n\
+                 # last, is here as restore.N.dar. Read each one this tape does not hold the\n\
+                 # same way from a tape whose front index lists its sha256_encrypted.\n\n",
+            );
         }
         s.push_str(
             "# Reassemble and extract all slices (they share the base name `restore`),\n\
@@ -7850,6 +8003,102 @@ mod tests {
         }
     }
 
+    /// RECOVERY.md in an envelope that lists a unit that may span
+    /// (`volume-format-v2.md` §4.4, "File 1 and RECOVERY.md"; ADR-0012 item
+    /// 135): its row of the units table counts and spans only the slices this
+    /// tape plans; a section after "Where this tape ended" says which slices
+    /// of it this tape holds, that the others are on other tapes, that a
+    /// restore needs every slice in slice order matched by `sha256_encrypted`,
+    /// and that RESTORE.sh does it; and the unit's own steps name each slice on
+    /// another tape and never read one at tape file 0. An envelope with no such
+    /// block has no such section.
+    #[test]
+    fn recovery_md_names_a_range_and_never_reads_a_slice_at_file_0() {
+        let slice = |number: i64, tape_position: Option<i64>| ManifestSlice {
+            number,
+            tape_position,
+            size_bytes: 10,
+            encrypted_bytes: 30 + number,
+            sha256_plain: "p".into(),
+            sha256_encrypted: format!("e{number}").repeat(32),
+        };
+        let whole = ManifestUnit {
+            name: "alpha".into(),
+            uuid: "11111111-aaaa".into(),
+            snapshot_version: 1,
+            stage_set_id: 7,
+            may_span: false,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![slice(1, Some(10)), slice(2, Some(11))],
+        };
+        let big = ManifestUnit {
+            name: "big".into(),
+            uuid: "88888888-9999".into(),
+            snapshot_version: 2,
+            stage_set_id: 8,
+            may_span: true,
+            slices: vec![
+                slice(1, None),
+                slice(2, None),
+                slice(3, Some(12)),
+                slice(4, Some(13)),
+            ],
+            ..whole.clone()
+        };
+        let r = generate_recovery_md("SPR1", "alice", &[whole.clone(), big.clone()], &[]);
+        assert!(r.contains("| alpha | v1 | 2 | 10..11 |\n"), "{r}");
+        assert!(r.contains("| big | v2 | 2 of 4 | 12..13 |\n"), "{r}");
+        let end = r.find("## Where this tape ended").expect("the end section");
+        let span = r.find("## A unit across tapes").expect("the span section");
+        let first_unit = r.find("## alpha").expect("the first unit's section");
+        assert!(end < span && span < first_unit, "{r}");
+        let sec = &r[span..first_unit];
+        assert!(
+            sec.contains("| big | v2 | 3 to 4 | 12..13 | 4 |\n"),
+            "{sec}"
+        );
+        assert!(!sec.contains("| alpha |"), "{sec}");
+        let f = flat_text(sec);
+        for needle in [
+            "These units may run across tapes (their blocks in MANIFEST.toml state `may_span = true`). Each block lists every slice of the unit, and this tape's plan holds the slices given a tape position",
+            "The slices with no tape position, and any after the seal marker's `ended_after` (\"Where this tape ended\", above), are on other tapes.",
+            "A restore needs every slice, 1 to the last, in slice order, from the tapes that hold them: take each from a tape whose front index (File 3) lists the slice's `sha256_encrypted`",
+            "`RESTORE.sh` (tape file 2) does it: run it with `--restore --unit UNIT` on the tape that holds slice 1",
+            "The unit's section below gives the steps for the slices this tape holds.",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+
+        let unit_sec = &r[r.find("## big").expect("big's section")..];
+        let unit_sec = &unit_sec[..unit_sec.find("\n## ").unwrap_or(unit_sec.len())];
+        for n in [1, 2] {
+            assert!(
+                unit_sec.contains(&format!(
+                    "# Slice {n} — on another tape (no tape position here): {} bytes,\n# sha256_encrypted {}\n",
+                    30 + n,
+                    format!("e{n}").repeat(32)
+                )),
+                "{unit_sec}"
+            );
+            assert!(!unit_sec.contains(&format!("restore.{n}.dar.age\n")), "{unit_sec}");
+        }
+        assert!(!unit_sec.contains("tape file 0"), "{unit_sec}");
+        assert!(!unit_sec.contains("fsf 0"), "{unit_sec}");
+        assert!(
+            unit_sec.contains("# Slice 3 — tape file 12, 33 bytes\nmt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 12\n"),
+            "{unit_sec}"
+        );
+        assert!(unit_sec.contains("# Slice 4 — tape file 13, 34 bytes\ndd if="), "{unit_sec}");
+        assert!(
+            unit_sec.contains("# This unit may run across tapes: run dar only once every slice, 1 to the\n"),
+            "{unit_sec}"
+        );
+
+        let plain = generate_recovery_md("SPR1", "alice", &[whole], &[]);
+        assert!(!plain.contains("across tapes"), "{plain}");
+    }
+
     /// File 1 says the same for the heir (§1.7): what `requires =
     /// ["short-seal"]` means (the glossary no longer says the list is empty),
     /// that the seal's `ended_after` says where the tape ended, the four
@@ -7901,6 +8150,138 @@ mod tests {
         // Every section the new text names is a heading of the guide.
         assert!(g.contains("\n## Which device?\n"), "{g}");
         assert!(g.contains("\n## The rest of the box"), "{g}");
+    }
+
+    /// ADR-0012 item 135 (`volume-format-v2.md` §4.4, "File 1 and
+    /// RECOVERY.md"): File 1's glossary entry for `requires` names both
+    /// features, the glossary says what a range is, and a section on a unit
+    /// across tapes says what one tape shows, that a restore needs every slice
+    /// 1 to N in slice order, that it starts from the tape holding slice 1,
+    /// which `--where` on the newest tape names, that a tape is accepted by
+    /// hash, that RESTORE.sh asks for the next cartridge, and what each of its
+    /// two modes needs. On every tape 1.7.0 writes.
+    #[test]
+    fn file_1_says_what_a_unit_across_tapes_is_and_how_it_restores() {
+        let g = generate_system_guide_v2_for_media("SP02", 20, "LTO-6");
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        for needle in [
+            "A tape written by tapectl 1.7.0 or later that holds a slice of a unit allowed to run across tapes states `requires = [\"short-seal\", \"spanning\"]`: some slices of that unit may be on other tapes (\"A unit across tapes\").",
+            "a tape then holds a **range** of it, one unbroken run of its slices in order",
+        ] {
+            assert!(words.contains(needle), "{needle:?}: {words}");
+        }
+        let sec = flat_text(guide_section(&g, "A unit across tapes"));
+        for needle in [
+            "A tape that holds only some of them holds a RANGE: one unbroken run of the unit's slices, in slice order.",
+            "states `requires = [\"short-seal\", \"spanning\"]` in File 0 and its seal marker",
+            "A range is not damage, and it is not a copy of the unit on its own.",
+            "lists EVERY slice of the unit, 1 to N, each with its `encrypted_bytes` and its `sha256_encrypted`, and gives a `tape_position` only to the slices this tape's plan holds",
+            "A slice with no `tape_position` is on another tape: it is never at tape file 0.",
+            "`--info` and `--verify` need no key and see the range as data slices like any other.",
+            "`--list` says which slices of the unit this tape holds.",
+            "What a restore needs: every slice, 1 to N, in slice order, from the tapes that hold them. dar never runs over one tape's slices alone.",
+            "Start from the tape that holds slice 1: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` on the NEWEST tape names the tapes and the slices each holds",
+            "it names the slice it needs next and the tapes an index names for it, and waits for you to load another cartridge and press ENTER",
+            "It takes a cartridge only when that tape's front index lists the next slice's `sha256_encrypted`, at a position its own seal marker covers",
+            "so that disk needs room for the whole unit's encrypted slices (the sum of their `encrypted_bytes`) besides the restored files",
+            "when the room is not there it refuses and names `--stream-tapes`",
+            "`--stream-tapes` keeps no slice on disk: it feeds dar from each tape in turn, so it needs every cartridge at hand",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        let end = flat_text(guide_section(&g, "Where the tape ended"));
+        assert!(
+            end.contains("with a slice at or before `ended_after` is not cut: this tape holds a range of it"),
+            "{end}"
+        );
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        assert!(
+            manual.contains("A block that states `may_span = true` is a unit across tapes: a slice with no `tape_position` is on another tape"),
+            "{manual}"
+        );
+        // The guide is the same on every tape 1.7.0 writes, a span tape or not.
+        assert_eq!(g, generate_system_guide_v2_for_media("SP02", 20, "LTO-6"));
+    }
+
+    /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
+    /// reads the Heir Kit's `catalog.db.age`): File 1's query of which tapes
+    /// hold which units lists `range` writes beside whole copies, each with
+    /// the run of slices it holds. Run as written against a catalogue of this
+    /// tapectl's schema, holding item 93's layout: a range 1-2 on V1, the
+    /// whole set on V2 and a range 3-4 on V3; a cut write is not listed.
+    #[test]
+    fn file_1_heir_query_lists_range_rows_with_their_slice_runs() {
+        let g = generate_system_guide_v2_for_media("SP03", 20, "LTO-6");
+        let sec = guide_section(&g, "The Heir Kit's catalogue (catalog.db.age)");
+        let from = sec
+            .find("catalog.db \"SELECT u.name AS unit")
+            .expect("the query of which tapes hold which units");
+        let sqls = guide_sql(sec);
+        let sql = &sqls[1];
+        assert!(sql.contains("WHERE w.status IN ('completed', 'range')"), "{sql}");
+
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'uu', 'big', 1);
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 2, '/s');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 1000);
+             INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted)
+               VALUES (1, 1, 1, 10, 20, 'p1', 'e1'), (2, 1, 2, 10, 20, 'p2', 'e2'),
+                      (3, 1, 3, 10, 20, 'p3', 'e3'), (4, 1, 4, 10, 20, 'p4', 'e4');
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+               VALUES (1, 'V1', 'lto', 'p', 1000, 'sealed'), (2, 'V2', 'lto', 'p', 1000, 'sealed'),
+                      (3, 'V3', 'lto', 'p', 1000, 'sealed'), (4, 'V4', 'lto', 'p', 1000, 'sealed');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status, may_span)
+               VALUES (1, 1, 1, 1, 'range', 1), (2, 1, 1, 2, 'completed', 1),
+                      (3, 1, 1, 3, 'range', 1), (4, 1, 1, 4, 'cut', 1);
+             INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+               VALUES (1, 1, '10', 'written'), (1, 2, '11', 'written'),
+                      (1, 3, '12', 'pending'), (1, 4, '13', 'pending'),
+                      (2, 1, '8', 'written'), (2, 2, '9', 'written'),
+                      (2, 3, '10', 'written'), (2, 4, '11', 'written'),
+                      (3, 3, '4', 'written'), (3, 4, '5', 'written'),
+                      (4, 1, '20', 'pending');",
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(sql).expect("the query runs on this schema");
+        let rows: Vec<(String, String, String, Option<String>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>("unit")?,
+                    r.get::<_, String>("tape")?,
+                    r.get::<_, String>("holds")?,
+                    r.get::<_, Option<String>>("slices")?,
+                    r.get::<_, i64>("of_slices")?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let row = |tape: &str, holds: &str, slices: &str| {
+            (
+                "big".to_string(),
+                tape.to_string(),
+                holds.to_string(),
+                Some(slices.to_string()),
+                4,
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row("V1", "range", "1-2"),
+                row("V2", "completed", "1-4"),
+                row("V3", "range", "3-4"),
+            ]
+        );
+        let after = flat_text(&sec[from..]);
+        assert!(
+            after.contains("`holds` is `completed` for a tape that holds that version whole and `range` for one that holds only the run `slices` names, of the version's `of_slices`"),
+            "{after}"
+        );
+        assert!(after.contains("A `range` tape is not a copy on its own"), "{after}");
     }
 
     /// RESTORE.sh knows `short-seal` and `spanning` (`volume-format-v2.md`
@@ -13563,13 +13944,24 @@ sha256_encrypted = \"bbb\"
                 "L6-0003 | BC0003L6 | HUJ808A5L6 | erased | (none)",
             ]
         );
-        // 2. which tapes hold which units: only completed writes, each
-        // version on each tape that holds it, the erased tape marked.
+        // 2. which tapes hold which units: only completed (and, from 1.7.0,
+        // range) writes, each version on each tape that holds it, the erased
+        // tape marked, with what each holds (item 141).
         let mut stmt = conn.prepare(&sqls[1]).unwrap();
         let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
         assert_eq!(
             cols,
-            ["unit", "uuid", "version", "tape", "status", "condition"]
+            [
+                "unit",
+                "uuid",
+                "version",
+                "tape",
+                "status",
+                "condition",
+                "holds",
+                "slices",
+                "of_slices"
+            ]
         );
         let rows: Vec<(String, i64, String, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(2)?, r.get(3)?, r.get(4)?)))
