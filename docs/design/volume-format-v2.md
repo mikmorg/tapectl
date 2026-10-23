@@ -1042,8 +1042,13 @@ files past the end of every short tape, span or not, instead of one line per pos
 item 140). The line names the first and the last planned position after `ended_after` (K+1 and
 M, the planned seal entry, which the file map and `--verify` list; `--info`'s sentence above
 counts the planned files to M-1) and says that the seal is file K+1. It is still not a failure.
-RESTORE.sh's
-other modes on a range are §4.4's.
+`--verify` prints it unindented and `--info` indents it as its file map:
+
+```
+NOT ON TAPE  files K+1 to M  (planned; the tape ended after file K, and its seal marker is file K+1)
+```
+
+RESTORE.sh's other modes on a range are §4.4's.
 
 tapectl, in 1.6.0:
 - The chain walk (confirm, `volume verify`) covers files 0 to `ended_after` (§5).
