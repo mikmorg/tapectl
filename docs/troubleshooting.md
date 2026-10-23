@@ -2987,7 +2987,7 @@ The per-unit checks cover every unit, whatever its status (`active`,
 `tape_only` or `missing`), except `dirty`, which looks only at `active` ones
 (and `tenancy` reads the dotfile of an `active` unit only). The archive-wide checks (`compaction_candidate` and every row after it
 below) run only for a whole-archive audit, not with `--unit`. The `short_seal` family's findings name a volume, as
-`volume:<label>`, where the others name a unit.
+`volume:<label>`.
 
 | Check | Severity | Message | Meaning and fix |
 |---|---|---|---|
