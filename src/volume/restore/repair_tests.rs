@@ -483,6 +483,41 @@ mod tests {
             }
         }
 
+        /// Another unit of the same tenant, with `files` as its version 1.
+        fn other_unit(&self, name: &str, files: &[(String, Vec<u8>)]) -> i64 {
+            let tenant_id: i64 = self
+                .conn
+                .query_row("SELECT id FROM tenants WHERE name = 't1'", [], |r| r.get(0))
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                    params![format!("{name}-uuid"), name, tenant_id],
+                )
+                .unwrap();
+            let unit_id = self.conn.last_insert_rowid();
+            self.conn
+                .execute(
+                    "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                     VALUES (?1, 1, 'staged', '/tmp', 1, 16)",
+                    params![unit_id],
+                )
+                .unwrap();
+            let snapshot_id = self.conn.last_insert_rowid();
+            for (path, bytes) in files {
+                crate::db::files::fixture::insert(
+                    &self.conn,
+                    snapshot_id,
+                    path,
+                    bytes.len() as i64,
+                    "regular",
+                    Some(&sha_hex(bytes)),
+                );
+            }
+            snapshot_id
+        }
+
         /// Bind volume `label` to a cartridge with this sticker and chip serial,
         /// as `volume init` does.
         fn bind(&self, label: &str, barcode: &str, serial: &str) {
@@ -2552,6 +2587,92 @@ mod tests {
         let mut want = vec![Op::Rewind, Op::ReadHead(0), Op::Space(first - 1)];
         want.extend((0..n as u32).map(|i| Op::Read(first + i)));
         assert_eq!(fakes[A].ops(), want);
+    }
+
+    /// `restore volume` (item 89): the whole units on the tape are restored,
+    /// the unit of which it holds only a range is named with the `restore
+    /// unit` that reads it, and named on its own it is refused before the
+    /// drive.
+    #[test]
+    fn restore_volume_names_the_spanning_unit_and_restores_the_whole_ones() {
+        // The plan order of a tape (`layout-session.md` "Spanning"): the
+        // whole unit first, the spannable set last, where the tape ended.
+        let mut fx = Fixture::new(&[A, B], tree());
+        let st = fx.stage(&tree(), "150k", true);
+        let n = st.slices();
+        let other_files: Vec<(String, Vec<u8>)> = (0..2)
+            .map(|i| (format!("o{i}.bin"), noise(30_000, i * 31 + 5)))
+            .collect();
+        let other = fx.other_unit("other-478", &other_files);
+        let other_st = fx.stage_in(other, &other_files, "150k", true);
+        fx.write_in(other, &other_st, A);
+        fx.write_range(&st, A, 1..=2, n);
+        fx.write_range(&st, B, 3..=n, n);
+
+        assert_eq!(units_on_volume(&fx.conn, A).unwrap(), vec!["other-478"]);
+        let cut = cut_units_on_volume(&fx.conn, A).unwrap();
+        assert_eq!(
+            cut,
+            vec![CutUnit {
+                unit_name: fx.unit.clone(),
+                version: 1,
+                whole_on: None,
+                range: Some((1, 2)),
+                starts_on: Some(A.to_string()),
+            }]
+        );
+        let lines = crate::cli::restore::cut_units_lines(&cut, A).join("\n");
+        for needle in [
+            "not on this tape whole: \"unit-480\" v1, slices 1 to 2 of it on this tape",
+            "tapectl restore unit --unit unit-480 --from L6-0001 --version 1",
+            "1 unit(s) held across cartridges left out",
+        ] {
+            assert!(lines.contains(needle), "{needle}: {lines}");
+        }
+        assert!(!lines.contains("ended early"), "{lines}");
+        // B holds the tail, not slice 1: its restore starts on A.
+        let on_b = cut_units_on_volume(&fx.conn, B).unwrap();
+        assert_eq!(on_b[0].restore_from(), Some(A));
+
+        let dest = TempDir::new().unwrap();
+        let root = dest.path().to_string_lossy().into_owned();
+        let config = Config::default();
+        let options = RestoreOptions::default();
+        let named = unit_requests(&[fx.unit.clone()], &root).unwrap();
+        let err = plan_units(&fx.conn, &config, A, &named, &options)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(
+            err.contains("is not on volume \"L6-0001\" whole")
+                && err.contains("holds only slices 1 to 2")
+                && err.contains("--from L6-0001"),
+            "{err}"
+        );
+
+        let requests = unit_requests(&units_on_volume(&fx.conn, A).unwrap(), &root).unwrap();
+        let planned = plan_units(&fx.conn, &config, A, &requests, &options).unwrap();
+        let mut bay = fx.bay(A, true, &[]);
+        let report = restore_units_from_bay(
+            &fx.conn,
+            &fx.paths,
+            &config,
+            A,
+            &planned,
+            &options,
+            false,
+            &mut bay,
+            site(),
+        )
+        .unwrap();
+        assert_eq!(report.failed(), 0, "{report:?}");
+        for (path, bytes) in &other_files {
+            assert_eq!(
+                &fs::read(dest.path().join("other-478").join(path)).unwrap(),
+                bytes
+            );
+        }
+        assert!(bay.asked.is_empty());
     }
 
     /// Every entry under `dir`, recursively — empty for a restore that wrote
