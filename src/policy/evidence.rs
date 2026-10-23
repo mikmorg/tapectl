@@ -66,9 +66,12 @@ pub struct CoverageEvidence {
 
 /// The shared query behind [`remaining_coverage_evidence`] and
 /// [`per_volume_verification`]: one row per volume holding a completed
-/// write for `unit_id`, with that volume's most recent PASSED FULL
-/// readback, dated by its start ([`full_readback_date`]; `None` = never
-/// verified; a quick one does not count).
+/// write for `unit_id`, or a `range` of one (#478, ADR-0012 item 127: a
+/// range's slices are on the volume and count slice by slice), with that
+/// volume's most recent PASSED FULL readback, dated by its start
+/// ([`full_readback_date`]; `None` = never verified; a quick one does not
+/// count). Without `range` a volume holding only ranges had no row, and
+/// `catalog locate` read its Verified column as never.
 ///
 /// `only_eligible` selects which of the two callers' questions this
 /// answers:
@@ -133,7 +136,7 @@ fn tape_rows(
          LEFT JOIN verification_sessions vs
                 ON vs.volume_id = v.id AND vs.outcome = 'passed'
                AND vs.verify_type = 'full'
-         WHERE s.unit_id = ?1 AND w.status = 'completed'
+         WHERE s.unit_id = ?1 AND w.status IN ('completed', 'range')
            {current_clause}
            {exclude_clause}
            {eligible_clause}
@@ -163,8 +166,9 @@ fn tape_rows(
 }
 
 /// Per-volume verification evidence for EVERY volume holding a completed
-/// write for `unit_id`, regardless of the volume's CURRENT lifecycle
-/// status — `catalog locate`'s source (issue #196).
+/// write for `unit_id` (or a `range` of one, #478), regardless of the
+/// volume's CURRENT lifecycle status — `catalog locate`'s source (issue
+/// #196).
 ///
 /// Deliberately NOT [`remaining_coverage_evidence`]: that function answers
 /// "what coverage still counts toward ADR-0004 right now", and gates every
@@ -179,8 +183,8 @@ fn tape_rows(
 /// quarantined tape an operator might still be about to walk to the shelf
 /// for — silently lose their evidence instead of showing it.
 ///
-/// Only tape rows: every row `locate` shows comes from a completed
-/// `writes` row, so it is always `EvidenceKind::Tape`. A volume's
+/// Only tape rows: every row `locate` shows comes from a completed or
+/// `range` `writes` row, so it is always `EvidenceKind::Tape`. A volume's
 /// warehouse deposits (ADR-0006) are a different evidence class with their
 /// own column in `locate` already — see that module's doc — and must
 /// never be folded into a verification age here, so this function does not
@@ -310,7 +314,7 @@ pub fn remaining_coverage_evidence(
              FROM writes w
              JOIN stage_sets ss ON ss.id = w.stage_set_id
              JOIN snapshots s ON s.id = ss.snapshot_id
-             WHERE s.unit_id = ?1 AND w.status = 'completed'
+             WHERE s.unit_id = ?1 AND w.status IN ('completed', 'range')
                AND s.status = 'current' {deposit_exclude}
          )
          ORDER BY v.label, l.name",
@@ -1163,6 +1167,46 @@ mod tests {
             all.iter()
                 .any(|e| e.volume_label == "V2" && e.last_verified.is_some()),
             "V2 (verified) must appear with last_verified = Some(..): {all:?}"
+        );
+    }
+
+    /// #478 (found by H2): a volume holding only a `range` of the unit's
+    /// set is a holder of it, so `catalog locate`'s Verified column and the
+    /// Tier-1 evidence read its readback, not "never". Item 93's layout: SPAN-1
+    /// holds slices 1-2 (read back in full), SPAN-2 the version whole.
+    #[test]
+    fn a_volume_holding_only_a_range_carries_its_readback() {
+        let c = crate::policy::coverage::tests::SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", None);
+        let t2 = c.volume("SPAN-2", None);
+        c.range(set, t1, 1, 2, 6);
+        c.whole(set, 6, t2);
+        c.conn
+            .execute(
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 VALUES (?1, 'full', 'passed', '2026-10-22 08:00:00', '2026-10-22 09:00:00')",
+                params![t1],
+            )
+            .unwrap();
+
+        let locate = per_volume_verification(&c.conn, c.unit_id).unwrap();
+        let span1 = locate
+            .iter()
+            .find(|e| e.volume_label == "SPAN-1")
+            .unwrap_or_else(|| panic!("the range holder must have a row: {locate:?}"));
+        assert_eq!(span1.last_verified.as_deref(), Some("2026-10-22 08:00:00"));
+
+        let remaining = remaining_coverage_evidence(&c.conn, c.unit_id, Some(t2)).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|e| e.volume_label.as_str())
+                .collect::<Vec<_>>(),
+            ["SPAN-1"],
+            "the range holder is remaining coverage: {remaining:?}"
         );
     }
 

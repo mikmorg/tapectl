@@ -164,10 +164,12 @@ pub fn marker(fingerprints: Option<&str>, origin: Origin, escrow: Option<&str>) 
 /// happened to be in scope.
 #[derive(Debug, Clone, Copy)]
 pub enum Scope<'a> {
-    /// Every completed write of this unit's stage sets, on an in-service
-    /// volume — across every snapshot, not only the current one. An escrow
-    /// gap on a superseded snapshot's tape is still a gap; nothing in the
-    /// four call sites wants it hidden.
+    /// Every completed write of this unit's stage sets, and every `range`
+    /// of one (#478: a range's slices are on its volume, encrypted to the
+    /// same recipient list as the rest of the set), on an in-service volume
+    /// — across every snapshot, not only the current one. An escrow gap on
+    /// a superseded snapshot's tape is still a gap; nothing in the four call
+    /// sites wants it hidden.
     Unit(i64),
     /// The same, for every unit in the catalog. `report copies --unit` with
     /// no filter, and `report copies` overall, are the callers.
@@ -179,8 +181,8 @@ pub enum Scope<'a> {
     /// entirely (or whose snapshot/unit chain is broken) still gets a row —
     /// fail-closed, not silently dropped.
     StageSets(&'a [i64]),
-    /// Every completed write of this unit's stage sets on ANY volume,
-    /// whatever its status — retired, quarantined, erased included — and
+    /// Every completed or `range` write of this unit's stage sets on ANY
+    /// volume, whatever its status — retired, quarantined, erased included — and
     /// including unencrypted stage sets. `catalog locate` lists every
     /// volume a unit was ever written to (issue #57: a retired cartridge
     /// must be distinguishable from a sealed one, not absent), so its
@@ -255,7 +257,9 @@ enum Volumes {
 }
 
 /// [`Scope::Unit`] / [`Scope::AllUnits`] / [`Scope::UnitAnyVolume`]: every
-/// completed write, joined back to its unit, on the volumes `volumes` says.
+/// completed or `range` write, joined back to its unit, on the volumes
+/// `volumes` says. Without `range`, a set held only as ranges had no row,
+/// and `catalog locate` showed its Escrow column as `-` (#478, found by H2).
 fn stage_set_coverage_via_writes(
     conn: &rusqlite::Connection,
     unit_id: Option<i64>,
@@ -269,7 +273,7 @@ fn stage_set_coverage_via_writes(
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE w.status = 'completed'",
+         WHERE w.status IN ('completed', 'range')",
     );
     if volumes == Volumes::InService {
         sql.push_str(&format!(
@@ -536,6 +540,40 @@ mod tests {
             assert_eq!(rows[0].stage_set_id, ss_id);
             assert_eq!(rows[0].volume_label.as_deref(), Some("VOL1"));
             assert_eq!(rows[0].coverage, Coverage::Covered);
+        }
+
+        /// #478 (found by H2): a set held only as a `range` has a verdict,
+        /// in every via-`writes` scope, so `catalog locate`'s Escrow column
+        /// is not `-` for it.
+        #[test]
+        fn a_range_row_has_a_verdict() {
+            let (conn, unit_id, ss_id) =
+                setup("sealed", Some(r#"["age1escrowescrowescrow"]"#), "staged", 1);
+            conn.execute(
+                "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+                params![ss_id],
+            )
+            .unwrap();
+            for scope in [
+                Scope::Unit(unit_id),
+                Scope::AllUnits,
+                Scope::UnitAnyVolume(unit_id),
+            ] {
+                let rows = stage_set_coverage(&conn, scope, ESCROW).unwrap();
+                assert_eq!(rows.len(), 1, "{scope:?}: {rows:?}");
+                assert_eq!(rows[0].volume_label.as_deref(), Some("VOL1"));
+                assert_eq!(rows[0].coverage, Coverage::Covered);
+            }
+            // Positive control: a cut write left nothing of the set on the
+            // tape, and has no row.
+            conn.execute(
+                "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
+                params![ss_id],
+            )
+            .unwrap();
+            assert!(stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW)
+                .unwrap()
+                .is_empty());
         }
 
         #[test]

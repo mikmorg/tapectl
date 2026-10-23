@@ -89,9 +89,10 @@ pub fn tenant_public_keys(conn: &Connection, tenant_id: i64) -> Result<Vec<Strin
 pub type WrittenSet = (i64, i64, String, Option<String>);
 
 /// The written stage sets (completed writes on in-service volumes,
-/// encrypted) of `unit_id`, or of every unit when `None`, keyed by unit, in
-/// volume order: one statement whatever the unit count, so `audit` reads
-/// them once for all units (`tests/catalog_budget.rs`).
+/// encrypted, and `range` writes, whose slices are on the volume too: #478)
+/// of `unit_id`, or of every unit when `None`, keyed by unit, in volume
+/// order: one statement whatever the unit count, so `audit` reads them once
+/// for all units (`tests/catalog_budget.rs`).
 pub fn written_stage_sets(
     conn: &Connection,
     unit_id: Option<i64>,
@@ -102,7 +103,7 @@ pub fn written_stage_sets(
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE w.status = 'completed' AND ss.encrypted = 1 AND {}
+         WHERE w.status IN ('completed', 'range') AND ss.encrypted = 1 AND {}
            AND (?1 IS NULL OR s.unit_id = ?1)
          ORDER BY v.label, ss.id",
         crate::policy::coverage::in_service("v")
@@ -135,8 +136,8 @@ fn unreadable(written: &[WrittenSet], tenant_keys: &[String]) -> Vec<(i64, i64, 
         .collect()
 }
 
-/// The written stage sets of `unit_id` (completed writes on in-service
-/// volumes, encrypted) that none of `tenant_keys` can open, as
+/// The written stage sets of `unit_id` (completed and `range` writes on
+/// in-service volumes, encrypted) that none of `tenant_keys` can open, as
 /// `(stage_set_id, version, volume_label)`, in volume order.
 pub fn unreadable_stage_sets(
     conn: &Connection,
@@ -350,6 +351,26 @@ mod tests {
             copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
             Some(1),
             "only the copy encrypted without other's key"
+        );
+
+        // #478: a range of a spannable set is on its volume too, encrypted
+        // to its set's list, so it counts as a written copy here.
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+             VALUES (?1, 'staged', 524288, 1, '[\"age1acme\",\"age1op\"]')",
+            params![snap],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+             VALUES (last_insert_rowid(), ?1, ?2, 'range', 1)",
+            params![snap, vol],
+        )
+        .unwrap();
+        assert_eq!(
+            copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
+            Some(2),
+            "a range other cannot open is a copy it cannot open"
         );
 
         // A destination the catalog holds no key for (a rebuilt tenant
