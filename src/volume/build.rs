@@ -29,8 +29,8 @@ use super::format;
 use super::index::{self, IndexFiles};
 use super::layout::{self, FrontIndexFile, IdThunkV2Params};
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, PlanSplit,
-    SliceCheck, ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, Placement,
+    PlanClass, PlanSplit, SliceCheck, ZoneKind,
 };
 
 // ── Plain-data inputs ──
@@ -260,6 +260,13 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
 /// the units are the caller's, every one is laid out whole, and the front
 /// index lists them all — the ones past the ceiling too
 /// ([`BuiltLayout::split`] says which those are).
+///
+/// The units are laid out in the caller's order, on a span tape too. The
+/// plan order of `layout-session.md` "Spanning" (owed runs, whole units,
+/// spannable sets, and which units wait for a later tape) is decided before
+/// the build, by [`CapacityBudget::place`], because only the caller knows an
+/// owed run from a fresh spannable set and a deferred unit must not reach
+/// the envelopes; [`BuiltLayout::place`] reads the built plan back.
 pub fn build_with_plan_bound(
     inputs: &BuildInputs,
     plan_bound_bytes: Option<u64>,
@@ -752,6 +759,18 @@ impl BuiltLayout {
     /// position order ([`Layout::entries_past_ceiling`]).
     pub fn entries_past_ceiling(&self, units: &[BuildUnit]) -> Vec<&LayoutEntry> {
         self.layout.entries_past_ceiling(&unit_slice_ids(units))
+    }
+
+    /// Where `units` sit in a span tape's plan order (`layout-session.md`
+    /// "Spanning"; [`CapacityBudget::place`], [`Layout::place_units`]), each
+    /// with its [`PlanClass`] from the caller: `classes[i]` is `units[i]`'s.
+    /// The class is the caller's to give because only the catalog knows it:
+    /// an owed run and a fresh spannable set can be the same slices (item
+    /// 93's second tape owes the whole set), and a [`BuildUnit`] says only
+    /// that a unit may span. The placement describes this Layout when it was
+    /// built from the units in [`Placement::order`], with none deferred.
+    pub fn place(&self, units: &[BuildUnit], classes: &[PlanClass]) -> Placement {
+        self.layout.place_units(&unit_slice_ids(units), classes)
     }
 }
 
@@ -2710,6 +2729,211 @@ mod tests {
         // The fixture itself builds.
         let session = tempfile::tempdir().unwrap();
         build(&mutated(&|_| {}), session.path()).unwrap();
+    }
+
+    // ── File 0 and the seal placeholder per tape (ADR-0012 item 124) ──
+
+    /// A materialized zone's text.
+    fn zone_text(layout: &Layout, want: fn(&ZoneKind) -> bool) -> String {
+        let e = layout.entries.iter().find(|e| want(&e.kind)).unwrap();
+        let ContentSource::Materialized(path) = &e.source else {
+            panic!("{:?} is materialized", e.kind);
+        };
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// File 3's hash and the seal's embedded copy of a built Layout, as
+    /// `build` assembles them: every entry with its size and hash, File 3's
+    /// own included, and the seal's own entry bare.
+    fn seal_copy(layout: &Layout) -> (String, Vec<FrontIndexFile>) {
+        let fi_hash = layout
+            .entries
+            .iter()
+            .find(|e| e.kind == ZoneKind::FrontIndex)
+            .and_then(|e| e.sha256.clone())
+            .unwrap();
+        let files = layout
+            .entries
+            .iter()
+            .map(|e| {
+                let bare = e.kind == ZoneKind::SealMarker;
+                FrontIndexFile {
+                    position: e.position,
+                    type_label: e.kind.type_label(),
+                    size_bytes: if bare { None } else { e.size_bytes },
+                    sha256_encrypted: if bare { None } else { e.sha256.clone() },
+                }
+            })
+            .collect();
+        (fi_hash, files)
+    }
+
+    /// Every line of a seal but its `sealed_at`, which is the clock's.
+    fn without_sealed_at(seal: &str) -> Vec<&str> {
+        seal.lines()
+            .filter(|l| !l.starts_with("sealed_at = "))
+            .collect()
+    }
+
+    /// The brief's byte-identity case: a tape with no unit that may span
+    /// builds File 0 and the seal placeholder exactly as 1.6.0's generators
+    /// make them (`requires = ["short-seal"]`), so a whole-unit tape's bytes
+    /// do not move in 1.7.0.
+    #[test]
+    fn a_tape_with_no_span_builds_file_0_and_the_placeholder_as_1_6_0_did() {
+        let (inputs, _src) = three_unit_inputs();
+        assert!(inputs.units.iter().all(|u| u.span.is_none()));
+        let session = tempfile::tempdir().unwrap();
+        let layout = build(&inputs, session.path()).unwrap().layout;
+        let total_files = layout.entries.len() as i32;
+
+        let file0 = zone_text(&layout, |k| matches!(k, ZoneKind::IdThunk));
+        let want = layout::generate_id_thunk_v2(&IdThunkV2Params {
+            label: &inputs.label,
+            uuid: &inputs.volume_uuid,
+            media_type: &inputs.media_type,
+            tapectl_version: &inputs.tapectl_version,
+            nominal_capacity: inputs.nominal_capacity,
+            mam_capacity: inputs.mam_capacity,
+            total_files,
+            mam_manufacturer: &inputs.mam_manufacturer,
+            mam_serial: &inputs.mam_serial,
+            mam_length: inputs.mam_length,
+            mam_loads: inputs.mam_loads,
+            created_at: &inputs.created_at,
+            cartridge_identity_source: inputs.cartridge_identity_source.as_deref(),
+        });
+        assert_eq!(file0, want, "File 0 is 1.6.0's, byte for byte");
+        assert_eq!(file0.matches("\nrequires = [\"short-seal\"]\n").count(), 1);
+
+        let placeholder = zone_text(&layout, |k| matches!(k, ZoneKind::SealMarker));
+        let (fi_hash, copy) = seal_copy(&layout);
+        let want = layout::generate_seal_marker(&inputs.label, total_files, &fi_hash, &copy);
+        assert_eq!(placeholder.len(), want.len());
+        assert_eq!(without_sealed_at(&placeholder), without_sealed_at(&want));
+        assert_eq!(
+            placeholder
+                .matches("\nrequires = [\"short-seal\"]\n")
+                .count(),
+            1
+        );
+    }
+
+    /// `layout-session.md` "Spanning" and `volume-format-v2.md` §4.1
+    /// "Length", through `build`: a span tape's placeholder states both
+    /// features, is exactly the length of the full seal that states them, and
+    /// is at least as long as every short seal that states them.
+    #[test]
+    fn a_span_tapes_placeholder_holds_every_short_seal_that_states_both_features() {
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let span = span_unit(src.path());
+        let whole = BuildUnit {
+            stage_set_id: 20,
+            snapshot_id: 20,
+            unit_name: "unit-whole".to_string(),
+            unit_uuid: "dddddddd-1111-4222-8333-444444444444".to_string(),
+            snapshot_version: 1,
+            slices: vec![fake_slice(src.path(), 21, 1, b"whole slice one")],
+            span: None,
+            ..span.clone()
+        };
+        let inputs = base_inputs(
+            "550e8400-e29b-41d4-a716-4466554400b3",
+            vec![TenantInfo {
+                tenant_id: 1,
+                tenant_name: "alpha".to_string(),
+                public_keys: vec![kp.public_key],
+            }],
+            vec![span, whole],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let layout = build(&inputs, session.path()).unwrap().layout;
+        let total_files = layout.entries.len() as i32;
+        let both = "\nrequires = [\"short-seal\", \"spanning\"]\n";
+        let placeholder = zone_text(&layout, |k| matches!(k, ZoneKind::SealMarker));
+        assert_eq!(placeholder.matches(both).count(), 1, "{placeholder}");
+        assert_eq!(
+            zone_text(&layout, |k| matches!(k, ZoneKind::IdThunk))
+                .matches(both)
+                .count(),
+            1
+        );
+
+        let (fi_hash, copy) = seal_copy(&layout);
+        let full = layout::generate_seal_marker_requiring(
+            &inputs.label,
+            total_files,
+            &fi_hash,
+            &copy,
+            layout::REQUIRES_SPAN,
+        );
+        assert_eq!(full.len(), placeholder.len());
+        assert_eq!(without_sealed_at(&full), without_sealed_at(&placeholder));
+        let slices: Vec<i32> = layout
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .map(|e| e.position)
+            .collect();
+        let seal_pos = total_files - 1;
+        let shorts: Vec<i32> = slices.into_iter().filter(|&k| k <= seal_pos - 2).collect();
+        assert_eq!(shorts.len(), 2, "two places a short seal can come");
+        for k in shorts {
+            let short = layout::generate_short_seal_marker_requiring(
+                &inputs.label,
+                k,
+                &fi_hash,
+                &copy[..=k as usize],
+                layout::REQUIRES_SPAN,
+            );
+            assert_eq!(short.matches(both).count(), 1, "K={k}");
+            assert!(short.len() <= placeholder.len(), "K={k}");
+            format::parse_seal_marker(&short)
+                .unwrap()
+                .check_parse_rules()
+                .unwrap();
+        }
+    }
+
+    /// [`BuiltLayout::place`] reads a built plan back in the plan order,
+    /// with the classes the caller gives: here the caller built the span
+    /// first, so the Layout's order is not the plan's.
+    #[test]
+    fn a_built_layouts_units_are_placed_by_the_callers_classes() {
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let span = span_unit(src.path());
+        let whole = BuildUnit {
+            stage_set_id: 20,
+            snapshot_id: 20,
+            unit_name: "unit-whole".to_string(),
+            unit_uuid: "dddddddd-1111-4222-8333-444444444444".to_string(),
+            snapshot_version: 1,
+            slices: vec![fake_slice(src.path(), 21, 1, b"whole slice one")],
+            span: None,
+            ..span.clone()
+        };
+        let inputs = base_inputs(
+            "550e8400-e29b-41d4-a716-4466554400b4",
+            vec![TenantInfo {
+                tenant_id: 1,
+                tenant_name: "alpha".to_string(),
+                public_keys: vec![kp.public_key],
+            }],
+            vec![span, whole],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let built = build(&inputs, session.path()).unwrap();
+        assert!(slice_position(&built.layout, 12) < slice_position(&built.layout, 21));
+        for (span_is, order) in [
+            (PlanClass::Spannable, vec![1, 0]),
+            (PlanClass::Owed, vec![0, 1]),
+        ] {
+            let p = built.place(&inputs.units, &[span_is, PlanClass::Whole]);
+            assert!(p.is_ok(), "{span_is:?}: {:?}", p.errors);
+            assert_eq!(p.order, order, "{span_is:?}");
+        }
     }
 
     /// #449 comment 2: RECOVERY.md names a unit's dar catalogue only when the
