@@ -379,8 +379,13 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // invariants of a short-sealed volume's rows (`cut` only where
         // `ended_after` is set; no `completed` slice past it), joined from
         // the volumes to their writes and positions by index, so no new full
-        // scan: 15 + 8 a unit.
-        Command::Audit => (15 + 8 * LARGE, 8, &["encryption_keys", "h", "v", "w"]),
+        // scan: 15 + 8 a unit. Then #478 (ADR-0012 item 128): ONE more
+        // statement over the whole catalog for the spans still in progress
+        // (versions with a range on a sealed volume, not every slice on one),
+        // with the range invariants folded into `short_seal`'s statement and
+        // verify age still two statements a unit, now per slice (item 127):
+        // 16 + 8 a unit, no new full scan.
+        Command::Audit => (16 + 8 * LARGE, 8, &["encryption_keys", "h", "v", "w"]),
         // Per unit by design today: the unit list, then for each unit
         // under the root its policy (`policy::resolve`) and its copy count
         // — three statements a unit.
