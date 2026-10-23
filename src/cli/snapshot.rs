@@ -215,9 +215,10 @@ pub fn run(
             force,
         } => {
             // Issue #241: reproduces `snapshot_delete`'s two refusals
-            // (completed writes; staged data without --force) so a dry
-            // run refuses exactly what the real delete would refuse,
-            // without touching a row or a staged file.
+            // (on tape, `operations::snapshot_on_tape_refusal`: a completed
+            // write or a range; staged data without --force) so a dry run
+            // refuses exactly what the real delete would refuse, without
+            // touching a row or a staged file.
             if dry_run {
                 let unit = crate::db::queries::get_unit_by_name(conn, name)?
                     .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
@@ -230,18 +231,10 @@ pub fn run(
                     .map_err(|_| {
                         TapectlError::Other(format!("snapshot v{version} not found for \"{name}\""))
                     })?;
-                let write_count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM writes w
-                     JOIN stage_sets ss ON ss.id = w.stage_set_id
-                     WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
-                    params![snap_id],
-                    |row| row.get(0),
-                )?;
-                if write_count > 0 {
-                    return Err(TapectlError::Other(format!(
-                        "snapshot v{version} has {write_count} completed write(s) — cannot \
-                         delete"
-                    )));
+                if let Some(refusal) =
+                    crate::cli::operations::snapshot_on_tape_refusal(conn, snap_id, *version)?
+                {
+                    return Err(TapectlError::Other(refusal));
                 }
                 let staged_count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = \

@@ -631,8 +631,10 @@ pub(crate) struct RetireImpact {
 
 /// The impact analysis behind `volume_retire`: one [`RetireImpact`] per
 /// unit with a write that REACHED THE TAPE
-/// (`policy::coverage::write_reaches_tape` — `completed`, `in_progress`, or
-/// `interrupted`, issue #276) on `vol_id`. Split out from the call site
+/// (`policy::coverage::write_reaches_tape` — `completed`, `range`,
+/// `in_progress`, or `interrupted`; issue #276, and #478 for `range`: a
+/// range's slices are on the tape, maybe the only copy of them while its
+/// span is in progress) on `vol_id`. Split out from the call site
 /// (same reasoning as `report::copies_rows`/`audit::copy_count_for_unit`)
 /// so the `other_copies` derivation is directly testable without going
 /// anywhere near `volume_retire`'s consent gate — which reads real stdin
@@ -766,21 +768,46 @@ pub(crate) fn refuse_last_eligible_copy(
     volume_label: &str,
     impacts: &[RetireImpact],
 ) -> Result<()> {
-    let mut doomed: Vec<(&str, i64)> = Vec::new();
+    // Split by what the version is (#478, ADR-0012 item 128): a `current`
+    // one has a copy to replace; one that is not is a span still in
+    // progress (the floor admits a non-current version only for a range it
+    // alone holds slices of), and its remedy is to finish the span.
+    let mut whole: Vec<(&str, i64)> = Vec::new();
+    let mut spans: Vec<(&str, i64)> = Vec::new();
     for impact in impacts {
         for version in &impact.at_stake {
             if version.copies_after == 0 {
-                doomed.push((impact.unit_name.as_str(), version.version));
+                let status: String = conn.query_row(
+                    "SELECT status FROM snapshots WHERE id = ?1",
+                    params![version.snapshot_id],
+                    |row| row.get(0),
+                )?;
+                let at = (impact.unit_name.as_str(), version.version);
+                if status == "current" {
+                    whole.push(at);
+                } else {
+                    spans.push(at);
+                }
             }
         }
     }
+    let doomed: Vec<(&str, i64)> = whole.iter().chain(&spans).copied().collect();
     if doomed.is_empty() {
         return Ok(());
     }
 
     let named = doomed
         .iter()
-        .map(|(unit, version)| format!("unit \"{unit}\" v{version}"))
+        .map(|(unit, version)| {
+            if spans.contains(&(*unit, *version)) {
+                format!(
+                    "unit \"{unit}\" v{version} (a span in progress: this tape holds the only \
+                     copy of some of its slices)"
+                )
+            } else {
+                format!("unit \"{unit}\" v{version}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let (count, those) = if doomed.len() == 1 {
@@ -795,7 +822,7 @@ pub(crate) fn refuse_last_eligible_copy(
     // One recovery line per DISTINCT unit, and one release line per
     // (unit, version): the operator has to act on each separately, and a
     // single example would leave them guessing at the rest.
-    let mut units: Vec<&str> = doomed.iter().map(|(unit, _)| *unit).collect();
+    let mut units: Vec<&str> = whole.iter().map(|(unit, _)| *unit).collect();
     units.dedup();
     let copy_out = units
         .iter()
@@ -826,7 +853,7 @@ pub(crate) fn refuse_last_eligible_copy(
     // operator a command which will be refused is not a recipe.
     let mut restage_lines: Vec<String> = Vec::new();
     let mut already_staged: Vec<String> = Vec::new();
-    for (unit, version) in &doomed {
+    for (unit, version) in &whole {
         if version_has_live_stage_set(conn, unit, *version)? {
             already_staged.push(format!("unit \"{unit}\" v{version}"));
         } else {
@@ -883,9 +910,52 @@ pub(crate) fn refuse_last_eligible_copy(
                 "need"
             },
         ),
-        // Unreachable: `doomed` is non-empty by the early return above, so
-        // every version landed in one list or the other.
+        // Only spans are at stake: no current version to copy (below).
         (true, true) => String::new(),
+    };
+    let copy_section = if whole.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Make another copy first, then re-run this:\n\
+             {copy_out}\n    \
+             tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
+             tapectl volume write <OTHER-LABEL>\n\
+             {on_disk_branch}\
+             \n"
+        )
+    };
+    // #478 (layout-session.md, "The plan order" and "Promotion and the
+    // retire floor"): a span in progress is not a copy to replace but the
+    // start of one. The next write lays out the slices the span still owes
+    // first, from staging; while the copy floor asks for more than one copy,
+    // those include another copy of the slices this tape alone holds.
+    let span_section = if spans.is_empty() {
+        String::new()
+    } else {
+        let named_spans = spans
+            .iter()
+            .map(|(unit, version)| format!("unit \"{unit}\" v{version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (is, its) = if spans.len() == 1 {
+            ("is a version", "its")
+        } else {
+            ("are versions", "their")
+        };
+        format!(
+            "Finish the span first: {named_spans} {is} still being written across \
+             cartridges, not current until every slice is on a sealed volume, and \
+             \"{volume_label}\" holds the only copy of some of {its} slices. The next write \
+             takes the slices a span still owes first, from staging (it names the `volume \
+             read-slices` command for a slice staging no longer has):\n    \
+             tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
+             tapectl volume write <OTHER-LABEL>\n\
+             then re-run this once every slice on this tape has a copy on another one. With a \
+             copy floor of one copy, finishing the span leaves those slices on this tape \
+             alone, and giving the version up is the way.\n\
+             \n"
+        )
     };
 
     // Issue #276: when `volume_label` itself is sealed-but-unconfirmed, the
@@ -924,12 +994,8 @@ pub(crate) fn refuse_last_eligible_copy(
          exist, and ADR-0008 puts it in Tier 3. There is no --force for this, and --yes \
          does not reach it.\n\
          \n\
-         Make another copy first, then re-run this:\n\
-         {copy_out}\n    \
-         tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
-         tapectl volume write <OTHER-LABEL>\n\
-         {on_disk_branch}\
-         \n\
+         {copy_section}\
+         {span_section}\
          Or give the version up on purpose — a different statement, with its own command \
          and its own preconditions:\n\
          {release}\n\
@@ -3048,6 +3114,41 @@ fn interrupted_write_volumes(conn: &Connection, snap_id: i64) -> Result<Vec<Stri
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+/// Why `snapshot delete` refuses version `version` (snapshot `snap_id`), when
+/// it is on tape: a `completed` write holds it whole, and a `range` write
+/// (#478) holds a run of its slices, maybe the only copy of them while its
+/// span is in progress. Deleting the snapshot would drop the catalog's
+/// record of bytes that are on a cartridge. `snapshot.rs`' dry run asks the
+/// same question through this function, so the two refuse alike.
+pub(crate) fn snapshot_on_tape_refusal(
+    conn: &Connection,
+    snap_id: i64,
+    version: i64,
+) -> Result<Option<String>> {
+    let (completed, ranges): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(w.status = 'completed'), 0), COALESCE(SUM(w.status = 'range'), 0)
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         WHERE ss.snapshot_id = ?1 AND w.status IN ('completed', 'range')",
+        params![snap_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(match (completed, ranges) {
+        (0, 0) => None,
+        (n, 0) => Some(format!(
+            "snapshot v{version} has {n} completed write(s) — cannot delete"
+        )),
+        (0, r) => Some(format!(
+            "snapshot v{version} has {r} range write(s): a run of its slices is on tape, part \
+             of a version across tapes — cannot delete"
+        )),
+        (n, r) => Some(format!(
+            "snapshot v{version} has {n} completed write(s) and {r} range write(s) — cannot \
+             delete"
+        )),
+    })
+}
+
 /// Delete an unwritten snapshot.
 pub fn snapshot_delete(
     conn: &Connection,
@@ -3069,18 +3170,10 @@ pub fn snapshot_delete(
             TapectlError::Other(format!("snapshot v{version} not found for \"{unit_name}\""))
         })?;
 
-    // Check if snapshot has been written to tape
-    let write_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         WHERE ss.snapshot_id = ?1 AND w.status = 'completed'",
-        params![snap_id],
-        |row| row.get(0),
-    )?;
-    if write_count > 0 {
-        return Err(TapectlError::Other(format!(
-            "snapshot v{version} has {write_count} completed write(s) — cannot delete"
-        )));
+    // Check if snapshot has been written to tape: a completed write, or a
+    // range of one (#478), whose slices are on its tape as surely.
+    if let Some(refusal) = snapshot_on_tape_refusal(conn, snap_id, version)? {
+        return Err(TapectlError::Other(refusal));
     }
 
     // Check if staged (allow with --force)
@@ -6309,6 +6402,49 @@ mod tests {
                 "the Tier-3 floor must be what fired, not a consent prompt: {err}"
             );
             assert_eq!(volume_status(&conn, vol_id), "sealed");
+        }
+
+        /// #478 (ADR-0012 item 128): the floor protects a span in progress,
+        /// whose version is `staged`, not `current`. Tape 1 of a span holds
+        /// the only copy of slices 1-2 and nothing else holds them, so the
+        /// retirement is refused, and the refusal says to finish the span,
+        /// not to copy a current version out and re-stage it.
+        #[test]
+        fn tier3_tells_a_span_in_progress_to_finish_the_span() {
+            let c = crate::policy::coverage::tests::SpanCatalog::new();
+            let snap = c.version(1, "staged");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            c.range(set, t1, 1, 2, 6);
+
+            let err = volume_retire(&c.conn, &Config::default(), "SPAN-1", true, false, false)
+                .expect_err("the only copy of a span's slices is Tier 3");
+            let msg = err.to_string();
+            assert!(msg.contains("LAST eligible copy"), "{msg}");
+            assert!(
+                msg.contains(
+                    "unit \"span\" v1 (a span in progress: this tape holds the only copy of \
+                     some of its slices)"
+                ),
+                "{msg}"
+            );
+            assert!(msg.contains("Finish the span first"), "{msg}");
+            assert!(
+                !msg.contains("Make another copy first")
+                    && !msg.contains("read-slices --from")
+                    && !msg.contains("stage create"),
+                "a current version's recipe is not a span's: {msg}"
+            );
+            crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+                &msg,
+                &[("<OTHER-LABEL>", "SPAN-2")],
+                &[
+                    "tapectl volume write SPAN-2",
+                    "tapectl snapshot mark-reclaimable span --version 1",
+                    "tapectl volume verify SPAN-1",
+                ],
+            );
+            assert_eq!(volume_status(&c.conn, t1), "sealed");
         }
 
         /// Tier 3 is ABSOLUTE: `--yes` is not a way past it. This is the
@@ -9618,6 +9754,62 @@ mod tests {
                 f.display()
             );
         }
+    }
+
+    /// #478: a `range` write holds a run of the version's slices on its
+    /// tape, maybe the only copy of them while its span is in progress, so
+    /// `snapshot delete` refuses it as it refuses a completed write, and
+    /// `--dry-run` refuses the same way. Positive control: the same snapshot
+    /// with the write `cut` (nothing of it on the tape) deletes.
+    #[test]
+    fn delete_is_refused_with_a_range_write_and_its_dry_run_agrees() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, _slice_files) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-RANGE");
+        let (write_id, _) = insert_write(&conn, snap_id, volume_id, "planned", None);
+        conn.execute(
+            "UPDATE writes SET status = 'range', may_span = 1 WHERE id = ?1",
+            params![write_id],
+        )
+        .unwrap();
+
+        let err = snapshot_delete(&conn, "unit1", 1, true, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("v1 has 1 range write(s)"), "{msg}");
+        assert!(msg.contains("cannot delete"), "{msg}");
+
+        let paths = crate::config::TapectlPaths::new(tmp.path().to_path_buf());
+        let dry = crate::cli::snapshot::run(
+            &conn,
+            &paths,
+            &crate::config::Config::default(),
+            &crate::cli::snapshot::SnapshotCommands::Delete {
+                name: "unit1".into(),
+                version: 1,
+                force: true,
+            },
+            false,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(dry.to_string(), msg, "the dry run refuses as the delete does");
+
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1);
+
+        conn.execute(
+            "UPDATE writes SET status = 'cut' WHERE id = ?1",
+            params![write_id],
+        )
+        .unwrap();
+        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
     }
 
     /// The cascade must be all-or-nothing. Driven by a trigger that rejects
