@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20, and (g) takes it to 1.6.0 after the acceptance run). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20, (g) takes it to 1.6.0 after the acceptance run, and (h) to 1.7.0, spanning, with spanning left off until its real-drive proof passes). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -42,6 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
+| (h) | Upgrade home2 to 1.7.0, spanning off; spanning's real-drive proof before any unit allows it | **you** (sudo; the cartridge and the drive for the proof), once `v1.7.0` is tagged |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -448,6 +449,62 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
    becomes `tapectl-1.6.0`; reprint COVER.txt and put the new files on the media in each
    envelope.
 
+## (h) Upgrade home2 to 1.7.0, with spanning off
+
+1.7.0 is spanning (#478, ADR-0012 items 121-144, `docs/releases/1.7.0.md`): a unit that allows
+it (`allow_spanning`, off by default) may have its slices run across tapes, the drive's early
+warning ending each tape's run. A tape whose plan holds a slice of such a unit states
+`requires = ["short-seal", "spanning"]`, so **a 1.6.0 tapectl or RESTORE.sh refuses it by
+name**. Every other 1.7.0 tape states `requires = ["short-seal"]` as 1.6.0 did, and a 1.6.0
+reader still reads it. With `allow_spanning` unset nothing spans, and a write plans as 1.6.0 did.
+1.7.0 reads L6-0001 and L6-0002 as they are. One catalog migration applies at the first open:
+039 (the write status `range`, `writes.may_span`, `stage_slices.released_at`,
+`archive_sets.allow_spanning`). There is no downgrade past it: the rollback is the 1.6.0 binary
+kept in step 3 plus `db import` of the backup from step 1, losing whatever the catalog recorded
+in between.
+
+This assumes (g)'s upgrade is done. If home2 still runs 1.5.0, go straight to 1.7.0, which
+contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step 3, migrations
+038 and 039 both apply at step 4, and step 5 sets `post_warning_bytes` as (g) step 5 would have.
+
+On home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0` is
+tagged:
+
+1. **Back up the catalog with 1.6.0:** `tapectl-op db backup --to
+   /srv/local_backup/tapectl/tapectl-pre-1.7.0.db`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.7.0`.
+3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
+   /usr/local/bin/tapectl-1.6.0`, then `scripts/first-run.sh --profile
+   contrib/hosts/home2.profile --from 3 --to 3`. `tapectl --version` should read
+   `1.7.0 (v1.7.0, <date>)`.
+4. **The first open applies migration 039:** `tapectl-op config check`.
+5. **Confirm `post_warning_bytes`** in the drive's `[[backends.lto]]` table
+   (`tapectl-op config show`): (g) step 5 set it to `99008M`. If it is missing, set it as (g)
+   step 5 says. A span is planned only on a drive that declares it; without it a unit that
+   allows spanning and would pass the fill ceiling is refused, naming the key (item 123).
+6. **Look:** `tapectl status`, `tapectl-op audit` (the new `span_in_progress` check and the four
+   range invariants of `short_seal` are silent: nothing spans yet), and `tapectl-op report
+   failed-stages` (new: every stage attempt that failed, and the hours each lost; item 91).
+7. **Before the next write,** step 12's rehearsal proves the new binary on the drive, as in (f)
+   step 7. Stop the drive-poll timer for it.
+8. **Regenerate the Heir Kit** with the installed binary, as in (f) step 8. RESTORE.sh and File
+   1 moved, and once a span tape exists the kit's copy of tapectl must read it. The kit's
+   fourth file becomes `tapectl-1.7.0`; reprint COVER.txt and put the new files on the media in
+   each envelope.
+
+**Spanning stays off on home2 until its real-drive proof passes.** A config written before 1.7.0
+has no `allow_spanning`, and an absent key reads `false`: nothing to edit. The proof is
+item 137, as item 139 amends it: on test cartridge EW7VWMVKF6 in a throwaway home, tape 1 is
+filler to the fill ceiling and then a real spannable unit the drive's early warning cuts (the
+`range` row, the readback past the warning, RESTORE.sh spooling tape 1's range into scratch, a
+rebuild of tape 1); the cartridge is then erased and written as tape 2, a whole copy, and the
+restore finishes from scratch plus tape 2. Its script, `scripts/span-acceptance.sh`, is not
+written yet; the coordinator says when it is ready, as for (g)'s acceptance run. It is the step
+before any production use of spanning. After it passes, allow spanning per unit (its dotfile's
+`[policy]`), per archive set (`tapectl-op archive-set edit <NAME> --allow-spanning true`) or in
+`[defaults]`, and keep the tapes `volume write` names together ("keep these together"): a
+whole copy across tapes needs every one of them to restore.
+
 ## (e) After: the backlog
 
 None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369, #371,
@@ -464,7 +521,9 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   - Whether to prove the readback before building is the CTO's question on #420. The short seal
     is then a CTO-ruled on-tape change with its own re-pin, and item 99 makes every write fill to
     the early warning with it.
-- **#478, spanning:** designed and ruled (ADR-0012 items 76-77, 82-100), built right after #420.
+- **#478, spanning:** built as 1.7.0 (ADR-0012 items 76-77, 82-100 and 121-144; (h) above).
+  Its real-drive proof (item 137, `scripts/span-acceptance.sh`) is still to run, and the
+  residuals it left are listed in `docs/releases/1.7.0.md`, "Known open items".
 - **#479, the profiling toolkit:** built in 1.4.0: `scripts/lto-profile.sh` and
   `docs/lto-profiling.md`; its real-drive run is the same run as #420's (done 2026-10-20; the
   readback gap is #487).
@@ -557,4 +616,5 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   clean`. On 1.1.1 the write that completes the policy releases staging itself otherwise.
 - **The on-tape authorizations of 1.2.0, 1.3.0, 1.4.0 and 1.5.0 end when v1.5.0 is installed**
   (ADR-0012 items 72, 81, 104, 105 and 109; the 2026-10-07 one ended with the v1.1.0 install, item 40). After it, a failing
-  `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin.
+  `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin. 1.6.0's (item 116) ends
+  when v1.6.0 is installed on home2, and 1.7.0's (item 135) when v1.7.0 is.
