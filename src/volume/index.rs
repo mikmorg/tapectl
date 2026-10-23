@@ -1421,20 +1421,21 @@ mod tests {
         .unwrap();
         let alpha = c.tenant("alpha");
         let units = read(&files.tenants[&alpha].units);
-        let runs: Vec<(String, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> =
-            parse_units(&units)
-                .unwrap()
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.volume,
-                        r.num_slices,
-                        r.first_slice,
-                        r.last_slice,
-                        r.version_bytes,
-                    )
-                })
-                .collect();
+        // (volume, num_slices, first_slice, last_slice, version_bytes)
+        type Run = (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let runs: Vec<Run> = parse_units(&units)
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.volume,
+                    r.num_slices,
+                    r.first_slice,
+                    r.last_slice,
+                    r.version_bytes,
+                )
+            })
+            .collect();
         assert_eq!(
             runs,
             vec![

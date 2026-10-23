@@ -5924,7 +5924,10 @@ pub(crate) mod tests {
         let photos = c.unit("alpha", "photos");
         let tape = c.volume("L6-0001", "sealed", "ok", Some("2026-10-21 10:00:00"));
         let (_, p1) = c.version(photos, 1, "current", &[10, 10]);
-        c.range(p1, tape, 3..=2);
+        c.range(p1, tape, 1..=2);
+        c.conn
+            .execute("UPDATE write_positions SET status = 'pending'", [])
+            .unwrap();
         let (_, p2) = c.version(photos, 2, "current", &[]);
         c.write(p2, tape, "completed");
         let rows = index_runs(&index_versions(&c.conn, &THIS, &[]).unwrap());
