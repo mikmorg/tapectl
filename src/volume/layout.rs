@@ -9447,7 +9447,8 @@ mod tests {
         }
         // It sits between the replacement-slice commands and "With no other copy".
         let cmds = span.find("--swap-tapes --to /destination/UNIT\n```\n\nNeither applies");
-        let rest = span.find("left out as below.\n\nWith no other copy, leave the failed slice out");
+        let rest =
+            span.find("left out as below.\n\nWith no other copy, leave the failed slice out");
         assert!(cmds.is_some() && rest.is_some(), "{span}");
         assert!(!plain.contains("Neither applies"), "{plain}");
         assert!(
