@@ -1711,7 +1711,11 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
   inside them can still be restored: RESTORE.sh does it (`--swap-tapes`,
   then type `done`), and "No other copy", in "If a slice or a file is
   damaged", has that and the commands by hand. The files in the failed
-  slices are lost.
+  slices are lost. Not so for a unit across tapes when no tape you hold has
+  that version whole ("A unit across tapes"): RESTORE.sh refuses
+  `--swap-tapes` for it, `done` at its prompt stops the restore, and it
+  restores nothing of the unit without every slice. "No other copy" names
+  the ways that do work for it.
 
 ## Where the tape ended
 
@@ -1987,6 +1991,22 @@ RESTORE.sh does this for you: run the `--swap-tapes` restore above and type
 lists the others in `.tapectl-damaged-files.txt` ("A file fails", above) and
 ends `RESTORE INCOMPLETE`. It needs the room of a replacement-slice restore
 ("Disk space").
+
+Not for a unit across tapes when no tape you hold has that version whole
+("A unit across tapes"): RESTORE.sh takes no `--swap-tapes` or
+`--slices-from` for it, and `done` at its prompt stops the restore with
+nothing of the unit restored. What does work for such a unit:
+
+- `--restore --unit UNIT --path PATH` restores a folder or a file whose
+  slices all avoid the failed one. It reads only the slices that hold the
+  path, and the last slice, which must therefore be good; the `dar -l` line
+  below shows which slices hold each file.
+- tapectl's own restore reads a unit across tapes, asking for each
+  cartridge, and reads around a damaged 64 KiB piece of a slice, losing
+  only the files in that piece ("tapectl itself").
+- By hand, as below: step 7 of "Manual Recovery Steps" reads each tape's
+  slices of the unit into the one directory, matched by their
+  `sha256_encrypted`, and the failed slice is left out.
 
 By hand, without RESTORE.sh, do the steps of "Manual Recovery Steps" for the
 unit, but leave the failed slices out: do not decrypt them, and do not put
@@ -8983,6 +9003,39 @@ mod tests {
             "  PART: %s\\n\"",
         ] {
             assert!(script.contains(said), "{said:?}");
+        }
+    }
+
+    /// The fresh read, S3: File 1 promised that with no other copy of a bad
+    /// slice RESTORE.sh restores the files wholly inside the good ones
+    /// (`--swap-tapes`, then `done`). For a unit across tapes it refuses
+    /// `--swap-tapes` and restores nothing without every slice. Both places
+    /// say so, and "No other copy" gives the routes that do exist; no partial
+    /// restore across tapes is built.
+    #[test]
+    fn fresh_read_478_s3_no_partial_restore_across_tapes_and_the_routes_that_exist() {
+        let g = generate_system_guide_v2_for_media("FR02", 20, "LTO-6");
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        assert!(
+            verdict.contains("The files in the failed slices are lost. Not so for a unit across tapes when no tape you hold has that version whole (\"A unit across tapes\"): RESTORE.sh refuses `--swap-tapes` for it, `done` at its prompt stops the restore, and it restores nothing of the unit without every slice. \"No other copy\" names the ways that do work for it."),
+            "{verdict}"
+        );
+        let f = flat_text(guide_section(&g, "If a slice or a file is damaged"));
+        for needle in [
+            "Not for a unit across tapes when no tape you hold has that version whole (\"A unit across tapes\"): RESTORE.sh takes no `--swap-tapes` or `--slices-from` for it, and `done` at its prompt stops the restore with nothing of the unit restored. What does work for such a unit:",
+            "- `--restore --unit UNIT --path PATH` restores a folder or a file whose slices all avoid the failed one. It reads only the slices that hold the path, and the last slice, which must therefore be good;",
+            "- tapectl's own restore reads a unit across tapes, asking for each cartridge, and reads around a damaged 64 KiB piece of a slice, losing only the files in that piece (\"tapectl itself\").",
+            "- By hand, as below: step 7 of \"Manual Recovery Steps\" reads each tape's slices of the unit into the one directory, matched by their `sha256_encrypted`, and the failed slice is left out.",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+        // What the text describes is what the script does.
+        let script = generate_restore_script_v2("FR02", 20);
+        for does in [
+            "--slices-from or --swap-tapes. Run the same command without them.",
+            "restored only with every slice, so nothing of it was restored, and the encrypted slices read so",
+        ] {
+            assert!(script.contains(does), "{does:?}");
         }
     }
 
