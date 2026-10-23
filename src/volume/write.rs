@@ -4239,6 +4239,19 @@ fn finish_confirm(
             // stays one document.
             if let Some(report) = sealed.short_ending_report() {
                 eprintln!("{report}");
+            } else if let Some(report) = full_seal_range_report(&sealed) {
+                eprintln!("{report}");
+            }
+            // #478 (ADR-0012 item 134): the tapes that make up each whole copy
+            // across tapes a range here completes. Best-effort, like the
+            // figures above: the copy stands whatever this reads.
+            match keep_together(conn, label) {
+                Ok(copies) => {
+                    for copy in copies {
+                        eprintln!("volume \"{label}\": {}", copy.describe());
+                    }
+                }
+                Err(e) => warn!(label, error = %e, "could not read which tapes to keep together"),
             }
             info!(label = sealed.label, volume_id, "volume write sealed");
             Ok(())
@@ -4910,6 +4923,30 @@ fn record_after_sealed(
     })
 }
 
+/// What the operator is told about a tape that sealed full and holds a
+/// range (#478, `layout-session.md` "A write that may span"): a
+/// continuation whose run reached the tape whole but is not the whole set.
+/// [`session::SealedSession::short_ending_report`] says it of a short seal;
+/// `None` on a short seal and when the tape holds no range.
+fn full_seal_range_report(sealed: &session::SealedSession) -> Option<String> {
+    if !matches!(sealed.ending, session::Ending::Full) || sealed.range_units.is_empty() {
+        return None;
+    }
+    let ranges: Vec<String> = sealed
+        .range_units
+        .iter()
+        .map(|r| format!("{} ({})", r.unit, slice_run(r.first_slice, r.last_slice)))
+        .collect();
+    Some(format!(
+        "volume \"{}\" sealed full and holds as a range: {}. A range is a run of a unit's slices, \
+         not a copy on its own (ADR-0012 item 127): the unit's other slices are on other tapes, \
+         or still staged for an ordinary `tapectl volume write` onto another cartridge of the \
+         same generation.",
+        sealed.label,
+        ranges.join(", ")
+    ))
+}
+
 /// The `write_completed` event's `details` (#420, #478; `layout-session.md`
 /// "Confirm of a short ending"): [`session::SealedSession::write_completed_details`],
 /// which names the short ending and the cut units and, from 1.7.0, the range
@@ -4921,7 +4958,10 @@ pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option
 }
 
 /// How a volume's tape ended, as the catalog records it (#420): what
-/// `volume write --json` reports once the write returned `Ok`.
+/// `volume write --json` reports once the write returned `Ok`. From 1.7.0
+/// (#478) also what the write left of a span: the units it holds as a range,
+/// the staged units it did not put on the tape, and the whole copies across
+/// tapes it completed. Read before the staging release.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecordedEnding {
     /// `volumes.ended_after`: the short seal's K, `None` on a full seal.
@@ -4929,6 +4969,15 @@ pub struct RecordedEnding {
     /// The units whose `writes` rows on the volume are `cut`, in plan order
     /// (the order the session inserted its rows): empty on a full seal.
     pub cut_units: Vec<String>,
+    /// The units whose `writes` rows on the volume are `range`, in plan
+    /// order, with their runs ([`recorded_ranges`]).
+    pub range_units: Vec<RecordedRange>,
+    /// The staged units with no write on the volume ([`waiting_units`]): a
+    /// span tape's deferred units, which wait for the next tape.
+    pub deferred_units: Vec<String>,
+    /// The whole copies across tapes a range on the volume completes, to be
+    /// kept together ([`keep_together`], ADR-0012 item 134).
+    pub keep_together: Vec<KeepTogether>,
 }
 
 impl RecordedEnding {
@@ -4967,7 +5016,206 @@ pub fn recorded_ending(conn: &Connection, label: &str) -> Result<RecordedEnding>
     Ok(RecordedEnding {
         ended_after,
         cut_units,
+        range_units: recorded_ranges(conn, label)?,
+        deferred_units: waiting_units(conn, label)?,
+        keep_together: keep_together(conn, label)?,
     })
+}
+
+/// A unit a volume holds as a range (#478, `writes.status = 'range'`): the
+/// run of its stage set's slices `written` there, by slice number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordedRange {
+    pub unit: String,
+    pub version: i64,
+    pub first_slice: i64,
+    pub last_slice: i64,
+}
+
+impl RecordedRange {
+    /// `"b" v1 (slices 1-2)`, or `(slice 3)` for a run of one.
+    pub fn describe(&self) -> String {
+        format!(
+            "\"{}\" v{} ({})",
+            self.unit,
+            self.version,
+            slice_run(self.first_slice, self.last_slice)
+        )
+    }
+}
+
+/// One volume of a whole copy held across tapes, with the run it holds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CopyTape {
+    pub label: String,
+    pub first_slice: i64,
+    pub last_slice: i64,
+}
+
+/// A whole copy of a spanning version held across tapes, which this volume's
+/// range completes (ADR-0012 item 134, "keep these together"): the tapes in
+/// slice order, each with its run. Together they are one copy, and its
+/// restore needs every one of them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KeepTogether {
+    pub unit: String,
+    pub version: i64,
+    pub tapes: Vec<CopyTape>,
+}
+
+impl KeepTogether {
+    /// What the write tells the operator (item 134).
+    pub fn describe(&self) -> String {
+        let tapes: Vec<String> = self
+            .tapes
+            .iter()
+            .map(|t| format!("{} ({})", t.label, slice_run(t.first_slice, t.last_slice)))
+            .collect();
+        let tapes = match tapes.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => tapes.join(""),
+        };
+        format!(
+            "keep these together: \"{}\" v{} is whole across {tapes}. Together these tapes are \
+             one copy of it, and restoring it needs every one of them (ADR-0012 item 134)",
+            self.unit, self.version
+        )
+    }
+}
+
+/// The units the volume labelled `label` holds as a range, in plan order,
+/// each with the run of its slices `written` there.
+pub fn recorded_ranges(conn: &Connection, label: &str) -> Result<Vec<RecordedRange>> {
+    Ok(conn
+        .prepare(
+            "SELECT u.name, s.version,
+                    MIN(sl.slice_number), MAX(sl.slice_number)
+             FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             JOIN write_positions wp ON wp.write_id = w.id AND wp.status = 'written'
+             JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+             WHERE v.label = ?1 AND w.status = 'range'
+             GROUP BY w.id
+             ORDER BY w.id",
+        )?
+        .query_map(params![label], |r| {
+            Ok(RecordedRange {
+                unit: r.get(0)?,
+                version: r.get(1)?,
+                first_slice: r.get(2)?,
+                last_slice: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every whole copy across tapes that a range on the volume labelled
+/// `label` makes up with ranges on other eligible volumes (ADR-0012 item
+/// 134): for each range of the volume, the chain of ranges of the same stage
+/// set whose runs follow one another, `first == previous last + 1`, from
+/// slice 1 to the set's last slice. A volume holds one unbroken run of a set
+/// (item 122), and a span's owed run begins where the range before it ended,
+/// so the tapes of one copy chain exactly. Where two ranges could follow,
+/// the one written first is taken. Empty when no range of the volume
+/// completes a copy yet (the first tape of a span), and for a `completed`
+/// write, which is a whole copy on one tape.
+pub fn keep_together(conn: &Connection, label: &str) -> Result<Vec<KeepTogether>> {
+    let mine: Vec<(i64, String, i64, i64)> = conn
+        .prepare(
+            "SELECT w.stage_set_id, u.name, s.version,
+                    (SELECT COUNT(*) FROM stage_slices sl WHERE sl.stage_set_id = w.stage_set_id)
+             FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE v.label = ?1 AND w.status = 'range'
+             ORDER BY w.id",
+        )?
+        .query_map(params![label], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut copies = Vec::new();
+    for (stage_set_id, unit, version, slices) in mine {
+        // Every range of the set on an eligible volume, this one included
+        // (sealed by the confirm that ran), in the order they were written.
+        let runs: Vec<CopyTape> = conn
+            .prepare(&format!(
+                "SELECT v.label, MIN(sl.slice_number), MAX(sl.slice_number)
+                 FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 JOIN write_positions wp ON wp.write_id = w.id AND wp.status = 'written'
+                 JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                 WHERE w.stage_set_id = ?1 AND w.status = 'range' AND {}
+                 GROUP BY w.id
+                 ORDER BY w.id",
+                coverage::eligible("v")
+            ))?
+            .query_map(params![stage_set_id], |r| {
+                Ok(CopyTape {
+                    label: r.get(0)?,
+                    first_slice: r.get(1)?,
+                    last_slice: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some(this) = runs.iter().find(|r| r.label == label) else {
+            continue;
+        };
+        let mut chain = vec![this.clone()];
+        while chain[0].first_slice > 1 {
+            let want = chain[0].first_slice - 1;
+            match runs
+                .iter()
+                .find(|r| r.last_slice == want && !chain.iter().any(|c| c.label == r.label))
+            {
+                Some(before) => chain.insert(0, before.clone()),
+                None => break,
+            }
+        }
+        while chain[chain.len() - 1].last_slice < slices {
+            let want = chain[chain.len() - 1].last_slice + 1;
+            match runs
+                .iter()
+                .find(|r| r.first_slice == want && !chain.iter().any(|c| c.label == r.label))
+            {
+                Some(after) => chain.push(after.clone()),
+                None => break,
+            }
+        }
+        let whole = chain[0].first_slice == 1 && chain[chain.len() - 1].last_slice == slices;
+        if whole && chain.len() > 1 {
+            copies.push(KeepTogether {
+                unit,
+                version,
+                tapes: chain,
+            });
+        }
+    }
+    Ok(copies)
+}
+
+/// The staged sets with no write on the volume labelled `label`, by unit
+/// name: after a write of every staged set, the units it did not put on the
+/// tape, which wait for the next one (a span tape's deferred units,
+/// `layout-session.md` "The plan order"). Read before the staging release.
+pub fn waiting_units(conn: &Connection, label: &str) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare(
+            "SELECT DISTINCT u.name FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE ss.status = 'staged'
+               AND NOT EXISTS (SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
+                                WHERE w.stage_set_id = ss.id AND v.label = ?1)
+             ORDER BY u.name",
+        )?
+        .query_map(params![label], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?)
 }
 
 /// The command that records a sealed copy's write figures when the write
