@@ -10304,6 +10304,13 @@ mod tests {
         /// bytes), every slice's bytes distinct block by block (so a block
         /// written twice changes the file's hash), staged on disk.
         fn short_fixture(units: &[(&'static str, &[usize])]) -> Short {
+            span_fixture(units, &[])
+        }
+
+        /// [`short_fixture`], with the units named in `spannable` planned as
+        /// writes that may span (#478, ADR-0012 item 121): each one's span
+        /// lists every slice of its stage set, and this tape plans them all.
+        fn span_fixture(units: &[(&'static str, &[usize])], spannable: &[&str]) -> Short {
             let conn = db::open_memory().unwrap();
             conn.execute(
                 "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
@@ -10382,7 +10389,10 @@ mod tests {
                             &content,
                         )
                     })
-                    .collect();
+                    .collect::<Vec<BuildSlice>>();
+                let span = spannable.contains(name).then(|| build::UnitSpan {
+                    slices: slices.iter().map(build::SpanSlice::from).collect(),
+                });
                 build_units.push(BuildUnit {
                     stage_set_id,
                     snapshot_id,
@@ -10394,13 +10404,51 @@ mod tests {
                     catalog_path: None,
                     snapshot_version: 1,
                     slices,
-                    span: None,
+                    span,
                 });
             }
 
+            let (built, keys, session_dir) = build_tape(
+                &conn,
+                "SHORT01",
+                "6f9619ff-8b86-d011-b42d-00cf4fc964ff",
+                &build_units,
+            );
+            Short {
+                conn,
+                built,
+                keys,
+                units: build_units,
+                volume_id,
+                _dirs: (slices_dir, session_dir),
+            }
+        }
+
+        /// Build `units` onto the volume `label` of `conn`'s catalog, for
+        /// the tenant `alpha` and the operator, with their keys read from the
+        /// catalog: the Layout, the keys `validate` wants, and the session
+        /// directory it is frozen in.
+        fn build_tape(
+            conn: &Connection,
+            label: &str,
+            volume_uuid: &str,
+            units: &[BuildUnit],
+        ) -> (BuiltLayout, KeyAvailability, TempDir) {
+            let key_of = |operator: bool| -> (i64, String) {
+                conn.query_row(
+                    "SELECT t.id, k.public_key FROM tenants t
+                     JOIN encryption_keys k ON k.tenant_id = t.id
+                     WHERE t.is_operator = ?1",
+                    params![operator],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            };
+            let (_, operator_key) = key_of(true);
+            let (tenant_id, tenant_key) = key_of(false);
             let inputs = BuildInputs {
-                label: "SHORT01".to_string(),
-                volume_uuid: "6f9619ff-8b86-d011-b42d-00cf4fc964ff".to_string(),
+                label: label.to_string(),
+                volume_uuid: volume_uuid.to_string(),
                 media_type: "LTO-6".to_string(),
                 tapectl_version: "0.1.0-test".to_string(),
                 created_at: "2026-10-20T00:00:00Z".to_string(),
@@ -10414,13 +10462,13 @@ mod tests {
                 cartridge_identity_source: None,
                 mam_length: 0,
                 mam_loads: 0,
-                units: build_units.clone(),
+                units: units.to_vec(),
                 tenants: vec![TenantInfo {
                     tenant_id,
                     tenant_name: "alpha".to_string(),
-                    public_keys: vec![tenant_key.public_key],
+                    public_keys: vec![tenant_key],
                 }],
-                operator_public_keys: vec![op_key.public_key],
+                operator_public_keys: vec![operator_key],
                 escrow_public_key: None,
                 catalog_db_path: None,
                 index: None,
@@ -10434,14 +10482,39 @@ mod tests {
                 escrow_recipient_present: None,
                 stage_sets_lacking_escrow: None,
             };
-            Short {
+            (built, keys, session_dir)
+        }
+
+        /// The next tape of a span (#478): a new volume `label` in `s`'s
+        /// catalog, `units` planned on it, staged from the slices `s` staged.
+        /// Hands back `s`'s session directory too, for a test whose first
+        /// session is not over yet.
+        fn next_tape(s: Short, label: &str, units: Vec<BuildUnit>) -> (Short, TempDir) {
+            let Short {
                 conn,
-                built,
-                keys,
-                units: build_units,
-                volume_id,
-                _dirs: (slices_dir, session_dir),
-            }
+                _dirs: (slices_dir, first_session),
+                ..
+            } = s;
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                params![label],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+            let (built, keys, session_dir) =
+                build_tape(&conn, label, "7a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d", &units);
+            (
+                Short {
+                    conn,
+                    built,
+                    keys,
+                    units,
+                    volume_id,
+                    _dirs: (slices_dir, session_dir),
+                },
+                first_session,
+            )
         }
 
         /// Three blocks less a little: a slice the warning can come in.
@@ -11496,6 +11569,623 @@ mod tests {
                 ContactOutcome::AlreadySealed {
                     seal_position: k + 1
                 }
+            );
+        }
+
+        // ── spanning (#478, tapectl 1.7.0) ──
+
+        /// File 0's `requires`, as the tape holds it.
+        fn file0_requires(store: &MemStore) -> Vec<String> {
+            format::parse_id_thunk_claims(&String::from_utf8_lossy(format::without_nul_padding(
+                &store.files[0],
+            )))
+            .unwrap()
+            .requires
+        }
+
+        /// Each unit's `writes.may_span` on `s`'s volume, in plan order.
+        fn may_span_rows(s: &Short) -> Vec<(String, bool)> {
+            s.conn
+                .prepare(
+                    "SELECT u.name, w.may_span FROM writes w
+                     JOIN snapshots sn ON sn.id = w.snapshot_id
+                     JOIN units u ON u.id = sn.unit_id
+                     WHERE w.volume_id = ?1 ORDER BY w.id",
+                )
+                .unwrap()
+                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// `writes.write_verified` of unit `unit`'s row on `s`'s volume.
+        fn write_verified(s: &Short, unit: usize) -> bool {
+            s.conn
+                .query_row(
+                    "SELECT write_verified FROM writes WHERE volume_id = ?1 AND stage_set_id = ?2",
+                    params![s.volume_id, s.units[unit].stage_set_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// The positions of unit `unit`'s row on `s`'s volume only.
+        fn positions_here(s: &Short, unit: usize) -> Vec<(i64, String)> {
+            s.conn
+                .prepare(
+                    "SELECT CAST(wp.position AS INTEGER), wp.status FROM write_positions wp
+                     JOIN writes w ON w.id = wp.write_id
+                     WHERE w.stage_set_id = ?1 AND w.volume_id = ?2 ORDER BY 1",
+                )
+                .unwrap()
+                .query_map(params![s.units[unit].stage_set_id, s.volume_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn range(unit: &str, first_slice: i64, last_slice: i64) -> RangeUnit {
+            RangeUnit {
+                unit: unit.to_string(),
+                first_slice,
+                last_slice,
+            }
+        }
+
+        /// Unit `b`'s three slices may span, after a whole `a` and before a
+        /// whole `c`.
+        fn a_span_between_whole_units() -> Short {
+            span_fixture(
+                &[
+                    ("a", &[SLICE, SLICE]),
+                    ("b", &[SLICE, SLICE, SLICE]),
+                    ("c", &[SLICE]),
+                ],
+                &["b"],
+            )
+        }
+
+        /// `plan` freezes whether each write may span into its row
+        /// (ADR-0012 item 121): set for the unit with a span, not for the
+        /// others.
+        #[test]
+        fn plan_records_may_span_from_the_units_span() {
+            let s = a_span_between_whole_units();
+            let mut store = MemStore::new(SBS as usize);
+            let (s, _) = execute(s, &mut store);
+            assert_eq!(
+                may_span_rows(&s),
+                [
+                    ("a".to_string(), false),
+                    ("b".to_string(), true),
+                    ("c".to_string(), false)
+                ]
+            );
+        }
+
+        /// The early warning inside a spannable set (item 121, X2): the slice
+        /// in flight finishes, the tape seals short after it, and the set is
+        /// a `range` — its written positions are at or before K, the one
+        /// after K stays `pending`. Its version is on no other tape, so it
+        /// stays `staged` (item 128). The whole unit after it is cut as in
+        /// 1.6.0. The seal states the two features File 0 states (item 124),
+        /// and the operator's report and the event's details name the range
+        /// with its slice run.
+        #[test]
+        fn the_early_warning_inside_a_spannable_set_records_a_range() {
+            let s = a_span_between_whole_units();
+            let k = slice_at(&s, 1, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            let seal = parsed_seal(&store.files[k as usize + 1]);
+            assert_eq!(seal.requires, file0_requires(&store), "item 124");
+            assert_eq!(seal.ended_after, Some(u64::from(k)));
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.range_units, [range("b", 1, 2)]);
+            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "range", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(
+                positions_here(&s, 1),
+                [
+                    (i64::from(k) - 1, "written".to_string()),
+                    (i64::from(k), "written".to_string()),
+                    (i64::from(k) + 1, "pending".to_string())
+                ]
+            );
+            assert!(!write_verified(&s, 1), "a quick confirm verifies nothing");
+            assert_eq!(
+                volume(&s),
+                ("sealed".into(), Some(i64::from(k)), "ok".into())
+            );
+
+            let report = done.short_ending_report().unwrap();
+            assert!(report.contains("b (slices 1-2)"), "{report}");
+            assert!(report.contains("same generation"), "{report}");
+            assert!(
+                report.contains("Cut (not on this tape, still staged): c."),
+                "{report}"
+            );
+            let details: serde_json::Value =
+                serde_json::from_str(&done.write_completed_details().unwrap()).unwrap();
+            assert_eq!(
+                details,
+                serde_json::json!({
+                    "ending": "short",
+                    "ended_after": k,
+                    "cut_units": ["c"],
+                    "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 2}],
+                })
+            );
+        }
+
+        /// A spannable set planned whole on a tape that seals full is
+        /// `completed` (item 93's middle tape) and promoted, and the full seal
+        /// states both features. Before X7 this write failed at the seal: the
+        /// one-feature seal was 12 bytes shorter than the two-feature
+        /// placeholder `build` sized. A full confirm marks it verified.
+        #[test]
+        fn a_spannable_set_whole_on_a_full_tape_is_completed() {
+            let s = span_fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE])], &["b"]);
+            let m = planned_seal(&s);
+            let mut store = MemStore::new(SBS as usize);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Full);
+            let seal = parsed_seal(&store.files[m as usize]);
+            assert_eq!(seal.file_count as u32, m + 1, "the full seal");
+            assert_eq!(seal.requires, layout::REQUIRES_SPAN);
+            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Integrity)
+                    .unwrap(),
+            );
+            assert!(done.range_units.is_empty() && done.cut_units.is_empty());
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "completed", "current")
+                ]
+            );
+            assert!(write_verified(&s, 1));
+            assert_eq!(done.write_completed_details(), None, "1.6.0's full event");
+        }
+
+        /// The early warning before a spannable set's first slice: the tape
+        /// holds none of it, so it is `cut` (X2), like a whole unit. The tape
+        /// still states `spanning`: the fence follows the plan
+        /// (`volume-format-v2.md` §1.2).
+        #[test]
+        fn the_early_warning_before_a_spannable_sets_first_slice_cuts_it() {
+            let s = span_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE])], &["b"]);
+            let k = slice_at(&s, 0, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert_eq!(
+                parsed_seal(&store.files[k as usize + 1]).requires,
+                layout::REQUIRES_SPAN
+            );
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert!(done.range_units.is_empty());
+            assert_eq!(done.cut_units, ["b"]);
+            assert_eq!(
+                rows(&s),
+                [row("a", "completed", "current"), row("b", "cut", "staged")]
+            );
+            assert!(!done.short_ending_report().unwrap().contains("range"));
+        }
+
+        /// The tail of a span on a second tape (item 93's tape 3, item 128):
+        /// tape 1 ends in the range 1..2 of `b`; tape 2 plans only slice 3
+        /// (its span lists all three) and seals full. Its row is a `range` —
+        /// a fully written tail is still not the whole set — and its seal
+        /// promotes the version, because every slice is now on a sealed
+        /// volume. Tape 1 alone left it `staged`.
+        #[test]
+        fn a_fully_written_tail_is_a_range_and_its_seal_promotes_the_version() {
+            let s = span_fixture(&[("b", &[SLICE, SLICE, SLICE])], &["b"]);
+            let k = slice_at(&s, 0, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let first = sealed(
+                ready(outcome)
+                    .seal(&mut store)
+                    .unwrap()
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(first.range_units, [range("b", 1, 2)]);
+            assert_eq!(rows(&s), [row("b", "range", "staged")]);
+
+            let b = s.units[0].clone();
+            let tail = BuildUnit {
+                slices: b.slices[2..].to_vec(),
+                ..b
+            };
+            let (s, _first_session) = next_tape(s, "SHORT02", vec![tail]);
+            let m = planned_seal(&s);
+            let mut store = MemStore::new(SBS as usize);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Full);
+            assert_eq!(
+                parsed_seal(&store.files[m as usize]).requires,
+                file0_requires(&store)
+            );
+            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.range_units, [range("b", 3, 3)]);
+            assert_eq!(rows(&s), [row("b", "range", "current")]);
+            assert_eq!(
+                positions_here(&s, 0),
+                [(i64::from(m) - 1, "written".to_string())]
+            );
+            let details: serde_json::Value =
+                serde_json::from_str(&done.write_completed_details().unwrap()).unwrap();
+            assert_eq!(
+                details,
+                serde_json::json!({
+                    "ending": "full",
+                    "range_units": [{"unit": "b", "first_slice": 3, "last_slice": 3}],
+                })
+            );
+        }
+
+        /// Item 128 in the other order: tape 2's tail is confirmed while
+        /// tape 1 (which holds 1..2) is sealed on the medium but not yet in
+        /// the catalog. Tape 2's range does not promote the version; tape
+        /// 1's confirm, the last of the two, does.
+        #[test]
+        fn a_spanning_version_is_promoted_only_at_the_last_of_its_seals() {
+            let s = span_fixture(&[("b", &[SLICE, SLICE, SLICE])], &["b"]);
+            let k = slice_at(&s, 0, 1);
+            let mut first_store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut first_store);
+            let first_pending = ready(outcome).seal(&mut first_store).unwrap();
+            let first_volume = s.volume_id;
+
+            let b = s.units[0].clone();
+            let tail = BuildUnit {
+                slices: b.slices[2..].to_vec(),
+                ..b
+            };
+            let (s, _first_session) = next_tape(s, "SHORT02", vec![tail]);
+            let mut store = MemStore::new(SBS as usize);
+            let (s, outcome) = execute(s, &mut store);
+            sealed(
+                ready(outcome)
+                    .seal(&mut store)
+                    .unwrap()
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(
+                rows(&s),
+                [row("b", "range", "staged")],
+                "slices 1 and 2 are on no sealed volume yet"
+            );
+
+            let done = sealed(
+                first_pending
+                    .confirm(&s.conn, &mut first_store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.volume_id, first_volume);
+            assert_eq!(done.range_units, [range("b", 1, 2)]);
+            assert_eq!(
+                rows(&s),
+                [row("b", "range", "current")],
+                "every slice is on a sealed volume once tape 1 is"
+            );
+        }
+
+        /// A crash after the warning inside a spannable set, before the seal
+        /// (`layout-session.md`, "Resume after a crash past the warning"
+        /// step 3): the rehydrated session seals short at K+1 stating the
+        /// two features its frozen File 0 states, and confirm records the
+        /// range from the rows' `may_span`.
+        #[test]
+        fn a_resume_after_a_crash_past_the_warning_records_the_range() {
+            let s = a_span_between_whole_units();
+            let k = slice_at(&s, 1, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            drop(ready(outcome)); // the crash: no seal
+            let interrupted = crashed_after_the_warning(&s);
+            let mut store = NoDataWrites {
+                inner: store,
+                planned_seal: planned_seal(&s),
+            };
+            let ready = resume_to_ready(&s, interrupted, &mut store);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            let pending = ready.seal(&mut store).unwrap();
+            assert_eq!(
+                parsed_seal(&store.inner.files[k as usize + 1]).requires,
+                layout::REQUIRES_SPAN
+            );
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.range_units, [range("b", 1, 2)]);
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "range", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(warning_events(&s).len(), 1, "no second event");
+        }
+
+        /// The seal's `requires` is File 0's (item 124, X7), for both
+        /// endings and both fences: one feature on a tape whose plan holds no
+        /// spannable set, two on one that does.
+        #[test]
+        fn the_seals_requires_is_file_0s_full_or_short_one_or_two_features() {
+            for (spannable, warned) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let what = format!("spannable {spannable}, warned {warned}");
+                let spans: &[&str] = if spannable { &["b"] } else { &[] };
+                let s = span_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE])], spans);
+                let mut store = if warned {
+                    warning_in(&s, slice_at(&s, 0, 1))
+                } else {
+                    MemStore::new(SBS as usize)
+                };
+                let m = planned_seal(&s);
+                let (s, outcome) = execute(s, &mut store);
+                let pending = ready(outcome).seal(&mut store).unwrap();
+                let at = pending.ending().seal_position(m);
+                assert_eq!(
+                    matches!(pending.ending(), Ending::Short { .. }),
+                    warned,
+                    "{what}"
+                );
+                let expected = layout::tape_requires(spannable);
+                assert_eq!(file0_requires(&store), expected, "{what}");
+                assert_eq!(
+                    parsed_seal(&store.files[at as usize]).requires,
+                    expected,
+                    "{what}"
+                );
+                sealed(
+                    pending
+                        .confirm(&s.conn, &mut store, Tier::Navigable)
+                        .unwrap(),
+                );
+            }
+        }
+
+        /// The seal never guesses its features: a frozen File 0 that does not
+        /// parse fails the seal before its first block. The positive control
+        /// is every other test here, whose frozen File 0 reads.
+        #[test]
+        fn a_frozen_file_0_that_does_not_parse_fails_the_seal_before_writing_it() {
+            let s = a_span_between_whole_units();
+            let mut store = MemStore::new(SBS as usize);
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            let file0 = s
+                .built
+                .layout
+                .entries
+                .iter()
+                .find_map(|e| match (&e.kind, &e.source) {
+                    (ZoneKind::IdThunk, ContentSource::Materialized(path)) => Some(path.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            std::fs::write(&file0, b"not an id thunk").unwrap();
+            let before = store.files.len();
+            let err = ready.seal(&mut store).err().expect("the seal is refused");
+            assert!(err.to_string().contains("frozen File 0"), "{err}");
+            assert_eq!(store.files.len(), before, "nothing written");
+        }
+
+        /// Item 114 on a span tape: the quick confirm still reads back the
+        /// slice at `ended_after`, so a refused block the drive kept is caught
+        /// there, and no row becomes a range over it.
+        #[test]
+        fn the_readback_past_the_warning_is_unchanged_on_a_span_tape() {
+            let s = a_span_between_whole_units();
+            let k = slice_at(&s, 1, 1);
+            let mut store = warning_in(&s, k).with_refused_blocks_written();
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert!(pending.readback_past_warning());
+            let outcome = pending
+                .confirm(&s.conn, &mut store, Tier::Navigable)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Quarantined(_)));
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+        }
+
+        /// A write with no unit that may span is 1.6.0's, row for row and
+        /// byte for byte where it is deterministic: no row may span, File 0
+        /// and the seal state `short-seal` alone, the rows split
+        /// completed/cut, no range is named, and the event's details are the
+        /// ones `write::write_completed_details` makes from the same session.
+        #[test]
+        fn a_write_with_no_spannable_unit_is_1_6_0s() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert!(may_span_rows(&s).iter().all(|(_, may)| !may));
+            let seal_text = String::from_utf8(store.files[k as usize + 1].clone()).unwrap();
+            assert!(
+                seal_text.contains("\nrequires = [\"short-seal\"]\n")
+                    && !seal_text.contains("spanning"),
+                "{seal_text}"
+            );
+            assert_eq!(file0_requires(&store), layout::REQUIRES_WHOLE);
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert!(done.range_units.is_empty());
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "cut", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(
+                done.write_completed_details(),
+                crate::volume::write::write_completed_details(&done)
+            );
+            assert!(!done.short_ending_report().unwrap().contains("range"));
+
+            // And a full seal: no details, as before 1.6.0.
+            let s = three_units();
+            let mut store = MemStore::new(SBS as usize);
+            let (s, outcome) = execute(s, &mut store);
+            let done = sealed(
+                ready(outcome)
+                    .seal(&mut store)
+                    .unwrap()
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.write_completed_details(), None);
+            assert_eq!(crate::volume::write::write_completed_details(&done), None);
+        }
+
+        /// `range` is terminal like `cut` (item 121): an Inconclusive
+        /// confirm's `interrupted` never overwrites a `range` row, and
+        /// `mark_writes` never writes over one.
+        #[test]
+        fn an_inconclusive_confirm_never_overwrites_a_range_row() {
+            let s = a_span_between_whole_units();
+            let k = slice_at(&s, 1, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'range' WHERE stage_set_id = ?1",
+                    params![s.units[1].stage_set_id],
+                )
+                .unwrap();
+            let mut failing = unreadable_at(store, 3);
+            let outcome = pending
+                .confirm(&s.conn, &mut failing, Tier::Navigable)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Inconclusive(_)));
+            assert_eq!(
+                rows(&s).into_iter().map(|(_, w, _)| w).collect::<Vec<_>>(),
+                ["interrupted", "range", "interrupted"]
+            );
+            let ids: Vec<(i64, i64)> = s
+                .conn
+                .prepare("SELECT id, snapshot_id FROM writes WHERE volume_id = ?1 ORDER BY id")
+                .unwrap()
+                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            mark_writes(&s.conn, &ids, "aborted").unwrap();
+            assert_eq!(rows(&s)[1].1, "range");
+        }
+
+        /// The contact check sees a span tape sealed, short or full: its
+        /// File 0 and its seal state both features (the fixtures' feature
+        /// variants), and rule 6 accepts the short seal before the planned
+        /// position because the tape requires `short-seal` among them.
+        #[test]
+        fn the_contact_check_sees_a_span_tape_sealed_short_or_full() {
+            let (k, m) = (6, 12);
+            let file0 = |total_files: i32| -> Vec<u8> {
+                let thunk = layout::generate_id_thunk_v2_requiring(
+                    &layout::IdThunkV2Params {
+                        label: CONTACT_LABEL,
+                        uuid: CONTACT_UUID,
+                        media_type: "LTO-6",
+                        tapectl_version: "0.1.0-test",
+                        nominal_capacity: 1,
+                        mam_capacity: 1,
+                        total_files,
+                        mam_manufacturer: "",
+                        mam_serial: "",
+                        mam_length: 0,
+                        mam_loads: 0,
+                        created_at: "2026-10-23T00:00:00Z",
+                        cartridge_identity_source: None,
+                    },
+                    layout::REQUIRES_SPAN,
+                );
+                thunk.into_bytes()
+            };
+
+            let mut store = MemStore::new(BS as usize);
+            put_file(&mut store, 0, file0(m as i32 + 1));
+            for p in 1..=k {
+                put_file(&mut store, p as usize, vec![p as u8; 64]);
+            }
+            put_file(
+                &mut store,
+                k as usize + 1,
+                fixture_short_seal_requiring(CONTACT_LABEL, k, "deadbeef", layout::REQUIRES_SPAN),
+            );
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                }
+            );
+
+            let mut store = MemStore::new(BS as usize);
+            put_file(&mut store, 0, file0(m as i32 + 1));
+            for p in 1..m {
+                put_file(&mut store, p as usize, vec![p as u8; 64]);
+            }
+            put_file(
+                &mut store,
+                m as usize,
+                fixture_seal_requiring(CONTACT_LABEL, m, "deadbeef", layout::REQUIRES_SPAN),
+            );
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::AlreadySealed { seal_position: m }
+            );
+            assert_eq!(
+                parsed_seal(&store.files[m as usize]).requires,
+                layout::REQUIRES_SPAN
             );
         }
     }
