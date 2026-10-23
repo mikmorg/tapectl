@@ -240,6 +240,22 @@
 //! reads exactly as before. The MANIFEST.toml pin moved by one line,
 //! `may_end_early = true` after `created_at` (item 111).
 //!
+//! **RE-PINNED 2026-10-23 for tapectl 1.7.0, under ADR-0012 item 135** (the CTO
+//! pre-authorized the moves items 121-134 name, and item 140 within them; the
+//! bound ends when v1.7.0 is installed on home2). The previous RESTORE.sh pin was
+//! `d9787a4f…` (kept byte for byte as `tests/fixtures/restore_sh_1_6_0/`); this
+//! one is `16a21522…`. Every hunk of the diff is spanning's reading on one tape
+//! (`volume-format-v2.md` §4.4) or item 140's one line: `KNOWN_FEATURES="short-seal
+//! spanning"` and "tapectl 1.7.0" in `die_newer_needed` (item 73's fixed points,
+//! moved by item 124); a slice with no `tape_position` never read and never taken
+//! for file 0 (R6); a version classed whole, range or cut from which of its slices
+//! are here; a range refused by `--restore` and `--path` before any slice is read,
+//! named by `--all` and `--list` with its run, never a fill source, and printed
+//! with each holder's run by `--where` and `--find` (R7, item 126); and one NOT ON
+//! TAPE line for the planned files after the end of every short tape, under
+//! `--info` and `--verify` (item 140). A 1.6.0 or 1.5.0 tape reads as before. Neither
+//! MANIFEST.toml pin moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -266,7 +282,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "d9787a4ffdd05ba038416696d9866a9a285fc97509c35692a18dc3a9b68f9e9d";
+const RESTORE_SH_SHA256: &str = "16a21522cf5929840dc1077c3c20132fe9f1760b103580c3e9a4958668fcccae";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -406,20 +422,45 @@ fn restore_sh_bytes_are_pinned() {
         "  if [ \"$unit\" = --all ]; then\n    where_every_unit\n    return 0\n  fi\n",
         "do_where() { # <unit, or --all for every unit>\n",
         "--where needs a unit name, or --all for every unit the index names",
+        // 1.7.0 (ADR-0012 items 124-126, 140): one NOT ON TAPE line on every
+        // short tape, and a range read on one tape (volume-format-v2.md 4.4)
+        "not_on_tape_line() { # <indent> <first planned file after the end> <last>\n",
+        "printf \"%sNOT ON TAPE  files %d to %d  (planned; the tape ended after file %d, and its seal marker is file %d)\\n\"",
+        "slice_here() { # <slice number> <its tape file here, or empty>\n",
+        "range_text() { # <unit> <version>\n",
+        "range_holders() { # <unit> <version>\n",
+        "die_range() { # <unit> <version>\n",
+        "note_range_units() {\n",
+        "list_range_note() { # <unit>\n",
+        "note_range_holders() {\n",
+        "read -r PICKED_VERSION PICKED_SPAN _ <\"$WORK/picked_version.txt\" 2>/dev/null || true",
+        "RANGE_OUT=\"$WORK/range.versions\" awk -v k=\"$k\"",
+        "is held across tapes, and this tape holds only part of it:",
+        "HELD ACROSS TAPES: this tape holds only some of the slices of these unit(s), so they were not",
+        "a range is never",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
     assert!(!script.contains("__AWK_") && !script.contains("__TOOLS_"));
-    // ADR-0012 item 73's two fixed points, moved once by item 111 (1.6.0):
-    // the "needs" text names 1.6.0, and short-seal is the one known feature.
+    // Each of these twice: the --where program and the --find program.
     assert_eq!(
         script
-            .matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
+            .matches("INDEX_CUT=\"$WORK/cut.versions\" INDEX_RANGE=\"$WORK/range.versions\" INDEX_PARTIAL=\"$WORK/partial.flag\"")
+            .count(),
+        2,
+        "the index programs read the range runs"
+    );
+    // ADR-0012 item 73's two fixed points, moved by item 111 (1.6.0) and by
+    // item 124 (1.7.0): the "needs" text names 1.7.0, and short-seal and
+    // spanning are the known features.
+    assert_eq!(
+        script
+            .matches("This RESTORE.sh (layout v2, tapectl 1.7.0) cannot read it safely")
             .count(),
         1,
-        "die_newer_needed says tapectl 1.6.0"
+        "die_newer_needed says tapectl 1.7.0"
     );
     assert_eq!(
         script.matches("tapectl 1.").count(),
@@ -427,9 +468,11 @@ fn restore_sh_bytes_are_pinned() {
         "no other version named"
     );
     assert_eq!(
-        script.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(),
+        script
+            .matches("\nKNOWN_FEATURES=\"short-seal spanning\"\n")
+            .count(),
         1,
-        "RESTORE.sh knows short-seal and no other feature"
+        "RESTORE.sh knows short-seal and spanning and no other feature"
     );
     assert!(script.contains("LABEL=\"GOLD01\""));
     assert!(script.contains("# Total files on tape: 12"));
