@@ -567,59 +567,331 @@ impl<'a> CoverageQuery<'a> {
     }
 }
 
-/// The eligible-writes subquery every expression below is built on:
-/// completed writes, on volumes that pass [`eligible`] RIGHT NOW, inside
-/// the requested scope. Selects `{projection}` from the aliases
-/// `cw` (writes), `css` (stage_sets), `cs` (snapshots), `cv` (volumes).
-fn eligible_writes(q: &CoverageQuery, projection: &str) -> String {
-    let scope = match q.scope {
-        CoverageScope::Unit {
-            id_expr,
-            current_only,
-        } => {
-            let current = if current_only {
-                " AND cs.status = 'current'"
-            } else {
-                ""
-            };
-            format!("cs.unit_id = {id_expr}{current}")
+// ── The least-covered slice (#478; ADR-0012 items 76, 127, 134, 138) ──
+//
+// From 1.7.0 a spannable version can be on tape as `range` rows, each
+// holding only a run of its stage set's slices, so a copy is counted slice
+// by slice (item 76): a version is as covered as its least-covered slice.
+// Every count below — copies, places, deposits, the copies at a named place,
+// [`slice_copies`] — is this one derivation, asked of a different thing.
+//
+// - **Who holds a slice.** An [`eligible`] volume with a `completed` write of
+//   the slice's stage set (`layout-session.md`: `completed` means every slice
+//   of the set, 1 to N, is on that volume, so the row holds them all by its
+//   status), or with a `range` write whose `write_positions` row for the
+//   slice is `written` (the range is the row's written positions, item 121).
+//   A `cut` write holds nothing that counts (item 112), and no other status
+//   is a finished write on a sealed tape. A recorded warehouse deposit of a
+//   holder holds what its volume holds (item 127: "a deposit of a range
+//   volume counts for that range"; ADR-0006).
+// - **Item 138's credit.** Each tape, deposit and place counts for ONE stage
+//   set only: the lowest-numbered stage set it holds among the stage sets of
+//   the count's scope (a version's, for every per-version count). Without
+//   it two stagings of one version on one tape, or at one place, would count
+//   that tape or place twice.
+// - **Per stage set**, the copies of its least-covered slice; **per scope**,
+//   the sum over its stage sets (slices of two stage sets never combine,
+//   item 102). A stage set with no slice rows counts its whole writes.
+//
+// With whole writes only this is exactly 1.6.0's count: every credited
+// holder holds every slice, so the least-covered slice is the number of
+// distinct volumes (and deposits, and places), each counted once. The SQL
+// keeps that case cheap: a set's whole holders are counted from `writes`
+// alone, and its slices are walked only when it has a `range` row.
+
+/// What the per-slice derivation counts at each slice of a stage set.
+#[derive(Debug, Clone, Copy)]
+enum Counted<'a> {
+    /// Copies: each credited holder volume, and each deposit of one.
+    Copies,
+    /// The deposits alone, for display ([`deposit_count_expr`]).
+    Deposits,
+    /// The copies at one place (`place_expr`, SQL evaluating to a location
+    /// id): a credited holder shelved there, and each deposit of one there.
+    CopiesAt(&'a str),
+    /// Distinct places: a holder's shelf and a deposit's location, each
+    /// place credited to one stage set.
+    Places,
+}
+
+/// The stage sets among which item 138 credits each tape, deposit and
+/// place: those of the count's own scope.
+#[derive(Debug, Clone, Copy)]
+enum Partition<'a> {
+    /// One version's stage sets; SQL evaluating to its snapshot id.
+    Version(&'a str),
+    /// A unit's stage sets, or only its current versions'.
+    Unit {
+        id_expr: &'a str,
+        current_only: bool,
+    },
+}
+
+impl Partition<'_> {
+    /// The joins after `stage_sets xss` and the predicate that keep `xss` in
+    /// this partition.
+    fn of_xss(&self) -> (String, String) {
+        match *self {
+            Partition::Version(snapshot) => {
+                (String::new(), format!("xss.snapshot_id = {snapshot}"))
+            }
+            Partition::Unit {
+                id_expr,
+                current_only,
+            } => (
+                " JOIN snapshots xs ON xs.id = xss.snapshot_id".to_string(),
+                format!(
+                    "xs.unit_id = {id_expr}{}",
+                    if current_only {
+                        " AND xs.status = 'current'"
+                    } else {
+                        ""
+                    }
+                ),
+            ),
         }
-        CoverageScope::Snapshot { id_expr } => format!("css.snapshot_id = {id_expr}"),
-    };
-    let exclude = match q.exclude_volume {
-        Some(expr) => format!(" AND cw.volume_id != {expr}"),
-        None => String::new(),
-    };
-    let eligible_cv = eligible("cv");
+    }
+}
+
+/// `{write_alias}`'s status is one whose slices can count: `completed` or
+/// `range`.
+fn holds_slices(write_alias: &str) -> String {
+    status_in(write_alias, &["completed", "range"])
+}
+
+/// A SQL boolean: the `range` write `cw` has a `written` position of the
+/// slice `slice_expr`.
+fn range_holds(slice_expr: &str) -> String {
     format!(
-        "SELECT {projection}
-         FROM writes cw
-         JOIN stage_sets css ON css.id = cw.stage_set_id
-         JOIN snapshots cs ON cs.id = css.snapshot_id
-         JOIN volumes cv ON cv.id = cw.volume_id
-         WHERE cw.status = 'completed' AND {eligible_cv} AND {scope}{exclude}"
+        "EXISTS (SELECT 1 FROM write_positions cp
+                 WHERE cp.write_id = cw.id AND cp.stage_slice_id = {slice_expr}
+                   AND cp.status = 'written')"
     )
 }
 
-/// The deposits of the volumes in scope: every recorded warehouse deposit
-/// (ADR-0006) whose source volume is currently eligible coverage.
-fn scoped_deposits(q: &CoverageQuery, projection: &str) -> String {
-    format!(
-        "SELECT {projection} FROM volume_deposits cd
-         WHERE cd.volume_id IN ({})",
-        eligible_writes(q, "cw.volume_id")
-    )
+/// One stage set's per-slice count: the building blocks every count in this
+/// module is made of. Aliases: `cw` (writes), `cv` (volumes), `cd`
+/// (deposits), `cp` (positions), `cl` (the set's slices) and `xss`/`xs`/
+/// `xw`/`xv`/`xd` for item 138's lower stage sets.
+#[derive(Debug, Clone, Copy)]
+struct SliceCount<'a> {
+    /// SQL evaluating to the stage set's id.
+    set: &'a str,
+    partition: Partition<'a>,
+    /// SQL evaluating to a volume id to pretend away
+    /// ([`CoverageQuery::exclude_volume`]).
+    exclude: Option<&'a str>,
+    counted: Counted<'a>,
+}
+
+impl SliceCount<'_> {
+    /// `FROM … WHERE …` of the set's writes of `status` on [`eligible`]
+    /// volumes, not the excluded one, with `extra_join` after `volumes cv`.
+    fn writes(&self, status: &str, extra_join: &str) -> String {
+        let exclude = self
+            .exclude
+            .map(|e| format!(" AND cw.volume_id != {e}"))
+            .unwrap_or_default();
+        format!(
+            "FROM writes cw JOIN volumes cv ON cv.id = cw.volume_id{extra_join}
+             WHERE cw.stage_set_id = {set} AND cw.status = '{status}' AND {eligible}{exclude}",
+            set = self.set,
+            eligible = eligible("cv"),
+        )
+    }
+
+    /// Item 138 for the tape `cw` is on, and its deposits: no lower stage
+    /// set of the partition is held on the same volume.
+    fn tape_credited(&self) -> String {
+        let (joins, partition) = self.partition.of_xss();
+        format!(
+            "NOT EXISTS (SELECT 1 FROM writes xw
+                         JOIN stage_sets xss ON xss.id = xw.stage_set_id{joins}
+                         WHERE xw.volume_id = cw.volume_id
+                           AND xw.stage_set_id < cw.stage_set_id
+                           AND {holds} AND {partition})",
+            holds = holds_slices("xw"),
+        )
+    }
+
+    /// Item 138 for the place `place` (SQL for a location id): no lower stage
+    /// set of the partition is held there, on an eligible volume shelved
+    /// there or by a deposit there of one.
+    fn place_credited(&self, place: &str) -> String {
+        let (joins, partition) = self.partition.of_xss();
+        let exclude = self
+            .exclude
+            .map(|e| format!(" AND xw.volume_id != {e}"))
+            .unwrap_or_default();
+        format!(
+            "NOT EXISTS (SELECT 1 FROM stage_sets xss{joins}
+                         JOIN writes xw ON xw.stage_set_id = xss.id
+                         JOIN volumes xv ON xv.id = xw.volume_id
+                         WHERE {partition} AND xss.id < {set} AND {holds}
+                           AND {eligible}{exclude}
+                           AND (xv.location_id = {place}
+                                OR EXISTS (SELECT 1 FROM volume_deposits xd
+                                           WHERE xd.volume_id = xv.id
+                                             AND xd.location_id = {place})))",
+            set = self.set,
+            holds = holds_slices("xw"),
+            eligible = eligible("xv"),
+        )
+    }
+
+    /// What one holder `cw` adds at a slice it holds, for the counts that
+    /// are sums: itself and its deposits, its deposits, or those at a place.
+    fn weight(&self) -> String {
+        let deposits = |at: &str| {
+            format!(
+                "(SELECT COUNT(*) FROM volume_deposits cd WHERE cd.volume_id = cw.volume_id{at})"
+            )
+        };
+        match self.counted {
+            Counted::Copies => format!("1 + {}", deposits("")),
+            Counted::Deposits => deposits(""),
+            Counted::CopiesAt(place) => format!(
+                "(CASE WHEN cv.location_id = {place} THEN 1 ELSE 0 END) + {}",
+                deposits(&format!(" AND cd.location_id = {place}"))
+            ),
+            Counted::Places => unreachable!("places are counted distinct, never summed"),
+        }
+    }
+
+    /// The places of the set's `status` writes (for a range, those holding
+    /// `slice`), as one column `column`: each holder's shelf, and each
+    /// deposit's location.
+    fn place_rows(&self, status: &str, column: &str, slice: Option<&str>) -> String {
+        let holds = slice
+            .map(|s| format!(" AND {}", range_holds(s)))
+            .unwrap_or_default();
+        format!(
+            "SELECT cv.location_id AS {column} {} AND cv.location_id IS NOT NULL{holds}
+             UNION ALL
+             SELECT cd.location_id {}{holds}",
+            self.writes(status, ""),
+            self.writes(
+                status,
+                " JOIN volume_deposits cd ON cd.volume_id = cw.volume_id"
+            ),
+        )
+    }
+
+    /// What the set's credited WHOLE holders (`completed` writes) count at
+    /// every one of its slices.
+    fn whole(&self) -> String {
+        match self.counted {
+            Counted::Places => format!(
+                "(SELECT COUNT(DISTINCT cov_wplace) FROM ({}) WHERE {})",
+                self.place_rows("completed", "cov_wplace", None),
+                self.place_credited("cov_wplace"),
+            ),
+            _ => format!(
+                "(SELECT COALESCE(SUM({}), 0) {} AND {})",
+                self.weight(),
+                self.writes("completed", ""),
+                self.tape_credited(),
+            ),
+        }
+    }
+
+    /// What the set's credited `range` holders add at the slice `slice`
+    /// (SQL for a `stage_slices` id), over [`Self::whole`]. A place that
+    /// already holds the set whole is not counted again.
+    fn range_at(&self, slice: &str) -> String {
+        match self.counted {
+            Counted::Places => format!(
+                "(SELECT COUNT(DISTINCT cov_rplace) FROM ({}) WHERE {} AND cov_rplace NOT IN ({}))",
+                self.place_rows("range", "cov_rplace", Some(slice)),
+                self.place_credited("cov_rplace"),
+                self.place_rows("completed", "cov_place", None),
+            ),
+            _ => format!(
+                "(SELECT COALESCE(SUM({}), 0) {} AND {} AND {})",
+                self.weight(),
+                self.writes("range", ""),
+                self.tape_credited(),
+                range_holds(slice),
+            ),
+        }
+    }
+
+    /// The count at the set's least-covered slice. Its slices are walked only
+    /// when it has a `range` row: otherwise every slice counts the whole
+    /// holders alone, and so does a set with no slice rows (item 138).
+    fn least_covered(&self) -> String {
+        format!(
+            "({whole} + COALESCE(CASE WHEN EXISTS (SELECT 1 {ranges}) THEN
+                 (SELECT {range} AS cov_n FROM stage_slices cl
+                   WHERE cl.stage_set_id = {set} ORDER BY cov_n LIMIT 1)
+             END, 0))",
+            whole = self.whole(),
+            ranges = self.writes("range", ""),
+            range = self.range_at("cl.id"),
+            set = self.set,
+        )
+    }
+}
+
+/// `counted` for `q`'s scope: the sum, over the scope's stage sets, of each
+/// one's least-covered slice ([`SliceCount::least_covered`]), item 138's
+/// credit taken among the scope's own stage sets. For
+/// [`CoverageScope::Snapshot`] that is one version's; for
+/// [`CoverageScope::Unit`] it is the unit's (current, with `current_only`)
+/// versions', so a tape holding two versions counts once there, as 1.6.0's
+/// union across versions did. The `MIN` over current versions is
+/// [`copy_count_expr`]'s and [`location_count_expr`]'s, above this.
+fn scope_sum(q: &CoverageQuery, counted: Counted) -> String {
+    let (from, partition) = match q.scope {
+        CoverageScope::Snapshot { id_expr } => (
+            format!("FROM stage_sets css WHERE css.snapshot_id = {id_expr}"),
+            Partition::Version(id_expr),
+        ),
+        CoverageScope::Unit {
+            id_expr,
+            current_only,
+        } => (
+            format!(
+                "FROM snapshots cs JOIN stage_sets css ON css.snapshot_id = cs.id
+                 WHERE cs.unit_id = {id_expr}{}",
+                if current_only {
+                    " AND cs.status = 'current'"
+                } else {
+                    ""
+                }
+            ),
+            Partition::Unit {
+                id_expr,
+                current_only,
+            },
+        ),
+    };
+    let per_set = SliceCount {
+        set: "css.id",
+        partition,
+        exclude: q.exclude_volume,
+        counted,
+    }
+    .least_covered();
+    format!("(SELECT COALESCE(SUM({per_set}), 0) {from})")
 }
 
 /// **The** copy-count expression: a parenthesised SQL scalar subquery
 /// counting a unit's (or snapshot's) copies, warehouse deposits included.
 ///
-/// A copy is one of two things and the count is their UNION:
-/// - a distinct eligible VOLUME carrying a completed write, and
+/// A copy of a slice is one of two things, and both count:
+/// - a distinct eligible VOLUME holding it (a `completed` write of its stage
+///   set, or a `range` write with the slice `written`), and
 /// - a recorded warehouse DEPOSIT of such a volume (ADR-0006: "the catalog
 ///   must claim them to reason about them" — the rejected alternative,
 ///   "cloud as external practice only with no model presence", is exactly
 ///   the under-count this expression exists to prevent).
+///
+/// A version's copies are its least-covered slice's, per stage set, summed
+/// over its stage sets, each tape and deposit credited to one stage set
+/// (#478, ADR-0012 items 127 and 138; the derivation is described above
+/// [`Counted`]). With whole writes only this is 1.6.0's count: the distinct
+/// eligible volumes with a completed write, plus their deposits.
 ///
 /// A deposit's WEAKER EVIDENCE is not expressed here. It is surfaced by
 /// [`crate::policy::evidence`] at destructive moments and never by
@@ -639,15 +911,15 @@ fn scoped_deposits(q: &CoverageQuery, projection: &str) -> String {
 /// migration 026). A newer
 /// Version is not a copy of an older one, so when `q.scope` is
 /// [`CoverageScope::Unit`] with `current_only: true`, this is NOT the
-/// union of eligible volumes across every current snapshot (that would
-/// count "how many volumes hold ANY version," not how covered the unit
-/// actually is). It is instead the MINIMUM, over the unit's current
-/// snapshots, of each one's own copy count — ADR-0012: "a unit is as
-/// covered as its least-covered live version." Every other scope
-/// ([`CoverageScope::Snapshot`], and [`CoverageScope::Unit`] with
-/// `current_only: false` — `volume retire`'s impact analysis, which
-/// deliberately asks about ANY snapshot) is untouched and still the plain
-/// union.
+/// count across every current snapshot (that would count "how many volumes
+/// hold ANY version," not how covered the unit actually is). It is instead
+/// the MINIMUM, over the unit's current snapshots, of each one's own copy
+/// count — ADR-0012: "a unit is as covered as its least-covered live
+/// version." Every other scope ([`CoverageScope::Snapshot`], and
+/// [`CoverageScope::Unit`] with `current_only: false` — `volume retire`'s
+/// impact analysis, which deliberately asks about ANY snapshot) takes no
+/// such minimum: the unit form counts each holder once across all of the
+/// unit's versions, as the plain union did.
 pub fn copy_count_expr(q: &CoverageQuery) -> String {
     if let CoverageScope::Unit {
         id_expr,
@@ -670,35 +942,30 @@ pub fn copy_count_expr(q: &CoverageQuery) -> String {
             copy_count_expr(&per_snapshot)
         );
     }
-    format!(
-        "(SELECT COUNT(*) FROM (
-            {}
-            UNION
-            {}
-        ))",
-        eligible_writes(q, "'v' || cw.volume_id"),
-        scoped_deposits(q, "'d' || cd.id"),
-    )
+    scope_sum(q, Counted::Copies)
 }
 
 /// **The** distinct-location expression, warehouse deposits included.
 ///
-/// The counted set is the UNION of the eligible volumes' non-NULL
-/// `location_id`s and the deposits' `location_id`s. `UNION` (not two added
-/// counts) because a location could in principle appear on both sides, and
-/// a doubled location count would silently satisfy a `required_locations`
-/// policy that is not actually met. `IS NOT NULL` is explicit because
-/// `UNION` treats NULL as a value and would count "no location recorded"
-/// as a location.
+/// A place holds a slice when an eligible volume shelved there (a non-NULL
+/// `location_id`) holds it, or a deposit there of a volume that does. Each
+/// place is counted once per slice, never once per tape or deposit there,
+/// because a doubled location count would silently satisfy a
+/// `required_locations` policy that is not actually met; "no location
+/// recorded" is no place. Per stage set the places of its least-covered
+/// slice, summed over the stage sets, each place credited to one stage set
+/// (#478, ADR-0012 items 127, 134 and 138: "locations use the same
+/// minimum"). With whole writes only this is 1.6.0's union of the eligible
+/// volumes' and the deposits' locations.
 ///
 /// Same warning as [`copy_count_expr`]: one expression, N call sites.
 ///
 /// **Same per-version rule as [`copy_count_expr`] (issue #153, ADR-0012),
 /// same reason:** for [`CoverageScope::Unit`] with `current_only: true`,
 /// this is the MINIMUM over the unit's current snapshots of each one's
-/// own location count, not their union — a unit is as covered as its
-/// least-covered live version, and that applies to locations exactly as
-/// it does to copies. Every other scope is untouched.
+/// own location count — a unit is as covered as its least-covered live
+/// version, and that applies to locations exactly as it does to copies.
+/// Every other scope takes no such minimum.
 pub fn location_count_expr(q: &CoverageQuery) -> String {
     if let CoverageScope::Unit {
         id_expr,
@@ -718,15 +985,7 @@ pub fn location_count_expr(q: &CoverageQuery) -> String {
             location_count_expr(&per_snapshot)
         );
     }
-    format!(
-        "(SELECT COUNT(*) FROM (
-            {} AND cv.location_id IS NOT NULL
-            UNION
-            {}
-        ))",
-        eligible_writes(q, "cv.location_id"),
-        scoped_deposits(q, "cd.location_id"),
-    )
+    scope_sum(q, Counted::Places)
 }
 
 /// How many of the copies counted by [`copy_count_expr`] are warehouse
@@ -734,12 +993,19 @@ pub fn location_count_expr(q: &CoverageQuery) -> String {
 /// total so a warehouse copy is visibly distinguishable rather than
 /// silently folded into a number that looks like tapes on a shelf.
 ///
+/// The same derivation counting the deposits alone (#478, ADR-0012 items 127
+/// and 138): per stage set, the deposits holding its least-covered slice, so
+/// deposits of two range volumes that together hold a version count as one
+/// copy, never more than the copies they are part of; each deposit credited
+/// to one stage set. With whole writes only, every deposit of an eligible
+/// volume with a completed write in scope, once.
+///
 /// Deliberately NOT per-version-MINed (issue #153): nothing gates on this
 /// value, and a display count that disagrees with the total it is meant
-/// to break down would confuse rather than protect — leave it the plain
-/// union it has always been.
+/// to break down would confuse rather than protect — for a unit's current
+/// versions it is taken across them all, as it has always been.
 pub fn deposit_count_expr(q: &CoverageQuery) -> String {
-    format!("(SELECT COUNT(*) FROM ({}))", scoped_deposits(q, "cd.id"))
+    scope_sum(q, Counted::Deposits)
 }
 
 // ── Named required locations (issue #348; ADR-0012 2026-10-07 items 15, 34) ──
@@ -988,10 +1254,15 @@ pub fn short_of_location_floor_excluding(
 /// item 34 put the tape-only multiplier into it for every caller).
 ///
 /// A copy "at" a location is counted on the same terms [`copy_count_expr`]
-/// counts copies and [`location_count_expr`] places them: a distinct
-/// [`eligible`] volume with a completed write, shelved there, plus each
-/// recorded warehouse deposit there of such a volume (ADR-0006) — unioned,
-/// so one volume with several writes of the version is one copy.
+/// counts copies and [`location_count_expr`] places them, the one per-slice
+/// derivation (#478, ADR-0012 items 127, 134 and 138): at each slice, a
+/// distinct [`eligible`] volume holding it, shelved there, plus each recorded
+/// warehouse deposit there of such a volume (ADR-0006); per stage set its
+/// least-covered slice, summed over the version's stage sets, each tape and
+/// deposit credited to one stage set — so one volume with several writes of
+/// the version is one copy, and two tapes there that each hold a range of it
+/// make one copy there between them. With whole writes only: the distinct
+/// eligible volumes there with a completed write, plus the deposits there.
 ///
 /// A name matching no `locations` row (a typo, or a location since renamed)
 /// holds 0: nothing can be at a place the catalog does not know.
@@ -1033,16 +1304,16 @@ pub fn short_required_locations_excluding(
         scope: CoverageScope::Snapshot { id_expr: "?1" },
         exclude_volume: exclude_volume.map(|_| "?2"),
     };
+    // ?1 is the version, ?2 the excluded volume when there is one, and the
+    // names follow.
+    let first_name = 2 + usize::from(exclude_volume.is_some());
+    let names = (0..wanted.len())
+        .map(|i| format!("?{}", first_name + i))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
-        "SELECT l.name, COUNT(*) FROM (
-            {} AND cv.location_id IS NOT NULL
-            UNION
-            {}
-         ) at_loc
-         JOIN locations l ON l.id = at_loc.loc
-         GROUP BY l.name",
-        eligible_writes(&q, "'v' || cw.volume_id AS copy, cv.location_id AS loc"),
-        scoped_deposits(&q, "'d' || cd.id AS copy, cd.location_id AS loc"),
+        "SELECT l.name, {} FROM locations l WHERE l.name IN ({names})",
+        scope_sum(&q, Counted::CopiesAt("l.id")),
     );
     let mut stmt = conn.prepare(&sql)?;
     // The fewest copies any examined version holds at each name; a version
@@ -1050,13 +1321,13 @@ pub fn short_required_locations_excluding(
     // name at 0.
     let mut fewest: Option<std::collections::HashMap<String, i64>> = None;
     for snapshot_id in snapshot_ids {
+        let mut bound: Vec<rusqlite::types::Value> = vec![snapshot_id.into()];
+        bound.extend(exclude_volume.map(rusqlite::types::Value::from));
+        bound.extend(wanted.iter().map(|name| (*name).clone().into()));
         let held: std::collections::HashMap<String, i64> = stmt
-            .query_map(
-                rusqlite::params_from_iter(
-                    [Some(snapshot_id), exclude_volume].into_iter().flatten(),
-                ),
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<std::result::Result<_, _>>()?;
         fewest = Some(match fewest {
             None => held,
@@ -1375,7 +1646,7 @@ pub fn copy_distinctness(
 ) -> crate::error::Result<Distinctness> {
     // The existing copies of stage set ?1's version: completed writes of
     // any stage set of the same snapshot, on an eligible volume other than
-    // the destination ?2. Aliases as `eligible_writes`'s.
+    // the destination ?2. Aliases as the copy counts use them.
     let copies_of = |extra_joins: &str, cond: &str, cols: &str| {
         format!(
             "SELECT {cols}
@@ -4445,5 +4716,491 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(got, listed, "{label}: {status}/{condition}");
         }
+    }
+
+    // ── the least-covered slice (#478; ADR-0012 items 76, 93, 127, 134, 138) ──
+
+    /// A catalog for the per-slice counts: one unit `span` of tenant `t`,
+    /// versions and stage sets of any number of slices, sealed volumes at
+    /// any place, and writes of a set to a volume, whole or as a range of
+    /// `written` slices (the rest of a range's planned slices `pending`, as
+    /// confirm leaves them, item 121).
+    pub(crate) struct SpanCatalog {
+        pub conn: Connection,
+        pub unit_id: i64,
+    }
+
+    impl SpanCatalog {
+        pub(crate) fn new() -> Self {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-span', 'span', ?1, 'mtime_size', 1, 'active')",
+                params![tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            SpanCatalog { conn, unit_id }
+        }
+
+        /// The location `name`, made on first use.
+        pub(crate) fn place(&self, name: &str) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO locations (name, kind) VALUES (?1, 'shelf')",
+                    params![name],
+                )
+                .unwrap();
+            self.conn
+                .query_row(
+                    "SELECT id FROM locations WHERE name = ?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// Version `version` in `status`; its snapshot id.
+        pub(crate) fn version(&self, version: i64, status: &str) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', ?3, '/src/span')",
+                    params![self.unit_id, version, status],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// A stage set of `snapshot` with `slices` slices; its id.
+        pub(crate) fn stage_set(&self, snapshot: i64, slices: i64) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
+                     VALUES (?1, 'staged', 1048576, ?2)",
+                    params![snapshot, slices],
+                )
+                .unwrap();
+            let set = self.conn.last_insert_rowid();
+            for n in 1..=slices {
+                self.conn
+                    .execute(
+                        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                                   encrypted_bytes, sha256_plain, sha256_encrypted)
+                         VALUES (?1, ?2, 100, 100, 'p', ?3)",
+                        params![set, n, format!("e-{set}-{n}")],
+                    )
+                    .unwrap();
+            }
+            set
+        }
+
+        /// A sealed volume `label` in good condition, shelved at `place`.
+        pub(crate) fn volume(&self, label: &str, place: Option<&str>) -> i64 {
+            let location = place.map(|p| self.place(p));
+            self.conn
+                .execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status, location_id, sealed_at)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', ?2,
+                             '2026-10-21 10:00:00')",
+                    params![label, location],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// The id of the slice `number` of `set`.
+        pub(crate) fn slice(&self, set: i64, number: i64) -> i64 {
+            self.conn
+                .query_row(
+                    "SELECT id FROM stage_slices WHERE stage_set_id = ?1 AND slice_number = ?2",
+                    params![set, number],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// A write of `set` to `volume` in `status` (`range` writes are
+        /// planned spannable), with a position per slice from `planned`:
+        /// `written` for those in `written`, `pending` for the rest. Its id.
+        pub(crate) fn write_planned(
+            &self,
+            set: i64,
+            volume: i64,
+            status: &str,
+            planned: std::ops::RangeInclusive<i64>,
+            written: std::ops::RangeInclusive<i64>,
+        ) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+                     SELECT id, snapshot_id, ?2, ?3, ?4 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status, i64::from(status == "range")],
+                )
+                .unwrap();
+            let write = self.conn.last_insert_rowid();
+            for (position, n) in planned.enumerate() {
+                let state = if written.contains(&n) {
+                    "written"
+                } else {
+                    "pending"
+                };
+                self.conn
+                    .execute(
+                        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![write, self.slice(set, n), (6 + position).to_string(), state],
+                    )
+                    .unwrap();
+            }
+            write
+        }
+
+        /// A `completed` write of all `slices` of `set`, every one `written`.
+        pub(crate) fn whole(&self, set: i64, slices: i64, volume: i64) -> i64 {
+            self.write_planned(set, volume, "completed", 1..=slices, 1..=slices)
+        }
+
+        /// A `range` write of `set` holding slices `first..=last`, planned
+        /// to `planned_last` (the rest `pending`: the tape ended first).
+        pub(crate) fn range(
+            &self,
+            set: i64,
+            volume: i64,
+            first: i64,
+            last: i64,
+            planned_last: i64,
+        ) -> i64 {
+            self.write_planned(set, volume, "range", first..=planned_last, first..=last)
+        }
+
+        /// A warehouse deposit of `volume` at `place`.
+        pub(crate) fn deposit(&self, volume: i64, place: &str) {
+            let location = self.place(place);
+            self.conn
+                .execute(
+                    "INSERT INTO volume_deposits (volume_id, location_id, deposited_at, receipt)
+                     VALUES (?1, ?2, '2026-10-22 00:00:00', 'rcpt')",
+                    params![volume, location],
+                )
+                .unwrap();
+        }
+
+        fn scalar(&self, expr: &str, id: i64) -> i64 {
+            self.conn
+                .query_row(&format!("SELECT {expr}"), params![id], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn snapshot_scope(&self) -> CoverageQuery<'static> {
+            CoverageQuery {
+                scope: CoverageScope::Snapshot { id_expr: "?1" },
+                exclude_volume: None,
+            }
+        }
+
+        /// One version's copies.
+        pub(crate) fn copies(&self, snapshot: i64) -> i64 {
+            self.scalar(&copy_count_expr(&self.snapshot_scope()), snapshot)
+        }
+
+        /// One version's distinct places.
+        pub(crate) fn places(&self, snapshot: i64) -> i64 {
+            self.scalar(&location_count_expr(&self.snapshot_scope()), snapshot)
+        }
+
+        /// How many of one version's copies are deposits.
+        pub(crate) fn deposits(&self, snapshot: i64) -> i64 {
+            self.scalar(&deposit_count_expr(&self.snapshot_scope()), snapshot)
+        }
+
+        /// The unit's copies across its current versions.
+        pub(crate) fn unit_copies(&self) -> i64 {
+            self.scalar(
+                &copy_count_expr(&CoverageQuery::current_unit("?1")),
+                self.unit_id,
+            )
+        }
+    }
+
+    /// Item 93's layout with a copy target of 2, slices 1..6 cut after 2:
+    /// tape 1 holds the range 1..2 (3..6 planned, the tape ended first), tape
+    /// 2 the version whole (the owed run 1..6), tape 3 the range 3..6. Every
+    /// slice is on two tapes, so the version has 2 copies. Tape 1 alone is
+    /// no copy: slices 3..6 are on no tape. Returns the catalog, the
+    /// snapshot, the set and the three volumes.
+    fn item_93() -> (SpanCatalog, i64, i64, [i64; 3]) {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("home"));
+        let t2 = c.volume("SPAN-2", Some("home"));
+        let t3 = c.volume("SPAN-3", Some("home"));
+        c.range(set, t1, 1, 2, 6);
+        c.whole(set, 6, t2);
+        c.range(set, t3, 3, 6, 6);
+        (c, snap, set, [t1, t2, t3])
+    }
+
+    #[test]
+    fn item_93s_three_tapes_count_two_copies_and_tape_one_alone_none() {
+        let (c, snap, _set, [t1, t2, t3]) = item_93();
+        assert_eq!(c.copies(snap), 2, "every slice is on two tapes");
+        assert_eq!(c.unit_copies(), 2);
+        assert_eq!(c.places(snap), 1, "all three tapes are at home");
+
+        // Retire tape 2: tapes 1 and 3 still make one copy between them.
+        let without = |vol: i64| -> i64 {
+            c.scalar(
+                &copy_count_expr(&CoverageQuery {
+                    scope: CoverageScope::Snapshot { id_expr: "?1" },
+                    exclude_volume: Some(&vol.to_string()),
+                }),
+                snap,
+            )
+        };
+        assert_eq!(without(t2), 1);
+        assert_eq!(without(t1), 1, "tape 2 whole; 3..6 also on tape 3");
+        assert_eq!(without(t3), 1);
+
+        // Tape 1 alone holds a range and nothing else: no copy at all.
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id IN (?1, ?2)",
+                params![t2, t3],
+            )
+            .unwrap();
+        assert_eq!(c.copies(snap), 0, "slices 3..6 are on no eligible tape");
+        assert_eq!(c.places(snap), 0);
+        assert_eq!(c.unit_copies(), 0);
+    }
+
+    /// The control for the pending positions: a range is its `written`
+    /// slices only. The same three tapes with tape 3's run all `pending`
+    /// (planned, never reached) leave slices 3..6 on tape 2 alone.
+    #[test]
+    fn a_ranges_pending_positions_hold_nothing() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", None);
+        let t2 = c.volume("SPAN-2", None);
+        let t3 = c.volume("SPAN-3", None);
+        c.range(set, t1, 1, 2, 6);
+        c.whole(set, 6, t2);
+        c.write_planned(set, t3, "range", 3..=6, 3..=5);
+        assert_eq!(c.copies(snap), 1, "slice 6 is written on tape 2 alone");
+        c.conn
+            .execute(
+                "UPDATE write_positions SET status = 'written'
+                  WHERE write_id = (SELECT id FROM writes WHERE volume_id = ?1)",
+                params![t3],
+            )
+            .unwrap();
+        assert_eq!(c.copies(snap), 2, "the positive control");
+    }
+
+    /// Item 127: "a deposit of a range volume counts for that range". Two
+    /// range tapes make one copy; a deposit of the first adds a copy of 1..2
+    /// only, so the version still has one copy until the second's range is
+    /// deposited too. The deposit count is the same derivation: deposits that
+    /// together hold the version count as one.
+    #[test]
+    fn a_deposit_of_a_range_volume_counts_for_that_range() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("home"));
+        let t3 = c.volume("SPAN-3", Some("home"));
+        c.range(set, t1, 1, 2, 6);
+        c.range(set, t3, 3, 6, 6);
+        assert_eq!(
+            (c.copies(snap), c.deposits(snap), c.places(snap)),
+            (1, 0, 1)
+        );
+
+        c.deposit(t1, "glacier");
+        assert_eq!(
+            (c.copies(snap), c.deposits(snap), c.places(snap)),
+            (1, 0, 1),
+            "slices 3..6 are still on one tape, at one place"
+        );
+
+        c.deposit(t3, "glacier");
+        assert_eq!(
+            (c.copies(snap), c.deposits(snap), c.places(snap)),
+            (2, 1, 2),
+            "every slice on a tape at home and a deposit at glacier"
+        );
+    }
+
+    /// Item 138's three cases, two stagings of one version (item 102), each
+    /// against the count 1.6.0 gave for whole writes, and its documented
+    /// under-count for a range sharing a tape with a whole staging.
+    #[test]
+    fn each_tape_deposit_and_place_counts_for_one_stage_set() {
+        // (a) Two stagings whole on one tape: one copy, not two.
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 2);
+        let s2 = c.stage_set(snap, 3);
+        let tape = c.volume("BOTH", Some("home"));
+        c.whole(s1, 2, tape);
+        c.whole(s2, 3, tape);
+        c.deposit(tape, "glacier");
+        assert_eq!(
+            (c.copies(snap), c.deposits(snap), c.places(snap)),
+            (2, 1, 2),
+            "the tape and its deposit, once each; home and glacier, once each"
+        );
+
+        // (b) Two stagings at one place: two copies, one place.
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 2);
+        let s2 = c.stage_set(snap, 3);
+        let a = c.volume("A", Some("home"));
+        let b = c.volume("B", Some("home"));
+        c.whole(s1, 2, a);
+        c.whole(s2, 3, b);
+        assert_eq!((c.copies(snap), c.places(snap)), (2, 1));
+        let short =
+            short_required_locations(&c.conn, NamedScope::Snapshot(snap), &names(&["home"]), 3)
+                .unwrap();
+        assert_eq!(short, vec![("home".to_string(), 2)], "two tapes at home");
+
+        // (c) A stage set with no slice rows counts its whole writes.
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let empty = c.stage_set(snap, 0);
+        let sliced = c.stage_set(snap, 2);
+        let a = c.volume("A", Some("home"));
+        let b = c.volume("B", Some("vault"));
+        c.whole(empty, 0, a);
+        c.whole(sliced, 2, b);
+        assert_eq!((c.copies(snap), c.places(snap)), (2, 2));
+
+        // Where the rule is wrong it under-counts, and only when two
+        // stagings share a tape: the tape is credited to the lower set, whose
+        // range alone is no copy, so the whole higher set on it reads 0.
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 4);
+        let s2 = c.stage_set(snap, 2);
+        let tape = c.volume("BOTH", None);
+        c.range(s1, tape, 1, 2, 4);
+        c.whole(s2, 2, tape);
+        assert_eq!(c.copies(snap), 0, "item 138's accepted under-count");
+        // Its control: the same whole set on a tape of its own is a copy.
+        let other = c.volume("OTHER", None);
+        c.whole(s2, 2, other);
+        assert_eq!(c.copies(snap), 1);
+    }
+
+    /// Slices of two stage sets never combine (item 102): a range of one
+    /// staging and the rest of another are two halves of nothing.
+    #[test]
+    fn ranges_of_two_stagings_do_not_combine() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 4);
+        let s2 = c.stage_set(snap, 4);
+        let a = c.volume("A", None);
+        let b = c.volume("B", None);
+        c.range(s1, a, 1, 2, 4);
+        c.range(s2, b, 3, 4, 4);
+        assert_eq!(c.copies(snap), 0);
+        // The control: the matching half of the same staging makes a copy.
+        let d = c.volume("D", None);
+        c.range(s1, d, 3, 4, 4);
+        assert_eq!(c.copies(snap), 1);
+    }
+
+    /// The unit form across ALL versions (`volume retire`'s display): a tape
+    /// holding two versions is one holder there, as 1.6.0's union counted
+    /// it, and two range tapes of one version make one holder between them.
+    #[test]
+    fn the_any_version_unit_form_counts_a_holder_once() {
+        let c = SpanCatalog::new();
+        let v1 = c.version(1, "current");
+        let v2 = c.version(2, "current");
+        let s1 = c.stage_set(v1, 2);
+        let s2 = c.stage_set(v2, 2);
+        let tape = c.volume("BOTH", None);
+        c.whole(s1, 2, tape);
+        c.whole(s2, 2, tape);
+        let any = CoverageQuery {
+            scope: CoverageScope::Unit {
+                id_expr: "?1",
+                current_only: false,
+            },
+            exclude_volume: None,
+        };
+        assert_eq!(c.scalar(&copy_count_expr(&any), c.unit_id), 1);
+        assert_eq!(c.unit_copies(), 1, "each version has one copy");
+
+        let v3 = c.version(3, "staged");
+        let s3 = c.stage_set(v3, 4);
+        let a = c.volume("A", None);
+        let b = c.volume("B", None);
+        c.range(s3, a, 1, 2, 4);
+        c.range(s3, b, 3, 4, 4);
+        assert_eq!(
+            c.scalar(&copy_count_expr(&any), c.unit_id),
+            2,
+            "BOTH, and A and B together"
+        );
+    }
+
+    /// A required location is met by the tapes there that hold every slice
+    /// between them (item 134: "audit's per-slice location count checks"
+    /// that the tapes of a whole copy were kept together).
+    #[test]
+    fn two_range_tapes_at_one_named_place_are_one_copy_there() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("offsite"));
+        let t3 = c.volume("SPAN-3", Some("offsite"));
+        c.range(set, t1, 1, 2, 6);
+        c.range(set, t3, 3, 6, 6);
+        let short = |per_name: i64| {
+            short_required_locations(
+                &c.conn,
+                NamedScope::Snapshot(snap),
+                &names(&["offsite", "home"]),
+                per_name,
+            )
+            .unwrap()
+        };
+        assert_eq!(short(1), vec![("home".to_string(), 0)]);
+        assert_eq!(
+            short(2),
+            vec![("offsite".to_string(), 1), ("home".to_string(), 0)]
+        );
+
+        // Tape 3 moved home: neither place holds every slice.
+        c.conn
+            .execute(
+                "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
+                params![c.place("home"), t3],
+            )
+            .unwrap();
+        assert_eq!(
+            short(1),
+            vec![("offsite".to_string(), 0), ("home".to_string(), 0)]
+        );
+        assert_eq!(
+            c.places(snap),
+            1,
+            "each slice is at one place, though no one place holds them all"
+        );
     }
 }
