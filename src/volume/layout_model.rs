@@ -338,8 +338,8 @@ impl CapacityBudget {
     /// 2. **Whole units**, in the caller's order and never reordered, by
     ///    1.6.0's rule: committed up to the fill ceiling and, when no
     ///    spannable set is queued, planned past it within item 113's bound
-    ///    (items 83 and 99: with one queued, whole units stop at the ceiling
-    ///    and the spannable set goes after them).
+    ///    (items 83, 95 and 99: with one queued, whole units stop at the
+    ///    ceiling and the room past it is the set's).
     /// 3. **Spannable sets**, in the caller's order, last (items 83 and 95).
     ///    The first one that crosses the plan bound is the [`Placed::Tail`],
     ///    planned to its end, and nothing is planned after it (item 123,
@@ -352,19 +352,18 @@ impl CapacityBudget {
     /// An owed run may be the tail too: one that crosses the bound is
     /// planned to its end, and everything after it is deferred.
     ///
-    /// **Deferred and refused** (X12). The baseline is 1.6.0's plan of the
-    /// whole units alone. A whole unit it cannot hold is [`Placed::Refused`]
-    /// as in 1.6.0 ([`LayoutError::PlanBoundExceeded`] with a bound,
+    /// **Deferred and refused** (X12, as the coordinator amended it on
+    /// 2026-10-23). The baseline is 1.6.0's plan of the whole units alone. A
+    /// whole unit it cannot hold is [`Placed::Refused`] as in 1.6.0
+    /// ([`LayoutError::PlanBoundExceeded`] with a bound,
     /// [`LayoutError::CapacityExceeded`] without one): nothing displaced it,
     /// so the plan is never trimmed for it. A whole unit the baseline holds
-    /// but an owed run or a set larger than one tape leaves no room for is
-    /// [`Placed::Deferred`]: it is not on this tape and waits, staged, for a
-    /// later one. A whole unit the baseline plans past the fill ceiling,
-    /// stopped at the ceiling only because a spannable set that fits one tape
-    /// is queued, is refused ([`LayoutError::CapacityExceeded`]): X12 defers
-    /// only for an owed run or a set larger than one tape. A spannable unit
-    /// that passes the fill ceiling on a drive with no plan bound is refused
-    /// by [`LayoutError::SpanNeedsPostWarningBytes`].
+    /// but an owed run or a spannable set pushes out is [`Placed::Deferred`]:
+    /// it is not on this tape and waits, staged, for a later one. That covers
+    /// a set larger than one tape starting early (item 94) and a queued set
+    /// that fits one tape taking the room past the ceiling (items 83 and 95).
+    /// A spannable unit that passes the fill ceiling on a drive with no plan
+    /// bound is refused by [`LayoutError::SpanNeedsPostWarningBytes`].
     ///
     /// Every unit [`PlanClass::Whole`] gives exactly [`Self::split`].
     pub fn place(&self, fixed_bytes: u64, items: &[PlanItem]) -> Placement {
@@ -421,18 +420,13 @@ impl CapacityBudget {
         let owed_end = end;
         let open = tail.is_none() && !refused_span;
 
-        // 2. Whole units after them: `after_owed` by 1.6.0's rule, and
-        // `beside_spans` with item 83's stop at the fill ceiling when a
-        // spannable set is queued. Nothing is planned after a tail.
-        let (after_owed, (committed, beside_spans)) = if open {
-            (
-                self.whole_run(owed_end, sizes(held_whole), true).1,
-                self.whole_run(owed_end, sizes(held_whole), spannable.is_empty()),
-            )
+        // 2. Whole units after them, stopped at the fill ceiling when a
+        // spannable set is queued (item 83). Nothing is planned after a tail.
+        let (committed, mut kept) = if open {
+            self.whole_run(owed_end, sizes(held_whole), spannable.is_empty())
         } else {
-            (0, (0, 0))
+            (0, 0)
         };
-        let mut kept = beside_spans;
 
         // 3. Spannable sets, then item 94's early start for the tail when it
         // is larger than one tape.
@@ -442,12 +436,10 @@ impl CapacityBudget {
             owed_end.saturating_add(bytes(&held_whole[..kept])),
             !open,
         );
-        let mut early_start = false;
         if let (Some(t), Some(bound)) = (spans.tail, self.plan_bound_bytes) {
             let room = bound.saturating_sub(fixed_bytes);
             let set = items[t].bytes;
             if room > 0 && set > room {
-                early_start = true;
                 let before_tail: Vec<usize> =
                     spannable.iter().copied().take_while(|&i| i != t).collect();
                 let earliest = owed_end.saturating_add(bytes(&before_tail));
@@ -469,26 +461,16 @@ impl CapacityBudget {
                 );
             }
         }
-        // The whole units 1.6.0 would plan past the ceiling, stopped there
-        // by a queued spannable set that fits one tape: refused (X12).
-        if beside_spans < after_owed && !early_start {
-            for &i in &held_whole[beside_spans..after_owed] {
-                placed[i] = Placed::Refused;
-            }
-            errors.push(LayoutError::CapacityExceeded {
-                needed: owed_end.saturating_add(bytes(&held_whole[..after_owed])),
-                reserve: self.reserve_bytes,
-                available: self.available_bytes,
-            });
-        }
+        // What the baseline holds and this plan does not, an owed run or a
+        // spannable set pushed out: deferred (X12).
         for (n, &i) in held_whole.iter().enumerate() {
-            if n < committed.min(kept) {
-                placed[i] = Placed::Committed;
+            placed[i] = if n < committed.min(kept) {
+                Placed::Committed
             } else if n < kept {
-                placed[i] = Placed::PastCeiling;
-            } else if placed[i] != Placed::Refused {
-                placed[i] = Placed::Deferred;
-            }
+                Placed::PastCeiling
+            } else {
+                Placed::Deferred
+            };
         }
         order.extend(&held_whole[..kept]);
         for (i, p) in spans.placed {
@@ -621,8 +603,8 @@ pub enum Placed {
     /// planned to its end; the early warning ends its range (items 84 and
     /// 123). At most one, and the last unit of the plan.
     Tail,
-    /// Not on this tape: a whole unit an owed run or a set larger than one
-    /// tape leaves no room for (item 94, X12), or a unit queued after the
+    /// Not on this tape: a whole unit an owed run or a spannable set pushes
+    /// out (items 83, 94 and 95; X12 as amended), or a unit queued after the
     /// tail (X13). It stays staged and waits for a later tape.
     Deferred,
     /// The plan cannot hold it, and is refused ([`Placement::errors`]).
@@ -2069,41 +2051,69 @@ mod tests {
         );
     }
 
-    /// Items 83 and 99, and X12's "otherwise": whole units are planned past
-    /// the fill ceiling only when no spannable set is queued. Beside a set
-    /// that fits one tape they stop at the ceiling, nothing displaced them,
-    /// and the write is refused, not trimmed. The set itself goes after them.
+    /// Items 83, 95 and 99, with X12 as the coordinator amended it
+    /// (2026-10-23): whole units are planned past the fill ceiling only when
+    /// no spannable set is queued. Beside a set that fits one tape they stop
+    /// at the ceiling, the room past it is the set's, and the whole units
+    /// 1.6.0 would have planned there are deferred to a later tape, not
+    /// refused. A unit 1.6.0's plan of the whole units alone refuses is still
+    /// refused.
     #[test]
-    fn beside_a_queued_set_that_fits_whole_units_stop_at_the_fill_ceiling() {
-        use Placed::{Committed, PastCeiling, Refused};
+    fn beside_a_queued_set_that_fits_the_whole_units_past_the_ceiling_are_deferred() {
+        use Placed::{Committed, Deferred, PastCeiling, Refused};
         use PlanClass::{Spannable, Whole};
-        // Fixed 1, fill 10, bound 20: whole units of 3 end at 4, 7, 10, 13.
+        // Fixed 1, fill 10, bound 20: whole units of 3 end at 4, 7, 10 (under
+        // the ceiling), 13 and 16 (past it).
         let b = budget(10 * BS, 0, Some(20 * BS));
-        let alone = b.place(BS, &[item(Whole, 3); 4]);
+        let whole = vec![item(Whole, 3); 5];
+        let alone = b.place(BS, &whole);
         assert!(alone.is_ok());
-        assert_eq!(alone.placed[3], PastCeiling, "item 99: none queued");
+        assert_eq!(alone.with(PastCeiling), vec![3, 4], "item 99: none queued");
 
-        let mut with_set = vec![item(Whole, 3); 4];
+        let mut with_set = whole.clone();
         with_set.push(item(Spannable, 4));
         let p = b.place(BS, &with_set);
+        assert!(p.is_ok(), "deferred, not refused: {:?}", p.errors);
         assert_eq!(
             p.placed,
-            vec![Committed, Committed, Committed, Refused, PastCeiling]
+            vec![
+                Committed,
+                Committed,
+                Committed,
+                Deferred,
+                Deferred,
+                PastCeiling
+            ]
         );
-        assert_eq!(p.order, vec![0, 1, 2, 4]);
+        assert_eq!(
+            p.deferred(),
+            alone.with(PastCeiling),
+            "exactly the units 1.6.0 planned past the ceiling wait"
+        );
+        // The set goes after the whole units under the ceiling (item 83).
+        assert_eq!(p.order, vec![0, 1, 2, 5]);
+
+        // A whole unit beyond the bound on the whole units' own plan is
+        // refused as in 1.6.0, set queued or not.
+        let mut over = with_set.clone();
+        over.insert(5, item(Whole, 5));
+        let p = b.place(BS, &over);
+        assert_eq!(p.placed[5], Refused);
+        assert_eq!(p.deferred(), vec![3, 4]);
         assert_eq!(
             p.errors,
-            vec![LayoutError::CapacityExceeded {
-                needed: 13 * BS,
-                reserve: 0,
-                available: 10 * BS
+            vec![LayoutError::PlanBoundExceeded {
+                needed: 21 * BS,
+                bound: 20 * BS
             }]
         );
+
         // Positive control: whole units under the ceiling, the set after
-        // them, past it.
-        let p = b.place(BS, &with_set[1..]);
+        // them, past it, nothing deferred.
+        let p = b.place(BS, &with_set[2..]);
         assert!(p.is_ok(), "{:?}", p.errors);
         assert_eq!(p.placed, vec![Committed, Committed, Committed, PastCeiling]);
+        assert!(p.deferred().is_empty());
     }
 
     /// X13: several spannable sets go in the caller's order. The first that
