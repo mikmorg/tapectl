@@ -1906,9 +1906,13 @@ by the number or position of a slice or by a file name:
         --swap-tapes --to /destination/UNIT
 
 `--verify` takes the same two options and says whether a copy of each failed
-slice was found. To copy a slice off the other tape by hand, find its tape
-file in THAT tape's front index (File 3) by its sha256 (the entry's
-`position` is POSITION), then:
+slice was found. `--swap-tapes` reads the other cartridge's seal marker
+first, and takes a slice from it only at a position the seal says the tape
+holds ("Where the tape ended"): a cartridge whose seal marker cannot be read
+gives none. The other cartridge may hold only part of a unit held across
+tapes ("A unit across tapes"); it gives the slices it holds. To copy a slice
+off the other tape by hand, find its tape file in THAT tape's front index
+(File 3) by its sha256 (the entry's `position` is POSITION), then:
 
     mt -f /dev/nst0 rewind
     mt -f /dev/nst0 fsf POSITION
@@ -13822,6 +13826,9 @@ sha256_encrypted = \"bbb\"
             "Only a tape whose envelope lists the same unit, with the same uuid, at the same version is used",
             "another version can differ in the very files that are damaged",
             "so `--to` needs room for the unit's slices beside its restored files",
+            // volume-format-v2.md 4.2 R5, 4.4 R8 (#478 L3).
+            "`--swap-tapes` reads the other cartridge's seal marker first, and takes a slice from it only at a position the seal says the tape holds (\"Where the tape ended\"): a cartridge whose seal marker cannot be read gives none.",
+            "The other cartridge may hold only part of a unit held across tapes (\"A unit across tapes\"); it gives the slices it holds.",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
