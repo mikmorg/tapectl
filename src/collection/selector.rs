@@ -20,8 +20,19 @@
 //! re-examined when a registered unit passes a tenth of its cartridge
 //! generation's capacity (ADR-0012 2026-10-15 item 69); `collection plan`
 //! prints the largest pending unit's share of the tape so that is visible.
+//!
+//! **Spanning** (1.7.0, #478; ADR-0012 items 82, 83, 94, 95 and 123;
+//! `layout-session.md` "Spanning"). A unit that allows spanning may be cut
+//! by the drive's early warning and continue on the next tape, so it is not
+//! held to one tape: [`plan_batches_spanning`] admits it at any size up to
+//! the staging area, and fills each batch by the per-tape plan order
+//! ([`CapacityBudget::place`], never a copy of it): whole units first, the
+//! spannable ones last. With no spannable unit pending it is exactly
+//! [`plan_batches`] (or [`plan_batches_prioritised`]).
 
-use crate::volume::layout_model::pad_to_blocks;
+use std::collections::HashSet;
+
+use crate::volume::layout_model::{pad_to_blocks, CapacityBudget, Placed, PlanClass, PlanItem};
 
 /// One pending unit as the selector sees it: a name (the sort key) and a
 /// size in bytes. Sourcing the size is the caller's concern — see
@@ -62,7 +73,8 @@ impl Batch {
     }
 }
 
-/// A unit whose block-padded size alone exceeds the per-tape budget.
+/// A unit whose block-padded size alone exceeds the per-tape budget, and
+/// which may not span on this drive.
 ///
 /// Per the T10 trap ("a unit too large for a whole tape is a clear error,
 /// not a split" — §7: "Unit contiguity is inviolate regardless, a movie
@@ -70,12 +82,21 @@ impl Batch {
 /// BEFORE the fits-in-current-batch test so an oversized unit can never
 /// silently close an empty batch (which would either loop forever trying to
 /// place it, or emit a batch that itself overflows the budget).
+///
+/// Since 1.7.0 (#478) a unit that allows spanning is not held to one tape
+/// (ADR-0012 items 82 and 94) — except on a drive with no
+/// `post_warning_bytes`, where no unit may pass the fill ceiling and a span
+/// is refused (item 123): such a unit is oversized too, `allows_spanning`
+/// set, and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OversizedUnit {
     pub name: String,
     pub size_bytes: u64,
     pub padded_bytes: u64,
     pub budget_bytes: u64,
+    /// The unit allows spanning (`allow_spanning`), and is refused only
+    /// because the drive does not declare `post_warning_bytes`.
+    pub allows_spanning: bool,
 }
 
 impl std::fmt::Display for OversizedUnit {
@@ -85,19 +106,93 @@ impl std::fmt::Display for OversizedUnit {
         write!(
             f,
             "unit \"{}\" ({} bytes, {} block-padded) exceeds the per-tape budget \
-             ({} bytes) by {} bytes ({}) — units are never split across tapes, so this \
-             one cannot be batched at all",
+             ({} bytes) by {} bytes ({}) — {}, so this one cannot be batched at all",
             self.name,
             self.size_bytes,
             self.padded_bytes,
             self.budget_bytes,
             over,
             crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
+            if self.allows_spanning {
+                "it allows spanning (allow_spanning), but a span is written only by a drive \
+                 whose `[[backends.lto]]` entry declares `post_warning_bytes` (ADR-0012 item \
+                 123), and this one does not"
+            } else {
+                "a unit that does not allow spanning (allow_spanning) is never split across \
+                 tapes"
+            },
         )
     }
 }
 
 impl std::error::Error for OversizedUnit {}
+
+/// A unit that allows spanning and is larger than the staging area (ADR-0012
+/// items 85 and 94): it is staged whole before its first tape is written, so
+/// it could never be staged. `stage create` refuses it by the same rule
+/// (`staging::check_unit_fits_one_tape`): its size, unpadded, against the
+/// staging filesystem's total size (ruling X14), not its free space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargerThanStaging {
+    pub name: String,
+    pub size_bytes: u64,
+    /// The staging filesystem's total size.
+    pub staging_total: u64,
+}
+
+/// Every unit [`plan_batches_spanning`] refused, collected like
+/// `Layout::validate` (no batch is returned while any unit is refused).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refused {
+    /// Units too large for one tape that may not span on it.
+    pub oversized: Vec<OversizedUnit>,
+    /// Spannable units larger than the staging area.
+    pub larger_than_staging: Vec<LargerThanStaging>,
+}
+
+/// What one batch is packed against: the room of one tape, as the per-tape
+/// plan sees it (ADR-0012 items 113 and 123).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchRoom {
+    /// The room under the fill ceiling.
+    pub fill: u64,
+    /// The plan bound (item 113): with the drive's `post_warning_bytes`, the
+    /// room to the cartridge's whole nominal capacity, where whole units may
+    /// reach and past which a spannable unit spans. `None`: nothing passes
+    /// the fill ceiling, and nothing spans (item 123).
+    pub bound: Option<u64>,
+}
+
+impl BatchRoom {
+    /// The most a batch of whole units is packed to: the bound, or the fill
+    /// without one, as 1.6.0 packs.
+    pub fn whole_bytes(self) -> u64 {
+        self.bound.unwrap_or(self.fill)
+    }
+
+    /// This room as the per-tape plan's budget, with no fixed files and no
+    /// reserve under the fill ceiling: `fill` is already net of it.
+    pub fn budget(self) -> CapacityBudget {
+        CapacityBudget {
+            available_bytes: self.fill,
+            reserve_bytes: 0,
+            plan_bound_bytes: self.bound,
+            span_tail_from: None,
+        }
+    }
+}
+
+/// The pending units that allow spanning (ADR-0012 item 82: the policy key
+/// `allow_spanning`), and the staging area each must fit (items 85 and 94).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Spanning {
+    /// Their names. Empty: the plan is 1.6.0's.
+    pub units: HashSet<String>,
+    /// The staging filesystem's total size (ruling X14), as `stage create`
+    /// reads it; `None` when it could not be read, and then nothing is
+    /// refused for it, as there.
+    pub staging_total: Option<u64>,
+}
 
 /// Greedily fill batches, alphabetical NEXT-fit (§7 ruling — explicitly
 /// NOT best-fit-decreasing, and not first-fit either: issue #456): sort
@@ -138,14 +233,161 @@ pub fn plan_batches(
 /// the flag nothing calls this, and [`plan_batches`]' order is unchanged.
 pub fn plan_batches_prioritised(
     mut units: Vec<PendingUnit>,
-    prioritised: &std::collections::HashSet<String>,
+    prioritised: &HashSet<String>,
     budget_bytes: u64,
     block_size: u64,
 ) -> Result<Vec<Batch>, Vec<OversizedUnit>> {
+    sort_prioritised(&mut units, prioritised);
+    next_fit(units, budget_bytes, block_size)
+}
+
+/// [`plan_batches_prioritised`]'s order: the prioritised units first, each
+/// group in name order.
+fn sort_prioritised(units: &mut [PendingUnit], prioritised: &HashSet<String>) {
     units.sort_by(|a, b| {
         (!prioritised.contains(&a.name), &a.name).cmp(&(!prioritised.contains(&b.name), &b.name))
     });
-    next_fit(units, budget_bytes, block_size)
+}
+
+/// [`plan_batches`] — or, with `prioritised`, [`plan_batches_prioritised`] —
+/// over pending units some of which may allow spanning (1.7.0, #478), packed
+/// against `room`. Without a unit of `spanning.units` among `units` it is
+/// exactly that function, packed to [`BatchRoom::whole_bytes`], as 1.6.0
+/// packs. Otherwise:
+///
+/// - **Admission** (ADR-0012 items 82, 85, 94 and 123). A unit that does not
+///   allow spanning is refused above one tape, as before. A spannable unit
+///   is refused only when it is larger than the staging area
+///   ([`LargerThanStaging`], `stage create`'s own rule), or when the drive
+///   declares no plan bound and it does not fit under the fill ceiling (no
+///   unit may span there: [`OversizedUnit::allows_spanning`]).
+/// - **The fill** is still next-fit over the same order: a unit joins the
+///   current batch while the per-tape plan order ([`CapacityBudget::place`])
+///   places every unit of the batch on its tape, and otherwise starts the
+///   next. So whole units are committed to the fill ceiling and, with no
+///   spannable unit in their batch, past it within the bound (item 113);
+///   spannable units go last (items 83 and 95); the first that crosses the
+///   bound spans and nothing after it is planned on that tape (item 123);
+///   and one larger than one tape starts early, the whole units it leaves
+///   no room for starting the next batch (item 94).
+/// - **Order within a batch**: its whole units in the order taken, then its
+///   spannable units in the order taken (the tape's order).
+///
+/// A batch's `padded_bytes` counts each spannable unit whole, including what
+/// continues on the next tape. Which unit of a batch spans is
+/// [`CapacityBudget::place`]'s to say, over the same room; `collection plan`
+/// asks it (`collection::plan::placement`).
+pub fn plan_batches_spanning(
+    mut units: Vec<PendingUnit>,
+    prioritised: Option<&HashSet<String>>,
+    spanning: &Spanning,
+    room: BatchRoom,
+    block_size: u64,
+) -> Result<Vec<Batch>, Refused> {
+    match prioritised {
+        Some(first) => sort_prioritised(&mut units, first),
+        None => units.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+    if !units.iter().any(|u| spanning.units.contains(&u.name)) {
+        return next_fit(units, room.whole_bytes(), block_size).map_err(|oversized| Refused {
+            oversized,
+            larger_than_staging: Vec::new(),
+        });
+    }
+
+    let mut refused = Refused::default();
+    for u in &units {
+        let padded = pad_to_blocks(u.size_bytes, block_size);
+        let allows_spanning = spanning.units.contains(&u.name);
+        // Item 123: with no plan bound nothing passes the fill ceiling, a
+        // spannable unit included.
+        let budget_bytes = match (allows_spanning, room.bound) {
+            (true, Some(_)) => u64::MAX,
+            (true, None) => room.fill,
+            (false, _) => room.whole_bytes(),
+        };
+        if padded > budget_bytes {
+            refused.oversized.push(OversizedUnit {
+                name: u.name.clone(),
+                size_bytes: u.size_bytes,
+                padded_bytes: padded,
+                budget_bytes,
+                allows_spanning,
+            });
+        }
+        // Items 85 and 94, `stage create`'s rule: the size against the
+        // staging filesystem's total size.
+        if let Some(total) = spanning.staging_total.filter(|_| allows_spanning) {
+            if u.size_bytes > total {
+                refused.larger_than_staging.push(LargerThanStaging {
+                    name: u.name.clone(),
+                    size_bytes: u.size_bytes,
+                    staging_total: total,
+                });
+            }
+        }
+    }
+    if refused != Refused::default() {
+        return Err(refused);
+    }
+
+    let budget = room.budget();
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut current: Vec<(PendingUnit, PlanItem)> = Vec::new();
+    for u in units {
+        let item = PlanItem {
+            class: if spanning.units.contains(&u.name) {
+                PlanClass::Spannable
+            } else {
+                PlanClass::Whole
+            },
+            bytes: pad_to_blocks(u.size_bytes, block_size),
+        };
+        // The admission above guarantees one unit alone is always placed, so
+        // an empty batch always takes the next unit.
+        if !current.is_empty() && !every_unit_placed(&budget, &current, item) {
+            batches.push(batch_in_tape_order(std::mem::take(&mut current)));
+        }
+        current.push((u, item));
+    }
+    if !current.is_empty() {
+        batches.push(batch_in_tape_order(current));
+    }
+    Ok(batches)
+}
+
+/// Whether the per-tape plan order places every unit of `current` and
+/// `next` on one tape: none deferred to a later tape, none refused.
+fn every_unit_placed(
+    budget: &CapacityBudget,
+    current: &[(PendingUnit, PlanItem)],
+    next: PlanItem,
+) -> bool {
+    let items: Vec<PlanItem> = current
+        .iter()
+        .map(|(_, item)| *item)
+        .chain(std::iter::once(next))
+        .collect();
+    budget
+        .place(0, &items)
+        .placed
+        .iter()
+        .all(|p| !matches!(p, Placed::Deferred | Placed::Refused))
+}
+
+/// One batch of `units`, in its tape's order: the whole units, then the
+/// spannable ones (items 83 and 95), each group in the order taken.
+fn batch_in_tape_order(units: Vec<(PendingUnit, PlanItem)>) -> Batch {
+    let (whole, spannable): (Vec<_>, Vec<_>) = units
+        .into_iter()
+        .partition(|(_, item)| item.class == PlanClass::Whole);
+    let mut batch = Batch::default();
+    for (u, item) in whole.into_iter().chain(spannable) {
+        batch.total_bytes += u.size_bytes;
+        batch.padded_bytes += item.bytes;
+        batch.units.push(u);
+    }
+    batch
 }
 
 /// The oversized refusal and the next-fit fill, over `units` in the order
@@ -164,6 +406,7 @@ fn next_fit(
                 size_bytes: u.size_bytes,
                 padded_bytes: padded,
                 budget_bytes,
+                allows_spanning: false,
             })
         })
         .collect();
@@ -328,6 +571,221 @@ mod tests {
     #[test]
     fn empty_input_yields_no_batches() {
         assert_eq!(plan_batches(vec![], 1000, 512).unwrap(), Vec::new());
+    }
+
+    // ── spanning (1.7.0, #478; ADR-0012 items 82, 83, 94, 95 and 123) ──
+
+    /// A fill ceiling at 8 and a plan bound at 10, block size 1.
+    const ROOM: BatchRoom = BatchRoom {
+        fill: 8,
+        bound: Some(10),
+    };
+
+    fn spanning(names: &[&str], staging_total: Option<u64>) -> Spanning {
+        Spanning {
+            units: names.iter().map(|n| n.to_string()).collect(),
+            staging_total,
+        }
+    }
+
+    fn names_of(batches: &[Batch]) -> Vec<Vec<&str>> {
+        batches.iter().map(|b| b.unit_names()).collect()
+    }
+
+    /// Item 82: a unit that does not allow spanning is still refused above
+    /// one tape, and the refusal names the key.
+    #[test]
+    fn a_unit_that_does_not_allow_spanning_is_refused_above_one_tape_naming_the_key() {
+        let err = plan_batches(vec![unit("huge", 100)], 50, 1).unwrap_err();
+        assert!(!err[0].allows_spanning);
+        let text = err[0].to_string();
+        assert!(
+            text.contains(
+                "a unit that does not allow spanning (allow_spanning) is never split across tapes"
+            ),
+            "{text}"
+        );
+        // The same through the spanning selector, beside a unit that does.
+        let err = plan_batches_spanning(
+            vec![unit("huge", 100), unit("span", 30)],
+            None,
+            &spanning(&["span"], None),
+            ROOM,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(err.oversized.len(), 1, "{err:?}");
+        assert_eq!(
+            (
+                err.oversized[0].name.as_str(),
+                err.oversized[0].budget_bytes
+            ),
+            ("huge", 10),
+            "a whole unit is held to the bound"
+        );
+        assert!(err.larger_than_staging.is_empty());
+    }
+
+    /// Item 94: a spannable unit larger than one tape is admitted. It goes
+    /// last on its batch's tape (items 83 and 95): `z`, after it in the
+    /// alphabet, is on the tape before it. Its early start leaves 5 for whole
+    /// units before it (it touches three tapes either way), and a, z take 5.
+    #[test]
+    fn a_spannable_unit_larger_than_one_tape_is_admitted_and_goes_last() {
+        let units = vec![unit("a", 3), unit("m", 25), unit("z", 2)];
+        let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "z", "m"]]);
+        assert_eq!(
+            batches[0].padded_bytes, 30,
+            "the spanning unit is counted whole"
+        );
+    }
+
+    /// Item 94's displacement: a whole unit the early start leaves no room
+    /// for starts the next batch rather than pushing the span later.
+    #[test]
+    fn a_whole_unit_the_early_start_leaves_no_room_for_starts_the_next_batch() {
+        let units = vec![unit("a", 3), unit("m", 25), unit("z", 4)];
+        let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "m"], vec!["z"]]);
+    }
+
+    /// Items 83 and 95: a spannable unit that fits one tape goes last in its
+    /// batch, after a whole unit later in the alphabet, and passes the fill
+    /// ceiling (a, b and n take 6 of the 8 under it; m takes the tape to 9),
+    /// where whole units, with it queued, stop at the ceiling.
+    #[test]
+    fn a_spannable_unit_that_fits_one_tape_goes_after_the_whole_units() {
+        let units = vec![unit("a", 2), unit("b", 2), unit("m", 3), unit("n", 2)];
+        let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "b", "n", "m"]]);
+    }
+
+    /// With a spannable unit queued, whole units stop at the fill ceiling
+    /// (item 83): a batch of whole units already past it does not take the
+    /// spannable unit, which starts the next batch, and the whole units after
+    /// it join it there.
+    #[test]
+    fn whole_units_past_the_ceiling_keep_their_batch_and_the_span_starts_the_next() {
+        let units = vec![
+            unit("a", 4),
+            unit("b", 3),
+            unit("c", 3),
+            unit("m", 3),
+            unit("n", 4),
+        ];
+        let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "b", "c"], vec!["n", "m"]]);
+    }
+
+    /// Item 123 (X13): nothing is planned after the unit that spans; the
+    /// next spannable unit starts the next batch.
+    #[test]
+    fn nothing_follows_the_span_on_its_tape() {
+        let units = vec![unit("m", 12), unit("n", 2)];
+        let batches =
+            plan_batches_spanning(units, None, &spanning(&["m", "n"], None), ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["m"], vec!["n"]]);
+    }
+
+    /// Item 123: on a drive with no plan bound nothing passes the fill
+    /// ceiling. A spannable unit over it is refused, naming
+    /// `post_warning_bytes`, not `allow_spanning`; one under it is packed
+    /// like a whole unit and goes last in its batch.
+    #[test]
+    fn without_a_plan_bound_a_spannable_unit_over_the_fill_is_refused_naming_the_drive_key() {
+        let no_bound = BatchRoom {
+            fill: 8,
+            bound: None,
+        };
+        let err = plan_batches_spanning(
+            vec![unit("a", 1), unit("m", 9)],
+            None,
+            &spanning(&["m"], None),
+            no_bound,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(err.oversized.len(), 1, "{err:?}");
+        let o = &err.oversized[0];
+        assert!(o.allows_spanning && o.budget_bytes == 8, "{o:?}");
+        let text = o.to_string();
+        assert!(
+            text.contains("it allows spanning (allow_spanning)")
+                && text.contains("`post_warning_bytes` (ADR-0012 item 123)"),
+            "{text}"
+        );
+
+        let batches = plan_batches_spanning(
+            vec![unit("a", 1), unit("m", 4), unit("n", 3), unit("z", 2)],
+            None,
+            &spanning(&["m"], None),
+            no_bound,
+            1,
+        )
+        .unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "n", "m"], vec!["z"]]);
+    }
+
+    /// Items 85 and 94: a spannable unit larger than the staging area is
+    /// refused, its size unpadded against the staging filesystem's total, as
+    /// `stage create` holds it. Equal is not larger; an unreadable total
+    /// refuses nothing.
+    #[test]
+    fn a_spannable_unit_larger_than_the_staging_area_is_refused() {
+        let units = || vec![unit("a", 1), unit("m", 25)];
+        let err =
+            plan_batches_spanning(units(), None, &spanning(&["m"], Some(24)), ROOM, 1).unwrap_err();
+        assert_eq!(
+            err.larger_than_staging,
+            [LargerThanStaging {
+                name: "m".into(),
+                size_bytes: 25,
+                staging_total: 24,
+            }]
+        );
+        assert!(err.oversized.is_empty(), "a span is not held to one tape");
+        for total in [Some(25), None] {
+            assert!(
+                plan_batches_spanning(units(), None, &spanning(&["m"], total), ROOM, 1).is_ok(),
+                "{total:?}"
+            );
+        }
+    }
+
+    /// With no spannable unit pending, the spanning selector IS next-fit at
+    /// the bound (or the fill without one), in either order — the 600-unit
+    /// drill's units, a set naming only units that are not pending, and the
+    /// hand-computed case.
+    #[test]
+    fn with_no_spannable_unit_pending_the_plan_is_1_6_0s() {
+        let drill: Vec<PendingUnit> = (0..600u64)
+            .map(|i| unit(&format!("{i:04}"), 1 + (i * 7919) % 8))
+            .collect();
+        let first: HashSet<String> = ["0007".to_string(), "0300".to_string()].into();
+        let not_pending = spanning(&["absent"], Some(1));
+        for room in [
+            ROOM,
+            BatchRoom {
+                fill: 8,
+                bound: None,
+            },
+        ] {
+            for units in [
+                drill.clone(),
+                vec![unit("a", 3), unit("b", 4), unit("c", 3)],
+            ] {
+                assert_eq!(
+                    plan_batches_spanning(units.clone(), None, &not_pending, room, 1).unwrap(),
+                    plan_batches(units.clone(), room.whole_bytes(), 1).unwrap(),
+                );
+                assert_eq!(
+                    plan_batches_spanning(units.clone(), Some(&first), &not_pending, room, 1)
+                        .unwrap(),
+                    plan_batches_prioritised(units, &first, room.whole_bytes(), 1).unwrap(),
+                );
+            }
+        }
     }
 
     /// The multi-tape drill (T10 §4): ~600 units, microcosm sizes, asserting
