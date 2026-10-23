@@ -353,7 +353,8 @@ impl ValidatedLayout {
     }
 }
 
-/// `plan`'s rows: one `writes` row per unit and one `write_positions` row
+/// `plan`'s rows: one `writes` row per unit, `may_span` set for a unit whose
+/// write may span ([`BuildUnit::span`]), and one `write_positions` row
 /// per slice entry, on `tx`. Returns the `(write_id, snapshot_id)` pairs and
 /// the `stage_slice_id -> write_id` map the session carries.
 #[allow(clippy::type_complexity)]
@@ -367,10 +368,21 @@ fn insert_plan_rows(
     let mut write_ids = Vec::with_capacity(units.len());
     let mut slice_write_id = HashMap::new();
     for u in units {
+        // `writes.may_span` (ADR-0012 item 121, migration 039): whether this
+        // write may span is frozen here, from the unit's span, which is what
+        // `build` fenced File 0 and the seal placeholder with (item 124).
+        // Everything after the plan reads the row, never the policy again.
         tx.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
-             VALUES (?1, ?2, ?3, 'planned', ?4)",
-            params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir,
+                                 may_span)
+             VALUES (?1, ?2, ?3, 'planned', ?4, ?5)",
+            params![
+                u.stage_set_id,
+                u.snapshot_id,
+                volume_id,
+                session_dir,
+                u.span.is_some()
+            ],
         )?;
         let write_id = tx.last_insert_rowid();
         write_ids.push((write_id, u.snapshot_id));
