@@ -383,6 +383,7 @@ mod tests {
                 compression: Some("none".into()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec!["*.secret".into()],
             },
         )
@@ -440,6 +441,7 @@ mod tests {
                 compression: Some("none".into()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec!["*.secret".into()],
             },
         )
@@ -538,6 +540,7 @@ mod tests {
                 compression: None,
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![".cache/".into()],
             },
         )

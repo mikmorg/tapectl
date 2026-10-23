@@ -226,6 +226,7 @@ mod tests {
             compression: Some("none".to_string()),
             slice_size: None,
             warehouse_copies: None,
+            allow_spanning: None,
             exclude_patterns: vec![],
         };
         dotfile::write_dotfile(&dir.join(".tapectl-unit.toml"), &df).unwrap();

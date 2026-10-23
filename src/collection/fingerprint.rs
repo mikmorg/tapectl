@@ -866,6 +866,7 @@ mod tests {
                 compression: Some("none".into()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec!["*.tmp".into(), "Thumbs.db".into()],
             },
         )
@@ -945,6 +946,7 @@ mod tests {
                 compression: None,
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![".cache/".into()],
             },
         )
@@ -985,6 +987,44 @@ mod tests {
                 "web/app.js".to_string(),
             ],
             "everything under .cache/ (any case, any depth) and node_modules/ must be gone"
+        );
+    }
+
+    /// #478 (ADR-0012 item 82): the dotfile model gained `allow_spanning`,
+    /// and an existing unit's dotfile that does not set it keeps its
+    /// fingerprint across the rewrite every unit command does (`unit tag`,
+    /// `unit rename`, `tenant reassign`: `read_dotfile` then
+    /// `write_dotfile`): the same walk, the same paths and sizes, and the
+    /// dotfile's own bytes unchanged. (Its mtime moves with any rewrite; the
+    /// dotfile is not content either way, ADR-0012 item 24.)
+    #[test]
+    fn an_unset_allow_spanning_leaves_an_existing_dotfiles_fingerprint_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let existing = "[unit]\nuuid = \"u-1\"\nname = \"fixture\"\n\
+                        created = \"2026-01-01T00:00:00Z\"\ntags = []\ntenant = \"t\"\n\n\
+                        [policy]\ncompression = \"none\"\n\n\
+                        [excludes]\npatterns = [\"*.tmp\"]\n";
+        std::fs::write(&path, existing).unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"keep me").unwrap();
+        std::fs::write(tmp.path().join("junk.tmp"), b"junk").unwrap();
+        let sized = |stamps: Vec<FileStamp>| -> Vec<(String, i64)> {
+            stamps.into_iter().map(|f| (f.path, f.size_bytes)).collect()
+        };
+        let before = sized(walk_fingerprint(tmp.path(), &[]).unwrap());
+
+        let df = crate::unit::dotfile::read_dotfile(&path).unwrap();
+        assert!(df.allow_spanning.is_none());
+        crate::unit::dotfile::write_dotfile(&path, &df).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        assert_eq!(sized(walk_fingerprint(tmp.path(), &[]).unwrap()), before);
+        assert_eq!(
+            before,
+            vec![
+                (".tapectl-unit.toml".to_string(), existing.len() as i64),
+                ("keep.txt".to_string(), 7),
+            ]
         );
     }
 
@@ -1060,6 +1100,7 @@ mod tests {
                 compression: Some("none".into()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec!["*.tmp".into()],
             },
         )

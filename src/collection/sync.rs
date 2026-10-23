@@ -720,6 +720,7 @@ mod tests {
             compression: None,
             slice_size: None,
             warehouse_copies: None,
+            allow_spanning: None,
             exclude_patterns: vec![],
         };
         for d in ["one", "two"] {
@@ -784,6 +785,7 @@ mod tests {
                 compression: Some("none".to_string()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![],
             },
         )
@@ -897,6 +899,7 @@ mod tests {
                 compression: Some("zstd-ish".to_string()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![],
             },
         )
@@ -1009,6 +1012,7 @@ mod tests {
             compression: Some("none".to_string()),
             slice_size: None,
             warehouse_copies: None,
+            allow_spanning: None,
             exclude_patterns: Vec::new(),
         };
 

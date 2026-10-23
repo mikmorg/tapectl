@@ -180,6 +180,7 @@ pub fn init_unit_with_config(
         compression: None,
         slice_size: None,
         warehouse_copies: None,
+        allow_spanning: None,
         exclude_patterns: Vec::new(),
     };
     dotfile::write_dotfile(&dotfile_path, &dotfile_data)?;
@@ -629,7 +630,7 @@ mod tests {
         let mut contents = std::fs::read_to_string(&dotfile_path).unwrap();
         contents.push_str(
             "\n[policy]\nchecksum_mode = \"sha256\"\ncompression = \"gzip\"\n\
-             slice_size = \"500M\"\nwarehouse_copies = 2\n",
+             slice_size = \"500M\"\nwarehouse_copies = 2\nallow_spanning = true\n",
         );
         std::fs::write(&dotfile_path, &contents).unwrap();
 
@@ -656,6 +657,11 @@ mod tests {
         assert!(
             after.contains("warehouse_copies"),
             "warehouse_copies must survive rename, got: {after}"
+        );
+        // #478 (ADR-0012 item 82).
+        assert!(
+            after.contains("allow_spanning = true"),
+            "allow_spanning must survive rename, got: {after}"
         );
     }
 }

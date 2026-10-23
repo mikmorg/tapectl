@@ -471,6 +471,7 @@ mod tests {
                 compression: Some("gzip".into()),
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![],
             },
         )

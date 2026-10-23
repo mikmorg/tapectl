@@ -898,7 +898,7 @@ mod tag_tests {
         let dotfile_path = src.join(".tapectl-unit.toml");
         // Hand-set a policy key, to prove the rewrite round-trips it.
         let mut raw = std::fs::read_to_string(&dotfile_path).unwrap();
-        raw.push_str("\n[policy]\nslice_size = \"500M\"\n");
+        raw.push_str("\n[policy]\nslice_size = \"500M\"\nallow_spanning = false\n");
         std::fs::write(&dotfile_path, raw).unwrap();
 
         run_cmd(
@@ -922,6 +922,9 @@ mod tag_tests {
             Some("500M"),
             "rewriting the tags must not drop a [policy] key"
         );
+        // #478 (ADR-0012 item 82): an explicit `false` is kept as `false`,
+        // not dropped to "not set".
+        assert_eq!(df.allow_spanning, Some(false), "nor the spanning key");
         let unit = queries::get_unit_by_name(&conn, "photos").unwrap().unwrap();
         assert_eq!(queries::get_tags_for_unit(&conn, unit.id).unwrap(), df.tags);
     }
@@ -1152,6 +1155,7 @@ mod checksum_mode_tests {
                 compression: None,
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![],
             },
         )
@@ -1192,6 +1196,7 @@ mod checksum_mode_tests {
                 compression: None,
                 slice_size: None,
                 warehouse_copies: None,
+                allow_spanning: None,
                 exclude_patterns: vec![],
             },
         )
