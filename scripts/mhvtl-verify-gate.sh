@@ -2059,8 +2059,12 @@ step_heir_short_info() {
     grep -F "Verdict: SEALED" >/dev/null <<<"$out" || { echo "heir_short_info: a short tape is SEALED"; return 1; }
     grep -F "The tape ended early, after file $k: its seal marker, the last file, is" >/dev/null <<<"$out" \
         || { echo "heir_short_info: no line saying the tape ended after file $k"; return 1; }
-    grep -F "(planned; NOT ON TAPE)" >/dev/null <<<"$out" \
-        || { echo "heir_short_info: the file map marks no planned file NOT ON TAPE"; return 1; }
+    # 1.7.0 (ADR-0012 item 140): one NOT ON TAPE line for the planned files after the end.
+    grep -E "^  NOT ON TAPE  files $((k + 1)) to [0-9]+  \(planned; the tape ended after file $k, and its seal marker is file $((k + 1))\)\$" >/dev/null <<<"$out" \
+        || { echo "heir_short_info: the file map has no NOT ON TAPE line for files $((k + 1)) on"; return 1; }
+    # Lines that START with it, at any indent: the --verify verdict names it mid-sentence.
+    [ "$(grep -cE '^ *NOT ON TAPE' <<<"$out" || true)" -eq 1 ] \
+        || { echo "heir_short_info: want exactly one NOT ON TAPE line"; return 1; }
 }
 step_heir_short_verify() {
     local k out rc
@@ -2070,8 +2074,12 @@ step_heir_short_verify() {
     [ "$rc" -eq 0 ] || { echo "heir_short_verify: RESTORE.sh --verify exited $rc, want 0"; return 1; }
     grep -F "VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after" >/dev/null <<<"$out" \
         || { echo "heir_short_verify: no PASS verdict naming the early end"; return 1; }
-    grep -E "^NOT ON TAPE  file +$((k + 1))  " >/dev/null <<<"$out" \
-        || { echo "heir_short_verify: file $((k + 1)), planned, is not reported NOT ON TAPE"; return 1; }
+    # 1.7.0 (ADR-0012 item 140): one NOT ON TAPE line for the planned files after the end.
+    grep -E "^NOT ON TAPE  files $((k + 1)) to [0-9]+  \(planned; the tape ended after file $k, and its seal marker is file $((k + 1))\)\$" >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: files $((k + 1)) on, planned, are not reported NOT ON TAPE"; return 1; }
+    # Lines that START with it, at any indent: the --verify verdict names it mid-sentence.
+    [ "$(grep -cE '^ *NOT ON TAPE' <<<"$out" || true)" -eq 1 ] \
+        || { echo "heir_short_verify: want exactly one NOT ON TAPE line"; return 1; }
     if grep -E "^FAIL " <<<"$out"; then echo "heir_short_verify: a FAIL line"; return 1; fi
     # The control: the last file on the tape, K, was hashed, and none after it.
     grep -E "^PASS  file +$k  data_slice" >/dev/null <<<"$out" \

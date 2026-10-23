@@ -675,8 +675,8 @@ grep -F "The tape ended early, after file $K" "$STEP_DIR/info.out" >/dev/null ||
 heir heir-verify 0 --verify
 grep -F "VERIFY: PASS" "$STEP_DIR/heir-verify.out" >/dev/null || fail "RESTORE.sh --verify did not PASS"
 NOT_ON_TAPE="$(grep -c "^NOT ON TAPE" "$STEP_DIR/heir-verify.out" || true)"
-[ "$NOT_ON_TAPE" -ge 1 ] || fail "RESTORE.sh --verify marks no file NOT ON TAPE on a short tape"
-log "  RESTORE.sh --verify: PASS, $NOT_ON_TAPE planned file(s) NOT ON TAPE after file $K"
+[ "$NOT_ON_TAPE" -eq 1 ] || fail "RESTORE.sh --verify prints $NOT_ON_TAPE NOT ON TAPE lines on a short tape, want one (ADR-0012 item 140)"
+log "  RESTORE.sh --verify: PASS; $(grep "^NOT ON TAPE" "$STEP_DIR/heir-verify.out")"
 end_step
 
 # ------------------------------------------------------------
