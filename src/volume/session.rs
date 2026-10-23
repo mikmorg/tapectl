@@ -3688,16 +3688,21 @@ fn record_quarantine(
 /// a 5-second lock wait would leave the rows claiming a state the tape is
 /// not in. Idempotent, so safe to retry.
 ///
-/// Never a `cut` row, and never TO `cut` (#420, ADR-0012 item 112): `cut`
-/// is terminal and is written only inside a passing confirm's transaction,
-/// so an Inconclusive confirm's `interrupted` (or any later mark) leaves it
-/// as it is.
+/// Never a `cut` or `range` row, and never TO either (#420, ADR-0012 items
+/// 112 and 121): both are terminal and are written only inside a passing
+/// confirm's transaction, so an Inconclusive confirm's `interrupted` (or any
+/// later mark) leaves them as they are.
 fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
-    debug_assert_ne!(status, "cut", "cut is written only by a passing confirm");
+    debug_assert!(
+        status != "cut" && status != "range",
+        "cut and range are written only by a passing confirm"
+    );
     for (write_id, _) in write_ids {
         busy::retry(BusyPolicy::DEFAULT, "a write session's status", || {
+            // `cut` (#420) and `range` (#478, ADR-0012 item 121) are terminal
+            // outcomes of a passing confirm: nothing after it moves them.
             Ok(conn.execute(
-                "UPDATE writes SET status = ?1 WHERE id = ?2 AND status <> 'cut'",
+                "UPDATE writes SET status = ?1 WHERE id = ?2 AND status NOT IN ('cut', 'range')",
                 params![status, write_id],
             )?)
         })?;
