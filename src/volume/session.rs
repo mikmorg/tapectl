@@ -12064,8 +12064,8 @@ mod tests {
         /// A write with no unit that may span is 1.6.0's, row for row and
         /// byte for byte where it is deterministic: no row may span, File 0
         /// and the seal state `short-seal` alone, the rows split
-        /// completed/cut, no range is named, and the event's details are the
-        /// ones `write::write_completed_details` makes from the same session.
+        /// completed/cut, no range is named, and the event's details are
+        /// 1.6.0's bytes, which `write::write_completed_details` now passes on.
         #[test]
         fn a_write_with_no_spannable_unit_is_1_6_0s() {
             let s = three_units();
@@ -12095,9 +12095,21 @@ mod tests {
                     row("c", "cut", "staged")
                 ]
             );
+            // 1.6.0's details, built as `write::write_completed_details` built
+            // them before it delegated to the session (#478).
+            let Ending::Short { ended_after } = done.ending else {
+                panic!("a short seal");
+            };
+            let v1_6_0 = serde_json::json!({
+                "ending": "short",
+                "ended_after": ended_after,
+                "cut_units": done.cut_units,
+            })
+            .to_string();
+            assert_eq!(done.write_completed_details(), Some(v1_6_0.clone()));
             assert_eq!(
-                done.write_completed_details(),
-                crate::volume::write::write_completed_details(&done)
+                crate::volume::write::write_completed_details(&done),
+                Some(v1_6_0)
             );
             assert!(!done.short_ending_report().unwrap().contains("range"));
 

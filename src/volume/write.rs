@@ -4472,24 +4472,14 @@ fn record_after_sealed(
     })
 }
 
-/// The `write_completed` event's `details` (#420, `layout-session.md`
-/// "Confirm of a short ending": the event names the short ending and the cut
-/// units): one JSON object, `{"ending": "short", "ended_after": K,
-/// "cut_units": [..]}`. `None` on a full seal, whose event is what it was
-/// before 1.6.0. Shared with the adoption of a lost write
+/// The `write_completed` event's `details` (#420, #478; `layout-session.md`
+/// "Confirm of a short ending"): [`session::SealedSession::write_completed_details`],
+/// which names the short ending and the cut units and, from 1.7.0, the range
+/// units with their slice runs. `None` on a full seal with no range, whose
+/// event is what it was before 1.6.0. Shared with the adoption of a lost write
 /// (`adopt_lost::record_adoption`), which writes the same event.
 pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
-    let session::Ending::Short { ended_after } = sealed.ending else {
-        return None;
-    };
-    Some(
-        serde_json::json!({
-            "ending": "short",
-            "ended_after": ended_after,
-            "cut_units": sealed.cut_units,
-        })
-        .to_string(),
-    )
+    sealed.write_completed_details()
 }
 
 /// How a volume's tape ended, as the catalog records it (#420): what
