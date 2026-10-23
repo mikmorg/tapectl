@@ -1984,8 +1984,9 @@ list is `/destination/UNIT/.tapectl-damaged-files.txt`. A tape that holds ONE
 unit, restored with `--all --to /destination`, puts the files straight into
 `/destination`: its list is `/destination/.tapectl-damaged-files.txt`, and
 that directory is the `--to` below. Load a tape that holds
-the same unit at the same version and run ITS RESTORE.sh, with the list and
-`--to` of that same unit directory:
+the same unit at the same version WHOLE (a tape that holds only part of a
+unit across tapes is refused: "A unit across tapes") and run ITS
+RESTORE.sh, with the list and `--to` of that same unit directory:
 
     ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT \
         --fill-from /destination/UNIT/.tapectl-damaged-files.txt \
@@ -5958,6 +5959,8 @@ damage_note() { # <count> <list file> <slices not available, or empty>
   echo "  RESTORE.sh (File 2 of that tape), which restores only those files and overwrites only them:"
   echo "    ./RESTORE.sh --restore $(keys_args) --unit $(printf '%q' "$UNIT_NAME") --fill-from $(printf '%q' "$list") --to $(printf '%q' "$to")"
   echo "  A tape that does not hold this unit at this version is refused: no other version is used."
+  echo "  It must hold this version WHOLE: a tape that holds only part of a unit held across tapes is"
+  echo "  refused too (--list --unit on that tape says which it is)."
 }
 
 # Write the list of files dar could not restore into the unit's directory and
@@ -7419,7 +7422,8 @@ case "${1:-}" in
   echo "      lists another is refused; no other version is ever used. dar checks each file, and so"
   echo "      does the sha256 check below. The list is rewritten with what is still damaged and"
   echo "      removed when nothing is. Give --to the same directory as the restore (the list is in"
-  echo "      it, or in --to/UNIT)."
+  echo "      it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part"
+  echo "      of a unit held across tapes is refused."
   echo "  --no-file-check   (--restore, with --fill-from too) dar checks each file it restores with a"
   echo "      short checksum, so a damaged file can come back with no error. A tape written since"
   echo "      version 1.3.0 records the sha256 of every regular file in its index, and after each"
@@ -9228,6 +9232,29 @@ mod tests {
         assert!(script.contains(
             "sealed_other() {\n  [ -z \"$OTHER_END\" ] || return 0\n  info \"Its seal marker cannot be read, so nothing is taken from it:"
         ));
+    }
+
+    /// The fresh read, m8: a fill takes files only from a tape that holds the
+    /// version whole (ADR-0012 item 143; a range is never a fill source), and
+    /// File 1, the script's note after a damaged restore and the help now say
+    /// so where they send the heir to another tape.
+    #[test]
+    fn fresh_read_478_m8_a_fill_needs_a_tape_that_holds_the_version_whole() {
+        let g = generate_system_guide_v2_for_media("FR09", 20, "LTO-6");
+        let f = flat_text(guide_section(&g, "If a slice or a file is damaged"));
+        assert!(
+            f.contains("Load a tape that holds the same unit at the same version WHOLE (a tape that holds only part of a unit across tapes is refused: \"A unit across tapes\") and run ITS RESTORE.sh, with the list and `--to` of that same unit directory:"),
+            "{f}"
+        );
+        let script = generate_restore_script_v2("FR09", 20);
+        for said in [
+            "  echo \"  A tape that does not hold this unit at this version is refused: no other version is used.\"\n  echo \"  It must hold this version WHOLE: a tape that holds only part of a unit held across tapes is\"\n  echo \"  refused too (--list --unit on that tape says which it is).\"\n",
+            "  echo \"      it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part\"\n  echo \"      of a unit held across tapes is refused.\"\n",
+            // What it describes (do_fill).
+            "A fill takes files only from a tape that holds the version whole, and a range is never",
+        ] {
+            assert_eq!(script.matches(said).count(), 1, "{said:?}");
+        }
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
