@@ -555,42 +555,6 @@ fn placement_lines(at: &collection::plan::BatchPlacement) -> Vec<String> {
 const SPAN_COUNT_CAVEAT: &str = "the count is a minimum: a unit that spans continues on the next \
                                  cartridge, ahead of the units planned there";
 
-/// The lines naming what the per-slice release did (#478; ADR-0012 item
-/// 129): each set's slices released, and each set's slices kept because they
-/// are short of copies. The words of `staging clean`'s
-/// (`cli::staging::slice_release_notice`, private to that module), kept
-/// identical. Empty when it did nothing.
-fn slice_release_notice(report: &crate::staging::clean::CleanReport) -> String {
-    let describe = crate::staging::clean::describe_slice_numbers;
-    let mut msg = String::new();
-    for (id, slices) in &report.slices_released {
-        msg.push_str(&format!(
-            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
-             cartridges and is released slice by slice)\n",
-            describe(slices)
-        ));
-    }
-    for (id, slices) in &report.slices_short {
-        msg.push_str(&format!(
-            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
-             span; `tapectl volume write <LABEL>` onto another cartridge of the same \
-             generation writes them (--force would leave the ranges already on tape unable \
-             to be continued)\n",
-            describe(slices)
-        ));
-    }
-    msg
-}
-
-/// `[{"stage_set_id": N, "slices": [..]}, ..]`, as `staging clean --json`
-/// gives its per-slice lists (#478).
-fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
-    runs.iter()
-        .map(|(id, slices)| serde_json::json!({ "stage_set_id": id, "slices": slices }))
-        .collect::<Vec<_>>()
-        .into()
-}
-
 /// Every file the run's release could not remove (issue #108): the
 /// whole-set release's and the per-slice release's. Their `staging_path`
 /// rows are already nulled, so no later `staging clean` can find them.
@@ -967,8 +931,8 @@ fn cmd_run(
                 // #478 (ADR-0012 item 129): slices released on their own from
                 // sets that span cartridges, and those still short of copies.
                 // Always present, as `staging clean --json` gives them.
-                "slices_released": slice_runs_json(&report.slices.slices_released),
-                "slices_short": slice_runs_json(&report.slices.slices_short),
+                "slices_released": crate::cli::staging::slice_runs_json(&report.slices.slices_released),
+                "slices_short": crate::cli::staging::slice_runs_json(&report.slices.slices_short),
                 // Issue #108: the paths, not a count; nothing will find them
                 // again.
                 "stranded": stranded,
@@ -1019,7 +983,10 @@ fn cmd_run(
         }
         // #478 (ADR-0012 item 129): a set that spans cartridges is released
         // slice by slice, whatever the whole-set release decided.
-        print!("{}", slice_release_notice(&report.slices));
+        print!(
+            "{}",
+            crate::cli::staging::slice_release_notice(&report.slices)
+        );
     }
     Ok(exit_code)
 }
@@ -1578,16 +1545,16 @@ mod checksum_mode_tests {
             ..Default::default()
         };
         assert_eq!(
-            slice_release_notice(&report),
+            crate::cli::staging::slice_release_notice(&report),
             "  stage set 7: slice(s) 1-3 released, each now has its copies (the set spans \
              cartridges and is released slice by slice)\n  stage set 7 kept in part: slice(s) \
              4-5 are short of copies and continue its span; `tapectl volume write <LABEL>` \
              onto another cartridge of the same generation writes them (--force would leave \
              the ranges already on tape unable to be continued)\n"
         );
-        assert!(slice_release_notice(&Default::default()).is_empty());
+        assert!(crate::cli::staging::slice_release_notice(&Default::default()).is_empty());
         assert_eq!(
-            slice_runs_json(&report.slices_released),
+            crate::cli::staging::slice_runs_json(&report.slices_released),
             serde_json::json!([{ "stage_set_id": 7, "slices": [1, 2, 3] }])
         );
     }

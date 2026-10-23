@@ -209,7 +209,7 @@ fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
 
 /// `[{"stage_set_id": N, "slices": [..]}, ..]` for a report's per-slice
 /// lists (#478).
-fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
+pub(crate) fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
     runs.iter()
         .map(|(id, slices)| serde_json::json!({ "stage_set_id": id, "slices": slices }))
         .collect::<Vec<_>>()
@@ -219,7 +219,7 @@ fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
 /// The lines naming what the per-slice release did (#478; ADR-0012 item
 /// 129): each set's slices released, and each set's slices kept because they
 /// are short of copies, with what writes them. Empty when it did nothing.
-fn slice_release_notice(report: &clean::CleanReport) -> String {
+pub(crate) fn slice_release_notice(report: &clean::CleanReport) -> String {
     let mut msg = String::new();
     for (id, slices) in &report.slices_released {
         msg.push_str(&format!(
