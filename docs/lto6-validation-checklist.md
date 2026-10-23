@@ -269,6 +269,141 @@ The run directory (`/scratch/tapectl-short-seal/ssa-<UTC>-<serial>/`, or under
 step, it also keeps the drive's `/sys/class/scsi_tape/nstN/options` and `stats/`, MAM, and log
 pages 0x02 0x03 0x0c 0x17 from before and after (one LOG SENSE each; never 0x2E).
 
+## Spanning on the real drive (1.7.0 acceptance)
+
+ADR-0012 item 137, as item 139 amends it (#478). Spanning stays off on home2 until this passes
+(`docs/handoff.md` (h)). It uses the one test cartridge, EW7VWMVKF6, as two volumes in turn:
+- **Tape 1** holds a unit that allows spanning, ended by the drive's real early warning. Its row
+  is `range`, and what was written past the warning reads back (item 114).
+- **RESTORE.sh's default mode** spools tape 1's range into scratch and is held at its prompt.
+- **A rebuild of tape 1** records the range and names the slices it lacks.
+- **Tape 2:** the same cartridge is written again as a whole copy, and the held restore finishes
+  from scratch plus tape 2.
+
+`--stream-tapes` and tapectl's continuation row (a range K1+1..N) need two cartridges and are
+proven on mhvtl only (item 136; the gate's `span_*` checks).
+`scripts/span-acceptance.sh` runs it in a throwaway home. `--print-plan` prints the operator's
+part and the drive time without touching anything.
+
+**How tape 1 is filled.** As in 1.6.0's run (item 115), with two units:
+- **The filler** (`spn-filler`) is staged from a little more than one slice and given slice rows
+  that all name its one staged file (`examples/short_seal_filler.rs`, `fill`). Here it is a whole
+  unit that ends at the fill ceiling (97% of 2.5 TB, 2.425 TB).
+- **The unit that may span** (`spn-span`, `allow_spanning = true` in its dotfile) comes after
+  it. With such a unit queued, whole units stop at the ceiling, and that unit is planned last, past
+  the plan bound to its end (items 83 and 123).
+
+The drive's warning came near 2.502 TB on this cartridge (2026-10-21), so about 77 GB of a 100 GB
+unit lands on tape 1. The cartridge keeps the generation table's 2.5 TB, as production does: unlike
+1.6.0's run, nothing is registered at another capacity. `volume plan` must show the filler `committed`
+and the unit the `tail` before any tape moves.
+
+**The unit's source is copied.** `--span-source DIR` is the operator's real data, about 100 GB:
+- the script refuses one too small to reach 8 GiB past the warning (about 93 GB);
+- it copies the directory into `--work` and never writes the original. `unit init` writes a
+  dotfile into the directory it registers;
+- any `.tapectl-unit.toml` in the copy is removed (it belongs to another home);
+- `defaults.global_excludes` is emptied, so every file is archived;
+- the restore is compared with a sha256 manifest of the copy, taken once it was staged.
+
+**Tape 2** (item 139). Tape 1 cannot be given up the 1.6.0 way:
+- `volume retire` meets item 128's floor, because tape 1 is the only holder of slices 1..K1 of a
+  version that is not yet current;
+- `cartridge erase` refuses a volume the catalog still holds.
+
+Step 4a shows both refusals and releases the filler from staging (tape 1 still gives it its copy).
+It then writes one filemark at the start of the tape by hand (`mt weof 1`, the same short erase
+`cartridge erase` does), so File 0 reads EMPTY, and runs `volume init SPN-0002 --force`. The chip
+serial matches the cartridge's row, so binding marks `SPN-0001` `erased`. The unit then owes every
+slice, and tape 2 holds it whole, written from the staging tape 1 kept (`--keep-staging`).
+
+**The held restore.** RESTORE.sh's input is a FIFO the script holds open and answers in step 5.
+It waits through steps 3 and 4 (an hour or so on home2) with no timeout and no tape device open;
+the script checks its descriptors at the prompt and again before it answers. Its scratch keeps
+only ciphertext.
+
+**Before the run.**
+- [ ] The whole chain is green on the 1.7.0 candidate, including the mhvtl rehearsal:
+      `scripts/span-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst` (an LTO-6
+      emulation). It runs the same steps with a generated 48 MiB unit, 1 MiB slices, the drive's
+      `capacity_override` at 200 MB and the store's test hook `TAPECTL_TEST_EARLY_WARNING_AT`
+      inside the unit, for tape 1's write only.
+- [ ] The candidate binary and its `short_seal_filler` example are built the same way and copied
+      to home2. A debug build stages the 100 GB unit at about 3.9 MiB/s (1.6.0's run), about 7
+      hours; a release build is faster.
+- [ ] `--work` on a disk with about 4 x the unit free (the copy, its staging, the restore's
+      scratch and the restored tree): on home2 a new directory on acache. `~/.cache` (/srv/home)
+      has about 80 GB and is refused.
+- [ ] The dar on `PATH` is 2.7.9 or later (home2's `/usr/local/bin/dar` is 2.7.21); RESTORE.sh
+      restores a unit across tapes only with it.
+- [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
+      drive; the host is quiet while the tape moves (`docs/operator-guide.md`, "A quiet host while
+      the tape runs"). Start it inside tmux.
+
+```bash
+TAPECTL_HOME="$HOME/.cache/tapectl/spn-home-$(date +%Y%m%d)" \
+TAPECTL_BIN=/path/to/tapectl-1.7.0 FIXTURE_BIN=/path/to/short_seal_filler \
+  scripts/span-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
+    --i-will-lose-the-cartridge EW7VWMVKF6 \
+    --span-source /path/to/about-100-GB --work /srv/acache/spn-work-$(date +%Y%m%d)
+```
+
+It refuses (exit 2, nothing touched) when any of these fails:
+- `TAPECTL_HOME` is unset, not empty, or one of production's homes (as for 1.6.0's run).
+- The drive is not HUJ808A5L4, or the chip serial is not EW7VWMVKF6.
+- The binary is older than 1.7.0.
+- `TAPECTL_TEST_EARLY_WARNING_AT` is set.
+- The drive-poll timer is active, or the tape lock is held.
+- `--span-source` is missing, unreadable, or too small.
+- `--work` is not empty, is inside production's home or staging, or lacks the room.
+- The dar on `PATH` is older than 2.7.9.
+
+**The steps, what each must show, and its time on home2** (the write at ~152 MiB/s and the reads
+at ~108 MiB/s, as 1.6.0's run measured them):
+
+| step | must show | time |
+|---|---|---|
+| 1a setup | no tape. The home and config (`post_warning_bytes = "99008M"`, `min_copies = 1`, no global excludes), the copy, both units staged, the manifest, the filler's rows; `volume plan` shows the filler `committed` and `spn-span` the `tail` | the copy and manifest ~30 min; staging (see above) |
+| 1b init | whatever the cartridge held erased by this home's `cartridge erase`; `SPN-0001` initialised, the medium's capacity 2.5 TB | ~5 min |
+| 1c write | exit 0, `"ending": "short"`, `ended_after` K; `range_units` names `spn-span` slices 1 to K1, nothing cut or deferred, the staging kept; rows `completed` (the filler) and `range` (`may_span` set); `spn-span`'s written positions consecutive, ending at K; the version `staged`; the confirm phase's bytes cover the slice at file K and the seal (item 114); File 0 and the short seal at K+1 state `requires = ["short-seal", "spanning"]` | ~4.5 h |
+| 2 spool | RESTORE.sh off tape 1, `--restore --unit spn-span --scratch`: one prompt for slice K1+1; slices 1 to K1 in its scratch directory, each age ciphertext of its recorded size; alive, with its input on the FIFO and no tape device open | ~15 min |
+| 3 rebuild | `catalog rebuild --from-volume` into a second home: `range_units` 1 to K1 of N; `spans_in_progress` names slices K1+1 to N missing, with no holder (a tape never names a later one); `spn-span` `staged`; `short_seal_filler compare` agrees | ~5 min |
+| 4a re-init | `volume retire SPN-0001` refused ("Finish the span first"); `cartridge erase --dry-run` refused, naming `volume retire`; the filler released; one filemark at BOT; `volume init SPN-0002 --force` warns that `SPN-0001` is now marked erased, and it is | ~5 min |
+| 4b write | `SPN-0002` seals full: `spn-span` `completed` with slices 1 to N, the version `current`; File 0 still states both features | ~15 min |
+| 5 answer | ENTER on the FIFO: RESTORE.sh takes `SPN-0002` ("It gives slice(s) K1+1 to N", by the hashes its seal covers), "RESTORE COMPLETE", exit 0, its scratch removed; the restored tree equals the source's manifest | ~1 h |
+| 6 close | `RESULT.txt` and the cleanup commands; nothing is erased | — |
+
+About 5.5 hours of drive time; staging is most of the rest.
+
+- [ ] Record: K and K1, N, the `write_early_warning` event's `bytes_at` and `refusals` beside
+      1.6.0's 2,502,136,692,736, the `write_feed_ratio` event, how long the restore was held, and
+      each step's duration (`steps.tsv`).
+- [ ] Record the readback past the warning (item 114): step 1c's log line "item 114: the confirm
+      read back N bytes".
+- [ ] A FAIL stops the run and leaves the cartridge as that step left it: no later step writes it,
+      and the exit trap only ends the held RESTORE.sh run. Read the failure first (`RESULT.txt`, the
+      step's `.err` and `.out` files, `held.out`, `drive-at-fail/`), and keep the cartridge
+      unwritten until it is understood. Then:
+  - On a FAIL in 1c or 2, `catalog-at-fail.db` and tape 1 are the evidence.
+  - On a FAIL in 2 to 5 the held run is ended, and its scratch directory under `<work>/scratch`
+    stays, holding encrypted slices only. Remove it once it is read.
+  - A FAIL in 4a after the filemark leaves the cartridge with File 0 EMPTY: tape 1's data is
+    gone, and the run cannot be resumed. Start again from 1a in a fresh home.
+- [ ] Afterwards the cartridge holds `SPN-0002` (`spn-span` whole), owned by the throwaway home.
+      Return it to the test pool from that home, with the same binary:
+
+```bash
+tapectl --home "$TAPECTL_HOME" snapshot mark-reclaimable spn-span --version 1 --force
+tapectl --home "$TAPECTL_HOME" volume retire SPN-0002
+tapectl --home "$TAPECTL_HOME" cartridge erase --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --confirm-label SPN-0002
+```
+
+  Then remove `--work` (the copy and the restored tree), and start the drive-poll timer.
+
+The run directory (`/scratch/tapectl-span/spn-<UTC>-<serial>/`, or under `~/.cache/tapectl/span`
+where there is no `/scratch`) keeps every command's output, the catalog after each tape, both
+manifests, and the drive's state before and after every step, as for 1.6.0's run.
+
 ## After a pass
 
 - [ ] Add the run to `docs/runs/` with the numbers above re-measured.
