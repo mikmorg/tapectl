@@ -25087,11 +25087,9 @@ mod tests {
                 /// `unit`'s id.
                 fn unit_id(f: &Fixture, unit: &str) -> i64 {
                     f.conn
-                        .query_row(
-                            "SELECT id FROM units WHERE name = ?1",
-                            params![unit],
-                            |r| r.get(0),
-                        )
+                        .query_row("SELECT id FROM units WHERE name = ?1", params![unit], |r| {
+                            r.get(0)
+                        })
                         .unwrap()
                 }
 
