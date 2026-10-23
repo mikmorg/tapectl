@@ -1373,3 +1373,130 @@ fn items_130_and_144_item_94s_tapes_rebuilt_give_the_writing_catalogs_rows() {
     assert_eq!(volume_rows(&fresh), volume_rows(&h.conn));
     assert_eq!(unit_copies(&fresh, S94), 1);
 }
+
+// ── the tapes' own bytes ──
+
+/// The `requires` line of the tape's seal, its last file.
+fn seal_requires_line(files: &[Vec<u8>]) -> String {
+    let seal = crate::volume::format::without_nul_padding(files.last().unwrap());
+    String::from_utf8_lossy(seal)
+        .lines()
+        .find(|l| l.starts_with("requires = "))
+        .expect("the seal states requires")
+        .to_string()
+}
+
+/// The members of the tape's operator envelope, `(name, bytes)` in tar
+/// order, opened with the operator's key from the recorded bytes.
+fn operator_envelope(h: &Home, label: &str) -> Vec<(String, Vec<u8>)> {
+    let files = h.files(label);
+    let entry = front_index(files)
+        .into_iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .expect("an operator envelope");
+    let size = entry.size_bytes.expect("sized") as usize;
+    let ciphertext = &files[entry.position as usize][..size];
+    let identities = h.operator_identities();
+    let decryptor = age::Decryptor::new(ciphertext).unwrap();
+    let mut reader = decryptor
+        .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
+        .unwrap();
+    let mut tar_bytes = Vec::new();
+    reader.read_to_end(&mut tar_bytes).unwrap();
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    archive
+        .entries()
+        .unwrap()
+        .map(|m| {
+            let mut m = m.unwrap();
+            let name = m.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            m.read_to_end(&mut bytes).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+fn member(members: &[(String, Vec<u8>)], name: &str) -> String {
+    let (_, bytes) = members
+        .iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("no {name} in the envelope"));
+    String::from_utf8(bytes.clone()).unwrap()
+}
+
+/// The `[[units]]` block of `unit` in a MANIFEST.toml, as text: from its
+/// header to the next unit's.
+fn manifest_block(manifest: &str, unit: &str) -> String {
+    manifest
+        .split("[[units]]\n")
+        .find(|b| b.starts_with(&format!("name = \"{unit}\"\n")))
+        .unwrap_or_else(|| panic!("no block of {unit}: {manifest}"))
+        .to_string()
+}
+
+/// Item 125 from the real write: on every tape whose plan holds a slice of
+/// a spannable set, the operator envelope's block of it states `may_span =
+/// true` and lists every slice of the set, giving `tape_position` only to
+/// the slices this tape's plan holds; whole units' blocks have no
+/// `may_span` and a position for every slice; and RECOVERY.md has its
+/// section on a unit across tapes.
+#[test]
+fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
+    let h = written_93();
+    for (label, planned) in [
+        (T93[0], vec![1, 2, 3]),
+        (T93[1], vec![1, 2, 3]),
+        (T93[2], vec![3]),
+    ] {
+        let members = operator_envelope(&h, label);
+        let text = member(&members, "MANIFEST.toml");
+        let manifest = crate::volume::envelope::parse_manifest(&text).unwrap();
+        let b = manifest
+            .units
+            .iter()
+            .find(|u| u.name == B93)
+            .unwrap_or_else(|| panic!("{label} lists {B93}"));
+        assert!(b.may_span, "{label}");
+        assert_eq!(
+            b.slices.iter().map(|s| s.number).collect::<Vec<_>>(),
+            [1, 2, 3],
+            "{label}: every slice of the set"
+        );
+        let positioned: Vec<i64> = b
+            .slices
+            .iter()
+            .filter(|s| s.tape_position.is_some())
+            .map(|s| s.number)
+            .collect();
+        assert_eq!(positioned, planned, "{label}: this tape's plan");
+        for s in &b.slices {
+            if let Some(p) = s.tape_position {
+                assert_eq!(p, position_of(&h.conn, label, B93, s.number), "{label}");
+            }
+        }
+        assert!(
+            manifest_block(&text, B93).contains("may_span = true\n"),
+            "{label}"
+        );
+        for whole in manifest.units.iter().filter(|u| u.name != B93) {
+            assert!(!whole.may_span, "{label}: {}", whole.name);
+            assert!(
+                whole.slices.iter().all(|s| s.tape_position.is_some()),
+                "{label}: {}",
+                whole.name
+            );
+            assert!(!manifest_block(&text, &whole.name).contains("may_span"));
+        }
+        let recovery = member(&members, "RECOVERY.md");
+        assert!(
+            recovery.contains("## A unit across tapes"),
+            "{label}: {recovery}"
+        );
+        assert_eq!(
+            seal_requires_line(h.files(label)),
+            "requires = [\"short-seal\", \"spanning\"]",
+            "{label}"
+        );
+    }
+}
