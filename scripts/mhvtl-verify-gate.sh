@@ -21,8 +21,15 @@
 #      Includes tape_alert_surfaced (issue #340): `report health` shows a
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
+#   Span leg (1.7.0, #478; ADR-0012 item 136): a unit across tapes, in its
+#      own homes and on its own cartridges, swapped with mtx; RESTORE.sh's
+#      prompts and tapectl's (on a pseudo-terminal) answered by
+#      scripts/mhvtl-prompt-driver.py. TAPECTL_GATE_SWAP_WAIT (seconds,
+#      default 300) is how long the drive stays empty at --stream-tapes' swap.
 #
-# The `check` lines below are the list (52 since #420's heir_short_seal, heir_short_info,
+# The `check` lines below are the list (61 since #478's span_rows, span_heir_tapes_1_3,
+# span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
+# span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
 # heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
 # heir_file_check; 46 since #480: heir_where, heir_find and heir_slice_from_copy join the
 # 43 of #444; #400 is not exercisable on mhvtl, see its section). The verdict judges each by NAME against the manifest, never by a total (#471).
@@ -113,10 +120,15 @@ CFG="$HOME_DIR/config.toml"
 TCTL() { "$BIN" --home "$HOME_DIR" --config "$CFG" "$@"; }
 
 # ---------- check harness ----------
+# TAPECTL_GATE_SPAN_ONLY=1 is a switch for iterating on the span leg (#478): only the span_*
+# checks run, after the discovery and the build above; every other check is skipped and not
+# judged, and the verdict says PARTIAL and exits non-zero, never GREEN. Unset, it changes nothing.
+GATE_SPAN_ONLY="${TAPECTL_GATE_SPAN_ONLY:-}"
 declare -A RESULT
 CHECKS=()
 check() { # check <name> <fn>
     local name="$1"; shift
+    if [ -n "$GATE_SPAN_ONLY" ] && [[ "$name" != span_* ]]; then return 0; fi
     CHECKS+=("$name")
     if "$@" >"$RUN/log-$name.txt" 2>&1; then RESULT[$name]=PASS; else RESULT[$name]=FAIL; fi
     echo "  [$name] ${RESULT[$name]}"
@@ -2113,6 +2125,848 @@ check heir_short_verify    step_heir_short_verify
 check heir_short_restore   step_heir_short_restore
 check heir_short_cut_refused step_heir_short_cut_refused
 
+# ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478) ----------
+# ADR-0012 item 136: the mhvtl proof of spanning is this one leg, judged by test name, with the
+# store's early-warning test hook (TAPECTL_TEST_EARLY_WARNING_AT, as heir_short_* uses it) on
+# the write of each tape that must end inside the unit, and on no other. Everything runs in
+# throwaway homes under $SP, tenant alice, on cartridges of the gate's generation picked by tag
+# from the library and erased before each volume init. A cartridge is changed as a person
+# changes it: `mtx` takes the one in the drive back to its slot and loads the next (sp_swap).
+# The prompts of a restore across tapes are answered by scripts/mhvtl-prompt-driver.py: on a
+# pipe for RESTORE.sh, which reads its answer from its input, and on a pseudo-terminal for
+# tapectl, which asks only on a terminal and refuses unattended (coordinator ruling X30; there
+# is no production hook for it).
+#
+#   span_rows              proof 1, home A (copy target 2): two copies over three tapes laid
+#                          out as item 93 says. Tape 1 holds sa-whole and sc-whole, then
+#                          sb-span (40 MiB, allow_spanning) until the warning: a range. Tape 2
+#                          begins with the owed run, the whole set: completed. Tape 3 holds the
+#                          owed run that is left: a range. Every slice is on two volumes.
+#   span_heir_tapes_1_3    proof 2: RESTORE.sh's default mode from tapes 1 and 3: tape 1's range
+#                          kept in scratch, still encrypted, until tape 3 is taken by hash.
+#   span_heir_tape_2       proof 2: from tape 2 alone, which holds sb-span whole: no prompt.
+#   span_heir_stream_swap  proof 3: --stream-tapes from tapes 1 and 3, the drive empty for
+#                          TAPECTL_GATE_SWAP_WAIT seconds (default 300) at the swap. The one dar
+#                          run is the same process when the prompt comes and when it is answered
+#                          (item 132's open fact: dar waits on its pipe across a cartridge change).
+#   span_restore_unit      proof 4: tapectl restore unit from tape 1: refused without a terminal,
+#                          and on one it asks for the whole copy, tape 2 (item 131).
+#   span_retire_floors     proof 5: retiring tape 2 is Tier 2 (one copy left); then tapes 1 and 3
+#                          each hold the last copy of slices and are refused at Tier 3.
+#   span_floor_target_1    proof 6, home F (copy target 1): tape 1 of a span released its slices
+#                          and the version is not current, yet retiring the tape is refused (item 128).
+#   span_rebuild_tape_3    proof 7, home R: catalog rebuild of tape 3 alone records its range and
+#                          names the missing slices and their tapes; tape 1 then completes it.
+#   span_three_tapes       proof 8, home C (copy target 1, small cartridges, post_warning_bytes):
+#                          a unit larger than one tape starts first on tape 1, ahead of a whole
+#                          unit it defers, spans three tapes, and restores across both swaps.
+SP="$RUN/span"
+SP_WAIT="${TAPECTL_GATE_SWAP_WAIT:-300}"
+SP_DRIVER="$(cd "$(dirname "$0")" && pwd)/mhvtl-prompt-driver.py"
+# The hook for a 40 MiB unit of 4 MiB slices (4.5 MiB each on tape) after the eight fixed files
+# (4 MiB) and two small whole units, heir_short_seal's figure: the warning comes in its sixth slice.
+SP_HOOK_AT=31457280
+SP_PROMPT_HEIR="Load the cartridge that holds slice "
+SP_PROMPT_TAPECTL="and press Enter."
+SP_HOOK_RE='TAPECTL_TEST_EARLY_WARNING_AT=[0-9]+ is set'
+SP_PREP=""
+SP_ORIG=""
+SP_FREE=()
+declare -A SP_SLOT=() SP_TAG=()
+export SP_CHG="$CHG_SG" SP_DTE="$DTE" SP_DEV="$TAPE_DEV" SP_SLOTS="$SP/slots.tsv"
+SPA() { "$BIN" --home "$SP/a/home" "$@"; }
+SPF() { "$BIN" --home "$SP/f/home" "$@"; }
+SPC() { "$BIN" --home "$SP/c/home" "$@"; }
+SPR() { "$BIN" --home "$SP/r/home" "$@"; }
+
+# The swap a person makes at a cartridge prompt: the cartridge in the drive back to the slot it
+# came from, a wait with the drive empty, the cartridge in slot $1 into the drive, and a rewind,
+# which returns once the drive is ready. $1 "asked" is the slot of the label the prompt names
+# (tapectl's "load LABEL, and press Enter", in the driver's PROMPT_LINE), from $SP_SLOTS.
+# Exported with its variables: the prompt driver runs it.
+sp_swap() { # sp_swap <slot|asked> [wait seconds]
+    local slot="$1" wait="${2:-0}" from label n
+    if [ "$slot" = asked ]; then
+        label="$(sed -n 's/.*, load \([^ ,]*\), and press Enter\..*/\1/p' <<<"${PROMPT_LINE:-}")"
+        slot="$(awk -F'\t' -v l="$label" '$1 == l { print $2 }' "$SP_SLOTS")"
+        [ -n "$slot" ] || { echo "sp_swap: the prompt names '${label:-nothing}', no cartridge of this leg: ${PROMPT_LINE:-}"; return 1; }
+        echo "sp_swap: the prompt asks for $label, the cartridge in slot $slot"
+    fi
+    from="$(mtx -f "$SP_CHG" status | sed -n "s/.*Data Transfer Element $SP_DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+    if [ "$from" != "$slot" ]; then
+        if [ -n "$from" ]; then
+            mtx -f "$SP_CHG" unload "$from" "$SP_DTE" || { echo "sp_swap: unload to slot $from failed"; return 1; }
+        fi
+        if [ "$wait" -gt 0 ]; then echo "sp_swap: the drive is empty; waiting ${wait}s"; sleep "$wait"; fi
+        mtx -f "$SP_CHG" load "$slot" "$SP_DTE" || { echo "sp_swap: load of slot $slot failed"; return 1; }
+    fi
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+        if mt -f "$SP_DEV" rewind 2>/dev/null; then
+            echo "sp_swap: slot $slot in the drive (slot ${from:-none} out)"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "sp_swap: the drive is not ready after slot $slot was loaded"
+    return 1
+}
+# The slice files in a restore's scratch directory inside <dest>, when a prompt comes: each
+# name and its first 21 bytes ("age-encryption.org/v1" for an age file). Exported likewise.
+sp_scratch_note() { # sp_scratch_note <dest> <out>
+    local f
+    : >"$2" || return 1
+    for f in "$1"/.tapectl-restore.*/slice.*.enc; do
+        [ -e "$f" ] || continue
+        printf '%s %s\n' "$(basename "$f")" "$(head -c 21 "$f" | tr -c '[:print:]' '?')" >>"$2"
+    done
+    echo "sp_scratch_note: $(wc -l <"$2") slice file(s) in a scratch directory under $1"
+}
+export -f sp_swap sp_scratch_note
+
+# Rows of an SQL query on a catalog, read-only, tab-separated.
+sp_q() { # sp_q <db> <sql> [param...]
+    python3 - "$@" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+for row in c.execute(sys.argv[2], sys.argv[3:]):
+    print("\t".join("" if v is None else str(v) for v in row))
+PY
+}
+# "first last count" of a unit's slices written on a volume, and a unit's slice count.
+sp_run_of() { # sp_run_of <db> <label> <unit>
+    sp_q "$1" "SELECT MIN(sl.slice_number), MAX(sl.slice_number), COUNT(*) FROM write_positions wp
+        JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE v.label = ? AND u.name = ? AND wp.status = 'written'" "$2" "$3" | tr '\t' ' '
+}
+sp_slices() { # sp_slices <db> <unit>
+    sp_q "$1" "SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = ?" "$2"
+}
+
+# The cartridges this leg may use: every storage slot holding a data cartridge of the gate's
+# generation (the one in the drive is the gate's own, put back when the leg ends).
+sp_prepare() {
+    local status line slot
+    rm -rf "$SP" && mkdir -p "$SP" && : >"$SP_SLOTS" || { SP_PREP="cannot create $SP"; return 1; }
+    case "$SP_WAIT" in
+        '' | *[!0-9]*) SP_PREP="TAPECTL_GATE_SWAP_WAIT='$SP_WAIT' is not a whole number of seconds"; return 1 ;;
+    esac
+    [ -f "$SP_DRIVER" ] || { SP_PREP="the prompt driver $SP_DRIVER is missing"; return 1; }
+    status="$(mtx -f "$CHG_SG" status)" || { SP_PREP="mtx status on $CHG_SG failed"; return 1; }
+    SP_ORIG="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p" <<<"$status")"
+    while IFS= read -r line; do
+        slot="$(sed -n 's/.*Storage Element \([0-9]*\):Full.*/\1/p' <<<"$line")"
+        [ -n "$slot" ] || continue
+        SP_FREE+=("$slot")
+        SP_TAG[$slot]="$(sed -n 's/.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p' <<<"$line")"
+    done < <(grep -E "Storage Element [0-9]+:Full" <<<"$status" | grep "VolumeTag=[EF][0-9]*$GEN")
+    [ "${#SP_FREE[@]}" -ge 7 ] || { SP_PREP="the library has ${#SP_FREE[@]} free $GEN data cartridges; the leg needs 7"; return 1; }
+}
+sp_ready() {
+    [ -z "$SP_PREP" ] || { echo "the span leg could not be prepared: $SP_PREP"; return 1; }
+}
+# The next free cartridge becomes <label>'s, recorded in $SP_SLOTS for sp_swap's "asked".
+sp_assign() { # sp_assign <label>
+    [ "${#SP_FREE[@]}" -gt 0 ] || { echo "no free cartridge left for $1"; return 1; }
+    SP_SLOT[$1]="${SP_FREE[0]}"
+    SP_FREE=("${SP_FREE[@]:1}")
+    printf '%s\t%s\n' "$1" "${SP_SLOT[$1]}" >>"$SP_SLOTS"
+    echo "$1: the cartridge in slot ${SP_SLOT[$1]} (${SP_TAG[${SP_SLOT[$1]}]:-no tag})"
+}
+sp_load() { # sp_load <label>: <label>'s cartridge in the drive
+    [ -n "${SP_SLOT[$1]:-}" ] || { echo "no cartridge was given to $1"; return 1; }
+    sp_swap "${SP_SLOT[$1]}"
+}
+# A throwaway home: an escrow recipient (ADR-0005; its secret only in escrow.out), the gate's
+# drive, staging, 4 MiB slices, the copy target, and tenant alice.
+sp_home() { # sp_home <ctl> <dir> <operator> <min_copies>
+    local ctl="$1" d="$2" op="$3" copies="$4"
+    mkdir -p "$d/home/staging" "$d/src" || return 1
+    "$ctl" init --operator "$op" --no-escrow \
+        && "$ctl" key generate --escrow >"$d/escrow.out" 2>&1 \
+        && chmod 600 "$d/escrow.out" \
+        && "$ctl" backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && "$ctl" config set staging.directory "$d/home/staging" \
+        && "$ctl" config set defaults.slice_size 4M \
+        && "$ctl" config set defaults.min_copies "$copies" \
+        && "$ctl" tenant add alice \
+        || { echo "home $d: init, escrow, backend add, config set or tenant add failed"; return 1; }
+}
+# unit init each source under <dir>/src for alice, the one that may span with `allow_spanning =
+# true` in its dotfile's [policy] (as an operator sets it), then snapshot and stage each.
+sp_units() { # sp_units <ctl> <dir> <unit that may span> <unit>...
+    local ctl="$1" d="$2" span="$3" u
+    shift 3
+    for u in "$@"; do
+        "$ctl" unit init "$d/src/$u" --tenant alice --name "$u" || { echo "unit init $u failed"; return 1; }
+        if [ "$u" = "$span" ]; then
+            printf '\n[policy]\nallow_spanning = true\n' >>"$d/src/$u/.tapectl-unit.toml" || return 1
+        fi
+    done
+    for u in "$@"; do
+        "$ctl" snapshot create "$u" && "$ctl" stage create "$u" || { echo "snapshot or stage of $u failed"; return 1; }
+    done
+}
+# <label>'s cartridge in the drive, erased, and `volume init --json` into <dir>/<label>.init.json.
+sp_new_volume() { # sp_new_volume <ctl> <dir> <label> [volume init arg...]
+    local ctl="$1" d="$2" label="$3"
+    shift 3
+    sp_load "$label" && mt -f "$TAPE_DEV" erase || { echo "loading and erasing $label's cartridge failed"; return 1; }
+    "$ctl" --json volume init "$label" --device "$TAPE_DEV" "$@" >"$d/$label.init.json" \
+        || { cat "$d/$label.init.json"; echo "volume init $label failed"; return 1; }
+    cat "$d/$label.init.json"
+}
+# volume write --json: the report into <out>.json, the errors (the hook's announcement, the
+# notices) into <out>.err. The hook is set for this one write when [hook bytes] is given.
+sp_write() { # sp_write <ctl> <label> <out> [hook bytes]
+    local ctl="$1" label="$2" out="$3" hook="${4:-}" rc
+    if [ -n "$hook" ]; then
+        TAPECTL_TEST_EARLY_WARNING_AT="$hook" "$ctl" --json --yes volume write "$label" --device "$TAPE_DEV" >"$out.json" 2>"$out.err"
+    else
+        "$ctl" --json --yes volume write "$label" --device "$TAPE_DEV" >"$out.json" 2>"$out.err"
+    fi
+    rc=$?
+    cat "$out.err" "$out.json"
+    [ "$rc" -eq 0 ] || { echo "volume write $label exited $rc (a short seal is a success)"; return 1; }
+}
+# Whether a write's errors announce the test hook: 0 yes, 1 no, 2 unreadable (never "no").
+sp_hook_said() { # sp_hook_said <err file>
+    grep -E "$SP_HOOK_RE" "$1" >/dev/null
+}
+# The hook announced by the hooked writes (the positive control), and by none of the others.
+sp_hook_only_on() { # sp_hook_only_on <hooked err>... -- <unhooked err>...
+    local f rc hooked=1
+    for f in "$@"; do
+        if [ "$f" = -- ]; then hooked=0; continue; fi
+        sp_hook_said "$f"
+        rc=$?
+        if [ "$hooked" = 1 ] && [ "$rc" -ne 0 ]; then
+            echo "$f: the hooked write does not announce TAPECTL_TEST_EARLY_WARNING_AT (grep rc=$rc)"; return 1
+        fi
+        if [ "$hooked" = 0 ] && [ "$rc" -ne 1 ]; then
+            echo "$f: a write run without the hook announces it, or could not be searched (grep rc=$rc)"; return 1
+        fi
+    done
+    echo "the hook was announced by the hooked writes and by no other"
+}
+# File 0's requires line of the tape in the drive (ADR-0012 item 124's normative spelling).
+sp_requires_spanning() { # sp_requires_spanning <label>
+    local line
+    line="$(mt -f "$TAPE_DEV" rewind && dd if="$TAPE_DEV" bs=512k count=1 2>/dev/null | tr -d '\0' | grep -E '^requires = ')"
+    [ "$line" = 'requires = ["short-seal", "spanning"]' ] \
+        || { echo "$1: File 0 says '${line:-no requires line}', want requires = [\"short-seal\", \"spanning\"]"; return 1; }
+}
+# RESTORE.sh (file 2) of the tape in the drive, into <dir>.
+sp_restore_sh() { # sp_restore_sh <dir>
+    mkdir -p "$1" && mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$1/RESTORE.sh" \
+        && chmod +x "$1/RESTORE.sh" && bash -n "$1/RESTORE.sh" \
+        || { echo "cannot read RESTORE.sh off the tape into $1"; return 1; }
+}
+# The prompt driver; COMMAND's output (and the driver's own lines) into <out>.
+sp_drive() { # sp_drive <out> <events> <prompt> <stop> [driver option...] -- COMMAND [arg...]
+    local out="$1" ev="$2" prompt="$3" stop="$4"
+    shift 4
+    python3 "$SP_DRIVER" --prompt "$prompt" --stop "$stop" --events "$ev" --timeout $((SP_WAIT + 1800)) "$@" >"$out" 2>&1
+}
+# Every needle in a file, each missing one named.
+sp_has() { # sp_has <file> <needle>...
+    local f="$1" n
+    shift
+    for n in "$@"; do
+        grep -F -- "$n" "$f" >/dev/null || { echo "$f lacks: $n"; return 1; }
+    done
+}
+# A volume's status in home A, and the versions of sb-span a retire of it would leave with no
+# copy, as the dry run's JSON says ("none", or the versions; "error" when it cannot be read).
+sp_a_status() { # sp_a_status <label>
+    sp_q "$SP/a/home/tapectl.db" "SELECT status FROM volumes WHERE label = ?" "$1"
+}
+sp_a_last_copy() { # sp_a_last_copy <label>
+    SPA --json --dry-run volume retire "$1" >"$SP/a/retire/$1.dry.json" 2>&1 || { echo error; return 0; }
+    python3 - "$SP/a/retire/$1.dry.json" <<'PY' || echo error
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(" ".join(str(v) for u in d["affected_units"] if u["unit"] == "sb-span" for v in u["last_copy_versions"]) or "none")
+PY
+}
+
+echo "gate: span_* — a unit across tapes, written and read on mhvtl (#478)"
+if sp_prepare; then
+    echo "gate: span leg: the drive's cartridge came from slot ${SP_ORIG:-none}; free $GEN cartridges in slots ${SP_FREE[*]}"
+else
+    echo "gate: span leg NOT prepared: $SP_PREP"
+fi
+
+step_span_rows() {
+    local db="$SP/a/home/tapectl.db" n k1 run t u
+    sp_ready || return 1
+    sp_home SPA "$SP/a" gate-span-a 2 || return 1
+    mkdir -p "$SP/a/src/sa-whole" "$SP/a/src/sb-span/deep" "$SP/a/src/sc-whole"
+    echo "whole, before the span by name $CANARY" >"$SP/a/src/sa-whole/a.txt"
+    head -c 700000 /dev/urandom >"$SP/a/src/sa-whole/a.bin"
+    head -c 41943040 /dev/urandom >"$SP/a/src/sb-span/deep/forty-megs.bin"
+    echo "a unit that may span" >"$SP/a/src/sb-span/note.txt"
+    echo "whole, after the span by name" >"$SP/a/src/sc-whole/c.txt"
+    sp_units SPA "$SP/a" sb-span sa-whole sb-span sc-whole || return 1
+    for t in SPA-0001 SPA-0002 SPA-0003; do sp_assign "$t" || return 1; done
+
+    # Tape 1: the hook ends sb-span in a slice before its last: a range.
+    sp_new_volume SPA "$SP/a" SPA-0001 && sp_write SPA SPA-0001 "$SP/a/w1" "$SP_HOOK_AT" \
+        && sp_requires_spanning SPA-0001 || return 1
+    python3 - "$db" "$SP/a/w1.json" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+def q(sql, *a): return c.execute(sql, a).fetchall()
+rows = dict(q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
+    JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0001'"""))
+assert rows == {"sa-whole": "completed", "sb-span": "range", "sc-whole": "completed"}, f"tape 1's rows: {rows}"
+k = q("SELECT ended_after FROM volumes WHERE label = 'SPA-0001'")[0][0]
+assert k is not None, "tape 1 sealed full: the hook did not end it"
+def pos(unit, written_only=False):
+    return [p for (p,) in q(f"""SELECT CAST(wp.position AS INTEGER) FROM write_positions wp
+        JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = w.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE v.label = 'SPA-0001' AND u.name = ? {"AND wp.status = 'written'" if written_only else ""}
+        ORDER BY sl.slice_number""", unit)]
+b = pos("sb-span")
+assert b and b[0] <= k < b[-1], f"K = {k} is not inside sb-span's slices {b} (the hook's figure no longer lands there)"
+assert pos("sa-whole")[-1] < pos("sc-whole")[0] < b[0], "whole units first, the unit that may span last (item 83)"
+spans = dict(q("""SELECT u.name, w.may_span FROM writes w JOIN volumes v ON v.id = w.volume_id
+    JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0001'"""))
+assert spans == {"sa-whole": 0, "sb-span": 1, "sc-whole": 0}, f"writes.may_span (item 121): {spans}"
+k1 = len(pos("sb-span", True))
+assert j["ending"] == "short" and j["ended_after"] == k and j["cut_units"] == [], j
+assert j["range_units"] == [{"unit": "sb-span", "version": 1, "first_slice": 1, "last_slice": k1}], j["range_units"]
+assert j["keep_together"] == [] and j["deferred_units"] == [], j
+st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'")[0][0]
+assert st == "staged", f"sb-span is {st} after tape 1: a range alone is not a copy (item 128)"
+rel = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = 'sb-span' AND sl.released_at IS NOT NULL""")[0][0]
+assert rel == 0, f"{rel} slice(s) of sb-span released at one copy of a target of 2"
+print(f"tape 1: ended_after {k}; sb-span a range of slices 1-{k1} at {b[:k1]}, whole units first; staged")
+PY
+
+    # Tape 2: no hook. The owed run, all of sb-span, goes first: completed, and current.
+    sp_new_volume SPA "$SP/a" SPA-0002 && sp_write SPA SPA-0002 "$SP/a/w2" \
+        && sp_requires_spanning SPA-0002 || return 1
+    python3 - "$db" "$SP/a/w2.json" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+def q(sql, *a): return c.execute(sql, a).fetchall()
+rows = dict(q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
+    JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0002'"""))
+assert rows == {"sa-whole": "completed", "sb-span": "completed", "sc-whole": "completed"}, f"tape 2's rows: {rows}"
+assert q("SELECT ended_after FROM volumes WHERE label = 'SPA-0002'")[0][0] is None, "tape 2 sealed short"
+first = dict(q("""SELECT u.name, MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
+    JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+    JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0002' GROUP BY u.name"""))
+assert first["sb-span"] < min(first["sa-whole"], first["sc-whole"]), f"the owed run is not first (item 122): {first}"
+st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'")[0][0]
+assert st == "current", f"sb-span is {st} with every slice on a sealed volume (item 128)"
+k1 = q("""SELECT MAX(sl.slice_number) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+    JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+    WHERE v.label = 'SPA-0001' AND w.status = 'range' AND wp.status = 'written'""")[0][0]
+rel = [n for (n,) in q("""SELECT sl.slice_number FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = 'sb-span' AND sl.released_at IS NOT NULL ORDER BY sl.slice_number""")]
+assert rel == list(range(1, k1 + 1)), f"released {rel}, want slices 1-{k1}, the ones on two volumes (item 129)"
+assert [s["slices"] for s in j["slices_released"]] == [list(range(1, k1 + 1))], j["slices_released"]
+assert j["ending"] == "full" and j["range_units"] == [] and j["keep_together"] == [], j
+print(f"tape 2: every unit completed, sb-span's owed run first at {first['sb-span']}; current; slices 1-{k1} released")
+PY
+
+    # Tape 3: no hook. The owed run that is left: a range, sealed full.
+    sp_new_volume SPA "$SP/a" SPA-0003 && sp_write SPA SPA-0003 "$SP/a/w3" \
+        && sp_requires_spanning SPA-0003 || return 1
+    sp_hook_only_on "$SP/a/w1.err" -- "$SP/a/w2.err" "$SP/a/w3.err" || return 1
+    n="$(sp_slices "$db" sb-span)"
+    run="$(sp_run_of "$db" SPA-0001 sb-span)"; k1="${run#* }"; k1="${k1%% *}"
+    sp_has "$SP/a/w3.err" "volume \"SPA-0003\": keep these together: \"sb-span\" v1 is whole across SPA-0001 (slices 1-$k1) and SPA-0003 (slices $((k1 + 1))-$n)." \
+        || return 1
+    SPA --json report copies --unit sb-span >"$SP/a/copies.json" || { echo "report copies failed"; return 1; }
+    python3 - "$db" "$SP/a/w3.json" "$SP/a/copies.json" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+copies = json.load(open(sys.argv[3]))
+def q(sql, *a): return c.execute(sql, a).fetchall()
+rows = {(l, u): s for l, u, s in q("""SELECT v.label, u.name, w.status FROM writes w
+    JOIN volumes v ON v.id = w.volume_id JOIN stage_sets ss ON ss.id = w.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id""")}
+span = [rows.get((l, "sb-span")) for l in ("SPA-0001", "SPA-0002", "SPA-0003")]
+assert span == ["range", "completed", "range"], f"sb-span's rows on tapes 1-3: {span} (item 93)"
+assert {u for (l, u) in rows if l == "SPA-0003"} == {"sb-span"}, f"tape 3 holds more than the owed run: {rows}"
+assert q("SELECT ended_after FROM volumes WHERE label = 'SPA-0003'")[0][0] is None, "tape 3 sealed short"
+n = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'""")[0][0]
+def run(label):
+    return q("""SELECT MIN(sl.slice_number), MAX(sl.slice_number), COUNT(*) FROM write_positions wp
+        JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE v.label = ? AND u.name = 'sb-span' AND wp.status = 'written'""", label)[0]
+r1, r2, r3 = run("SPA-0001"), run("SPA-0002"), run("SPA-0003")
+k1 = r1[1]
+assert r1 == (1, k1, k1) and r2 == (1, n, n) and r3 == (k1 + 1, n, n - k1), f"runs {r1} {r2} {r3} of {n}"
+per_slice = [m for (_, m) in q("""SELECT sl.slice_number, COUNT(DISTINCT w.volume_id) FROM stage_slices sl
+    JOIN stage_sets ss ON ss.id = sl.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id
+    LEFT JOIN write_positions wp ON wp.stage_slice_id = sl.id AND wp.status = 'written'
+    LEFT JOIN writes w ON w.id = wp.write_id AND w.status IN ('completed', 'range')
+    WHERE u.name = 'sb-span' GROUP BY sl.slice_number ORDER BY sl.slice_number""")]
+assert per_slice == [2] * n, f"volumes per slice: {per_slice}, want every slice on two (item 76)"
+c2 = [r["copies"] for r in copies if r["unit"] == "sb-span"]
+assert c2 == [2], f"report copies says {copies} for sb-span, want 2 (item 127)"
+rel = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+    WHERE u.name = 'sb-span' AND sl.released_at IS NULL""")[0][0]
+assert rel == 0, f"{rel} slice(s) of sb-span still staged at two copies each"
+assert j["ending"] == "full", j
+assert j["range_units"] == [{"unit": "sb-span", "version": 1, "first_slice": k1 + 1, "last_slice": n}], j["range_units"]
+want = [{"unit": "sb-span", "version": 1, "tapes": [
+    {"label": "SPA-0001", "first_slice": 1, "last_slice": k1},
+    {"label": "SPA-0003", "first_slice": k1 + 1, "last_slice": n}]}]
+assert j["keep_together"] == want, f"keep_together {j['keep_together']} (item 134)"
+print(f"rows range, completed, range; {n} slices, each on two volumes; 2 copies; tapes 1 and 3 kept together")
+PY
+}
+check span_rows step_span_rows
+
+# The facts of home A the restores below compare with: K1 (tape 1's last slice) and N.
+sp_a_figures() {
+    local run
+    SP_A_N="$(sp_slices "$SP/a/home/tapectl.db" sb-span)"
+    run="$(sp_run_of "$SP/a/home/tapectl.db" SPA-0001 sb-span)"
+    SP_A_K1="${run#* }"
+    SP_A_K1="${SP_A_K1%% *}"
+    case "$SP_A_N:$SP_A_K1" in
+        *[!0-9:]* | :* | *:) echo "home A has no span to read (N='$SP_A_N', K1='$SP_A_K1'): span_rows did not write it"; return 1 ;;
+    esac
+    echo "sb-span: $SP_A_N slices; tape 1 holds 1-$SP_A_K1, tape 3 holds $((SP_A_K1 + 1))-$SP_A_N"
+}
+
+step_span_heir_tapes_1_3() {
+    local h="$SP/a/heir" dest="$SP/a/heir/from-1-3" key="$SP/a/home/keys/alice-primary.age.key" rc swap
+    sp_ready && sp_a_figures || return 1
+    sp_load SPA-0001 && sp_restore_sh "$h" || return 1
+    swap="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/prompt-scratch.txt" "${SP_SLOT[SPA-0003]}")"
+    (cd "$h" && sp_drive "$h/from-1-3.out" "$h/from-1-3.events" "$SP_PROMPT_HEIR" quit --swap "$swap" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
+    rc=$?
+    cat "$h/from-1-3.out"
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh across tapes 1 and 3 exited $rc, want 0"; return 1; }
+    sp_has "$h/from-1-3.out" "RESTORE COMPLETE" \
+        "'sb-span' (version 1) is held across tapes: this tape holds slices 1 to $SP_A_K1 of $SP_A_N." \
+        "'sb-span' (version 1) needs slice $((SP_A_K1 + 1)) of $SP_A_N next" \
+        "No index this key opened names a tape that holds slice $((SP_A_K1 + 1))" \
+        "This cartridge identifies as: SPA-0003" \
+        "It gives slice(s) $((SP_A_K1 + 1)) to $SP_A_N of 'sb-span'" \
+        "Every slice of 'sb-span' is in the scratch directory" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore from tapes 1 and 3 differs from the source"; return 1; }
+    python3 - "$h/from-1-3.events" "$h/prompt-scratch.txt" "$SP_A_K1" <<'PY' || return 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 1, f"{len(prompts)} prompts, want one cartridge change: {prompts}"
+p = prompts[0]
+assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
+assert p["dar_at_prompt"] == [], f"dar ran before every slice was in scratch: {p}"
+k1 = int(sys.argv[3])
+assert f"holds slice {k1 + 1} into" in p["line"], f"the prompt is {p['line']!r}, want slice {k1 + 1}"
+notes = [l.split(" ", 1) for l in open(sys.argv[2]).read().splitlines()]
+names = sorted((n for n, _ in notes), key=lambda n: int(n.split(".")[1]))
+assert names == [f"slice.{i}.enc" for i in range(1, k1 + 1)], f"scratch at the prompt: {names}, want slices 1-{k1}"
+bad = [n for n, head in notes if head != "age-encryption.org/v1"]
+assert not bad, f"not age ciphertext at rest in scratch: {bad}"
+print(f"one prompt; scratch held slices 1-{k1}, each still age ciphertext; no dar until all were there")
+PY
+    if compgen -G "$dest/.tapectl-restore.*" >/dev/null; then echo "the scratch directory was left in $dest"; return 1; fi
+}
+check span_heir_tapes_1_3 step_span_heir_tapes_1_3
+
+step_span_heir_tape_2() {
+    local h="$SP/a/heir2" dest="$SP/a/heir2/from-2" key="$SP/a/home/keys/alice-primary.age.key" rc needle
+    sp_ready || return 1
+    sp_load SPA-0002 && sp_restore_sh "$h" || return 1
+    (cd "$h" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest" </dev/null >"$h/from-2.out" 2>&1)
+    rc=$?
+    cat "$h/from-2.out"
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh from tape 2 alone exited $rc, want 0"; return 1; }
+    sp_has "$h/from-2.out" "RESTORE COMPLETE" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore from tape 2 differs from the source"; return 1; }
+    # Tape 2 holds sb-span whole: none of a restore across tapes' lines. The positive control is
+    # the restore from tapes 1 and 3, whose output holds each of them.
+    for needle in "$SP_PROMPT_HEIR" "is held across tapes" "needs slice" "scratch directory"; do
+        grep -F -- "$needle" "$SP/a/heir/from-1-3.out" >/dev/null \
+            || { echo "positive control: the restore from tapes 1 and 3 lacks '$needle', so its absence here proves nothing"; return 1; }
+        grep -F -- "$needle" "$h/from-2.out" >/dev/null
+        case $? in
+            0) echo "tape 2 alone printed '$needle': it holds sb-span whole"; return 1 ;;
+            1) ;;
+            *) echo "grep failed on $h/from-2.out"; return 1 ;;
+        esac
+    done
+    echo "tape 2 alone restored sb-span whole: no prompt, no scratch"
+}
+check span_heir_tape_2 step_span_heir_tape_2
+
+step_span_heir_stream_swap() {
+    local h="$SP/a/heir" dest="$SP/a/heir/stream" key="$SP/a/home/keys/alice-primary.age.key" rc swap
+    sp_ready && sp_a_figures || return 1
+    [ -x "$h/RESTORE.sh" ] || { echo "no RESTORE.sh from tape 1: span_heir_tapes_1_3 did not get that far"; return 1; }
+    sp_load SPA-0001 || return 1
+    swap="$(printf 'sp_scratch_note %q %q && sp_swap %q %q' "$dest" "$h/stream-scratch.txt" "${SP_SLOT[SPA-0003]}" "$SP_WAIT")"
+    (cd "$h" && sp_drive "$h/stream.out" "$h/stream.events" "$SP_PROMPT_HEIR" quit --swap "$swap" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest" --stream-tapes)
+    rc=$?
+    cat "$h/stream.out"
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh --stream-tapes across tapes 1 and 3 exited $rc, want 0"; return 1; }
+    sp_has "$h/stream.out" "RESTORE COMPLETE" \
+        "--stream-tapes: one dar run, fed from each tape in turn; no slice is kept on disk." \
+        "sp_swap: the drive is empty; waiting ${SP_WAIT}s" \
+        "This cartridge identifies as: SPA-0003" \
+        "It gives slice(s) $((SP_A_K1 + 1)) to $SP_A_N of 'sb-span'" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the streamed restore differs from the source"; return 1; }
+    # The scratch note found tape 1's slices in the default mode's scratch (the positive control);
+    # here the same note must find none, and no scratch directory may have been made.
+    [ -s "$h/prompt-scratch.txt" ] \
+        || { echo "positive control: the default mode's scratch note is empty, so an empty one here proves nothing"; return 1; }
+    [ -f "$h/stream-scratch.txt" ] && [ ! -s "$h/stream-scratch.txt" ] \
+        || { echo "--stream-tapes kept slices on disk at the prompt:"; cat "$h/stream-scratch.txt"; return 1; }
+    python3 - "$h/stream.events" "$SP_WAIT" <<'PY' || return 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+wait = int(sys.argv[2])
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 1, f"{len(prompts)} prompts, want one cartridge change: {prompts}"
+p = prompts[0]
+assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
+assert len(p["dar_at_prompt"]) == 1, f"want the one dar run waiting when the prompt came: {p}"
+assert p["dar_at_reply"] == p["dar_at_prompt"], (
+    f"dar {p['dar_at_prompt']} at the prompt, {p['dar_at_reply']} when it was answered: "
+    "the dar run did not wait across the swap (item 132)")
+waited = p["t_reply"] - p["t_prompt"]
+assert waited >= wait, f"the swap took {waited:.0f}s, less than the {wait}s wait"
+print(f"dar {p['dar_at_prompt'][0]} waited on its pipe across the swap, {waited:.0f}s with the drive empty for {wait}s of it")
+PY
+}
+check span_heir_stream_swap step_span_heir_stream_swap
+
+step_span_restore_unit() {
+    local w="$SP/a/restore" rc
+    sp_ready && sp_a_figures || return 1
+    mkdir -p "$w"
+    sp_load SPA-0001 || return 1
+    # Without a terminal: refused before a slice is read, naming the cartridges it would read.
+    SPA restore unit --unit sb-span --from SPA-0001 --to "$w/unattended" --device "$TAPE_DEV" </dev/null >"$w/unattended.out" 2>&1
+    rc=$?
+    cat "$w/unattended.out"
+    [ "$rc" -ne 0 ] || { echo "restore unit across cartridges succeeded with no terminal to ask at"; return 1; }
+    sp_has "$w/unattended.out" \
+        "unit \"sb-span\" version 1 is held across cartridges, and this restore reads slices 1 to $SP_A_K1 from \"SPA-0001\"" \
+        "then slices $((SP_A_K1 + 1)) to $SP_A_N from \"SPA-0002\"" \
+        "tapectl swaps no cartridge without a person at the terminal" || return 1
+    if [ -d "$w/unattended" ] && [ -n "$(ls -A "$w/unattended")" ]; then echo "the refused restore left files"; return 1; fi
+    # On a terminal: the same command asks for the next cartridge, the whole copy on tape 2
+    # first (item 131), and sp_swap loads what it names.
+    sp_drive "$w/attended.out" "$w/attended.events" "$SP_PROMPT_TAPECTL" stop --pty --swap "sp_swap asked" -- \
+        "$BIN" --home "$SP/a/home" restore unit --unit sb-span --from SPA-0001 --to "$w/attended" --device "$TAPE_DEV"
+    rc=$?
+    cat "$w/attended.out"
+    [ "$rc" -eq 0 ] || { echo "restore unit on a terminal exited $rc, want 0"; return 1; }
+    diff -r "$SP/a/src/sb-span" "$w/attended" || { echo "tapectl's restore across cartridges differs from the source"; return 1; }
+    python3 - "$w/attended.events" "$TAPE_DEV" <<'PY' || return 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 1, f"{len(prompts)} prompts, want one: {prompts}"
+p = prompts[0]
+want = f"Unload the cartridge in {sys.argv[2]} (`tapectl drive eject`), load SPA-0002, and press Enter."
+assert p["line"].startswith(want), f"the prompt is {p['line']!r}, want it to ask for SPA-0002, the whole copy (item 131)"
+assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
+print("on a terminal it asked for SPA-0002 once and restored sb-span across the swap")
+PY
+}
+check span_restore_unit step_span_restore_unit
+
+step_span_retire_floors() {
+    local w="$SP/a/retire" rc t got
+    sp_ready && sp_a_figures || return 1
+    mkdir -p "$w"
+    for t in SPA-0001 SPA-0003; do
+        got="$(sp_a_last_copy "$t")"
+        [ "$got" = none ] || { echo "the dry run of retiring $t says '$got' of sb-span, want none: tape 2 holds it whole"; return 1; }
+    done
+    # Tier 2: tape 2 is one whole copy; without it every slice keeps one copy, below the target of 2.
+    SPA volume retire SPA-0002 </dev/null >"$w/t2-unconsented.out" 2>&1
+    rc=$?
+    cat "$w/t2-unconsented.out"
+    [ "$rc" -ne 0 ] || { echo "retiring tape 2 needed no consent"; return 1; }
+    sp_has "$w/t2-unconsented.out" "refused: non-interactive session with no confirmation given" \
+        "unit \"sb-span\" v1 would be left with 1 copy/copies, below its policy of 2" || return 1
+    [ "$(sp_a_status SPA-0002)" = sealed ] || { echo "the refused retire changed tape 2"; return 1; }
+    SPA --yes volume retire SPA-0002 >"$w/t2.out" 2>&1 || { cat "$w/t2.out"; echo "retiring tape 2 with --yes failed"; return 1; }
+    [ "$(sp_a_status SPA-0002)" = retired ] || { echo "tape 2 is not retired"; return 1; }
+    # Tier 3: tape 3 alone holds slices K1+1..N, tape 1 alone 1..K1 (and the whole units).
+    for t in SPA-0003 SPA-0001; do
+        got="$(sp_a_last_copy "$t")"
+        [ "$got" = 1 ] || { echo "the dry run of retiring $t says '$got' of sb-span, want v1 as a last copy"; return 1; }
+        SPA --yes volume retire "$t" >"$w/$t.out" 2>&1
+        rc=$?
+        cat "$w/$t.out"
+        [ "$rc" -ne 0 ] || { echo "$t was retired holding the last copy of slices of sb-span"; return 1; }
+        sp_has "$w/$t.out" "cannot retire volume \"$t\": \"$t\" holds the LAST eligible copy" "sb-span" \
+            "There is no --force for this, and --yes does not reach it" || return 1
+        [ "$(sp_a_status "$t")" = sealed ] || { echo "the refused retire changed $t"; return 1; }
+    done
+    # Tape 3 holds no whole unit: its refusal names sb-span alone, while tape 1's (the positive
+    # control) names the whole units it holds too.
+    sp_has "$w/SPA-0001.out" "sa-whole" "sc-whole" || return 1
+    if grep -E 'sa-whole|sc-whole' "$w/SPA-0003.out" >/dev/null; then echo "tape 3's refusal names a whole unit it does not hold"; return 1; fi
+    echo "tape 2 retired at Tier 2 with --yes; tapes 1 and 3 refused at Tier 3, each for slices only it holds"
+}
+check span_retire_floors step_span_retire_floors
+
+step_span_floor_target_1() {
+    local db="$SP/f/home/tapectl.db" rc
+    sp_ready || return 1
+    sp_home SPF "$SP/f" gate-span-f 1 || return 1
+    mkdir -p "$SP/f/src/sf-span"
+    head -c 41943040 /dev/urandom >"$SP/f/src/sf-span/forty-megs.bin"
+    sp_units SPF "$SP/f" sf-span sf-span && sp_assign SPF-0001 || return 1
+    sp_new_volume SPF "$SP/f" SPF-0001 && sp_write SPF SPF-0001 "$SP/f/w1" "$SP_HOOK_AT" || return 1
+    sp_hook_only_on "$SP/f/w1.err" -- || return 1
+    # The state item 128 guards: at a copy target of 1 the range's slices were released from
+    # staging, and the version is not current, so the 1.6.0 floor (current versions) sees nothing.
+    python3 - "$db" "$SP/f/w1.json" <<'PY' || return 1
+import json, sqlite3, sys, os
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+def q(sql, *a): return c.execute(sql, a).fetchall()
+assert j["ending"] == "short" and len(j["range_units"]) == 1, j
+k1 = j["range_units"][0]["last_slice"]
+sl = q("""SELECT sl.slice_number, sl.released_at, sl.staging_path FROM stage_slices sl
+    JOIN stage_sets ss ON ss.id = sl.stage_set_id ORDER BY sl.slice_number""")
+released = [n for n, r, _ in sl if r is not None]
+assert released == list(range(1, k1 + 1)), f"released {released}, want 1-{k1} (item 129 at a target of 1)"
+kept = [p for n, r, p in sl if r is None]
+assert kept and all(p and os.path.exists(p) for p in kept), "the slices past the range are not all still staged"
+assert all(p is None for n, r, p in sl if r is not None), "a released slice still names a staging file"
+st = q("SELECT status FROM snapshots")[0][0]
+assert st == "staged", f"sf-span is {st}: a span in progress is not current (item 128)"
+print(f"sf-span: slices 1-{k1} on SPF-0001 only, released from staging; {len(kept)} still staged; the version staged")
+PY
+    SPF --json --dry-run volume retire SPF-0001 >"$SP/f/retire-dry.json" \
+        && python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = [u["last_copy_versions"] for u in d["affected_units"] if u["unit"] == "sf-span"]
+assert v == [[1]], f"the dry run reads {d} -- want sf-span v1 as a last copy"' "$SP/f/retire-dry.json" || return 1
+    SPF --yes volume retire SPF-0001 >"$SP/f/retire.out" 2>&1
+    rc=$?
+    cat "$SP/f/retire.out"
+    [ "$rc" -ne 0 ] || { echo "SPF-0001 was retired holding the only copy of sf-span's slices 1-K"; return 1; }
+    sp_has "$SP/f/retire.out" "cannot retire volume \"SPF-0001\": \"SPF-0001\" holds the LAST eligible copy" \
+        "Finish the span first: unit \"sf-span\" v1 is a version still being written across cartridges" || return 1
+    [ "$(sp_q "$db" "SELECT status FROM volumes WHERE label = 'SPF-0001'")" = sealed ] || { echo "the refused retire changed SPF-0001"; return 1; }
+}
+check span_floor_target_1 step_span_floor_target_1
+
+step_span_rebuild_tape_3() {
+    local db="$SP/r/home/tapectl.db" pub key="$SP/a/home/keys/gate-span-a-primary.age.key"
+    sp_ready && sp_a_figures || return 1
+    pub="$(grep -ohE 'age1[a-z0-9]+' "$SP/a/escrow.out" | head -n 1)"
+    [ -n "$pub" ] && [ -f "$key" ] || { echo "home A's escrow recipient or operator key is missing"; return 1; }
+    mkdir -p "$SP/r/home"
+    # The DR recipe (#139): a new home adopting the original escrow recipient; the rebuild reads
+    # the tape with the original operator key. Only tape 3 is given.
+    SPR init --operator gate-span-a --escrow-public-key "$pub" || { echo "init of the rebuild home failed"; return 1; }
+    [ "$(sp_q "$db" "SELECT COUNT(*) FROM units")" = 0 ] || { echo "the rebuild home is not empty before the rebuild"; return 1; }
+    sp_load SPA-0003 || return 1
+    SPR --json catalog rebuild --from-volume --device "$TAPE_DEV" --key "$key" --label SPA-0003 >"$SP/r/tape3.json" \
+        || { cat "$SP/r/tape3.json"; echo "catalog rebuild of SPA-0003 failed"; return 1; }
+    cat "$SP/r/tape3.json"
+    python3 - "$db" "$SP/r/tape3.json" "$SP_A_K1" "$SP_A_N" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+k1, n = int(sys.argv[3]), int(sys.argv[4])
+def q(sql, *a): return c.execute(sql, a).fetchall()
+assert j["range_units"] == [{"unit": "sb-span", "version": 1, "first_slice": k1 + 1, "last_slice": n, "num_slices": n}], j["range_units"]
+assert j["versions_promoted"] == [], j["versions_promoted"]
+sp = j["spans_in_progress"]
+assert len(sp) == 1 and sp[0]["unit"] == "sb-span" and sp[0]["missing_slices"] == list(range(1, k1 + 1)), sp
+holders = {h["label"]: (h["first_slice"], h["last_slice"]) for h in sp[0]["holders"]}
+assert holders.get("SPA-0001") == (1, k1) and "SPA-0002" in holders, f"tape 3's index names {holders}"
+rows = q("""SELECT v.label, v.status, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id""")
+assert rows == [("SPA-0003", "sealed", "range")], f"the rebuilt rows: {rows} (item 130)"
+slices = q("""SELECT sl.slice_number, wp.status FROM stage_slices sl
+    LEFT JOIN write_positions wp ON wp.stage_slice_id = sl.id ORDER BY sl.slice_number""")
+assert [s for s, _ in slices] == list(range(1, n + 1)), f"slice rows {slices}: the manifest lists all {n}"
+written = [s for s, st in slices if st == "written"]
+assert written == list(range(k1 + 1, n + 1)), f"written {written}, want only tape 3's {k1 + 1}-{n}"
+st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'")[0][0]
+assert st == "staged", f"sb-span is {st} from tape 3 alone, want staged (0 copies until its other tapes)"
+print(f"tape 3 alone: a range {k1 + 1}-{n} of {n} slice rows; slices 1-{k1} named missing, on {sorted(holders)}")
+PY
+    # The control: tape 1 too, and the version is whole on sealed volumes (item 144).
+    sp_load SPA-0001 || return 1
+    SPR --json catalog rebuild --from-volume --device "$TAPE_DEV" --key "$key" --label SPA-0001 >"$SP/r/tape1.json" \
+        || { cat "$SP/r/tape1.json"; echo "catalog rebuild of SPA-0001 failed"; return 1; }
+    python3 - "$db" "$SP/r/tape1.json" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+j = json.load(open(sys.argv[2]))
+assert j["spans_in_progress"] == [] and any("sb-span" in v for v in j["versions_promoted"]), j
+st = c.execute("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'").fetchone()[0]
+assert st == "current", f"sb-span is {st} with tapes 1 and 3 rebuilt (item 144)"
+print(f"with tape 1 rebuilt too: promoted {j['versions_promoted']}, sb-span current")
+PY
+}
+check span_rebuild_tape_3 step_span_rebuild_tape_3
+
+# Home C's figures (MiB on tape: a 4 MiB slice takes nine 512 KiB blocks, 4.5 MiB; files 0-7
+# take one block each, 4 MiB). pb-big, 57 full slices and a short one, is 257 MiB, more than a
+# 94 MiB cartridge (98566144 bytes, its room 90 MiB past the fixed files): item 94. Starting
+# early to touch the fewest tapes leaves 3 x 90 - 257 = 13 MiB before it on tape 1, too little
+# for pa-whole (27.5 MiB), which waits. The hook at 114 MiB, 20 MiB past the cartridge's end as
+# a real drive's warning comes past nominal, ends tapes 1 and 2 after 25 slices each, so tape 3
+# holds the last 8 (32 MiB) and pa-whole after them. Each tape needs post_warning_bytes (item
+# 123); 64M leaves a 4 MiB slice and the seal inside half of it (W8), with a 4 MiB reserve.
+SP_C_CAPACITY=98566144
+SP_C_HOOK_AT=119537664
+step_span_three_tapes() {
+    local db="$SP/c/home/tapectl.db" h="$SP/c/heir" dest="$SP/c/heir/restored" t swap1 swap2 rc
+    local key="$SP/c/home/keys/alice-primary.age.key"
+    sp_ready || return 1
+    sp_home SPC "$SP/c" gate-span-c 1 \
+        && SPC config set 'backends.lto[0].post_warning_bytes' '"64M"' \
+        && SPC config set 'backends.lto[0].enospc_buffer' '"4M"' \
+        && SPC config check || { echo "home C's drive keys were refused"; return 1; }
+    mkdir -p "$SP/c/src/pa-whole" "$SP/c/src/pb-big"
+    head -c 25165824 /dev/urandom >"$SP/c/src/pa-whole/whole.bin"
+    head -c 239075328 /dev/urandom >"$SP/c/src/pb-big/big.bin"
+    sp_units SPC "$SP/c" pb-big pa-whole pb-big || return 1
+    for t in SPC-0001 SPC-0002 SPC-0003; do
+        sp_assign "$t" \
+            && SPC cartridge register --barcode "${SP_TAG[${SP_SLOT[$t]}]}" --generation LTO-8 \
+                --capacity "$SP_C_CAPACITY" --notes "gate span leg micro-tape" \
+            && sp_new_volume SPC "$SP/c" "$t" --cartridge "${SP_TAG[${SP_SLOT[$t]}]}" || return 1
+        python3 -c 'import json, sys; c = json.load(open(sys.argv[1]))["medium"]["capacity_bytes"]; assert c == int(sys.argv[2]), f"{sys.argv[3]} stored capacity {c}"' \
+            "$SP/c/$t.init.json" "$SP_C_CAPACITY" "$t" || return 1
+        case "$t" in
+            SPC-0003) sp_write SPC "$t" "$SP/c/$t" || return 1 ;;
+            *) sp_write SPC "$t" "$SP/c/$t" "$SP_C_HOOK_AT" || return 1 ;;
+        esac
+    done
+    sp_hook_only_on "$SP/c/SPC-0001.err" "$SP/c/SPC-0002.err" -- "$SP/c/SPC-0003.err" || return 1
+    python3 - "$db" "$SP/c" "$SP_C_CAPACITY" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+d, cap = sys.argv[2], int(sys.argv[3])
+J = {t: json.load(open(f"{d}/{t}.json")) for t in ("SPC-0001", "SPC-0002", "SPC-0003")}
+def q(sql, *a): return c.execute(sql, a).fetchall()
+B = 512 * 1024
+sizes = dict(q("""SELECT u.name, SUM((sl.encrypted_bytes + ? - 1) / ? * ?) FROM stage_slices sl
+    JOIN stage_sets ss ON ss.id = sl.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+    JOIN units u ON u.id = s.unit_id GROUP BY u.name""", B, B, B))
+print(f"on tape: pb-big {sizes['pb-big']} bytes, pa-whole {sizes['pa-whole']} bytes; cartridges {cap} bytes")
+assert sizes["pb-big"] > cap, "pb-big is not larger than one tape: this is not item 94's case"
+n = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+    JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'pb-big'""")[0][0]
+def rows(label):
+    return dict(q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
+        JOIN units u ON u.id = s.unit_id WHERE v.label = ?""", label))
+def written(label, unit):
+    return q("""SELECT sl.slice_number, CAST(wp.position AS INTEGER) FROM write_positions wp
+        JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE v.label = ? AND u.name = ? AND wp.status = 'written' ORDER BY sl.slice_number""", label, unit)
+runs, nxt = [], 1
+for t, ending in (("SPC-0001", "short"), ("SPC-0002", "short"), ("SPC-0003", "full")):
+    j = J[t]
+    assert j["ending"] == ending, f"{t} sealed {j['ending']}, want {ending}"
+    w = written(t, "pb-big")
+    lo, hi = w[0][0], w[-1][0]
+    assert [s for s, _ in w] == list(range(lo, hi + 1)) and lo == nxt, f"{t}: pb-big's run {lo}-{hi} does not follow {nxt - 1}"
+    assert j["range_units"] == [{"unit": "pb-big", "version": 1, "first_slice": lo, "last_slice": hi}], (t, j["range_units"])
+    runs.append((t, lo, hi))
+    nxt = hi + 1
+    if t != "SPC-0003":
+        assert rows(t) == {"pb-big": "range"}, f"{t}'s rows: {rows(t)}"
+        assert j["deferred_units"] == ["pa-whole"], f"{t}: pa-whole should wait for the next tape (item 94): {j['deferred_units']}"
+assert nxt == n + 1, f"the runs {runs} do not reach slice {n}"
+first_data = q("""SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
+    JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id WHERE v.label = 'SPC-0001'""")[0][0]
+assert written("SPC-0001", "pb-big")[0][1] == first_data, "pb-big does not start first on tape 1 (item 94)"
+assert rows("SPC-0003") == {"pb-big": "range", "pa-whole": "completed"}, f"tape 3's rows: {rows('SPC-0003')}"
+tail_end = written("SPC-0003", "pb-big")[-1][1]
+whole_at = [p for _, p in written("SPC-0003", "pa-whole")]
+assert whole_at and min(whole_at) > tail_end, f"pa-whole at {whole_at} is not after pb-big's tail (ends {tail_end})"
+want = [{"unit": "pb-big", "version": 1, "tapes": [
+    {"label": t, "first_slice": lo, "last_slice": hi} for t, lo, hi in runs]}]
+assert J["SPC-0003"]["keep_together"] == want, J["SPC-0003"]["keep_together"]
+st = dict(q("SELECT u.name, s.status FROM snapshots s JOIN units u ON u.id = s.unit_id"))
+assert st == {"pb-big": "current", "pa-whole": "current"}, f"snapshots {st}"
+print(f"pb-big over {runs} of {n}, starting first on tape 1; pa-whole deferred twice, then after the tail on tape 3")
+PY
+    # The restore from tape 1, in the default mode, across both swaps.
+    sp_load SPC-0001 && sp_restore_sh "$h" || return 1
+    swap1="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/scratch-1.txt" "${SP_SLOT[SPC-0002]}")"
+    swap2="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/scratch-2.txt" "${SP_SLOT[SPC-0003]}")"
+    (cd "$h" && sp_drive "$h/restore.out" "$h/restore.events" "$SP_PROMPT_HEIR" quit --swap "$swap1" --swap "$swap2" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit pb-big --key "$key" --to "$dest")
+    rc=$?
+    tail -n 60 "$h/restore.out"
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh across three tapes exited $rc, want 0"; return 1; }
+    sp_has "$h/restore.out" "RESTORE COMPLETE" "This cartridge identifies as: SPC-0002" "This cartridge identifies as: SPC-0003" || return 1
+    diff -r "$SP/c/src/pb-big" "$dest" || { echo "the restore across three tapes differs from the source"; return 1; }
+    python3 - "$db" "$h" <<'PY' || return 1
+import json, sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+h = sys.argv[2]
+ev = [json.loads(l) for l in open(f"{h}/restore.events")]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 2 and all(p["swap_rc"] == 0 for p in prompts), f"want two swaps: {prompts}"
+ends = [r[0] for r in c.execute("""SELECT MAX(sl.slice_number) FROM write_positions wp
+    JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+    JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+    WHERE v.label IN ('SPC-0001', 'SPC-0002') AND w.status = 'range' AND wp.status = 'written'
+    GROUP BY v.label ORDER BY v.label""")]
+out = open(f"{h}/restore.out").read()
+for k, end in enumerate(ends, 1):
+    assert f"holds slice {end + 1} into" in prompts[k - 1]["line"], f"prompt {k} is {prompts[k - 1]['line']!r}, want slice {end + 1}"
+    assert f"needs slice {end + 1} of " in out, f"no 'needs slice {end + 1}' line before prompt {k}"
+    names = sorted((l.split()[0] for l in open(f"{h}/scratch-{k}.txt")), key=lambda x: int(x.split(".")[1]))
+    assert names == [f"slice.{i}.enc" for i in range(1, end + 1)], f"scratch at prompt {k}: slices {names[:2]}..{names[-1:]}, want 1-{end}"
+print(f"two swaps, at slices {[e + 1 for e in ends]}; scratch held every slice read so far at each")
+PY
+}
+check span_three_tapes step_span_three_tapes
+
+# The gate's own cartridge back in the drive, and the leg's bulk (sources, staging, restores)
+# removed: the logs, JSON reports and catalogs stay.
+if [ -z "$SP_PREP" ]; then
+    if [ -n "$SP_ORIG" ]; then
+        sp_swap "$SP_ORIG" >/dev/null || echo "gate: span leg: could not put the gate's cartridge back from slot $SP_ORIG"
+    fi
+    rm -rf "$SP"/{a,c,f}/src "$SP"/{a,c,f}/home/staging "$SP"/a/heir/from-1-3 "$SP"/a/heir/stream \
+        "$SP"/a/heir2/from-2 "$SP"/a/restore/attended "$SP"/c/heir/restored
+fi
+
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
 # the only place in the tree that produces medium evidence on real media. So
@@ -2213,6 +3067,12 @@ for name in "${CHECKS[@]}"; do
     fi
 done
 echo
+if [ -n "$GATE_SPAN_ONLY" ]; then
+    # Never a gate verdict: every check but span_* was skipped. 3 when those all passed.
+    echo "PARTIAL — not a gate verdict: TAPECTL_GATE_SPAN_ONLY ran the ${#CHECKS[@]} span_* check(s) alone$([ $rc -eq 0 ] && echo ", all passing"). Logs: $RUN"
+    [ $rc -eq 0 ] && exit 3
+    exit 1
+fi
 if [ $rc -eq 0 ]; then
     echo "GATE GREEN (against manifest: ${#EXPECTED_FAIL[@]} expected failures remain). Logs: $RUN"
 else
