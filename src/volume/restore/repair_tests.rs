@@ -10,7 +10,7 @@
 //! what was asked.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::io::Cursor;
 
@@ -28,7 +28,7 @@ mod tests {
 
     /// What the operator does when a cartridge is asked for.
     #[derive(Debug, Clone, Copy)]
-    enum Reply {
+    pub(crate) enum Reply {
         /// Load this cartridge and press Enter.
         Load(&'static str),
         /// Press Enter without changing the cartridge.
@@ -40,21 +40,21 @@ mod tests {
     }
 
     /// A drive and an operator, scripted.
-    struct TestBay {
-        carts: BTreeMap<String, Box<dyn Store>>,
+    pub(crate) struct TestBay {
+        pub(crate) carts: BTreeMap<String, Box<dyn Store>>,
         /// What the st driver has open (`None` between a release and a load).
-        open: Option<String>,
+        pub(crate) open: Option<String>,
         /// What is physically in the drive.
-        physical: Option<String>,
-        attended: bool,
-        script: VecDeque<Reply>,
+        pub(crate) physical: Option<String>,
+        pub(crate) attended: bool,
+        pub(crate) script: VecDeque<Reply>,
         /// `(label asked for, the reason shown)`, in order.
-        asked: Vec<(String, String)>,
-        releases: usize,
+        pub(crate) asked: Vec<(String, String)>,
+        pub(crate) releases: usize,
     }
 
     impl TestBay {
-        fn asked_labels(&self) -> Vec<&str> {
+        pub(crate) fn asked_labels(&self) -> Vec<&str> {
             self.asked.iter().map(|(l, _)| l.as_str()).collect()
         }
     }

@@ -29,8 +29,10 @@ use crate::cli::volume::StagingRelease;
 use crate::config::{Config, LtoBackendConfig, TapectlPaths};
 use crate::error::Result;
 use crate::store::{CapacityReport, EarlyWarning, MemStore, Store};
-use crate::tape::contact::ContactSlot;
+use crate::tape::contact::{ContactSite, ContactSlot, Medium, Operation};
 use crate::volume::format::ParsedIndexEntry;
+use crate::volume::restore::repair_tests::tests::{Reply, TestBay};
+use crate::volume::restore::{RestoreOptions, RestoreReport, RestoreTarget};
 use crate::volume::write::{self, ContactStore, RecordedRange};
 
 /// The tape's block size: small, so a fixture's slices are a few blocks.
@@ -886,4 +888,285 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     let keep = write::keep_together(c, T94[2]).unwrap();
     let tapes: Vec<&str> = keep[0].tapes.iter().map(|t| t.label.as_str()).collect();
     assert_eq!((keep.len(), tapes), (1, T94.to_vec()));
+}
+
+// ── item 131: tapectl's restore across the cartridges ──
+
+/// [`home_93`] with its three tapes written by item 93's layout.
+fn written_93() -> Home {
+    let mut h = home_93();
+    h.write(T93[0], Warn::InSlice(B93, 2));
+    h.write(T93[1], Warn::Never);
+    h.write(T93[2], Warn::Never);
+    h
+}
+
+/// [`home_94`] with its three tapes written, each tape's early warning at
+/// [`WARN94`].
+fn written_94() -> Home {
+    let mut h = home_94();
+    for label in T94 {
+        h.write(label, Warn::AtBytes(WARN94));
+    }
+    h
+}
+
+/// H1's scripted bay ([`TestBay`]) over copies of every medium of `h`, with
+/// `start` in the drive and an operator who answers the prompts by `script`.
+fn bay(h: &Home, start: &str, script: &[Reply]) -> TestBay {
+    TestBay {
+        carts: h
+            .tapes
+            .iter()
+            .map(|(label, m)| (label.clone(), Box::new(copy_of(m)) as Box<dyn Store>))
+            .collect(),
+        open: Some(start.to_string()),
+        physical: Some(start.to_string()),
+        attended: true,
+        script: script.iter().copied().collect(),
+        asked: Vec::new(),
+        releases: 0,
+    }
+}
+
+fn restore_site(h: &Home) -> ContactSite<'_> {
+    ContactSite::new(&h.config, Operation::RestoreUnit, DEVICE, Medium::NoBackend)
+}
+
+/// What a restore is of: the whole unit, or one file of it.
+#[derive(Clone, Copy)]
+enum What<'a> {
+    Unit,
+    File(&'a str),
+}
+
+/// `restore unit` / `restore file` of `unit` v1 into a fresh directory
+/// through `bay`: `--from label`, or the loaded tape when `from` is `None`.
+fn restore(
+    h: &Home,
+    unit: &str,
+    what: What<'_>,
+    from: Option<&str>,
+    options: &RestoreOptions,
+    bay: &mut TestBay,
+) -> (Result<RestoreReport>, TempDir) {
+    let dest = TempDir::new().unwrap();
+    let dest_dir = dest.path().to_string_lossy().into_owned();
+    let target = match what {
+        What::Unit => RestoreTarget::Unit {
+            dest_dir: &dest_dir,
+        },
+        What::File(file_path) => RestoreTarget::File {
+            file_path,
+            dest_dir: &dest_dir,
+        },
+    };
+    let r = match from {
+        Some(label) => crate::volume::restore::restore_unit_from_bay(
+            &h.conn,
+            &h.paths,
+            &h.config,
+            unit,
+            label,
+            1,
+            target,
+            options,
+            bay,
+            restore_site(h),
+        ),
+        None => crate::volume::restore::restore_unit_from_loaded_bay(
+            &h.conn,
+            &h.paths,
+            &h.config,
+            unit,
+            target,
+            options,
+            None,
+            bay,
+            restore_site(h),
+        ),
+    };
+    (r, dest)
+}
+
+/// Every file of `unit` is in `dest`, byte for byte.
+fn assert_restored(h: &Home, unit: &str, dest: &Path) {
+    for (file, bytes) in &h.units[unit] {
+        assert!(
+            fs::read(dest.join(file)).ok().as_ref() == Some(bytes),
+            "{unit}: {file} is not restored byte for byte"
+        );
+    }
+}
+
+/// Item 131 on item 93's tapes, written by the real write: `restore unit`
+/// from tape 1 reads its range and asks for the live whole copy on tape 2
+/// for the rest (a whole copy first, not tape 3's range), by label; from
+/// tape 2 alone it needs no other cartridge; `--from` tape 3, which does not
+/// hold slice 1, is refused before anything is read, naming the holders of
+/// slice 1. Every restored file is byte-identical.
+#[test]
+fn item_131_restore_unit_crosses_the_written_cartridges() {
+    let h = written_93();
+
+    let mut b = bay(&h, T93[0], &[Reply::Load(T93[1])]);
+    let (r, dest) = restore(
+        &h,
+        B93,
+        What::Unit,
+        Some(T93[0]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    let report = r.unwrap_or_else(|e| panic!("from {}: {e}", T93[0]));
+    assert_restored(&h, B93, dest.path());
+    assert_eq!(report.slices, 3);
+    assert_eq!(b.asked_labels(), [T93[1]], "the whole copy, by label");
+    let prompt = &b.asked[0].1;
+    assert!(
+        prompt.contains("slice 3 is next") && prompt.contains(&format!("cartridge {}-STK", T93[1])),
+        "{prompt}"
+    );
+
+    let mut b = bay(&h, T93[1], &[]);
+    let (r, dest) = restore(
+        &h,
+        B93,
+        What::Unit,
+        Some(T93[1]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("from {}: {e}", T93[1]));
+    assert_restored(&h, B93, dest.path());
+    assert!(b.asked.is_empty(), "tape 2 holds the version whole");
+
+    // Named, the refusal comes before the drive (the dry run is that path).
+    let dest = TempDir::new().unwrap();
+    let err = crate::volume::restore::restore_unit(
+        &h.conn,
+        &h.paths,
+        &h.config,
+        B93,
+        T93[2],
+        &dest.path().to_string_lossy(),
+        DEVICE,
+        BS,
+        None,
+        true,
+        &RestoreOptions::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    for needle in [
+        format!("volume \"{}\" holds only slice 3", T93[2]),
+        format!("Slice 1 is on \"{}\"", T93[0]),
+        format!("--from {}", T93[0]),
+    ] {
+        assert!(err.contains(&needle), "{needle}: {err}");
+    }
+
+    // A whole unit of the same tapes restores as in 1.6.0.
+    let mut b = bay(&h, T93[0], &[]);
+    let (r, dest) = restore(
+        &h,
+        C93,
+        What::Unit,
+        Some(T93[0]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap();
+    assert_restored(&h, C93, dest.path());
+    assert!(b.asked.is_empty());
+}
+
+/// Item 131 on item 94's tapes, which hold the version only as three
+/// ranges: `restore unit --from` tape 1 asks for tapes 2 and 3 in slice
+/// order; `restore unit` of the loaded tape 1 does the same, and so does
+/// `--spool`; `restore file` of a file whose bytes are on the later tapes
+/// reads across the cartridges. Every file comes back byte for byte.
+#[test]
+fn item_131_restore_crosses_three_written_ranges() {
+    let h = written_94();
+    let later = [Reply::Load(T94[1]), Reply::Load(T94[2])];
+
+    let mut b = bay(&h, T94[0], &later);
+    let (r, dest) = restore(
+        &h,
+        S94,
+        What::Unit,
+        Some(T94[0]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    let report = r.unwrap_or_else(|e| panic!("--from {}: {e}", T94[0]));
+    assert_restored(&h, S94, dest.path());
+    assert_eq!(report.slices as i64, num_slices(&h.conn, S94));
+    assert_eq!(b.asked_labels(), [T94[1], T94[2]], "in slice order");
+    for (prompt, (label, first)) in b.asked.iter().zip([
+        (T94[1], written_run(&h.conn, T94[1], S94).0),
+        (T94[2], written_run(&h.conn, T94[2], S94).0),
+    ]) {
+        assert!(
+            prompt.1.contains(&format!("slice {first} is next"))
+                && prompt.1.contains(&format!("cartridge {label}-STK")),
+            "{}",
+            prompt.1
+        );
+    }
+
+    let mut b = bay(&h, T94[0], &later);
+    let (r, dest) = restore(
+        &h,
+        S94,
+        What::Unit,
+        None,
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("loaded {}: {e}", T94[0]));
+    assert_restored(&h, S94, dest.path());
+    assert_eq!(b.asked_labels(), [T94[1], T94[2]]);
+
+    let spool = RestoreOptions {
+        spool: true,
+        ..RestoreOptions::default()
+    };
+    let mut b = bay(&h, T94[0], &later);
+    let (r, dest) = restore(&h, S94, What::Unit, Some(T94[0]), &spool, &mut b);
+    r.unwrap_or_else(|e| panic!("--spool: {e}"));
+    assert_restored(&h, S94, dest.path());
+
+    let (file, bytes) = h.units[S94].last().unwrap().clone();
+    let mut b = bay(&h, T94[0], &later);
+    let (r, dest) = restore(
+        &h,
+        S94,
+        What::File(&file),
+        Some(T94[0]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("restore file {file}: {e}"));
+    assert_eq!(fs::read(dest.path().join(&file)).unwrap(), bytes);
+    assert_eq!(
+        b.asked_labels(),
+        [T94[1], T94[2]],
+        "the file's bytes, and the archive's end, are on the later tapes"
+    );
+
+    // The whole unit written after the span's tail restores alone.
+    let mut b = bay(&h, T94[2], &[]);
+    let (r, dest) = restore(
+        &h,
+        W94,
+        What::Unit,
+        Some(T94[2]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    r.unwrap();
+    assert_restored(&h, W94, dest.path());
+    assert!(b.asked.is_empty());
 }

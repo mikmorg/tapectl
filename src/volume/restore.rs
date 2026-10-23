@@ -502,7 +502,7 @@ pub(crate) fn restore_unit_from_loaded_store(
 /// [`restore_unit_from_loaded_store`] over a [`Bay`]: the drive that can
 /// also be asked for another cartridge.
 #[allow(clippy::too_many_arguments)]
-fn restore_unit_from_loaded_bay(
+pub(crate) fn restore_unit_from_loaded_bay(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -1157,7 +1157,7 @@ pub(crate) fn restore_unit_from_store(
 /// [`restore_unit_from_store`] over a [`Bay`] — the drive that can also be
 /// asked for another cartridge when a slice is damaged (issue #480).
 #[allow(clippy::too_many_arguments)]
-fn restore_unit_from_bay(
+pub(crate) fn restore_unit_from_bay(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -8514,4 +8514,4 @@ mod tests {
 #[cfg(test)]
 mod heir_tests;
 #[cfg(test)]
-mod repair_tests;
+pub(crate) mod repair_tests;
