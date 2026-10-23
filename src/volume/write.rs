@@ -6841,12 +6841,14 @@ pub(crate) fn live_recovery_slices(
 }
 
 /// A slice file a recovery read wrote into staging, and what
-/// `stage_slices.staging_path` said before the read recorded this one.
+/// `stage_slices.staging_path` and `released_at` said before the read
+/// recorded this one.
 struct StagedFile {
     slice_id: i64,
     stage_set_id: i64,
     path: PathBuf,
     prior: Option<String>,
+    prior_released_at: Option<String>,
 }
 
 /// What a recovery read has put into staging so far (issue #474), so that a
@@ -6862,7 +6864,12 @@ struct StagedRun {
 
 impl StagedRun {
     /// Record `path` as the staged file of `slice_id`: this run's list first,
-    /// then the catalog row, so a failed UPDATE is still undone.
+    /// then the catalog row, so a failed UPDATE is still undone. A slice the
+    /// per-slice release had released is staged again, so its `released_at`
+    /// is cleared with it (#478; `layout-session.md` "Per-slice release":
+    /// `volume read-slices` that stages a released slice again clears its
+    /// `released_at`), as the remedy of a released slice a write would plan
+    /// (X18) needs.
     fn record(
         &mut self,
         conn: &Connection,
@@ -6870,19 +6877,20 @@ impl StagedRun {
         stage_set_id: i64,
         path: &Path,
     ) -> Result<()> {
-        let prior: Option<String> = conn.query_row(
-            "SELECT staging_path FROM stage_slices WHERE id = ?1",
+        let (prior, prior_released_at): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT staging_path, released_at FROM stage_slices WHERE id = ?1",
             params![slice_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         self.files.push(StagedFile {
             slice_id,
             stage_set_id,
             path: path.to_path_buf(),
             prior,
+            prior_released_at,
         });
         conn.execute(
-            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+            "UPDATE stage_slices SET staging_path = ?1, released_at = NULL WHERE id = ?2",
             params![path.to_string_lossy().to_string(), slice_id],
         )?;
         Ok(())
@@ -6914,8 +6922,8 @@ impl StagedRun {
             // (an earlier read into the same directory), so it goes too.
             let restored = f.prior.filter(|p| Path::new(p) != f.path);
             if let Err(e) = conn.execute(
-                "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-                params![restored, f.slice_id],
+                "UPDATE stage_slices SET staging_path = ?1, released_at = ?3 WHERE id = ?2",
+                params![restored, f.slice_id, f.prior_released_at],
             ) {
                 warn!(
                     slice_id = f.slice_id,
@@ -13755,6 +13763,51 @@ mod tests {
             .unwrap();
         assert_eq!(path.as_deref(), Some(staged.path.to_str().unwrap()));
         assert_eq!(status, "staged");
+    }
+
+    /// #478 (`layout-session.md` "Per-slice release"): a recovery read that
+    /// stages a released slice again clears its `released_at`, and a read
+    /// that does not finish puts both columns back as it found them.
+    #[test]
+    fn a_recovery_read_restaging_a_released_slice_clears_released_at_and_undo_restores_it() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active');
+             INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 SELECT 'b', 'b', id, 'mtime_size', 1, 'active' FROM tenants;
+             INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 SELECT id, 1, 'staged', '/tmp', 1, 10 FROM units;
+             INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 SELECT id, 'staged', 524288 FROM snapshots;
+             INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path, released_at)
+                 SELECT id, 1, 10, 10, 'a', 'b', NULL, '2026-10-23 00:00:00' FROM stage_sets;",
+        )
+        .unwrap();
+        let (slice_id, set_id): (i64, i64) = conn
+            .query_row("SELECT id, stage_set_id FROM stage_slices", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let row = || -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT staging_path, released_at FROM stage_slices WHERE id = ?1",
+                params![slice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b_1.age");
+        fs::write(&path, b"ciphertext").unwrap();
+
+        let mut run = StagedRun::default();
+        run.record(&conn, slice_id, set_id, &path).unwrap();
+        assert_eq!(row(), (Some(path.to_string_lossy().into_owned()), None));
+
+        run.undo(&conn, None);
+        assert_eq!(row(), (None, Some("2026-10-23 00:00:00".to_string())));
+        assert!(!path.exists(), "the failed read's file is removed");
     }
 
     #[test]
