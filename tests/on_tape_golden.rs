@@ -572,6 +572,136 @@ fn manifest_toml_bytes_are_pinned_except_created_at() {
     );
 }
 
+// ── the range block (#478, ADR-0012 item 125) ──────────────────────────────
+
+/// A spannable unit's block as a span tape states it: `may_span = true`
+/// after `stage_set_id`, and every slice of the set listed, with
+/// `tape_position` only on the slices this tape holds (slice 3 is on another
+/// tape). The whole unit after it is written as before. The bytes are the
+/// ones `manifest::tests::a_range_block_round_trips_byte_for_byte` reads;
+/// the `photos/2019` block alone is 945 bytes.
+fn range_units() -> Vec<ManifestUnit> {
+    vec![
+        ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            may_span: true,
+            dar_version: Some("2.7.20".to_string()),
+            dar_command: Some(r#"dar -c "x" -s 10G \ path"#.to_string()),
+            slices: vec![
+                ManifestSlice {
+                    number: 1,
+                    tape_position: Some(9),
+                    size_bytes: 100,
+                    encrypted_bytes: 120,
+                    sha256_plain: "11".repeat(32),
+                    sha256_encrypted: "21".repeat(32),
+                },
+                ManifestSlice {
+                    number: 2,
+                    tape_position: Some(10),
+                    size_bytes: 101,
+                    encrypted_bytes: 121,
+                    sha256_plain: "12".repeat(32),
+                    sha256_encrypted: "22".repeat(32),
+                },
+                ManifestSlice {
+                    number: 3,
+                    tape_position: None,
+                    size_bytes: 102,
+                    encrypted_bytes: 122,
+                    sha256_plain: "13".repeat(32),
+                    sha256_encrypted: "23".repeat(32),
+                },
+            ],
+        },
+        ManifestUnit {
+            name: "ledgers/fy24".to_string(),
+            uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+            snapshot_version: 1,
+            stage_set_id: 43,
+            may_span: false,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: Some(11),
+                size_bytes: 5,
+                encrypted_bytes: 25,
+                sha256_plain: "ee".repeat(32),
+                sha256_encrypted: "ff".repeat(32),
+            }],
+        },
+    ]
+}
+
+const MANIFEST_RANGE_EXPECTED: &str = r##"[manifest]
+volume = "SPAN01"
+tenant = "alpha"
+created_at = "<normalised>"
+may_end_early = true
+
+[[units]]
+name = "photos/2019"
+uuid = "11111111-2222-3333-4444-555555555555"
+snapshot_version = 7
+stage_set_id = 42
+may_span = true
+dar_version = "2.7.20"
+dar_command = "dar -c \"x\" -s 10G \\ path"
+
+[[units.slices]]
+number = 1
+tape_position = 9
+size_bytes = 100
+encrypted_bytes = 120
+sha256_plain = "1111111111111111111111111111111111111111111111111111111111111111"
+sha256_encrypted = "2121212121212121212121212121212121212121212121212121212121212121"
+
+[[units.slices]]
+number = 2
+tape_position = 10
+size_bytes = 101
+encrypted_bytes = 121
+sha256_plain = "1212121212121212121212121212121212121212121212121212121212121212"
+sha256_encrypted = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[units.slices]]
+number = 3
+size_bytes = 102
+encrypted_bytes = 122
+sha256_plain = "1313131313131313131313131313131313131313131313131313131313131313"
+sha256_encrypted = "2323232323232323232323232323232323232323232323232323232323232323"
+
+[[units]]
+name = "ledgers/fy24"
+uuid = "66666666-7777-8888-9999-000000000000"
+snapshot_version = 1
+stage_set_id = 43
+
+[[units.slices]]
+number = 1
+tape_position = 11
+size_bytes = 5
+encrypted_bytes = 25
+sha256_plain = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+sha256_encrypted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+"##;
+
+#[test]
+fn manifest_toml_range_block_bytes_are_pinned_except_created_at() {
+    let manifest = generate_manifest_toml("SPAN01", "alpha", &range_units());
+    let actual = normalise_created_at(&manifest);
+    assert_eq!(
+        actual, MANIFEST_RANGE_EXPECTED,
+        "MANIFEST.toml's range block changed (created_at excluded). That is an on-tape \
+         format change and a CTO decision; do not re-pin without one."
+    );
+}
+
 // ── the short seal (#420, `volume-format-v2.md` §4.1) ──────────────────────
 
 /// The plan the short-seal pin is cut from: GOLD01's twelve files, as the
