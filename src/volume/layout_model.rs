@@ -759,8 +759,9 @@ pub fn capacity_refusal_note(
         .then(|| {
             format!(
                 "the fill ceiling is {}% of this volume's {} capacity (ADR-0012). Write less \
-                 to this volume — a unit is never split — or, if you know this cartridge can \
-                 take it, raise the ceiling for this write with --fill-ceiling",
+                 to this volume — a unit that does not allow spanning (allow_spanning) is never \
+                 split — or, if you know this cartridge can take it, raise the ceiling for this \
+                 write with --fill-ceiling",
                 fill_ceiling_percent(fill_ceiling),
                 crate::util::format_bytes_decimal(
                     i64::try_from(capacity_bytes).unwrap_or(i64::MAX)
@@ -814,8 +815,8 @@ pub enum LayoutError {
     #[error(
         "capacity exceeded: the layout needs {needed} bytes on tape, {over} bytes ({over_h}) \
          over the {bound} bytes of this volume's nominal capacity, the most a plan may reach \
-         past the fill ceiling (ADR-0012 item 113). A unit is never split: write fewer units \
-         to this volume",
+         past the fill ceiling (ADR-0012 item 113). A unit that does not allow spanning \
+         (allow_spanning) is never split: write fewer units to this volume",
         over = needed.saturating_sub(*bound),
         over_h = crate::util::format_bytes_binary(
             i64::try_from(needed.saturating_sub(*bound)).unwrap_or(i64::MAX)
@@ -2165,6 +2166,30 @@ mod tests {
         assert!(unbounded
             .capacity_errors_with_tail(10 * BS, Some(3))
             .is_empty());
+    }
+
+    /// The refusals a 1.7.0 write gives say what is true from 1.7.0: a unit
+    /// that does not allow spanning is never split, and they name the key.
+    #[test]
+    fn the_capacity_refusals_say_a_unit_that_does_not_allow_spanning_is_never_split() {
+        let cap = [LayoutError::CapacityExceeded {
+            needed: 10 * BS,
+            reserve: 0,
+            available: 7 * BS,
+        }];
+        let note = capacity_refusal_note(&cap, 0.97, 10 * BS).unwrap();
+        let bound = LayoutError::PlanBoundExceeded {
+            needed: 10 * BS,
+            bound: 9 * BS,
+        }
+        .to_string();
+        for text in [&note, &bound] {
+            assert!(
+                text.contains("does not allow spanning (allow_spanning) is never split"),
+                "{text}"
+            );
+            assert!(!text.contains("unit is never split"), "{text}");
+        }
     }
 
     #[test]
