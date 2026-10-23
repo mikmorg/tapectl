@@ -1109,7 +1109,11 @@ directory inside `--to` unless `--scratch DIR` names another disk, and
 then need more room, for a unit's slices beside its restored files: the older-dar fallback above (all of the unit's
 slices), `--path` (only the few slices that hold the path), and asking
 for a replacement slice (`--slices-from`, `--swap-tapes`: "If a slice or
-a file is damaged"). Doing it by hand ("Manual Recovery Steps") is the
+a file is damaged"); and a unit across tapes, by default: all of its
+slices, still encrypted, about the unit's size again beside its restored
+files (the sum of its slices' `encrypted_bytes`; `--stream-tapes` keeps
+none on disk: "A unit across tapes"). Doing it by hand ("Manual Recovery
+Steps") is the
 same: the decrypted slices (the unit's size) beside the restored files
 (the unit's size, more if it was stored compressed); delete a unit's slices
 once it is restored. The script checks the
@@ -7368,6 +7372,9 @@ case "${1:-}" in
   echo "      dar cannot stream a unit safely (no catalogue in the envelope and"
   echo "      dar older than 2.7.21, or dar older than 2.7.9) its slices are"
   echo "      decrypted to disk first, in --scratch DIR (default: inside --to)."
+  echo "      A unit across tapes (by default) keeps all of its slices there too, still"
+  echo "      encrypted: about the unit's size again, beside the restored files"
+  echo "      (--stream-tapes keeps none on disk)."
   echo "  A dar built with GPG support needs gpg (package gnupg) to start."
   echo "  --slices-from DIR   (--restore, --verify; repeat it for more directories) A directory of"
   echo "      slice files copied off another tape that holds a copy of the unit, under any names."
@@ -9146,6 +9153,26 @@ mod tests {
         }
         assert!(!script.contains("If this run is killed, that directory stays"));
         assert!(!script.contains("a run that is killed\""));
+    }
+
+    /// The fresh read, m3: Disk space and the help listed the restores that
+    /// keep slices on disk, but not the default restore across tapes, which
+    /// keeps every slice of the unit, still encrypted, in scratch.
+    #[test]
+    fn fresh_read_478_m3_disk_space_counts_a_unit_across_tapes() {
+        let g = generate_system_guide_v2_for_media("FR06", 20, "LTO-6");
+        let disk = flat_text(guide_section(&g, "Disk space"));
+        assert!(
+            disk.contains("and asking for a replacement slice (`--slices-from`, `--swap-tapes`: \"If a slice or a file is damaged\"); and a unit across tapes, by default: all of its slices, still encrypted, about the unit's size again beside its restored files (the sum of its slices' `encrypted_bytes`; `--stream-tapes` keeps none on disk: \"A unit across tapes\")."),
+            "{disk}"
+        );
+        let script = generate_restore_script_v2("FR06", 20);
+        assert_eq!(
+            script
+                .matches("  echo \"      A unit across tapes (by default) keeps all of its slices there too, still\"\n  echo \"      encrypted: about the unit's size again, beside the restored files\"\n  echo \"      (--stream-tapes keeps none on disk).\"\n")
+                .count(),
+            1
+        );
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
