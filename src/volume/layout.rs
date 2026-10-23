@@ -4865,9 +4865,11 @@ range_holders() { # <unit> <version>
   return 1
 }
 
-# Refuse a unit this tape holds a range of, before any slice is read, naming
-# the run that is here and the tapes that hold the rest, as far as an index
-# this key opened says (an index never names a tape written after its own).
+# Where a restore starts (volume-format-v2.md 4.4): refuse a unit this tape
+# holds a range of that does not start at slice 1, before any slice is read,
+# naming the run that is here and the tapes that hold slice 1, as far as an
+# index this key opened says (an index never names a tape written after its
+# own).
 die_range() { # <unit> <version>
   local holders where
   HOLDER_SLICE=1
