@@ -31,9 +31,9 @@ the normative design set named in the Policy block below.
 
   **Waiting on the operator:**
   - the drive-poll timer restart;
-  - the cartridge cleanup: from `~/.cache/tapectl/ssa-home-20261021`, `volume retire SSA-0002`,
-    then `cartridge erase`;
-  - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated).
+  - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated);
+  - optionally, deleting the drive phase's 40 GB under `/srv/google_copy/tapectl-shaping` and its
+    throwaway home (the run record lists them).
 
   **Landed after the tag:** #489 and #490 (b2f1ea6, 71bdaaf, the JSON shape pin cfb87ee; both
   closed), and p488 (5ecccc8..2643b2c) after chain42 went green on its tip:
@@ -42,20 +42,13 @@ the normative design set named in the Policy block below.
 
   Run `cargo test --no-fail-fast` on any landing: cargo stops at the first failing test binary.
 
-  **#488's drive phase is READY; the operator runs it.**
-  - The release research binary is on home2 at `~/tapectl-1.6.0-research-b660a26/` (sha256
-    5bf51d0a..., SHA256SUMS beside it).
-  - The mhvtl rehearsal passed every run, the no-L* branch and the restore leg.
-  - R5w's write under its own load cannot pass on vm-desk1: mhvtl's tape file is on /scratch,
-    the disk that load writes. On home2 the tape is real.
-  - The L1/L2 loads are reviewed only, because vm-desk1 cannot ssh to itself; home2 to vm-desk1
-    works.
-  - Before it runs, the operator cleans SSA-0002 with the acceptance binary (mark-reclaimable,
-    retire, erase) and stops the drive-poll timer.
-  - While it runs, vm-desk1 does no cargo and homorg and lcsas-4c are told: its L1/L2 loads run
-    there on purpose.
-  - Afterwards: read results.tsv and restore.tsv, decide the shaping per the note's §10, and
-    record the run.
+  **#488's drive phase RAN 2026-10-22, 14/14** (`docs/runs/2026-10-22-488-drive-phase.md`, 18afc8c;
+  #488 comment 6356349155). No load reproduced #426 (max 1.0943); the stop rule's fallback ran.
+  The excess came with page 0x02 correction jumps while the feed was steady and 0x34 read 0
+  repositions; ring is the supported lever; the pace helped nothing; release restore reads at
+  46.5 MiB/s. **#488 waits on the CTO**: §12 items 5-7, the warning's text (it blames the host),
+  R0 extended to page 0x02, and whether more drive time is wanted. Do not build shaping before
+  they rule.
 
   **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
   the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
@@ -66,6 +59,12 @@ the normative design set named in the Policy block below.
   (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
+
+  **#478 wave 1 is on `p478-span`** (`/scratch/tapectl-p478`, pushed to origin at a4def5e): T0, A
+  and D. Its gate is GREEN: golden 4/4 first, fmt, clippy with and without research, unit
+  4071/0/24, and the mhvtl gate 52/52 (2026-10-23). The branch is not releasable before wave 5
+  (plan.md), so it does not land on master until then. Next is wave 2: B (the policy key), C
+  (per-slice coverage) and L (layout text and RESTORE.sh), per plan.md §5 and its "Wave 1 notes".
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
