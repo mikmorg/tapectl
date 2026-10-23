@@ -320,8 +320,8 @@ fn missing_refusal(
     // volume order of first mention.
     let mut seen: Vec<(String, String, Vec<i64>)> = Vec::new();
     for t in traces.iter().filter(|t| missing.contains(&t.slice_number)) {
-        let why = if t.volume_status == "retired" || t.volume_status == "erased" {
-            format!("is {}", t.volume_status)
+        let why = if t.given_up {
+            "is given up (retired or erased)".to_string()
         } else if t.position_status == "pending" {
             "planned it, but its tape ended before it".to_string()
         } else if t.write_status == "cut" {
@@ -330,11 +330,10 @@ fn missing_refusal(
             format!("holds it in a write that is {}", t.write_status)
         } else if t.position_status != "written" {
             format!("records it {}", t.position_status)
+        } else if !t.in_service {
+            "is not in service, and holds no bytes a restore may read".to_string()
         } else {
-            format!(
-                "is not in service (status {}, condition {})",
-                t.volume_status, t.condition
-            )
+            "holds it, but the catalog records it past where that tape ended".to_string()
         };
         match seen
             .iter_mut()

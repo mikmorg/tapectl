@@ -2429,7 +2429,7 @@ mod tests {
         for needle in [
             slices.as_str(),
             "\"L6-0001\" planned it, but its tape ended before it",
-            "\"L6-0002\" is retired",
+            "\"L6-0002\" is given up (retired or erased)",
             "catalog rebuild --from-volume",
             "Nothing was read from tape",
         ] {

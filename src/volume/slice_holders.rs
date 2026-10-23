@@ -216,10 +216,10 @@ pub fn holders_of_set(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceH
 pub struct SliceTrace {
     pub slice_number: i64,
     pub label: String,
-    /// `volumes.status`.
-    pub volume_status: String,
-    /// `volumes.observed_condition`.
-    pub condition: String,
+    /// The volume is given up: retired or erased ([`coverage::given_up`]).
+    pub given_up: bool,
+    /// The volume is in service ([`coverage::in_service`]).
+    pub in_service: bool,
     /// `writes.status`.
     pub write_status: String,
     /// `write_positions.status`: `written`, or `pending` for a slice planned
@@ -231,9 +231,8 @@ pub struct SliceTrace {
 /// whatever became of it: what a refusal names when a slice has no holder
 /// (#478, "say what would hold them"). In slice order, then volume order.
 pub fn traces_of_set(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceTrace>> {
-    let mut stmt = conn.prepare(
-        "SELECT mine.slice_number, v.label, v.status, COALESCE(v.observed_condition, 'ok'),
-                w.status, wp.status
+    let mut stmt = conn.prepare(&format!(
+        "SELECT mine.slice_number, v.label, {given_up}, {in_service}, w.status, wp.status
            FROM stage_slices mine
            JOIN stage_slices sl ON sl.sha256_encrypted = mine.sha256_encrypted
            JOIN write_positions wp ON wp.stage_slice_id = sl.id
@@ -241,14 +240,16 @@ pub fn traces_of_set(conn: &Connection, stage_set_id: i64) -> Result<Vec<SliceTr
            JOIN volumes v ON v.id = w.volume_id
           WHERE mine.stage_set_id = ?1
           ORDER BY mine.slice_number, v.id",
-    )?;
+        given_up = coverage::given_up("v"),
+        in_service = coverage::in_service("v"),
+    ))?;
     let rows = stmt
         .query_map(params![stage_set_id], |r| {
             Ok(SliceTrace {
                 slice_number: r.get(0)?,
                 label: r.get(1)?,
-                volume_status: r.get(2)?,
-                condition: r.get(3)?,
+                given_up: r.get(2)?,
+                in_service: r.get(3)?,
                 write_status: r.get(4)?,
                 position_status: r.get(5)?,
             })
@@ -706,24 +707,26 @@ mod tests {
         with_a_range(&conn);
         conn.execute("UPDATE volumes SET status = 'retired' WHERE id = 2", [])
             .unwrap();
-        let traces: Vec<(i64, String, String, String, String)> = traces_of_set(&conn, 1)
+        let traces: Vec<(i64, String, bool, bool, String, String)> = traces_of_set(&conn, 1)
             .unwrap()
             .into_iter()
             .map(|t| {
                 (
                     t.slice_number,
                     t.label,
-                    t.volume_status,
+                    t.given_up,
+                    t.in_service,
                     t.write_status,
                     t.position_status,
                 )
             })
             .collect();
-        let row = |n, l: &str, vs: &str, ws: &str, ps: &str| {
+        let row = |n, l: &str, gone: bool, ws: &str, ps: &str| {
             (
                 n,
                 l.to_string(),
-                vs.to_string(),
+                gone,
+                !gone,
                 ws.to_string(),
                 ps.to_string(),
             )
@@ -731,10 +734,10 @@ mod tests {
         assert_eq!(
             traces,
             vec![
-                row(1, "V1", "sealed", "completed", "written"),
-                row(1, "V2", "retired", "completed", "written"),
-                row(1, "V4", "sealed", "range", "pending"),
-                row(2, "V4", "sealed", "range", "written"),
+                row(1, "V1", false, "completed", "written"),
+                row(1, "V2", true, "completed", "written"),
+                row(1, "V4", false, "range", "pending"),
+                row(2, "V4", false, "range", "written"),
             ]
         );
     }
