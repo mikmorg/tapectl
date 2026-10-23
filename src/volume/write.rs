@@ -25084,6 +25084,111 @@ mod tests {
                     }
                 }
 
+                /// `unit`'s id.
+                fn unit_id(f: &Fixture, unit: &str) -> i64 {
+                    f.conn
+                        .query_row(
+                            "SELECT id FROM units WHERE name = ?1",
+                            params![unit],
+                            |r| r.get(0),
+                        )
+                        .unwrap()
+                }
+
+                /// #402 meets a span (#478): a staged slice of a set that holds
+                /// a range, gone from staging though never released, refuses
+                /// the write as #402 rules, and with no volume holding the
+                /// version whole the remedy names `volume read-slices --from`
+                /// the range that holds THAT slice. A volume that has just
+                /// failed to give the slice up is never named; with no other
+                /// holder the remedy is #402's stage-again.
+                #[test]
+                fn the_402_remedy_for_a_missing_slice_of_a_span_names_the_range_holding_it() {
+                    let mut f = fixture(B3, &["SM-1", "SM-2"]);
+                    f.config.defaults.min_copies = 2;
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SM-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SM-1").unwrap(),
+                        [range("b", 1, 2)]
+                    );
+                    let (path, released) = slice_row(&f, "b", 1);
+                    assert_eq!(released, None, "slice 1 was never released");
+                    fs::remove_file(path.expect("slice 1 is staged")).unwrap();
+
+                    let mut store = MemStore::new(SBS);
+                    let (r, code) = write(&f, "SM-2", &mut store, false);
+                    let err = r.unwrap_err().to_string();
+                    assert!(
+                        err.contains("these staged sets are not whole on disk"),
+                        "{err}"
+                    );
+                    assert!(
+                        err.contains(
+                            "remedy: tapectl volume read-slices --from SM-1 --unit b --version 1"
+                        ),
+                        "{err}"
+                    );
+                    assert_eq!(code, 2);
+                    assert!(store.files.is_empty(), "nothing was written");
+
+                    assert_eq!(
+                        staging::incomplete_set_remedy(
+                            &f.conn,
+                            unit_id(&f, "b"),
+                            "b",
+                            1,
+                            "active",
+                            Some(volume_id(&f, "SM-1")),
+                        )
+                        .unwrap(),
+                        "tapectl staging clean --unit b --version 1 --force && tapectl stage \
+                         create b --version 1",
+                        "the volume that failed is never the source"
+                    );
+                }
+
+                /// Two missing slices held by two ranges: the remedy names each
+                /// volume once, in slice order. Tape 1 holds `b`'s range 1-2 and
+                /// tape 2 its continuation 3-3, so slices 1 and 3 come back
+                /// from two cartridges; slice 2, still staged, needs none.
+                #[test]
+                fn the_402_remedy_names_each_range_holding_a_missing_slice() {
+                    let f = fixture(B3, &["SM-1", "SM-2"]);
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SM-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SM-2", &mut store, false)
+                        .0
+                        .expect("tape 2 continues it");
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SM-2").unwrap(),
+                        [range("b", 3, 3)]
+                    );
+                    for n in [1, 3] {
+                        fs::remove_file(slice_row(&f, "b", n).0.unwrap()).unwrap();
+                    }
+                    assert_eq!(
+                        staging::incomplete_set_remedy(
+                            &f.conn,
+                            unit_id(&f, "b"),
+                            "b",
+                            1,
+                            "active",
+                            None
+                        )
+                        .unwrap(),
+                        "tapectl volume read-slices --from SM-1 --unit b --version 1 && tapectl \
+                         volume read-slices --from SM-2 --unit b --version 1"
+                    );
+                }
+
                 /// The units of a hand-made span plan, `a` whole, `b` may span
                 /// (slices 1-3), `c` whole.
                 fn plan_units() -> Vec<BuildUnit> {

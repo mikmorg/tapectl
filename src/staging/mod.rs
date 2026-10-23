@@ -371,6 +371,14 @@ pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Res
 /// it would fail the same way — so the remedy names another sealed copy or,
 /// with none, falls through to staging the version again. `None` where no
 /// read has failed.
+///
+/// **A set that holds a range** (1.7.0, #478): with no volume holding the
+/// version whole, a stage set of it that holds a range may still have every
+/// missing slice on some volume, a range holder included
+/// ([`span_slice_sources`]). The remedy then names, for those slices,
+/// `volume read-slices --from` the volumes that hold them, one command per
+/// volume. [`crate::policy::coverage::in_service_copy_of_version_excluding`]
+/// stays whole-copy only and is asked first.
 pub(crate) fn incomplete_set_remedy(
     conn: &Connection,
     unit_id: i64,
@@ -379,25 +387,119 @@ pub(crate) fn incomplete_set_remedy(
     unit_status: &str,
     failed_volume_id: Option<i64>,
 ) -> Result<String> {
-    let from = crate::policy::coverage::in_service_copy_of_version_excluding(
+    let whole = crate::policy::coverage::in_service_copy_of_version_excluding(
         conn,
         unit_id,
         version,
         failed_volume_id,
     )?;
-    Ok(match from {
-        Some(from) => format!(
-            "tapectl volume read-slices --from {from} --unit {unit_name} --version {version}"
-        ),
-        None if unit_status == "active" => format!(
+    let from = match whole {
+        Some(from) => vec![from],
+        None => span_slice_sources(conn, unit_id, version, failed_volume_id)?,
+    };
+    Ok(match from.as_slice() {
+        [_, ..] => from
+            .iter()
+            .map(|from| {
+                format!(
+                    "tapectl volume read-slices --from {from} --unit {unit_name} --version \
+                     {version}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" && "),
+        [] if unit_status == "active" => format!(
             "tapectl staging clean --unit {unit_name} --version {version} --force && \
              tapectl stage create {unit_name} --version {version}"
         ),
-        None => format!(
+        [] => format!(
             "no sealed copy to read back, and unit \"{unit_name}\" is not active so it cannot \
              be staged again — investigate with `tapectl catalog locate {unit_name}`"
         ),
     })
+}
+
+/// The volumes `volume read-slices --from` brings back the missing slices of
+/// `unit_id`'s version `version` from, when a stage set of it holds a range
+/// (#478, a `range` write on any volume): empty when no such set has a
+/// missing slice, or when any missing slice has no source, because then no
+/// read makes the set whole.
+///
+/// A slice is missing as [`staged_slice_problems`] sees it: not released
+/// (`released_at` unset; a released slice is the planner's question) and
+/// with no staged file of its recorded size. Its sources are
+/// [`crate::volume::slice_holders::holders_of`]'s in-service holders, a
+/// range holder included, never `failed_volume_id`. In slice order, each
+/// slice not yet covered takes the source that holds the most of the slices
+/// still uncovered, the first such in `holders_of`'s order.
+fn span_slice_sources(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+    failed_volume_id: Option<i64>,
+) -> Result<Vec<String>> {
+    use crate::volume::slice_holders::{self, Standing};
+
+    let slices: Vec<(i64, Option<String>, String)> = conn
+        .prepare(
+            "SELECT sl.encrypted_bytes, sl.staging_path, sl.sha256_encrypted
+             FROM stage_slices sl
+             JOIN stage_sets ss ON ss.id = sl.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             WHERE s.unit_id = ?1 AND s.version = ?2 AND sl.released_at IS NULL
+               AND EXISTS (SELECT 1 FROM writes w
+                           WHERE w.stage_set_id = ss.id AND w.status = 'range')
+             ORDER BY ss.id, sl.slice_number",
+        )?
+        .query_map(params![unit_id, version], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let staged_whole = |path: &Option<String>, expected: i64| {
+        path.as_deref()
+            .and_then(|p| fs::metadata(p).ok())
+            .is_some_and(|m| m.is_file() && m.len() as i64 == expected)
+    };
+
+    // Each missing slice and the labels of the volumes that may source it.
+    let mut missing: Vec<Vec<String>> = Vec::new();
+    for (expected, path, sha256) in &slices {
+        if staged_whole(path, *expected) {
+            continue;
+        }
+        let sources: Vec<String> = slice_holders::holders_of(conn, sha256)?
+            .into_iter()
+            .filter(|h| h.standing == Standing::InService)
+            .filter(|h| Some(h.volume_id) != failed_volume_id)
+            .map(|h| h.label)
+            .collect();
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        missing.push(sources);
+    }
+
+    let mut chosen: Vec<String> = Vec::new();
+    for sources in &missing {
+        if sources.iter().any(|s| chosen.contains(s)) {
+            continue;
+        }
+        let uncovered = |label: &String| {
+            missing
+                .iter()
+                .filter(|m| !m.iter().any(|s| chosen.contains(s)))
+                .filter(|m| m.contains(label))
+                .count()
+        };
+        // `max_by_key` keeps the last of equals; the first is wanted.
+        let best = sources
+            .iter()
+            .rev()
+            .max_by_key(|label| uncovered(label))
+            .cloned();
+        chosen.extend(best);
+    }
+    Ok(chosen)
 }
 
 /// Full stage pipeline: validate → dar → encrypt → checksums.
