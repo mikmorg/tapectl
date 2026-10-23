@@ -1702,6 +1702,17 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
 
 - A unit whose slices all PASS is complete: restore it as usual. RESTORE.sh
   does not need the seal, and checks every slice again as it restores.
+  That holds for the tape in the drive when the restore starts. Every LATER
+  cartridge, of a unit across tapes, and every cartridge `--swap-tapes`
+  reads for a replacement slice, is refused without a readable seal marker:
+  a slice is taken from another tape only at a position its own seal says
+  that tape holds ("A unit across tapes"). With such a tape as a later part
+  of a unit across tapes, read its slices by hand (step 7 of "Manual
+  Recovery Steps"), each checked against the `sha256_encrypted` the
+  manifest gives, into one directory with the other tapes' slices of the
+  unit, and run dar there once every slice is in it. For a slice of a whole
+  unit, copy it off with `dd` and give it to `--slices-from DIR` ("If a
+  slice or a file is damaged"), which matches by sha256 alone.
 - If every file PASSes against the front index and only the seal
   disagrees, the data is exactly what that index describes (each file
   matches its recorded hash): the fault is in the seal marker or the
@@ -9194,6 +9205,28 @@ mod tests {
         let script = generate_restore_script_v2("FR07", 20);
         assert!(script.contains(
             "  if ! { [ -n \"$cat\" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then\n"
+        ));
+    }
+
+    /// The fresh read, m6: "RESTORE.sh does not need the seal" is true of the
+    /// tape a restore starts on only. Every later cartridge and every
+    /// `--swap-tapes` source is refused without a readable seal (R5, R8;
+    /// sealed_other), and the guide gives the manual route for such a tape.
+    #[test]
+    fn fresh_read_478_m6_a_later_cartridge_needs_its_seal() {
+        let g = generate_system_guide_v2_for_media("FR08", 20, "LTO-6");
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        for needle in [
+            "RESTORE.sh does not need the seal, and checks every slice again as it restores. That holds for the tape in the drive when the restore starts.",
+            "Every LATER cartridge, of a unit across tapes, and every cartridge `--swap-tapes` reads for a replacement slice, is refused without a readable seal marker: a slice is taken from another tape only at a position its own seal says that tape holds (\"A unit across tapes\").",
+            "With such a tape as a later part of a unit across tapes, read its slices by hand (step 7 of \"Manual Recovery Steps\"), each checked against the `sha256_encrypted` the manifest gives, into one directory with the other tapes' slices of the unit, and run dar there once every slice is in it.",
+            "For a slice of a whole unit, copy it off with `dd` and give it to `--slices-from DIR` (\"If a slice or a file is damaged\"), which matches by sha256 alone.",
+        ] {
+            assert!(verdict.contains(needle), "{needle:?}: {verdict}");
+        }
+        let script = generate_restore_script_v2("FR08", 20);
+        assert!(script.contains(
+            "sealed_other() {\n  [ -z \"$OTHER_END\" ] || return 0\n  info \"Its seal marker cannot be read, so nothing is taken from it:"
         ));
     }
 
