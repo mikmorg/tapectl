@@ -302,19 +302,29 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
 /// them as the whole unit, and coverage counts writes, not slices — a
 /// partial unit sealed as a full copy. One description per problem, each
 /// naming the slice; the caller names the set.
+///
+/// **A slice released on its own is not missing** (1.7.0, issue #478;
+/// ADR-0012 item 129): a set that holds a range is released slice by slice
+/// (`staging::clean::release_covered_slices`), and a released slice's
+/// `staging_path` is cleared and its `released_at` set in one transaction
+/// before its file is removed. So a NULL path or a missing file is accepted
+/// only when `released_at` is set; any other is still refused, as #402
+/// rules. Whether a released slice is one a write still needs is the
+/// planner's question (it refuses an owed slice that was released).
 pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Result<Vec<String>> {
     let num_slices: Option<i64> = conn.query_row(
         "SELECT num_slices FROM stage_sets WHERE id = ?1",
         params![stage_set_id],
         |row| row.get(0),
     )?;
-    let rows: Vec<(i64, i64, Option<String>)> = conn
+    let rows: Vec<(i64, i64, Option<String>, bool)> = conn
         .prepare(
-            "SELECT slice_number, encrypted_bytes, staging_path FROM stage_slices
+            "SELECT slice_number, encrypted_bytes, staging_path, released_at IS NOT NULL
+             FROM stage_slices
              WHERE stage_set_id = ?1 ORDER BY slice_number",
         )?
         .query_map(params![stage_set_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -327,7 +337,10 @@ pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Res
             ));
         }
     }
-    for (number, expected, path) in rows {
+    for (number, expected, path, released) in rows {
+        if released {
+            continue;
+        }
         let Some(path) = path else {
             problems.push(format!("slice {number}: no staged file recorded"));
             continue;
@@ -6523,6 +6536,84 @@ mod tests {
         config.dar.binary = real_dar;
         stage_create(&conn, &paths, &config, snap_id, false)
             .expect("a unit that fits the largest configured generation stages");
+    }
+
+    /// Issue #402 as item 129 amends it: a slice released on its own
+    /// (`released_at` set, its path cleared, its file gone) is not missing;
+    /// one with no `released_at` whose path is NULL, or whose file is gone,
+    /// still is.
+    #[test]
+    fn staged_slice_problems_accepts_a_released_slice_and_refuses_an_unreleased_missing_one() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('u', 'u', 1, '/tmp/u', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path) VALUES (1, 1, 'staged', '/tmp/u')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
+             VALUES (1, 'staged', 524288, 3)",
+            [],
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let present = dir.path().join("s3.age");
+        fs::write(&present, b"abc").unwrap();
+        let gone = dir.path().join("s2.age");
+        for (n, path, released) in [
+            (1, None, true),
+            (2, Some(gone.to_string_lossy().to_string()), false),
+            (3, Some(present.to_string_lossy().to_string()), false),
+        ] {
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                            sha256_plain, sha256_encrypted, staging_path,
+                                            released_at)
+                 VALUES (1, ?1, 3, 3, 'p', ?2, ?3,
+                         CASE WHEN ?4 THEN datetime('now') END)",
+                params![n, format!("e{n}"), path, released],
+            )
+            .unwrap();
+        }
+
+        let problems = staged_slice_problems(&conn, 1).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("slice 2:"),
+            "an unreleased missing file is still refused: {problems:?}"
+        );
+
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = NULL WHERE slice_number = 2",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            staged_slice_problems(&conn, 1).unwrap(),
+            ["slice 2: no staged file recorded"],
+            "a NULL path with no released_at is still refused"
+        );
+
+        conn.execute(
+            "UPDATE stage_slices SET released_at = datetime('now') WHERE slice_number = 2",
+            [],
+        )
+        .unwrap();
+        assert!(
+            staged_slice_problems(&conn, 1).unwrap().is_empty(),
+            "released slices are accepted, and slice 3's file is whole"
+        );
     }
 
     /// Issue #479 (ADR-0012 2026-10-17 item 100): with a measured

@@ -89,15 +89,66 @@ pub enum CleanScope<'a> {
 /// same rule; this is `pub(crate)` so that query can be built from it too.
 /// [`release_blocker`] answers the same question per stage set, with the
 /// reason, and drops `'cut'` rows the same way.
+///
+/// **A `'range'` row is terminal** (1.7.0, issue #478; ADR-0012 items 121
+/// and 129; `layout-session.md` "Per-slice release"): like a `'completed'`
+/// row it never holds the staging as an unfinished write would
+/// ([`writes_finished_sql`]), and unlike a `'cut'` row its slices count.
+/// But a set holding one has its slices on different volumes, so it is never
+/// released whole here: it is released slice by slice
+/// ([`slice_release_candidate_predicate_sql`], [`release_covered_slices`]).
+/// So this whole-set rule excludes it, and for a set with no `'range'` row
+/// it is 1.6.0's rule exactly.
 pub(crate) fn release_candidate_predicate_sql(id_expr: &str) -> String {
     format!(
         "EXISTS (
              SELECT 1 FROM writes w
              WHERE w.stage_set_id = {id_expr} AND w.status = 'completed'
          )
-         AND NOT EXISTS (
+         AND {finished}
+         AND NOT {range}",
+        finished = writes_finished_sql(id_expr),
+        range = holds_a_range_sql(id_expr),
+    )
+}
+
+/// The per-slice counterpart of [`release_candidate_predicate_sql`] (1.7.0,
+/// issue #478; ADR-0012 item 129): the stage set `id_expr` holds a range,
+/// and none of its writes holds its staging as an unfinished write would.
+/// Which of its slices are released is [`release_covered_slices`]' question,
+/// slice by slice; this only says the set's writes no longer stand in the
+/// way.
+pub(crate) fn slice_release_candidate_predicate_sql(id_expr: &str) -> String {
+    format!(
+        "{range} AND {finished}",
+        range = holds_a_range_sql(id_expr),
+        finished = writes_finished_sql(id_expr),
+    )
+}
+
+/// A SQL boolean: no `writes` row of the stage set `id_expr` holds its
+/// staging as an unfinished write would. `'completed'` and `'range'` rows
+/// are finished and count, a `'cut'` row is no write (ADR-0012 items 112,
+/// 121 and 129); every other status is a write that is live, resumable, or
+/// abandoned, which keeps the staging until `--force`.
+fn writes_finished_sql(id_expr: &str) -> String {
+    format!(
+        "NOT EXISTS (
              SELECT 1 FROM writes w
-             WHERE w.stage_set_id = {id_expr} AND w.status NOT IN ('completed', 'cut')
+             WHERE w.stage_set_id = {id_expr}
+               AND w.status NOT IN ('completed', 'cut', 'range')
+         )"
+    )
+}
+
+/// A SQL boolean: the stage set `id_expr` has a `'range'` row on some
+/// volume (ADR-0012 item 121), so its slices are on different volumes and
+/// its staging is released slice by slice (item 129).
+fn holds_a_range_sql(id_expr: &str) -> String {
+    format!(
+        "EXISTS (
+             SELECT 1 FROM writes w
+             WHERE w.stage_set_id = {id_expr} AND w.status = 'range'
          )"
     )
 }
@@ -116,10 +167,22 @@ pub(crate) fn release_candidate_predicate_sql(id_expr: &str) -> String {
 /// exactly what makes the interrupted write unrecoverable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReleaseBlocker {
-    /// Nothing blocks it: at least one `writes` row is `'completed'` and
-    /// every other is `'completed'` or `'cut'`. A bare clean releases it
-    /// unless the unit is below its policy's `min_copies`.
+    /// Nothing blocks it: at least one `writes` row is `'completed'` or
+    /// `'range'` and every other is one of those or `'cut'`. A bare clean
+    /// releases it unless the unit is below its policy's `min_copies` -- or,
+    /// for a set holding a range, releases each slice that has its copies
+    /// ([`Self::SlicesShort`] names the ones that do not).
     None,
+    /// The stage set holds a range (1.7.0, issue #478; ADR-0012 items 127
+    /// and 129): its slices are on different volumes, so its staging is
+    /// released slice by slice, each once its copies meet the set's copy
+    /// floor, and `slices` (slice numbers, ascending) are the staged ones
+    /// still short. They are what continues the span: an ordinary `volume
+    /// write` onto another cartridge writes them. Its writes block nothing
+    /// (a `'range'` row is terminal), so [`release_blocker`], which reads
+    /// only the writes, never returns this: the floor is policy, and
+    /// `staging::release::release_blocker_judged` adds it.
+    SlicesShort { slices: Vec<i64> },
     /// No `writes` row at all — staged and never written. A bare clean does
     /// not see it; only `--force` releases it.
     NeverWritten,
@@ -171,6 +234,12 @@ pub(crate) enum ReleaseBlocker {
 /// session whose remedy is `--force`. Only a set with nothing but `'cut'`
 /// rows reads [`ReleaseBlocker::Cut`], so its refusal can name the volume
 /// that cut it and the write that finishes it.
+///
+/// A `'range'` row (1.7.0, issue #478; ADR-0012 items 121 and 129) is
+/// terminal, as [`release_candidate_predicate_sql`] reads it: beside
+/// `'completed'` rows, or alone, it blocks nothing. Whether the slices of a
+/// set holding one have their copies is policy, so it is not this
+/// function's to say ([`ReleaseBlocker::SlicesShort`]).
 pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
     let statuses: Vec<String> = conn
         .prepare("SELECT status FROM writes WHERE stage_set_id = ?1 AND status <> 'cut'")?
@@ -192,7 +261,7 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
             None => ReleaseBlocker::NeverWritten,
         });
     }
-    if statuses.iter().all(|s| s == "completed") {
+    if statuses.iter().all(|s| s == "completed" || s == "range") {
         return Ok(ReleaseBlocker::None);
     }
 
@@ -272,6 +341,11 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 /// stuck behind a copy that will never complete (e.g. the operator
 /// re-planned onto a different volume entirely) — it is unaffected by this
 /// change and has no bearing on `'failed'` sets, which are always eligible.
+///
+/// A `'staged'` set that holds a `'range'` row (1.7.0, issue #478) is not
+/// released here without `force`: its slices are on different volumes, so
+/// it is released slice by slice ([`release_covered_slices`], ADR-0012 item
+/// 129). `force` releases it whole, as any other.
 ///
 /// Two different discovery strategies for orphaned files, matching
 /// `staging::cleanup_failed_stage_set` (issue #54) exactly:
@@ -422,66 +496,7 @@ pub fn clean_staging(
         rows
     };
 
-    // Issue #376: a stage set that a live session is writing (or resuming,
-    // or confirming) to some volume is never released, `force` or not — its
-    // staged slices are what that session reads next. The session's volume
-    // lock is the fact (ADR-0008 Tier 3), not a policy judgement, so this
-    // stays within the policy-free rule above. Held sets are skipped and
-    // named in the report; every other candidate is still cleaned.
-    let mut candidates_free = Vec::with_capacity(candidates.len());
-    for (stage_set_id, status) in candidates {
-        let live: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT v.id, v.label FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1",
-            )?;
-            let rows = stmt
-                .query_map(params![stage_set_id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows.into_iter()
-                .filter(|(volume_id, _)| {
-                    crate::staging::lock::volume_session_live(conn, *volume_id)
-                })
-                .map(|(_, label)| label)
-                .collect()
-        };
-        if live.is_empty() {
-            candidates_free.push((stage_set_id, status));
-        } else {
-            report.held_by_live_session.push((stage_set_id, live));
-        }
-    }
-    let candidates = candidates_free;
-
-    // Issue #483 (ADR-0012 2026-10-19 item 106): a stage set a pending
-    // `volume rewrite` holds is never released, `force` or not. The window
-    // from the rewrite's erase until its new volume has passed a full
-    // readback is one in which these staged slices may be the ONLY copy of a
-    // unit; the hold is a fact about that window (the catalog's record of the
-    // rewrite and the absence of a fully read back copy elsewhere), not a
-    // policy judgement, so it sits beside the live-session check above and
-    // inside the policy-free rule. Every release path funnels through here —
-    // `staging clean`, `release_if_covered` (so `volume write`, `volume
-    // resume` and `collection run`) — and so inherits it. One query for the
-    // whole call, not one per candidate.
-    let held = if candidates.is_empty() {
-        Default::default()
-    } else {
-        crate::volume::rewrite::holds(conn)?
-    };
-    let mut candidates_free = Vec::with_capacity(candidates.len());
-    for (stage_set_id, status) in candidates {
-        match held.get(&stage_set_id) {
-            Some(hold) => report
-                .held_by_pending_rewrite
-                .push((stage_set_id, hold.clone())),
-            None => candidates_free.push((stage_set_id, status)),
-        }
-    }
-    let candidates = candidates_free;
+    let candidates = drop_held(conn, candidates, &mut report)?;
 
     if candidates.is_empty() {
         return Ok(report);
@@ -594,6 +609,333 @@ pub fn clean_staging(
     Ok(report)
 }
 
+/// `candidates` less the stage sets something holds whatever a release
+/// would otherwise decide, each held one named in `report` -- the two facts
+/// every release path keeps, the whole-set one of [`clean_staging`] and the
+/// per-slice one of [`release_covered_slices`] alike.
+///
+/// - Issue #376: a stage set that a live session is writing (or resuming,
+///   or confirming) to some volume is never released, `force` or not — its
+///   staged slices are what that session reads next. The session's volume
+///   lock is the fact (ADR-0008 Tier 3), not a policy judgement, so this
+///   stays within the policy-free rule. Held sets are skipped and named in
+///   the report; every other candidate is still cleaned.
+/// - Issue #483 (ADR-0012 2026-10-19 item 106): a stage set a pending
+///   `volume rewrite` holds is never released, `force` or not. The window
+///   from the rewrite's erase until its new volume has passed a full
+///   readback is one in which these staged slices may be the ONLY copy of a
+///   unit; the hold is a fact about that window (the catalog's record of the
+///   rewrite and the absence of a fully read back copy elsewhere), not a
+///   policy judgement, so it sits beside the live-session check and inside
+///   the policy-free rule. Every release path funnels through here —
+///   `staging clean`, `release_if_covered` (so `volume write`, `volume
+///   resume` and `collection run`) — and so inherits it. One query for the
+///   whole call, not one per candidate.
+fn drop_held<T>(
+    conn: &Connection,
+    candidates: Vec<(i64, T)>,
+    report: &mut CleanReport,
+) -> Result<Vec<(i64, T)>> {
+    let mut candidates_free = Vec::with_capacity(candidates.len());
+    for (stage_set_id, item) in candidates {
+        let live: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT v.id, v.label FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![stage_set_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .filter(|(volume_id, _)| {
+                    crate::staging::lock::volume_session_live(conn, *volume_id)
+                })
+                .map(|(_, label)| label)
+                .collect()
+        };
+        if live.is_empty() {
+            candidates_free.push((stage_set_id, item));
+        } else {
+            report.held_by_live_session.push((stage_set_id, live));
+        }
+    }
+    let candidates = candidates_free;
+
+    let held = if candidates.is_empty() {
+        Default::default()
+    } else {
+        crate::volume::rewrite::holds(conn)?
+    };
+    let mut candidates_free = Vec::with_capacity(candidates.len());
+    for (stage_set_id, item) in candidates {
+        match held.get(&stage_set_id) {
+            Some(hold) => report
+                .held_by_pending_rewrite
+                .push((stage_set_id, hold.clone())),
+            None => candidates_free.push((stage_set_id, item)),
+        }
+    }
+    Ok(candidates_free)
+}
+
+/// The `'staged'` sets within `scope` that hold a range (1.7.0, issue #478;
+/// ADR-0012 item 121), each with its unit's id, in stage set order: the sets
+/// whose staging is released slice by slice ([`release_covered_slices`])
+/// rather than whole. A SELECTION, as [`CleanScope`] is for
+/// [`clean_staging`]: it names the sets, never decides a release. Whether
+/// their writes still hold them is [`release_covered_slices`]' first check.
+pub(crate) fn staged_sets_holding_a_range(
+    conn: &Connection,
+    scope: CleanScope,
+) -> Result<Vec<(i64, i64)>> {
+    let (scope_predicate, bind_params): (String, Vec<i64>) = match scope {
+        CleanScope::Whole => (String::new(), Vec::new()),
+        CleanScope::Units([]) => return Ok(Vec::new()),
+        CleanScope::Units(ids) => (
+            format!(
+                "AND sn.unit_id IN ({})",
+                ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+            ),
+            ids.to_vec(),
+        ),
+        CleanScope::UnitVersion { unit_id, version } => (
+            "AND sn.unit_id = ? AND sn.version = ?".to_string(),
+            vec![unit_id, version],
+        ),
+    };
+    let sql = format!(
+        "SELECT ss.id, sn.unit_id FROM stage_sets ss
+         JOIN snapshots sn ON sn.id = ss.snapshot_id
+         WHERE ss.status = 'staged' AND {} {scope_predicate}
+         ORDER BY ss.id",
+        holds_a_range_sql("ss.id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(bind_params.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The staged slices of the stage set `stage_set_id` whose copies
+/// ([`crate::policy::coverage::slice_copies`]) are below `floor`, by slice
+/// number, ascending: the slices [`ReleaseBlocker::SlicesShort`] names. A
+/// slice already released (`released_at` set) is not staged, so it is not
+/// one staging is held for and is never named.
+pub(crate) fn slices_short_of(
+    conn: &Connection,
+    stage_set_id: i64,
+    floor: i64,
+) -> Result<Vec<i64>> {
+    let released = released_slice_ids(conn, stage_set_id)?;
+    Ok(crate::policy::coverage::slice_copies(conn, stage_set_id)?
+        .into_iter()
+        .filter(|s| s.copies < floor && !released.contains(&s.stage_slice_id))
+        .map(|s| s.slice_number)
+        .collect())
+}
+
+/// The ids of `stage_set_id`'s slices that were released on their own
+/// (`stage_slices.released_at`, migration 039).
+fn released_slice_ids(
+    conn: &Connection,
+    stage_set_id: i64,
+) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM stage_slices WHERE stage_set_id = ?1 AND released_at IS NOT NULL",
+    )?;
+    let ids = stmt
+        .query_map(params![stage_set_id], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// `numbers` (ascending slice numbers) as runs: `1-12, 15, 17-18`.
+pub(crate) fn describe_slice_numbers(numbers: &[i64]) -> String {
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for &n in numbers {
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == n => *end = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs.iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Release, slice by slice, the staged slices of the stage set
+/// `stage_set_id`, which holds a range (1.7.0, issue #478; ADR-0012 items
+/// 85 and 129; `layout-session.md` "Per-slice release"): each slice whose
+/// copies ([`crate::policy::coverage::slice_copies`], item 127) meet `floor`
+/// is released, so tape 1's slices need not wait for tape 3.
+///
+/// `floor` is the set's copy floor, which the caller resolves
+/// (`staging::release`, through `policy::coverage::copy_floor`): this
+/// function stays as policy-free as [`clean_staging`] (ADR-0012's #244
+/// amendment) and compares the catalog's per-slice copies with the number
+/// it is handed. A slice is released only when some eligible volume holds
+/// it, whatever `floor` says -- the per-slice form of the whole-set rule's
+/// "a completed write" -- so a floor of 0 never releases a slice that is on
+/// no tape.
+///
+/// The set is released by it only when its writes no longer hold it
+/// ([`slice_release_candidate_predicate_sql`]: a `'range'` row is terminal,
+/// any live, resumable or abandoned row keeps every slice) and nothing
+/// holds it ([`drop_held`]: a live session, a pending rewrite). A set
+/// with no `'range'` row is never touched: its slices are all on the same
+/// volumes, and [`clean_staging`] releases it whole exactly as in 1.6.0.
+///
+/// The order is [`clean_staging`]'s, for its reason (issue #402, #108):
+/// in ONE immediate transaction, retried on a busy catalog, each released
+/// slice's `staging_path` is cleared and its `released_at` set, the copies
+/// read inside that transaction; when no slice of the set is left
+/// unreleased the set moves to `'cleaned'`, with the same status-change
+/// event; THEN the files are unlinked, a failure recorded in
+/// [`CleanReport::stranded`]. Only when the set is cleaned are the other
+/// files named for it removed by prefix ([`find_prefix_orphans`]): before
+/// then its unreleased slices are still live.
+///
+/// The slices still short are named in [`CleanReport::slices_short`].
+pub(crate) fn release_covered_slices(
+    conn: &Connection,
+    config: &Config,
+    stage_set_id: i64,
+    floor: i64,
+) -> Result<CleanReport> {
+    let mut report = CleanReport::default();
+    let candidate: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM stage_sets
+                             WHERE id = ?1 AND status = 'staged' AND {})",
+            slice_release_candidate_predicate_sql("?1")
+        ),
+        params![stage_set_id],
+        |row| row.get(0),
+    )?;
+    if !candidate {
+        return Ok(report);
+    }
+    if drop_held(conn, vec![(stage_set_id, ())], &mut report)?.is_empty() {
+        return Ok(report);
+    }
+
+    let floor = floor.max(1);
+    // Filled by the transaction below, afresh on each attempt.
+    let mut released: Vec<(i64, Option<String>)> = Vec::new();
+    let mut short: Vec<i64> = Vec::new();
+    let mut cleaned = false;
+    crate::db::busy::retry(
+        crate::db::busy::BusyPolicy::DEFAULT,
+        "the staging release",
+        || {
+            let tx = crate::db::busy::immediate_tx(conn)?;
+            let already = released_slice_ids(&tx, stage_set_id)?;
+            let all = crate::policy::coverage::slice_copies(&tx, stage_set_id)?;
+            let any_slice = !all.is_empty();
+            let slices: Vec<_> = all
+                .into_iter()
+                .filter(|s| !already.contains(&s.stage_slice_id))
+                .collect();
+            let mut now_released = Vec::new();
+            let mut now_short = Vec::new();
+            for s in &slices {
+                if s.copies < floor {
+                    now_short.push(s.slice_number);
+                    continue;
+                }
+                let path: Option<String> = tx.query_row(
+                    "SELECT staging_path FROM stage_slices WHERE id = ?1",
+                    params![s.stage_slice_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE stage_slices SET staging_path = NULL, released_at = datetime('now')
+                     WHERE id = ?1",
+                    params![s.stage_slice_id],
+                )?;
+                now_released.push((s.slice_number, path));
+            }
+            // The set's last slice released: nothing of it is staged now.
+            let now_cleaned = any_slice && now_short.is_empty();
+            if now_cleaned {
+                let old_status: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM stage_sets WHERE id = ?1",
+                        params![stage_set_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                tx.execute(
+                    "UPDATE stage_sets SET status = 'cleaned', cleaned_at = datetime('now')
+                     WHERE id = ?1",
+                    params![stage_set_id],
+                )?;
+                events::log_field_change(
+                    &tx,
+                    "stage_set",
+                    stage_set_id,
+                    &format!("stage_set_{stage_set_id}"),
+                    "status_change",
+                    "status",
+                    old_status.as_deref(),
+                    "cleaned",
+                    None,
+                )?;
+            }
+            tx.commit()?;
+            released = now_released;
+            short = now_short;
+            cleaned = now_cleaned;
+            Ok(())
+        },
+    )?;
+
+    if !released.is_empty() {
+        report.slices_released.push((
+            stage_set_id,
+            released.iter().map(|(number, _)| *number).collect(),
+        ));
+    }
+    if !short.is_empty() {
+        report.slices_short.push((stage_set_id, short));
+    }
+    if cleaned {
+        report.sets_cleaned += 1;
+    }
+
+    // THEN unlink — the catalog no longer points at any of these paths.
+    for (_, path) in &released {
+        if let Some(path) = path {
+            remove_and_account(Path::new(path), &mut report);
+        }
+    }
+    if cleaned {
+        let staging_dir = Path::new(&config.staging.directory);
+        for path in find_prefix_orphans(conn, staging_dir, stage_set_id)? {
+            if !released
+                .iter()
+                .any(|(_, p)| p.as_deref().map(Path::new) == Some(path.as_path()))
+            {
+                remove_and_account(&path, &mut report);
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn remove_and_account(path: &Path, report: &mut CleanReport) {
     if !path.exists() {
         return;
@@ -668,6 +1010,11 @@ fn find_prefix_orphans(
 }
 
 /// Show staging status.
+///
+/// `write_count` counts the writes that put the set's slices on a sealed
+/// tape: `'completed'` ones and, since 1.7.0, `'range'` ones (ADR-0012 item
+/// 121). A set released in part, slice by slice (item 129), lists the slices
+/// released and those still staged.
 pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, u.name, s.version, ss.status, ss.num_slices,
@@ -676,7 +1023,8 @@ pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
-         LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
+         LEFT JOIN writes w ON w.stage_set_id = ss.id
+                           AND w.status IN ('completed', 'range')
          WHERE ss.status IN ('staged', 'staging')
          GROUP BY ss.id
          ORDER BY ss.staged_at DESC",
@@ -695,6 +1043,8 @@ pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
                 write_count: row.get(7)?,
                 on_disk_problems: Vec::new(),
                 remedy: None,
+                released_slices: Vec::new(),
+                staged_slices: Vec::new(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -703,6 +1053,26 @@ pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
     // still there — look. ('staging' is mid-write; its files are growing.)
     let mut rows = rows;
     for info in rows.iter_mut().filter(|i| i.status == "staged") {
+        // #478 (item 129): a set released slice by slice is still 'staged'
+        // until its last slice goes.
+        let slices: Vec<(i64, bool)> = conn
+            .prepare(
+                "SELECT slice_number, released_at IS NOT NULL FROM stage_slices
+                 WHERE stage_set_id = ?1 ORDER BY slice_number",
+            )?
+            .query_map(params![info.stage_set_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if slices.iter().any(|(_, released)| *released) {
+            for (number, released) in slices {
+                if released {
+                    info.released_slices.push(number);
+                } else {
+                    info.staged_slices.push(number);
+                }
+            }
+        }
         info.on_disk_problems = crate::staging::staged_slice_problems(conn, info.stage_set_id)?;
         if !info.on_disk_problems.is_empty() {
             let (unit_id, unit_status): (i64, String) = conn.query_row(
@@ -776,6 +1146,41 @@ pub struct CleanReport {
     /// copy. `--force` does not release them; `volume rewrite --resume`
     /// finishes the rewrite and lifts the hold.
     pub held_by_pending_rewrite: Vec<(i64, crate::volume::rewrite::Hold)>,
+    /// Slices released on their own from stage sets that hold a range
+    /// (1.7.0, issue #478; ADR-0012 item 129; [`release_covered_slices`]):
+    /// per stage set, the slice numbers this call released, ascending. A set
+    /// whose last slice went is also counted in `sets_cleaned`; the files
+    /// are counted in `files_removed`/`bytes_freed` as any others.
+    pub slices_released: Vec<(i64, Vec<i64>)>,
+    /// Stage sets that hold a range kept staged in part: per stage set, the
+    /// staged slice numbers still short of copies
+    /// ([`ReleaseBlocker::SlicesShort`]). They continue the span, so they
+    /// wait for the next `volume write` of it.
+    pub slices_short: Vec<(i64, Vec<i64>)>,
+}
+
+impl CleanReport {
+    /// Add `other`'s counts and lists to these: two release passes of one
+    /// command reported as one.
+    pub fn absorb(&mut self, other: CleanReport) {
+        self.sets_cleaned += other.sets_cleaned;
+        self.files_removed += other.files_removed;
+        self.bytes_freed += other.bytes_freed;
+        self.errors += other.errors;
+        self.stranded.extend(other.stranded);
+        self.session_dirs_reclaimed += other.session_dirs_reclaimed;
+        self.session_dirs_retained += other.session_dirs_retained;
+        self.session_dirs_orphaned += other.session_dirs_orphaned;
+        self.session_dirs_awaiting_reconfirm
+            .extend(other.session_dirs_awaiting_reconfirm);
+        self.lockfiles_reclaimed += other.lockfiles_reclaimed;
+        self.home_leftovers_reclaimed += other.home_leftovers_reclaimed;
+        self.held_by_live_session.extend(other.held_by_live_session);
+        self.held_by_pending_rewrite
+            .extend(other.held_by_pending_rewrite);
+        self.slices_released.extend(other.slices_released);
+        self.slices_short.extend(other.slices_short);
+    }
 }
 
 /// Reclaim `{staging.directory}/sessions/*` directories and terminal
@@ -1209,6 +1614,13 @@ pub struct StagingInfo {
     pub on_disk_problems: Vec<String>,
     /// The command that makes the set whole again, when it is not.
     pub remedy: Option<String>,
+    /// A `'staged'` set released in part, slice by slice (1.7.0, issue
+    /// #478; ADR-0012 item 129): the slice numbers released, ascending.
+    /// Empty for a set none of whose slices was released on its own.
+    pub released_slices: Vec<i64>,
+    /// With `released_slices`, the slice numbers still staged. Empty when
+    /// `released_slices` is.
+    pub staged_slices: Vec<i64>,
 }
 
 #[cfg(test)]
@@ -2587,6 +2999,443 @@ mod tests {
                 "tapectl staging clean --unit u --version 1 --force && \
                  tapectl stage create u --version 1"
             )
+        );
+    }
+
+    // --- per-slice release (1.7.0, issue #478; ADR-0012 items 121, 127, 129) ---
+
+    /// [`seed_stage_set`]'s set with `n` slices, each a real file whose
+    /// recorded size is its size: `(conn, stage_set_id, files by slice
+    /// number from 1, TempDir guard)`.
+    fn seed_span(n: i64) -> (Connection, i64, Vec<PathBuf>, tempfile::TempDir) {
+        let (conn, stage_set_id, first, dir) = seed_stage_set();
+        let bytes = b"staged slice bytes";
+        let mut files = vec![first];
+        for k in 2..=n {
+            let path = dir.path().join(format!("slice_{k}.age"));
+            std::fs::write(&path, bytes).unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                            sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, ?2, 18, 18, 'p', ?3, ?4)",
+                params![stage_set_id, k, format!("e{k}"), path.to_string_lossy()],
+            )
+            .unwrap();
+            files.push(path);
+        }
+        conn.execute(
+            "UPDATE stage_slices SET encrypted_bytes = ?2 WHERE stage_set_id = ?1",
+            params![stage_set_id, bytes.len() as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE stage_sets SET num_slices = ?2 WHERE id = ?1",
+            params![stage_set_id, n],
+        )
+        .unwrap();
+        (conn, stage_set_id, files, dir)
+    }
+
+    /// A new `sealed` volume `label` (eligible: condition `ok` by default).
+    fn sealed_volume(conn: &Connection, label: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status,
+                                  sealed_at)
+             VALUES (?1, 'lto', 'lto0', 2500000000000, 'sealed', datetime('now'))",
+            params![label],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A `range` write of `stage_set_id` (planned spannable) on a new sealed
+    /// volume `label`, holding the slices `written`, with every later slice
+    /// planned and `pending` (the tape ended first): the row confirm leaves.
+    fn seed_range_on(
+        conn: &Connection,
+        stage_set_id: i64,
+        label: &str,
+        written: std::ops::RangeInclusive<i64>,
+    ) {
+        let volume_id = sealed_volume(conn, label);
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+             SELECT id, snapshot_id, ?2, 'range', 1 FROM stage_sets WHERE id = ?1",
+            params![stage_set_id, volume_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             SELECT ?1, id, CAST(5 + slice_number AS TEXT),
+                    CASE WHEN slice_number <= ?4 THEN 'written' ELSE 'pending' END
+               FROM stage_slices WHERE stage_set_id = ?2 AND slice_number >= ?3",
+            params![write_id, stage_set_id, written.start(), written.end()],
+        )
+        .unwrap();
+    }
+
+    /// A `completed` write of the whole set on a new sealed volume `label`,
+    /// planned spannable or not.
+    fn seed_whole_on(conn: &Connection, stage_set_id: i64, label: &str, may_span: bool) {
+        let volume_id = sealed_volume(conn, label);
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, may_span)
+             SELECT id, snapshot_id, ?2, 'completed', ?3 FROM stage_sets WHERE id = ?1",
+            params![stage_set_id, volume_id, may_span],
+        )
+        .unwrap();
+    }
+
+    /// Per slice of `stage_set_id`, in slice order: whether a path is still
+    /// recorded, and whether `released_at` is set.
+    fn slice_rows(conn: &Connection, stage_set_id: i64) -> Vec<(bool, bool)> {
+        conn.prepare(
+            "SELECT staging_path IS NOT NULL, released_at IS NOT NULL FROM stage_slices
+             WHERE stage_set_id = ?1 ORDER BY slice_number",
+        )
+        .unwrap()
+        .query_map(params![stage_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    fn set_status(conn: &Connection, stage_set_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A `range` row is terminal: alone or beside a `completed` one it
+    /// blocks nothing, and the set it belongs to is a per-slice candidate,
+    /// never a whole-set one. Beside a write that is live, resumable or
+    /// abandoned it excuses nothing, exactly as a `completed` row does not.
+    #[test]
+    fn a_range_row_is_terminal_and_never_holds_staging_as_an_unfinished_write_would() {
+        let predicates = |conn: &Connection, id: i64| -> (bool, bool) {
+            conn.query_row(
+                &format!(
+                    "SELECT {}, {}",
+                    release_candidate_predicate_sql("?1"),
+                    slice_release_candidate_predicate_sql("?1")
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        let (conn, set, _files, _dir) = seed_span(4);
+        assert_eq!(
+            predicates(&conn, set),
+            (false, false),
+            "positive control: no write at all is neither"
+        );
+        seed_range_on(&conn, set, "V-R1", 1..=2);
+        assert_eq!(release_blocker(&conn, set).unwrap(), ReleaseBlocker::None);
+        assert_eq!(
+            predicates(&conn, set),
+            (false, true),
+            "a set holding a range is released slice by slice, never whole"
+        );
+        seed_whole_on(&conn, set, "V-W2", true);
+        assert_eq!(release_blocker(&conn, set).unwrap(), ReleaseBlocker::None);
+        assert_eq!(predicates(&conn, set), (false, true));
+
+        for (other, want) in [
+            (
+                "interrupted",
+                ReleaseBlocker::Interrupted {
+                    volume_label: Some("V-OTHER".into()),
+                },
+            ),
+            (
+                "in_progress",
+                ReleaseBlocker::WriteInFlight {
+                    volume_label: Some("V-OTHER".into()),
+                },
+            ),
+            ("aborted", ReleaseBlocker::Abandoned { reconfirm_on: None }),
+        ] {
+            let (conn, set, _files, _dir) = seed_span(4);
+            seed_range_on(&conn, set, "V-R1", 1..=2);
+            seed_write(&conn, set, "V-OTHER", other);
+            assert_eq!(release_blocker(&conn, set).unwrap(), want, "{other}");
+            assert_eq!(predicates(&conn, set), (false, false), "{other}");
+        }
+
+        // A set with no range row reads exactly as in 1.6.0.
+        let (conn, set, _files, _dir) = seed_span(2);
+        seed_whole_on(&conn, set, "V-W1", true);
+        assert_eq!(predicates(&conn, set), (true, false));
+    }
+
+    /// Copy target 1 on the two-volume range fixture (tape 1 holds slices
+    /// 1..2 as a `range` row, tape 2 slices 3..4): after tape 1 its two
+    /// slices are released and the other two named short; after tape 2 the
+    /// rest go and the set is `cleaned`, with its status-change event.
+    #[test]
+    fn per_slice_release_at_copy_target_one_frees_each_tapes_range() {
+        let (conn, set, files, dir) = seed_span(4);
+        let config = config_for(dir.path());
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![1, 2])]);
+        assert_eq!(report.slices_short, vec![(set, vec![3, 4])]);
+        assert_eq!(
+            (report.sets_cleaned, report.files_removed),
+            (0, 2),
+            "{report:?}"
+        );
+        assert_eq!(
+            slice_rows(&conn, set),
+            [(false, true), (false, true), (true, false), (true, false)]
+        );
+        assert!(!files[0].exists() && !files[1].exists());
+        assert!(files[2].exists() && files[3].exists());
+        assert_eq!(set_status(&conn, set), "staged");
+
+        let again = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert!(
+            again.slices_released.is_empty() && again.files_removed == 0,
+            "a released slice is never released twice: {again:?}"
+        );
+
+        seed_range_on(&conn, set, "V-T2", 3..=4);
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![3, 4])]);
+        assert!(report.slices_short.is_empty(), "{report:?}");
+        assert_eq!((report.sets_cleaned, report.files_removed), (1, 2));
+        assert!(files.iter().all(|f| !f.exists()));
+        assert_eq!(set_status(&conn, set), "cleaned");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE entity_type = 'stage_set' AND entity_id = ?1
+                   AND action = 'status_change' AND new_value = 'cleaned'",
+                params![set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            events, 1,
+            "the set's last slice moves it to cleaned, logged"
+        );
+    }
+
+    /// Copy target 2 on item 93's layout: tape 1 `range` 1..2, tape 2 the
+    /// whole set `completed`, tape 3 `range` 3..4. Nothing is released after
+    /// tape 1; after tape 2 slices 1..2 have their two copies and 3..4 one;
+    /// after tape 3 every slice has two and the set is cleaned.
+    #[test]
+    fn per_slice_release_at_copy_target_two_follows_each_slices_copies() {
+        let (conn, set, files, dir) = seed_span(4);
+        let config = config_for(dir.path());
+
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+        let report = release_covered_slices(&conn, &config, set, 2).unwrap();
+        assert!(report.slices_released.is_empty(), "{report:?}");
+        assert_eq!(report.slices_short, vec![(set, vec![1, 2, 3, 4])]);
+        assert!(files.iter().all(|f| f.exists()));
+
+        seed_whole_on(&conn, set, "V-T2", true);
+        let report = release_covered_slices(&conn, &config, set, 2).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![1, 2])]);
+        assert_eq!(report.slices_short, vec![(set, vec![3, 4])]);
+        assert_eq!(set_status(&conn, set), "staged");
+        assert!(!files[0].exists() && !files[1].exists());
+        assert!(files[2].exists() && files[3].exists());
+
+        seed_range_on(&conn, set, "V-T3", 3..=4);
+        let report = release_covered_slices(&conn, &config, set, 2).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![3, 4])]);
+        assert_eq!(report.sets_cleaned, 1);
+        assert_eq!(set_status(&conn, set), "cleaned");
+        assert!(files.iter().all(|f| !f.exists()));
+    }
+
+    /// A set with no `range` row has every slice on the same volumes: the
+    /// per-slice release never touches it, even one planned spannable that
+    /// reached its tape whole, and `clean_staging` releases it whole as in
+    /// 1.6.0, row for row: every path cleared, no `released_at` set.
+    #[test]
+    fn a_set_with_no_range_row_is_released_whole_as_in_1_6_0() {
+        for may_span in [false, true] {
+            let (conn, set, files, dir) = seed_span(3);
+            let config = config_for(dir.path());
+            seed_whole_on(&conn, set, "V-W1", may_span);
+
+            let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+            assert_eq!(report.files_removed, 0, "may_span={may_span}: {report:?}");
+            assert!(report.slices_released.is_empty() && report.slices_short.is_empty());
+            assert!(files.iter().all(|f| f.exists()));
+
+            let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
+            assert_eq!((report.sets_cleaned, report.files_removed), (1, 3));
+            assert!(report.slices_released.is_empty());
+            assert_eq!(slice_rows(&conn, set), [(false, false); 3]);
+            assert_eq!(set_status(&conn, set), "cleaned");
+        }
+    }
+
+    /// The whole-set release never takes a set holding a range, even one
+    /// with a `completed` row beside it (item 93's middle tape): its other
+    /// slices may be short. `--force` still releases it whole.
+    #[test]
+    fn clean_staging_leaves_a_set_holding_a_range_to_the_per_slice_release() {
+        let (conn, set, files, dir) = seed_span(4);
+        let config = config_for(dir.path());
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+        seed_whole_on(&conn, set, "V-T2", true);
+
+        let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 0, "{report:?}");
+        assert!(files.iter().all(|f| f.exists()));
+
+        let report = clean_staging(&conn, &config, true, CleanScope::Whole).unwrap();
+        assert_eq!((report.sets_cleaned, report.files_removed), (1, 4));
+        assert_eq!(set_status(&conn, set), "cleaned");
+    }
+
+    /// Beside a write that is live, resumable or abandoned, a set holding a
+    /// range keeps every slice, as a whole set does: those rows read these
+    /// slices, or may.
+    #[test]
+    fn per_slice_release_keeps_every_slice_beside_an_unfinished_write() {
+        for other in ["planned", "in_progress", "interrupted", "aborted", "failed"] {
+            let (conn, set, files, dir) = seed_span(4);
+            seed_range_on(&conn, set, "V-T1", 1..=2);
+            seed_write(&conn, set, "V-OTHER", other);
+
+            let report = release_covered_slices(&conn, &config_for(dir.path()), set, 1).unwrap();
+            assert!(report.slices_released.is_empty(), "{other}: {report:?}");
+            assert!(files.iter().all(|f| f.exists()), "{other}");
+        }
+    }
+
+    /// Issue #376 holds for the per-slice release too: with the lock of a
+    /// volume the set is planned onto held, nothing is released and the set
+    /// is named; released, the same call frees the covered slices.
+    #[test]
+    fn per_slice_release_keeps_a_set_a_live_session_is_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = db::open(&db_file).unwrap();
+        let (set, first, dir) = seed_stage_set_rows(&conn, "staged");
+        seed_range_on(&conn, set, "V-T1", 1..=1);
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 2, 19, 19, 'p', 'e2', NULL)",
+            params![set],
+        )
+        .unwrap();
+        seed_write(&conn, set, "V-LIVE", "completed");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'V-LIVE'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let holder_conn = Connection::open(&db_file).unwrap();
+        let holder =
+            crate::staging::lock::acquire_volume(&holder_conn, volume_id, "V-LIVE").unwrap();
+
+        let config = config_for(dir.path());
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(
+            report.held_by_live_session,
+            vec![(set, vec!["V-LIVE".to_string()])]
+        );
+        assert!(report.slices_released.is_empty());
+        assert!(first.exists());
+
+        drop(holder);
+        let report = release_covered_slices(&conn, &config, set, 1).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![1])]);
+        assert!(!first.exists());
+    }
+
+    /// Clearing the paths, setting `released_at` and the set's move to
+    /// `cleaned` with its event are one commit (issue #402's rule, kept).
+    #[test]
+    fn the_per_slice_release_commits_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (conn, set, _files, dir) = seed_span(3);
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+        seed_range_on(&conn, set, "V-T2", 3..=3);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&commits);
+        conn.commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        }))
+        .unwrap();
+        let report = release_covered_slices(&conn, &config_for(dir.path()), set, 1).unwrap();
+        conn.commit_hook(None::<fn() -> bool>).unwrap();
+
+        assert_eq!(report.sets_cleaned, 1, "positive control: {report:?}");
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A slice is released only when some eligible volume holds it: a floor
+    /// of 0 (which config refuses anyway) never frees a slice on no tape.
+    #[test]
+    fn per_slice_release_never_frees_a_slice_no_eligible_volume_holds() {
+        let (conn, set, files, dir) = seed_span(2);
+        seed_range_on(&conn, set, "V-T1", 1..=1);
+        let report = release_covered_slices(&conn, &config_for(dir.path()), set, 0).unwrap();
+        assert_eq!(report.slices_released, vec![(set, vec![1])]);
+        assert_eq!(report.slices_short, vec![(set, vec![2])]);
+        assert!(files[1].exists());
+    }
+
+    /// [`slices_short_of`] names the staged slices below the floor and
+    /// never a released one.
+    #[test]
+    fn slices_short_of_names_only_staged_slices_below_the_floor() {
+        let (conn, set, _files, dir) = seed_span(4);
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+        assert_eq!(slices_short_of(&conn, set, 1).unwrap(), [3, 4]);
+        assert_eq!(slices_short_of(&conn, set, 2).unwrap(), [1, 2, 3, 4]);
+        release_covered_slices(&conn, &config_for(dir.path()), set, 1).unwrap();
+        assert_eq!(
+            slices_short_of(&conn, set, 2).unwrap(),
+            [3, 4],
+            "slices 1..2 are released: they hold no staging"
+        );
+    }
+
+    #[test]
+    fn describe_slice_numbers_writes_runs() {
+        assert_eq!(describe_slice_numbers(&[]), "");
+        assert_eq!(describe_slice_numbers(&[3]), "3");
+        assert_eq!(describe_slice_numbers(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
+    }
+
+    /// `staging status` shows a set released in part, and the #402 check it
+    /// runs accepts the released slices; a whole staged set lists nothing.
+    #[test]
+    fn staging_status_shows_a_partly_released_set() {
+        let (conn, set, _files, dir) = seed_span(4);
+        let whole = staging_status(&conn).unwrap();
+        assert!(whole[0].released_slices.is_empty() && whole[0].staged_slices.is_empty());
+
+        seed_range_on(&conn, set, "V-T1", 1..=2);
+        release_covered_slices(&conn, &config_for(dir.path()), set, 1).unwrap();
+        let info = staging_status(&conn).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].released_slices, [1, 2]);
+        assert_eq!(info[0].staged_slices, [3, 4]);
+        assert_eq!(info[0].write_count, 1, "the range row is a write");
+        assert!(
+            info[0].on_disk_problems.is_empty() && info[0].remedy.is_none(),
+            "released slices are not missing: {info:?}"
         );
     }
 

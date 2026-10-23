@@ -207,6 +207,52 @@ fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
     msg
 }
 
+/// `[{"stage_set_id": N, "slices": [..]}, ..]` for a report's per-slice
+/// lists (#478).
+fn slice_runs_json(runs: &[(i64, Vec<i64>)]) -> serde_json::Value {
+    runs.iter()
+        .map(|(id, slices)| serde_json::json!({ "stage_set_id": id, "slices": slices }))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// The lines naming what the per-slice release did (#478; ADR-0012 item
+/// 129): each set's slices released, and each set's slices kept because they
+/// are short of copies, with what writes them. Empty when it did nothing.
+fn slice_release_notice(report: &clean::CleanReport) -> String {
+    let mut msg = String::new();
+    for (id, slices) in &report.slices_released {
+        msg.push_str(&format!(
+            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
+             cartridges and is released slice by slice)\n",
+            clean::describe_slice_numbers(slices)
+        ));
+    }
+    for (id, slices) in &report.slices_short {
+        msg.push_str(&format!(
+            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
+             span; `tapectl volume write <LABEL>` onto another cartridge of the same \
+             generation writes them (--force would leave the ranges already on tape unable \
+             to be continued)\n",
+            clean::describe_slice_numbers(slices)
+        ));
+    }
+    msg
+}
+
+/// `staging status`'s line for a set released in part (#478).
+fn partly_released_notice(r: &StagingRow) -> String {
+    format!(
+        "stage set {} ({} v{}) spans cartridges and is released slice by slice: slice(s) {} \
+         released, {} still staged",
+        r.id,
+        r.unit,
+        r.version,
+        clean::describe_slice_numbers(&r.released_slices),
+        clean::describe_slice_numbers(&r.staged_slices),
+    )
+}
+
 #[derive(Tabled, Serialize)]
 struct StagingRow {
     #[tabled(rename = "ID")]
@@ -244,6 +290,15 @@ struct StagingRow {
     /// The command that makes the set whole again; `null` when it is.
     #[tabled(skip)]
     remedy: Option<String>,
+    /// #478 (ADR-0012 item 129): a set released in part, slice by slice —
+    /// the slice numbers released. Empty unless it was. Printed below the
+    /// table, not in it.
+    #[tabled(skip)]
+    released_slices: Vec<i64>,
+    /// With `released_slices`, the slice numbers still staged; empty when it
+    /// is.
+    #[tabled(skip)]
+    staged_slices: Vec<i64>,
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -299,6 +354,8 @@ pub fn run(
                     staged: i.staged_at,
                     problems: i.on_disk_problems,
                     remedy: i.remedy,
+                    released_slices: i.released_slices,
+                    staged_slices: i.staged_slices,
                 })
                 .collect();
             if json_output {
@@ -330,9 +387,20 @@ pub fn run(
                         s
                     })
                     .collect();
+                // #478 (ADR-0012 item 129): a set that spans cartridges is
+                // released slice by slice, and stays 'staged' until its last
+                // slice goes.
+                let partly: Vec<String> = rows
+                    .iter()
+                    .filter(|r| !r.released_slices.is_empty())
+                    .map(partly_released_notice)
+                    .collect();
                 println!("{}", Table::new(rows));
                 for b in broken {
                     println!("{b}");
+                }
+                for p in partly {
+                    println!("{p}");
                 }
             }
         }
@@ -434,6 +502,10 @@ pub fn run(
                 } else {
                     let under_ids: std::collections::HashSet<i64> =
                         under_copied.iter().map(|u| u.unit_id).collect();
+                    // The candidates are the whole-set rule's
+                    // (`release_candidate_predicate_sql`): a set holding a
+                    // range is never one, it is released slice by slice
+                    // below, whatever this split decides.
                     let covered_ids: Vec<i64> = candidates
                         .into_iter()
                         .map(|(id, _)| id)
@@ -454,6 +526,20 @@ pub fn run(
                     )
                 }
             };
+            // #478 (ADR-0012 items 85 and 129; ruling X15): the sets that
+            // hold a range are released slice by slice, each slice once its
+            // copies meet its unit's floor, over the whole scope and
+            // whatever the min_copies split above decided. `--force` has
+            // already released them whole.
+            if !*force {
+                let scope = match unit_scope {
+                    Some(ids) => release_scope(ids, *version),
+                    None => clean::CleanScope::Whole,
+                };
+                report.absorb(crate::staging::release::release_ranges(
+                    conn, config, scope,
+                )?);
+            }
             clean::reclaim_session_dirs_and_lockfiles(
                 conn,
                 config,
@@ -508,6 +594,11 @@ pub fn run(
                             "copies": u.copies,
                             "min_copies": u.min_copies,
                         })).collect::<Vec<_>>(),
+                        // #478 (ADR-0012 item 129): slices released on their
+                        // own from sets that span cartridges, and those
+                        // still short of copies. Always present.
+                        "slices_released": slice_runs_json(&report.slices_released),
+                        "slices_short": slice_runs_json(&report.slices_short),
                     })
                 );
             } else {
@@ -570,6 +661,7 @@ pub fn run(
                 if !retained.is_empty() {
                     print!("{}", retention_notice(&retained));
                 }
+                print!("{}", slice_release_notice(&report));
             }
         }
     }
@@ -1352,6 +1444,129 @@ mod tests {
         assert!(msg.contains("--unit"), "{msg}");
     }
 
+    /// #478 (ADR-0012 items 85 and 129): a bare `staging clean` releases a
+    /// spanning set slice by slice: the slices tape 1's range gave their
+    /// copies go, the others stay, and the report names both. A whole unit
+    /// short of copies beside it is still retained by the min_copies split,
+    /// which does not reach the span (ruling X15).
+    #[test]
+    fn clean_releases_a_spans_covered_slices_and_names_the_short_ones() {
+        use crate::staging::release::fixtures::*;
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 1);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let (span, files) = staged_span(&conn, alpha, 1, "staged", dir.path(), 3);
+        range_on(&conn, &span, "V-T1", 1..=2);
+        // Beta: written whole, but onto a volume that is not eligible, so it
+        // has no copy and the min_copies split retains it.
+        let short = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+        add_write(&conn, &short, "V-B1", "initialized", "completed");
+
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: Vec::new(),
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.exists()).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert_eq!(stage_set_status(&conn, span.stage_set_id), "staged");
+        assert!(short.file.exists(), "beta has no eligible copy: retained");
+
+        let mut report = clean::CleanReport::default();
+        report.slices_released.push((span.stage_set_id, vec![1, 2]));
+        report.slices_short.push((span.stage_set_id, vec![3]));
+        let notice = slice_release_notice(&report);
+        assert!(
+            notice.contains(&format!(
+                "stage set {}: slice(s) 1-2 released",
+                span.stage_set_id
+            )),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "stage set {} kept in part: slice(s) 3 are short of copies",
+                span.stage_set_id
+            )) && notice.contains("`tapectl volume write <LABEL>`"),
+            "{notice}"
+        );
+        assert!(slice_release_notice(&clean::CleanReport::default()).is_empty());
+    }
+
+    /// `staging clean --unit` narrows the per-slice release too: another
+    /// unit's span is never reached.
+    #[test]
+    fn clean_with_unit_releases_only_that_units_span() {
+        use crate::staging::release::fixtures::*;
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir_and_min_copies(dir.path(), 1);
+        let paths = TapectlPaths::new(dir.path().to_path_buf());
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let (a, a_files) = staged_span(&conn, alpha, 1, "staged", dir.path(), 2);
+        let (b, b_files) = staged_span(&conn, beta, 1, "staged", dir.path(), 2);
+        range_on(&conn, &a, "V-A", 1..=1);
+        range_on(&conn, &b, "V-B", 1..=1);
+
+        run(
+            &conn,
+            &paths,
+            &config,
+            &StagingCommands::Clean {
+                force: false,
+                unit: vec!["testlib/alpha".to_string()],
+                version: None,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!a_files[0].exists() && a_files[1].exists());
+        assert!(b_files[0].exists(), "beta was not named");
+        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
+    }
+
+    /// `staging status` names a set released in part, with the slices
+    /// released and those still staged.
+    #[test]
+    fn partly_released_notice_names_released_and_staged_slices() {
+        let row = StagingRow {
+            id: 7,
+            unit: "photos".to_string(),
+            version: 2,
+            status: "staged".to_string(),
+            slices: Some(5),
+            encrypted_bytes: Some(1),
+            writes: 1,
+            staged: None,
+            problems: Vec::new(),
+            remedy: None,
+            released_slices: vec![1, 2, 3],
+            staged_slices: vec![4, 5],
+        };
+        assert_eq!(
+            partly_released_notice(&row),
+            "stage set 7 (photos v2) spans cartridges and is released slice by slice: \
+             slice(s) 1-3 released, 4-5 still staged"
+        );
+    }
+
     /// `staging status --json` shape (issue: C2 row-listing drift). One row
     /// has every optional field populated with a byte count that is NOT an
     /// even multiple of 1 MiB -- proof the JSON carries raw bytes, not the
@@ -1373,6 +1588,8 @@ mod tests {
                 remedy: Some(
                     "tapectl volume read-slices --from L6-0001 --unit backups".to_string(),
                 ),
+                released_slices: vec![1],
+                staged_slices: vec![2, 3],
             },
             StagingRow {
                 id: 2,
@@ -1385,12 +1602,14 @@ mod tests {
                 staged: None,
                 problems: Vec::new(),
                 remedy: None,
+                released_slices: Vec::new(),
+                staged_slices: Vec::new(),
             },
         ];
         let value = staging_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"num_slices":3,"on_disk_problems":["slice 2: no staged file recorded"],"remedy":"tapectl volume read-slices --from L6-0001 --unit backups","stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"on_disk_problems":[],"remedy":null,"stage_set_id":2,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
+            r#"[{"num_slices":3,"on_disk_problems":["slice 2: no staged file recorded"],"released_slices":[1],"remedy":"tapectl volume read-slices --from L6-0001 --unit backups","stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","staged_slices":[2,3],"status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"on_disk_problems":[],"released_slices":[],"remedy":null,"stage_set_id":2,"staged_at":null,"staged_slices":[],"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
         );
     }
 }

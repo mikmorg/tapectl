@@ -340,7 +340,7 @@ pub fn run(
                 }
                 to_stage.push(staging::jobs::StageJob {
                     unit_name: n.clone(),
-                    snapshot_id: snapshot_to_stage(conn, n, *version)?,
+                    snapshot_id: snapshot_to_stage(conn, config, n, *version)?,
                     admission: if version.is_some() {
                         staging::Admission::Restage
                     } else {
@@ -465,7 +465,12 @@ fn write_in_flight_remedy(label: Option<&str>, status: Option<String>) -> String
 /// The snapshot `stage create NAME [--version V]` stages: the unit's latest
 /// unstaged snapshot, or version `V` when no stage set of it has live slices
 /// (issue #53's re-stage, with the refusals that name what to do instead).
-fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> Result<i64> {
+fn snapshot_to_stage(
+    conn: &Connection,
+    config: &Config,
+    name: &String,
+    version: Option<i64>,
+) -> Result<i64> {
     let unit = crate::db::queries::get_unit_by_name(conn, name)?
         .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
 
@@ -527,12 +532,27 @@ fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> 
                 // across volumes, and the costliest thing to be
                 // wrong about is telling someone to delete slices
                 // something is still using.
+                //
+                // #478 (ADR-0012 item 129): `release_blocker_judged` adds
+                // the policy `release_blocker` leaves out, the slices of a
+                // set holding a range still short of copies.
                 let mut worst = staging::clean::ReleaseBlocker::None;
                 for id in &live_ids {
-                    let b = staging::clean::release_blocker(conn, *id)?;
+                    let b = staging::release::release_blocker_judged(conn, config, *id)?;
                     let rank = |x: &staging::clean::ReleaseBlocker| match x {
-                        staging::clean::ReleaseBlocker::WriteInFlight { .. } => 5,
-                        staging::clean::ReleaseBlocker::Interrupted { .. } => 4,
+                        staging::clean::ReleaseBlocker::WriteInFlight { .. } => 6,
+                        staging::clean::ReleaseBlocker::Interrupted { .. } => 5,
+                        // #478: the short slices of a span in progress are
+                        // the only source its next tape can continue from:
+                        // staging the version again makes a different stage
+                        // set, whose ciphertext cannot continue the ranges
+                        // already sealed. So `--force` costs more here than
+                        // for an abandoned session (a re-confirmation, and
+                        // its remedy text recommends --force) or a cut set
+                        // (written nowhere, nothing on tape to orphan), and
+                        // it outranks both; a live or resumable session
+                        // still outranks it, being in use now or next.
+                        staging::clean::ReleaseBlocker::SlicesShort { .. } => 4,
                         staging::clean::ReleaseBlocker::Abandoned { .. } => 3,
                         // #420: never written whole, as `NeverWritten`, but
                         // it names the volume that cut it.
@@ -582,6 +602,22 @@ fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> 
                              version up"
                         )
                     }
+                    // #478 (ADR-0012 items 85 and 129): a span in
+                    // progress. Its released slices are on tape; the short
+                    // ones continue it, and are released one by one as
+                    // their copies land.
+                    staging::clean::ReleaseBlocker::SlicesShort { slices } => format!(
+                        "{head}, and it spans cartridges: slice(s) {} are not yet on as many \
+                         tapes as the unit's policy requires, so they stay staged and are \
+                         released one by one as each gets its copies. They are what continues \
+                         the span: an ordinary `tapectl volume write <LABEL>` onto another \
+                         cartridge of the same generation writes them (`--init` initialises a \
+                         new one). Do not give them up with --force: staging the version again \
+                         makes a different stage set, which cannot continue the ranges already \
+                         sealed on tape. `tapectl staging clean --unit {name} --version {v}` \
+                         releases each slice once it has its copies",
+                        staging::clean::describe_slice_numbers(slices)
+                    ),
                     // #292: `--force` here destroys the recovery.
                     // Name `volume resume` first, as the Tier-3
                     // refusal does for a sealed-but-unconfirmed
@@ -1320,6 +1356,70 @@ mod tests {
         assert!(!msg.contains("volume resume"), "{msg}");
         assert!(!msg.contains("aborted"), "{msg}");
         assert!(!msg.contains("min_copies"), "{msg}");
+    }
+
+    /// #478 (ADR-0012 items 85 and 129): a version spanning cartridges,
+    /// whose tape so far holds its slice 1 as a `range` row and whose slice
+    /// 2 is still short of copies. The refusal names the short slice, says
+    /// what continues the span (an ordinary `volume write` onto another
+    /// cartridge) and warns that `--force` would orphan the sealed range,
+    /// instead of reading the set as releasable or abandoned.
+    #[test]
+    fn create_with_version_refusal_names_the_short_slices_of_a_span() {
+        let (conn, paths, config, tmp) = staged_unit_with_write("completed", "sealed", true);
+        let stage_set_id: i64 = conn
+            .query_row("SELECT id FROM stage_sets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // Read the completed write as tape 1 of a span: a `range` row that
+        // holds slice 1, and a second slice planned after the cut.
+        let extra = tmp.path().join("slice-2.age");
+        fs::write(&extra, b"slice two").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 2, 9, 9, 'p', 'e2', ?2)",
+            params![stage_set_id, extra.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE writes SET status = 'range', may_span = 1 WHERE stage_set_id = ?1",
+            params![stage_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             SELECT w.id, sl.id, CAST(5 + sl.slice_number AS TEXT),
+                    CASE WHEN sl.slice_number = 1 THEN 'written' ELSE 'pending' END
+               FROM writes w JOIN stage_slices sl ON sl.stage_set_id = w.stage_set_id
+              WHERE w.stage_set_id = ?1",
+            params![stage_set_id],
+        )
+        .unwrap();
+
+        let msg = stage_version_1_refusal(&conn, &paths, &config);
+        assert!(
+            msg.contains("already has a stage set with live slices"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("spans cartridges: slice(s) 1-2 are"),
+            "at the default min_copies of 2 both are short: {msg}"
+        );
+        assert!(msg.contains("`tapectl volume write <LABEL>`"), "{msg}");
+        assert!(
+            msg.contains("another cartridge of the same generation"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Do not give them up with --force"),
+            "--force orphans the sealed range: {msg}"
+        );
+        assert!(
+            msg.contains("tapectl staging clean --unit unit1 --version 1"),
+            "{msg}"
+        );
+        assert!(!msg.contains("volume resume"), "{msg}");
+        assert!(!msg.contains("aborted"), "{msg}");
     }
 
     /// `create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set`
