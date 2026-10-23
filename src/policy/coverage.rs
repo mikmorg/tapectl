@@ -1047,21 +1047,7 @@ pub fn slice_copies(
     conn: &Connection,
     stage_set_id: i64,
 ) -> crate::error::Result<Vec<SliceCopies>> {
-    let count = |counted| SliceCount {
-        set: "css.id",
-        partition: Partition::Version("css.snapshot_id"),
-        exclude: None,
-        counted,
-    };
-    let sql = format!(
-        "SELECT cl.id, cl.slice_number, {}, {}
-         FROM stage_sets css JOIN stage_slices cl ON cl.stage_set_id = css.id
-         WHERE css.id = ?1
-         ORDER BY cl.slice_number",
-        count(Counted::Copies).at_slice("cl.id"),
-        count(Counted::Places).at_slice("cl.id"),
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&slice_copies_sql())?;
     let rows = stmt
         .query_map(params![stage_set_id], |r| {
             Ok(SliceCopies {
@@ -1073,6 +1059,25 @@ pub fn slice_copies(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// [`slice_copies`]' statement: the stage set `?1`'s slices, each with its
+/// copies and places.
+fn slice_copies_sql() -> String {
+    let count = |counted| SliceCount {
+        set: "css.id",
+        partition: Partition::Version("css.snapshot_id"),
+        exclude: None,
+        counted,
+    };
+    format!(
+        "SELECT cl.id, cl.slice_number, {}, {}
+         FROM stage_sets css JOIN stage_slices cl ON cl.stage_set_id = css.id
+         WHERE css.id = ?1
+         ORDER BY cl.slice_number",
+        count(Counted::Copies).at_slice("cl.id"),
+        count(Counted::Places).at_slice("cl.id"),
+    )
 }
 
 /// A SQL boolean: every slice of the stage set `set_expr` is on a SEALED
@@ -1411,22 +1416,7 @@ pub fn short_required_locations_excluding(
             .query_map(params![unit_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?,
     };
-    let q = CoverageQuery {
-        scope: CoverageScope::Snapshot { id_expr: "?1" },
-        exclude_volume: exclude_volume.map(|_| "?2"),
-    };
-    // ?1 is the version, ?2 the excluded volume when there is one, and the
-    // names follow.
-    let first_name = 2 + usize::from(exclude_volume.is_some());
-    let names = (0..wanted.len())
-        .map(|i| format!("?{}", first_name + i))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT l.name, {} FROM locations l WHERE l.name IN ({names})",
-        scope_sum(&q, Counted::CopiesAt("l.id")),
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&copies_at_names_sql(exclude_volume.is_some(), wanted.len()))?;
     // The fewest copies any examined version holds at each name; a version
     // holding none there makes it 0, and no version at all leaves every
     // name at 0.
@@ -1462,6 +1452,25 @@ pub fn short_required_locations_excluding(
         })
         .filter(|(_, copies)| *copies < per_name)
         .collect())
+}
+
+/// [`short_required_locations_excluding`]' statement: each of `names` named
+/// locations (`?2`.. or, with `exclude`, `?3`..) that exists, with the copies
+/// version `?1` has there, the volume `?2` pretended away when `exclude`.
+fn copies_at_names_sql(exclude: bool, names: usize) -> String {
+    let q = CoverageQuery {
+        scope: CoverageScope::Snapshot { id_expr: "?1" },
+        exclude_volume: exclude.then_some("?2"),
+    };
+    let first_name = 2 + usize::from(exclude);
+    let names = (0..names)
+        .map(|i| format!("?{}", first_name + i))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "SELECT l.name, {} FROM locations l WHERE l.name IN ({names})",
+        scope_sum(&q, Counted::CopiesAt("l.id")),
+    )
 }
 
 /// The names in a [`short_required_locations`] answer that hold no copy at
@@ -5940,5 +5949,77 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    /// The tables a statement reads in full by its plan: a `SCAN` of a table
+    /// with no index, or an AUTOMATIC index SQLite builds by reading one
+    /// (catalog_budget's reading, on the live schema). Parameters stay unbound
+    /// (`raw_query` does not check their count), which plans as for any value.
+    fn tables_read_in_full(sql: &str) -> Vec<String> {
+        let conn = crate::db::open_memory().unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let mut rows = stmt.raw_query();
+        let mut plan: Vec<String> = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push(row.get(3).unwrap());
+        }
+        plan.into_iter()
+            .filter(|l| {
+                let scan = l
+                    .strip_prefix("SCAN ")
+                    .is_some_and(|rest| !rest.starts_with('(') && !rest.starts_with("CONSTANT"))
+                    && !l.contains(" USING ");
+                scan || l.contains("AUTOMATIC")
+            })
+            .collect()
+    }
+
+    /// #478: every shape of the per-slice counts, and the statements of
+    /// `slice_copies`, the named-place count and the promotion rule, is
+    /// driven by keys: no table is read in full (#373's rule, catalog_budget's
+    /// pin, for the shapes no budgeted command runs). The positive control is
+    /// a predicate on an unindexed column.
+    #[test]
+    fn the_per_slice_counts_read_no_table_in_full() {
+        assert_eq!(
+            tables_read_in_full("SELECT id FROM writes WHERE status = 'range'").len(),
+            1,
+            "the reader sees a full scan"
+        );
+        let scopes = [
+            CoverageQuery::current_unit("?1"),
+            CoverageQuery {
+                scope: CoverageScope::Snapshot { id_expr: "?1" },
+                exclude_volume: Some("?2"),
+            },
+            CoverageQuery {
+                scope: CoverageScope::Unit {
+                    id_expr: "?1",
+                    current_only: false,
+                },
+                exclude_volume: None,
+            },
+        ];
+        let mut statements = vec![
+            slice_copies_sql(),
+            copies_at_names_sql(true, 2),
+            format!(
+                "SELECT {}",
+                every_slice_on_sealed_volume_sql("?1", Some("?2"))
+            ),
+        ];
+        for q in scopes {
+            for expr in [
+                copy_count_expr(&q),
+                location_count_expr(&q),
+                deposit_count_expr(&q),
+            ] {
+                statements.push(format!("SELECT {expr}"));
+            }
+        }
+        for sql in &statements {
+            let full = tables_read_in_full(sql);
+            assert!(full.is_empty(), "{full:#?} in the plan of\n{sql}");
+        }
     }
 }
