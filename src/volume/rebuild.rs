@@ -267,11 +267,13 @@ pub struct RebuildReport {
     pub range_units: Vec<RebuiltRange>,
     /// `<unit> v<N>` of each version whose snapshot this run FOUND `staged`
     /// and made `current`, because with this tape every slice of a stage set
-    /// of it is on a sealed volume (item 128, the confirm rule;
-    /// `layout-session.md` "Promotion and the retire floor"). Only for a
+    /// of it is on a volume the catalog records sealed (item 128, the confirm
+    /// rule; `layout-session.md` "Promotion and the retire floor"). Only for a
     /// spannable set: a snapshot row this run inserts is inserted with the
     /// status the rule gives it, and a whole unit's found snapshot is left
-    /// as it was found, as before 1.7.0.
+    /// as it was found, as before 1.7.0. Each also gets the snapshot's
+    /// `sealed_current` status-change event, as confirm's promotion does
+    /// (ADR-0012 item 144).
     pub versions_promoted: Vec<String>,
     /// The spannable versions on this tape that some slice of is still on
     /// no tape this catalog records, after this run: the to-do list's span
@@ -994,6 +996,31 @@ fn rebuild_contacted(
         &mut report,
     )?;
     tx.commit()?;
+
+    // #478 (item 128): a snapshot this run found `staged` and made `current`
+    // gets the status-change event confirm's promotion records, after the
+    // commit and best-effort, for confirm's reason: an advisory row must not
+    // roll back the rows it describes.
+    for p in &inserted.promoted {
+        if let Err(e) = crate::db::events::log_field_change(
+            conn,
+            "snapshot",
+            p.snapshot_id,
+            &p.unit_name,
+            "sealed_current",
+            "status",
+            Some(&p.old_status),
+            "current",
+            Some(p.tenant_id),
+        ) {
+            tracing::warn!(
+                snapshot_id = p.snapshot_id,
+                unit = %p.unit_name,
+                error = %e,
+                "rebuilt, but the snapshot-promotion audit row could not be written"
+            );
+        }
+    }
 
     // Issue #473: the dar catalogues, after the rows are committed (files
     // placed inside the transaction would be orphaned by a rollback, and
@@ -2230,6 +2257,7 @@ fn insert_all(
     };
 
     let mut sets = Vec::with_capacity(operator.units.len());
+    let mut promoted: Vec<Promotion> = Vec::new();
     for unit in &operator.units {
         // Resolve the unit BEFORE touching `tenants`: a unit the catalog
         // already knows keeps the tenant it already has, and creating that
@@ -2295,19 +2323,20 @@ fn insert_all(
             let laid_down = sealed && slice_on_tape(slice, ended_after);
             ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
         }
-        // X24: after the positions, which are what the rule reads. Only on a
-        // tape whose seal was read: an unsealed tape counts as no sealed
-        // volume, and its rows (`aborted`) hold nothing the rule counts.
-        if unit.may_span && sealed {
+        // X24: after the positions, which are what the rule reads. The order
+        // matters: the volume row is written at the top of this function, so
+        // a tape this run records `sealed` is a sealed volume by the time the
+        // rule is asked; a found row keeps the status it had (#158), and
+        // counts only if that is `sealed`.
+        if unit.may_span {
             promote_spanning_version(
                 tx,
                 unit,
-                written,
                 snapshot_id,
                 stage_set_id,
-                volume_id,
                 snapshot_inserted,
                 report,
+                &mut promoted,
             )?;
         }
 
@@ -2328,7 +2357,11 @@ fn insert_all(
         });
     }
 
-    Ok(Inserted { volume_id, sets })
+    Ok(Inserted {
+        volume_id,
+        sets,
+        promoted,
+    })
 }
 
 /// What [`insert_all`] settled: the volume's row and, for each manifest unit,
@@ -2336,6 +2369,8 @@ fn insert_all(
 struct Inserted {
     volume_id: i64,
     sets: Vec<RebuiltSet>,
+    /// Found snapshots item 128's rule made `current` (#478).
+    promoted: Vec<Promotion>,
 }
 
 /// A stage set of the volume being rebuilt, with what names its catalogue
@@ -2662,48 +2697,76 @@ fn ensure_snapshot(
 /// Item 128's promotion, for a rebuild (`layout-session.md` "Promotion and
 /// the retire floor"; ADR-0012 item 130, X24): a spanning version becomes
 /// `current` once every slice of one of its stage sets is on a sealed
-/// volume, this tape counted: the rebuild read its seal, and records it
-/// without changing the volume's status, so it is named
-/// ([`crate::policy::coverage::every_slice_on_sealed_volume_sql`]'s
-/// `also_sealed`). Asked of a snapshot this run inserted (`staged`) and of
-/// one it found, which an earlier rebuild of another tape of the span left
-/// `staged`: the rebuild of the span's last tape, in whichever order the
-/// tapes come, promotes it, as the confirm of the last tape to seal did.
-/// Guarded as confirm's update is: only from `created` or `staged`, and
-/// never a demotion. As confirm does, a set this tape holds whole
-/// (`completed`) promotes its version without asking the rule (which a set
-/// with no slice rows never meets). A found row it promotes is reported
-/// ([`RebuildReport::versions_promoted`]).
-#[allow(clippy::too_many_arguments)]
+/// volume ([`crate::policy::coverage::every_slice_on_sealed_volume_sql`]).
+///
+/// Only volumes the catalog records `sealed` count. "The volume being
+/// sealed counted" is confirm's and the adoption's, which seal it in the
+/// same transaction; a rebuild never changes a volume's status, so its tape
+/// counts only when this run inserted its row `sealed` (a fresh rebuild of a
+/// sealed tape). A tape under a found `initialized` row (#360's lost write)
+/// does not: its version stays `staged` until the adoption seals the volume
+/// and promotes it. A spannable set held whole on a sealed volume meets the
+/// rule, every slice being on it.
+///
+/// Asked of a snapshot this run inserted (`staged`) and of one it found,
+/// which an earlier rebuild of another tape of the span left `staged`: the
+/// rebuild of the span's last tape, in whichever order the tapes come,
+/// promotes it, as the confirm of the last tape to seal did. Guarded as
+/// confirm's update is: only from `created` or `staged`, and never a
+/// demotion. A found row it promotes is reported
+/// ([`RebuildReport::versions_promoted`]) and pushed to `promoted`, whose
+/// status-change events are logged after the commit, as confirm logs its
+/// own. The promotion of a snapshot the rebuild finds is ADR-0012 item 144:
+/// upward only, by item 128's rule over volumes the catalog records sealed,
+/// never a change to a volume's status.
 fn promote_spanning_version(
     tx: &Connection,
     unit: &envelope::ManifestUnit,
-    written: Written,
     snapshot_id: i64,
     stage_set_id: i64,
-    volume_id: i64,
     inserted: bool,
     report: &mut RebuildReport,
+    promoted: &mut Vec<Promotion>,
 ) -> Result<()> {
-    let promoted = tx.execute(
+    let before: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT s.status, u.name, u.tenant_id
+               FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE s.id = ?1",
+            params![snapshot_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let changed = tx.execute(
         &format!(
             "UPDATE snapshots SET status = 'current'
-              WHERE id = ?1 AND status IN ('created', 'staged') AND (?4 OR {})",
-            crate::policy::coverage::every_slice_on_sealed_volume_sql("?2", Some("?3"))
+              WHERE id = ?1 AND status IN ('created', 'staged') AND {}",
+            crate::policy::coverage::every_slice_on_sealed_volume_sql("?2", None)
         ),
-        params![
-            snapshot_id,
-            stage_set_id,
-            volume_id,
-            written == Written::Completed
-        ],
+        params![snapshot_id, stage_set_id],
     )?;
-    if promoted > 0 && !inserted {
+    if changed > 0 && !inserted {
         report
             .versions_promoted
             .push(format!("{} v{}", unit.name, unit.snapshot_version));
+        if let Some((old_status, unit_name, tenant_id)) = before {
+            promoted.push(Promotion {
+                snapshot_id,
+                old_status,
+                unit_name,
+                tenant_id,
+            });
+        }
     }
     Ok(())
+}
+
+/// A found snapshot [`promote_spanning_version`] made `current`, with what
+/// its status-change event records.
+struct Promotion {
+    snapshot_id: i64,
+    old_status: String,
+    unit_name: String,
+    tenant_id: i64,
 }
 
 fn ensure_stage_set(
@@ -3214,7 +3277,7 @@ fn record_event(
     }
     if !report.versions_promoted.is_empty() {
         span_clause.push_str(&format!(
-            "; made current, every slice now on a sealed volume: {}",
+            "; made current, every slice now on a sealed volume (ADR-0012 item 144): {}",
             report.versions_promoted.join(", ")
         ));
     }

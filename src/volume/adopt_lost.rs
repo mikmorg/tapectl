@@ -1934,11 +1934,29 @@ mod tests {
             );
         }
 
+        /// The snapshot's `sealed_current` status-change events, as
+        /// `(old_value, new_value)`.
+        fn promotion_events(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT old_value, new_value FROM events
+                  WHERE entity_type = 'snapshot' AND action = 'sealed_current'
+                    AND field = 'status' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        }
+
         /// The tail of a span, lost (item 128): tape 1 sealed the range 1..2
         /// in the catalog the backup holds, and the lost tape holds slice 3,
-        /// sealed full. Its row is a `range` and, with it, every slice is on
-        /// a sealed volume: the version is current once the lost write is
-        /// adopted, and the event of the full seal names the range.
+        /// sealed full. Its row is a `range`. The rebuild never changes a
+        /// volume's status, so the lost tape (still `initialized`) is no
+        /// sealed volume and the version stays `staged`; the adoption seals
+        /// it, and with it every slice is on a sealed volume: the version is
+        /// current, its promotion event recorded, and the event of the full
+        /// seal names the range.
         #[test]
         fn a_lost_tail_of_a_span_is_adopted_and_its_version_is_current() {
             let mut w = world();
@@ -1964,7 +1982,13 @@ mod tests {
                 &w.operator.secret_key,
             );
             assert_eq!(report.ended_after, None, "the tail sealed full");
-            assert_eq!(row(&conn, volume_id).0, "range");
+            assert!(report.versions_promoted.is_empty(), "{report:?}");
+            assert_eq!(
+                row(&conn, volume_id),
+                ("range".to_string(), true, "staged".to_string()),
+                "the rebuild counts no volume the catalog does not record sealed"
+            );
+            assert!(promotion_events(&conn).is_empty());
 
             let verdict = adopt(&conn, &mut store, volume_id, "SPAN02", BS).unwrap();
             assert_eq!(verdict, LostAdoption::Adopted { slices: 1 });
@@ -1972,11 +1996,65 @@ mod tests {
                 row(&conn, volume_id),
                 ("range".to_string(), true, "current".to_string())
             );
+            assert_eq!(
+                promotion_events(&conn),
+                [("staged".to_string(), "current".to_string())]
+            );
             let detail = last_write_completed(&conn);
             assert_eq!(detail["ending"], "full");
             assert_eq!(
                 detail["range_units"],
                 serde_json::json!([{"unit": UNIT, "first_slice": 3, "last_slice": 3}])
+            );
+        }
+
+        /// A spannable set held whole on a tape whose volume row is NOT
+        /// sealed (#360's lost write: `initialized`) is `completed` but not
+        /// promoted by the rebuild: item 128 counts only volumes the catalog
+        /// records sealed, and a rebuild never seals a row it finds. The
+        /// adoption seals the volume and promotes it, as confirm would have.
+        #[test]
+        fn a_whole_spannable_set_on_an_unsealed_row_is_not_promoted_by_the_rebuild() {
+            let mut w = world();
+            let (mut store, volume_id, backup) = write_tape(
+                &mut w,
+                "SPAN01",
+                "47800000-0000-4000-8000-000000000364",
+                0..3,
+                None,
+            );
+            let (conn, report) = restored_rebuilt_verified(
+                &backup,
+                &mut store,
+                "SPAN01",
+                volume_id,
+                &w.operator.secret_key,
+            );
+            assert!(report.range_units.is_empty(), "{report:?}");
+            assert!(report.versions_promoted.is_empty(), "{report:?}");
+            assert_eq!(report.found_volume_status.as_deref(), Some("initialized"));
+            assert_eq!(
+                row(&conn, volume_id),
+                ("completed".to_string(), true, "staged".to_string())
+            );
+
+            let verdict = adopt(&conn, &mut store, volume_id, "SPAN01", BS).unwrap();
+            assert_eq!(verdict, LostAdoption::Adopted { slices: 3 });
+            assert_eq!(
+                row(&conn, volume_id),
+                ("completed".to_string(), true, "current".to_string())
+            );
+            let detail: String = conn
+                .query_row(
+                    "SELECT details FROM events WHERE action = 'write_completed'
+                      ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                detail.starts_with("adopted by `volume resume`"),
+                "a full seal with no range: the account alone, as before 1.6.0: {detail}"
             );
         }
 

@@ -6385,6 +6385,30 @@ fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
             vec![format!("{SPAN_UNIT} v7")]
         };
         assert_eq!(promoted, expect_promoted, "order {order:?}");
+        // ADR-0012 item 144: a found row's promotion is logged as confirm's
+        // is, the snapshot's own status-change event.
+        let events: Vec<(String, String, String)> = fresh
+            .prepare(
+                "SELECT entity_label, old_value, new_value FROM events
+                  WHERE entity_type = 'snapshot' AND action = 'sealed_current'
+                    AND field = 'status' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let expect_events: Vec<(String, String, String)> = expect_promoted
+            .iter()
+            .map(|_| {
+                (
+                    SPAN_UNIT.to_string(),
+                    "staged".to_string(),
+                    "current".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(events, expect_events, "order {order:?}");
     }
 }
 
