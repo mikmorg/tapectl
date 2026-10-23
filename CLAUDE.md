@@ -163,7 +163,10 @@ issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below
   `catalog rebuild --from-volume`) only on a matching File 0 uuid, a seal marker binding
   the front index, a passing full verify recorded after the rebuild, and front-index slice
   hashes equal to the catalog's own staged hashes (`stage_sets.origin = 'staged'`);
-  `catalog rebuild` still never changes a status (ADR-0012, 2026-09-29 later amendment).
+  `catalog rebuild` still never changes a status (ADR-0012, 2026-09-29 later amendment),
+  with one exception from 1.7.0: it promotes a spanning snapshot it finds `staged` to
+  `current`, upward only, once every slice is on a volume the catalog records `sealed`
+  (ADR-0012 item 144); a volume's status it never changes.
   Still back up the catalog at the end of every write session.
 
 **2026-09-30 — the structural review** (ADR-0012, "Amendment, 2026-09-30"): nothing in the
@@ -299,6 +302,36 @@ The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) passe
 on 2026-10-22, reading back the slice past the warning and the short seal on the real drive
 (`docs/runs/2026-10-21-1.6.0-acceptance.md`); 1.6.0 is tagged `v1.6.0` on `c9c5877`.
 
+**2026-10-23: 1.7.0, spanning** (`docs/releases/1.7.0.md`; ADR-0012 items 121-144 on the design of
+items 82-95, #478). A unit whose policy sets `allow_spanning` (dotfile > archive set >
+`[defaults]`, off when absent) may have its slices on several tapes: spannable units go last, the
+drive's early warning ends each tape's *range* (the run of one stage set's slices on one volume,
+`writes.status = 'range'`), and the next write lays the owed slices first. Whole units are still
+never split. A tape whose plan holds a slice of a spannable set states `requires = ["short-seal",
+"spanning"]` (a 1.6.0 reader refuses it); the MANIFEST block states `may_span = true` and lists
+every slice, with `tape_position` only for this tape's (`volume-format-v2.md` §1.2, §4.4;
+`layout-session.md` "Spanning"). Migration 039: `writes.may_span` (frozen at plan time; rebuild
+reads the block), `stage_slices.released_at`, `archive_sets.allow_spanning`. Where things live:
+the plan order in `CapacityBudget::place` (`Placement`; `split` is `place` of whole units), wired by
+`volume::write::build_span_layout` (a probe build, `place`, the build in plan order, read back);
+confirm's completed/range/cut split in `session::span_split`, shared with the adoption of a lost
+write; copies per slice (a version is as covered as its least-covered slice, item 127; item 138's
+credit) and item 128's promotion in `policy::coverage` (`slice_copies`,
+`every_slice_on_sealed_volume_sql`); the per-slice staging release in
+`staging::clean::release_covered_slices`; tapectl's restore across cartridges in
+`volume::restore::span` over `slice_holders::holders_of_set`; RESTORE.sh's in `restore_across_tapes`
+and the `span_*` functions (`span_accept` takes a cartridge only by hash under its seal, R8), with
+the one prompt in `swap_loop` (stdin, no timeout, no device held); the rebuild's split in
+`rebuild::tape_split` and item 144's promotion in `promote_spanning_version`. `volume rewrite` and
+compaction refuse a range volume (`write::refuse_range_holder`, item 133). `audit` adds
+`span_in_progress` and four range invariants under `short_seal`; `report failed-stages` is #409's
+report (item 91). RESTORE.sh was re-pinned three times under item 135 (`39d2535e…`), a pin covers
+the range block, and the 1.6.0 RESTORE.sh is a test fixture. The coordinator amended fork X12: a
+whole unit a queued spannable unit pushes past the fill ceiling waits for the next tape, never
+refused (for the CTO, in the release notes). The tag waits for the gate's span leg (item 136),
+the chain and a fresh read of File 1; the real-drive proof (item 137, `scripts/span-acceptance.sh`,
+not written yet) comes before any production use of spanning (`docs/handoff.md` (h)).
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
@@ -389,19 +422,22 @@ Two suites are gated (they skip at runtime unless the env var is set):
 # pass --ignored.
 #
 # DEVICE NUMBERING IS NOT STABLE: the real LTO-6 may be lent to this VM (production
-# owns it from home2 since 2026-09-28; ADR-0012), and a reboot can hand it /dev/nst0. Always set TAPECTL_GATE_TAPE. Discovery fails
-# closed on a non-mhvtl device, so an unset value aborts rather than writing to the
-# real drive — but do not rely on that. Check `ls -l /dev/tape/by-id/` after a boot:
-# scsi-HUJ808A5L4-nst is the REAL drive; scsi-XYZZY_A* are mhvtl. The gate and
-# mhvtl_e2e want an LTO-8 emulation (ULT3580-TD8, `lsscsi`) by its /dev/nstN
-# spelling — since the 2026-09-26 reboot that is nst3/nst4 (A1/A2); nst1/nst2 are TD6
-# and the gate's LTO-8 backend refuses their LTO-6 media.
-TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
+# owns it from home2 since 2026-09-28; ADR-0012), and a reboot can hand it /dev/nst0.
+# A restart of mhvtl's tape daemons renumbers the mhvtl drives too (needrestart did it
+# after an apt upgrade on 2026-10-23). So never hard-code /dev/nstN: resolve it from
+# /dev/tape/by-id at the start of every run, and always set TAPECTL_GATE_TAPE. Discovery
+# fails closed on a non-mhvtl device, so an unset value aborts rather than writing to
+# the real drive — but do not rely on that. scsi-HUJ808A5L4-nst is the REAL drive;
+# scsi-XYZZY_A* are mhvtl. The gate and mhvtl_e2e want an LTO-8 emulation (ULT3580-TD8,
+# `lsscsi`): A1 and A2 are TD8, A3 and A4 TD6, whose LTO-6 media the gate's LTO-8
+# backend refuses. Pass the /dev/nstN spelling the link resolves to, not the by-id path:
+# one of the gate's steps needs that spelling in its config.
+TAPECTL_GATE_TAPE="$(readlink -f /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # TapeStore's own command count held to the kernel's other_cnt (#416 item 12). Same
 # gating; it writes the loaded cartridge. The gate runs it as its last leg, rust_motions.
-TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
+TAPECTL_GATE_TAPE="$(readlink -f /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_motions -- --ignored --nocapture
 
 # Performance scenarios (100k-file unit, 2 GiB write, 184k-file rebuild); ~3 min. The one
