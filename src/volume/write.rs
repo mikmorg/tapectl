@@ -8065,6 +8065,7 @@ mod tests {
             label: label.to_string(),
             ending: session::Ending::Full,
             cut_units: Vec::new(),
+            range_units: Vec::new(),
         }
     }
 

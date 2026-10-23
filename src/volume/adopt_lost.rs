@@ -563,6 +563,7 @@ fn record_adoption(
                 None => crate::volume::session::Ending::Full,
             },
             cut_units,
+            range_units: Vec::new(),
         });
     let details = match as_written
         .as_deref()
