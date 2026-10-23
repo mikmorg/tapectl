@@ -1500,3 +1500,124 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
         );
     }
 }
+
+// ── the isolation scan (`volume-format-v2.md` §2) ──
+
+/// Everything the isolation invariant says no plaintext file may reveal,
+/// for `h`: tenant, unit and file names, each file's sha256 and each
+/// slice's `sha256_plain`, and every key's `age1…` recipient and
+/// fingerprint, the escrow recipient's among them.
+fn needles(h: &Home) -> Vec<String> {
+    let mut needles: Vec<String> = [OPERATOR, TENANT_ONE, TENANT_TWO]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (unit, files) in &h.units {
+        needles.push(unit.clone());
+        for (file, bytes) in files {
+            needles.push(file.clone());
+            needles.push(sha_hex(bytes));
+        }
+    }
+    let mut stmt = h
+        .conn
+        .prepare("SELECT sha256_plain FROM stage_slices")
+        .unwrap();
+    needles.extend(
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap()),
+    );
+    let mut stmt = h
+        .conn
+        .prepare("SELECT fingerprint, public_key FROM encryption_keys")
+        .unwrap();
+    for row in stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+    {
+        let (fingerprint, public_key) = row.unwrap();
+        needles.extend([fingerprint, public_key]);
+    }
+    assert!(needles.contains(&h.escrow_public), "the escrow recipient");
+    needles.sort();
+    needles.dedup();
+    needles
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Every needle found in `bytes`, by raw bytes.
+fn found<'a>(bytes: &[u8], needles: &'a [String]) -> Vec<&'a str> {
+    needles
+        .iter()
+        .filter(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The isolation scan of every tape of `h`: the plaintext files (Files 0
+/// to 3 and the seal, the last) hold none of `needles` nor another tape's
+/// label; every other file is age ciphertext and holds none either.
+fn scan_every_tape(h: &Home) {
+    let needles = needles(h);
+    assert!(
+        needles.iter().all(|n| n.len() >= 15),
+        "a short needle matches ordinary words: {needles:?}"
+    );
+    for (label, medium) in &h.tapes {
+        let files = &medium.files;
+        let seal = files.len() - 1;
+        let plaintext = [0, 1, 2, 3, seal];
+        let mut others: Vec<String> = h.tapes.keys().filter(|l| *l != label).cloned().collect();
+        others.extend(needles.iter().cloned());
+        for (pos, bytes) in files.iter().enumerate() {
+            assert!(
+                found(bytes, &others).is_empty(),
+                "{label} file {pos} reveals {:?}",
+                found(bytes, &others)
+            );
+            if !plaintext.contains(&pos) {
+                assert!(
+                    bytes.starts_with(b"age-encryption.org/v1"),
+                    "{label} file {pos} is not age ciphertext"
+                );
+            }
+        }
+        // Controls: the same search finds a needle planted in File 1, and
+        // finds what File 0 holds by design.
+        let mut planted = files[1].clone();
+        let mid = planted.len() / 2;
+        planted.splice(mid..mid, TENANT_ONE.bytes());
+        assert_eq!(found(&planted, &others), [TENANT_ONE]);
+        assert_eq!(found(&files[0], &[label.clone()]), [label.as_str()]);
+        assert!(
+            String::from_utf8_lossy(crate::volume::format::without_nul_padding(&files[seal]))
+                .contains("[seal]"),
+            "{label}: the last file is the seal"
+        );
+    }
+}
+
+/// The isolation scan (`volume-format-v2.md` §2, §4.4: nothing new is
+/// readable without a key) over every raw tape image of item 93's span:
+/// no tenant, unit or file name, no plaintext hash, no key, and no other
+/// tape's label is anywhere on a tape in the clear, File 1, the front index
+/// and the seal included.
+#[test]
+fn no_tape_of_the_written_span_reveals_a_tenant_unit_file_hash_or_key() {
+    let h = written_93();
+    assert_eq!(h.tapes.len(), 3);
+    scan_every_tape(&h);
+}
+
+/// The isolation scan over every raw tape image of item 94's span.
+#[test]
+fn no_tape_of_a_three_range_span_reveals_a_tenant_unit_file_hash_or_key() {
+    let h = written_94();
+    assert_eq!(h.tapes.len(), 3);
+    scan_every_tape(&h);
+}
