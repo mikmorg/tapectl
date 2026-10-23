@@ -2410,9 +2410,9 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
         AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT,
-        AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
-        AWK_UNIT_UUID,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
+        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -2472,6 +2472,15 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # the seal first, right after the front index: one wind to the end of the data
 # and a rewind. --info says where the tape ended, and --info and --verify print
 # one NOT ON TAPE line for the planned files after it.
+#
+# A tape written since version 1.7.0 may hold part of a unit held across tapes:
+# a range, one unbroken run of its slices in slice order (File 0 then requires
+# spanning). The envelopes list every slice of such a unit and give a tape
+# position only to the slices this tape holds: a slice with none is on another
+# tape. --list says which slices of it this tape holds, --restore names it and
+# never runs dar over part of it (--all restores the units this tape holds
+# whole and names it), and --where and --find print a tape's run of slices
+# when it is not the whole version.
 #
 # A slice that fails its hash, or will not read, can be taken from another copy
 # of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
@@ -4165,6 +4174,14 @@ die_dar() { # <destination>
   die "dar extraction failed (exit $rc) — dar's own message is above."
 }
 
+# A slice with no tape position here is on another tape (volume-format-v2.md
+# 4.4, R6): it is never read from this tape, and never taken for file 0.
+slice_here() { # <slice number> <its tape file here, or empty>
+  [ -z "$2" ] || return 0
+  die "slice $1 has no tape position on this tape: it is on another tape, and is never read from this
+       one (volume-format-v2.md 4.4)."
+}
+
 # Stream one unit's slices off the tape, through age, into dar (#412 item 1).
 # dar reads the slices from FIFOs with --sequential-read, so nothing decrypted
 # is written to disk except the restored files: the 1.0.x restore decrypted
@@ -4205,6 +4222,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
   local hpid wpid st got
   for ((i = 0; i < n; i++)); do
     num=${nums[$i]} tpos=${poss[$i]} size=${sizes[$i]} sha=${shas[$i]}
+    slice_here "$num" "$tpos"
     info "Slice $((i + 1))/$n — tape file $tpos"
     if ! kill -0 "$DAR_PID" 2>/dev/null; then
       die_dar "$destdir"
@@ -4308,6 +4326,7 @@ spool_slices() { # <slices file> [<directory> [<file for the slices not found>]]
   n=$(wc -l <"$list")
   while IFS='|' read -r num tpos size sha; do
     i=$((i + 1))
+    slice_here "$num" "$tpos"
     info "Slice $num ($i/$n) — tape file $tpos"
     if [ "$SALVAGE" = 1 ]; then
       if read_slice_checked "$tpos" "$size" "$sha" "$SCRATCH/slice.enc"; then
@@ -4503,22 +4522,41 @@ note_other_units() {
 }
 
 # Pick the slices of one unit (one version) from the manifest into $3, checked
-# against the file map before any slice is read. Sets PICKED_VERSION and
-# PICKED_BYTES. On a short tape a version with a slice after ENDED_AFTER is
-# cut (volume-format-v2.md 4.2): PICKED_CUT is then 1, PICKED_LAST is its last
-# slice's tape file, $3 is left empty, and the caller names it (R4).
+# against the file map before any slice is read. Sets PICKED_VERSION,
+# PICKED_SPAN (1 when the block states may_span = true) and PICKED_BYTES.
+# Which of its slices this tape holds decides what the version is here
+# (volume-format-v2.md 4.2, 4.4): a slice with no tape_position is on another
+# tape (R6), never at file 0, and one planned after ENDED_AFTER is not on this
+# tape (R3). A version every slice of which is here is whole. One that states
+# may_span = true (a unit that may run across tapes) and has some slices here
+# is a RANGE: PICKED_RANGE is 1, PICKED_COUNT is how many slices it has,
+# PICKED_RUN_FIRST and PICKED_RUN_LAST the first and the last slice here, and
+# PICKED_FILE_FIRST and PICKED_FILE_LAST their tape files. Any other version
+# not here whole is cut: PICKED_CUT is 1 and PICKED_LAST its last slice's
+# planned tape file. For a range or a cut version $3 is left empty, and the
+# caller names it (R4, R7).
 PICKED_VERSION=""
+PICKED_SPAN=0
 PICKED_BYTES=0
 PICKED_CUT=0
 PICKED_LAST=""
+PICKED_RANGE=0
+PICKED_COUNT=0
+PICKED_RUN_FIRST=""
+PICKED_RUN_LAST=""
+PICKED_FILE_FIRST=""
+PICKED_FILE_LAST=""
 pick_slices() { # <manifest> <unit> <out> [version]
-  local manifest=$1 unit=$2 out=$3 want=${4:-} num tpos meb msha isize ihash
+  local manifest=$1 unit=$2 out=$3 want=${4:-} num tpos meb msha isize ihash k="" class n last a b fa fb
   # A volume can carry the SAME unit more than once — two snapshot versions,
   # two stage sets. Collecting every matching [[units]] block concatenated
   # both versions' slices and handed the mix to dar (issue #131). So: buffer
   # per block and emit exactly one version's slices.
   awk -v unit="$unit" -v want="$want" '__AWK_SELECT_VERSION__' "$manifest" >"$WORK/picked.txt" 2>"$WORK/picked_version.txt"
-  PICKED_VERSION=$(tr -d ' \n' <"$WORK/picked_version.txt" 2>/dev/null)
+  PICKED_VERSION=""
+  PICKED_SPAN=0
+  read -r PICKED_VERSION PICKED_SPAN _ <"$WORK/picked_version.txt" 2>/dev/null || true
+  [ "$PICKED_SPAN" = 1 ] || PICKED_SPAN=0
   if [ ! -s "$WORK/picked.txt" ]; then
     if [ -n "$want" ]; then
       die "unit '$unit' has no version $want on this volume
@@ -4531,18 +4569,50 @@ pick_slices() { # <manifest> <unit> <out> [version]
   PICKED_BYTES=0
   PICKED_CUT=0
   PICKED_LAST=""
-  if tape_is_short; then
-    PICKED_LAST=$(awk -F'|' -v k="$ENDED_AFTER" '
-      $2 + 0 > k + 0 { cut = 1 }
-      $2 + 0 > last + 0 { last = $2 + 0 }
-      END { if (cut) print last }
-    ' "$WORK/picked.txt")
-    if [ -n "$PICKED_LAST" ]; then
-      PICKED_CUT=1
-      return 0
-    fi
-  fi
+  PICKED_RANGE=0
+  PICKED_COUNT=0
+  PICKED_RUN_FIRST=""
+  PICKED_RUN_LAST=""
+  PICKED_FILE_FIRST=""
+  PICKED_FILE_LAST=""
+  ! tape_is_short || k=$ENDED_AFTER
+  # One line: what the version is here, its slices, its last planned tape
+  # file, and the first and last slice here with their tape files ("-" for
+  # none). An empty tape_position is never read as a number.
+  read -r class n last a b fa fb < <(awk -F'|' -v k="$k" -v span="$PICKED_SPAN" '
+    { n++ }
+    $2 == "" { away++; next }
+    $2 + 0 > last + 0 { last = $2 + 0 }
+    k != "" && $2 + 0 > k + 0 { past++; next }
+    { here++; if (here == 1) { a = $1; fa = $2 } b = $1; fb = $2 }
+    END {
+      if (away + past == 0) c = "whole"
+      else if (here > 0 && (span == 1 || away > 0)) c = "range"
+      else c = "cut"
+      print c, n + 0, (last == "" ? "-" : last), (a == "" ? "-" : a), (b == "" ? "-" : b), (fa == "" ? "-" : fa), (fb == "" ? "-" : fb)
+    }
+  ' "$WORK/picked.txt")
+  case "$class" in
+  cut)
+    PICKED_CUT=1
+    PICKED_LAST=$last
+    return 0
+    ;;
+  range)
+    PICKED_RANGE=1
+    PICKED_COUNT=$n
+    PICKED_RUN_FIRST=$a
+    PICKED_RUN_LAST=$b
+    PICKED_FILE_FIRST=$fa
+    PICKED_FILE_LAST=$fb
+    # The run this tape holds, for the index programs (range_holders).
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(awk -v unit="$unit" -v want="$PICKED_VERSION" '__AWK_UNIT_UUID__' "$manifest")" \
+      "$PICKED_VERSION" "$a" "$b" "$n" >"$WORK/range.here"
+    return 0
+    ;;
+  esac
   while IFS='|' read -r num tpos meb msha; do
+    slice_here "$num" "$tpos"
     isize=$(file_size_at "$tpos" "$FILES_TXT")
     ihash=$(file_hash_at "$tpos" "$FILES_TXT")
     if [ -z "$isize" ] || [ -z "$ihash" ]; then
@@ -4593,6 +4663,75 @@ note_cut_units() {
     info "    '$u' (version $v), slices to tape file $last"
   done
   info "  The tapes that hold one: $0 --where UNIT $(keys_args)"
+}
+
+# A unit held across tapes, of which this tape holds a range (volume-format-v2.md
+# 4.4): the run of its slices that is here, from pick_slices. A restore needs
+# every slice, 1 to the last, in slice order, from the tapes that hold them
+# (R7): dar is never run over one tape's slices alone.
+range_text() { # <unit> <version>
+  echo "unit '$1' (version ${2:-unknown}) is held across tapes, and this tape holds only part of it:
+       slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of its $PICKED_COUNT, at tape files $PICKED_FILE_FIRST to $PICKED_FILE_LAST. The
+       other slices are on other tapes. A unit held across tapes is restored only with
+       every slice, 1 to $PICKED_COUNT, in slice order, never from one tape's slices alone."
+}
+
+# The tapes an index this run opened names for one version of a unit, with the
+# slices each holds, as --where prints them (this tape among them, with the run
+# it holds). Returns 1 when no open envelope's index names the version.
+range_holders() { # <unit> <version>
+  local d uuid
+  uuid=$(cut -f1 "$WORK/range.here" 2>/dev/null || true)
+  for d in "$CHOSEN_ENV" "$WORK"/opened.*; do
+    [ -f "$d/index/units.tsv" ] || continue
+    if CHK_UNIT="$1" CHK_VER="$2" CHK_UUID="$uuid" INDEX_RANGE="$WORK/range.here" \
+      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_HOLDERS__' "$d/index/units.tsv" >"$WORK/range.holders" 2>/dev/null; then
+      cat "$WORK/range.holders"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Refuse a unit this tape holds a range of, before any slice is read, naming
+# the run that is here and the tapes that hold the rest, as far as an index
+# this key opened says (an index never names a tape written after its own).
+die_range() { # <unit> <version>
+  local holders where
+  if holders=$(range_holders "$1" "$2") && [ -n "$holders" ]; then
+    where="The index this key opened names these tapes for this version, with the slices each
+       holds (a tape never names one written after it: the newest tape's index names the most):
+$holders"
+  else
+    where="No index this key opened names the tapes that hold the other slices (a tape never
+       names one written after it): the newest tape's --where does."
+  fi
+  die "$(range_text "$1" "$2")
+       $where
+       Find the tapes that hold it:
+         $0 --where '$1' $(keys_args)
+       No slice has been read."
+}
+
+# The units --all left out because this tape holds only a range of them, as
+# unit|version|first slice here|last slice here|slices.
+RANGE_UNITS=()
+
+# Said before RESTORE COMPLETE when --all left a unit out because this tape
+# holds only part of it.
+note_range_units() {
+  [ ${#RANGE_UNITS[@]} -gt 0 ] || return 0
+  local line u v a b n
+  echo ""
+  info "HELD ACROSS TAPES: this tape holds only some of the slices of these unit(s), so they were not"
+  info "  restored from it. Each restores with every slice, in slice order, from the tapes that hold them:"
+  for line in "${RANGE_UNITS[@]}"; do
+    IFS='|' read -r u v a b n <<<"$line"
+    info "    '$u' (version $v): slices $a to $b of $n are on this tape"
+    info "      $0 --restore $(keys_args) --unit '$u' --to /your/destination/$u"
+  done
+  info "  Run it with the tape that holds slice 1 loaded. The tapes that hold each slice:"
+  info "    $0 --where UNIT $(keys_args)"
 }
 
 do_restore() {
@@ -4647,6 +4786,7 @@ do_restore() {
     info "Parsing slices for unit: ${targets[0]}"
     pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
     [ "$PICKED_CUT" = 0 ] || die_cut "${targets[0]}" "$PICKED_VERSION" "$PICKED_LAST"
+    [ "$PICKED_RANGE" = 0 ] || die_range "${targets[0]}" "$PICKED_VERSION"
     info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
     restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
     restore_end
@@ -4669,6 +4809,14 @@ do_restore() {
       CUT_UNITS+=("${targets[$i]}|$PICKED_VERSION|$PICKED_LAST")
       continue
     fi
+    if [ "$PICKED_RANGE" = 1 ]; then
+      # --all restores the units this tape holds whole and names the ones it
+      # holds a range of (volume-format-v2.md 4.4); one asked for is refused.
+      [ "$RESTORE_ALL" = 1 ] || die_range "${targets[$i]}" "$PICKED_VERSION"
+      info "  '${targets[$i]}' (version $PICKED_VERSION) is held across tapes: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of $PICKED_COUNT"
+      RANGE_UNITS+=("${targets[$i]}|$PICKED_VERSION|$PICKED_RUN_FIRST|$PICKED_RUN_LAST|$PICKED_COUNT")
+      continue
+    fi
     versions[$i]=$PICKED_VERSION
     info "Restoring '${targets[$i]}' snapshot version ${PICKED_VERSION:-unknown} ($(wc -l <"$WORK/slices.$i") slice(s))"
     total=$((total + PICKED_BYTES))
@@ -4678,6 +4826,11 @@ do_restore() {
 
   if [ ${#order_lines[@]} -eq 0 ]; then
     note_cut_units
+    note_range_units
+    if [ ${#RANGE_UNITS[@]} -gt 0 ]; then
+      die "no unit this envelope lists is on this tape whole: each is cut by the end of the
+       tape or held across tapes (see above). Nothing was restored."
+    fi
     die "no unit this envelope lists is on this tape whole: the tape ended early, after
        file $ENDED_AFTER, and every one is cut (see above). Nothing was restored."
   fi
@@ -4743,6 +4896,14 @@ list_cut_note() { # <unit>
   echo "      $0 --where '$1' $(keys_args)"
 }
 
+# --list says which slices of a unit held across tapes this tape holds.
+list_range_note() { # <unit>
+  echo "    HELD ACROSS TAPES: this tape holds slices $PICKED_RUN_FIRST to $PICKED_RUN_LAST of this version's $PICKED_COUNT"
+  echo "    (tape files $PICKED_FILE_FIRST to $PICKED_FILE_LAST); the others are on other tapes. Restoring it needs every"
+  echo "    slice, in slice order, from the tapes that hold them:"
+  echo "      $0 --where '$1' $(keys_args)"
+}
+
 do_list() {
   local want_version=${1:-} manifest u base
   set_age_ids
@@ -4772,6 +4933,8 @@ do_list() {
       echo "=== $u, snapshot version $PICKED_VERSION — no dar catalogue in this envelope ==="
       if [ "$PICKED_CUT" = 1 ]; then
         list_cut_note "$u"
+      elif [ "$PICKED_RANGE" = 1 ]; then
+        list_range_note "$u"
       else
         echo "    (it can still be restored whole; --list and --path need the catalogue)"
       fi
@@ -4779,6 +4942,7 @@ do_list() {
     fi
     echo "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ==="
     [ "$PICKED_CUT" = 0 ] || list_cut_note "$u"
+    [ "$PICKED_RANGE" = 0 ] || list_range_note "$u"
     dar -l "$base" -N -Q || die "dar could not list the catalogue of '$u'"
   done
   echo ""
@@ -5622,12 +5786,14 @@ finish_pending() {
 }
 
 # The end of a restore: COMPLETE only when no unit came back short. A unit
-# --all left out because the tape ended before it is named, not counted short:
-# it is not on this tape whole by design, and another tape holds it.
+# --all left out because the tape ended before it, or because this tape holds
+# only a range of it, is named, not counted short: it is not on this tape
+# whole by design, and other tapes hold it.
 restore_end() {
   local line
   note_other_units
   note_cut_units
+  note_range_units
   echo ""
   if [ ${#INCOMPLETE[@]} -gt 0 ]; then
     info "RESTORE INCOMPLETE"
@@ -5780,6 +5946,11 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   # ended. The list is unchanged.
   [ "$PICKED_CUT" = 0 ] || die "$(cut_text "$unit" "$ver" "$PICKED_LAST")
        A fill uses a tape that holds the unit whole. Nothing was changed."
+  # Nor from a tape that holds a range of it (ADR-0012 item 143): a range is
+  # never a fill source.
+  [ "$PICKED_RANGE" = 0 ] || die "$(range_text "$unit" "$ver")
+       A fill takes files only from a tape that holds the version whole, and a range is never
+       a fill source. Nothing was changed."
   local last
   last=$(tail -n 1 "$WORK/slices.0" | cut -d'|' -f1)
   awk -F'|' -v last="$last" 'FILENAME == ARGV[1] { need[$1] = 1; next } ($1 in need) || $1 == last' "$WORK/fill.slices" "$WORK/slices.0" >"$WORK/fill.slice.list"
@@ -5912,14 +6083,18 @@ fill_end() { # <list> <root>
 INDEX_OPENED=0
 INDEX_HAD=0
 
-# On a short tape, the versions an opened envelope lists that this tape does
-# not hold whole go to $WORK/cut.versions (uuid TAB version), which the index
-# programs read through INDEX_CUT: a this-tape row of such a version is cut,
-# never a holder, and the loaded tape does not count as holding it (R4).
+# The versions an opened envelope lists that this tape does not hold whole:
+# those the end of a short tape cut go to $WORK/cut.versions (uuid TAB version),
+# and those of a unit held across tapes, of which this tape holds a range, to
+# $WORK/range.versions (uuid TAB version TAB first TAB last slice here TAB
+# slices). The index programs read them through INDEX_CUT and INDEX_RANGE: a
+# this-tape row of either is never a holder of the whole version, and the
+# loaded tape does not count as holding it (R4, volume-format-v2.md 4.4).
 note_cut_versions() { # <envelope dir>
-  tape_is_short || return 0
+  local k=""
   [ -f "$1/MANIFEST.toml" ] || return 0
-  awk -v k="$ENDED_AFTER" '__AWK_CUT_VERSIONS__' "$1/MANIFEST.toml" >>"$WORK/cut.versions"
+  ! tape_is_short || k=$ENDED_AFTER
+  RANGE_OUT="$WORK/range.versions" awk -v k="$k" '__AWK_CUT_VERSIONS__' "$1/MANIFEST.toml" >>"$WORK/cut.versions"
 }
 
 # The line after a listing whose holders include a version this tape cut.
@@ -5927,6 +6102,14 @@ note_cut_holders() {
   [ -s "$WORK/cut.versions" ] || return 0
   info "A holder marked CUT on this tape is the loaded tape, which ended early, after file $ENDED_AFTER (its"
   info "seal marker says so), before the last slice of that version: it does not hold it whole."
+}
+
+# The line after a listing that printed a holder of only some slices of a
+# version (volume-format-v2.md 1.5, 4.4).
+note_range_holders() {
+  [ -s "$WORK/partial.flag" ] || return 0
+  info "A holder marked 'a range' holds only the slices it names of that version, and is not a copy of it"
+  info "on its own: a restore needs every slice, 1 to the last, in slice order, from the tapes that hold them."
 }
 
 index_banner() {
@@ -5993,7 +6176,7 @@ where_every_unit() {
     : >"$WORK/all.counts"
     rc=0
     ALL_TENANT="${WHERE_TENANTS[$i]}" ALL_COUNTS="$WORK/all.counts" ALL_ABSENT="$WORK/all.absent" \
-      INDEX_CUT="$WORK/cut.versions" \
+      INDEX_CUT="$WORK/cut.versions" INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_ALL__' "$f" >>"$WORK/all.out" || rc=$?
     case "$rc" in
     0 | 1)
@@ -6024,12 +6207,15 @@ where_every_unit() {
   info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
   info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
   note_cut_holders
+  note_range_holders
 }
 
 do_where() { # <unit, or --all for every unit>
   local unit=$1 i rc found=0 f
   establish_files
   : >"$WORK/cut.versions"
+  : >"$WORK/range.versions"
+  rm -f "$WORK/partial.flag"
   walk_envelopes where_envelope
   [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
   index_banner
@@ -6048,7 +6234,7 @@ do_where() { # <unit, or --all for every unit>
     f=${WHERE_FILES[$i]}
     rc=0
     WHERE_UNIT="$unit" WHERE_KNOWN="$WORK/where.known" WHERE_TENANT="${WHERE_TENANTS[$i]}" \
-      INDEX_CUT="$WORK/cut.versions" \
+      INDEX_CUT="$WORK/cut.versions" INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_WHERE__' "$f" || rc=$?
     case "$rc" in
     0) found=1 ;;
@@ -6074,6 +6260,7 @@ do_where() { # <unit, or --all for every unit>
   info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
   info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
   note_cut_holders
+  note_range_holders
 }
 
 # --find: the matches of each tenant envelope's paths.tsv, kept in a file so the
@@ -6096,6 +6283,7 @@ find_in_envelope() { # <position>
     : >"$WORK/find.counts"
     FIND_TEXT="$FIND_TEXT" FIND_LIMIT="$FIND_LEFT" FIND_UNITS="$u" FIND_COUNTS="$WORK/find.counts" \
       FIND_WHO="tenant $(safe_str "$who")" INDEX_CUT="$WORK/cut.versions" \
+      INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_FIND__' "$d/index/paths.tsv" >>"$WORK/find.out" || {
       echo "WARNING: the index in the envelope at file $pos has no unit, version or path column, so this script cannot read it." >&2
       : >"$WORK/find.counts"
@@ -6128,6 +6316,8 @@ do_find() { # <text>
   : >"$WORK/find.out"
   establish_files
   : >"$WORK/cut.versions"
+  : >"$WORK/range.versions"
+  rm -f "$WORK/partial.flag"
   walk_envelopes find_in_envelope
   [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
   index_banner
@@ -6150,6 +6340,7 @@ do_find() { # <text>
     info "the path to narrow it."
   fi
   note_cut_holders
+  note_range_holders
   info "To restore one of these from the tape that holds it:"
   info "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
 }
@@ -6467,6 +6658,11 @@ case "${1:-}" in
   echo "      A unit with a slice after it is not on that tape whole: --restore refuses it by name"
   echo "      (--all restores the rest and names it), --list says so, and --where marks that tape"
   echo "      CUT for it."
+  echo "  A tape written since version 1.7.0 may hold part of a unit held across tapes (a range,"
+  echo "      one run of its slices; File 0 requires spanning). --list says which of its slices this"
+  echo "      tape holds, --restore names it and never runs dar over part of it (--all restores the"
+  echo "      rest and names it), and --where and --find print a tape's run of slices when it is"
+  echo "      not the whole version."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -6506,6 +6702,7 @@ esac
         .replace("__AWK_INDEX_WHERE__", AWK_INDEX_WHERE)
         .replace("__AWK_INDEX_ALL__", AWK_INDEX_ALL)
         .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
+        .replace("__AWK_INDEX_HOLDERS__", AWK_INDEX_HOLDERS)
         .replace("__AWK_DAR_DAMAGED__", AWK_DAR_DAMAGED)
         .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
         .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
@@ -7241,9 +7438,9 @@ mod tests {
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
         AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT,
-        AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
-        AWK_UNIT_UUID,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
+        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     // ---- what a 1.6.0 tape declares up front (volume-format-v2.md §1.7,
@@ -9059,6 +9256,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
             ("AWK_INDEX_ALL", AWK_INDEX_ALL),
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
+            ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
@@ -9604,6 +9802,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
             ("AWK_INDEX_ALL", AWK_INDEX_ALL),
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
+            ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),

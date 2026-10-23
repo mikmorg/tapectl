@@ -30,9 +30,10 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, generate_manifest_toml, generate_recovery_md,
-    generate_restore_script_v2, generate_seal_marker, generate_short_seal_marker,
-    generate_system_guide_v2, FrontIndexFile, IdThunkV2Params, ManifestSlice, ManifestUnit,
+    generate_front_index, generate_id_thunk_v2, generate_id_thunk_v2_requiring,
+    generate_manifest_toml, generate_recovery_md, generate_restore_script_v2, generate_seal_marker,
+    generate_short_seal_marker, generate_system_guide_v2, FrontIndexFile, IdThunkV2Params,
+    ManifestSlice, ManifestUnit, REQUIRES_SPAN,
 };
 
 /// The tape's fixed block size; every file on the fake tape is padded to it.
@@ -307,6 +308,9 @@ pub struct UnitOnTape {
     /// sha256 of those bytes.
     pub sizes: Vec<usize>,
     pub hashes: Vec<String>,
+    /// How many slices the unit has, on this tape or not (a span unit's
+    /// `positions` are only the run this tape holds).
+    pub slices: usize,
 }
 
 /// A built fake volume, kept as a template and copied per test.
@@ -327,8 +331,16 @@ enum Era {
     V150,
     /// 1.6.0: `requires = ["short-seal"]` in File 0 and the seal, every seal
     /// states `ended_after`, File 3 and the envelopes state `may_end_early`.
+    /// A tape 1.7.0 writes that holds no slice of a unit that may span is
+    /// this tape (its Files 1 and 2 aside).
     V160,
+    /// 1.7.0, a span tape (ADR-0012 item 124): as 1.6.0, but File 0 and the
+    /// seal state `requires = ["short-seal", "spanning"]`.
+    V170Span,
 }
+
+/// The `requires` line of File 0 and the seal on a span tape (§1.2).
+const SPAN_REQUIRES: &str = "requires = [\"short-seal\", \"spanning\"]";
 
 /// File 3's paragraph from 1.6.0 (volume-format-v2.md §3), with the blank line
 /// after it.
@@ -340,6 +352,14 @@ const MAY_END_EARLY_PARAGRAPH: &str =
 
 /// File 0 as `era` writes it.
 fn era_file0(era: Era, text: String) -> String {
+    if era == Era::V170Span {
+        assert_eq!(
+            text.matches(&format!("\n{SPAN_REQUIRES}\n")).count(),
+            1,
+            "this tapectl's File 0 of a span tape:\n{text}"
+        );
+        return text;
+    }
     let short = "\nrequires = [\"short-seal\"]\n";
     assert_eq!(
         text.matches(short).count(),
@@ -347,7 +367,7 @@ fn era_file0(era: Era, text: String) -> String {
         "this tapectl's File 0:\n{text}"
     );
     match era {
-        Era::V160 => text,
+        Era::V160 | Era::V170Span => text,
         Era::V150 => text.replace(short, "\nrequires = []\n"),
     }
 }
@@ -361,7 +381,7 @@ fn era_front_index(era: Era, text: String) -> String {
         "{text}"
     );
     match era {
-        Era::V160 => text,
+        Era::V160 | Era::V170Span => text,
         Era::V150 => text
             .replace(MAY_END_EARLY_PARAGRAPH, "")
             .replace("\nmay_end_early = true\n", "\n"),
@@ -376,7 +396,7 @@ fn era_manifest(era: Era, text: String) -> String {
         "{text}"
     );
     match era {
-        Era::V160 => text,
+        Era::V160 | Era::V170Span => text,
         Era::V150 => text.replace("\nmay_end_early = true\n", "\n"),
     }
 }
@@ -402,6 +422,7 @@ fn era_seal(era: Era, text: &str) -> String {
             out.push_str(match era {
                 Era::V150 => "requires = []\n",
                 Era::V160 => "requires = [\"short-seal\"]\n",
+                Era::V170Span => "requires = [\"short-seal\", \"spanning\"]\n",
             });
             continue;
         }
@@ -410,7 +431,7 @@ fn era_seal(era: Era, text: &str) -> String {
         }
         out.push_str(line);
         out.push('\n');
-        if in_seal && era == Era::V160 {
+        if in_seal && era != Era::V150 {
             if let Some(n) = line.strip_prefix("file_count = ") {
                 let n: i64 = n.parse().unwrap();
                 out.push_str(&format!("ended_after = {}\n", n - 2));
@@ -479,6 +500,13 @@ fn plan_on_tape(dir: &Path) -> (Vec<FrontIndexFile>, Vec<u8>) {
 /// 3's own entry filled in, then its own entry), and every planned file after
 /// it is gone. File 0, File 3 and the envelopes stay the plan.
 fn cut_tape_dir(dir: &Path, label: &str, k: i64) {
+    // The seal states File 0's features: a span tape's states both (§4.1).
+    let file0 = std::fs::read(dir.join("0")).unwrap();
+    let era = if String::from_utf8_lossy(&file0).contains(SPAN_REQUIRES) {
+        Era::V170Span
+    } else {
+        Era::V160
+    };
     let (mut plan, fi) = plan_on_tape(dir);
     let last = plan.len() as i64 - 1;
     assert!(k <= last - 2, "a short seal comes before the planned one");
@@ -494,7 +522,7 @@ fn cut_tape_dir(dir: &Path, label: &str, k: i64) {
         sha256_encrypted: None,
     });
     let seal = era_seal(
-        Era::V160,
+        era,
         &generate_seal_marker(label, (k + 2) as i32, &fi_sha, &copy),
     );
     assert!(seal.contains(&format!("\nfile_count = {}\nended_after = {k}\n", k + 2)));
@@ -776,6 +804,7 @@ fn box_template() -> &'static Template {
 // ---- the cross-volume index (volume-format-v2.md 1.5), built from the spec ----
 
 /// One `index/units.tsv` row: a (version, holding volume) pair.
+#[derive(Clone)]
 struct IdxRow {
     tenant: &'static str,
     unit: String,
@@ -1144,6 +1173,38 @@ fn build_template_full(
     phantoms: &[Phantom],
     era: Era,
 ) -> Template {
+    build_template_spans(tag, tenants, with_index, hash_column, phantoms, era, &[])
+}
+
+/// A unit held across tapes on a fake span tape (ADR-0012 items 124-125): its
+/// MANIFEST.toml block states `may_span = true` and lists every slice of it,
+/// and only the slices `held` (0-based, one unbroken run) are on this tape,
+/// each with its `tape_position`. A slice before the run is on OTHER02, which
+/// this tape's index names with its run (an index names only tapes written
+/// before its own); a slice after it is on no tape the index knows.
+#[derive(Clone)]
+struct SpanOnTape {
+    unit: &'static str,
+    held: std::ops::Range<usize>,
+}
+
+fn build_template_spans(
+    tag: &str,
+    tenants: &[TenantSpec],
+    with_index: bool,
+    hash_column: bool,
+    phantoms: &[Phantom],
+    era: Era,
+    spans: &[SpanOnTape],
+) -> Template {
+    assert_eq!(
+        era == Era::V170Span,
+        !spans.is_empty(),
+        "a span tape, and only a span tape, holds a unit that may span"
+    );
+    // A span's run, its end clamped to the unit's slices (`usize::MAX` reads
+    // as "to the last").
+    let span_of = |name: &str| spans.iter().find(|sp| sp.unit == name).cloned();
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "heir-restore-sh-template-{tag}-{}",
         std::process::id()
@@ -1265,7 +1326,7 @@ fn build_template_full(
                     uuid: u.uuid.to_string(),
                     snapshot_version: u.version,
                     stage_set_id: u.version,
-                    may_span: false,
+                    may_span: span_of(u.name).is_some(),
                     dar_version: Some("2.7.13".to_string()),
                     dar_command: Some("dar -c base -R /src -N".to_string()),
                     slices: Vec::new(),
@@ -1287,19 +1348,39 @@ fn build_template_full(
     let first_backup = op_pos + 2;
     let mut next = first_backup + tenants.len() as i64;
     let mut slice_cipher: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut held_runs: BTreeMap<String, std::ops::Range<usize>> = BTreeMap::new();
     for s in staged.iter_mut() {
+        let span = span_of(&s.unit.name).map(|sp| SpanOnTape {
+            held: sp.held.start..sp.held.end.min(s.slices.len()),
+            ..sp
+        });
+        if let Some(sp) = &span {
+            assert!(
+                !sp.held.is_empty(),
+                "{}: the run {:?} of its {} slices",
+                s.unit.name,
+                sp.held,
+                s.slices.len()
+            );
+            held_runs.insert(s.unit.name.clone(), sp.held.clone());
+        }
         for (i, plain) in s.slices.iter().enumerate() {
             let cipher = stub_encrypt(&format!("{},op,esc", s.tenant), "", plain);
+            // A span unit's slice outside the run is on another tape: listed,
+            // with its hashes, and no tape_position (item 125).
+            let here = span.as_ref().is_none_or(|sp| sp.held.contains(&i));
             s.unit.slices.push(ManifestSlice {
                 number: i as i64 + 1,
-                tape_position: Some(next),
+                tape_position: here.then_some(next),
                 size_bytes: plain.len() as i64,
                 encrypted_bytes: cipher.len() as i64,
                 sha256_plain: sha256_hex(plain),
                 sha256_encrypted: sha256_hex(&cipher),
             });
-            slice_cipher.push((next, cipher));
-            next += 1;
+            if here {
+                slice_cipher.push((next, cipher));
+                next += 1;
+            }
         }
     }
     let seal_pos = next;
@@ -1344,14 +1425,35 @@ fn build_template_full(
             let mut path_rows = Vec::new();
             for s in which {
                 let bytes: i64 = s.unit.slices.iter().map(|x| x.encrypted_bytes).sum();
-                unit_rows.extend(idx_rows_for(
+                let mut rows = idx_rows_for(
                     s.tenant,
                     &s.unit.name,
                     &s.unit.uuid,
                     s.unit.snapshot_version,
                     s.unit.slices.len() as i64,
                     bytes,
-                ));
+                );
+                // A span unit (§1.5): the `this-tape` row carries the run this
+                // tape's plan holds, and the earlier holder of the slices
+                // before it is OTHER02, with its run.
+                if let Some(held) = held_runs.get(&s.unit.name) {
+                    let first = held.start as i64 + 1;
+                    rows[0].first = first;
+                    rows[0].last = held.end as i64;
+                    if first > 1 {
+                        rows.push(IdxRow {
+                            first: 1,
+                            last: first - 1,
+                            volume: "OTHER02",
+                            volume_uuid: OTHER_UUID,
+                            serial: "OTHERSER02",
+                            state: "sealed",
+                            sealed_at: "2026-09-01T10:00:00Z",
+                            ..rows[0].clone()
+                        });
+                    }
+                }
+                unit_rows.extend(rows);
                 path_rows.push((
                     s.unit.name.clone(),
                     s.unit.snapshot_version,
@@ -1382,7 +1484,7 @@ fn build_template_full(
     };
 
     let mut files: Vec<(i64, &'static str, Vec<u8>)> = Vec::new();
-    let thunk = generate_id_thunk_v2(&IdThunkV2Params {
+    let thunk_params = IdThunkV2Params {
         label: LABEL,
         uuid: "a1b2c3d4-e5f6-4789-a123-456789abcdef",
         media_type: "LTO-6",
@@ -1396,7 +1498,14 @@ fn build_template_full(
         mam_loads: 1,
         created_at: "2026-10-05T00:00:00Z",
         cartridge_identity_source: Some("mam"),
-    });
+    };
+    // A span tape's File 0 comes from the sibling that states both features,
+    // as `build` writes it (ADR-0012 item 124).
+    let thunk = if era == Era::V170Span {
+        generate_id_thunk_v2_requiring(&thunk_params, REQUIRES_SPAN)
+    } else {
+        generate_id_thunk_v2(&thunk_params)
+    };
     files.push((0, "id_thunk", era_file0(era, thunk).into_bytes()));
     files.push((
         1,
@@ -1474,27 +1583,29 @@ fn build_template_full(
         .map(|s| UnitOnTape {
             name: s.unit.name.clone(),
             src: s.src.clone(),
+            // The slices on this tape (a span unit's run; every slice of any
+            // other unit).
             positions: s
                 .unit
                 .slices
                 .iter()
-                .map(|sl| {
-                    sl.tape_position
-                        .expect("a whole unit's slice has a position")
-                })
+                .filter_map(|sl| sl.tape_position)
                 .collect(),
             sizes: s
                 .unit
                 .slices
                 .iter()
+                .filter(|sl| sl.tape_position.is_some())
                 .map(|sl| sl.encrypted_bytes as usize)
                 .collect(),
             hashes: s
                 .unit
                 .slices
                 .iter()
+                .filter(|sl| sl.tape_position.is_some())
                 .map(|sl| sl.sha256_encrypted.clone())
                 .collect(),
+            slices: s.unit.slices.len(),
         })
         .collect();
     Template {
@@ -1917,7 +2028,7 @@ fn a_multi_slice_restore_rewinds_once_and_only_spaces_forward() {
                 assert_eq!(h.count("mt eod"), 0, "no seal read before 1.6.0:\n{ops:#?}");
                 (reads(&h), h.count("mt rewind"), 0)
             }
-            Era::V160 => {
+            Era::V160 | Era::V170Span => {
                 let (r, w) = walk(&h);
                 (r, w, 1)
             }
@@ -9386,4 +9497,782 @@ fn find_envelope_on_a_short_tape_reads_no_seal() {
     assert!(text.contains("ledgers"), "{text}");
     assert_eq!(h.count("mt eod"), 0, "{:#?}", h.ops());
     assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+}
+
+// ---- a unit across tapes, read on one tape (tapectl 1.7.0; volume-format-v2.md
+// §1.2, §1.5, §4.4; ADR-0012 items 124-126, 135, 140, 143; #478) ----
+
+const BIG_UUID: &str = "88888888-9999-aaaa-bbbb-cccccccccccc";
+
+/// alice's `big`, a unit allowed to run across tapes: five or more slices.
+fn big_spec() -> UnitSpec {
+    UnitSpec {
+        cat: Cat::Matched,
+        name: "big",
+        uuid: BIG_UUID,
+        version: 2,
+        seed: 8,
+        files: 4,
+        file_len: 120_000,
+        names: &[],
+        corrupt: &[],
+        tamper: &[],
+    }
+}
+
+fn small_spec(name: &'static str, uuid: &'static str, version: i64, seed: u64) -> UnitSpec {
+    UnitSpec {
+        cat: Cat::Matched,
+        name,
+        uuid,
+        version,
+        seed,
+        files: 2,
+        file_len: 130_000,
+        names: &[],
+        corrupt: &[],
+        tamper: &[],
+    }
+}
+
+const DOCS_UUID: &str = "22222222-3333-4444-5555-666666666666";
+const LEDGERS_UUID: &str = "33333333-4444-5555-6666-777777777777";
+
+/// The third tape of item 93's layout: `big`'s owed run first, slices 3 to N
+/// (slices 1 and 2 are on OTHER02, which its index names), then alice's `docs`
+/// and bob's `ledgers` whole. A full seal: the tape holds a range by its plan.
+fn span_tail_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let tenants = vec![
+            TenantSpec {
+                name: "alice",
+                units: vec![big_spec(), small_spec("docs", DOCS_UUID, 1, 12)],
+            },
+            TenantSpec {
+                name: "bob",
+                units: vec![small_spec("ledgers", LEDGERS_UUID, 3, 13)],
+            },
+        ];
+        build_template_spans(
+            "spantail",
+            &tenants,
+            true,
+            true,
+            &[],
+            Era::V170Span,
+            &[SpanOnTape {
+                unit: "big",
+                held: 2..usize::MAX,
+            }],
+        )
+    })
+}
+
+/// The first tape of item 93's layout, before its end: bob's `ledgers` and
+/// alice's `docs` whole, then `big`, planned whole to its last slice (the
+/// spannable set goes last). Uncut it is item 93's middle tape, holding `big`
+/// whole; `cut` inside `big` makes it the first tape, holding a range 1..K.
+fn span_head_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let tenants = vec![
+            TenantSpec {
+                name: "bob",
+                units: vec![small_spec("ledgers", LEDGERS_UUID, 3, 13)],
+            },
+            TenantSpec {
+                name: "alice",
+                units: vec![small_spec("docs", DOCS_UUID, 1, 12), big_spec()],
+            },
+        ];
+        build_template_spans(
+            "spanhead",
+            &tenants,
+            true,
+            true,
+            &[],
+            Era::V170Span,
+            &[SpanOnTape {
+                unit: "big",
+                held: 0..usize::MAX,
+            }],
+        )
+    })
+}
+
+fn span_unit(t: &Template, name: &str) -> UnitOnTape {
+    unit_of(t, name)
+}
+
+/// The OTHER02 row and this tape's row `--where big` prints on the tail tape.
+fn tail_rows(n: usize) -> (String, String) {
+    (
+        format!("    tape {LABEL}  (this tape, a range: not the whole version)  slices 3-{n} of {n}"),
+        format!(
+            "    tape OTHER02  (sealed 2026-09-01T10:00:00Z, a range: not the whole version)  slices 1-2 of {n}"
+        ),
+    )
+}
+
+/// ADR-0012 item 124 on a tape built from the spec: a span tape's File 0 and
+/// seal state `requires = ["short-seal", "spanning"]`, and its envelope's
+/// block of the unit that may span states `may_span = true`, lists every slice
+/// with its hashes, and gives a `tape_position` only to the run this tape
+/// holds. `--find-envelope` shows it to the tenant (it prints the manifest).
+#[test]
+fn a_span_tape_states_spanning_and_lists_every_slice_of_the_span_unit() {
+    let t = span_tail_template();
+    let big = span_unit(t, "big");
+    assert!(big.slices >= 5, "{big:?}: want a unit of five slices or more");
+    assert_eq!(big.positions.len(), big.slices - 2, "slices 3 to N here");
+    let last = t.total_files - 1;
+    let f0 = std::fs::read_to_string(t.dir.join("tape/0")).unwrap();
+    let seal = std::fs::read_to_string(t.dir.join(format!("tape/{last}"))).unwrap();
+    assert!(
+        f0.contains(&format!("\nlayout_version = 2\n{SPAN_REQUIRES}\n")),
+        "File 0"
+    );
+    assert!(seal.contains(&format!("\n{SPAN_REQUIRES}\n")), "the seal");
+
+    let h = Heir::of(t, &[]);
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let block = &text[text.find("name = \"big\"").expect("big's block")..];
+    let block = &block[..block.find("\n[[units]]").unwrap_or(block.len())];
+    assert!(block.contains("\nmay_span = true\n"), "{block}");
+    assert_eq!(
+        block.matches("\n[[units.slices]]\n").count(),
+        big.slices,
+        "every slice is listed:\n{block}"
+    );
+    assert_eq!(
+        block.matches("\ntape_position = ").count(),
+        big.slices - 2,
+        "a position only on the run here:\n{block}"
+    );
+    assert!(
+        block.contains("[[units.slices]]\nnumber = 1\nsize_bytes = "),
+        "slice 1 has no tape_position:\n{block}"
+    );
+}
+
+/// §4.4: `--info` and `--verify` read without a key and see a range only as
+/// data slices: the verdict is SEALED, every file on the tape passes, and the
+/// slices on other tapes are not in the front index, so nothing names them
+/// missing or damaged. Unchanged but for item 140's line, which a full span
+/// tape has no use for.
+#[test]
+fn info_and_verify_see_a_span_tapes_range_as_data_slices() {
+    let t = span_tail_template();
+    let h = Heir::of(t, &[]);
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    for word in ["NOT ON TAPE", "range", "across", "big", "WARNING"] {
+        assert!(!text.contains(word), "{word:?}:\n{text}");
+    }
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("VERIFY: PASS — every file matches the front index."),
+        "{text}"
+    );
+    let passes = text.lines().filter(|l| l.starts_with("PASS  file")).count();
+    assert_eq!(passes, t.total_files as usize - 1, "{text}");
+    assert!(!text.contains("FAIL") && !text.contains("NOT ON TAPE"), "{text}");
+}
+
+/// `--list` lists a unit held across tapes from its catalogue, as any unit,
+/// and says which of its slices this tape holds (§4.4), reading no slice; a
+/// whole unit's listing says nothing of the kind.
+#[test]
+fn list_names_the_run_of_a_unit_held_across_tapes() {
+    let t = span_tail_template();
+    let big = span_unit(t, "big");
+    let n = big.slices;
+    let h = Heir::of(t, &[]);
+    let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "big"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("=== big, snapshot version 2"), "{text}");
+    let flat_text = flat(&text);
+    for needle in [
+        format!("HELD ACROSS TAPES: this tape holds slices 3 to {n} of this version's {n}"),
+        format!(
+            "(tape files {} to {}); the others are on other tapes.",
+            big.positions[0],
+            big.positions.last().unwrap()
+        ),
+        "--where 'big' --key ".to_string(),
+    ] {
+        assert!(flat_text.contains(&needle), "{needle:?}:\n{text}");
+    }
+    assert!(text.contains("file0.bin"), "its files are listed:\n{text}");
+    let first_slice = big.positions[0];
+    assert!(
+        walk(&h).0.iter().all(|p| *p < first_slice),
+        "no slice is read:\n{:#?}",
+        h.ops()
+    );
+
+    let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "docs"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("HELD ACROSS TAPES"), "{text}");
+}
+
+/// R7 and the brief's single-tape rule: a whole-unit restore of a unit this
+/// tape holds a range of stops before any slice is read and before dar runs,
+/// naming the run here, every slice it needs, and the tapes the index names
+/// with their runs; `--path` into it stops the same way. Nothing is restored.
+/// A slice with no tape position is never read, and never as file 0: the run
+/// reads File 0 once, at the start, and nothing at or after the first slice.
+#[test]
+fn a_restore_of_a_range_stops_before_dar_and_names_the_tapes_it_needs() {
+    let t = span_tail_template();
+    let big = span_unit(t, "big");
+    let n = big.slices;
+    let first_slice = *t.units.iter().flat_map(|u| u.positions.iter()).min().unwrap();
+    let h = Heir::of(t, &[("dar", DAR_SPY)]);
+    let alice = h.key("alice");
+    for extra in [vec![], vec!["--path", "file0.bin"]] {
+        let dest = h.sub(&format!("restored-{}", extra.len()));
+        let mut args = vec!["--restore", "--key", &alice, "--unit", "big", "--to", &dest];
+        args.extend(extra.iter().copied());
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        let (here, other) = tail_rows(n);
+        for needle in [
+            "unit 'big' (version 2) is held across tapes, and this tape holds only part of it:".to_string(),
+            format!(
+                "slices 3 to {n} of its {n}, at tape files {} to {}.",
+                big.positions[0],
+                big.positions.last().unwrap()
+            ),
+            format!("every slice, 1 to {n}, in slice order, never from one tape's slices alone."),
+            here,
+            other,
+            "--where 'big' --key ".to_string(),
+            "No slice has been read.".to_string(),
+        ] {
+            assert!(text.contains(&needle), "{extra:?}: {needle:?}:\n{text}");
+        }
+        assert_eq!(
+            reads(&h).iter().filter(|p| **p == 0).count(),
+            1,
+            "{extra:?}: File 0 once, at the start:\n{:#?}",
+            h.ops()
+        );
+        // Past the wind to the seal (R1), nothing at or after the first slice.
+        assert!(
+            walk(&h).0.iter().all(|p| *p < first_slice),
+            "{extra:?}: no slice is read:\n{:#?}",
+            h.ops()
+        );
+        assert!(
+            !h.dir.join("dar.args").exists()
+                || !std::fs::read_to_string(h.dir.join("dar.args"))
+                    .unwrap()
+                    .contains("-x"),
+            "{extra:?}: dar never extracts"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0),
+            0,
+            "{extra:?}: nothing restored"
+        );
+    }
+}
+
+/// §4.4: `--restore --all` restores every unit the tape holds whole and names
+/// each unit it holds only a range of, with the `--restore --unit` command
+/// that restores it across tapes, before RESTORE COMPLETE. Nothing of the
+/// range is read.
+#[test]
+fn all_on_a_span_tape_restores_the_whole_units_and_names_the_range() {
+    let t = span_tail_template();
+    let big = span_unit(t, "big");
+    let n = big.slices;
+    let h = Heir::of(t, &[]);
+    let dest = h.dir.join("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--all",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    for u in ["docs", "ledgers"] {
+        assert!(
+            same_tree(&unit_of(t, u).src, &dest.join(u)),
+            "{u}:\n{text}"
+        );
+    }
+    assert!(!dest.join("big").exists(), "big is not restored");
+    let note = text
+        .find("HELD ACROSS TAPES: this tape holds only some of the slices of these unit(s)")
+        .unwrap_or_else(|| panic!("the range is named:\n{text}"));
+    let complete = text.find("RESTORE COMPLETE").expect("RESTORE COMPLETE");
+    assert!(note < complete, "named before RESTORE COMPLETE:\n{text}");
+    let named = &text[note..complete];
+    assert!(
+        named.contains(&format!("'big' (version 2): slices 3 to {n} of {n} are on this tape")),
+        "{named}"
+    );
+    assert!(
+        named.contains("--unit 'big' --to /your/destination/big"),
+        "{named}"
+    );
+    assert!(named.contains("--where UNIT --key "), "{named}");
+    let (walked, rewinds) = walk(&h);
+    assert_eq!(rewinds, 1, "{:#?}", h.ops());
+    assert!(ascending(&walked), "{walked:?}");
+    assert!(
+        walked.iter().all(|p| !big.positions.contains(p)),
+        "no slice of the range is read: {walked:?}"
+    );
+}
+
+/// §1.5 and §4.4: `--where` and `--find` print a holder's slice run when it
+/// is not the whole version, mark it a range, and a holder of a range does
+/// not count on its own as holding the version: `--where --all` does not count
+/// this tape for `big`, and names both holders of it with their runs. A unit
+/// this tape holds whole reads as before. The positive control: no tape that
+/// holds every version whole says "a range".
+#[test]
+fn where_and_find_print_each_holders_run_and_a_range_is_no_copy() {
+    let t = span_tail_template();
+    let n = span_unit(t, "big").slices;
+    let h = Heir::of(t, &[]);
+    let (code, text) = h.run(&["--where", "big", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let (here, other) = tail_rows(n);
+    assert!(text.contains(&here), "{text}");
+    assert!(text.contains(&other), "{text}");
+    assert!(
+        text.contains("A holder marked 'a range' holds only the slices it names of that version"),
+        "{text}"
+    );
+    assert!(!text.contains("CUT on this tape"), "{text}");
+
+    let (code, text) = h.run(&["--where", "docs", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&format!("tape {LABEL}  (this tape)  slices 1-")), "{text}");
+    assert!(!text.contains("a range"), "{text}");
+
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("3 unit(s) in this index; this tape holds the newest version of 2 of them."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Unit big (tenant alice): newest version 2, NOT on this tape"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("{LABEL} (this tape: slices 3-{n} only), OTHER02 (slices 1-2 only)")),
+        "the absent list names each holder's run:\n{text}"
+    );
+
+    let (code, text) = h.run(&["--find", "file0", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let holders = block(&text, "Tapes holding big version 2:");
+    assert!(
+        holders.iter().any(|l| l.contains(&here)),
+        "{holders:#?}\n{text}"
+    );
+
+    for h in [Heir::new(), Heir::of(template_150(), &[])] {
+        let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
+        assert_eq!(code, 0, "{text}");
+        assert!(!text.contains("a range") && !text.contains("only)"), "{text}");
+    }
+}
+
+/// Item 93's middle tape: a unit that may span, planned and held whole on one
+/// tape, is a whole unit there (§4.4 "All N slices"): it restores from this
+/// tape alone, and no mode calls it a range.
+#[test]
+fn a_span_unit_held_whole_restores_from_its_one_tape() {
+    let t = span_head_template();
+    let big = span_unit(t, "big");
+    assert_eq!(big.positions.len(), big.slices, "the whole set is here");
+    let h = Heir::of(t, &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "big",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "big"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("HELD ACROSS TAPES"), "{text}");
+    let (code, text) = h.run(&["--where", "big", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&format!("tape {LABEL}  (this tape)  slices 1-")), "{text}");
+    assert!(!text.contains("a range"), "{text}");
+}
+
+/// The first tape of item 93: the early warning came inside `big`, which was
+/// planned to its last slice, so the tape holds the range 1..K and the rest of
+/// the set is cut off this tape by design, not damage. The tape's index row
+/// says the plan's run (1..N); every mode reads the seal and names the run
+/// that is really here: `--where` prints this tape's row as a range of 1-K,
+/// never CUT, `--list` and `--restore` name it, and `--info` and `--verify`
+/// print item 140's one NOT ON TAPE line.
+#[test]
+fn a_range_the_early_warning_ended_is_named_by_its_run_and_not_as_cut() {
+    let t = span_head_template();
+    let big = span_unit(t, "big");
+    let n = big.slices;
+    let h = Heir::of(t, &[]);
+    // The warning in big's third slice.
+    let k = big.positions[2];
+    h.cut(k);
+    let m = t.total_files as i64 - 1;
+
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 0, "{text}");
+    let gone: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("NOT ON TAPE"))
+        .collect();
+    assert_eq!(
+        gone,
+        vec![format!(
+            "NOT ON TAPE  files {} to {m}  (planned; the tape ended after file {k}, and its seal marker is file {})",
+            k + 1,
+            k + 1
+        )],
+        "{text}"
+    );
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        text.lines()
+            .filter(|l| l.trim_start().starts_with("NOT ON TAPE"))
+            .count(),
+        1,
+        "{text}"
+    );
+
+    let (code, text) = h.run(&["--where", "big", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "    tape {LABEL}  (this tape, a range: not the whole version)  slices 1-3 of {n}"
+        )),
+        "the run the seal leaves, not the plan's 1-{n}:\n{text}"
+    );
+    assert!(!text.contains("CUT on this tape"), "{text}");
+
+    let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "big"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        flat(&text).contains(&format!(
+            "HELD ACROSS TAPES: this tape holds slices 1 to 3 of this version's {n} (tape files {} to {k});",
+            big.positions[0]
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("NOT ON THIS TAPE WHOLE"), "{text}");
+
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "big",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(&format!("slices 1 to 3 of its {n}, at tape files")),
+        "{text}"
+    );
+    assert!(text.contains("No slice has been read."), "{text}");
+
+    // docs, wholly before the end, still restores whole.
+    let dest = h.sub("restored-docs");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&unit_of(t, "docs").src, Path::new(&dest)), "{text}");
+}
+
+/// Cut detection with a range present (§4.2, §4.4): on the tail tape ended
+/// early inside `docs`, `big`'s run lies wholly before the end and is still a
+/// range, never CUT, while `docs` and `ledgers` are cut. On the head tape
+/// ended before `big`'s first slice, `big` holds no slice here and is cut. With
+/// nothing whole on the tape, `--all` names both kinds and restores nothing.
+#[test]
+fn cut_detection_keeps_a_range_a_range_and_cuts_a_span_set_with_no_slice_here() {
+    let t = span_tail_template();
+    let n = span_unit(t, "big").slices;
+    let h = Heir::of(t, &[]);
+    let docs = unit_of(t, "docs");
+    h.cut(docs.positions[0]);
+    let (code, text) = h.run(&["--where", "big", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&tail_rows(n).0), "{text}");
+    assert!(!text.contains("(CUT on this tape: it ended early"), "{text}");
+    let (code, text) = h.run(&["--where", "docs", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("(CUT on this tape: it ended early"), "{text}");
+
+    let dest = h.dir.join("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--all",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    for needle in [
+        "NOT ON THIS TAPE WHOLE",
+        "'docs' (version 1)",
+        "'ledgers' (version 3)",
+        "HELD ACROSS TAPES",
+        "'big' (version 2): slices 3 to",
+        "each is cut by the end of the\n       tape or held across tapes (see above). Nothing was restored.",
+    ] {
+        assert!(text.contains(needle), "{needle:?}:\n{text}");
+    }
+
+    let t = span_head_template();
+    let h = Heir::of(t, &[]);
+    h.cut(unit_of(t, "docs").positions[0]);
+    let (code, text) = h.run(&["--where", "big", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("(CUT on this tape: it ended early"), "{text}");
+    assert!(!text.contains("a range"), "{text}");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "big",
+        "--to",
+        &h.sub("cut-big"),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("unit 'big' (version 2) is not on this tape whole: the tape ended early,"),
+        "{text}"
+    );
+}
+
+/// ADR-0012 item 143: a fill never takes files from a range; the refusal says
+/// why, and the list is left as it was.
+#[test]
+fn a_fill_from_a_tape_holding_a_range_is_refused_and_the_list_kept() {
+    let t = span_tail_template();
+    let h = Heir::of(t, &[]);
+    let dir = h.dir.join("restored");
+    std::fs::create_dir_all(&dir).unwrap();
+    let list = dir.join(".tapectl-damaged-files.txt");
+    let body = format!("#tapectl-damaged-files\t1\tunit=big\tuuid={BIG_UUID}\tversion=2\nfile0.bin\n");
+    std::fs::write(&list, &body).unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "big",
+        "--fill-from",
+        list.to_str().unwrap(),
+        "--to",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("unit 'big' (version 2) is held across tapes"),
+        "{text}"
+    );
+    assert!(
+        flat(&text).contains(
+            "A fill takes files only from a tape that holds the version whole, and a range is never a fill source. Nothing was changed."
+        ),
+        "{text}"
+    );
+    assert_eq!(std::fs::read_to_string(&list).unwrap(), body);
+}
+
+/// RESTORE.sh as tapectl 1.6.0 wrote it, byte for byte (the fixture's README
+/// says how it was made; the hash is the pin `tests/on_tape_golden.rs` held in
+/// 1.6.0).
+const RESTORE_SH_1_6_0: &str = include_str!("fixtures/restore_sh_1_6_0/RESTORE-GOLD01-12.sh");
+const RESTORE_SH_1_6_0_SHA256: &str =
+    "d9787a4ffdd05ba038416696d9866a9a285fc97509c35692a18dc3a9b68f9e9d";
+
+/// ADR-0012 item 124: a 1.6.0 RESTORE.sh refuses a span tape at File 0, by
+/// name, in every mode, before it reads anything else of it, full or short,
+/// and points to the RESTORE.sh on the tape itself. The positive control: it
+/// still reads a tape 1.7.0 writes that does not span (it requires
+/// short-seal alone), and restores from it.
+#[test]
+fn the_1_6_0_script_refuses_a_span_tape_at_file_0_by_name_and_reads_one_that_does_not_span() {
+    assert_eq!(
+        sha256_hex(RESTORE_SH_1_6_0.as_bytes()),
+        RESTORE_SH_1_6_0_SHA256,
+        "the fixture is v1.6.0's RESTORE.sh"
+    );
+    for short in [false, true] {
+        let t = span_tail_template();
+        let h = Heir::of(t, &[]);
+        if short {
+            h.cut(unit_of(t, "docs").positions[0]);
+        }
+        std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
+        let alice = h.key("alice");
+        let dest = h.sub("restored");
+        for args in [
+            vec!["--info"],
+            vec!["--verify"],
+            vec!["--find-envelope", "--key", &alice],
+            vec!["--restore", "--key", &alice, "--unit", "docs", "--to", &dest],
+            vec!["--list", "--key", &alice],
+            vec!["--where", "docs", "--key", &alice],
+        ] {
+            let (code, text) = h.run(&args);
+            assert_eq!(code, 1, "short {short}, {args:?}: {text}");
+            for needle in [
+                "this tape requires feature(s) spanning, which this script does not know",
+                "This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely",
+                "fsf 2",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "short {short}, {args:?}: {needle:?}:\n{text}"
+                );
+            }
+            assert_eq!(
+                reads(&h),
+                vec![0],
+                "short {short}, {args:?}: File 0 alone is read:\n{:#?}",
+                h.ops()
+            );
+        }
+    }
+    let h = Heir::new();
+    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&unit("docs").src, Path::new(&dest)), "{text}");
+}
+
+/// A 1.6.0 RESTORE.sh given a span tape as its second cartridge
+/// (`--swap-tapes`) refuses it by the same rule, at that tape's File 0, and
+/// reads nothing else of it.
+#[test]
+fn the_1_6_0_script_refuses_a_span_tape_as_its_second_cartridge() {
+    let t = template();
+    let photos = unit("photos/2019");
+    let h = Heir::new();
+    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
+    flip_in_tape(&h, photos.positions[1]);
+    let all: Vec<Vec<u8>> = (0..photos.positions.len())
+        .map(|i| good_slice(t, &photos, i))
+        .collect();
+    second_tape(&h, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
+    let f0 = h.dir.join("tape2/0");
+    let text: String = String::from_utf8(
+        std::fs::read(&f0)
+            .unwrap()
+            .into_iter()
+            .filter(|b| *b != 0)
+            .collect(),
+    )
+    .unwrap();
+    std::fs::write(&f0, padded(with_requires(&text, SPAN_REQUIRES).into_bytes())).unwrap();
+    let dest = h.sub("restored");
+    let (code, text) = run_with(
+        &h,
+        &restore_args(&h, "photos/2019", &dest),
+        &["--swap-tapes"],
+        "\n",
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+    );
+    assert_eq!(code, 1, "{text}");
+    let swap = h.ops().iter().position(|l| l == "swap").expect("a swap");
+    assert_eq!(
+        reads_in(&h.ops()[swap..]),
+        vec![0],
+        "only the second tape's File 0:\n{:#?}",
+        h.ops()
+    );
+    assert!(
+        text.contains("this tape requires feature(s) spanning, which this script does not know"),
+        "{text}"
+    );
+}
+
+/// This script reads the tapes 1.6.0 and 1.5.0 wrote as before: none of the
+/// range text appears on them, in any mode that names units.
+#[test]
+fn the_1_7_0_script_reads_1_6_0_and_1_5_0_tapes_as_before() {
+    for t in [template(), template_150()] {
+        let h = Heir::of(t, &[]);
+        for args in [
+            vec!["--info".to_string()],
+            vec!["--verify".to_string()],
+            vec!["--list".to_string(), "--key".to_string(), h.key("esc")],
+            vec![
+                "--where".to_string(),
+                "--all".to_string(),
+                "--key".to_string(),
+                h.key("esc"),
+            ],
+        ] {
+            let (code, text) = runv(&h, &args);
+            assert_eq!(code, 0, "{args:?}: {text}");
+            for word in ["HELD ACROSS TAPES", "a range", "spanning", "NOT ON TAPE"] {
+                assert!(!text.contains(word), "{args:?}: {word:?}:\n{text}");
+            }
+        }
+        let dest = h.dir.join("restored");
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("esc"),
+            "--all",
+            "--to",
+            dest.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("RESTORE COMPLETE"), "{text}");
+        assert!(!text.contains("HELD ACROSS TAPES"), "{text}");
+    }
 }

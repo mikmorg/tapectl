@@ -157,6 +157,14 @@ pub(crate) const AWK_UNIT_LIST: &str = r##"
 /// selected; `in_head` tracks POSITION (are we in the key/value region
 /// directly under `[[units]]`?) separately from `in_u`, which tracks
 /// IDENTITY (is this block the unit we want?).
+///
+/// Each line printed is `number|tape_position|encrypted_bytes|sha256_encrypted`
+/// for one slice of the chosen block, in manifest order; `tape_position` is
+/// EMPTY for a slice the block lists with none, which is on another tape
+/// (`volume-format-v2.md` sec 4.4, rule R6: never file 0). Standard error gets
+/// one line, `VERSION MAY_SPAN`: the chosen block's `snapshot_version`, and 1
+/// when its head states `may_span = true` (a unit that may run across tapes,
+/// tapectl 1.7.0), else 0. `may_span` is read in the head only (#135).
 pub(crate) const AWK_SELECT_VERSION: &str = r##"
     function flush() {
       if (in_s && num != "") {
@@ -175,13 +183,14 @@ pub(crate) const AWK_SELECT_VERSION: &str = r##"
     #
     # No apostrophes in these comments: the whole program is single-quoted in
     # the shell, so one would end it mid-awk and break the generated script.
-    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; in_u = 0; in_head = 1; next }
+    /^\[\[units\]\]/ { flush(); blk++; hit[blk] = 0; ver[blk] = -1; span[blk] = 0; in_u = 0; in_head = 1; next }
     /^\[/ { in_head = 0 }
     in_head && /^name = / {
       gsub(/"/, "", $3)
       if ($3 == unit) { in_u = 1; hit[blk] = 1 } else { in_u = 0 }
     }
     in_u && in_head && /^snapshot_version = / { ver[blk] = $3 + 0 }
+    in_u && in_head && /^may_span = / { span[blk] = ($3 == "true") }
     in_u && /^\[\[units\.slices\]\]/ { flush(); in_s = 1; next }
     in_s && /^number = /           { num = $3 }
     in_s && /^tape_position = /    { tpos = $3 }
@@ -196,7 +205,7 @@ pub(crate) const AWK_SELECT_VERSION: &str = r##"
         else if (ver[b] >= best) { best = ver[b]; pick = b }
       }
       if (pick) {
-        print best > "/dev/stderr"
+        print best, span[pick] + 0 > "/dev/stderr"
         for (i = 1; i <= n[pick]; i++) print slice[pick, i]
       }
     }
@@ -338,13 +347,44 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
       if (val(row, names, "state") != "this-tape") return 0
       return ((val(row, names, "unit_uuid") "\t" val(row, names, "version")) in cutv)
     }
-    function holder(row, names,    state, sealed, first, last, count, st, s) {
+    function range_here(row, names,    f, line, q, key) {
+      if (!range_read) {
+        range_read = 1
+        f = ENVIRON["INDEX_RANGE"]
+        if (f != "") {
+          while ((getline line < f) > 0) {
+            split(line, q, "\t")
+            rangev[q[1] "\t" q[2]] = q[3] "\t" q[4]
+          }
+          close(f)
+        }
+      }
+      if (val(row, names, "state") != "this-tape") return ""
+      key = val(row, names, "unit_uuid") "\t" val(row, names, "version")
+      return (key in rangev) ? rangev[key] : ""
+    }
+    function partial(first, last, count) {
+      if (first !~ /^[0-9]+$/ || last !~ /^[0-9]+$/ || count !~ /^[0-9]+$/) return 0
+      return (first + 0 != 1 || last + 0 != count + 0)
+    }
+    function note_partial(    f) {
+      f = ENVIRON["INDEX_PARTIAL"]
+      if (f == "" || partial_noted) return
+      partial_noted = 1
+      print "1" >> f
+      close(f)
+    }
+    function holder(row, names,    state, sealed, first, last, count, st, s, run, q, part, cut) {
       state = show(val(row, names, "state"))
       sealed = show(val(row, names, "sealed_at"))
       first = show(val(row, names, "first_slice"))
       last = show(val(row, names, "last_slice"))
       count = show(val(row, names, "num_slices"))
-      if (state == "this-tape" && cut_here(row, names)) st = "CUT on this tape: it ended early, before the last slice of this version, so it does not hold it whole"
+      run = range_here(row, names)
+      if (run != "") { split(run, q, "\t"); first = q[1]; last = q[2] }
+      cut = (state == "this-tape" && cut_here(row, names))
+      part = !cut && (run != "" || partial(first, last, count))
+      if (cut) st = "CUT on this tape: it ended early, before the last slice of this version, so it does not hold it whole"
       else if (state == "this-tape") st = "this tape"
       else if (state == "sealed") st = (sealed == "") ? "sealed" : "sealed " sealed
       else if (state == "quarantined") {
@@ -352,6 +392,7 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
         if (sealed != "") st = st "; sealed " sealed
       }
       else st = (state == "") ? "state not known" : "state " state
+      if (part) { st = st ", a range: not the whole version"; note_partial() }
       s = "    tape " nk(show(val(row, names, "volume"))) "  (" st ")"
       if (first != "" && last != "") s = s "  slices " first "-" last (count == "" ? "" : " of " count)
       s = s "\n        volume uuid " nk(show(val(row, names, "volume_uuid")))
@@ -362,25 +403,51 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
   "##;
 
 /// The versions an envelope `MANIFEST.toml` lists that the tape does not hold
-/// whole (`volume-format-v2.md` sec 4.2): a line `uuid TAB version` for each
-/// `[[units]]` block with a slice whose `tape_position` is after `k`, the
-/// tape's `ended_after`. RESTORE.sh collects them for `--where` and `--find`,
-/// whose index programs then print a `this-tape` row of such a version as cut
-/// (`AWK_INDEX_COMMON`'s `cut_here`), never as a holder. `uuid` and
-/// `snapshot_version` are read in the `[[units]]` head only, as
+/// whole (`volume-format-v2.md` sec 4.2, 4.4), by which of each block's slices
+/// the tape holds: a slice with no `tape_position` is on another tape (R6),
+/// one whose `tape_position` is after `k` (the `ended_after` of a short tape,
+/// or empty) is not on this one (R3), and the others are here. A block with
+/// a slice not here is CUT, printed as `uuid TAB version`, unless it is a
+/// RANGE: some of its slices are here and it states `may_span = true` (a unit
+/// that may run across tapes, tapectl 1.7.0), or lists a slice with no
+/// position. A range is appended to the file `RANGE_OUT` as `uuid TAB version
+/// TAB first TAB last TAB slices`: the first and the last slice number here,
+/// and how many slices the block lists. RESTORE.sh collects both for `--where`
+/// and `--find`, whose index programs print a `this-tape` row of a cut version
+/// as cut (`AWK_INDEX_COMMON`'s `cut_here`) and of a range as that run
+/// (`range_here`), never as a holder of the whole version. `uuid`,
+/// `snapshot_version` and `may_span` are read in the `[[units]]` head only, as
 /// `AWK_SELECT_VERSION` reads them (#135).
 pub(crate) const AWK_CUT_VERSIONS: &str = r##"
-    function done_block() {
-      if (inblk && cut && id != "") printf "%s\t%s\n", id, v
-      inblk = 0; cut = 0; id = ""; v = ""
+    function slice_done() {
+      if (in_s && num != "") {
+        n++
+        if (tp == "") away++
+        else if (k != "" && tp + 0 > k + 0) past++
+        else { here++; if (first == "") first = num; last = num }
+      }
+      num = ""; tp = ""
     }
-    /^\[\[units\]\]/ { done_block(); inblk = 1; in_head = 1; in_s = 0; next }
-    /^\[\[units\.slices\]\]/ { in_head = 0; in_s = inblk; next }
-    /^\[/ { in_head = 0; in_s = 0 }
+    function done_block() {
+      slice_done()
+      if (inblk && id != "" && away + past > 0) {
+        if (here > 0 && (span || away > 0)) {
+          if (rf != "") printf "%s\t%s\t%s\t%s\t%s\n", id, v, first, last, n >> rf
+        } else printf "%s\t%s\n", id, v
+      }
+      inblk = 0; span = 0; id = ""; v = ""; in_s = 0
+      n = 0; here = 0; away = 0; past = 0; first = ""; last = ""
+    }
+    BEGIN { rf = ENVIRON["RANGE_OUT"] }
+    /^\[\[units\]\]/ { done_block(); inblk = 1; in_head = 1; next }
+    /^\[\[units\.slices\]\]/ { slice_done(); in_head = 0; in_s = inblk; next }
+    /^\[/ { slice_done(); in_head = 0; in_s = 0 }
     in_head && /^uuid = / { id = $3; gsub(/"/, "", id) }
     in_head && /^snapshot_version = / { v = $3 + 0 }
-    in_s && /^tape_position = / { if ($3 + 0 > k + 0) cut = 1 }
-    END { done_block() }
+    in_head && /^may_span = / { span = ($3 == "true") }
+    in_s && /^number = / { num = $3 }
+    in_s && /^tape_position = / { tp = $3 }
+    END { done_block(); if (rf != "") close(rf) }
   "##;
 
 /// `--where UNIT` over one `index/units.tsv` (an envelope member,
@@ -452,15 +519,19 @@ pub(crate) const AWK_INDEX_WHERE: &str = r##"
 /// the tapes that do. Exit status 0 when the file has units, 1 when it has
 /// none, 2 when it lacks the `unit` or `version` column.
 pub(crate) const AWK_INDEX_ALL: &str = r##"
-    function holders_of(k,    j, r, s, lab, st) {
+    function holders_of(k,    j, r, s, lab, st, run, q) {
       s = ""
       for (j = 1; j <= rows[k]; j++) {
         split(row[k, j], r, "\t")
         lab = nk(show(val(r, h, "volume")))
         st = val(r, h, "state")
+        run = range_here(r, h)
         if (st == "this-tape" && cut_here(r, h)) lab = lab " (CUT on this tape: not held whole)"
+        else if (run != "") { split(run, q, "\t"); lab = lab " (this tape: slices " q[1] "-" q[2] " only)" }
         else if (st == "this-tape") lab = lab " (this tape)"
         else if (st == "quarantined") lab = lab " (QUARANTINED)"
+        if (st != "this-tape" && partial(val(r, h, "first_slice"), val(r, h, "last_slice"), val(r, h, "num_slices")))
+          lab = lab " (slices " show(val(r, h, "first_slice")) "-" show(val(r, h, "last_slice")) " only)"
         s = s (s == "" ? "" : ", ") lab
       }
       return (s == "") ? "no tape the index lists" : s
@@ -497,7 +568,7 @@ pub(crate) const AWK_INDEX_ALL: &str = r##"
       }
       rows[k]++
       row[k, rows[k]] = $0
-      if (val(f, h, "state") == "this-tape" && !cut_here(f, h)) here[k] = 1
+      if (val(f, h, "state") == "this-tape" && !cut_here(f, h) && range_here(f, h) == "") here[k] = 1
     }
     END {
       if (bad) exit 2
@@ -531,6 +602,40 @@ pub(crate) const AWK_INDEX_ALL: &str = r##"
       close(counts)
       close(absent)
       exit(ng > 0 ? 0 : 1)
+    }
+  "##;
+
+/// The holders one `index/units.tsv` names for one version of a unit, each as
+/// `--where` prints it (`AWK_INDEX_COMMON`'s `holder`), for the refusal of a
+/// unit held across tapes (`volume-format-v2.md` sec 4.4): the tapes that hold
+/// its other slices, with each one's run. `CHK_UNIT`, `CHK_VER` and `CHK_UUID`
+/// name the version as `AWK_FILE_CHECK_LISTED` takes them. Exit status 0 when
+/// the file names the version, 1 when it does not, 2 when it lacks the `unit`
+/// or `version` column.
+pub(crate) const AWK_INDEX_HOLDERS: &str = r##"
+    BEGIN {
+      FS = "\t"
+      unit = ENVIRON["CHK_UNIT"]
+      ver = ENVIRON["CHK_VER"] + 0
+      uuid = ENVIRON["CHK_UUID"]
+    }
+    NR == 1 {
+      header($0, h)
+      if (!("unit" in h) || !("version" in h)) { bad = 1; exit 2 }
+      next
+    }
+    {
+      split($0, f, "\t")
+      if (unesc(val(f, h, "unit")) != unit) next
+      if (val(f, h, "version") + 0 != ver) next
+      u = val(f, h, "unit_uuid")
+      if (uuid != "" && u != "" && u != uuid) next
+      found = 1
+      print holder(f, h)
+    }
+    END {
+      if (bad) exit 2
+      exit(found ? 0 : 1)
     }
   "##;
 
