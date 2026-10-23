@@ -11498,3 +11498,54 @@ fn a_slice_that_fails_is_asked_for_again_from_another_cartridge() {
         assert!(text.contains(&needle), "{needle:?}:\n{text}");
     }
 }
+
+/// A cartridge this script cannot read at all (its File 0 requires a feature
+/// it does not know) does not end a restore across tapes: it is named, nothing
+/// is taken from it, the slices already in scratch stay, and the prompt asks
+/// again; the right cartridge then finishes the restore.
+#[test]
+fn a_cartridge_the_script_cannot_read_is_named_and_the_prompt_asks_again() {
+    let b = span_box();
+    let n = b.n;
+    let big = b.big();
+    let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+    let x = h.dir.join("cart/SPAN03F");
+    copy_dir(&h.dir.join("cart/SPAN03"), &x);
+    let f0: String = String::from_utf8(
+        std::fs::read(x.join("0"))
+            .unwrap()
+            .into_iter()
+            .filter(|b| *b != 0)
+            .collect(),
+    )
+    .unwrap();
+    std::fs::write(
+        x.join("0"),
+        padded(
+            with_requires(
+                &f0,
+                "requires = [\"short-seal\", \"spanning\", \"zz-future\"]",
+            )
+            .into_bytes(),
+        ),
+    )
+    .unwrap();
+    let dest = h.sub("restored");
+    let args = big_args(&h, &dest, &[]);
+    let (code, text) = h.run_prompted(&strs(&args), |k, _| {
+        assert_scratch_holds(&dest, b, 2, &format!("prompt {k}"));
+        h.load(["SPAN03F", "SPAN03"][k - 1]);
+        Some(String::new())
+    });
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&big.src, Path::new(&dest)), "{text}");
+    assert_eq!(text.matches(SPAN_PROMPT).count(), 2, "{text}");
+    for needle in [
+        "NOTE: this tape requires feature(s) zz-future, which this script does not know",
+        "Nothing is taken from this cartridge: its file map cannot be used (see above).",
+        &format!("It gives slice(s) 3 to {n} of 'big'"),
+    ] {
+        assert!(text.contains(needle), "{needle:?}:\n{text}");
+    }
+    assert!(!text.contains("FATAL"), "{text}");
+}
