@@ -1013,8 +1013,13 @@ box has its own: File 0 of that tape gives it (`total_files`, and
 - dar 2.7.9 or later streams a restore with no disk space for slices;
   an older one, or a unit without its dar catalogue on a dar before 2.7.21,
   is restored by decrypting the slices to disk first (RESTORE.sh
-  chooses, and checks the space either way). `dar --version` says which
-  dar you have. A unit's dar catalogue is the small file `catalogs/NAME` in
+  chooses, and checks the space either way). A unit across tapes is the
+  exception: it is fed to dar only through pipes (only its encrypted slices
+  are ever kept on disk), so it needs dar 2.7.9 or later with the unit's
+  dar catalogue, or 2.7.21 or later, and with an older dar RESTORE.sh
+  refuses it before it reads a slice ("A unit across tapes").
+  `dar --version` says which dar you have. A unit's dar catalogue is the
+  small file `catalogs/NAME` in
   its envelope ("Words this guide uses"); "without its dar catalogue" means
   the envelope has none for that unit, or dar refuses the one it has
   because it was cut from another run of the same snapshot. RESTORE.sh
@@ -9173,6 +9178,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The fresh read, m7: Tools Required said an older dar restores by
+    /// decrypting the slices to disk first, but a unit across tapes is refused
+    /// with such a dar (restore_across_tapes): it says so there.
+    #[test]
+    fn fresh_read_478_m7_an_older_dar_cannot_restore_a_unit_across_tapes() {
+        let g = generate_system_guide_v2_for_media("FR07", 20, "LTO-6");
+        let tools = flat_text(guide_section(&g, "Tools Required"));
+        assert!(
+            tools.contains("A unit across tapes is the exception: it is fed to dar only through pipes (only its encrypted slices are ever kept on disk), so it needs dar 2.7.9 or later with the unit's dar catalogue, or 2.7.21 or later, and with an older dar RESTORE.sh refuses it before it reads a slice (\"A unit across tapes\")."),
+            "{tools}"
+        );
+        let script = generate_restore_script_v2("FR07", 20);
+        assert!(script.contains(
+            "  if ! { [ -n \"$cat\" ] && dar_at_least 2.7.9; } && ! dar_at_least 2.7.21; then\n"
+        ));
     }
 
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
