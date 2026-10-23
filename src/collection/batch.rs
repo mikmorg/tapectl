@@ -22,6 +22,7 @@ use crate::config::{CollectionConfig, Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::staging::clean::CleanReport;
 pub use crate::staging::release::CopyProgress;
+use crate::staging::release::ReleaseOutcome;
 use crate::staging::view::SourceView;
 
 use super::selector::Batch;
@@ -72,11 +73,20 @@ pub struct BatchExecutionReport {
     /// Non-empty exactly when `cleaned` is `None`: which units are still
     /// short, and by how much.
     pub under_copied: Vec<CopyProgress>,
+    /// The per-slice release of the batch's stage sets that hold a range
+    /// (1.7.0, #478; ADR-0012 item 129), made whatever `cleaned` says: per
+    /// stage set, the slices released (`slices_released`) and those kept
+    /// because they are short of copies (`slices_short`), a set whose last
+    /// slice went (`sets_cleaned`), and any file it could not remove
+    /// (`stranded`, #108). Its counts are never also in `cleaned`. Empty when
+    /// no set of the batch spans cartridges, or the release failed.
+    pub slices: CleanReport,
     /// `Some` when releasing staging failed after every copy was sealed and
     /// confirmed (a catalog error): the warning naming the unfinished step
     /// and `tapectl staging clean`, which finishes it. The copies stand, so
     /// the run exits as if the release had been retained (ADR-0012
-    /// 2026-10-07 item 33); `cleaned` is `None` and `under_copied` empty.
+    /// 2026-10-07 item 33); `cleaned` is `None`, `under_copied` empty and
+    /// `slices` empty.
     pub release_warning: Option<String>,
     /// The snapshot of the collection root this run's snapshot and stage read
     /// in place of the live one, when the collection has a `snapshot_command`
@@ -216,14 +226,14 @@ pub fn execute_batch(
     // Release staging only when this batch's copy just sealed is enough —
     // see `release_if_covered`'s own doc comment for the gate and the #248
     // scoping it applies.
-    let (cleaned, under_copied, release_warning) =
-        release_after_copies(conn, config, batch, copy_labels);
+    let (released, release_warning) = release_after_copies(conn, config, batch, copy_labels);
 
     Ok(BatchExecutionReport {
         units_staged: staged.units_staged,
         copies_written: copy_labels.len(),
-        cleaned,
-        under_copied,
+        cleaned: released.cleaned,
+        under_copied: released.under_copied,
+        slices: released.slices,
         release_warning,
         snapshot_path: staged.snapshot_path,
         snapshot_release_warning: staged.release_warning,
@@ -414,9 +424,9 @@ fn release_after_copies(
     config: &Config,
     batch: &Batch,
     copy_labels: &[String],
-) -> (Option<CleanReport>, Vec<CopyProgress>, Option<String>) {
+) -> (ReleaseOutcome, Option<String>) {
     match release_if_covered(conn, config, batch) {
-        Ok((cleaned, under_copied)) => (cleaned, under_copied, None),
+        Ok(released) => (released, None),
         Err(e) => {
             let volume = copy_labels.last().map(String::as_str).unwrap_or("?");
             let warning = crate::error::unfinished_after_seal(
@@ -425,7 +435,12 @@ fn release_after_copies(
                 &e,
                 Some("tapectl staging clean"),
             );
-            (None, Vec::new(), Some(warning))
+            let nothing = ReleaseOutcome {
+                cleaned: None,
+                under_copied: Vec::new(),
+                slices: CleanReport::default(),
+            };
+            (nothing, Some(warning))
         }
     }
 }
@@ -445,14 +460,14 @@ fn release_after_copies(
 /// with `volume write` and `volume resume`; this only names the batch's units
 /// for it, in `batch.units` order. [`execute_batch`]'s doc comment says why
 /// the gate cannot be `clean_staging`'s own guard.
-fn release_if_covered(
-    conn: &Connection,
-    config: &Config,
-    batch: &Batch,
-) -> Result<(Option<CleanReport>, Vec<CopyProgress>)> {
+///
+/// The whole outcome comes back, the per-slice release of the batch's sets
+/// that hold a range included (1.7.0, #478; ADR-0012 item 129), so `collection
+/// run` reports it as `staging clean` does.
+fn release_if_covered(conn: &Connection, config: &Config, batch: &Batch) -> Result<ReleaseOutcome> {
     let unit_ids = batch_unit_ids(conn, batch)?;
     let outcome = crate::staging::release::release_if_covered(conn, config, &unit_ids)?;
-    Ok((outcome.cleaned, outcome.under_copied))
+    Ok(outcome)
 }
 
 /// This batch's own unit ids, in `batch.units` order — the `CleanScope::
@@ -512,9 +527,10 @@ mod tests {
             total_bytes: 1,
             padded_bytes: 1,
         };
-        let (cleaned, under, warning) =
+        let (released, warning) =
             release_after_copies(&conn, &Config::default(), &batch, &["L6-0007".to_string()]);
-        assert!(cleaned.is_none() && under.is_empty());
+        assert!(released.cleaned.is_none() && released.under_copied.is_empty());
+        assert!(released.slices.slices_released.is_empty() && released.slices.stranded.is_empty());
         let warning = warning.expect("the failure is reported as a warning");
         assert!(
             warning.starts_with(
@@ -758,7 +774,11 @@ mod tests {
         let config = config_with_staging_dir(dir_guard.path(), 2);
         let batch = one_unit_batch("testlib/alpha");
 
-        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        let ReleaseOutcome {
+            cleaned,
+            under_copied,
+            ..
+        } = release_if_covered(&conn, &config, &batch).unwrap();
         assert_eq!(under_copied.len(), 1, "{under_copied:?}");
         assert!(
             cleaned.is_none(),
@@ -798,7 +818,11 @@ mod tests {
         let config = config_with_staging_dir(dir_guard.path(), 1);
         let batch = one_unit_batch("testlib/alpha");
 
-        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        let ReleaseOutcome {
+            cleaned,
+            under_copied,
+            ..
+        } = release_if_covered(&conn, &config, &batch).unwrap();
         assert!(under_copied.is_empty(), "{under_copied:?}");
         assert!(
             cleaned.is_some(),
@@ -963,7 +987,11 @@ mod tests {
 
         let batch = one_unit_batch("testlib/alpha");
 
-        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        let ReleaseOutcome {
+            cleaned,
+            under_copied,
+            ..
+        } = release_if_covered(&conn, &config, &batch).unwrap();
         assert!(
             under_copied.is_empty(),
             "alpha alone must look fully covered to its own batch's gate: {under_copied:?}"
@@ -1030,7 +1058,11 @@ mod tests {
             padded_bytes: 20,
         };
 
-        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        let ReleaseOutcome {
+            cleaned,
+            under_copied,
+            ..
+        } = release_if_covered(&conn, &config, &batch).unwrap();
         assert!(cleaned.is_none(), "one short unit keeps the whole batch");
         assert_eq!(under_copied.len(), 1, "{under_copied:?}");
         assert_eq!(
@@ -1044,6 +1076,47 @@ mod tests {
         assert!(
             alpha_file.exists() && beta_file.exists(),
             "neither unit's staged bytes are released while any unit of the batch is short"
+        );
+    }
+
+    /// 1.7.0 (#478; ADR-0012 item 129): the batch's release carries the
+    /// per-slice release of a set that spans cartridges through to `collection
+    /// run`'s report. Copy target 1, a four-slice set whose first tape holds
+    /// slices 1-2 as a `range` row: those two go, 3-4 are named short and
+    /// stay staged, and none of it is counted in `cleaned` (nothing whole to
+    /// judge, so `cleaned` is an empty release, not a retention).
+    #[test]
+    fn the_batch_release_carries_the_per_slice_release_of_a_span() {
+        use crate::staging::release::fixtures::{range_on, staged_span, tenant, unit};
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let (s, files) = staged_span(&conn, alpha, 1, "staged", dir.path(), 4);
+        range_on(&conn, &s, "V-T1", 1..=2);
+        let batch = one_unit_batch("testlib/alpha");
+
+        let (released, warning) = release_after_copies(&conn, &config, &batch, &["V-T1".into()]);
+        assert_eq!(warning, None);
+        assert!(released.under_copied.is_empty());
+        assert_eq!(
+            released
+                .cleaned
+                .expect("nothing whole to judge")
+                .sets_cleaned,
+            0
+        );
+        assert_eq!(
+            released.slices.slices_released,
+            vec![(s.stage_set_id, vec![1, 2])]
+        );
+        assert_eq!(
+            released.slices.slices_short,
+            vec![(s.stage_set_id, vec![3, 4])]
+        );
+        assert_eq!(
+            files.iter().map(|f| f.exists()).collect::<Vec<_>>(),
+            [false, false, true, true]
         );
     }
 
