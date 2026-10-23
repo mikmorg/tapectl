@@ -23982,6 +23982,773 @@ mod tests {
                 assert!(store.files.is_empty(), "nothing was written");
                 assert!(writes_of(&f, "SE-0").is_empty(), "no session was planned");
             }
+            // ── #478: a write that plans, writes and reports a span ──
+
+            /// `volume write` of a unit that allows spanning (1.7.0;
+            /// `layout-session.md` "Spanning"; ADR-0012 items 86, 93, 94,
+            /// 122-123, 129, 134 and 142). The unit allows it through its own
+            /// dotfile, as an operator sets it: no test hands the build a
+            /// span.
+            mod spanning {
+                use super::*;
+                use crate::volume::session::{Ending, RangeUnit, SealedSession};
+
+                /// `a` and `c` whole, `b` of three slices, in name order.
+                const A_B3_C: &[(&str, &[usize])] = &[
+                    ("a", &[SLICE]),
+                    ("b", &[SLICE, SLICE, SLICE]),
+                    ("c", &[SLICE]),
+                ];
+                /// `b` of three slices, alone.
+                const B3: &[(&str, &[usize])] = &[("b", &[SLICE, SLICE, SLICE])];
+
+                /// `unit`'s dotfile says `allow_spanning = value` (ADR-0012
+                /// item 82: the unit's own layer of the policy).
+                fn dotfile(f: &Fixture, unit: &str, value: bool) {
+                    let dir = f._tmp.path().join("sources").join(unit);
+                    fs::create_dir_all(&dir).unwrap();
+                    fs::write(
+                        dir.join(".tapectl-unit.toml"),
+                        format!("[policy]\nallow_spanning = {value}\n"),
+                    )
+                    .unwrap();
+                    f.conn
+                        .execute(
+                            "UPDATE units SET current_path = ?2 WHERE name = ?1",
+                            params![unit, dir.to_string_lossy()],
+                        )
+                        .unwrap();
+                }
+
+                fn allow_spanning(f: &Fixture, unit: &str) {
+                    dotfile(f, unit, true);
+                }
+
+                /// [`write`], scoped to `only` as `volume rewrite` scopes it
+                /// (`volume_write_scoped`).
+                fn write_scoped(
+                    f: &Fixture,
+                    label: &str,
+                    store: &mut dyn Store,
+                    only: Option<&[i64]>,
+                ) -> (Result<()>, i32) {
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &f.conn,
+                        &f.paths,
+                        &f.config,
+                        label,
+                        GENCHK_DEVICE,
+                        SBS,
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(store),
+                        only,
+                    );
+                    let r = slot.finish_result(r).map(|_| ());
+                    let code = match &r {
+                        Ok(()) => crate::error::EXIT_SUCCESS,
+                        Err(e) => {
+                            crate::error::ErrorContract::Write.exit_code(&clone_error(e).into())
+                        }
+                    };
+                    (r, code)
+                }
+
+                /// `writes.may_span` of `unit`'s write on `label`.
+                fn may_span(f: &Fixture, label: &str, unit: &str) -> bool {
+                    f.conn
+                        .query_row(
+                            "SELECT w.may_span FROM writes w
+                             JOIN volumes v ON v.id = w.volume_id
+                             WHERE v.label = ?1 AND w.stage_set_id = ?2",
+                            params![label, stage_set_of(f, unit)],
+                            |r| r.get(0),
+                        )
+                        .unwrap()
+                }
+
+                /// `unit`'s snapshot status.
+                fn snapshot_status(f: &Fixture, unit: &str) -> String {
+                    f.conn
+                        .query_row(
+                            "SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id
+                             WHERE u.name = ?1",
+                            params![unit],
+                            |r| r.get(0),
+                        )
+                        .unwrap()
+                }
+
+                /// Each slice's copies, in slice order (`coverage::slice_copies`).
+                fn slice_copies(f: &Fixture, unit: &str) -> Vec<i64> {
+                    coverage::slice_copies(&f.conn, stage_set_of(f, unit))
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| s.copies)
+                        .collect()
+                }
+
+                /// `(bytes_written, num_data_files)` of the volume.
+                fn figures(f: &Fixture, label: &str) -> (i64, i64) {
+                    f.conn
+                        .query_row(
+                            "SELECT bytes_written, num_data_files FROM volumes WHERE label = ?1",
+                            params![label],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap()
+                }
+
+                /// File 0's `requires` line, as the tape holds it.
+                fn requires_line(files: &[Vec<u8>]) -> String {
+                    String::from_utf8_lossy(&files[0])
+                        .lines()
+                        .find(|l| l.starts_with("requires = "))
+                        .expect("File 0 states requires")
+                        .to_string()
+                }
+
+                fn range(unit: &str, first_slice: i64, last_slice: i64) -> RecordedRange {
+                    RecordedRange {
+                        unit: unit.into(),
+                        version: 1,
+                        first_slice,
+                        last_slice,
+                    }
+                }
+
+                /// What the release does as the per-slice release does
+                /// (ADR-0012 item 129): the staging path cleared, the release
+                /// recorded, the file removed.
+                fn release_slices(f: &Fixture, unit: &str, numbers: &[i64]) {
+                    for n in numbers {
+                        let path: String = f
+                            .conn
+                            .query_row(
+                                "SELECT staging_path FROM stage_slices
+                                 WHERE stage_set_id = ?1 AND slice_number = ?2",
+                                params![stage_set_of(f, unit), n],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        f.conn
+                            .execute(
+                                "UPDATE stage_slices
+                                 SET staging_path = NULL, released_at = datetime('now')
+                                 WHERE stage_set_id = ?1 AND slice_number = ?2",
+                                params![stage_set_of(f, unit), n],
+                            )
+                            .unwrap();
+                        fs::remove_file(path).unwrap();
+                    }
+                }
+
+                /// THE item 93 case (`layout-session.md` "The plan order"):
+                /// two copies of a spannable `b` over three tapes. Tape 1 holds
+                /// the whole units first and `b` last, and its early warning
+                /// ends `b` in slice 2: a range of 1-2. Tape 2 begins with `b`'s
+                /// owed run, the whole set (1-2 owe one more copy, 3 two), and
+                /// holds it whole: completed, and the version current (item
+                /// 128). Tape 3 begins with the owed run 3-3 and seals full,
+                /// still a range. The rows are `range`, `completed`, `range`;
+                /// every slice is on two volumes; and the write of tape 3 names
+                /// tapes 1 and 3 as one copy to keep together (item 134).
+                #[test]
+                fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
+                    let mut f = fixture(A_B3_C, &["SP-1", "SP-2", "SP-3"]);
+                    f.config.defaults.min_copies = 2;
+                    allow_spanning(&f, "b");
+
+                    // Tape 1: a at 8, c at 9, b last at 10-12; the warning in
+                    // b's second slice (11).
+                    let mut store = ArmedAt::new(11, warning);
+                    let (r, code) = write(&f, "SP-1", &mut store, false);
+                    r.expect("tape 1 seals short");
+                    assert_eq!(code, 0);
+                    assert_eq!(
+                        [
+                            position_of(&f, "SP-1", "a", 1),
+                            position_of(&f, "SP-1", "c", 1),
+                            position_of(&f, "SP-1", "b", 1),
+                        ],
+                        [8, 9, 10],
+                        "whole units first, the spannable set last (item 83)"
+                    );
+                    assert_eq!(volume_row(&f, "SP-1"), ("sealed".into(), true, Some(11)));
+                    assert_eq!(
+                        writes_of(&f, "SP-1"),
+                        pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
+                    );
+                    assert!(may_span(&f, "SP-1", "b") && !may_span(&f, "SP-1", "a"));
+                    assert_eq!(
+                        requires_line(&store.inner.files),
+                        "requires = [\"short-seal\", \"spanning\"]"
+                    );
+                    assert_eq!(
+                        snapshot_status(&f, "b"),
+                        "staged",
+                        "a range alone (item 128)"
+                    );
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SP-1").unwrap(),
+                        [range("b", 1, 2)]
+                    );
+                    assert!(keep_together(&f.conn, "SP-1").unwrap().is_empty());
+                    assert_eq!(slice_copies(&f, "b"), [1, 1, 0]);
+
+                    // Tape 2: b's owed run is the whole set, first.
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SP-2", &mut store, false)
+                        .0
+                        .expect("tape 2 seals");
+                    assert_eq!(position_of(&f, "SP-2", "b", 1), 8, "the owed run first");
+                    assert_eq!(
+                        writes_of(&f, "SP-2"),
+                        pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
+                    );
+                    assert_eq!(snapshot_status(&f, "b"), "current");
+                    assert!(
+                        keep_together(&f.conn, "SP-2").unwrap().is_empty(),
+                        "a whole copy on one tape needs no other"
+                    );
+                    assert_eq!(slice_copies(&f, "b"), [2, 2, 1]);
+
+                    // a and c have their two copies: the release cleans them.
+                    for unit in ["a", "c"] {
+                        f.conn
+                            .execute(
+                                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                                params![stage_set_of(&f, unit)],
+                            )
+                            .unwrap();
+                    }
+
+                    // Tape 3: the owed run 3-3, first and alone; a full seal.
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SP-3", &mut store, false)
+                        .0
+                        .expect("tape 3 seals");
+                    assert_eq!(volume_row(&f, "SP-3"), ("sealed".into(), true, None));
+                    assert_eq!(position_of(&f, "SP-3", "b", 3), 8);
+                    assert_eq!(writes_of(&f, "SP-3"), pairs(&[("b", "range")]));
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SP-3").unwrap(),
+                        [range("b", 3, 3)]
+                    );
+                    assert_eq!(
+                        slice_copies(&f, "b"),
+                        [2, 2, 2],
+                        "every slice on two volumes"
+                    );
+                    assert_eq!(
+                        figures(&f, "SP-3"),
+                        (PADDED as i64, 1),
+                        "the figures are the run this tape planned"
+                    );
+
+                    // Item 134: tapes 1 and 3 are one copy.
+                    let keep = keep_together(&f.conn, "SP-3").unwrap();
+                    assert_eq!(keep.len(), 1, "{keep:?}");
+                    assert_eq!(
+                        keep[0].describe(),
+                        "keep these together: \"b\" v1 is whole across SP-1 (slices 1-2) and \
+                         SP-3 (slice 3). Together these tapes are one copy of it, and restoring \
+                         it needs every one of them (ADR-0012 item 134)"
+                    );
+                    let ending = recorded_ending(&f.conn, "SP-3").unwrap();
+                    assert_eq!(ending.range_units, [range("b", 3, 3)]);
+                    assert_eq!(ending.keep_together, keep);
+                    assert!(ending.deferred_units.is_empty());
+                }
+
+                /// Item 86 (X19): at a copy target of 1, tape 1's range 1-2
+                /// covers slices 1 and 2, so the owed run is 3-3: it continues
+                /// tape 1's range and goes only onto its generation. An LTO-5
+                /// volume is refused, naming both generations and the range's
+                /// volume, before anything is written. Positive control: an
+                /// LTO-6 volume continues it, and the two tapes are one copy.
+                #[test]
+                fn a_continuation_onto_another_generation_is_refused_naming_both() {
+                    let f = fixture(B3, &["SG-1", "SG-5", "SG-6"]);
+                    allow_spanning(&f, "b");
+                    f.conn
+                        .execute(
+                            "UPDATE volumes SET media_type = 'LTO-5',
+                                                capacity_bytes = 1500000000000
+                             WHERE label = 'SG-5'",
+                            [],
+                        )
+                        .unwrap();
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SG-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    assert_eq!(writes_of(&f, "SG-1"), pairs(&[("b", "range")]));
+
+                    let mut store = MemStore::new(SBS);
+                    let (r, code) = write(&f, "SG-5", &mut store, false);
+                    let err = r.unwrap_err().to_string();
+                    assert!(
+                        err.contains(
+                            "volume \"SG-5\" is LTO-5, and this tape would continue \"b\" v1 \
+                             (slice 3) from its range on volume \"SG-1\", which is LTO-6"
+                        ),
+                        "{err}"
+                    );
+                    assert!(err.contains("ADR-0012 item 86"), "{err}");
+                    assert_eq!(code, 2);
+                    assert!(store.files.is_empty(), "nothing was written");
+                    assert!(writes_of(&f, "SG-5").is_empty(), "no session was planned");
+
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SG-6", &mut store, false)
+                        .0
+                        .expect("the same generation");
+                    assert_eq!(writes_of(&f, "SG-6"), pairs(&[("b", "range")]));
+                    assert_eq!(
+                        recorded_ranges(&f.conn, "SG-6").unwrap(),
+                        [range("b", 3, 3)]
+                    );
+                    let keep = keep_together(&f.conn, "SG-6").unwrap();
+                    let tapes: Vec<&str> = keep[0].tapes.iter().map(|t| t.label.as_str()).collect();
+                    assert_eq!(tapes, ["SG-1", "SG-6"]);
+                }
+
+                /// Item 123: on a drive with no `post_warning_bytes`, a unit
+                /// that may span and would pass the fill ceiling is refused,
+                /// and the refusal names the key; nothing is written. Positive
+                /// control: with the key it is planned past the ceiling, and
+                /// this medium takes it whole.
+                #[test]
+                fn without_post_warning_bytes_a_span_past_the_ceiling_is_refused_naming_the_key() {
+                    let mut f =
+                        fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE, SLICE])], &["SN-1"]);
+                    allow_spanning(&f, "b");
+                    let fixed = fixed_bytes(&f, "SN-1");
+                    budget(
+                        &mut f,
+                        "SN-1",
+                        fixed + 6 * PADDED,
+                        fixed + 2 * PADDED,
+                        false,
+                    );
+
+                    let mut store = MemStore::new(SBS);
+                    let (r, code) = write(&f, "SN-1", &mut store, false);
+                    let err = r.unwrap_err().to_string();
+                    assert!(
+                        err.starts_with(
+                            "volume \"SN-1\" failed pre-write validation: capacity exceeded: a \
+                             unit that allows spanning would pass the fill ceiling"
+                        ),
+                        "{err}"
+                    );
+                    assert!(err.contains("post_warning_bytes"), "{err}");
+                    assert!(err.contains("ADR-0012 item 123"), "{err}");
+                    assert_eq!(code, 2);
+                    assert!(store.files.is_empty(), "nothing was written");
+                    assert!(writes_of(&f, "SN-1").is_empty(), "no session was planned");
+
+                    budget(&mut f, "SN-1", fixed + 6 * PADDED, fixed + 2 * PADDED, true);
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SN-1", &mut store, false)
+                        .0
+                        .expect("planned past the ceiling");
+                    assert_eq!(
+                        writes_of(&f, "SN-1"),
+                        pairs(&[("a", "completed"), ("b", "completed")])
+                    );
+                }
+
+                /// Item 142 (X20): a write scoped as `volume rewrite` scopes it
+                /// plans a unit that allows spanning whole and never makes a
+                /// range: the early warning in it cuts it, as in 1.6.0, with
+                /// `may_span` unset and File 0 stating `short-seal` alone.
+                /// Positive control: the same write unscoped makes a range.
+                #[test]
+                fn a_rewrite_scoped_write_never_makes_a_range() {
+                    let f = fixture(B3, &["SR-1", "SR-2"]);
+                    allow_spanning(&f, "b");
+                    let b = stage_set_of(&f, "b");
+
+                    let mut store = ArmedAt::new(9, warning);
+                    let (r, code) = write_scoped(&f, "SR-1", &mut store, Some(&[b]));
+                    r.expect("a short seal is a success");
+                    assert_eq!(code, 0);
+                    assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "cut")]));
+                    assert!(!may_span(&f, "SR-1", "b"));
+                    assert_eq!(
+                        requires_line(&store.inner.files),
+                        "requires = [\"short-seal\"]"
+                    );
+                    assert!(recorded_ranges(&f.conn, "SR-1").unwrap().is_empty());
+
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SR-2", &mut store, false).0.expect("seals short");
+                    assert_eq!(writes_of(&f, "SR-2"), pairs(&[("b", "range")]));
+                    assert!(may_span(&f, "SR-2", "b"));
+                }
+
+                /// X18: a slice the tape plans whose staged file was released
+                /// is refused, never skipped, naming `volume read-slices --from`
+                /// the volume that holds it. At a copy target of 1 tape 1's
+                /// range released slices 1 and 2; the target rises to 2, so
+                /// slices 1-3 are owed again. Positive control: with them staged
+                /// again, the same write plans the whole set.
+                #[test]
+                fn an_owed_slice_released_from_staging_is_refused_naming_read_slices() {
+                    let mut f = fixture(B3, &["SX-1", "SX-2"]);
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SX-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+                    let paths: Vec<String> = (1..=2)
+                        .map(|n| {
+                            f.conn
+                                .query_row(
+                                    "SELECT staging_path FROM stage_slices
+                                     WHERE stage_set_id = ?1 AND slice_number = ?2",
+                                    params![stage_set_of(&f, "b"), n],
+                                    |r| r.get(0),
+                                )
+                                .unwrap()
+                        })
+                        .collect();
+                    let kept: Vec<Vec<u8>> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+                    release_slices(&f, "b", &[1, 2]);
+                    f.config.defaults.min_copies = 2;
+
+                    let mut store = MemStore::new(SBS);
+                    let (r, code) = write(&f, "SX-2", &mut store, false);
+                    let err = r.unwrap_err().to_string();
+                    assert!(
+                        err.contains("its slice 1, whose staged file was released"),
+                        "{err}"
+                    );
+                    assert!(
+                        err.contains("tapectl volume read-slices --from SX-1 --unit b --version 1"),
+                        "{err}"
+                    );
+                    assert_eq!(code, 2);
+                    assert!(store.files.is_empty(), "nothing was written");
+                    assert!(writes_of(&f, "SX-2").is_empty(), "no session was planned");
+
+                    // Staged again, as `read-slices` would.
+                    for (n, (path, bytes)) in paths.iter().zip(&kept).enumerate() {
+                        fs::write(path, bytes).unwrap();
+                        f.conn
+                            .execute(
+                                "UPDATE stage_slices SET staging_path = ?3, released_at = NULL
+                                 WHERE stage_set_id = ?1 AND slice_number = ?2",
+                                params![stage_set_of(&f, "b"), n as i64 + 1, path],
+                            )
+                            .unwrap();
+                    }
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SX-2", &mut store, false)
+                        .0
+                        .expect("staged again, it is written");
+                    assert_eq!(writes_of(&f, "SX-2"), pairs(&[("b", "completed")]));
+                    assert_eq!(position_of(&f, "SX-2", "b", 1), 8);
+                }
+
+                /// Items 83 and 95 (X12): a spannable `b` that fits one tape
+                /// takes the room past the fill ceiling, so the whole unit `c`,
+                /// which the ceiling stops, is deferred: not on this tape, no
+                /// row, still staged, and named as waiting for the next tape.
+                /// The next write takes it.
+                #[test]
+                fn whole_units_a_spannable_set_leaves_no_room_for_wait_for_the_next_tape() {
+                    let mut f = fixture(A_B3_C, &["SD-1", "SD-2"]);
+                    allow_spanning(&f, "b");
+                    let fixed = fixed_bytes(&f, "SD-1");
+                    budget(
+                        &mut f,
+                        "SD-1",
+                        fixed + 5 * PADDED,
+                        fixed + 3 * PADDED / 2,
+                        true,
+                    );
+
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SD-1", &mut store, false).0.expect("seals");
+                    assert_eq!(
+                        writes_of(&f, "SD-1"),
+                        pairs(&[("a", "completed"), ("b", "completed")])
+                    );
+                    assert_eq!(position_of(&f, "SD-1", "b", 1), 9, "b right after a");
+                    assert_eq!(stage_set_status(&f, "c"), "staged");
+                    assert_eq!(waiting_units(&f.conn, "SD-1").unwrap(), ["c"]);
+                    assert_eq!(
+                        recorded_ending(&f.conn, "SD-1").unwrap().deferred_units,
+                        ["c"]
+                    );
+
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SD-2", &mut store, false).0.expect("seals");
+                    assert!(
+                        writes_of(&f, "SD-2").contains(&("c".to_string(), "completed".to_string())),
+                        "{:?}",
+                        writes_of(&f, "SD-2")
+                    );
+                }
+
+                /// With `allow_spanning` off at every layer (the dotfile says
+                /// false, `[defaults]` is false), a write is 1.6.0's: the same
+                /// plan order, rows, File 0, `write_completed` event and
+                /// recorded ending as [`an_early_warning_mid_unit_seals_short_exits_0_and_the_next_write_takes_the_cut_units`],
+                /// and nothing that names a range, a deferral or a span.
+                #[test]
+                fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
+                    let f = fixture(ABC, &["S0-1"]);
+                    dotfile(&f, "b", false);
+                    let batch =
+                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
+                    assert!(!batch.spans());
+                    assert!(batch.classes.iter().all(|c| *c == PlanClass::Whole));
+
+                    let mut store = ArmedAt::new(B_FIRST, warning);
+                    write(&f, "S0-1", &mut store, false).0.expect("seals short");
+                    assert_eq!(position_of(&f, "S0-1", "b", 1), B_FIRST);
+                    assert_eq!(
+                        writes_of(&f, "S0-1"),
+                        pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                    );
+                    for unit in ["a", "b", "c"] {
+                        assert!(!may_span(&f, "S0-1", unit), "{unit}");
+                    }
+                    assert_eq!(
+                        requires_line(&store.inner.files),
+                        "requires = [\"short-seal\"]"
+                    );
+                    assert_eq!(
+                        events(&f, "S0-1", "write_completed"),
+                        vec![(
+                            None,
+                            Some(
+                                serde_json::json!({
+                                    "ending": "short",
+                                    "ended_after": B_FIRST,
+                                    "cut_units": ["b", "c"],
+                                })
+                                .to_string()
+                            )
+                        )]
+                    );
+                    assert_eq!(
+                        recorded_ending(&f.conn, "S0-1").unwrap(),
+                        RecordedEnding {
+                            ended_after: Some(i64::from(B_FIRST)),
+                            cut_units: vec!["b".into(), "c".into()],
+                            ..RecordedEnding::default()
+                        }
+                    );
+                }
+
+                /// Item 129 through `volume write`'s own release step: after
+                /// tape 1's range 1-2 at a copy target of 1, slices 1 and 2 are
+                /// released and slice 3 is kept, and the write's output names
+                /// both, never "no stage set was eligible". The next tape then
+                /// continues the span from slice 3 alone.
+                #[test]
+                fn a_write_that_releases_part_of_a_span_names_the_released_and_kept_slices() {
+                    let f = fixture(B3, &["SL-1", "SL-2"]);
+                    allow_spanning(&f, "b");
+                    let mut store = ArmedAt::new(9, warning);
+                    write(&f, "SL-1", &mut store, false)
+                        .0
+                        .expect("tape 1 seals short");
+
+                    let release = crate::cli::volume::release_staging_after_write(
+                        &f.conn, &f.config, "SL-1", false,
+                    );
+                    let (out, err) = crate::cli::volume::render_staging_release("SL-1", &release);
+                    let id = stage_set_of(&f, "b");
+                    assert!(
+                        !out.iter().any(|l| l.contains("no stage set was eligible")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        out.contains(&format!(
+                            "  stage set {id}: slice(s) 1-2 released, each now has its copies \
+                             (the set spans cartridges and is released slice by slice)"
+                        )),
+                        "{out:?}"
+                    );
+                    assert!(
+                        out.iter().any(|l| l.starts_with(&format!(
+                            "  stage set {id} kept in part: slice(s) 3 are short of copies"
+                        ))),
+                        "{out:?}"
+                    );
+                    assert!(err.is_empty(), "{err:?}");
+                    let json =
+                        crate::cli::volume::staging_release_json(serde_json::json!({}), &release);
+                    assert_eq!(
+                        json["slices_released"],
+                        serde_json::json!([{"stage_set_id": id, "slices": [1, 2]}])
+                    );
+                    assert_eq!(
+                        json["slices_short"],
+                        serde_json::json!([{"stage_set_id": id, "slices": [3]}])
+                    );
+                    assert_eq!(stage_set_status(&f, "b"), "staged");
+
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "SL-2", &mut store, false)
+                        .0
+                        .expect("tape 2 continues it");
+                    assert_eq!(writes_of(&f, "SL-2"), pairs(&[("b", "range")]));
+                    assert_eq!(position_of(&f, "SL-2", "b", 3), 8);
+                }
+
+                /// The units of a hand-made span plan, `a` whole, `b` may span
+                /// (slices 1-3), `c` whole.
+                fn plan_units() -> Vec<BuildUnit> {
+                    let unit = |name: &str, slices: &[i64], span: bool| BuildUnit {
+                        stage_set_id: 1,
+                        snapshot_id: 1,
+                        unit_name: name.into(),
+                        unit_uuid: name.into(),
+                        tenant_id: 1,
+                        dar_version: None,
+                        dar_command: None,
+                        catalog_path: None,
+                        snapshot_version: 1,
+                        slices: slices
+                            .iter()
+                            .map(|&n| BuildSlice {
+                                slice_id: n,
+                                slice_number: n,
+                                size_bytes: 1,
+                                encrypted_bytes: 1,
+                                sha256_plain: String::new(),
+                                sha256_encrypted: String::new(),
+                                staging_path: PathBuf::new(),
+                            })
+                            .collect(),
+                        span: span.then(|| UnitSpan { slices: Vec::new() }),
+                    };
+                    vec![
+                        unit("a", &[1], false),
+                        unit("b", &[1, 2, 3], true),
+                        unit("c", &[1], false),
+                    ]
+                }
+
+                /// The notices a span tape's plan prints before the tape moves
+                /// name the unit that may span past the fill ceiling and the
+                /// whole units that wait for the next tape; and the write
+                /// names those again when it is done. A plan with a unit that
+                /// may span is never one that commits nothing.
+                #[test]
+                fn a_span_plans_notices_name_the_span_and_the_units_that_wait() {
+                    let units = plan_units();
+                    let plan = SpanPlan {
+                        placement: Placement {
+                            order: vec![0, 1],
+                            placed: vec![Placed::Committed, Placed::Tail],
+                            errors: Vec::new(),
+                        },
+                        deferred: vec![units[2].clone()],
+                    };
+                    let notices = span_plan_notices("SN-0", &plan, &units[..2]);
+                    assert_eq!(notices.len(), 2, "{notices:?}");
+                    assert!(
+                        notices[0].starts_with(
+                            "volume \"SN-0\": \"b\" v1 may span, and the plan takes it past the \
+                             fill ceiling to its end"
+                        ),
+                        "{notices:?}"
+                    );
+                    assert_eq!(notices[1], waiting_notice("SN-0", &plan.deferred).unwrap());
+                    assert!(
+                        notices[1].starts_with("volume \"SN-0\": \"c\" v1 waits for the next tape"),
+                        "{notices:?}"
+                    );
+                    assert!(placed_past_ceiling_refusal("SN-0", &plan, &units[..2]).is_none());
+
+                    // A span tail alone commits nothing and is still a plan
+                    // (item 94); a whole unit alone past the ceiling is not.
+                    let tail = SpanPlan {
+                        placement: Placement {
+                            order: vec![0],
+                            placed: vec![Placed::Tail],
+                            errors: Vec::new(),
+                        },
+                        deferred: Vec::new(),
+                    };
+                    assert!(placed_past_ceiling_refusal("SN-0", &tail, &units[1..2]).is_none());
+                    let past = SpanPlan {
+                        placement: Placement {
+                            order: vec![0],
+                            placed: vec![Placed::PastCeiling],
+                            errors: Vec::new(),
+                        },
+                        deferred: Vec::new(),
+                    };
+                    assert!(placed_past_ceiling_refusal("SN-0", &past, &units[..1])
+                        .is_some_and(|r| r.contains("would commit nothing")));
+                }
+
+                /// The index's `this-tape` rows (item 126): a unit that may span
+                /// says the run this tape plans, a whole unit its whole set.
+                #[test]
+                fn the_index_states_the_run_each_span_unit_plans() {
+                    let mut units = plan_units();
+                    units[1].slices.remove(0);
+                    assert_eq!(
+                        index_runs(&units),
+                        [
+                            coverage::IndexRun::whole(1),
+                            coverage::IndexRun {
+                                stage_set_id: 1,
+                                slices: Some((2, 3)),
+                            },
+                            coverage::IndexRun::whole(1),
+                        ]
+                    );
+                }
+
+                /// A tape that sealed full and holds a range (a continuation)
+                /// says so; a short seal is the session's report, and a full
+                /// seal with no range says nothing, as in 1.6.0.
+                #[test]
+                fn a_full_seal_holding_a_range_says_so() {
+                    let sealed = |ending, range_units| SealedSession {
+                        volume_id: 1,
+                        label: "SF-3".into(),
+                        ending,
+                        cut_units: Vec::new(),
+                        range_units,
+                    };
+                    let run = vec![RangeUnit {
+                        unit: "b".into(),
+                        first_slice: 3,
+                        last_slice: 5,
+                    }];
+                    let full = sealed(Ending::Full, run.clone());
+                    assert_eq!(
+                        full_seal_range_report(&full).unwrap(),
+                        "volume \"SF-3\" sealed full and holds as a range: b (slices 3-5). A \
+                         range is a run of a unit's slices, not a copy on its own (ADR-0012 item \
+                         127): the unit's other slices are on other tapes, or still staged for an \
+                         ordinary `tapectl volume write` onto another cartridge of the same \
+                         generation."
+                    );
+                    assert!(full_seal_range_report(&sealed(Ending::Full, Vec::new())).is_none());
+                    assert!(
+                        full_seal_range_report(&sealed(Ending::Short { ended_after: 9 }, run))
+                            .is_none()
+                    );
+                }
+            }
         }
     }
 
