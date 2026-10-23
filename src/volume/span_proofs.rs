@@ -30,6 +30,7 @@ use crate::config::{Config, LtoBackendConfig, TapectlPaths};
 use crate::error::Result;
 use crate::store::{CapacityReport, EarlyWarning, MemStore, Store};
 use crate::tape::contact::ContactSlot;
+use crate::volume::format::ParsedIndexEntry;
 use crate::volume::write::{self, ContactStore, RecordedRange};
 
 /// The tape's block size: small, so a fixture's slices are a few blocks.
@@ -238,6 +239,18 @@ impl Home {
     /// `unit init` of a folder of `files` for `tenant`; `allow_spanning`
     /// set in its dotfile's `[policy]` when given, as an operator edits it.
     fn unit(&mut self, tenant: &str, name: &str, files: Files, allow_spanning: Option<bool>) {
+        self.unit_in(tenant, name, files, allow_spanning, None);
+    }
+
+    /// [`Self::unit`], in archive set `archive_set` when given.
+    fn unit_in(
+        &mut self,
+        tenant: &str,
+        name: &str,
+        files: Files,
+        allow_spanning: Option<bool>,
+        archive_set: Option<&str>,
+    ) {
         let dir = self.sources.join(name);
         fs::create_dir_all(&dir).unwrap();
         for (file, bytes) in &files {
@@ -250,16 +263,22 @@ impl Home {
             tenant,
             Some(name),
             &[],
-            None,
+            archive_set,
         )
         .unwrap();
         if let Some(value) = allow_spanning {
-            let dotfile = dir.join(".tapectl-unit.toml");
-            let mut d = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
-            d.allow_spanning = Some(value);
-            crate::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
+            self.set_allow_spanning(name, value);
         }
         self.units.insert(name.to_string(), files);
+    }
+
+    /// The operator's edit of `unit`'s dotfile: `allow_spanning = value` in
+    /// its `[policy]`.
+    fn set_allow_spanning(&self, unit: &str, value: bool) {
+        let dotfile = self.sources.join(unit).join(".tapectl-unit.toml");
+        let mut d = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+        d.allow_spanning = Some(value);
+        crate::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
     }
 
     /// `snapshot create` then `stage create` of `unit`: its stage set.
@@ -512,6 +531,12 @@ fn requires_line(files: &[Vec<u8>]) -> String {
         .to_string()
 }
 
+/// A tape's front index (File 3), from its recorded bytes.
+fn front_index(files: &[Vec<u8>]) -> Vec<ParsedIndexEntry> {
+    let raw = crate::volume::format::without_nul_padding(&files[3]);
+    crate::volume::format::parse_front_index(&String::from_utf8_lossy(raw)).unwrap()
+}
+
 fn range(unit: &str, first_slice: i64, last_slice: i64) -> RecordedRange {
     RecordedRange {
         unit: unit.into(),
@@ -694,4 +719,171 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
             "{label} holds {holds:?}"
         );
     }
+}
+
+// ── item 94: a spannable set larger than one tape, over three tapes ──
+
+const W94: &str = "medlar-whole-waiting";
+const S94: &str = "medlar-span-sequoia";
+const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
+/// The cartridges' nominal capacity, the drive's `capacity_override` (a
+/// virtual drive's small cartridges): about 1.75 MB past a tape's own files.
+const CAP94: u64 = 2_500_000;
+/// Where each tape's early warning comes: a little past the nominal
+/// capacity, as a real cartridge's may. The plan's estimate takes it at the
+/// nominal capacity (X11), and the room past it is what the waiting unit
+/// fills after the span's tail on its last tape.
+const WARN94: u64 = CAP94 + 352_000;
+
+/// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
+/// staged first, so 1.6.0's order would put it first, then `S`, which may
+/// span and is about 2.75 tapes; three blank volumes.
+fn home_94() -> Home {
+    let mut h = Home::new(Some(&CAP94.to_string()), 1, "128K");
+    h.unit(
+        TENANT_TWO,
+        W94,
+        files("waiting-ledger", &[380_000, 380_000], 21),
+        None,
+    );
+    h.unit(
+        TENANT_ONE,
+        S94,
+        files("sequoia-reel", &[775_000; 6], 22),
+        Some(true),
+    );
+    h.stage(W94);
+    h.stage(S94);
+    for label in T94 {
+        h.volume(label);
+    }
+    h
+}
+
+/// The block-padded bytes of `unit`'s slices: its size to the plan.
+fn padded_bytes(conn: &Connection, unit: &str) -> u64 {
+    let sizes: Vec<i64> = conn
+        .prepare("SELECT encrypted_bytes FROM stage_slices WHERE stage_set_id = ?1")
+        .unwrap()
+        .query_map(params![stage_set_of(conn, unit)], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    sizes
+        .iter()
+        .map(|&b| (b as u64).div_ceil(BS as u64) * BS as u64)
+        .sum()
+}
+
+/// `(first slice, last slice, first position)` of `unit`'s written slices
+/// on `label`.
+fn written_run(conn: &Connection, label: &str, unit: &str) -> (i64, i64, i64) {
+    conn.query_row(
+        "SELECT MIN(sl.slice_number), MAX(sl.slice_number), MIN(CAST(wp.position AS INTEGER))
+           FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+          WHERE v.label = ?1 AND u.name = ?2 AND wp.status = 'written'",
+        params![label, unit],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+/// THE item 94 proof, from the real write. `S` is larger than one tape and
+/// allows spanning, so `stage create` admits it. On tape 1 it starts right
+/// after the tape's own files, ahead of the whole unit `W` that 1.6.0's
+/// order puts first: by the plan's estimate (the early warning at the
+/// nominal capacity), starting there it touches three tapes, and behind `W`
+/// it would touch four. `W` waits, staged and named. Tape 2 is the owed run,
+/// to its warning; `W` still waits. Tape 3 is the rest of `S`, then `W`
+/// after its tail, and seals full. The three ranges join end to end, every
+/// slice has its one copy, the version is `current` only once tape 3 seals
+/// (item 128), and each tape's slices are released after it (item 129).
+#[test]
+fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes() {
+    let mut h = home_94();
+    let n = num_slices(&h.conn, S94);
+    let s_bytes = padded_bytes(&h.conn, S94);
+    let w_bytes = padded_bytes(&h.conn, W94);
+    assert!(s_bytes > CAP94, "S is larger than one tape: {s_bytes}");
+
+    // Tape 1: S first, W waits.
+    h.write(T94[0], Warn::AtBytes(WARN94));
+    let c = &h.conn;
+    assert_eq!(writes_of(c, T94[0]), rows(&[(S94, "range", true)]));
+    let (first, k1, s1) = written_run(c, T94[0], S94);
+    assert_eq!(first, 1);
+    let fixed: u64 = h.files(T94[0])[..s1 as usize]
+        .iter()
+        .map(|f| f.len() as u64)
+        .sum();
+    assert!(
+        front_index(h.files(T94[0]))[s1 as usize - 1].type_label != "data_slice",
+        "S's slice 1 is the tape's first data file"
+    );
+    assert_eq!(write::waiting_units(c, T94[0]).unwrap(), [W94]);
+    assert_eq!(
+        write::recorded_ending(c, T94[0]).unwrap().deferred_units,
+        [W94]
+    );
+    assert_eq!(stage_set_status(c, W94), "staged");
+    // The estimate (X11): each tape holds the bound less the tape's own
+    // files. From where S started it touches three tapes; behind W, four.
+    let room = CAP94 - fixed;
+    let tapes_from = |start: u64| 1 + (s_bytes - (CAP94 - start)).div_ceil(room);
+    assert_eq!(tapes_from(fixed), 3, "the fewest tapes");
+    assert_eq!(
+        tapes_from(fixed + w_bytes),
+        4,
+        "behind W it would touch four"
+    );
+    assert_eq!(snapshot_status(c, S94), "staged");
+    assert_eq!(released_slices(c, S94), (1..=k1).collect::<Vec<_>>());
+
+    // Tape 2: the owed run, from K1+1, to the warning; W still waits.
+    h.write(T94[1], Warn::AtBytes(WARN94));
+    let c = &h.conn;
+    assert_eq!(writes_of(c, T94[1]), rows(&[(S94, "range", true)]));
+    let (first, k2, _) = written_run(c, T94[1], S94);
+    assert_eq!(first, k1 + 1, "the owed run continues the range");
+    assert!(k2 < n, "tape 2 ends inside S");
+    assert_eq!(write::waiting_units(c, T94[1]).unwrap(), [W94]);
+    assert_eq!(snapshot_status(c, S94), "staged", "item 128: not yet");
+    assert_eq!(released_slices(c, S94), (1..=k2).collect::<Vec<_>>());
+
+    // Tape 3: the rest of S, then W after its tail; a full seal.
+    h.write(T94[2], Warn::AtBytes(WARN94));
+    let c = &h.conn;
+    assert_eq!(sealing(c, T94[2]), (true, None));
+    assert_eq!(
+        writes_of(c, T94[2]),
+        rows(&[(S94, "range", true), (W94, "completed", false)])
+    );
+    let (first, last, _) = written_run(c, T94[2], S94);
+    assert_eq!((first, last), (k2 + 1, n));
+    assert!(
+        position_of(c, T94[2], W94, 1) > position_of(c, T94[2], S94, n),
+        "W after S's tail"
+    );
+    assert!(write::waiting_units(c, T94[2]).unwrap().is_empty());
+    assert_eq!(
+        write::recorded_ranges(c, T94[2]).unwrap(),
+        [range(S94, k2 + 1, n)]
+    );
+    assert_eq!(slice_copies(c, S94), vec![1; n as usize]);
+    assert_eq!(
+        snapshot_status(c, S94),
+        "current",
+        "item 128: every slice sealed"
+    );
+    assert_eq!(unit_copies(c, S94), 1);
+    assert_eq!(released_slices(c, S94), (1..=n).collect::<Vec<_>>());
+    assert_eq!(stage_set_status(c, W94), "cleaned");
+    let keep = write::keep_together(c, T94[2]).unwrap();
+    let tapes: Vec<&str> = keep[0].tapes.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!((keep.len(), tapes), (1, T94.to_vec()));
 }
