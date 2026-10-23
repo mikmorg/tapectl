@@ -1264,13 +1264,16 @@ this way: `range` when the tape holds some of the set's slices, `completed` when
     the scratch (the sum of every slice's `encrypted_bytes` in the manifest), as well as the
     files for `--to`. When the room is not there it refuses and names `--stream-tapes`. It never
     chooses the stream itself: item 88 leaves that to the heir.
-  - The mode is one run of the script. It waits at each swap for as long as the heir takes, and
-    a run that is killed leaves its scratch directory to be removed by hand, as any killed
-    restore does.
+  - The mode is one run of the script. It waits at each swap for as long as the heir takes. A
+    run that ends early (`done` or `quit` at a prompt, Ctrl-C, a closed terminal, `kill`) ends
+    through the script's exit trap, which removes the scratch directory and the slices read: so
+    the heir runs it in `screen` or `tmux`. Only a run stopped with no chance to clean up
+    (`kill -9`, a crash, a power loss) leaves the directory, to be removed by hand.
 - **`--stream-tapes`** feeds one dar run through pipes across the swaps instead: no slice is
   kept on disk, and the script pauses at each tape's end for the next cartridge, accepted by R8.
-  Whether dar waits on a pipe across a cartridge change, for as long as a swap takes, is
-  unverified. The mhvtl gate's span leg settles it (items 132 and 136).
+  dar waits on its pipe across a cartridge change: the mhvtl gate's span leg holds the swap
+  for `TAPECTL_GATE_SWAP_WAIT` seconds (300 by default) with the same dar process alive at the
+  prompt and at the answer (items 132 and 136; first shown 2026-10-23).
 - `--restore --path` of a spanning unit reads the slices its catalogue names for the path, and
   the last, in slice order, from whichever tapes hold them, accepting each tape by R8.
 - `--restore --all` restores every unit this tape holds whole, and names each spanning unit of
