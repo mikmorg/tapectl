@@ -11769,6 +11769,36 @@ mod tests {
             assert_eq!(done.write_completed_details(), None, "1.6.0's full event");
         }
 
+        /// A spannable set can be whole on a short tape
+        /// (`layout-session.md`, "A write that may span"): the warning comes
+        /// in the whole unit after it, so every slice of the set is at or
+        /// before K and its row is `completed`, promoted as today, on a short
+        /// seal that states both features.
+        #[test]
+        fn a_spannable_set_wholly_before_the_warning_is_completed_on_a_short_tape() {
+            let s = span_fixture(&[("b", &[SLICE, SLICE]), ("c", &[SLICE, SLICE])], &["b"]);
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert_eq!(
+                parsed_seal(&store.files[k as usize + 1]).requires,
+                layout::REQUIRES_SPAN
+            );
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert!(done.range_units.is_empty());
+            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(
+                rows(&s),
+                [row("b", "completed", "current"), row("c", "cut", "staged")]
+            );
+        }
+
         /// The early warning before a spannable set's first slice: the tape
         /// holds none of it, so it is `cut` (X2), like a whole unit. The tape
         /// still states `spanning`: the fence follows the plan
