@@ -9910,11 +9910,8 @@ sha256_encrypted = \"bbb\"
             "with no ended_after only a run with slices elsewhere is a range:\n{got}"
         );
         let tail_sel = format!(
-            "select tail:\nexit Some(0)\n1||31|{}\n2||32|{}\n3|4|33|{}\n4|5|34|{}\nstderr: 2 1\n",
-            format!("{:064x}", 1),
-            format!("{:064x}", 2),
-            format!("{:064x}", 3),
-            format!("{:064x}", 4)
+            "select tail:\nexit Some(0)\n1||31|{:064x}\n2||32|{:064x}\n3|4|33|{:064x}\n4|5|34|{:064x}\nstderr: 2 1\n",
+            1, 2, 3, 4
         );
         assert!(got.contains(&tail_sel), "{got}");
         assert!(got.contains("stderr: 1 0\n"), "whole: may_span 0:\n{got}");
