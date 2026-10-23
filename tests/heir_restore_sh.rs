@@ -11773,7 +11773,7 @@ fn a_path_started_on_tape_3_takes_its_last_slice_there_and_asks_for_tape_1() {
         let wanted = text
             .lines()
             .filter_map(|l| l.split("needs slice ").nth(1))
-            .last()
+            .next_back()
             .and_then(|r| r.split(' ').next())
             .unwrap()
             .to_string();
