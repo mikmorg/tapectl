@@ -1827,8 +1827,9 @@ pub fn copy_distinctness(
 
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
 
-/// One CURRENT version of a unit whose coverage a retirement is about to
-/// consume, and what would be left of that version afterwards.
+/// One version of a unit whose coverage a retirement is about to consume
+/// (a CURRENT one, or one still being spanned: [`versions_at_stake`]), and
+/// what would be left of that version afterwards.
 ///
 /// The rows exist only for versions the act ACTUALLY REMOVES coverage from
 /// — see [`versions_at_stake`] for the three conditions — so the counts
@@ -1836,7 +1837,7 @@ pub fn copy_distinctness(
 /// a shortfall that already existed.
 #[derive(Debug, Clone)]
 pub struct VersionAtStake {
-    /// `snapshots.id` of the current snapshot — what the by-name location
+    /// `snapshots.id` of the version's snapshot — what the by-name location
     /// predicates ([`short_required_locations_excluding`],
     /// [`short_of_location_floor_excluding`]) take as `NamedScope::Snapshot`.
     pub snapshot_id: i64,
@@ -1845,7 +1846,7 @@ pub struct VersionAtStake {
     /// further "after this volume is gone" question of the same version
     /// excludes the same volume (a cartridge's merged impacts span several).
     pub volume_id: i64,
-    /// `snapshots.version` of the current snapshot.
+    /// `snapshots.version` of the version's snapshot.
     pub version: i64,
     /// Copies this VERSION would still have, [`copy_count_expr`] with the
     /// volume excluded. `0` is ADR-0008's absolute floor.
@@ -1863,10 +1864,10 @@ pub struct VersionAtStake {
 /// **Three conditions decide whether a version is at stake, and together
 /// they are ADR-0012's "defined by what the act REMOVES".**
 ///
-/// 1. The snapshot is `'current'`. A `reclaimable` or `purged` version has
-///    been released by the operator (`snapshot mark-reclaimable`, whose own
-///    `--force` is that statement in so many words) and the floor does not
-///    protect what has been given up.
+/// 1. The snapshot is `'current'` (or a span is in progress: below). A
+///    `reclaimable` or `purged` version has been released by the operator
+///    (`snapshot mark-reclaimable`, whose own `--force` is that statement in
+///    so many words) and the floor does not protect what has been given up.
 /// 2. The volume carries a write of that snapshot that REACHED THE TAPE
 ///    ([`write_reaches_tape`]: `completed`, `range`, `in_progress`, or
 ///    `interrupted` — issue #276. `in_progress`/`interrupted` are the same
@@ -1892,6 +1893,21 @@ pub struct VersionAtStake {
 /// reading of "last one" (issue #153: a unit with v1 elsewhere and v2 only
 /// here has ZERO remaining for v2, and that is the case the floor exists
 /// for), not a question about the unit as a whole.
+///
+/// **A span in progress (#478, ADR-0012 item 128).** A spanning version is
+/// promoted `current` only once every slice of a stage set of it is on a
+/// sealed volume ([`every_slice_on_sealed_volume_sql`]), and until then
+/// condition 1 would not see it. With staging released slice by slice (item
+/// 129), at a copy target of 1 tape 1's range may be the only place its
+/// slices are. So a version that is neither current nor released
+/// (`reclaimable`/`purged` are released, as in condition 1) is at stake too
+/// when the volume holds a `range` of it, is [`eligible`], and is the only
+/// holder of at least one of the range's slices: no other eligible volume
+/// has a `written` position of it in a `completed` or `range` write. That is
+/// [`sole_slices`]' own reading of a copy elsewhere, so the floor and the
+/// rewrite's list agree about which slices a volume alone holds. Its
+/// `copies_after` is the version's count without the volume, as for a
+/// current one, and it is 0 whenever the volume alone held a slice.
 ///
 /// **`copies_after`/`locations_after` do NOT widen with condition 3.** They
 /// stay on [`copy_count_expr`]/[`location_count_expr`], which route through
@@ -1929,11 +1945,18 @@ pub fn versions_at_stake(
          JOIN stage_sets ss ON ss.snapshot_id = s.id
          JOIN writes w ON w.stage_set_id = ss.id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND s.status = 'current'
-           AND w.volume_id = ?2 AND {} AND {}
+         WHERE s.unit_id = ?1 AND w.volume_id = ?2
+           AND ((s.status = 'current' AND {reaches} AND {sealed_bytes})
+                OR (s.status NOT IN ('current', 'reclaimable', 'purged')
+                    AND w.status = 'range' AND {eligible}
+                    AND EXISTS (SELECT 1 FROM write_positions sp
+                                 WHERE sp.write_id = w.id AND sp.status = 'written'
+                                   AND NOT {elsewhere})))
          ORDER BY s.version",
-        write_reaches_tape("w"),
-        holds_sealed_bytes("v")
+        reaches = write_reaches_tape("w"),
+        sealed_bytes = holds_sealed_bytes("v"),
+        eligible = eligible("v"),
+        elsewhere = held_elsewhere("sp.stage_slice_id", "?2"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1951,6 +1974,25 @@ pub fn versions_at_stake(
 }
 
 // ── What a `volume rewrite` asks of the catalog (ADR-0012 2026-10-19 item 106) ──
+
+/// A SQL boolean: the slice `slice_expr` (a `stage_slices` id) has a
+/// `written` position in a `completed` or `range` write on an [`eligible`]
+/// volume other than `volume_expr`: "a copy elsewhere", as [`sole_slices`]
+/// and [`versions_at_stake`]' floor for a span in progress both ask it, so
+/// the two never disagree about which slices a volume alone holds. A
+/// warehouse deposit is not a copy elsewhere here: the bytes these callers
+/// rely on are on a cartridge. Aliases `wp2`, `w2`, `v2`.
+fn held_elsewhere(slice_expr: &str, volume_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM write_positions wp2
+                 JOIN writes w2 ON w2.id = wp2.write_id
+                 JOIN volumes v2 ON v2.id = w2.volume_id
+                 WHERE wp2.stage_slice_id = {slice_expr} AND w2.volume_id <> {volume_expr}
+                   AND {holds} AND wp2.status = 'written' AND {eligible})",
+        holds = holds_slices("w2"),
+        eligible = eligible("v2"),
+    )
+}
 
 /// One live slice of a volume that no other eligible volume carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1976,6 +2018,16 @@ pub struct SoleSlice {
 /// rewrite's operator can rely on are on a cartridge). That is deliberately
 /// stricter than `compact-finish`'s own gate, which asks only for a completed
 /// write on another volume of any status.
+///
+/// From 1.7.0 a `range` write counts on both sides (#478, ADR-0012 item 128):
+/// its `written` slices are on the volume, the range may be the only place a
+/// slice of a span in progress is, and a range elsewhere holds its own run.
+/// Both sides read `written` positions, as they always did, where the copy
+/// counts read a `completed` write as holding every slice by its status; the
+/// two agree on every catalog the session writes, which records a `written`
+/// position for every slice of a completed write. The other side is
+/// [`held_elsewhere`], which [`versions_at_stake`]' floor for a span in
+/// progress shares.
 pub fn sole_slices(conn: &Connection, volume_id: i64) -> crate::error::Result<Vec<SoleSlice>> {
     let sql = format!(
         "SELECT sl.id, sts.id, u.name, s.version, sl.encrypted_bytes
@@ -1985,19 +2037,13 @@ pub fn sole_slices(conn: &Connection, volume_id: i64) -> crate::error::Result<Ve
          JOIN stage_sets sts ON sts.id = sl.stage_set_id
          JOIN snapshots s ON s.id = sts.snapshot_id
          JOIN units u ON u.id = s.unit_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+         WHERE w.volume_id = ?1 AND {holds} AND wp.status = 'written'
            AND s.status NOT IN ('reclaimable', 'purged')
-           AND NOT EXISTS (
-             SELECT 1 FROM write_positions wp2
-             JOIN writes w2 ON w2.id = wp2.write_id
-             JOIN volumes v2 ON v2.id = w2.volume_id
-             WHERE wp2.stage_slice_id = wp.stage_slice_id
-               AND w2.volume_id <> ?1
-               AND w2.status = 'completed' AND wp2.status = 'written'
-               AND {})
+           AND NOT {elsewhere}
          GROUP BY sl.id
          ORDER BY u.name, s.version, sl.slice_number",
-        eligible("v2")
+        holds = holds_slices("w"),
+        elsewhere = held_elsewhere("wp.stage_slice_id", "?1"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -5464,5 +5510,138 @@ pub(crate) mod tests {
         let empty = c.stage_set(snap, 0);
         c.whole(empty, 0, t2);
         assert!(!promoted(&c, empty, None));
+    }
+
+    /// Item 128's floor at a copy target of 1 (item 129's hazard): after tape
+    /// 1 the version is still `staged`, and tape 1 is the only place slices
+    /// 1..2 are, so retiring it is at stake with nothing left. Once another
+    /// tape holds 1..2 it is not; nor is a released version, a quarantined
+    /// tape, or a version tape 1 holds nothing of alone.
+    #[test]
+    fn at_stake_protects_a_span_in_progress_that_is_not_current() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "staged");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", None);
+        c.range(set, t1, 1, 2, 6);
+        let rows = versions_at_stake(&c.conn, c.unit_id, t1).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].snapshot_id, rows[0].version, rows[0].copies_after),
+            (snap, 1, 0)
+        );
+
+        // A version the operator released is not protected (condition 1).
+        for released in ["reclaimable", "purged"] {
+            c.conn
+                .execute(
+                    "UPDATE snapshots SET status = ?1 WHERE id = ?2",
+                    params![released, snap],
+                )
+                .unwrap();
+            assert!(versions_at_stake(&c.conn, c.unit_id, t1)
+                .unwrap()
+                .is_empty());
+        }
+        c.conn
+            .execute(
+                "UPDATE snapshots SET status = 'staged' WHERE id = ?1",
+                params![snap],
+            )
+            .unwrap();
+
+        // A quarantined tape counts for nothing, and retiring it removes
+        // nothing (condition 3's escape, for a range).
+        c.conn
+            .execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+                params![t1],
+            )
+            .unwrap();
+        assert!(versions_at_stake(&c.conn, c.unit_id, t1)
+            .unwrap()
+            .is_empty());
+        c.conn
+            .execute(
+                "UPDATE volumes SET observed_condition = 'ok' WHERE id = ?1",
+                params![t1],
+            )
+            .unwrap();
+
+        // Slice 2 also on another tape: slice 1 is still tape 1's alone.
+        let other = c.volume("OTHER", None);
+        c.range(set, other, 2, 6, 6);
+        assert_eq!(versions_at_stake(&c.conn, c.unit_id, t1).unwrap().len(), 1);
+        // Slices 1..2 both elsewhere: tape 1 holds nothing alone.
+        let again = c.volume("AGAIN", None);
+        c.range(set, again, 1, 1, 1);
+        assert!(
+            versions_at_stake(&c.conn, c.unit_id, t1)
+                .unwrap()
+                .is_empty(),
+            "every slice of tape 1's range has another holder"
+        );
+        // And the other tape, which alone holds 3..6, is at stake.
+        assert_eq!(
+            versions_at_stake(&c.conn, c.unit_id, other).unwrap().len(),
+            1
+        );
+    }
+
+    /// The floor for a CURRENT spanning version reads the per-slice count:
+    /// with item 93's three tapes, no single retirement leaves no copy, and
+    /// after tape 2 is gone, tape 1 and tape 3 are each the last holder of
+    /// their slices.
+    #[test]
+    fn at_stake_counts_a_current_spans_copies_slice_by_slice() {
+        let (c, _snap, _set, [t1, t2, t3]) = item_93();
+        for t in [t1, t2, t3] {
+            let rows = versions_at_stake(&c.conn, c.unit_id, t).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].copies_after, 1, "volume {t}");
+            assert_eq!(rows[0].locations_after, 1);
+        }
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![t2],
+            )
+            .unwrap();
+        for t in [t1, t3] {
+            assert_eq!(
+                versions_at_stake(&c.conn, c.unit_id, t).unwrap()[0].copies_after,
+                0
+            );
+        }
+    }
+
+    /// `sole_slices` with range rows on both sides: a range tape's slices that
+    /// no other eligible tape holds, and none that another range holds. A
+    /// `pending` position (planned past the cut) is not on the tape.
+    #[test]
+    fn sole_slices_reads_ranges_on_both_sides() {
+        let (c, _snap, set, [t1, t2, t3]) = item_93();
+        let numbers = |vol: i64| -> Vec<i64> {
+            let sole = sole_slices(&c.conn, vol).unwrap();
+            assert!(sole
+                .iter()
+                .all(|s| s.stage_set_id == set && s.unit_name == "span"));
+            let ids: Vec<i64> = sole.iter().map(|s| s.stage_slice_id).collect();
+            (1..=6)
+                .filter(|n| ids.contains(&c.slice(set, *n)))
+                .collect()
+        };
+        assert!(numbers(t1).is_empty(), "1..2 are on tape 2 too");
+        assert!(numbers(t2).is_empty());
+        assert!(numbers(t3).is_empty());
+
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![t2],
+            )
+            .unwrap();
+        assert_eq!(numbers(t1), vec![1, 2], "not 3..6: planned, never written");
+        assert_eq!(numbers(t3), vec![3, 4, 5, 6]);
     }
 }
