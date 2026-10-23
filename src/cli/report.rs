@@ -84,6 +84,14 @@ pub enum ReportCommands {
     },
     /// Superseded snapshot versions that could be marked reclaimable
     Supersedable,
+    /// Stage attempts that failed, and the hours each lost
+    ///
+    /// Every `stage create` that ended without staging its unit, from the
+    /// facts the catalog keeps: when it started, the last moment it recorded
+    /// (its phases, dar's report, its source check), and the hours between,
+    /// with the total. A failed stage restarts its unit from the beginning
+    /// (ADR-0012 item 91), so this is the time it cost.
+    FailedStages,
 }
 
 pub fn run(
@@ -125,6 +133,7 @@ pub fn run(
             generation,
         } => report_compaction_plan(conn, config, generation.as_deref(), json_output),
         ReportCommands::Supersedable => report_supersedable(conn, config, json_output),
+        ReportCommands::FailedStages => report_failed_stages(conn, json_output),
     }
 }
 
@@ -251,6 +260,152 @@ fn supersedable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serd
     })
 }
 
+// ── Failed stages (#409, ADR-0012 item 91; coordinator fork X28) ──
+
+/// One `stage create` that ended without staging its unit.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct FailedStage {
+    pub unit: String,
+    pub version: i64,
+    pub stage_set_id: i64,
+    /// When the attempt began (`stage_sets.created_at`).
+    pub started: String,
+    /// The last moment the catalog recorded of the attempt: the end of its
+    /// last recorded phase (`phase_timings`, written as the attempt
+    /// unwinds, its failed phase included), dar's report (`dar_create_reports`,
+    /// written when dar ends), or its source check (`source_validated_at`),
+    /// whichever is latest. `None` when it recorded none of them: a crash or
+    /// a power loss before dar ended leaves only the start.
+    pub failed: Option<String>,
+    /// `failed` less `started`, in hours. `None` with `failed`.
+    pub hours_lost: Option<f64>,
+}
+
+/// Every failed stage attempt the catalog still has, oldest first.
+///
+/// A stage set is one attempt (each `stage create` inserts its own row). It
+/// failed when it never reached `staged` (`staged_at` is set only there) and
+/// is no longer in progress: `failed` (marked by `db::open`'s sweep, or the
+/// failure path's own cleanup leaving it for the sweep), or `cleaned` after
+/// `staging clean` released a failed set's files. A rebuilt row
+/// (`origin = 'rebuilt'`) was never staged here and is left out. A row
+/// `snapshot delete` removed takes its attempt with it.
+///
+/// Derived from the facts the catalog already keeps (ADR-0012 item 91): no
+/// new column records a failure. The total is over the attempts with a
+/// recorded end.
+pub(crate) fn failed_stage_rows(conn: &Connection) -> Result<Vec<FailedStage>> {
+    let mut stmt = conn.prepare(
+        "SELECT ss.id, u.name, s.version, ss.created_at,
+                (SELECT MAX(datetime(pt.started_at,
+                                     '+' || (pt.duration_ms / 1000.0) || ' seconds'))
+                   FROM phase_timings pt WHERE pt.stage_set_id = ss.id),
+                (SELECT MAX(dr.captured_at) FROM dar_create_reports dr
+                  WHERE dr.stage_set_id = ss.id),
+                ss.source_validated_at
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE ss.status IN ('failed', 'cleaned') AND ss.staged_at IS NULL
+           AND ss.origin = 'staged'
+         ORDER BY ss.created_at, ss.id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                [
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ],
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let parse = |t: &str| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S").ok();
+    Ok(rows
+        .into_iter()
+        .map(|(stage_set_id, unit, version, started, ends)| {
+            // Every stamp is `datetime('now')`'s spelling, so the latest is
+            // the greatest string.
+            let failed = ends.into_iter().flatten().max();
+            let hours_lost = match (parse(&started), failed.as_deref().and_then(parse)) {
+                (Some(a), Some(b)) => Some(((b - a).num_seconds().max(0)) as f64 / 3600.0),
+                _ => None,
+            };
+            FailedStage {
+                unit,
+                version,
+                stage_set_id,
+                started,
+                failed,
+                hours_lost,
+            }
+        })
+        .collect())
+}
+
+/// `report failed-stages`' figures: the rows, and the total of the hours
+/// that are known.
+fn failed_stages_json(rows: &[FailedStage]) -> serde_json::Value {
+    let total: f64 = rows.iter().filter_map(|r| r.hours_lost).sum();
+    serde_json::json!({
+        "failed_stages": rows,
+        "count": rows.len(),
+        "total_hours_lost": total,
+        "without_recorded_end": rows.iter().filter(|r| r.hours_lost.is_none()).count(),
+    })
+}
+
+fn failed_stages_lines(rows: &[FailedStage]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["no failed stages recorded".to_string()];
+    }
+    let mut lines = vec![format!("failed stages ({}):", rows.len())];
+    for r in rows {
+        lines.push(match (&r.failed, r.hours_lost) {
+            (Some(failed), Some(hours)) => format!(
+                "  {} v{} (stage set {}): started {}, failed {}: {hours:.1} hours lost",
+                r.unit, r.version, r.stage_set_id, r.started, failed
+            ),
+            _ => format!(
+                "  {} v{} (stage set {}): started {}, no end recorded (the process stopped \
+                 before it could record one): hours lost unknown",
+                r.unit, r.version, r.stage_set_id, r.started
+            ),
+        });
+    }
+    let total: f64 = rows.iter().filter_map(|r| r.hours_lost).sum();
+    let unknown = rows.iter().filter(|r| r.hours_lost.is_none()).count();
+    lines.push(if unknown == 0 {
+        format!("total: {total:.1} hours lost")
+    } else {
+        format!(
+            "total: {total:.1} hours lost, not counting {unknown} stage(s) with no end recorded"
+        )
+    });
+    lines
+}
+
+/// `report failed-stages`.
+fn report_failed_stages(conn: &Connection, json_output: bool) -> Result<()> {
+    let rows = failed_stage_rows(conn)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&failed_stages_json(&rows)).unwrap()
+        );
+    } else {
+        for line in failed_stages_lines(&rows) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
 /// Count of volumes whose physical media is in service and accounted for
 /// (`report summary`). Group-B (issue #96): inventory, not copy-counting.
 fn in_service_volume_count(conn: &Connection) -> Result<i64> {
@@ -291,7 +446,11 @@ pub(crate) struct Summary {
     pub units: i64,
     pub snapshots: i64,
     pub volumes: i64,
+    /// `completed` writes: each holds its unit's version whole.
     pub writes: i64,
+    /// `range` writes (#478): each holds a run of a spannable version's
+    /// slices, a copy only together with the tapes holding the rest.
+    pub ranges: i64,
     pub total_bytes: i64,
     /// Every `staged` stage set, written or not.
     pub staged_held: i64,
@@ -312,7 +471,15 @@ impl Summary {
                  quarantined not counted)",
                 self.volumes
             ),
-            format!("  Writes:     {} completed", self.writes),
+            if self.ranges == 0 {
+                format!("  Writes:     {} completed", self.writes)
+            } else {
+                format!(
+                    "  Writes:     {} completed (each a version whole), {} range(s) (part of a \
+                     version across tapes)",
+                    self.writes, self.ranges
+                )
+            },
             format!(
                 "  Total data: {} on tape",
                 crate::util::format_bytes_binary(self.total_bytes)
@@ -345,7 +512,8 @@ impl Summary {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "tenants": self.tenants, "units": self.units, "snapshots": self.snapshots,
-            "volumes": self.volumes, "writes": self.writes, "total_bytes": self.total_bytes,
+            "volumes": self.volumes, "writes": self.writes, "ranges": self.ranges,
+            "total_bytes": self.total_bytes,
             "stage_sets_held": self.staged_held,
             "stage_sets_owing_a_copy": self.staged_owing,
         })
@@ -365,10 +533,13 @@ pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
     )?;
     let snapshots: i64 = conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
     let volumes: i64 = in_service_volume_count(conn)?;
-    let writes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM writes WHERE status = 'completed'",
+    // Whole copies and ranges apart (#478): a range is part of a copy, and
+    // one count of both would read as that many copies.
+    let (writes, ranges): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(status = 'completed'), 0), COALESCE(SUM(status = 'range'), 0)
+         FROM writes WHERE status IN ('completed', 'range')",
         [],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let total_bytes: i64 = in_service_bytes_written(conn)?;
     let staged = staged_set_rows(conn, config)?;
@@ -378,6 +549,7 @@ pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
         snapshots,
         volumes,
         writes,
+        ranges,
         total_bytes,
         staged_held: staged.len() as i64,
         staged_owing: staged.iter().filter(|r| r.owes_a_copy()).count() as i64,
@@ -639,6 +811,11 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
 /// #205/finding-5 defect this fix must not reintroduce (a raw fact must
 /// carry no display-only annotation) -- `report_copies` renders the marker
 /// for the table only, from these two clean lists.
+///
+/// From 1.7.0 the 4th field also lists a tape holding a `range` of a current
+/// version (#478): it holds part of the version, and is a tape to fetch to
+/// restore it. Which slices it holds is [`range_holdings_by_unit`]'s, beside
+/// it, never folded into this list.
 pub(crate) type CopyRow = (String, i64, i64, Option<String>, i64, Option<String>);
 
 pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Result<Vec<CopyRow>> {
@@ -678,7 +855,7 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
         "
          LEFT JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          LEFT JOIN stage_sets ss ON ss.snapshot_id = s.id
-         LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'completed'
+         LEFT JOIN writes w ON w.stage_set_id = ss.id AND w.status IN ('completed', 'range')
          LEFT JOIN volumes v ON v.id = w.volume_id
          WHERE u.status IN ('active', 'tape_only')",
     );
@@ -705,6 +882,73 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// One tape holding a `range` of a unit's current version (#478): the run of
+/// the version's slices it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RangeHolding {
+    pub volume: String,
+    pub version: i64,
+    pub first_slice: i64,
+    pub last_slice: i64,
+    /// How many slices the version's stage set has.
+    pub slices: i64,
+}
+
+impl RangeHolding {
+    fn describe(&self) -> String {
+        format!(
+            "{} holds v{} slices {}-{} of {}",
+            self.volume, self.version, self.first_slice, self.last_slice, self.slices
+        )
+    }
+}
+
+/// The tapes holding a `range` of each unit's current versions, per unit
+/// name, in version and slice order: the same population as
+/// [`copies_rows`]' tape list (a current version, an in-service volume, a
+/// unit `active` or `tape_only`), each with the run of slices its range
+/// `written` (#478; `volume-format-v2.md` §4.4). `report copies` prints them
+/// under the unit, so a tape in the list that holds only part of a version
+/// says which part.
+pub(crate) fn range_holdings_by_unit(
+    conn: &Connection,
+    unit_filter: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, Vec<RangeHolding>>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT u.name, v.label, s.version, MIN(sl.slice_number), MAX(sl.slice_number),
+                (SELECT COUNT(*) FROM stage_slices al WHERE al.stage_set_id = w.stage_set_id)
+         FROM units u
+         JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
+         JOIN stage_sets ss ON ss.snapshot_id = s.id
+         JOIN writes w ON w.stage_set_id = ss.id AND w.status = 'range'
+         JOIN volumes v ON v.id = w.volume_id
+         JOIN write_positions wp ON wp.write_id = w.id AND wp.status = 'written'
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+         WHERE u.status IN ('active', 'tape_only') AND {in_service}
+           AND (?1 IS NULL OR u.name = ?1)
+         GROUP BY w.id
+         ORDER BY u.name, s.version, MIN(sl.slice_number), v.label",
+        in_service = crate::policy::coverage::in_service("v"),
+    ))?;
+    let mut out: std::collections::BTreeMap<String, Vec<RangeHolding>> = Default::default();
+    for row in stmt.query_map(rusqlite::params![unit_filter], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            RangeHolding {
+                volume: r.get(1)?,
+                version: r.get(2)?,
+                first_slice: r.get(3)?,
+                last_slice: r.get(4)?,
+                slices: r.get(5)?,
+            },
+        ))
+    })? {
+        let (unit, holding) = row?;
+        out.entry(unit).or_default().push(holding);
+    }
+    Ok(out)
 }
 
 /// The table-only `*` rendering for `report copies`' volume list (issue
@@ -734,12 +978,14 @@ fn mark_ineligible_volumes(vols: &str, not_eligible: &str) -> String {
 fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
     let rows = copies_rows(conn, unit_filter)?;
     let gaps = escrow_gaps_by_unit(conn, unit_filter)?;
+    let ranges = range_holdings_by_unit(conn, unit_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
             .map(|(name, copies, locs, vols, deposits, not_eligible)| {
                 let no_escrow = gaps.get(name).cloned().unwrap_or_default();
+                let held_as_ranges = ranges.get(name).cloned().unwrap_or_default();
                 serde_json::json!({"unit": name, "copies": copies, "locations": locs,
                                    "volumes": vols, "warehouse_deposits": deposits,
                                    // Issue #236 finding 2 follow-up: additive,
@@ -747,7 +993,10 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
                                    // a raw fact carries no display annotation
                                    // (the finding-5 rule, applied here too).
                                    "volumes_not_eligible": not_eligible,
-                                   "volumes_without_escrow": no_escrow})
+                                   "volumes_without_escrow": no_escrow,
+                                   // #478: additive; each tape of the list
+                                   // that holds a range, with its run.
+                                   "ranges": held_as_ranges})
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -790,6 +1039,18 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
                     ""
                 }
             );
+            // #478: a tape in the list that holds only a range of a
+            // version says which slices, so "tapes holding any version" is
+            // not read as that many whole copies.
+            if let Some(held) = ranges.get(name) {
+                println!(
+                    "      ranges: {}",
+                    held.iter()
+                        .map(RangeHolding::describe)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             // A copy the current escrow key cannot open still counts as a
             // copy — it is real data on a real cartridge — so this is a note
             // beside the count, never a deduction from it. Silently lowering
@@ -6625,6 +6886,224 @@ Read error counter page  [0x3]
             let b = planner_budget(&config, Some("LTO-7")).unwrap();
             assert_eq!(b.capacity_bytes, 6_000_000_000_000);
             assert!(TapeBudget::new("x".into(), 100, 0.5, 10, false).bytes == 40);
+        }
+    }
+
+    /// #478: whole copies and ranges counted apart, and the tapes holding a
+    /// range named with their runs (item 93's layout: SPAN-1 holds slices
+    /// 1-2, SPAN-2 the version whole, SPAN-3 slices 3-6).
+    mod ranges {
+        use super::*;
+        use crate::policy::coverage::tests::SpanCatalog;
+
+        fn item_93() -> SpanCatalog {
+            let c = SpanCatalog::new();
+            let snap = c.version(1, "current");
+            let set = c.stage_set(snap, 6);
+            let t1 = c.volume("SPAN-1", None);
+            let t2 = c.volume("SPAN-2", None);
+            let t3 = c.volume("SPAN-3", None);
+            c.range(set, t1, 1, 2, 6);
+            c.whole(set, 6, t2);
+            c.range(set, t3, 3, 6, 6);
+            c
+        }
+
+        #[test]
+        fn summary_counts_whole_copies_and_ranges_apart() {
+            let c = item_93();
+            let summary = summarize(&c.conn, &Config::default()).unwrap();
+            assert_eq!((summary.writes, summary.ranges), (1, 2));
+            assert!(
+                summary.text_lines().contains(
+                    &"  Writes:     1 completed (each a version whole), 2 range(s) (part of \
+                      a version across tapes)"
+                        .to_string()
+                ),
+                "{:?}",
+                summary.text_lines()
+            );
+            let json = summary.json();
+            assert_eq!((json["writes"].as_i64(), json["ranges"].as_i64()), (Some(1), Some(2)));
+
+            // Positive control: with no range, the line reads as before.
+            c.conn
+                .execute("DELETE FROM write_positions WHERE write_id IN (SELECT id FROM writes WHERE status = 'range')", [])
+                .unwrap();
+            c.conn
+                .execute("DELETE FROM writes WHERE status = 'range'", [])
+                .unwrap();
+            let summary = summarize(&c.conn, &Config::default()).unwrap();
+            assert!(summary
+                .text_lines()
+                .contains(&"  Writes:     1 completed".to_string()));
+        }
+
+        #[test]
+        fn report_copies_lists_range_holders_with_their_runs() {
+            let c = item_93();
+            let rows = copies_rows(&c.conn, Some("span")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, 2, "item 93's layout is two copies");
+            assert_eq!(
+                rows[0].3.as_deref(),
+                Some("SPAN-1,SPAN-2,SPAN-3"),
+                "the tapes holding any part of the version"
+            );
+            let held = range_holdings_by_unit(&c.conn, Some("span")).unwrap();
+            assert_eq!(
+                held["span"]
+                    .iter()
+                    .map(RangeHolding::describe)
+                    .collect::<Vec<_>>(),
+                [
+                    "SPAN-1 holds v1 slices 1-2 of 6",
+                    "SPAN-3 holds v1 slices 3-6 of 6"
+                ]
+            );
+            assert_eq!(
+                held,
+                range_holdings_by_unit(&c.conn, None).unwrap(),
+                "the unit filter only narrows"
+            );
+            assert!(range_holdings_by_unit(&c.conn, Some("other"))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    /// #409 (ADR-0012 item 91; coordinator fork X28): `report failed-stages`.
+    mod failed_stages {
+        use super::*;
+
+        /// One unit `photos` (v1), its stage attempts as `(status,
+        /// staged_at, origin, created_at)`; returns the catalog and the ids.
+        fn attempts(rows: &[(&str, Option<&str>, &str, &str)]) -> (Connection, Vec<i64>) {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 0, 'active');
+                 INSERT INTO units (id, uuid, name, tenant_id, status)
+                     VALUES (1, 'u', 'photos', 1, 'active');
+                 INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path)
+                     VALUES (1, 1, 1, 'full', 'created', '/src');",
+            )
+            .unwrap();
+            let ids = rows
+                .iter()
+                .map(|(status, staged_at, origin, created_at)| {
+                    conn.execute(
+                        "INSERT INTO stage_sets (snapshot_id, status, slice_size, staged_at,
+                                                 origin, created_at)
+                         VALUES (1, ?1, 524288, ?2, ?3, ?4)",
+                        params![status, staged_at, origin, created_at],
+                    )
+                    .unwrap();
+                    conn.last_insert_rowid()
+                })
+                .collect();
+            (conn, ids)
+        }
+
+        fn phase(conn: &Connection, set: i64, seq: i64, started: &str, ms: i64, outcome: &str) {
+            conn.execute(
+                "INSERT INTO phase_timings (session, operation, stage_set_id, seq, phase,
+                                            started_at, duration_ms, outcome)
+                 VALUES ('s', 'stage create', ?1, ?2, 'dar', ?3, ?4, ?5)",
+                params![set, seq, started, ms, outcome],
+            )
+            .unwrap();
+        }
+
+        /// A failure recorded by its phases (2.5 hours), one released by
+        /// `staging clean` known by dar's report (1 hour), one that stopped
+        /// before recording anything (unknown, not in the total). A staged
+        /// set released later, one still staging and a rebuilt row are no
+        /// failures.
+        fn world() -> (Connection, Vec<i64>) {
+            let (conn, ids) = attempts(&[
+                ("failed", None, "staged", "2026-10-01 10:00:00"),
+                ("cleaned", None, "staged", "2026-10-02 09:00:00"),
+                ("failed", None, "staged", "2026-10-03 08:00:00"),
+                ("cleaned", Some("2026-10-04 12:00:00"), "staged", "2026-10-04 08:00:00"),
+                ("staging", None, "staged", "2026-10-05 08:00:00"),
+                ("cleaned", None, "rebuilt", "2026-10-06 08:00:00"),
+            ]);
+            phase(&conn, ids[0], 1, "2026-10-01 10:00:00", 3_600_000, "ok");
+            phase(&conn, ids[0], 2, "2026-10-01 11:00:00", 5_400_000, "failed");
+            conn.execute(
+                "INSERT INTO dar_create_reports (stage_set_id, captured_at, outcome, dar_command,
+                                                 tapectl_version)
+                 VALUES (?1, '2026-10-02 10:00:00', 'files_changed', 'dar -c -', '1.7.0')",
+                params![ids[1]],
+            )
+            .unwrap();
+            (conn, ids)
+        }
+
+        #[test]
+        fn failed_stages_are_listed_with_the_hours_each_lost() {
+            let (conn, ids) = world();
+            let rows = failed_stage_rows(&conn).unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.stage_set_id).collect::<Vec<_>>(),
+                ids[..3]
+            );
+            assert_eq!(rows[0].failed.as_deref(), Some("2026-10-01 12:30:00"));
+            assert_eq!(rows[0].hours_lost, Some(2.5));
+            assert_eq!(rows[1].failed.as_deref(), Some("2026-10-02 10:00:00"));
+            assert_eq!(rows[1].hours_lost, Some(1.0));
+            assert_eq!((rows[2].failed.as_ref(), rows[2].hours_lost), (None, None));
+
+            assert_eq!(
+                failed_stages_lines(&rows),
+                [
+                    "failed stages (3):".to_string(),
+                    format!(
+                        "  photos v1 (stage set {}): started 2026-10-01 10:00:00, failed \
+                         2026-10-01 12:30:00: 2.5 hours lost",
+                        ids[0]
+                    ),
+                    format!(
+                        "  photos v1 (stage set {}): started 2026-10-02 09:00:00, failed \
+                         2026-10-02 10:00:00: 1.0 hours lost",
+                        ids[1]
+                    ),
+                    format!(
+                        "  photos v1 (stage set {}): started 2026-10-03 08:00:00, no end \
+                         recorded (the process stopped before it could record one): hours \
+                         lost unknown",
+                        ids[2]
+                    ),
+                    "total: 3.5 hours lost, not counting 1 stage(s) with no end recorded"
+                        .to_string(),
+                ]
+            );
+
+            let json = failed_stages_json(&rows);
+            assert_eq!(json["count"], 3);
+            assert_eq!(json["total_hours_lost"], 3.5);
+            assert_eq!(json["without_recorded_end"], 1);
+            let first = &json["failed_stages"][0];
+            assert_eq!(first["unit"], "photos");
+            assert_eq!(first["version"], 1);
+            assert_eq!(first["started"], "2026-10-01 10:00:00");
+            assert_eq!(first["failed"], "2026-10-01 12:30:00");
+            assert_eq!(first["hours_lost"], 2.5);
+            assert!(json["failed_stages"][2]["hours_lost"].is_null());
+        }
+
+        #[test]
+        fn no_failed_stage_says_so() {
+            let (conn, _) = attempts(&[(
+                "cleaned",
+                Some("2026-10-04 12:00:00"),
+                "staged",
+                "2026-10-04 08:00:00",
+            )]);
+            let rows = failed_stage_rows(&conn).unwrap();
+            assert!(rows.is_empty());
+            assert_eq!(failed_stages_lines(&rows), ["no failed stages recorded"]);
+            assert_eq!(failed_stages_json(&rows)["total_hours_lost"], 0.0);
         }
     }
 }

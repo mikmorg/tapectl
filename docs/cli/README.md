@@ -135,6 +135,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`report events`](report.md#tapectl-report-events) | Audit trail browsing |
 | &nbsp;&nbsp;[`report compaction-candidates`](report.md#tapectl-report-compaction-candidates) | Volumes flagged for compaction |
 | &nbsp;&nbsp;[`report supersedable`](report.md#tapectl-report-supersedable) | Superseded snapshot versions that could be marked reclaimable |
+| &nbsp;&nbsp;[`report failed-stages`](report.md#tapectl-report-failed-stages) | Stage attempts that failed, and the hours each lost |
 | [`restore`](restore.md) | Restore data from volumes |
 | &nbsp;&nbsp;[`restore unit`](restore.md#tapectl-restore-unit) | Restore a unit from a volume |
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
