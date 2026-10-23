@@ -768,7 +768,10 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    first ("The rest of the box" says how to do both). A renamed unit has
    the name each tape shows. Two units of one name (compare the uuids
    `--where --all` prints) go in different directories:
-   `/destination/UNIT-` and the first 8 characters of the uuid.
+   `/destination/UNIT-` and the first 8 characters of the uuid. A unit
+   across tapes (`--where` shows a tape holding a range of it) restores from
+   a tape that holds it whole, or from the tape that holds its slice 1,
+   which asks for the others: "A unit across tapes".
 7. Check each restore: "Did the restore get everything?". A slice or a file
    that is damaged: "If a slice or a file is damaged".
 8. Know when you are done: every tape you hold opened with your key and
@@ -1807,12 +1810,29 @@ one it holds only a range of. `--where` and `--find` print the run of
 slices each tape holds when it is not the whole version, marked "a range".
 
 What a restore needs: every slice, 1 to N, in slice order, from the tapes
-that hold them. dar never runs over one tape's slices alone. Start from the
+that hold them. dar never runs over one tape's slices alone.
+
+Prefer a whole copy: if any tape holds the version whole (`--where` prints
+no "a range" beside it), restore from that tape alone, as any unit, with
+no change of cartridge and no scratch. A whole copy written from another
+staging run of the same version has slices of other sha256 values: the
+prompt below refuses it by hash, though `--where` names it, and it still
+restores alone.
+
+If none does, read the version across tapes. Start from the
 tape that holds slice 1: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`
 on the NEWEST tape names the tapes and the slices each holds (a tape never
 names a tape written after it, so the first tape of a unit across tapes
-cannot name the rest). Run THAT tape's RESTORE.sh with `--restore --unit
-UNIT`. When the tape's run ends before slice N, it names the slice it needs
+cannot name the rest). Before you start, write down every tape it names
+and the slices each holds: the restore asks for the next slice by number,
+the tape then in the drive can name only tapes written before it, and to
+run `--where` on the newest tape again you would have to change cartridges
+in the middle of the restore. Load the tape that holds slice 1 and run
+THAT tape's RESTORE.sh (saved as `RESTORE-<label>.sh`, as for any tape):
+
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT
+
+When the tape's run ends before slice N, it names the slice it needs
 next and the tapes an index names for it, and waits for you to load another
 cartridge and press ENTER. It takes a cartridge only when that tape's front
 index lists the next slice's `sha256_encrypted`, at a position its own seal
@@ -9257,6 +9277,60 @@ mod tests {
         }
     }
 
+    /// The fresh read, m4: "Run THAT tape's RESTORE.sh with `--restore --unit
+    /// UNIT`" lacked `--key` and `--to`, which the script requires; and Start
+    /// here never mentioned a unit across tapes.
+    #[test]
+    fn fresh_read_478_m4_the_full_command_and_a_line_in_start_here() {
+        let g = generate_system_guide_v2_for_media("FR10", 20, "LTO-6");
+        let sec = guide_section(&g, "A unit across tapes");
+        assert!(
+            sec.contains("\n    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT\n"),
+            "{sec}"
+        );
+        let f = flat_text(sec);
+        assert!(
+            f.contains("Load the tape that holds slice 1 and run THAT tape's RESTORE.sh (saved as `RESTORE-<label>.sh`, as for any tape):"),
+            "{f}"
+        );
+        assert!(!f.contains("with `--restore --unit UNIT`."), "{f}");
+        let start = flat_text(guide_section(&g, "Start here"));
+        assert!(
+            start.contains("A unit across tapes (`--where` shows a tape holding a range of it) restores from a tape that holds it whole, or from the tape that holds its slice 1, which asks for the others: \"A unit across tapes\"."),
+            "{start}"
+        );
+    }
+
+    /// The fresh read, m5: nothing told the heir to write down the holders
+    /// and their slices before a restore across tapes, though the first tape
+    /// cannot name the rest and the prompt sends the heir to `--where` on the
+    /// newest tape, a swap in the middle of the restore with one drive.
+    #[test]
+    fn fresh_read_478_m5_write_down_the_holders_before_you_start() {
+        let g = generate_system_guide_v2_for_media("FR11", 20, "LTO-6");
+        let f = flat_text(guide_section(&g, "A unit across tapes"));
+        assert!(
+            f.contains("Before you start, write down every tape it names and the slices each holds: the restore asks for the next slice by number, the tape then in the drive can name only tapes written before it, and to run `--where` on the newest tape again you would have to change cartridges in the middle of the restore."),
+            "{f}"
+        );
+    }
+
+    /// The fresh read, m9: nothing said to prefer a whole copy, and a whole
+    /// copy from another staging run is refused by hash at a swap prompt
+    /// (R8) though `--where` names it, yet restores alone.
+    #[test]
+    fn fresh_read_478_m9_prefer_a_whole_copy() {
+        let g = generate_system_guide_v2_for_media("FR12", 20, "LTO-6");
+        let f = flat_text(guide_section(&g, "A unit across tapes"));
+        for needle in [
+            "Prefer a whole copy: if any tape holds the version whole (`--where` prints no \"a range\" beside it), restore from that tape alone, as any unit, with no change of cartridge and no scratch.",
+            "A whole copy written from another staging run of the same version has slices of other sha256 values: the prompt below refuses it by hash, though `--where` names it, and it still restores alone.",
+            "If none does, read the version across tapes. Start from the tape that holds slice 1:",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+    }
+
     /// ADR-0012 item 141 (with its 2026-10-22 correction of fact: the query
     /// reads the Heir Kit's `catalog.db.age`): File 1's query of which tapes
     /// hold which units lists `range` writes beside whole copies, each with
@@ -14321,8 +14395,10 @@ sha256_encrypted = \"bbb\"
         // reads, a key checked without a cover sheet, and two units of one
         // name in different directories; 60 until the fifth read's fixes
         // (#481), which named the script step 3 saved, put `$TMPDIR` before
-        // the first listing that fills it, and pointed `--all` at its check.
-        assert!(guide_section(&g, "Start here").lines().count() <= 64);
+        // the first listing that fills it, and pointed `--all` at its check;
+        // 64 until the fresh read of a span (#478 m4), which told step 6
+        // where a unit across tapes restores from.
+        assert!(guide_section(&g, "Start here").lines().count() <= 67);
     }
 
     /// S1: with the escrow or operator key the first envelope that opens is a
@@ -16134,7 +16210,9 @@ sha256_encrypted = \"bbb\"
             box_section(&g).contains("Nothing on a tape can name tapes written after it"),
             "the full rule stays in the box section"
         );
-        assert!(guide_section(&g, "Start here").lines().count() <= 64);
+        // 67 since the fresh read of a span (#478 m4); the history is in
+        // reread2_s2_start_here_comes_first_and_names_sections_that_exist.
+        assert!(guide_section(&g, "Start here").lines().count() <= 67);
     }
 
     /// #485 item 2: a way to see the files only an older version has, with
@@ -16529,7 +16607,9 @@ sha256_encrypted = \"bbb\"
             ),
             "{start}"
         );
-        assert!(guide_section(&g, "Start here").lines().count() <= 64);
+        // 67 since the fresh read of a span (#478 m4); the history is in
+        // reread2_s2_start_here_comes_first_and_names_sections_that_exist.
+        assert!(guide_section(&g, "Start here").lines().count() <= 67);
         let kit = flat_text(guide_section(&g, "The Heir Kit's catalogue"));
         assert!(
             kit.contains("SELECT u.name AS unit, u.uuid, s.version"),
