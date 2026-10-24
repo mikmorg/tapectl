@@ -422,11 +422,30 @@ pub fn run(
                 None,
             )?;
             let sets = rename_in_archive_sets(&tx, current, new)?;
+            // #493 (ADR-0012 item 155): the per-location copy targets name
+            // locations too, in the archive sets' `copies_at` and in every
+            // unit's frozen dotfile map, so they follow in the same
+            // transaction; left alone, each would name a location that no
+            // longer exists and make its units' policy unresolvable.
+            let targets = rename_in_copies_at(&tx, current, new)?;
             tx.commit()?;
+            // The dotfiles after the commit, through the dotfile writer `unit
+            // rename` uses: the catalog is authoritative, and a file that
+            // cannot be rewritten is named, not a reason to undo the rename
+            // (issue #110's rule).
+            let dotfiles = rename_in_dotfiles(conn, current, new)?;
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"old": current, "new": new, "archive_sets": sets})
+                    serde_json::json!({
+                        "old": current, "new": new, "archive_sets": sets,
+                        "copies_at_archive_sets": targets.archive_sets,
+                        "copies_at_units": targets.units,
+                        "dotfiles_rewritten": dotfiles.rewritten,
+                        "dotfiles_failed": dotfiles.failed.iter()
+                            .map(|(path, why)| serde_json::json!({"path": path, "error": why}))
+                            .collect::<Vec<_>>(),
+                    })
                 );
             } else {
                 println!("location \"{current}\" renamed to \"{new}\"");
@@ -436,6 +455,36 @@ pub fn run(
                          [[archive_sets]] name \"{current}\", change it there too, or \
                          `archive-set sync` will refuse the old name.",
                         sets.join(", ")
+                    );
+                }
+                if !targets.archive_sets.is_empty() {
+                    println!(
+                        "  archive set(s) {} now name \"{new}\" in copies_at. If \
+                         config.toml's [[archive_sets]] copies_at name \"{current}\", change \
+                         it there too, or `archive-set sync` will refuse the old name.",
+                        targets.archive_sets.join(", ")
+                    );
+                }
+                if !targets.units.is_empty() {
+                    println!(
+                        "  {} unit(s) whose frozen copy targets named \"{current}\" now name \
+                         \"{new}\".",
+                        targets.units.len()
+                    );
+                }
+                if !dotfiles.rewritten.is_empty() {
+                    println!(
+                        "  {} unit dotfile(s) rewritten to name \"{new}\" in \
+                         [policy.copies_at].",
+                        dotfiles.rewritten.len()
+                    );
+                }
+            }
+            if !dotfiles.failed.is_empty() && !json_output {
+                for (path, why) in &dotfiles.failed {
+                    eprintln!(
+                        "warning: {path} {why}; if its [policy.copies_at] names \"{current}\", \
+                         rename it to \"{new}\" by hand, or the unit's policy cannot be resolved"
                     );
                 }
             }
@@ -488,6 +537,128 @@ fn rename_in_archive_sets(conn: &Connection, old: &str, new: &str) -> Result<Vec
         changed.push(set);
     }
     Ok(changed)
+}
+
+/// What [`rename_in_copies_at`] changed, by name.
+#[derive(Debug, Default)]
+struct CopiesAtRenamed {
+    /// The archive sets whose `copies_at` named the location.
+    archive_sets: Vec<String>,
+    /// The units whose frozen dotfile map (`units.copies_at_frozen`) named it.
+    units: Vec<String>,
+}
+
+/// `map` with the key `old` renamed `new` (its count kept; a stale entry
+/// already under `new` is replaced by it), as the JSON text every writer
+/// stores, or `None` when the text does not parse or does not name `old`.
+/// A value that does not parse is left exactly as it is: `policy::resolve`
+/// already refuses it by name.
+fn renamed_copies_at(text: &str, old: &str, new: &str) -> Option<String> {
+    let mut map = serde_json::from_str::<std::collections::BTreeMap<String, i64>>(text).ok()?;
+    let count = map.remove(old)?;
+    map.insert(new.to_string(), count);
+    Some(serde_json::to_string(&map).expect("a map of names to counts serialises"))
+}
+
+/// Rename location `old` to `new` in every archive set's `copies_at` and
+/// every unit's `copies_at_frozen` (#493, ADR-0012 item 155), logging each
+/// change; returns what changed, by name.
+fn rename_in_copies_at(conn: &Connection, old: &str, new: &str) -> Result<CopiesAtRenamed> {
+    let mut out = CopiesAtRenamed::default();
+    if old == new {
+        return Ok(out);
+    }
+    let sets: Vec<(i64, String, String)> = conn
+        .prepare(
+            "SELECT id, name, copies_at FROM archive_sets
+             WHERE copies_at IS NOT NULL ORDER BY name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, set, value) in sets {
+        let Some(renamed) = renamed_copies_at(&value, old, new) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE archive_sets SET copies_at = ?1 WHERE id = ?2",
+            params![renamed, id],
+        )?;
+        events::log_field_change(
+            conn,
+            "archive_set",
+            id,
+            &set,
+            "edited",
+            "copies_at",
+            Some(&value),
+            &renamed,
+            None,
+        )?;
+        out.archive_sets.push(set);
+    }
+    let units: Vec<(i64, String, i64, String)> = conn
+        .prepare(
+            "SELECT id, name, tenant_id, copies_at_frozen FROM units
+             WHERE copies_at_frozen IS NOT NULL ORDER BY name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, unit, tenant_id, value) in units {
+        let Some(renamed) = renamed_copies_at(&value, old, new) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = ?1 WHERE id = ?2",
+            params![renamed, id],
+        )?;
+        events::log_field_change(
+            conn,
+            "unit",
+            id,
+            &unit,
+            "location_renamed",
+            "copies_at_frozen",
+            Some(&value),
+            &renamed,
+            Some(tenant_id),
+        )?;
+        out.units.push(unit);
+    }
+    Ok(out)
+}
+
+/// What [`rename_in_dotfiles`] did: the dotfiles rewritten, and each one it
+/// could not rewrite with the reason, by path.
+#[derive(Debug, Default)]
+struct DotfilesRenamed {
+    rewritten: Vec<String>,
+    failed: Vec<(String, String)>,
+}
+
+/// Rename location `old` to `new` in the `[policy.copies_at]` of every
+/// present unit dotfile (#493, ADR-0012 item 155), each through
+/// `unit::rename_location_in_dotfile`. Runs after the catalog's commit.
+fn rename_in_dotfiles(conn: &Connection, old: &str, new: &str) -> Result<DotfilesRenamed> {
+    let mut out = DotfilesRenamed::default();
+    if old == new {
+        return Ok(out);
+    }
+    let paths: Vec<String> = conn
+        .prepare("SELECT current_path FROM units WHERE current_path IS NOT NULL ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for path in paths {
+        let dotfile = std::path::Path::new(&path)
+            .join(crate::unit::dotfile::UNIT_DOTFILE)
+            .display()
+            .to_string();
+        match crate::unit::rename_location_in_dotfile(&path, old, new) {
+            crate::unit::DotfileLocationRename::Unchanged => {}
+            crate::unit::DotfileLocationRename::Rewritten => out.rewritten.push(dotfile),
+            crate::unit::DotfileLocationRename::Failed(why) => out.failed.push((dotfile, why)),
+        }
+    }
+    Ok(out)
 }
 
 /// Everything one move touched: the cartridge that physically moved (when
@@ -975,6 +1146,152 @@ mod tests {
             )
             .unwrap();
         assert_eq!(missing, 2);
+    }
+
+    /// #493 (ADR-0012 item 155): `location rename` rewrites every place a
+    /// per-location copy target names the location: the archive sets'
+    /// `copies_at` and the units' frozen dotfile maps in the rename's own
+    /// transaction (each change logged), and every present dotfile's
+    /// `[policy.copies_at]` after it, through the dotfile writer, keeping
+    /// every other key. Maps that do not name it, an unparseable stored map
+    /// and a unit with no dotfile are left exactly as they are; a dotfile
+    /// that names it but cannot be parsed is left too, and named.
+    #[test]
+    fn rename_rewrites_copies_at_in_archive_sets_frozen_units_and_dotfiles() {
+        let conn = setup();
+        conn.execute_batch(
+            r#"INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active');
+               INSERT INTO archive_sets (name, copies_at) VALUES
+                   ('media', '{"glacier":1,"home":2}'),
+                   ('other', '{"glacier":1}'),
+                   ('corrupt', '[home');"#,
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let unit_dir = |name: &str, dotfile: Option<&str>| -> String {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(text) = dotfile {
+                std::fs::write(dir.join(".tapectl-unit.toml"), text).unwrap();
+            }
+            dir.to_str().unwrap().to_string()
+        };
+        let head = |name: &str| {
+            format!(
+                "[unit]\nuuid = \"u-{name}\"\nname = \"{name}\"\n\
+                 created = \"2026-10-24T00:00:00Z\"\ntenant = \"alice\"\n\n"
+            )
+        };
+        let one = unit_dir(
+            "one",
+            Some(&format!(
+                "{}[policy]\nslice_size = \"2G\"\n\n[policy.copies_at]\nglacier = 1\nhome = 1\n",
+                head("one")
+            )),
+        );
+        let two_text = format!("{}[policy.copies_at]\nglacier = 2\n", head("two"));
+        let two = unit_dir("two", Some(&two_text));
+        let broken_text = "[policy.copies_at\nhome = 1\n";
+        let broken = unit_dir("broken", Some(broken_text));
+        let bare = unit_dir("bare", None);
+        for (name, path, frozen) in [
+            ("one", Some(one.as_str()), Some(r#"{"glacier":1,"home":1}"#)),
+            ("two", Some(two.as_str()), Some(r#"{"glacier":2}"#)),
+            ("broken", Some(broken.as_str()), None),
+            ("bare", Some(bare.as_str()), None),
+            ("gone", None, Some(r#"{"home":3}"#)),
+        ] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status, copies_at_frozen)
+                 VALUES (?1, ?2, (SELECT id FROM tenants WHERE name = 'alice'), ?3, 'active', ?4)",
+                params![format!("u-{name}"), name, path, frozen],
+            )
+            .unwrap();
+        }
+
+        run(
+            &conn,
+            &LocationCommands::Rename {
+                current: "home".into(),
+                new: "house".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        let set = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT copies_at FROM archive_sets WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(set("media").as_deref(), Some(r#"{"glacier":1,"house":2}"#));
+        assert_eq!(set("other").as_deref(), Some(r#"{"glacier":1}"#));
+        assert_eq!(set("corrupt").as_deref(), Some("[home"), "left as it was");
+        let frozen = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT copies_at_frozen FROM units WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(frozen("one").as_deref(), Some(r#"{"glacier":1,"house":1}"#));
+        assert_eq!(frozen("two").as_deref(), Some(r#"{"glacier":2}"#));
+        assert_eq!(frozen("gone").as_deref(), Some(r#"{"house":3}"#), "no source needed");
+
+        let one_after =
+            std::fs::read_to_string(std::path::Path::new(&one).join(".tapectl-unit.toml")).unwrap();
+        assert!(
+            one_after.contains("[policy.copies_at]\nglacier = 1\nhouse = 1\n"),
+            "{one_after}"
+        );
+        assert!(one_after.contains("slice_size = \"2G\""), "other keys kept: {one_after}");
+        assert!(!one_after.contains("home"), "{one_after}");
+        let read = |dir: &str| {
+            std::fs::read_to_string(std::path::Path::new(dir).join(".tapectl-unit.toml")).unwrap()
+        };
+        assert_eq!(read(&two), two_text, "a dotfile that does not name it is not rewritten");
+        assert_eq!(read(&broken), broken_text, "a broken dotfile is left as it is");
+        match crate::unit::rename_location_in_dotfile(&broken, "home", "house") {
+            crate::unit::DotfileLocationRename::Failed(why) => {
+                assert!(why.contains("could not be parsed"), "{why}")
+            }
+            other => panic!("a broken dotfile naming the location is named: {other:?}"),
+        }
+
+        let events: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT entity_type, field, entity_label FROM events
+                 WHERE field IN ('copies_at', 'copies_at_frozen') ORDER BY entity_label",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            [
+                ("unit".to_string(), "copies_at_frozen".to_string(), "gone".to_string()),
+                ("archive_set".to_string(), "copies_at".to_string(), "media".to_string()),
+                ("unit".to_string(), "copies_at_frozen".to_string(), "one".to_string()),
+            ]
+        );
+
+        // The renamed unit resolves: every name it now carries is registered.
+        let unit = crate::db::queries::get_unit_by_name(&conn, "one").unwrap().unwrap();
+        let resolved =
+            crate::policy::resolve(&conn, &crate::config::Config::default(), &unit).unwrap();
+        assert_eq!(
+            resolved.copies_at,
+            [("glacier".to_string(), 1), ("house".to_string(), 1)]
+                .into_iter()
+                .collect()
+        );
     }
 
     /// Seed one shelf location, one warehouse location, and a sealed volume.
