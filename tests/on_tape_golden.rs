@@ -300,6 +300,21 @@
 //! every substring pinned before still occurs as often as it did, and no
 //! `TOOLS_*` line moved.
 //!
+//! **Moved a fifth time, 2026-10-24, under ADR-0012 item 145** (outside item
+//! 135's list; the CTO's own ruling): RESTORE.sh's damage handling (`707c5c87…`
+//! to `1cd5a405…`). R1: the per-file check no longer parses `sha256sum -c`'s
+//! report (a `sha256sum` that shell-quotes a name with a space, a colon or a TAB
+//! left that damaged file off the list, and a fill then said FILL COMPLETE): each
+//! file is hashed on its own from standard input, so no name is read back, and
+//! `AWK_FILE_CHECK_FAILED`, `CHECK_UNNAMED` and the "could not be matched" warning
+//! are gone, which removes the one-pass `sha256sum -c` pin. R2: a folder whose own
+//! entry was in the lost slice is replaced on the list by what the index records
+//! under it (`expand_damaged_dirs`), and with no index the fill restores what is
+//! missing in it without overwriting (`fill_runs`, `dar -n`); the fill also reads
+//! the slices of every folder above a listed path, without which dar restores
+//! nothing inside such a folder. Every first line of a prompt, refusal and verdict
+//! is unchanged, every other substring keeps its count, and no `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -326,7 +341,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "707c5c8763c514a557fd87b87c95bec25067f742976f105b749751de7efa1263";
+const RESTORE_SH_SHA256: &str = "1cd5a405dbbb996a1b0d151c79091a661ef3123ceab718a525b0b7e8aa261f7a";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -459,7 +474,6 @@ fn restore_sh_bytes_are_pinned() {
         "file_check() { # <destination> [<file of escaped paths to check>]\n",
         "finish_damage() { # <destination> <slices not available, or empty>\n",
         "  file_check \"$root\" \"$WORK/fill.restored\"\n",
-        "  (cd \"$destdir\" && sha256sum -c --quiet) <\"$WORK/check.sums\"",
         // 1.3.0, widened a third time (the third read of File 1, #477): every
         // unit the index names, with no cap
         "where_every_unit() {\n",
@@ -546,6 +560,18 @@ fn restore_sh_bytes_are_pinned() {
         "A unit across tapes (by default) keeps all of its slices there too, still",
         "it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part",
         "says why and asks again; done or quit stops it.",
+        "      got=$(sha256sum 2>/dev/null <\"$destdir/$UNESC\") || got=\"\"\n",
+        "restored_scope() {\n",
+        "expand_damaged_dirs() { # <file of escaped paths, rewritten in place>\n",
+        "  expand_damaged_dirs \"$WORK/damaged.new\"\n  file_check \"$destdir\"\n",
+        "  expand_damaged_dirs \"$WORK/fill.still\"\n",
+        "fill_runs() { # <job> <root> <file|dir>\n",
+        "  fill_runs \"$j\" \"$root\" file\n  fill_runs \"$j\" \"$root\" dir\n",
+        "  [ \"$kind\" = file ] || opt=-n\n",
+        "      FILL_KIND+=(dir)\n",
+        "      for (i = 1; i <= nfound; i++) above(found[i])\n",
+        "      for (j = 1; j <= m; j++) rt[j] = top(rp[j], isdir)\n",
+        "    if [ \"$FILL_DIRS\" -gt 0 ]; then\n      info \"  In the $FILL_DIRS listed folder(s) only what was missing was restored: what was there already\"\n",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
