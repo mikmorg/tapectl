@@ -2876,6 +2876,46 @@ const DAR_SPY: &str = "#!/bin/sh\necho \"$*\" >>\"$FAKE_TAPE/dar.args\"\n\
     else echo file >>\"$FAKE_TAPE/dar.slices\"; fi; done ;; esac; done\n\
     exec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
 
+/// `DAR_SPY`, answering the script's version probe (`dar -V`) as dar
+/// `version`. How the script restores a unit is chosen from that version
+/// (`dar_at_least`), so a test of one way holds on whichever dar is
+/// installed; the installed dar still does every extraction. Only the choice
+/// follows the claim: a claim of 2.7.21 or later on a dar older than that
+/// streams with the old dar's tail loss, so such a test checks the bytes
+/// only when the installed dar is new enough itself (`host_dar_at_least`).
+fn dar_spy_claiming(version: &str) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$*\" in -V*) echo ' dar version {version}, Copyright (C) 2002-2023 Denis Corbin'; exit 0 ;; esac\n{}",
+        DAR_SPY
+            .strip_prefix("#!/bin/sh\n")
+            .expect("DAR_SPY is a sh script")
+    )
+}
+
+/// The dar the old-dar tests claim: Debian's and Ubuntu's before Ubuntu 26.04
+/// (2.8.3 there), older than 2.7.21, which fixed sequential reading without a
+/// catalogue.
+const OLD_DAR: &str = "2.7.13";
+
+/// Is the dar on this host (not a stub) at least `want`, as RESTORE.sh's
+/// `dar_at_least` would judge it from `dar -V`?
+fn host_dar_at_least(want: (u32, u32, u32)) -> bool {
+    let out = Command::new("dar")
+        .args(["-V", "-Q", "-N"])
+        .env("HOME", "/nonexistent")
+        .output()
+        .expect("dar must be on PATH (issue #43)");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let have: Vec<u32> = text
+        .split("dar version ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| c != '.' && !c.is_ascii_digit()).next())
+        .map(|v| v.split('.').filter_map(|p| p.parse().ok()).collect())
+        .unwrap_or_default();
+    assert_eq!(have.len(), 3, "dar -V names no X.Y.Z version:\n{text}");
+    (have[0], have[1], have[2]) >= want
+}
+
 /// The slices go from the tape through age straight into dar: dar reads
 /// FIFOs with --sequential-read, nothing decrypted is written to disk, and
 /// the space check asks only for the unit's own size (it asked for about
@@ -3422,12 +3462,14 @@ fn a_streamed_restore_on_dar_2_7_13_keeps_the_tail_of_the_last_file() {
 
 /// A re-staged snapshot's envelope can carry the catalogue of a different
 /// dar run (#419), which dar refuses, fatally, before it writes anything.
-/// The restore falls back: on a dar older than 2.7.21 (this one) to
-/// decrypting the slices to disk and extracting directly, which needs no
-/// catalogue. It says so, and restores the unit byte for byte.
+/// The restore falls back: on a dar older than 2.7.21 to decrypting the
+/// slices to disk and extracting directly, which needs no catalogue. It says
+/// so, and restores the unit byte for byte. (The old version is claimed by a
+/// wrapper, so this way is tested on any installed dar; the installed dar does
+/// the extraction. A newer dar streams instead: the next test.)
 #[test]
 fn a_catalogue_dar_refuses_falls_back_to_slices_on_disk() {
-    let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
+    let h = Heir::with_stubs(&[("dar", &dar_spy_claiming(OLD_DAR))]);
     let u = unit("restaged");
     let dest = h.sub("restored");
     let (code, text) = h.run(&[
@@ -3456,12 +3498,52 @@ fn a_catalogue_dar_refuses_falls_back_to_slices_on_disk() {
     );
 }
 
-/// An envelope with no catalogue for the unit: dar 2.7.13 cannot stream it
-/// safely, so the slices are decrypted to disk first, with the space check
-/// that implies (the slices and the files).
+/// The same refused catalogue on dar 2.7.21 or later, which reads
+/// sequentially without one correctly: the restore drops the catalogue and
+/// streams the unit again, with no slice decrypted to disk. The version is
+/// claimed by a wrapper, so the choice is tested on any dar; the restored
+/// bytes are checked when the installed dar is 2.7.21 or later itself.
+#[test]
+fn a_catalogue_dar_refuses_on_dar_2_7_21_streams_again_without_it() {
+    let h = Heir::with_stubs(&[("dar", &dar_spy_claiming("2.7.21"))]);
+    let u = unit("restaged");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("carol"),
+        "--unit",
+        "restaged",
+        "--to",
+        &dest,
+    ]);
+    assert!(text.contains("refused the envelope's catalogue"), "{text}");
+    assert!(!text.contains("decrypting the slices to disk"), "{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    let calls: Vec<&str> = args.lines().filter(|l| l.starts_with("-x")).collect();
+    assert_eq!(calls.len(), 2, "{args}");
+    assert!(
+        calls[0].contains("--sequential-read") && calls[0].contains("-A "),
+        "{args}"
+    );
+    assert!(
+        calls[1].contains("--sequential-read") && !calls[1].contains("-A "),
+        "streamed again, without the catalogue: {args}"
+    );
+    if host_dar_at_least((2, 7, 21)) {
+        assert_eq!(code, 0, "{text}");
+        assert!(same_tree(&u.src, Path::new(&dest)), "{text}");
+    }
+}
+
+/// An envelope with no catalogue for the unit: a dar older than 2.7.21
+/// (2.7.13 is claimed by a wrapper) cannot stream it safely, so the slices
+/// are decrypted to disk first, with the space check that implies (the
+/// slices and the files). A newer dar streams it:
+/// `no_catalogue_on_dar_2_7_21_still_streams`.
 #[test]
 fn no_catalogue_on_an_old_dar_restores_from_slices_on_disk() {
-    let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
+    let h = Heir::with_stubs(&[("dar", &dar_spy_claiming(OLD_DAR))]);
     let u = unit("nocat");
     let dest = h.sub("restored");
     let (code, text) = h.run(&[
@@ -3483,25 +3565,33 @@ fn no_catalogue_on_an_old_dar_restores_from_slices_on_disk() {
 
 /// dar 2.7.21 and later read sequentially without a catalogue correctly, so
 /// there the unit streams even with none. (The version is claimed by a
-/// wrapper: only the choice is under test.)
+/// wrapper, so the choice is tested on any dar; the restored bytes are
+/// checked when the installed dar is 2.7.21 or later itself.)
 #[test]
 fn no_catalogue_on_dar_2_7_21_still_streams() {
     let dar =
         "#!/bin/sh\ncase \"$*\" in -V*) echo ' dar version 2.7.21, Copyright'; exit 0 ;; esac\n\
                echo \"$*\" >>\"$FAKE_TAPE/dar.args\"\nexec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
     let h = Heir::with_stubs(&[("dar", dar)]);
-    let _ = h.run(&[
+    let u = unit("nocat");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
         "--restore",
         "--key",
         &h.key("carol"),
         "--unit",
         "nocat",
         "--to",
-        &h.sub("restored"),
+        &dest,
     ]);
     let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
     assert!(args.contains("--sequential-read"), "{args}");
     assert!(!args.contains("-A "), "{args}");
+    assert!(!text.contains("decrypting the slices to disk"), "{text}");
+    if host_dar_at_least((2, 7, 21)) {
+        assert_eq!(code, 0, "{text}");
+        assert!(same_tree(&u.src, Path::new(&dest)), "{text}");
+    }
 }
 
 /// A dar built with GPG support aborts under -Q when no `gpg` is on PATH
@@ -6570,8 +6660,10 @@ fn help_names_the_replacement_and_fill_options() {
     }
 }
 
-/// The same damaged unit staged without an envelope catalogue: on this dar it
-/// restores from slices on disk, and that path ends the same way.
+/// The same damaged unit staged without an envelope catalogue: on a dar older
+/// than 2.7.21 it restores from slices on disk, and that path ends the same
+/// way; a newer dar streams it. A test of either way claims its dar's version
+/// with `dar_spy_claiming`.
 fn dmg_nocat_bad() -> &'static Template {
     static T: OnceLock<Template> = OnceLock::new();
     T.get_or_init(|| {
@@ -6581,9 +6673,11 @@ fn dmg_nocat_bad() -> &'static Template {
     })
 }
 
+/// On a dar older than 2.7.21 (claimed by a wrapper; the installed dar does
+/// the extraction).
 #[test]
 fn a_restore_from_slices_on_disk_writes_the_list_too() {
-    let h = Heir::of(dmg_nocat_bad(), &[]);
+    let h = Heir::of(dmg_nocat_bad(), &[("dar", &dar_spy_claiming(OLD_DAR))]);
     let ledger = unit_of(dmg_nocat_bad(), "ledger");
     let dest = h.sub("restored");
     let (code, text) = h.run(&[
@@ -6607,6 +6701,47 @@ fn a_restore_from_slices_on_disk_writes_the_list_too() {
     want.sort();
     assert!(!want.is_empty());
     assert_eq!(listed, want, "{text}");
+}
+
+/// The same unit on dar 2.7.21 or later streams without a catalogue, and
+/// that path writes the list too. The version is claimed by a wrapper, so the
+/// choice is tested on any dar; the outcome is checked when the installed dar
+/// is 2.7.21 or later itself (an older one, streaming, loses a file's tail).
+#[test]
+fn a_streamed_restore_without_a_catalogue_writes_the_list_too() {
+    let h = Heir::of(dmg_nocat_bad(), &[("dar", &dar_spy_claiming("2.7.21"))]);
+    let ledger = unit_of(dmg_nocat_bad(), "ledger");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert!(!text.contains("decrypting the slices to disk"), "{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    let calls: Vec<&str> = args.lines().filter(|l| l.starts_with("-x")).collect();
+    assert_eq!(calls.len(), 1, "{args}");
+    assert!(
+        calls[0].contains("--sequential-read") && !calls[0].contains("-A "),
+        "streamed, without a catalogue: {args}"
+    );
+    if host_dar_at_least((2, 7, 21)) {
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+        let list =
+            std::fs::read_to_string(Path::new(&dest).join(".tapectl-damaged-files.txt")).unwrap();
+        let mut listed: Vec<String> = list.lines().skip(1).map(str::to_string).collect();
+        let mut want = damaged_by_diff(&ledger.src, Path::new(&dest));
+        want.retain(|p| p != ".tapectl-damaged-files.txt");
+        listed.sort();
+        want.sort();
+        assert!(!want.is_empty());
+        assert_eq!(listed, want, "{text}");
+    }
 }
 
 /// A list from an earlier run is out of date once the unit restores whole:
@@ -6653,8 +6788,15 @@ fn a_clean_restore_over_a_damaged_one_removes_the_stale_list() {
 #[test]
 fn a_file_system_refusal_is_not_listed_as_damage() {
     use std::os::unix::fs::PermissionsExt;
-    for (t, via) in [(dmg_good(), "streamed"), (dmg_nocat_bad(), "from disk")] {
-        let h = Heir::of(t, &[]);
+    // The from-disk way is a dar older than 2.7.21's (claimed by a wrapper):
+    // a newer dar streams the unit with no catalogue too.
+    let old = dar_spy_claiming(OLD_DAR);
+    let from_disk: &[(&str, &str)] = &[("dar", &old)];
+    for (t, via, stubs) in [
+        (dmg_good(), "streamed", &[][..]),
+        (dmg_nocat_bad(), "from disk", from_disk),
+    ] {
+        let h = Heir::of(t, stubs);
         let dest = h.dir.join("readonly");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -6686,6 +6828,7 @@ fn a_file_system_refusal_is_not_listed_as_damage() {
         assert!(!text.contains("RESTORE INCOMPLETE"), "{via}: {text}");
         assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{via}");
         if via == "from disk" {
+            assert!(text.contains("decrypting the slices to disk"), "{text}");
             assert!(
                 text.contains("the file system refused a file"),
                 "{via}: {text}"
