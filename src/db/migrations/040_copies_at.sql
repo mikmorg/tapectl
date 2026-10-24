@@ -1,0 +1,54 @@
+-- 040: `archive_sets.copies_at` and `units.copies_at_frozen` (issue #493,
+-- per-location copy targets; ADR-0012 items 148, 149, 155 and 156).
+--
+-- WHY
+-- ---
+-- From 1.7.x a unit may name how many copies it wants at each location: a
+-- map from location name to count, `copies_at = { home = 1, offsite = 1 }`
+-- (item 149). It is a policy key like every other, set in the unit's
+-- dotfile (`[policy.copies_at]`, item 155), in an archive set, or in
+-- `[defaults]`, and the most specific layer that sets it wins entirely
+-- (item 156). Two columns carry it:
+--
+--   * `archive_sets.copies_at`: the key at the archive-set layer, as a JSON
+--     object `{"name": count}` (the way `required_locations` is a JSON
+--     array). Nullable on purpose, like every other archive_sets policy
+--     column (007's `warehouse_copies`, 039's `allow_spanning`): NULL means
+--     "defer to the next policy layer", never "no targets".
+--   * `units.copies_at_frozen`: the unit dotfile layer's OWN `copies_at`, as
+--     the same JSON object, frozen into the catalog each time tapectl writes
+--     the unit with its source present (`snapshot create`, `stage create`,
+--     and `collection sync`'s adoption of a dotfile; item 148). The dotfile
+--     layer is the only one lost when the source goes: a tape-only unit,
+--     exactly where location policy matters, has no dotfile to read, and
+--     without this column its targets would silently defer to its archive
+--     set. `policy::resolve` reads it as the dotfile layer only while the
+--     dotfile is absent; a present dotfile always wins. NULL means the
+--     dotfile set no `copies_at`, or the unit has not been written with the
+--     key since this migration.
+--
+-- Only the archive-set and `[defaults]` layers are live without the source,
+-- so only the dotfile's layer is frozen, never the resolved map.
+--
+-- THE GUARD (026's rule)
+-- ----------------------
+-- 026, 038 and 039 refuse, by row, a value their new CHECK could not admit
+-- rather than remap it. 040 has nothing to refuse: it adds two columns, NULL
+-- on every existing row, and changes no CHECK and no existing value. There
+-- is no CHECK on the new columns either, exactly as `required_locations`
+-- has none: `policy::resolve` refuses a value that does not parse as a map
+-- of location names to non-negative counts, naming the unit and the layer
+-- (`PolicyUnresolvable`), and never reads it as "no targets".
+--
+-- No table is rebuilt (SQLite adds a nullable column in place), so no
+-- foreign key moves and the registry entry needs no `.foreign_key_check()`.
+--
+-- The operator envelope's `catalog.db` (`volume-format-v2.md` §1.4) does not
+-- carry either column: its `units` table names its own five columns and it
+-- has no `archive_sets`, so its shape (generation 3) is unchanged. Its
+-- `PRAGMA user_version` mirrors this catalog's schema level, as §1.4 says,
+-- as it did for 038 and 039.
+
+ALTER TABLE archive_sets ADD COLUMN copies_at TEXT;
+
+ALTER TABLE units ADD COLUMN copies_at_frozen TEXT;

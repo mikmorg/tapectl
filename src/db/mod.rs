@@ -499,6 +499,13 @@ fn migrations() -> Migrations<'static> {
         // admitted is refused by id, never remapped. `.foreign_key_check()`:
         // `write_positions` points into the rebuilt table. See the header.
         M::up(include_str!("migrations/039_write_status_range.sql")).foreign_key_check(),
+        // 040 adds `archive_sets.copies_at` and `units.copies_at_frozen`
+        // (issue #493, per-location copy targets; ADR-0012 items 148, 149,
+        // 155, 156): the archive-set layer's map of location to count, and
+        // the dotfile layer's own map frozen for when the source is gone.
+        // Two nullable columns added in place, no rows touched, so no
+        // `.foreign_key_check()`. See the header.
+        M::up(include_str!("migrations/040_copies_at.sql")),
     ])
 }
 
@@ -5990,6 +5997,115 @@ mod tests {
                 "a refused 039 adds no {table}.{column}"
             );
         }
+    }
+
+    // --- Migration 040 (issue #493, per-location copy targets; ADR-0012 items 148-156) ---
+
+    /// The two tables 040 widens, each by one column.
+    const CHANGED_BY_040: [&str; 2] = ["archive_sets", "units"];
+
+    /// THE test for 040: on 039's seeded catalog, which holds units and an
+    /// archive set, `archive_sets.copies_at` and `units.copies_at_frozen` are
+    /// added last, nullable, with no default, NULL on every existing row (a
+    /// catalog from before 040 sets no per-location target at any layer);
+    /// nothing else moves: every row of every other table, every cell of the
+    /// two, every schema object outside them, every foreign key, and every
+    /// old column of the two.
+    #[test]
+    fn test_migrate_039_populated_db_to_040_preserves_every_row_and_adds_the_copies_at_columns() {
+        let mut conn = open_memory_at_038_seeded();
+        migrate_to(&mut conn, Some(39)).expect("the seed migrates to 39");
+        assert_eq!(user_version(&conn), 39, "precondition: at schema 39");
+
+        let mut rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let cols_before: Vec<_> = CHANGED_BY_040
+            .iter()
+            .map(|t| table_info(&conn, t))
+            .collect();
+        assert_eq!(rows_before["archive_sets"].len(), 1, "positive control");
+        assert!(rows_before["units"].len() >= 2, "positive control");
+        for (table, column) in [("archive_sets", "copies_at"), ("units", "copies_at_frozen")] {
+            assert!(
+                !table_info(&conn, table).iter().any(|c| c.0 == column),
+                "positive control: no {table}.{column} before 040"
+            );
+        }
+
+        migrate_to(&mut conn, Some(40)).expect("040 must migrate a populated catalog");
+        assert_eq!(user_version(&conn), 40);
+
+        let mut rows_after = every_row(&conn);
+        for table in CHANGED_BY_040 {
+            let mut widened: Vec<Vec<String>> = rows_before
+                .remove(table)
+                .unwrap()
+                .into_iter()
+                .map(|mut row| {
+                    row.push("NULL".into());
+                    row
+                })
+                .collect();
+            widened.sort();
+            assert_eq!(
+                widened,
+                rows_after.remove(table).unwrap(),
+                "every {table} row keeps every cell and gains NULL last"
+            );
+        }
+        assert_eq!(
+            rows_before, rows_after,
+            "040 must not add, drop, renumber or alter a single row of any other table"
+        );
+
+        let objects_after = schema_objects(&conn);
+        let untouched = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && CHANGED_BY_040.contains(&o.1.as_str())))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            untouched(&objects_before),
+            untouched(&objects_after),
+            "040 changed a schema object other than the two tables"
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "040 moves no foreign key");
+        for ((table, mut cols), name) in CHANGED_BY_040
+            .iter()
+            .zip(cols_before)
+            .zip(["copies_at", "copies_at_frozen"])
+        {
+            cols.push((name.into(), "TEXT".into(), 0, None, 0));
+            assert_eq!(
+                cols,
+                table_info(&conn, table),
+                "{table} keeps every column (names, order, types, NOT NULL, defaults) \
+                 and gains {name} last"
+            );
+        }
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+
+        // The columns take the JSON object every writer stores.
+        conn.execute(
+            "UPDATE archive_sets SET copies_at = '{\"home\":1,\"offsite\":2}' WHERE id = 4",
+            [],
+        )
+        .expect("an archive set states the map");
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":1}'
+              WHERE id = (SELECT MIN(id) FROM units)",
+            [],
+        )
+        .expect("a unit records its dotfile's map");
     }
 
     /// The live `writes.status` vocabulary, pinned to the schema rather than
