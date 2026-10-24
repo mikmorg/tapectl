@@ -356,27 +356,108 @@ fn rewrite_dotfile(
     if !dotfile_path.exists() {
         return;
     }
-    match dotfile::read_dotfile(&dotfile_path) {
-        Ok(mut df) => {
-            mutate(&mut df);
-            if let Err(e) = dotfile::write_dotfile(&dotfile_path, &df) {
-                warn!(
-                    path = %dotfile_path.display(),
-                    error = %e,
-                    "unit {} in the database, but its .tapectl-unit.toml could not be \
-                     rewritten — the dotfile still carries {} and must be corrected by hand",
-                    change.done,
-                    change.stale_when_unwritten,
-                );
-            }
-        }
-        Err(e) => warn!(
+    match round_trip_dotfile(&dotfile_path, |df| {
+        mutate(df);
+        true
+    }) {
+        Ok(_) => {}
+        Err(DotfileRoundTrip::Write(e)) => warn!(
+            path = %dotfile_path.display(),
+            error = %e,
+            "unit {} in the database, but its .tapectl-unit.toml could not be \
+             rewritten — the dotfile still carries {} and must be corrected by hand",
+            change.done,
+            change.stale_when_unwritten,
+        ),
+        Err(DotfileRoundTrip::Read(e)) => warn!(
             path = %dotfile_path.display(),
             error = %e,
             "unit {} in the database, but its .tapectl-unit.toml could not be read, so {}",
             change.done,
             change.stale_when_unreadable,
         ),
+    }
+}
+
+/// Why a dotfile round trip ([`round_trip_dotfile`]) stopped.
+enum DotfileRoundTrip {
+    /// The file could not be read or parsed; nothing was written.
+    Read(TapectlError),
+    /// It was read and changed, but could not be written back.
+    Write(TapectlError),
+}
+
+/// The one read -> mutate -> write of a unit's dotfile, through
+/// `dotfile::read_dotfile`/`write_dotfile` (which model every `[policy]` key,
+/// so nothing the mutation does not touch is lost, issue #212). `mutate`
+/// says whether it changed anything; when it did not, nothing is written.
+/// Returns whether the file was written.
+fn round_trip_dotfile(
+    dotfile_path: &Path,
+    mutate: impl FnOnce(&mut dotfile::UnitDotfile) -> bool,
+) -> std::result::Result<bool, DotfileRoundTrip> {
+    let mut df = dotfile::read_dotfile(dotfile_path).map_err(DotfileRoundTrip::Read)?;
+    if !mutate(&mut df) {
+        return Ok(false);
+    }
+    dotfile::write_dotfile(dotfile_path, &df).map_err(DotfileRoundTrip::Write)?;
+    Ok(true)
+}
+
+/// What [`rename_location_in_dotfile`] did with one unit's dotfile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DotfileLocationRename {
+    /// No dotfile, or its `[policy.copies_at]` does not name the location.
+    Unchanged,
+    /// The key was renamed and the file written.
+    Rewritten,
+    /// The file names the location, or may (it could not be parsed), and
+    /// was not rewritten; the reason, for the operator.
+    Failed(String),
+}
+
+/// Rename location `old` to `new` in the `[policy.copies_at]` of the
+/// dotfile under `current_path` (#493, ADR-0012 item 155: `location rename`
+/// rewrites every present dotfile, as it rewrites archive sets), through
+/// the same round trip `rename_unit` uses. The count moves with the name; a
+/// stale entry already under `new` (which no registered location could
+/// have been, or the rename would have been refused) is replaced by it.
+///
+/// Unlike the unit-scoped rewrites above, a failure is returned, not
+/// warned: `location rename` names every file it could not rewrite. A file
+/// whose text does not contain `old` at all is not parsed, so an unrelated
+/// malformed dotfile is not reported.
+pub fn rename_location_in_dotfile(current_path: &str, old: &str, new: &str) -> DotfileLocationRename {
+    let dotfile_path = Path::new(current_path).join(dotfile::UNIT_DOTFILE);
+    match std::fs::read_to_string(&dotfile_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return DotfileLocationRename::Unchanged;
+        }
+        Err(e) => {
+            return DotfileLocationRename::Failed(format!("could not be read ({e})"));
+        }
+        Ok(text) if !text.contains(old) => return DotfileLocationRename::Unchanged,
+        Ok(_) => {}
+    }
+    let renamed = round_trip_dotfile(&dotfile_path, |df| {
+        let Some(map) = df.copies_at.as_mut() else {
+            return false;
+        };
+        let Some(count) = map.remove(old) else {
+            return false;
+        };
+        map.insert(new.to_string(), count);
+        true
+    });
+    match renamed {
+        Ok(true) => DotfileLocationRename::Rewritten,
+        Ok(false) => DotfileLocationRename::Unchanged,
+        Err(DotfileRoundTrip::Read(e)) => DotfileLocationRename::Failed(format!(
+            "could not be parsed, so whether it names the location is unknown ({e})"
+        )),
+        Err(DotfileRoundTrip::Write(e)) => {
+            DotfileLocationRename::Failed(format!("could not be rewritten ({e})"))
+        }
     }
 }
 
