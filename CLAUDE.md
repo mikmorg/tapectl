@@ -328,12 +328,16 @@ the one prompt in `swap_loop` (stdin, no timeout, no device held); the rebuild's
 `rebuild::tape_split` and item 144's promotion in `promote_spanning_version`. `volume rewrite` and
 compaction refuse a range volume (`write::refuse_range_holder`, item 133). `audit` adds
 `span_in_progress` and four range invariants under `short_seal`; `report failed-stages` is #409's
-report (item 91). RESTORE.sh was re-pinned three times under item 135 (`39d2535e…`), a pin covers
+report (item 91). RESTORE.sh was re-pinned five times (three under item 135, once for the fresh
+read of File 1, once under item 145 for its damage handling; `1cd5a405…`), a pin covers
 the range block, and the 1.6.0 RESTORE.sh is a test fixture. The coordinator amended fork X12: a
 whole unit a queued spannable unit pushes past the fill ceiling waits for the next tape, never
-refused (for the CTO, in the release notes). The tag waits for the gate's span leg (item 136),
-the chain and a fresh read of File 1; the real-drive proof (item 137, `scripts/span-acceptance.sh`,
-not written yet) comes before any production use of spanning (`docs/handoff.md` (h)).
+refused (for the CTO, in the release notes). The gate's span leg (item 136), the chain and a fresh
+read of File 1 are done. Item 145 fixed RESTORE.sh's damage handling, which GitHub's Ubuntu 26 runner
+exposed: a `sha256sum` that quotes names had hidden damaged files from the list. By item 146 the
+real-drive proof (item 137, `scripts/span-acceptance.sh`, with a scratch build on home2) comes
+before the `v1.7.0` tag, and handoff (h) after it. Item 147 (#492) aligns item 94's start with its
+own text in a 1.7.x patch.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

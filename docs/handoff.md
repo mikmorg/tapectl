@@ -42,7 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
-| (h) | Upgrade home2 to 1.7.0, spanning off; spanning's real-drive proof before any unit allows it | **you** (sudo; the cartridge and the drive for the proof), once `v1.7.0` is tagged |
+| (h) | Spanning's real-drive proof with a scratch 1.7.0 build, then the `v1.7.0` tag, then the upgrade of home2 to 1.7.0, spanning off until a unit allows it (ADR-0012 item 146) | **you** (the cartridge and the drive for the proof; sudo for the install); the coordinator copies the build to home2 and tags between |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -468,8 +468,22 @@ This assumes (g)'s upgrade is done. If home2 still runs 1.5.0, go straight to 1.
 contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step 3, migrations
 038 and 039 both apply at step 4, and step 5 sets `post_warning_bytes` as (g) step 5 would have.
 
-On home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0` is
-tagged:
+**First, spanning's real-drive proof, before the tag** (ADR-0012 item 146, 1.6.0's order).
+- **The build:** the coordinator copies a static musl debug build of the landed commit to home2,
+  with its sha256, beside the acceptance run's other files. It is never put on `PATH` or in a
+  production home.
+- **The run:** you run `scripts/span-acceptance.sh` with it on test cartridge EW7VWMVKF6, as
+  `docs/lto6-validation-checklist.md`, "Spanning on the real drive (1.7.0 acceptance)", says:
+  inside tmux, with the drive-poll timer stopped and vm-desk1 kept quiet.
+- **What it needs:** a real source of about 100 GB for the spannable unit (`--span-source`), and
+  about 7 hours to stage it at debug speed. `--print-plan` prints your part without touching
+  anything.
+- **After a PASS:** the coordinator tags `v1.7.0` on the commit the build came from, and the
+  install below follows. A FAIL leaves the cartridge as the failed step left it; read its run
+  directory before anything writes it again.
+
+Then, on home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0`
+is tagged:
 
 1. **Back up the catalog with 1.6.0:** `tapectl-op db backup --to
    /srv/local_backup/tapectl/tapectl-pre-1.7.0.db`.
@@ -499,9 +513,8 @@ item 137, as item 139 amends it: on test cartridge EW7VWMVKF6 in a throwaway hom
 filler to the fill ceiling and then a real spannable unit the drive's early warning cuts (the
 `range` row, the readback past the warning, RESTORE.sh spooling tape 1's range into scratch, a
 rebuild of tape 1); the cartridge is then erased and written as tape 2, a whole copy, and the
-restore finishes from scratch plus tape 2. Its script, `scripts/span-acceptance.sh`, is not
-written yet; the coordinator says when it is ready, as for (g)'s acceptance run. It is the step
-before any production use of spanning. After it passes, allow spanning per unit (its dotfile's
+restore finishes from scratch plus tape 2. That is the first step of (h) above, run before the
+tag. After it passes, allow spanning per unit (its dotfile's
 `[policy]`), per archive set (`tapectl-op archive-set edit <NAME> --allow-spanning true`) or in
 `[defaults]`, and keep the tapes `volume write` names together ("keep these together"): a
 whole copy across tapes needs every one of them to restore.
