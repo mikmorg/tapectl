@@ -729,17 +729,20 @@ const W94: &str = "medlar-whole-waiting";
 const S94: &str = "medlar-span-sequoia";
 const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// The cartridges' nominal capacity, the drive's `capacity_override` (a
-/// virtual drive's small cartridges): about 1.75 MB past a tape's own files.
-const CAP94: u64 = 2_500_000;
-/// Where each tape's early warning comes: a little past the nominal
-/// capacity, as a real cartridge's may. The plan's estimate takes it at the
-/// nominal capacity (X11), and the room past it is what the waiting unit
-/// fills after the span's tail on its last tape.
-const WARN94: u64 = CAP94 + 352_000;
+/// virtual drive's small cartridges): about 2 MB past a tape's own files.
+/// Each tape's early warning comes AT it, the plan's own estimate (X11), or
+/// sooner: item 147 makes that the proofs' premise, where 1.7.0's needed it
+/// past nominal to fit `W` after the span's tail. The figure also puts tape
+/// 1's warning about three blocks into `S`'s slice 16 at nominal and about
+/// three blocks before slice 15 ends at 1% sooner, so the 1% proof moves a
+/// cut; its positive control says so if the tape's own files ever grow.
+const CAP94: u64 = 2_729_000;
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may
-/// span and is about 2.75 tapes; three blank volumes.
+/// span and is about 2.4 tapes; three blank volumes. `S` and `W` together
+/// fit three tapes with room to spare, so the late start 1.7.0 computed
+/// would have put `W` before `S` on tape 1; item 147 does not.
 fn home_94() -> Home {
     let mut h = Home::new(Some(&CAP94.to_string()), 1, "128K");
     h.unit(
@@ -795,18 +798,35 @@ fn written_run(conn: &Connection, label: &str, unit: &str) -> (i64, i64, i64) {
     .unwrap()
 }
 
-/// THE item 94 proof, from the real write. `S` is larger than one tape and
-/// allows spanning, so `stage create` admits it. On tape 1 it starts right
-/// after the tape's own files, ahead of the whole unit `W` that 1.6.0's
-/// order puts first: by the plan's estimate (the early warning at the
-/// nominal capacity), starting there it touches three tapes, and behind `W`
-/// it would touch four. `W` waits, staged and named. Tape 2 is the owed run,
-/// to its warning; `W` still waits. Tape 3 is the rest of `S`, then `W`
-/// after its tail, and seals full. The three ranges join end to end, every
-/// slice has its one copy, the version is `current` only once tape 3 seals
-/// (item 128), and each tape's slices are released after it (item 129).
+/// The bytes on `label`'s medium, its seal included.
+fn tape_bytes(h: &Home, label: &str) -> u64 {
+    h.files(label).iter().map(|f| f.len() as u64).sum()
+}
+
+/// The labels of the tapes holding a range of `unit` that `label` completes,
+/// in slice order (item 134's "keep these together").
+fn span_tapes(conn: &Connection, label: &str) -> Vec<String> {
+    let keep = write::keep_together(conn, label).unwrap();
+    assert_eq!(keep.len(), 1, "one whole copy across tapes: {keep:?}");
+    keep[0].tapes.iter().map(|t| t.label.clone()).collect()
+}
+
+/// THE item 94 proof, from the real write, with item 147's start and each
+/// tape's early warning AT the nominal capacity, the plan's own estimate
+/// (X11). `S` is larger than one tape and allows spanning, so `stage
+/// create` admits it. On tape 1 it starts right after the owed runs (there
+/// are none: right after the tape's own files), ahead of the whole unit `W`
+/// that 1.6.0's order puts first, and from there it touches three tapes,
+/// the fewest. Behind `W` it would touch three as well, so 1.7.0's late
+/// start put `W` first here; item 147 starts `S` first all the same, and
+/// `W` waits, staged and named. Tape 2 is the owed run, to its warning; `W`
+/// still waits. Tape 3 is the rest of `S`, then `W` after its tail within
+/// item 113's bound (item 123), and seals full. The three ranges join end
+/// to end, every slice has its one copy, the version is `current` only once
+/// tape 3 seals (item 128), and each tape's slices are released after it
+/// (item 129).
 #[test]
-fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes() {
+fn item_94_a_set_larger_than_one_tape_starts_first_and_the_unit_it_displaces_follows_its_tail() {
     let mut h = home_94();
     let n = num_slices(&h.conn, S94);
     let s_bytes = padded_bytes(&h.conn, S94);
@@ -814,11 +834,12 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     assert!(s_bytes > CAP94, "S is larger than one tape: {s_bytes}");
 
     // Tape 1: S first, W waits.
-    h.write(T94[0], Warn::AtBytes(WARN94));
+    h.write(T94[0], Warn::AtBytes(CAP94));
     let c = &h.conn;
     assert_eq!(writes_of(c, T94[0]), rows(&[(S94, "range", true)]));
     let (first, k1, s1) = written_run(c, T94[0], S94);
     assert_eq!(first, 1);
+    assert!(sealing(c, T94[0]).1.is_some(), "the warning ended tape 1");
     let fixed: u64 = h.files(T94[0])[..s1 as usize]
         .iter()
         .map(|f| f.len() as u64)
@@ -834,20 +855,23 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     );
     assert_eq!(stage_set_status(c, W94), "staged");
     // The estimate (X11): each tape holds the bound less the tape's own
-    // files. From where S started it touches three tapes; behind W, four.
+    // files. S is more than that, so it is item 94's set, and from where it
+    // started it touches three tapes. So it would behind W: 1.7.0 put W
+    // first here, and item 147 does not.
     let room = CAP94 - fixed;
+    assert!(s_bytes > room, "larger than one tape by X11's estimate");
     let tapes_from = |start: u64| 1 + (s_bytes - (CAP94 - start)).div_ceil(room);
     assert_eq!(tapes_from(fixed), 3, "the fewest tapes");
     assert_eq!(
         tapes_from(fixed + w_bytes),
-        4,
-        "behind W it would touch four"
+        3,
+        "behind W it would touch three too: the case 1.7.0 and item 147 lay out differently"
     );
     assert_eq!(snapshot_status(c, S94), "staged");
     assert_eq!(released_slices(c, S94), (1..=k1).collect::<Vec<_>>());
 
     // Tape 2: the owed run, from K1+1, to the warning; W still waits.
-    h.write(T94[1], Warn::AtBytes(WARN94));
+    h.write(T94[1], Warn::AtBytes(CAP94));
     let c = &h.conn;
     assert_eq!(writes_of(c, T94[1]), rows(&[(S94, "range", true)]));
     let (first, k2, _) = written_run(c, T94[1], S94);
@@ -857,8 +881,9 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     assert_eq!(snapshot_status(c, S94), "staged", "item 128: not yet");
     assert_eq!(released_slices(c, S94), (1..=k2).collect::<Vec<_>>());
 
-    // Tape 3: the rest of S, then W after its tail; a full seal.
-    h.write(T94[2], Warn::AtBytes(WARN94));
+    // Tape 3: the rest of S, then W after its tail, within the bound; a full
+    // seal, the warning never reached.
+    h.write(T94[2], Warn::AtBytes(CAP94));
     let c = &h.conn;
     assert_eq!(sealing(c, T94[2]), (true, None));
     assert_eq!(
@@ -870,6 +895,10 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     assert!(
         position_of(c, T94[2], W94, 1) > position_of(c, T94[2], S94, n),
         "W after S's tail"
+    );
+    assert!(
+        tape_bytes(&h, T94[2]) <= CAP94,
+        "item 123: W keeps item 113's bound"
     );
     assert!(write::waiting_units(c, T94[2]).unwrap().is_empty());
     assert_eq!(
@@ -885,9 +914,61 @@ fn item_94_a_set_larger_than_one_tape_starts_early_and_touches_the_fewest_tapes(
     assert_eq!(unit_copies(c, S94), 1);
     assert_eq!(released_slices(c, S94), (1..=n).collect::<Vec<_>>());
     assert_eq!(stage_set_status(c, W94), "cleaned");
-    let keep = write::keep_together(c, T94[2]).unwrap();
-    let tapes: Vec<&str> = keep[0].tapes.iter().map(|t| t.label.as_str()).collect();
-    assert_eq!((keep.len(), tapes), (1, T94.to_vec()));
+    assert_eq!(span_tapes(c, T94[2]), T94);
+}
+
+/// Item 147's reason, from the real write: each tape's early warning 1%
+/// before the nominal capacity, as a worn cartridge's may come. The cuts
+/// come sooner (the positive control: tape 1's range ends before it does at
+/// nominal, and tape 3 takes more of `S`), yet the span touches the same
+/// three tapes as at nominal. The slack item 147 leaves on the span's last
+/// tape, where `W` follows its tail, takes the slices the early warnings
+/// pushed there, and `W` still fits after them within item 113's bound.
+/// 1.7.0's late start spent that slack on whole units before the set on its
+/// first tape, so by X11's estimate an early warning could cost it a tape
+/// (#492).
+#[test]
+fn item_94_a_warning_1_percent_before_nominal_costs_the_span_no_tape() {
+    let at_nominal = written_94();
+    let mut h = home_94();
+    let n = num_slices(&h.conn, S94);
+    for label in T94 {
+        h.write(label, Warn::AtBytes(CAP94 - CAP94 / 100));
+    }
+    let c = &h.conn;
+
+    let (_, k1, _) = written_run(c, T94[0], S94);
+    let (_, k1_nominal, _) = written_run(&at_nominal.conn, T94[0], S94);
+    assert!(
+        k1 < k1_nominal,
+        "positive control: the 1% warning must cut tape 1 sooner than the nominal one \
+         (slice {k1}, at nominal {k1_nominal}); if not, CAP94 no longer moves a cut"
+    );
+    let (tail_from, _, _) = written_run(c, T94[2], S94);
+    assert!(tail_from < written_run(&at_nominal.conn, T94[2], S94).0);
+
+    // No more tapes than at nominal: the ranges join end to end over the
+    // same three, and S ends on tape 3.
+    let mut next = 1;
+    for label in T94 {
+        let (first, last, _) = written_run(c, label, S94);
+        assert_eq!(first, next, "{label}: the range continues the one before");
+        next = last + 1;
+    }
+    assert_eq!(next, n + 1, "S ends on tape 3");
+    assert_eq!(span_tapes(c, T94[2]), span_tapes(&at_nominal.conn, T94[2]));
+    assert_eq!(span_tapes(c, T94[2]), T94);
+    assert_eq!(slice_copies(c, S94), vec![1; n as usize]);
+    assert_eq!(snapshot_status(c, S94), "current");
+
+    // W still follows S's tail on tape 3, within the bound.
+    assert_eq!(sealing(c, T94[2]), (true, None));
+    assert_eq!(
+        writes_of(c, T94[2]),
+        rows(&[(S94, "range", true), (W94, "completed", false)])
+    );
+    assert!(position_of(c, T94[2], W94, 1) > position_of(c, T94[2], S94, n));
+    assert!(tape_bytes(&h, T94[2]) <= CAP94);
 }
 
 // ── item 131: tapectl's restore across the cartridges ──
@@ -902,11 +983,11 @@ fn written_93() -> Home {
 }
 
 /// [`home_94`] with its three tapes written, each tape's early warning at
-/// [`WARN94`].
+/// the nominal capacity, [`CAP94`] (item 147).
 fn written_94() -> Home {
     let mut h = home_94();
     for label in T94 {
-        h.write(label, Warn::AtBytes(WARN94));
+        h.write(label, Warn::AtBytes(CAP94));
     }
     h
 }
