@@ -2020,6 +2020,13 @@ tape whose envelope lists the same unit, with the same uuid, at the same
 version is used; any other is refused by name, because another version can
 differ in the very files that are damaged.
 
+When the slice that holds a folder's own entry is lost, dar names the
+folder and restores nothing in it. On a tape written since 1.3.0 the list
+names the files the index records under that folder instead, and the fill
+restores them like any other. A tape written before 1.3.0 has no index, so
+the list names the folder itself, and the fill restores what is missing in
+it and overwrites nothing that is there.
+
 **A file fails its hash.** dar checks each file it restores with a short
 checksum, not a hash, and two equal flips in a file can cancel: a damaged file
 can come back with no error from dar. A tape written since 1.3.0 records the
@@ -7494,6 +7501,8 @@ case "${1:-}" in
   echo "      removed when nothing is. Give --to the same directory as the restore (the list is in"
   echo "      it, or in --to/UNIT). The tape must hold that version WHOLE: one that holds only part"
   echo "      of a unit held across tapes is refused."
+  echo "      A folder on the list (a tape with no index names one dar restored nothing in) has what"
+  echo "      is missing in it restored, and nothing there is overwritten."
   echo "  --no-file-check   (--restore, with --fill-from too) dar checks each file it restores with a"
   echo "      short checksum, so a damaged file can come back with no error. A tape written since"
   echo "      version 1.3.0 records the sha256 of every regular file in its index, and after each"
@@ -8126,7 +8135,9 @@ where the failed one was), and dar, run as above into an empty directory
 file whose slices are all there. For each of the others it prints `PATH not
 restored (user choice)` (`grep 'not restored (user choice)' dar.log` lists
 them) and leaves an EMPTY or short file of that name, which is not the real
-file; its exit status is still 0. If the failed slice is the last one, dar
+file; its exit status is still 0. If a folder's own entry lies in the
+failed slice, dar names the folder and restores nothing in it ("No file in
+this directory will be restored"). If the failed slice is the last one, dar
 stops ("The last file of the set is not present"); add `-0` to restore, in
 order, everything before the first missing slice.
 
@@ -8147,6 +8158,9 @@ that holds another unit or another version:
 ```bash
 ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --fill-from /destination/UNIT/.tapectl-damaged-files.txt --to /destination/UNIT
 ```
+
+For a folder dar restored nothing in, the list names the files the index
+records under it, and the fill restores them like any other.
 
 dar checks each file it restores with a short checksum, not a hash, so a
 damaged file can come back with no error. A tape written since 1.3.0 records
@@ -14517,6 +14531,8 @@ sha256_encrypted = \"bbb\"
             "Only a tape whose envelope lists the same unit, with the same uuid, at the same version is used",
             "another version can differ in the very files that are damaged",
             "so `--to` needs room for the unit's slices beside its restored files",
+            // R2 (#478 L5): a folder dar restored nothing in.
+            "When the slice that holds a folder's own entry is lost, dar names the folder and restores nothing in it. On a tape written since 1.3.0 the list names the files the index records under that folder instead, and the fill restores them like any other. A tape written before 1.3.0 has no index, so the list names the folder itself, and the fill restores what is missing in it and overwrites nothing that is there.",
             // volume-format-v2.md 4.2 R5, 4.4 R8 (#478 L3).
             "`--swap-tapes` reads the other cartridge's seal marker first, and takes a slice from it only at a position the seal says the tape holds (\"Where the tape ended\"): a cartridge whose seal marker cannot be read gives none.",
             "The other cartridge may hold only part of a unit held across tapes (\"A unit across tapes\"); it gives the slices it holds.",
@@ -14543,6 +14559,9 @@ sha256_encrypted = \"bbb\"
                 "found by its `sha256_encrypted` and by nothing else",
                 "refuses a tape that holds another unit or another version",
                 "Only the same unit at the same version is a copy",
+                // R2 (#478 L5): a folder dar restored nothing in.
+                "If a folder's own entry lies in the failed slice, dar names the folder and restores nothing in it (\"No file in this directory will be restored\").",
+                "For a folder dar restored nothing in, the list names the files the index records under it, and the fill restores them like any other.",
             ] {
                 assert!(sec.contains(needle), "{needle:?}: {sec}");
             }
