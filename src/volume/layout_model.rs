@@ -330,9 +330,10 @@ impl CapacityBudget {
     }
 
     /// The plan order of one tape (`layout-session.md` "Spanning"; ADR-0012
-    /// items 83, 94, 95, 99, 113, 122 and 123), on block-padded sizes alone.
-    /// `fixed_bytes` is as for [`Self::split`]; `items` are the units in the
-    /// caller's order, each with its [`PlanClass`]. The plan is, in order:
+    /// items 83, 94, 95, 99, 113, 122, 123 and 147), on block-padded sizes
+    /// alone. `fixed_bytes` is as for [`Self::split`]; `items` are the units
+    /// in the caller's order, each with its [`PlanClass`]. The plan is, in
+    /// order:
     ///
     /// 1. **Owed runs**, in the caller's order (item 122).
     /// 2. **Whole units**, in the caller's order and never reordered, by
@@ -345,9 +346,13 @@ impl CapacityBudget {
     ///    planned to its end, and nothing is planned after it (item 123,
     ///    X13). A set larger than one tape (more than the bound less
     ///    `fixed_bytes`: the early warning estimated at the nominal capacity,
-    ///    X11) starts early instead, item 94: as late as it may while
-    ///    touching the fewest tapes, with the whole units it leaves no room
-    ///    for deferred.
+    ///    X11) starts right after the owed runs instead (items 94 and 147),
+    ///    and every whole unit is deferred. They fill in after its tail on
+    ///    its last tape, where the set's owed run comes first and whole units
+    ///    follow within item 113's bound (item 123). No later start is
+    ///    computed: 1.7.0 started such a set as late as it could while
+    ///    touching the fewest tapes, which by X11's estimate ended it at its
+    ///    last tape's bound and left no slack for an early warning (#492).
     ///
     /// An owed run may be the tail too: one that crosses the bound is
     /// planned to its end, and everything after it is deferred.
@@ -360,8 +365,9 @@ impl CapacityBudget {
     /// so the plan is never trimmed for it. A whole unit the baseline holds
     /// but an owed run or a spannable set pushes out is [`Placed::Deferred`]:
     /// it is not on this tape and waits, staged, for a later one. That covers
-    /// a set larger than one tape starting early (item 94) and a queued set
-    /// that fits one tape taking the room past the ceiling (items 83 and 95).
+    /// a set larger than one tape starting right after the owed runs (items
+    /// 94 and 147) and a queued set that fits one tape taking the room past
+    /// the ceiling (items 83 and 95).
     /// A spannable unit that passes the fill ceiling on a drive with no plan
     /// bound is refused by [`LayoutError::SpanNeedsPostWarningBytes`].
     ///
@@ -428,8 +434,9 @@ impl CapacityBudget {
             (0, 0)
         };
 
-        // 3. Spannable sets, then item 94's early start for the tail when it
-        // is larger than one tape.
+        // 3. Spannable sets. A tail larger than one tape starts right after
+        // the owed runs instead (items 94 and 147): every whole unit waits,
+        // to fill in after its tail on its last tape.
         let mut spans = self.place_spans(
             &spannable,
             items,
@@ -438,27 +445,9 @@ impl CapacityBudget {
         );
         if let (Some(t), Some(bound)) = (spans.tail, self.plan_bound_bytes) {
             let room = bound.saturating_sub(fixed_bytes);
-            let set = items[t].bytes;
-            if room > 0 && set > room {
-                let before_tail: Vec<usize> =
-                    spannable.iter().copied().take_while(|&i| i != t).collect();
-                let earliest = owed_end.saturating_add(bytes(&before_tail));
-                let allowance =
-                    latest_span_start(earliest, set, bound, room).saturating_sub(earliest);
-                let mut sum = 0u64;
-                kept = held_whole[..kept]
-                    .iter()
-                    .take_while(|&&i| {
-                        sum = sum.saturating_add(items[i].bytes);
-                        sum <= allowance
-                    })
-                    .count();
-                spans = self.place_spans(
-                    &spannable,
-                    items,
-                    owed_end.saturating_add(bytes(&held_whole[..kept])),
-                    false,
-                );
+            if room > 0 && items[t].bytes > room && kept > 0 {
+                kept = 0;
+                spans = self.place_spans(&spannable, items, owed_end, false);
             }
         }
         // What the baseline holds and this plan does not, an owed run or a
@@ -540,25 +529,6 @@ impl CapacityBudget {
     }
 }
 
-/// Item 94's start, by X11's estimate (the early warning at the nominal
-/// capacity, the plan bound): the latest point at which a set of `set`
-/// bytes may start on this tape and still touch the fewest tapes, given that
-/// it could start at `earliest` at the soonest. Each later tape is taken to
-/// hold `room` bytes of it (the bound less this tape's fixed files). From
-/// `earliest`, this tape holds `bound - earliest` of the set and the rest
-/// needs `ceil((set - (bound - earliest)) / room)` more tapes; the start may
-/// slip while that count holds. Never before `earliest`.
-fn latest_span_start(earliest: u64, set: u64, bound: u64, room: u64) -> u64 {
-    let on_this_tape = bound.saturating_sub(earliest);
-    let rest = set.saturating_sub(on_this_tape);
-    let later_tapes = rest.div_ceil(room);
-    later_tapes
-        .saturating_mul(room)
-        .saturating_add(bound)
-        .saturating_sub(set)
-        .max(earliest)
-}
-
 /// What [`CapacityBudget::place`]'s step 3 decided.
 struct SpanRun {
     placed: Vec<(usize, Placed)>,
@@ -578,8 +548,9 @@ pub enum PlanClass {
     Owed,
     /// A unit that may not span, as in 1.6.0 (items 99 and 113).
     Whole,
-    /// A spannable set with no range yet: last (items 83 and 95), or early
-    /// when it is larger than one tape (item 94).
+    /// A spannable set with no range yet: last (items 83 and 95), or right
+    /// after the owed runs when it is larger than one tape (items 94 and
+    /// 147).
     Spannable,
 }
 
@@ -604,8 +575,8 @@ pub enum Placed {
     /// 123). At most one, and the last unit of the plan.
     Tail,
     /// Not on this tape: a whole unit an owed run or a spannable set pushes
-    /// out (items 83, 94 and 95; X12 as amended), or a unit queued after the
-    /// tail (X13). It stays staged and waits for a later tape.
+    /// out (items 83, 94, 95 and 147; X12 as amended), or a unit queued after
+    /// the tail (X13). It stays staged and waits for a later tape.
     Deferred,
     /// The plan cannot hold it, and is refused ([`Placement::errors`]).
     Refused,
@@ -1794,7 +1765,7 @@ mod tests {
         );
     }
 
-    // ── the plan order (ADR-0012 items 83, 94, 95, 99, 113, 122 and 123) ──
+    // ── the plan order (ADR-0012 items 83, 94, 95, 99, 113, 122, 123 and 147) ──
 
     fn item(class: PlanClass, blocks: u64) -> PlanItem {
         PlanItem {
@@ -1942,18 +1913,25 @@ mod tests {
         assert_eq!(p.placed, vec![Committed, Committed]);
     }
 
-    /// Item 94 with X11 and X12: a set larger than one tape does not wait
-    /// behind the whole units. It starts as late as it may while touching
-    /// the fewest tapes, by the early warning estimated at the nominal
-    /// capacity, and the whole units it leaves no room for are deferred.
+    /// Items 94 and 147 with X11 and X12: a set larger than one tape does not
+    /// wait behind the whole units. It starts right after the owed runs (here
+    /// none: right after the tape's own files), and every whole unit is
+    /// deferred, to fill in after its tail on its last tape.
+    ///
+    /// Moved by item 147 (#492). 1.7.0 started such a set as late as it could
+    /// while touching the fewest tapes (`latest_span_start`), with the whole
+    /// units that fitted before it on its first tape: three of the four here
+    /// with the 35-block set, all four with the 51-block one. By X11's
+    /// estimate the set then ended exactly at its last tape's bound, so an
+    /// early warning before nominal cost it one more tape. The tape count
+    /// and the total fill are the same either way; only where the slack
+    /// sits moved, to the set's last tape.
     #[test]
-    fn a_set_larger_than_one_tape_starts_early_and_defers_the_whole_units_it_displaces() {
+    fn a_set_larger_than_one_tape_starts_after_the_owed_runs_and_defers_every_whole_unit() {
         use Placed::{Committed, Deferred, Tail};
-        use PlanClass::{Spannable, Whole};
-        // Fixed 1 and a bound of 26: a tape holds 25 blocks of a set (X11).
-        // A 35-block set touches two tapes at the fewest, and does so from
-        // any start up to block 16 (this tape holds 10 of it, the next 25):
-        // whole units may take 15 blocks before it. Under a 24-block fill
+        use PlanClass::{Owed, Spannable, Whole};
+        // Fixed 1 and a bound of 26: a tape holds 25 blocks of a set (X11),
+        // so a 35-block set is larger than one tape. Under a 24-block fill
         // budget all four whole units would be committed.
         let b = budget(24 * BS, 0, Some(26 * BS));
         let items = [
@@ -1965,25 +1943,71 @@ mod tests {
         ];
         let p = b.place(BS, &items);
         assert!(p.is_ok(), "{:?}", p.errors);
-        assert_eq!(p.order, vec![0, 2, 3, 1]);
-        assert_eq!(
-            p.placed,
-            vec![Committed, Tail, Committed, Committed, Deferred]
-        );
-        assert_eq!(p.deferred(), vec![4]);
-        assert_eq!(latest_span_start(BS, 35 * BS, 26 * BS, 25 * BS), 16 * BS);
+        assert_eq!(p.order, vec![1], "the set alone, from block 1");
+        assert_eq!(p.placed, vec![Deferred, Tail, Deferred, Deferred, Deferred]);
+        assert_eq!(p.deferred(), vec![0, 2, 3, 4]);
 
-        // A 51-block set touches three tapes at the fewest, and does so from
-        // any start up to block 25 (25 + 25 + 26 - 51): past every whole unit
-        // here, so it goes after them all and nothing is deferred.
+        // A 51-block set (1.7.0 put it after every whole unit here, since it
+        // touched three tapes from any start up to block 25) starts at block
+        // 1 all the same, and the whole units wait for its last tape.
         let mut long = items;
         long[1] = item(Spannable, 51);
         let p = b.place(BS, &long);
+        assert!(p.is_ok(), "{:?}", p.errors);
+        assert_eq!(p.order, vec![1]);
+        assert_eq!(p.placed, vec![Deferred, Tail, Deferred, Deferred, Deferred]);
+
+        // Its last tape, by X11's estimate: 25 blocks on each of the first
+        // two leave a 1-block owed run. It comes first (item 122) and the
+        // whole units fill in after its tail, under the fill ceiling.
+        let last = [
+            item(Whole, 5),
+            item(Owed, 1),
+            item(Whole, 5),
+            item(Whole, 5),
+            item(Whole, 5),
+        ];
+        let p = b.place(BS, &last);
+        assert!(p.is_ok(), "{:?}", p.errors);
+        assert_eq!(p.order, vec![1, 0, 2, 3, 4]);
+        assert!(p.placed.iter().all(|&x| x == Committed), "{p:?}");
+        // After its tail whole units keep item 113's bound (item 123): a
+        // fifth, which the whole units alone fit (to block 26), would end at
+        // 27 after the run, and waits rather than passing the bound.
+        let mut fifth = last.to_vec();
+        fifth.push(item(Whole, 5));
+        let p = b.place(BS, &fifth);
+        assert!(p.is_ok(), "{:?}", p.errors);
+        assert_eq!(p.order, vec![1, 0, 2, 3, 4]);
+        assert_eq!(p.deferred(), vec![5]);
+
+        // An owed run queued too: the set follows it directly (item 122's
+        // order), and every whole unit still waits.
+        let mut after_owed = vec![item(Owed, 3)];
+        after_owed.extend(items);
+        let p = b.place(BS, &after_owed);
+        assert!(p.is_ok(), "{:?}", p.errors);
+        assert_eq!(p.order, vec![0, 2]);
         assert_eq!(
             p.placed,
-            vec![Committed, Tail, Committed, Committed, Committed]
+            vec![Committed, Deferred, Tail, Deferred, Deferred, Deferred]
         );
-        assert_eq!(p.order, vec![0, 2, 3, 4, 1]);
+
+        // X13 holds: a set that fits one tape, queued before the larger one,
+        // stays before it. The larger set starts right after it, and the
+        // whole units wait.
+        let p = b.place(
+            BS,
+            &[
+                item(Whole, 5),
+                item(Spannable, 3),
+                item(Spannable, 35),
+                item(Whole, 5),
+            ],
+        );
+        assert!(p.is_ok(), "{:?}", p.errors);
+        assert_eq!(p.order, vec![1, 2]);
+        assert_eq!(p.placed, vec![Deferred, Committed, Tail, Deferred]);
 
         // Positive control (item 95): a set that fits one tape (25 blocks)
         // keeps item 83's place, after every whole unit, and defers none.
