@@ -1315,6 +1315,10 @@ fn stage_units(dir: &Path, tenants: &[TenantSpec], spans: &[SpanOnTape]) -> Vec<
                 };
                 let bytes = content(u.seed * 100 + i as u64, u.file_len);
                 hashes.insert(name.clone(), sha256_hex(&bytes));
+                // A name may sit in a folder of its own (`d0/a.bin`).
+                if let Some(parent) = Path::new(&name).parent() {
+                    std::fs::create_dir_all(src.join(parent)).unwrap();
+                }
                 std::fs::write(src.join(&name), &bytes).unwrap();
             }
             std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -6581,17 +6585,11 @@ fn a_fill_is_refused_for_a_list_that_is_not_the_units_own() {
         text.contains("keep the list where the restore wrote it"),
         "{text}"
     );
-    // A directory in the list is refused, not restored over.
-    std::fs::create_dir_all(Path::new(&dest).join("subdir")).unwrap();
+    // A path that leaves the unit is refused. (A folder on the list is not:
+    // what is missing in it is restored, and nothing there is overwritten;
+    // see without_an_index_a_lost_folder_stays_listed_and_the_fill_restores_what_is_missing_in_it.)
     let mut body = std::fs::read_to_string(&list).unwrap();
-    body.push_str("subdir\n");
-    std::fs::write(&list, body).unwrap();
-    let (code, text) = runv(&g, &fill_args(&g, "ledger", &list, &dest));
-    assert_ne!(code, 0, "{text}");
-    assert!(text.contains("names a directory (subdir)"), "{text}");
-    // A path that leaves the unit is refused.
-    let mut body = std::fs::read_to_string(&list).unwrap();
-    body = body.replace("subdir\n", "../escape\n");
+    body.push_str("../escape\n");
     std::fs::write(&list, body).unwrap();
     let (code, text) = runv(&g, &fill_args(&g, "ledger", &list, &dest));
     assert_ne!(code, 0, "{text}");
@@ -7904,6 +7902,359 @@ fn dar_and_check_both_find(stubs: &[(&str, &str)]) {
     assert!(same_tree(&checked.src, Path::new(&dest)), "{text}");
     assert_no_check_report(&a);
     assert_no_check_report(&b);
+}
+
+// ---- a folder dar restored nothing in (R2, ADR-0012 item 102) ----
+
+const FOLDER_UUID: &str = "f01de200-1111-2222-3333-444444444444";
+
+/// `foldered`: six folders of one 60 kB file each, in 100 KiB slices, beside
+/// `sub/`. dar writes a folder's own entry just before what is in it, so every
+/// slice between the first and the last holds the entry of a folder, whatever
+/// order the file system lists the names in. With such a slice lost, dar
+/// names the folder, says "No file in this directory will be restored.",
+/// restores nothing in it and names nothing under it (found on GitHub's Ubuntu
+/// 26.04 runner, where `checked`'s `sub` fell in its lost slice).
+fn folder_tenants() -> Vec<TenantSpec> {
+    vec![TenantSpec {
+        name: "alice",
+        units: vec![UnitSpec {
+            cat: Cat::Matched,
+            name: "foldered",
+            uuid: FOLDER_UUID,
+            version: 1,
+            seed: 71,
+            files: 6,
+            file_len: 60_000,
+            names: &[
+                "d0/a.bin", "d1/a.bin", "d2/a.bin", "d3/a.bin", "d4/a.bin", "d5/a.bin",
+            ],
+            corrupt: &[],
+            tamper: &[],
+        }],
+    }]
+}
+
+/// `foldered` on a tape with an index.
+fn folders() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("folders", &folder_tenants(), true))
+}
+
+/// `foldered` on a tape with no index, as a tape written before 1.3.0.
+fn folders_no_index() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("folders-old", &folder_tenants(), false))
+}
+
+/// Restore `foldered` from a fresh copy of `t` with one slice between the
+/// first and the last damaged and no replacement for it (`--slices-from` an
+/// empty directory), trying each such slice in turn, and return the first run
+/// in which dar restored nothing in a folder: the heir, the destination, the
+/// exit code, the output, and the folders dar named. A layout in which no
+/// such slice holds a folder's entry fails here, loudly.
+fn restore_losing_a_folder(
+    t: &'static Template,
+    extra: &[&str],
+) -> (Heir, String, i32, String, Vec<String>) {
+    let u = unit_of(t, "foldered");
+    for idx in 1..u.positions.len() - 1 {
+        let h = Heir::of(t, &[]);
+        flip_in_tape(&h, u.positions[idx]);
+        let empty = h.sub("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let dest = h.sub("restored");
+        let mut args = restore_args(&h, "foldered", &dest);
+        args.extend(["--slices-from".to_string(), empty]);
+        args.extend(extra.iter().map(|a| a.to_string()));
+        let (code, text) = runv(&h, &args);
+        if text.contains("No file in this directory will be restored.") {
+            // dar names a path under the -R it was given, which may be the
+            // destination's real path (/tmp can be a link).
+            let folders: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.strip_suffix(" not restored (user choice)"))
+                .filter_map(|l| l.rsplit_once("/restored/").map(|(_, p)| p))
+                .filter(|p| u.src.join(p).is_dir())
+                .map(str::to_string)
+                .collect();
+            assert!(!folders.is_empty(), "dar named a folder:\n{text}");
+            return (h, dest, code, text, folders);
+        }
+    }
+    panic!(
+        "no slice of foldered between the first and the last holds a folder's own entry ({} slices)",
+        u.positions.len()
+    );
+}
+
+/// The files of `src` that differ from or are missing in `dest`, escaped as
+/// the list escapes them, sorted (the list itself left out).
+fn differing(src: &Path, dest: &str) -> Vec<String> {
+    let mut v: Vec<String> = damaged_by_diff(src, Path::new(dest))
+        .into_iter()
+        .filter(|p| p != ".tapectl-damaged-files.txt")
+        .map(|p| idx_esc(&p))
+        .collect();
+    v.sort();
+    v
+}
+
+/// R2 with the tape's index: a folder dar named because the slice that holds
+/// its own entry was lost is listed as the files the index records under it,
+/// never as the folder, so the count counts files and a fill from another copy
+/// restores them like any other damaged file. With `--no-file-check` the list
+/// is the same: it does not hang on the check.
+#[test]
+fn a_folder_whose_entry_is_in_a_lost_slice_is_listed_as_its_files_and_filled() {
+    let t = folders();
+    let src = unit_of(t, "foldered").src;
+    let (_h, dest, code, text, named) = restore_losing_a_folder(t, &[]);
+    println!("--- the restore without the slice ---\n{text}");
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    let (_, listed) = damaged_list(&dest);
+    for l in &listed {
+        assert!(
+            !src.join(l).is_dir(),
+            "a folder is listed ({l}): {listed:?}\n{text}"
+        );
+    }
+    for d in &named {
+        assert!(
+            listed.iter().any(|l| l.starts_with(&format!("{d}/"))),
+            "the files under {d}, which dar named, are listed: {listed:?}\n{text}"
+        );
+    }
+    assert_eq!(
+        listed,
+        differing(&src, &dest),
+        "the list is exactly the files that are missing or short:\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Unit 'foldered' (version 1): {} file(s) were not restored",
+            listed.len()
+        )),
+        "the count counts files:\n{text}"
+    );
+    assert!(
+        !text.contains("folder(s) dar restored nothing in"),
+        "{text}"
+    );
+
+    // Without the check, the list is the same.
+    let (_h2, dest2, code, text2, _) = restore_losing_a_folder(t, &["--no-file-check"]);
+    assert_eq!(code, 1, "{text2}");
+    assert!(
+        text2.contains("File check skipped (--no-file-check)"),
+        "{text2}"
+    );
+    assert_eq!(damaged_list(&dest2).1, listed, "{text2}");
+
+    // The fill, from another copy.
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let b = Heir::of(t, &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "foldered", &list, &dest));
+    println!("--- the fill ---\n{text}");
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "Filling {} file(s) of unit 'foldered', version 1",
+            listed.len()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("folder(s): what is missing"), "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(!list.exists(), "the list is removed");
+    assert!(same_tree(&src, Path::new(&dest)), "{text}");
+}
+
+/// R2 on a tape with no index (written before 1.3.0): nothing names the
+/// files under the folder dar named, so the folder stays on the list and the
+/// end of the run says how many of the listed paths are folders. The fill
+/// does not refuse it: it restores what is missing in the folder and
+/// overwrites nothing there (dar's `-n`), and the files on the list over
+/// their damaged copies, as ever.
+#[test]
+fn without_an_index_a_lost_folder_stays_listed_and_the_fill_restores_what_is_missing_in_it() {
+    let t = folders_no_index();
+    let src = unit_of(t, "foldered").src;
+    let (_h, dest, code, text, named) = restore_losing_a_folder(t, &[]);
+    println!("--- the restore without the slice ---\n{text}");
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("this tape carries no index"), "{text}");
+    let (_, listed) = damaged_list(&dest);
+    let mut dirs: Vec<String> = listed
+        .iter()
+        .filter(|l| src.join(l).is_dir())
+        .cloned()
+        .collect();
+    dirs.sort();
+    let mut want = named.clone();
+    want.sort();
+    assert_eq!(
+        dirs, want,
+        "the folders dar named stay on the list: {listed:?}\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Unit 'foldered' (version 1): {} file(s) were not restored.",
+            listed.len()
+        )) && text.contains(&format!(
+            "  {} of them are folder(s) dar restored nothing in (the slice that holds a folder's own entry",
+            dirs.len()
+        )) && text.contains("A fill restores what is missing in each folder, and overwrites nothing there."),
+        "{text}"
+    );
+
+    // Something already in a listed folder is not overwritten: here a file
+    // the heir put back by hand, which differs from the archive's.
+    let folder = &dirs[0];
+    let inner = std::fs::read_dir(src.join(folder))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .min()
+        .unwrap();
+    let kept = Path::new(&dest).join(folder).join(&inner);
+    std::fs::write(&kept, "the heir's own copy").unwrap();
+
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let b = Heir::of(t, &[]);
+    let (code, ftext) = runv(&b, &fill_args(&b, "foldered", &list, &dest));
+    println!("--- the fill ---\n{ftext}");
+    assert_eq!(code, 0, "{ftext}");
+    assert!(!ftext.contains("names a directory"), "{ftext}");
+    assert!(
+        ftext.contains(&format!(
+            "  {} of them are folder(s): what is missing in each is restored, and nothing there is overwritten",
+            dirs.len()
+        )),
+        "{ftext}"
+    );
+    assert!(
+        ftext.contains(&format!(
+            "Restoring what is missing in {} folder(s), overwriting nothing there ...",
+            dirs.len()
+        )),
+        "{ftext}"
+    );
+    assert!(ftext.contains("FILL COMPLETE"), "{ftext}");
+    assert!(!list.exists(), "the list is removed");
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        "the heir's own copy",
+        "nothing in a listed folder is overwritten"
+    );
+    assert_eq!(
+        differing(&src, &dest),
+        vec![idx_esc(&format!("{folder}/{inner}"))],
+        "everything else is whole:\n{ftext}"
+    );
+}
+
+/// `fill-up`: `big/` holds two 120 kB files in 100 KiB slices, so the one dar
+/// writes second lies in slices that do not hold `big`'s own entry.
+fn fill_up() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let tenants = vec![TenantSpec {
+            name: "alice",
+            units: vec![UnitSpec {
+                cat: Cat::Matched,
+                name: "deep",
+                uuid: "dee90000-1111-2222-3333-444444444444",
+                version: 1,
+                seed: 81,
+                files: 2,
+                file_len: 120_000,
+                names: &["big/one.bin", "big/two.bin"],
+                corrupt: &[],
+                tamper: &[],
+            }],
+        }];
+        build_template("fill-up", &tenants, true)
+    })
+}
+
+/// Each entry of a `dar -l -T slice` listing: (path, is a directory, first
+/// slice, last slice). An entry with no slice (a symlink) is left out.
+fn listing_slices(listing: &str) -> Vec<(String, bool, i64, i64)> {
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        let Some((range, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let (lo, hi) = match range.trim().split_once('-') {
+            Some((a, b)) => (a.parse::<i64>(), b.parse::<i64>()),
+            None => (range.trim().parse::<i64>(), range.trim().parse::<i64>()),
+        };
+        let (Ok(lo), Ok(hi)) = (lo, hi) else { continue };
+        let mut cols = rest.split_whitespace();
+        let Some(perm) = cols.by_ref().find(|c| c.len() == 10 && c.contains('r')) else {
+            continue;
+        };
+        let name: Vec<&str> = cols.collect();
+        out.push((name.join(" "), perm.starts_with('d'), lo, hi));
+    }
+    out
+}
+
+/// A fill reads the slice that holds the own entry of each folder above a
+/// listed file, not only the file's own slices: dar restores a folder before
+/// anything in it, and restores nothing in a folder whose entry is in a slice
+/// it was not given ("big not restored (user choice)", with nothing filled).
+/// Here one file of `big/` is damaged after a whole restore and listed by
+/// hand, and its slices do not hold `big`'s entry (the positive control).
+#[test]
+fn a_fill_reads_the_slice_of_the_folder_above_a_listed_file() {
+    let t = fill_up();
+    let u = unit_of(t, "deep");
+    let cat = t
+        .dir
+        .join("work")
+        .join("dee90000-1111-2222-3333-444444444444-v1")
+        .join("dee90000_v1");
+    let o = Command::new("dar")
+        .args(["-l", cat.to_str().unwrap(), "-T", "slice", "-N", "-Q"])
+        .env("HOME", "/nonexistent")
+        .output()
+        .expect("dar -l");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let entries = listing_slices(&String::from_utf8_lossy(&o.stdout));
+    let (_, _, dlo, dhi) = entries
+        .iter()
+        .find(|(p, dir, _, _)| p == "big" && *dir)
+        .cloned()
+        .expect("big's entry");
+    let (file, _, flo, fhi) = entries
+        .iter()
+        .find(|(p, dir, lo, hi)| p.starts_with("big/") && !*dir && (*hi < dlo || *lo > dhi))
+        .cloned()
+        .unwrap_or_else(|| panic!("a file of big/ in other slices than its entry: {entries:?}"));
+    println!("big in slice(s) {dlo}-{dhi}; {file} in {flo}-{fhi}");
+
+    let a = Heir::of(t, &[]);
+    let dest = a.sub("restored");
+    let (code, text) = runv(&a, &restore_args(&a, "deep", &dest));
+    assert_eq!(code, 0, "{text}");
+    std::fs::write(Path::new(&dest).join(&file), "damaged").unwrap();
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "#tapectl-damaged-files\t1\tunit=deep\tuuid=dee90000-1111-2222-3333-444444444444\tversion=1\n{file}\n"
+        ),
+    )
+    .unwrap();
+    let b = Heir::of(t, &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "deep", &list, &dest));
+    println!("--- the fill ---\n{text}");
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("not restored (user choice)"), "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(same_tree(&u.src, Path::new(&dest)), "{text}");
 }
 
 // ---- the second fresh read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
