@@ -128,10 +128,11 @@ fn sg_logs_only_ever_reads() {
             "/dev/sg9"
         ]
     );
-    // The offline decode reads bytes from stdin and touches no device.
+    // The offline decode reads the page's bytes from a file (a temporary one in
+    // production) and touches no device.
     assert_eq!(
-        SgLogs::decode_argv(),
-        ["sg_logs", "--in=-", "--raw", "--pdt=1"]
+        SgLogs::decode_argv("/tmp/page.bin"),
+        ["sg_logs", "--in=/tmp/page.bin", "--raw", "--pdt=1"]
     );
 }
 

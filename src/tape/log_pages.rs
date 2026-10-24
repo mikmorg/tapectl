@@ -11,7 +11,7 @@
 //! 2. derive the page list from those bytes (4-byte header, then one page
 //!    code per byte — [`parse_supported_pages`]);
 //! 3. read every listed page once, `--raw` again;
-//! 4. decode each page OFFLINE from its stored bytes (`sg_logs --in=- --raw
+//! 4. decode each page OFFLINE from its stored bytes (`sg_logs --in=FILE --raw
 //!    --pdt=1`: no device, no second LOG SENSE). `--pdt=1` (sequential
 //!    access) is required, or sg_logs guesses a disk and decodes 0x17 as
 //!    "Non-volatile cache page".
@@ -146,12 +146,15 @@ impl SgLogs {
         ]
     }
 
-    /// The argv of one offline decode: bytes on stdin, sequential-access
-    /// device type forced.
-    pub fn decode_argv() -> Vec<String> {
+    /// The argv of one offline decode: the page's bytes in the file `input`,
+    /// sequential-access device type forced. A file, not `--in=-`: some
+    /// sg_logs versions stat() the `--in` path and refuse `-` ("unable to
+    /// stat(-)", the sg3-utils on GitHub's ubuntu-latest runner from
+    /// 2026-10-21), while every version reads a file.
+    pub fn decode_argv(input: &str) -> Vec<String> {
         vec![
             LOG_TOOL.to_string(),
-            "--in=-".to_string(),
+            format!("--in={input}"),
             "--raw".to_string(),
             "--pdt=1".to_string(),
         ]
@@ -181,26 +184,22 @@ impl LogSource for SgLogs {
     }
 }
 
-/// `sg_logs --in=- --raw --pdt=1`, bytes on stdin. Touches no device.
+/// `sg_logs --in=FILE --raw --pdt=1`, the bytes in a temporary file removed
+/// when the decode returns. Touches no device.
 pub fn decode_offline(raw: &[u8]) -> std::result::Result<String, String> {
-    let argv = SgLogs::decode_argv();
-    let mut child = Command::new(&argv[0])
+    // A page is at most 64 KiB; it is written whole, then sg_logs reads it.
+    let mut input = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("{LOG_TOOL} decode input file failed: {e}"))?;
+    input
+        .write_all(raw)
+        .and_then(|()| input.flush())
+        .map_err(|e| format!("{LOG_TOOL} decode input write failed: {e}"))?;
+    let argv = SgLogs::decode_argv(&input.path().to_string_lossy());
+    let out = Command::new(&argv[0])
         .args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdin(Stdio::null())
+        .output()
         .map_err(|e| format!("{LOG_TOOL} decode spawn failed: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A page is at most 64 KiB and sg_logs reads all of `--in` before
-        // decoding, so writing it whole and then closing cannot deadlock.
-        stdin
-            .write_all(raw)
-            .map_err(|e| format!("{LOG_TOOL} decode stdin write failed: {e}"))?;
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("{LOG_TOOL} decode wait failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{LOG_TOOL} decode exit {}: {}",
@@ -2701,15 +2700,15 @@ pub(crate) mod tests {
         );
         assert_eq!(READ_MAXLEN, 0xfffc, "sg_logs's own MX_ALLOC_LEN");
         assert_eq!(
-            SgLogs::decode_argv(),
-            vec!["sg_logs", "--in=-", "--raw", "--pdt=1"]
+            SgLogs::decode_argv("/tmp/page.bin"),
+            vec!["sg_logs", "--in=/tmp/page.bin", "--raw", "--pdt=1"]
         );
     }
 
     /// The real offline decoder over every fixture's bytes reproduces the
     /// recorded decode exactly — proving the decode argv (`--pdt=1`
     /// especially) is the one the fixtures were made with. It touches no
-    /// device (`--in=-`). sg3-utils is not a test dependency (only dar is,
+    /// device (`--in=FILE`). sg3-utils is not a test dependency (only dar is,
     /// `tests/test_dependencies.rs`), so without `sg_logs` this says so and
     /// returns.
     #[test]
