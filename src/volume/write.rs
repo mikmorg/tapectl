@@ -2196,10 +2196,15 @@ pub struct CapacityNumbers {
     /// envelope and its backup (catalogues, the cross-volume index, the
     /// on-tape `catalog.db`) and the seal.
     pub generated: u64,
-    /// One block per generated file: the identity of a volume that does not
-    /// exist yet (its uuid, its creation time, the chip's strings) moves a
-    /// generated file's size by a few bytes, and a few bytes can cross a
-    /// block. Kept as a margin so the verdict bounds the real write's.
+    /// One block per generated file: another build of the same batch does
+    /// not make these files to the byte. The identity of a volume that does
+    /// not exist yet (its uuid, its creation time, the chip's strings) moves
+    /// a file by a few bytes, and age writes a random "grease" stanza into
+    /// every header it makes (age-core's `grease_the_joint`), so each
+    /// encryption of the same envelope is up to ~170 bytes longer or shorter
+    /// than another (#491). Either can cross a block, and less than a block
+    /// can cross only one. Kept as a margin so the verdict bounds the real
+    /// write's.
     pub margin: u64,
     /// The end-of-tape reserve (`enospc_buffer`).
     pub reserve: u64,
