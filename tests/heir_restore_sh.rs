@@ -7286,6 +7286,9 @@ out=$(mktemp); rc=0
 awk -v check="$check" '
   function q(s,   out, i, c, run) {
     if (s ~ /^[A-Za-z0-9._\/+-]+$/) return s
+    # A host sha256sum that quotes already (as on Ubuntu 26.04) is passed through:
+    # quoting its output again would print a form no sha256sum prints.
+    if (substr(s, 1, 1) == "\047") return s
     out = ""; run = ""
     for (i = 1; i <= length(s); i++) {
       c = substr(s, i, 1)
