@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,15 @@ pub struct UnitDotfile {
     /// keeps the unit whole even under an archive set that allows spanning.
     /// No serde `default`, for `warehouse_copies`'s reason (issue #92).
     pub allow_spanning: Option<bool>,
+    /// #493 (ADR-0012 items 148, 149, 155): how many copies this unit should
+    /// hold at each named location, `[policy.copies_at]`. `None` means the
+    /// dotfile is silent and the archive set, then `[defaults]`, decides;
+    /// `Some(map)` replaces the lower layers' map whole (item 156), an empty
+    /// one included. No serde `default`, for `warehouse_copies`'s reason
+    /// (issue #92). Modeled here so a `unit rename`/`unit tag`/`tenant
+    /// reassign` round trip keeps it (issue #212's lesson), and `location
+    /// rename` rewrites its keys through the same writer.
+    pub copies_at: Option<BTreeMap<String, i64>>,
     pub exclude_patterns: Vec<String>,
 }
 
@@ -57,6 +67,10 @@ pub struct UnitDotfile {
 // slice_size = "1G"
 // warehouse_copies = 0
 // allow_spanning = false
+//
+// [policy.copies_at]
+// home = 1
+// offsite = 1
 //
 // [excludes]
 // patterns = [...]
@@ -105,7 +119,7 @@ struct UnitSection {
 /// below is the ONE definition of what a dotfile's `[policy]` table may
 /// contain, enforced identically by `read_dotfile` and by the resolver. A
 /// misspelled key (`slize_size`, `min_copies`, `allow_span`, anything not one
-/// of the five fields here) is refused by name instead of silently deferring
+/// of the six fields here) is refused by name instead of silently deferring
 /// upward forever (ADR-0012).
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +138,15 @@ pub(crate) struct PolicySection {
     /// named it is rewritten byte for byte as before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) allow_spanning: Option<bool>,
+    /// #493 (ADR-0012 item 155): `[policy.copies_at]`, one `location =
+    /// count` line each; TOML's inline `copies_at = { home = 1 }` is the same
+    /// table. Last, so it serializes as a `[policy.copies_at]` sub-table after
+    /// the plain keys. Skipped when unset, so a dotfile that never named it
+    /// is rewritten byte for byte as before. Each count is checked (0 or
+    /// more) and each name looked up among the registered locations by
+    /// `policy::resolve`, not here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) copies_at: Option<BTreeMap<String, i64>>,
 }
 
 /// Issue #263 -- the headline defect this issue exists to close:
@@ -179,6 +202,7 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
         && data.slice_size.is_none()
         && data.warehouse_copies.is_none()
         && data.allow_spanning.is_none()
+        && data.copies_at.is_none()
     {
         None
     } else {
@@ -188,6 +212,7 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
             slice_size: data.slice_size.clone(),
             warehouse_copies: data.warehouse_copies,
             allow_spanning: data.allow_spanning,
+            copies_at: data.copies_at.clone(),
         })
     };
 
@@ -243,6 +268,7 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
         slice_size: wrapper.policy.as_ref().and_then(|p| p.slice_size.clone()),
         warehouse_copies: wrapper.policy.as_ref().and_then(|p| p.warehouse_copies),
         allow_spanning: wrapper.policy.as_ref().and_then(|p| p.allow_spanning),
+        copies_at: wrapper.policy.as_ref().and_then(|p| p.copies_at.clone()),
         exclude_patterns: wrapper.excludes.patterns,
     })
 }
@@ -272,6 +298,7 @@ mod tests {
             slice_size: None,
             warehouse_copies: None,
             allow_spanning: None,
+            copies_at: None,
             exclude_patterns: vec!["*.tmp".into(), ".cache/".into()],
         }
     }
@@ -485,6 +512,101 @@ patterns = [\"*.iso\"]
             let err = read_dotfile(&path).unwrap_err().to_string();
             assert!(err.contains(bad), "{bad}: {err}");
             assert!(err.contains(&path.display().to_string()), "{bad}: {err}");
+        }
+    }
+
+    const UNIT_TABLE: &str = "[unit]\nuuid = \"u-1\"\nname = \"docs\"\n\
+                              created = \"2026-01-01T00:00:00Z\"\ntenant = \"alice\"\n\n";
+
+    /// #493 (ADR-0012 item 155): `[policy.copies_at]` with one `location =
+    /// count` line each, and TOML's inline `copies_at = { ... }` under
+    /// `[policy]`, are the same table and read the same map. A 0 count is
+    /// kept: it is a value, not silence.
+    #[test]
+    fn copies_at_reads_the_same_from_the_sub_table_and_the_inline_form() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let want: BTreeMap<String, i64> = [("home".to_string(), 1), ("offsite".to_string(), 0)]
+            .into_iter()
+            .collect();
+        for policy in [
+            "[policy.copies_at]\nhome = 1\noffsite = 0\n",
+            "[policy]\ncopies_at = { home = 1, offsite = 0 }\n",
+            "[policy]\nslice_size = \"2G\"\n\n[policy.copies_at]\nhome = 1\noffsite = 0\n",
+        ] {
+            std::fs::write(&path, format!("{UNIT_TABLE}{policy}")).unwrap();
+            let df = read_dotfile(&path).unwrap();
+            assert_eq!(df.copies_at.as_ref(), Some(&want), "{policy}");
+        }
+        std::fs::write(&path, format!("{UNIT_TABLE}[policy]\nslice_size = \"2G\"\n")).unwrap();
+        assert!(read_dotfile(&path).unwrap().copies_at.is_none(), "unset is None");
+    }
+
+    /// #493: set alone, `copies_at` still writes a policy table (the guard in
+    /// `write_dotfile` counts it, or the key would vanish on the next
+    /// rewrite), as the `[policy.copies_at]` sub-table after any plain
+    /// `[policy]` key, and round-trips, an empty map included (an explicit
+    /// "no targets", not silence). Unset, nothing is written.
+    #[test]
+    fn copies_at_round_trips_as_a_sub_table_and_is_not_written_when_unset() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        let mut d = sample();
+        d.checksum_mode = None;
+        d.compression = None;
+        let map: BTreeMap<String, i64> = [("home".to_string(), 1), ("offsite".to_string(), 2)]
+            .into_iter()
+            .collect();
+        d.copies_at = Some(map.clone());
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("[policy.copies_at]\nhome = 1\noffsite = 2\n"),
+            "{raw}"
+        );
+        assert_eq!(read_dotfile(&path).unwrap().copies_at, Some(map.clone()));
+
+        d.slice_size = Some("2G".into());
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let plain = raw.find("slice_size").unwrap();
+        let sub = raw.find("[policy.copies_at]").unwrap();
+        assert!(plain < sub, "plain keys first: {raw}");
+        assert_eq!(read_dotfile(&path).unwrap().copies_at, Some(map));
+
+        d.slice_size = None;
+        d.copies_at = Some(BTreeMap::new());
+        write_dotfile(&path, &d).unwrap();
+        assert_eq!(
+            read_dotfile(&path).unwrap().copies_at,
+            Some(BTreeMap::new()),
+            "an empty map is a value: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+
+        d.copies_at = None;
+        write_dotfile(&path, &d).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("copies_at"), "{raw}");
+        assert!(!raw.contains("[policy"), "{raw}");
+    }
+
+    /// #493: a count that is not a whole number is refused with the file's
+    /// path and the offending line, never read as "not set".
+    #[test]
+    fn a_copies_at_count_that_is_not_a_whole_number_is_refused_naming_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".tapectl-unit.toml");
+        for bad in ["home = 1.5", "home = \"one\"", "home = true"] {
+            std::fs::write(
+                &path,
+                format!("{UNIT_TABLE}[policy.copies_at]\n{bad}\n"),
+            )
+            .unwrap();
+            let err = read_dotfile(&path).unwrap_err().to_string();
+            assert!(err.contains(&path.display().to_string()), "{bad}: {err}");
+            // toml's own error quotes the offending line and points at it.
+            assert!(err.contains(bad), "{bad}: {err}");
         }
     }
 

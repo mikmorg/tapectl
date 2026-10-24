@@ -721,6 +721,7 @@ mod tests {
             slice_size: None,
             warehouse_copies: None,
             allow_spanning: None,
+            copies_at: None,
             exclude_patterns: vec![],
         };
         for d in ["one", "two"] {
@@ -786,6 +787,7 @@ mod tests {
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
+                copies_at: None,
                 exclude_patterns: vec![],
             },
         )
@@ -900,6 +902,7 @@ mod tests {
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
+                copies_at: None,
                 exclude_patterns: vec![],
             },
         )
@@ -1013,6 +1016,7 @@ mod tests {
             slice_size: None,
             warehouse_copies: None,
             allow_spanning: None,
+            copies_at: None,
             exclude_patterns: Vec::new(),
         };
 
@@ -1054,6 +1058,7 @@ mod tests {
             slice_size: None,
             warehouse_copies: None,
             allow_spanning: Some(true),
+            copies_at: None,
             exclude_patterns: Vec::new(),
         };
         let path = dir.join(dotfile::UNIT_DOTFILE);
