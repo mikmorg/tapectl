@@ -2101,3 +2101,40 @@ Ruled 2026-10-23, on a fork #478's build found (task H2, `catalog rebuild` of a 
      0 copies, unless the tape that completes it happens to be rebuilt first. Nothing else would
      promote it, because no later write touches the version. Considered and not chosen: keeping
      the letter of the 2026-09-29 ruling and promoting by a separate command.
+
+Ruled 2026-10-24, on what 1.7.0's landing found (GitHub's runner moved to Ubuntu 26, with dar 2.8.3 and
+a `sha256sum` that shell-quotes file names):
+
+145. **RESTORE.sh's damage handling is fixed in 1.7.0, before the tag, and its golden pin moves a
+     fifth time for it.** This is outside item 135's list. Two defects date from 1.3.0 (#480):
+     - **R1.** The per-file check parsed `sha256sum -c`'s report. A `sha256sum` that quotes names
+       containing a space, a colon or a TAB left those damaged files off
+       `.tapectl-damaged-files.txt`, and a `--fill-from` then reported FILL COMPLETE while they
+       were still wrong. The fix hashes each file on its own and reads back only the hash, never
+       a name.
+     - **R2.** A folder whose own entry lay in the lost slice went into the list, and the fill
+       refused its own list. With an index, the folder is now replaced by the entries the index
+       records under it. Without one, the fill restores what is missing in the folder and
+       overwrites nothing.
+
+     The fill also reads the slices of every folder above a listed path. dar restores nothing
+     inside a folder whose own entry it was not given, which RESTORE.sh's fill had missed since
+     1.3.0; tapectl's own fill already did this.
+
+     The cost is one hash process per restored file: a 100,000-file unit's check takes minutes,
+     against the hours its tapes take to read. Considered and not chosen: tagging 1.7.0 as it
+     stood and fixing in 1.7.1, which would leave the defect in every Heir Kit regenerated at the
+     1.7.0 install.
+146. **1.7.0 follows 1.6.0's order: the real-drive proof, then the tag, then the install.**
+     1. The operator runs `scripts/span-acceptance.sh` (item 137, as item 139 amends it) on home2's
+        drive and test cartridge EW7VWMVKF6, with a scratch build of the landed commit. That build
+        is a static musl debug build that the coordinator copies to home2 with its sha256, never
+        into `PATH` or a production home.
+     2. Only after it passes is `v1.7.0` tagged.
+     3. Then handoff (h) installs 1.7.0, with spanning off until `allow_spanning` is set.
+147. **Item 94's start follows item 94's own layout, in a 1.7.x patch** (#492). A spannable set
+     larger than one tape starts right after the owed runs. The whole units it displaces are
+     written after its tail on its last tape, keeping item 113's bound (item 123). 1.7.0's planner
+     starts such a set as late as it can while touching the fewest tapes, which leaves no slack
+     if the early warning comes before nominal. This changes planning only, never a byte on
+     tape, and home2 cannot reach it until staging is larger than one tape.
