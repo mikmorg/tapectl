@@ -2711,21 +2711,53 @@ pub(crate) mod tests {
     /// device (`--in=FILE`). sg3-utils is not a test dependency (only dar is,
     /// `tests/test_dependencies.rs`), so without `sg_logs` this says so and
     /// returns.
+    ///
+    /// The recorded text is the oracle only for the decoder that made it:
+    /// sg_logs's wording moves between sg3-utils releases (GitHub's
+    /// ubuntu-latest runner from 2026-10-21 prints "Write error counters" where
+    /// 1.81 prints "Write error", and indents differently). Any other version
+    /// must still decode every page, and decode 0x17 as a tape's page
+    /// (`--pdt=1`), never as a disk's "Non-volatile cache".
     #[test]
     fn the_real_offline_decoder_reproduces_every_fixture_decode() {
         if Command::new(LOG_TOOL).arg("-V").output().is_err() {
             eprintln!("SKIP: {LOG_TOOL} not on PATH; the offline decode was not exercised");
             return;
         }
+        let exact = tool_version().is_some_and(|v| v.contains(FIXTURE_DECODER));
         let mut n = 0;
         for (page, bytes, text) in fixture_pages() {
             let decoded =
                 decode_offline(bytes).unwrap_or_else(|e| panic!("decode of 0x{page:02x}: {e}"));
-            assert_eq!(decoded, text, "0x{page:02x}");
+            if exact {
+                assert_eq!(decoded, text, "0x{page:02x}");
+            } else {
+                assert!(!decoded.trim().is_empty(), "0x{page:02x}: an empty decode");
+            }
+            if page == 0x17 {
+                // The --pdt=1 proof, whatever the version: a disk's reading
+                // of these bytes is "Non-volatile cache page".
+                assert!(
+                    decoded.contains("Volume statistics")
+                        && !decoded.contains("Non-volatile cache"),
+                    "0x17 decoded as a tape's page: {decoded}"
+                );
+            }
             n += 1;
+        }
+        if !exact {
+            eprintln!(
+                "NOTE: {LOG_TOOL} {:?} is not the fixtures' decoder ({FIXTURE_DECODER}); \
+                 compared what every version shares",
+                tool_version()
+            );
         }
         assert_eq!(n, LISTED.len(), "positive control: every page was decoded");
     }
+
+    /// The sg_logs the fixtures' `page_0xNN.decoded.txt` were made with
+    /// (`tests/fixtures/sg_logs/mhvtl_td8_sg1/README.md`).
+    const FIXTURE_DECODER: &str = "1.81 20200110";
 
     // ── HP page 0x34 (issue #488) ──
 
