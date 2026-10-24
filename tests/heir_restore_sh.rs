@@ -7269,6 +7269,121 @@ fn the_gates_restore_with_the_dd_stand_in_and_a_copys_slices_works() {
 
 // ---- the restored files against their recorded sha256 (ADR-0012 item 103) ----
 
+/// A stand-in for `sha256sum` that prints every file name it names
+/// shell-quoted unless the name is only letters, digits and `._/+-`, as the
+/// `sha256sum` of GitHub's Ubuntu 26.04 runner quoted a name holding a space,
+/// a colon or a TAB in its `-c` report (`'we ird : name.bin': FAILED`,
+/// `'tab'$'\t''here.bin': FAILED`; the host's coreutils 9.4 prints them raw).
+/// It quotes the names of a `-c` report and of a plain run's `HASH  NAME`
+/// lines alike; a file read from standard input is named `-` and printed as
+/// it is. Every run with `-c` adds a line to `sha256sum-check.ran` in the
+/// test's directory. The hashing is the host's own `sha256sum`.
+const SHA256SUM_QUOTING: &str = r#"#!/bin/bash
+real="$FAKE_TAPE/hostbin/sha256sum"
+check=0
+for a in "$@"; do [ "$a" = -c ] && check=1; done
+[ "$check" = 0 ] || echo "$*" >>"$FAKE_TAPE/sha256sum-check.ran"
+out=$(mktemp); rc=0
+"$real" "$@" >"$out" || rc=$?
+awk -v check="$check" '
+  function q(s,   out, i, c, run) {
+    if (s ~ /^[A-Za-z0-9._\/+-]+$/) return s
+    out = ""; run = ""
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      if (c == "\t") { if (run != "") out = out "\047" run "\047"; run = ""; out = out "$\047\\t\047" }
+      else run = run c
+    }
+    if (run != "") out = out "\047" run "\047"
+    return out
+  }
+  check && match($0, /: (OK|FAILED|FAILED open or read)$/) { print q(substr($0, 1, RSTART - 1)) substr($0, RSTART); next }
+  !check && match($0, /^\\?[0-9a-f]+ [ *]/) { print substr($0, 1, RLENGTH) q(substr($0, RLENGTH + 1)); next }
+  { print }
+' "$out"
+rm -f "$out"
+exit $rc
+"#;
+
+/// The stubs a test runs with to have `sha256sum` quote names.
+const QUOTING: &[(&str, &str)] = &[("sha256sum", SHA256SUM_QUOTING)];
+
+/// The script never asked `sha256sum -c` for a report (the quoting stand-in
+/// marks every such run): no name was read back from it.
+fn assert_no_check_report(h: &Heir) {
+    let ran = h.dir.join("sha256sum-check.ran");
+    assert!(
+        !ran.exists(),
+        "RESTORE.sh ran sha256sum -c: {}",
+        std::fs::read_to_string(&ran).unwrap_or_default()
+    );
+}
+
+/// The positive control for every test run with [`QUOTING`]: the stand-in
+/// does quote, in a `-c` report and in a plain run, the very names the
+/// Ubuntu 26.04 runner's `sha256sum` quoted, and leaves a file read from
+/// standard input named `-`, as a host `sha256sum` does. Without it, a test
+/// that passes with the stand-in could be passing on a stub that changed
+/// nothing.
+#[test]
+fn the_quoting_sha256sum_stand_in_quotes_the_names_it_prints() {
+    let h = Heir::with_stubs(QUOTING);
+    let tree = h.dir.join("qtree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for (name, body) in [
+        ("we ird : name.bin", "one"),
+        ("tab\there.bin", "two"),
+        ("plain.bin", "three"),
+    ] {
+        std::fs::write(tree.join(name), body).unwrap();
+    }
+    std::fs::write(
+        h.dir.join("q.sums"),
+        format!(
+            "{zero}  we ird : name.bin\n{zero}  tab\there.bin\n{}  plain.bin\n",
+            sha256_hex(b"three"),
+            zero = "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    let sh = |script: &str| -> String {
+        let o = Command::new("bash")
+            .args(["-c", script])
+            .current_dir(&tree)
+            .env("PATH", &h.path)
+            .env("FAKE_TAPE", &h.dir)
+            .env("TMPDIR", h.dir.join("tmp"))
+            .output()
+            .expect("spawn bash");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let report = sh("sha256sum -c --quiet <../q.sums");
+    assert!(
+        report.contains("'we ird : name.bin': FAILED\n")
+            && report.contains("'tab'$'\\t''here.bin': FAILED\n"),
+        "the -c report quotes as the runner's did:\n{report}"
+    );
+    assert!(!report.contains("plain.bin"), "--quiet: {report}");
+    let plain = sh("sha256sum -- 'we ird : name.bin' plain.bin");
+    assert_eq!(
+        plain,
+        format!(
+            "{}  'we ird : name.bin'\n{}  plain.bin\n",
+            sha256_hex(b"one"),
+            sha256_hex(b"three")
+        )
+    );
+    assert_eq!(
+        sh("sha256sum <'we ird : name.bin'"),
+        format!("{}  -\n", sha256_hex(b"one")),
+        "standard input is named -, unquoted"
+    );
+    assert!(
+        h.dir.join("sha256sum-check.ran").exists(),
+        "a -c run leaves its mark"
+    );
+}
+
 const CHK_UUID: &str = "abcdabcd-1111-2222-3333-444444444444";
 
 /// One unit, `checked`, whose five files have the odd names of `ODD_NAMES`
@@ -7410,7 +7525,20 @@ fn a_clean_restore_passes_the_file_check_and_counts_what_it_checked() {
 /// the restore is whole.
 #[test]
 fn a_file_dar_cannot_see_is_found_by_its_hash_and_filled_from_another_copy() {
-    let bad = Heir::of(chk_bad(), &[]);
+    dar_cannot_see_then_fill(&[]);
+}
+
+/// The same with a `sha256sum` that quotes the names it prints (R1, found on
+/// GitHub's Ubuntu 26.04 runner): two of the four changed files have such a
+/// name, and they are listed, filled and checked like the others. The check
+/// reads no name back from `sha256sum`, so its quoting changes nothing.
+#[test]
+fn a_file_dar_cannot_see_is_found_and_filled_with_a_sha256sum_that_quotes_names() {
+    dar_cannot_see_then_fill(QUOTING);
+}
+
+fn dar_cannot_see_then_fill(stubs: &[(&str, &str)]) {
+    let bad = Heir::of(chk_bad(), stubs);
     let good_src = unit_of(chk_good(), "checked").src;
     let dest = bad.sub("restored");
     let (code, text) = runv(&bad, &restore_args(&bad, "checked", &dest));
@@ -7455,7 +7583,7 @@ fn a_file_dar_cannot_see_is_found_by_its_hash_and_filled_from_another_copy() {
 
     // The fill, from a copy whose files are the ones the index hashes.
     let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
-    let other = Heir::of(chk_good(), &[]);
+    let other = Heir::of(chk_good(), stubs);
     let (code, text) = runv(&other, &fill_args(&other, "checked", &list, &dest));
     println!("--- the fill from another copy ---\n{text}");
     assert_eq!(code, 0, "{text}");
@@ -7466,6 +7594,8 @@ fn a_file_dar_cannot_see_is_found_by_its_hash_and_filled_from_another_copy() {
     assert!(text.contains("FILL COMPLETE"), "{text}");
     assert!(!list.exists(), "the list is removed");
     assert!(same_tree(&good_src, Path::new(&dest)), "{text}");
+    assert_no_check_report(&bad);
+    assert_no_check_report(&other);
 }
 
 /// A fill takes its files from a copy, and a copy whose files are not the ones
@@ -7473,15 +7603,27 @@ fn a_file_dar_cannot_see_is_found_by_its_hash_and_filled_from_another_copy() {
 /// stay in the list, and the fill ends INCOMPLETE.
 #[test]
 fn a_fill_whose_files_still_fail_their_hash_stays_incomplete() {
-    let a = Heir::of(chk_bad(), &[]);
+    fill_still_fails(&[]);
+}
+
+/// The same with a `sha256sum` that quotes the names it prints (R1): all four
+/// are listed before and after, the two with a quoted name included.
+#[test]
+fn a_fill_whose_files_still_fail_stays_incomplete_with_a_sha256sum_that_quotes_names() {
+    fill_still_fails(QUOTING);
+}
+
+fn fill_still_fails(stubs: &[(&str, &str)]) {
+    let a = Heir::of(chk_bad(), stubs);
     let dest = a.sub("restored");
     let (code, text) = runv(&a, &restore_args(&a, "checked", &dest));
     assert_eq!(code, 1, "{text}");
     let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
     let before = damaged_list(&dest).1;
     assert_eq!(before.len(), 4);
+    assert_eq!(before, odd_escaped(CHK_TAMPERED), "{text}");
 
-    let again = Heir::of(chk_bad(), &[]);
+    let again = Heir::of(chk_bad(), stubs);
     let (code, text) = runv(&again, &fill_args(&again, "checked", &list, &dest));
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("FILL INCOMPLETE: 4 file(s)"), "{text}");
@@ -7490,6 +7632,8 @@ fn a_fill_whose_files_still_fail_their_hash_stays_incomplete() {
         "{text}"
     );
     assert_eq!(damaged_list(&dest).1, before, "the same four are listed");
+    assert_no_check_report(&a);
+    assert_no_check_report(&again);
 }
 
 /// `--no-file-check` runs the restore the old way: dar's checksum alone, the
@@ -7602,7 +7746,18 @@ fn an_escrow_or_operator_key_checks_against_the_tenant_envelopes_index() {
 /// asked for by name is found.
 #[test]
 fn a_path_restore_checks_only_the_paths_it_restored() {
-    let h = Heir::of(chk_bad(), &[]);
+    path_restore_checks(&[]);
+}
+
+/// The same with a `sha256sum` that quotes the names it prints (R1): the one
+/// changed file asked for by a name it quotes is found.
+#[test]
+fn a_path_restore_checks_its_paths_with_a_sha256sum_that_quotes_names() {
+    path_restore_checks(QUOTING);
+}
+
+fn path_restore_checks(stubs: &[(&str, &str)]) {
+    let h = Heir::of(chk_bad(), stubs);
     let path_args = |dest: &str, path: &str| {
         let mut a = restore_args(&h, "checked", dest);
         a.extend(["--path".to_string(), path.to_string()]);
@@ -7634,6 +7789,7 @@ fn a_path_restore_checks_only_the_paths_it_restored() {
         text.contains("File check: 1 of 1 file(s) of 'checked' version 1 do NOT match"),
         "{text}"
     );
+    assert_no_check_report(&h);
 }
 
 /// The same unit and version, indexed by an older 1.3.0 writer that wrote no
@@ -7691,7 +7847,19 @@ fn files_with_no_recorded_hash_are_counted_not_checked() {
 /// copy makes the unit whole.
 #[test]
 fn a_file_dar_and_the_check_both_find_is_listed_once() {
-    let a = Heir::of(chk_good(), &[]);
+    dar_and_check_both_find(&[]);
+}
+
+/// The same with a `sha256sum` that quotes the names it prints: on the Ubuntu
+/// 26.04 runner this case also lost `we ird : name.bin` from the check's
+/// side (R1).
+#[test]
+fn a_file_dar_and_the_check_both_find_is_listed_once_with_a_sha256sum_that_quotes_names() {
+    dar_and_check_both_find(QUOTING);
+}
+
+fn dar_and_check_both_find(stubs: &[(&str, &str)]) {
+    let a = Heir::of(chk_good(), stubs);
     let checked = unit_of(chk_good(), "checked");
     flip_in_tape(&a, checked.positions[1]);
     let empty = a.sub("empty");
@@ -7729,11 +7897,13 @@ fn a_file_dar_and_the_check_both_find_is_listed_once() {
     assert!(listed.len() >= 2, "a positive control: {listed:?}");
 
     let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
-    let b = Heir::of(chk_good(), &[]);
+    let b = Heir::of(chk_good(), stubs);
     let (code, text) = runv(&b, &fill_args(&b, "checked", &list, &dest));
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("FILL COMPLETE"), "{text}");
     assert!(same_tree(&checked.src, Path::new(&dest)), "{text}");
+    assert_no_check_report(&a);
+    assert_no_check_report(&b);
 }
 
 // ---- the second fresh read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
