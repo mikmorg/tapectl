@@ -4711,7 +4711,11 @@ mod tests {
     #[test]
     fn copies_at_loads_in_defaults_and_an_archive_set_in_either_spelling() {
         assert!(Config::default().defaults.copies_at.is_empty());
-        assert!(load_text("[defaults]\n").unwrap().defaults.copies_at.is_empty());
+        assert!(load_text("[defaults]\n")
+            .unwrap()
+            .defaults
+            .copies_at
+            .is_empty());
         let want: BTreeMap<String, i64> = [("home".to_string(), 1), ("offsite".to_string(), 0)]
             .into_iter()
             .collect();
@@ -4728,7 +4732,11 @@ mod tests {
         for text in [inline, tables] {
             let cfg = load_text(text).unwrap();
             assert_eq!(cfg.defaults.copies_at, want, "{text}");
-            assert_eq!(cfg.archive_sets[0].copies_at.as_ref(), Some(&want), "{text}");
+            assert_eq!(
+                cfg.archive_sets[0].copies_at.as_ref(),
+                Some(&want),
+                "{text}"
+            );
             assert_eq!(cfg.archive_sets[1].copies_at, None, "{text}");
             std::fs::write(&path, text).unwrap();
             let report = crate::policy::lenient_config::check(text, &path);
@@ -4779,7 +4787,10 @@ mod tests {
             let report = crate::policy::lenient_config::check(text, &path);
             assert!(!report.valid, "{key}");
             assert!(
-                report.problems.iter().any(|p| p.contains(key) && p.contains(says)),
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains(key) && p.contains(says)),
                 "{key}: {:?}",
                 report.problems
             );

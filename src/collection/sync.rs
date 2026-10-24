@@ -1133,8 +1133,7 @@ mod tests {
         ] {
             let dir = root.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            dotfile::write_dotfile(&dir.join(dotfile::UNIT_DOTFILE), &df(name, copies_at))
-                .unwrap();
+            dotfile::write_dotfile(&dir.join(dotfile::UNIT_DOTFILE), &df(name, copies_at)).unwrap();
         }
 
         let (_report, errors) = sync_collection(
@@ -1156,7 +1155,11 @@ mod tests {
             unit("alpha").copies_at_frozen.as_deref(),
             Some(r#"{"home":1,"offsite":1}"#)
         );
-        assert_eq!(unit("bravo").copies_at_frozen, None, "no key, nothing frozen");
+        assert_eq!(
+            unit("bravo").copies_at_frozen,
+            None,
+            "no key, nothing frozen"
+        );
 
         std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
         let resolved = crate::policy::resolve(&conn, &Config::default(), &unit("alpha"))

@@ -6934,7 +6934,9 @@ mod tests {
         };
         let resolved = || {
             let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
-            crate::policy::resolve(&conn, &config, &unit).unwrap().copies_at
+            crate::policy::resolve(&conn, &config, &unit)
+                .unwrap()
+                .copies_at
         };
         let map = |pairs: &[(&str, i64)]| -> std::collections::BTreeMap<String, i64> {
             pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
@@ -6943,12 +6945,23 @@ mod tests {
 
         set_copies_at(Some(&[("home", 1), ("offsite", 1)]));
         let snap = snapshot_create(&conn, "unit1", &config).unwrap();
-        assert_eq!(frozen().as_deref(), Some(r#"{"home":1,"offsite":1}"#), "snapshot");
+        assert_eq!(
+            frozen().as_deref(),
+            Some(r#"{"home":1,"offsite":1}"#),
+            "snapshot"
+        );
 
         set_copies_at(Some(&[("home", 2)]));
         let again = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
-        assert!(!again.minted, "positive control: a dotfile edit mints nothing");
-        assert_eq!(frozen().as_deref(), Some(r#"{"home":2}"#), "an unminted snapshot");
+        assert!(
+            !again.minted,
+            "positive control: a dotfile edit mints nothing"
+        );
+        assert_eq!(
+            frozen().as_deref(),
+            Some(r#"{"home":2}"#),
+            "an unminted snapshot"
+        );
 
         set_copies_at(Some(&[("offsite", 3)]));
         stage_create(&conn, &paths, &config, snap, true).unwrap();
@@ -6956,7 +6969,11 @@ mod tests {
 
         let saved = fs::read_to_string(&dotfile).unwrap();
         fs::remove_file(&dotfile).unwrap();
-        assert_eq!(resolved(), map(&[("offsite", 3)]), "absent: the frozen layer");
+        assert_eq!(
+            resolved(),
+            map(&[("offsite", 3)]),
+            "absent: the frozen layer"
+        );
         snapshot_create(&conn, "unit1", &config).unwrap();
         assert_eq!(
             frozen().as_deref(),
@@ -6966,7 +6983,11 @@ mod tests {
 
         fs::write(&dotfile, saved).unwrap();
         set_copies_at(None);
-        assert_eq!(resolved(), map(&[]), "present without the key: silent at once");
+        assert_eq!(
+            resolved(),
+            map(&[]),
+            "present without the key: silent at once"
+        );
         assert!(frozen().is_some(), "...and not yet cleared");
         snapshot_create(&conn, "unit1", &config).unwrap();
         assert_eq!(frozen(), None, "cleared at the next freeze point");
@@ -6979,7 +7000,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(events, 4, "set, changed twice, cleared; an unchanged map is not rewritten");
+        assert_eq!(
+            events, 4,
+            "set, changed twice, cleared; an unchanged map is not rewritten"
+        );
     }
 
     /// #478 (ADR-0012 item 94): a unit that allows spanning is admitted

@@ -2595,7 +2595,14 @@ fi
             add_location(&conn, name);
         }
         let mut config = Config::default();
-        run(&conn, &config, &create_cmd("plain", None, None), false, false).unwrap();
+        run(
+            &conn,
+            &config,
+            &create_cmd("plain", None, None),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(stored_copies_at(&conn, "plain"), None, "no flag is NULL");
 
         run(
@@ -2689,7 +2696,10 @@ fi
         add_location(&conn, "home");
         let config = Config::default();
         for (values, says) in [
-            (&["atlantis=1"][..], "\"atlantis\", which is not a registered location"),
+            (
+                &["atlantis=1"][..],
+                "\"atlantis\", which is not a registered location",
+            ),
             (&["home"][..], "must be NAME=N"),
             (&["home=one"][..], "is not a whole number"),
             (&["home=1.5"][..], "is not a whole number"),
@@ -2718,7 +2728,14 @@ fi
             .unwrap();
         assert_eq!(count, 0, "nothing was created");
 
-        run(&conn, &config, &create_cmd("media", None, None), false, false).unwrap();
+        run(
+            &conn,
+            &config,
+            &create_cmd("media", None, None),
+            false,
+            false,
+        )
+        .unwrap();
         let err = run(
             &conn,
             &config,
@@ -2743,6 +2760,10 @@ fi
             .to_string();
         assert!(err.contains("archive set \"media\""), "{err}");
         assert!(err.contains("copies_at names \"mu\""), "{err}");
-        assert_eq!(stored_copies_at(&conn, "media"), None, "sync is all or nothing");
+        assert_eq!(
+            stored_copies_at(&conn, "media"),
+            None,
+            "sync is all or nothing"
+        );
     }
 }

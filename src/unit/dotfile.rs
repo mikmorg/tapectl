@@ -538,8 +538,15 @@ patterns = [\"*.iso\"]
             let df = read_dotfile(&path).unwrap();
             assert_eq!(df.copies_at.as_ref(), Some(&want), "{policy}");
         }
-        std::fs::write(&path, format!("{UNIT_TABLE}[policy]\nslice_size = \"2G\"\n")).unwrap();
-        assert!(read_dotfile(&path).unwrap().copies_at.is_none(), "unset is None");
+        std::fs::write(
+            &path,
+            format!("{UNIT_TABLE}[policy]\nslice_size = \"2G\"\n"),
+        )
+        .unwrap();
+        assert!(
+            read_dotfile(&path).unwrap().copies_at.is_none(),
+            "unset is None"
+        );
     }
 
     /// #493: set alone, `copies_at` still writes a policy table (the guard in
@@ -598,11 +605,7 @@ patterns = [\"*.iso\"]
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".tapectl-unit.toml");
         for bad in ["home = 1.5", "home = \"one\"", "home = true"] {
-            std::fs::write(
-                &path,
-                format!("{UNIT_TABLE}[policy.copies_at]\n{bad}\n"),
-            )
-            .unwrap();
+            std::fs::write(&path, format!("{UNIT_TABLE}[policy.copies_at]\n{bad}\n")).unwrap();
             let err = read_dotfile(&path).unwrap_err().to_string();
             assert!(err.contains(&path.display().to_string()), "{bad}: {err}");
             // toml's own error quotes the offending line and points at it.

@@ -1083,7 +1083,12 @@ slice_size = "500M"
         conn
     }
 
-    fn archive_set(conn: &Connection, name: &str, required: Option<&str>, copies_at: Option<&str>) -> i64 {
+    fn archive_set(
+        conn: &Connection,
+        name: &str,
+        required: Option<&str>,
+        copies_at: Option<&str>,
+    ) -> i64 {
         conn.execute(
             "INSERT INTO archive_sets (name, required_locations, copies_at) VALUES (?1, ?2, ?3)",
             params![name, required, copies_at],
@@ -1111,7 +1116,11 @@ slice_size = "500M"
                 .copies_at
         };
 
-        assert_eq!(resolved(None, None), map(&[("home", 1), ("vault", 1)]), "defaults");
+        assert_eq!(
+            resolved(None, None),
+            map(&[("home", 1), ("vault", 1)]),
+            "defaults"
+        );
         assert_eq!(
             resolved(Some(silent), None),
             map(&[("home", 1), ("vault", 1)]),
@@ -1216,7 +1225,10 @@ slice_size = "500M"
         assert!(detail.contains("\"atlantis\""), "{detail}");
         assert!(detail.contains("[defaults] copies_at"), "{detail}");
         assert!(detail.contains("tapectl location add"), "{detail}");
-        assert!(!detail.contains("\"home\""), "only the unknown name: {detail}");
+        assert!(
+            !detail.contains("\"home\""),
+            "only the unknown name: {detail}"
+        );
 
         let config = Config::default();
         let set = archive_set(&conn, "media", None, Some(r#"{"lemuria":1}"#));
@@ -1229,7 +1241,10 @@ slice_size = "500M"
         let (layer, detail) = refused(&config, &make_unit(None, path_of(&dir)));
         assert_eq!(layer, PolicyLayer::Dotfile);
         assert!(detail.contains("\"hy-brasil\", \"mu\""), "{detail}");
-        assert!(detail.contains("which are not registered locations"), "{detail}");
+        assert!(
+            detail.contains("which are not registered locations"),
+            "{detail}"
+        );
         assert!(detail.contains(".tapectl-unit.toml"), "{detail}");
 
         let mut gone = make_unit(None, None);
@@ -1265,7 +1280,11 @@ slice_size = "500M"
         let frozen = map(&[("offsite", 1), ("vault", 1)]);
 
         let no_dotfile = TempDir::new().unwrap();
-        assert_eq!(resolved(path_of(&no_dotfile)), frozen, "no dotfile in the folder");
+        assert_eq!(
+            resolved(path_of(&no_dotfile)),
+            frozen,
+            "no dotfile in the folder"
+        );
         assert_eq!(
             resolved(Some("/nonexistent/tapectl-493".into())),
             frozen,
