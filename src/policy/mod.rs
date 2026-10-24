@@ -447,6 +447,7 @@ mod tests {
             created_at: "2026-01-01".into(),
             last_scanned: None,
             notes: None,
+            copies_at_frozen: None,
         }
     }
 

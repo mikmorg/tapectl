@@ -269,7 +269,7 @@ pub fn candidates(conn: &Connection, config: &Config) -> Result<Vec<Candidate>> 
     let sql = format!(
         "SELECT u.id, u.uuid, u.name, u.tenant_id, u.archive_set_id, u.current_path,
                 u.checksum_mode, u.encrypt, u.status, u.created_at, u.last_scanned, u.notes,
-                s.version, top.id, top.version, {}
+                s.version, top.id, top.version, {}, u.copies_at_frozen
          FROM units u
          JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
          JOIN snapshots top ON top.unit_id = u.id AND top.status = 'current'
@@ -296,6 +296,7 @@ pub fn candidates(conn: &Connection, config: &Config) -> Result<Vec<Candidate>> 
                     created_at: row.get(9)?,
                     last_scanned: row.get(10)?,
                     notes: row.get(11)?,
+                    copies_at_frozen: row.get(16)?,
                 },
                 row.get(12)?,
                 (row.get(13)?, row.get(14)?),
