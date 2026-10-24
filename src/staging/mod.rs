@@ -114,6 +114,14 @@ pub fn snapshot_create_detailed_reading(
     // fast, before doing expensive work.
     crate::unit::nesting::check_nesting_excluding(conn, source_path, Some(unit.id))?;
 
+    // #493 (ADR-0012 item 148): the source is present, so freeze the unit
+    // dotfile's own `[policy.copies_at]` for when it is gone. Before the
+    // content match below, so a run that mints nothing (a dotfile edit is
+    // not content, #378) still records the edited targets. The unit's real
+    // folder, as `policy::resolve` reads it, even when the files are read
+    // from a snapshot of the collection root.
+    crate::policy::freeze_copies_at(conn, &unit)?;
+
     // Walk directory and build manifest — the ONLY walk this function
     // performs. Both the content-match short-circuit immediately below and
     // the mint path that follows it reuse `walked` (issue #159).
@@ -770,6 +778,10 @@ fn stage_create_inner(
     // Resolved before the size check (#478): whether the unit may span
     // decides which limit it is held to.
     let resolved = crate::policy::resolve(conn, config, &unit)?;
+    // #493 (ADR-0012 item 148): the policy resolved with the source present,
+    // so freeze the dotfile's own `[policy.copies_at]` for when it is gone.
+    // After `resolve`, so a dotfile it refuses is never frozen.
+    crate::policy::freeze_copies_at(conn, &unit)?;
     check_unit_fits_one_tape(
         config,
         &unit.name,
@@ -6886,6 +6898,88 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+    }
+
+    /// #493 (ADR-0012 item 148, the coordinator's freeze mechanics):
+    /// `snapshot create` and `stage create` freeze the unit dotfile's own
+    /// `[policy.copies_at]` into `units.copies_at_frozen`, including on a
+    /// snapshot that mints nothing (a dotfile edit is not content, #378). The
+    /// frozen map is what `policy::resolve` answers while the dotfile is
+    /// absent, an absent dotfile at a freeze point leaves it as it is, a
+    /// present dotfile without the key outranks it at once and clears it at
+    /// the next freeze point. Each change is one `copies_at_frozen` event.
+    #[test]
+    fn snapshot_and_stage_create_freeze_the_dotfiles_own_copies_at() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        conn.execute_batch(
+            "INSERT INTO locations (name) VALUES ('home');
+             INSERT INTO locations (name) VALUES ('offsite');",
+        )
+        .unwrap();
+        fs::write(src.join("a.txt"), b"alpha").unwrap();
+        let dotfile = src.join(".tapectl-unit.toml");
+        let frozen = || {
+            conn.query_row(
+                "SELECT copies_at_frozen FROM units WHERE name = 'unit1'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        let set_copies_at = |pairs: Option<&[(&str, i64)]>| {
+            let mut df = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+            df.copies_at = pairs.map(|m| m.iter().map(|(n, c)| (n.to_string(), *c)).collect());
+            crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
+        };
+        let resolved = || {
+            let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+            crate::policy::resolve(&conn, &config, &unit).unwrap().copies_at
+        };
+        let map = |pairs: &[(&str, i64)]| -> std::collections::BTreeMap<String, i64> {
+            pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+        };
+        assert_eq!(frozen(), None, "nothing is frozen before a freeze point");
+
+        set_copies_at(Some(&[("home", 1), ("offsite", 1)]));
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        assert_eq!(frozen().as_deref(), Some(r#"{"home":1,"offsite":1}"#), "snapshot");
+
+        set_copies_at(Some(&[("home", 2)]));
+        let again = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
+        assert!(!again.minted, "positive control: a dotfile edit mints nothing");
+        assert_eq!(frozen().as_deref(), Some(r#"{"home":2}"#), "an unminted snapshot");
+
+        set_copies_at(Some(&[("offsite", 3)]));
+        stage_create(&conn, &paths, &config, snap, true).unwrap();
+        assert_eq!(frozen().as_deref(), Some(r#"{"offsite":3}"#), "stage");
+
+        let saved = fs::read_to_string(&dotfile).unwrap();
+        fs::remove_file(&dotfile).unwrap();
+        assert_eq!(resolved(), map(&[("offsite", 3)]), "absent: the frozen layer");
+        snapshot_create(&conn, "unit1", &config).unwrap();
+        assert_eq!(
+            frozen().as_deref(),
+            Some(r#"{"offsite":3}"#),
+            "an absent dotfile at a freeze point changes nothing"
+        );
+
+        fs::write(&dotfile, saved).unwrap();
+        set_copies_at(None);
+        assert_eq!(resolved(), map(&[]), "present without the key: silent at once");
+        assert!(frozen().is_some(), "...and not yet cleared");
+        snapshot_create(&conn, "unit1", &config).unwrap();
+        assert_eq!(frozen(), None, "cleared at the next freeze point");
+        snapshot_create(&conn, "unit1", &config).unwrap();
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = 'copies_at_frozen'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 4, "set, changed twice, cleared; an unchanged map is not rewritten");
     }
 
     /// #478 (ADR-0012 item 94): a unit that allows spanning is admitted

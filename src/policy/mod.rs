@@ -521,6 +521,93 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
     Ok(policy)
 }
 
+/// Freeze the unit dotfile layer's own `copies_at` into
+/// `units.copies_at_frozen` (#493, ADR-0012 item 148). Returns whether the
+/// stored value changed.
+///
+/// **What is frozen is the DOTFILE layer's own map, never the resolved one**
+/// (the coordinator's mechanics ruling): the dotfile is the only layer lost
+/// when a unit's source goes, while its archive set and `[defaults]` stay
+/// live and are read at use like every other key. [`resolve`] reads the
+/// frozen map as the dotfile layer only while the dotfile is absent, and
+/// stays read-only: freezing happens here, at the points where tapectl
+/// already writes the unit with its source present: `snapshot create`,
+/// `stage create` (after its policy resolved, so a bad dotfile never
+/// freezes), and `collection sync`'s adoption of a dotfile (which calls
+/// [`store_frozen_copies_at`] with the dotfile it already read). `collection
+/// run` freezes through its own snapshot and stage of each unit.
+///
+/// Item 148 freezes "with its dotfile present", so:
+/// - **present with `[policy.copies_at]`**: that map is stored (an empty
+///   map included: an explicit "no targets");
+/// - **present without the key**: NULL is stored, clearing what an earlier
+///   freeze left, since the dotfile now sets none;
+/// - **absent** (no file in the folder, the folder gone, no path): nothing
+///   changes. There is no dotfile to capture, and [`resolve`] reads the
+///   frozen map exactly then, so a freeze point must not move what it
+///   answers. A unit whose dotfile was deleted keeps the targets it last
+///   set until a dotfile says otherwise.
+///
+/// A dotfile that is present but cannot be read or parsed is an error,
+/// naming the file (`dotfile::read_dotfile`), as it already is for every
+/// freeze point's own read of it. Names and counts are not checked here:
+/// the map is frozen as the dotfile says it, and [`resolve`] refuses a bad
+/// one by name, as it would the dotfile itself.
+pub fn freeze_copies_at(conn: &Connection, unit: &Unit) -> Result<bool> {
+    let Some(path) = unit.current_path.as_deref() else {
+        return Ok(false);
+    };
+    let dotfile_path = std::path::Path::new(path).join(crate::unit::dotfile::UNIT_DOTFILE);
+    if !dotfile_path.exists() {
+        return Ok(false);
+    }
+    let dotfile = crate::unit::dotfile::read_dotfile(&dotfile_path)?;
+    store_frozen_copies_at(
+        conn,
+        unit.id,
+        &unit.name,
+        unit.tenant_id,
+        unit.copies_at_frozen.as_deref(),
+        dotfile.copies_at.as_ref(),
+    )
+}
+
+/// Store `copies_at` (a present dotfile's own map, `None` when it sets none)
+/// as unit `unit_id`'s frozen dotfile layer, when it differs from `stored`
+/// (the row's current `copies_at_frozen`), and record the change as a
+/// `copies_at_frozen` event. Returns whether it wrote. The JSON object is
+/// `serde_json`'s of a sorted map, so an unchanged map is never rewritten.
+pub fn store_frozen_copies_at(
+    conn: &Connection,
+    unit_id: i64,
+    unit_name: &str,
+    tenant_id: i64,
+    stored: Option<&str>,
+    copies_at: Option<&BTreeMap<String, i64>>,
+) -> Result<bool> {
+    let text = copies_at.map(|m| serde_json::to_string(m).expect("a map of names to counts"));
+    if text.as_deref() == stored {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE units SET copies_at_frozen = ?1 WHERE id = ?2",
+        params![text, unit_id],
+    )?;
+    crate::db::events::log_event(
+        conn,
+        "unit",
+        unit_id,
+        Some(unit_name),
+        "copies_at_frozen",
+        Some("copies_at_frozen"),
+        stored,
+        text.as_deref(),
+        None,
+        Some(tenant_id),
+    )?;
+    Ok(true)
+}
+
 /// Which layer set a resolved `copies_at` map, for [`check_copies_at`].
 struct CopiesAtSource {
     layer: PolicyLayer,

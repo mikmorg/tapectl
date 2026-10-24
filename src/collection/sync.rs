@@ -407,6 +407,17 @@ fn adopt_dotfile(
     for tag in &df.tags {
         queries::add_tag_to_unit(conn, unit_id, tag)?;
     }
+    // #493 (ADR-0012 item 148): registration with the source present freezes
+    // the adopted dotfile's own `[policy.copies_at]`, from the copy of it
+    // already read, so a unit adopted and then lost keeps its targets.
+    crate::policy::store_frozen_copies_at(
+        conn,
+        unit_id,
+        &df.name,
+        tenant.id,
+        None,
+        df.copies_at.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -1081,5 +1092,82 @@ mod tests {
             .expect("unit must be adopted");
         let policy = crate::policy::resolve(&conn, &Config::default(), &unit).unwrap();
         assert!(policy.allow_spanning);
+    }
+
+    /// #493 (ADR-0012 item 148): adopting a dotfile is a freeze point. The
+    /// unit's row carries the dotfile's own `[policy.copies_at]` from the
+    /// moment it is registered, so when the source later goes (here its
+    /// folder is removed) the unit still resolves to those targets rather
+    /// than to its archive set's. A dotfile that sets none freezes nothing.
+    #[test]
+    fn adopting_a_dotfile_freezes_its_copies_at_for_when_the_source_is_gone() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        seed_archive_set(&conn, "bulk-media");
+        conn.execute_batch(
+            "INSERT INTO locations (name) VALUES ('home');
+             INSERT INTO locations (name) VALUES ('offsite');
+             UPDATE archive_sets SET copies_at = '{\"home\":3}' WHERE name = 'bulk-media';",
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let df = |name: &str, copies_at: Option<&[(&str, i64)]>| dotfile::UnitDotfile {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            name: format!("testlib/{name}"),
+            created: "2026-10-24T00:00:00Z".to_string(),
+            tags: Vec::new(),
+            tenant: "media".to_string(),
+            archive_set: Some("bulk-media".to_string()),
+            checksum_mode: None,
+            compression: None,
+            slice_size: None,
+            warehouse_copies: None,
+            allow_spanning: None,
+            copies_at: copies_at.map(|m| m.iter().map(|(n, c)| (n.to_string(), *c)).collect()),
+            exclude_patterns: Vec::new(),
+        };
+        for (name, copies_at) in [
+            ("alpha", Some(&[("home", 1), ("offsite", 1)][..])),
+            ("bravo", None),
+        ] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dotfile::write_dotfile(&dir.join(dotfile::UNIT_DOTFILE), &df(name, copies_at))
+                .unwrap();
+        }
+
+        let (_report, errors) = sync_collection(
+            &conn,
+            &paths_in(home.path()),
+            &test_lib(root.path(), "media"),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "sync errors: {errors:?}");
+
+        let unit = |name: &str| {
+            queries::get_unit_by_name(&conn, &format!("testlib/{name}"))
+                .unwrap()
+                .expect("adopted")
+        };
+        assert_eq!(
+            unit("alpha").copies_at_frozen.as_deref(),
+            Some(r#"{"home":1,"offsite":1}"#)
+        );
+        assert_eq!(unit("bravo").copies_at_frozen, None, "no key, nothing frozen");
+
+        std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
+        let resolved = crate::policy::resolve(&conn, &Config::default(), &unit("alpha"))
+            .unwrap()
+            .copies_at;
+        assert_eq!(
+            resolved,
+            [("home".to_string(), 1), ("offsite".to_string(), 1)]
+                .into_iter()
+                .collect(),
+            "the source is gone: the frozen dotfile layer, not the set's home = 3"
+        );
     }
 }
