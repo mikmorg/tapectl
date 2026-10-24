@@ -24152,6 +24152,42 @@ mod tests {
                 assert!(got.abs_diff(fill) <= 1, "the fill budget: {got} for {fill}");
             }
 
+            /// One slice of [`WIDE_ABC`], block-padded.
+            const WIDE_PADDED: u64 = 32 * SBS as u64;
+            /// [`ABC`]'s units, with slices wide enough that half of one is
+            /// more than another build can move the volume's own files.
+            const WIDE_ABC: &[(&str, &[usize])] = &[
+                ("a", &[32 * SBS - 100]),
+                ("b", &[32 * SBS - 100, 32 * SBS - 100]),
+                ("c", &[32 * SBS - 100]),
+            ];
+
+            /// [`fixed_bytes`] of a [`WIDE_ABC`] fixture, for the tests below
+            /// that place a budget against the write's own build.
+            ///
+            /// The write builds its own Layout, and its files that are not
+            /// slices are not this probe's to the byte (#491): the volume's
+            /// identity and time differ, and age puts a random "grease"
+            /// stanza in every envelope's header, so one encryption of the
+            /// same envelope is up to ~170 bytes longer than another. Each of
+            /// those files may land one block either side of the probe's, so
+            /// the drift is bounded by one block per file — the rehearsal's
+            /// margin ([`CapacityNumbers::margin`]), counted on the probe.
+            /// Every figure placed from this one is half a slice or more from
+            /// the edge it is judged against, so this asserts the drift is
+            /// less than half a slice.
+            fn wide_fixed(f: &Fixture, label: &str) -> u64 {
+                let (probe, _dir) = built(f, label, u64::MAX / 4, None);
+                let drift = capacity_numbers(&probe.layout).unwrap().margin;
+                assert!(
+                    drift < WIDE_PADDED / 2,
+                    "the fixture needs wider slices: half of one ({}) must exceed the {drift} \
+                     bytes another build may move the volume's own files",
+                    WIDE_PADDED / 2
+                );
+                probe.layout.fixed_on_tape_bytes()
+            }
+
             /// With the drive's `post_warning_bytes`, a plan reaches past the
             /// fill ceiling: `a` is committed under it, `b` and `c` are
             /// planned past it, and the write proceeds — this medium has the
@@ -24162,12 +24198,29 @@ mod tests {
             #[test]
             fn with_post_warning_bytes_a_write_plans_past_the_fill_ceiling_and_names_the_units_there(
             ) {
-                let mut f = fixture(ABC, &["SE-P"]);
-                let fixed = fixed_bytes(&f, "SE-P");
+                plans_past_the_ceiling_and_names_the_units(0);
+            }
+
+            /// #491's positive control: the same plan and write however
+            /// heavy the envelopes are ([`grow_envelopes`]).
+            #[test]
+            fn a_write_plans_past_the_fill_ceiling_however_heavy_the_envelopes() {
+                for bytes in [512, 2048, 4096, 4608] {
+                    plans_past_the_ceiling_and_names_the_units(bytes);
+                }
+            }
+
+            /// The body of the two tests above, with the envelopes grown by
+            /// a dar catalogue of `catalogue_bytes`.
+            fn plans_past_the_ceiling_and_names_the_units(catalogue_bytes: usize) {
+                let mut f = fixture(WIDE_ABC, &["SE-P"]);
+                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                let fixed = wide_fixed(&f, "SE-P");
                 // Under the ceiling: `a` and a slice to spare. The whole
-                // capacity: the plan and a slice to spare.
-                let fill = fixed + 2 * PADDED;
-                let capacity = fixed + 5 * PADDED;
+                // capacity: the plan and a slice to spare. Each is more than
+                // the drift ([`wide_fixed`]) from the edge it is judged by.
+                let fill = fixed + 2 * WIDE_PADDED;
+                let capacity = fixed + 5 * WIDE_PADDED;
                 budget(&mut f, "SE-P", capacity, fill, true);
 
                 let (layout, _dir) = built(&f, "SE-P", fill, Some(capacity));
@@ -24203,10 +24256,10 @@ mod tests {
             /// counted. Nothing is written and no session is planned.
             #[test]
             fn without_post_warning_bytes_the_same_write_is_refused_with_todays_text() {
-                let mut f = fixture(ABC, &["SE-N"]);
-                let fixed = fixed_bytes(&f, "SE-N");
-                let fill = fixed + 2 * PADDED;
-                let capacity = fixed + 5 * PADDED;
+                let mut f = fixture(WIDE_ABC, &["SE-N"]);
+                let fixed = wide_fixed(&f, "SE-N");
+                let fill = fixed + 2 * WIDE_PADDED;
+                let capacity = fixed + 5 * WIDE_PADDED;
                 budget(&mut f, "SE-N", capacity, fill, false);
 
                 let mut store = MemStore::new(SBS);
@@ -24248,10 +24301,28 @@ mod tests {
             /// `a` and `b` but not `c`, and the write refuses by the bound.
             #[test]
             fn a_plan_beyond_the_bound_is_refused_not_trimmed() {
-                let mut f = fixture(ABC, &["SE-B"]);
-                let fixed = fixed_bytes(&f, "SE-B");
-                let fill = fixed + 2 * PADDED;
-                let capacity = fixed + 3 * PADDED + PADDED / 2;
+                refused_by_the_bound_not_trimmed(0);
+            }
+
+            /// #491's positive control: the same refusal however heavy the
+            /// envelopes are ([`grow_envelopes`]).
+            #[test]
+            fn a_plan_beyond_the_bound_is_refused_however_heavy_the_envelopes() {
+                for bytes in [512, 2048, 4096, 4608] {
+                    refused_by_the_bound_not_trimmed(bytes);
+                }
+            }
+
+            /// The body of the two tests above, with the envelopes grown by
+            /// a dar catalogue of `catalogue_bytes`. The bound sits half a
+            /// slice past `b`'s end on the probe, more than the drift
+            /// ([`wide_fixed`]) either side.
+            fn refused_by_the_bound_not_trimmed(catalogue_bytes: usize) {
+                let mut f = fixture(WIDE_ABC, &["SE-B"]);
+                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                let fixed = wide_fixed(&f, "SE-B");
+                let fill = fixed + 2 * WIDE_PADDED;
+                let capacity = fixed + 3 * WIDE_PADDED + WIDE_PADDED / 2;
                 budget(&mut f, "SE-B", capacity, fill, true);
 
                 let mut store = MemStore::new(SBS);
@@ -24288,44 +24359,17 @@ mod tests {
                 }
             }
 
-            /// One slice of [`WIDE_ABC`], block-padded.
-            const WIDE_PADDED: u64 = 32 * SBS as u64;
-            /// [`ABC`]'s units, with slices wide enough that half of one is
-            /// more than another build can move the volume's own files.
-            const WIDE_ABC: &[(&str, &[usize])] = &[
-                ("a", &[32 * SBS - 100]),
-                ("b", &[32 * SBS - 100, 32 * SBS - 100]),
-                ("c", &[32 * SBS - 100]),
-            ];
-
             /// The body of the two tests above, with the envelopes grown by
-            /// a dar catalogue of `catalogue_bytes`.
-            ///
-            /// The write builds its own Layout, and its files that are not
-            /// slices are not the probe's to the byte (#491): the volume's
-            /// identity and time differ, and age puts a random "grease"
-            /// stanza in every envelope's header, so one encryption of the
-            /// same envelope is up to ~170 bytes longer than another. Each of
-            /// those files may land one block either side of the probe's, so
-            /// the drift is bounded by one block per file — the rehearsal's
-            /// margin ([`CapacityNumbers::margin`]), counted on the probe.
-            /// The fill budget sits half a slice past the probe's files, which
-            /// leaves the drift on both sides: the real files still fit under
-            /// the ceiling (else the refusal is the capacity gate's, not this
-            /// one) and `a` still does not (else it is committed and the write
-            /// goes ahead).
+            /// a dar catalogue of `catalogue_bytes`. The fill budget sits half
+            /// a slice past the probe's files ([`wide_fixed`]), which leaves
+            /// the drift on both sides: the real files still fit under the
+            /// ceiling (else the refusal is the capacity gate's, not this one)
+            /// and `a` still does not (else it is committed and the write goes
+            /// ahead).
             fn commits_no_unit_and_is_refused(catalogue_bytes: usize) {
                 let mut f = fixture(WIDE_ABC, &["SE-0"]);
                 grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
-                let (probe, _dir) = built(&f, "SE-0", u64::MAX / 4, None);
-                let fixed = probe.layout.fixed_on_tape_bytes();
-                let drift = capacity_numbers(&probe.layout).unwrap().margin;
-                assert!(
-                    drift < WIDE_PADDED / 2,
-                    "the fixture needs wider slices: half of one ({}) must exceed the {drift} \
-                     bytes another build may move the volume's own files",
-                    WIDE_PADDED / 2
-                );
+                let fixed = wide_fixed(&f, "SE-0");
                 let fill = fixed + WIDE_PADDED / 2;
                 let capacity = fixed + 6 * WIDE_PADDED;
                 budget(&mut f, "SE-0", capacity, fill, true);
