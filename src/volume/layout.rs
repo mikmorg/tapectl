@@ -2581,9 +2581,9 @@ fewer, and its seal marker says where it ended ("Where the tape ended").
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
-        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_LIST,
+        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
+        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
         AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
@@ -6029,7 +6029,6 @@ CHECK_INDEX=""
 CHECK_ANY_INDEX=0
 CHECK_BAD="$WORK/check.bad"
 CHECK_FAILED=0
-CHECK_UNNAMED=0
 CHECK_ADDED=0
 
 # True when $1 was said before in this run; else remembers it and is false.
@@ -6075,14 +6074,12 @@ index_for_unit() { # <unit> <version> <unit uuid>
 # into $1, against the index. With $2, a file of escaped paths, only those
 # (a fill). With --path, only what was asked for. The files that fail are left
 # in $CHECK_BAD, one per line and escaped as the index escapes a path; their
-# number is CHECK_FAILED, and CHECK_UNNAMED counts failures that sha256sum
-# reported and this script could not name.
+# number is CHECK_FAILED.
 file_check() { # <destination> [<file of escaped paths to check>]
   local destdir=$1 only=${2:-} p whole=0
-  local rows=0 files=0 checked=0 nspecial=0 nohash=0 named=0 unmatched=0 stray=0
+  local rows=0 files=0 checked=0 nohash=0
   : >"$CHECK_BAD"
   CHECK_FAILED=0
-  CHECK_UNNAMED=0
   if [ "$FILE_CHECK" = 0 ]; then
     said_before off || {
       info "File check skipped (--no-file-check): the restored files are checked by dar's own checksum only,"
@@ -6124,50 +6121,38 @@ file_check() { # <destination> [<file of escaped paths to check>]
     [ "$whole" = 1 ] || only="$WORK/check.only"
   fi
   if ! CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_ONLY="$only" CHK_SUMS="$WORK/check.sums" \
-    CHK_SPECIAL="$WORK/check.special" CHK_COUNTS="$WORK/check.counts" \
+    CHK_COUNTS="$WORK/check.counts" \
     awk '__AWK_INDEX_COMMON__ __AWK_FILE_CHECK_LIST__' "$CHECK_INDEX"; then
     echo "WARNING: this script could not make the list of files to check from the index in the envelope (it has no" >&2
     echo "         unit, version or path column, or the work directory $WORK is full; TMPDIR moves it):" >&2
     echo "         the restored files of '$(visible_text "$UNIT_NAME")' are not checked against a recorded sha256." >&2
     return 0
   fi
-  read -r rows files checked nspecial nohash <"$WORK/check.counts" || true
+  read -r rows files checked nohash <"$WORK/check.counts" || true
   if [ "$checked" -eq 0 ]; then
     if [ "$nohash" -gt 0 ]; then
       info "File check: the index records no sha256 for the $nohash file(s) of '$(visible_text "$UNIT_NAME")' version $UNIT_VER: not checked."
     fi
     return 0
   fi
-  # Names that sha256sum -c takes as they stand: one pass, quiet, so only a
-  # failure is printed (a mismatch, or a file it could not open).
-  if [ "$checked" -gt "$nspecial" ]; then
-    (cd "$destdir" && sha256sum -c --quiet) <"$WORK/check.sums" >"$WORK/check.out" 2>"$WORK/check.err" || true
-    CHK_REPORT="$WORK/check.out" CHK_BAD="$WORK/check.named" CHK_COUNTS="$WORK/check.named.counts" \
-      awk '__AWK_FILE_CHECK_FAILED__' "$WORK/check.sums"
-    read -r named unmatched stray <"$WORK/check.named.counts" || true
-    cat "$WORK/check.named" >>"$CHECK_BAD"
-    if [ "$unmatched" -gt 0 ] || [ "$stray" -gt 0 ]; then
-      CHECK_UNNAMED=$((unmatched + stray))
-      echo "WARNING: sha256sum's report could not be matched to the files for $CHECK_UNNAMED line(s):" >&2
-      head -n 5 "$WORK/check.out" "$WORK/check.err" 2>/dev/null | sed 's/^/         /' >&2 || true
-    fi
-  fi
-  # A name with a backslash, a newline or a carriage return, one file at a
-  # time (sha256sum prints and reads such a name in an escaped form that
-  # differs between versions; hashing the file from standard input has no name
-  # to escape).
-  if [ "$nspecial" -gt 0 ]; then
-    local want esc got
-    while IFS=$'\t' read -r want esc; do
-      unesc_line "$esc"
-      got=$({ sha256sum <"$destdir/$UNESC"; } 2>/dev/null) || got=""
+  # Each file is hashed on its own, read from standard input, so sha256sum
+  # prints a hash and no name: nothing it prints is matched back to a file (a
+  # sha256sum may quote or escape a name in what it prints, and versions
+  # differ). A path that is not a regular file here, or cannot be read, has
+  # no hash and is listed. Each restored file is read once.
+  local want esc got
+  while IFS=$'\t' read -r want esc; do
+    unesc_line "$esc"
+    got=""
+    if [ -f "$destdir/$UNESC" ]; then
+      got=$(sha256sum 2>/dev/null <"$destdir/$UNESC") || got=""
       got=${got%% *}
-      [ "$got" = "$want" ] || printf '%s\n' "$esc" >>"$CHECK_BAD"
-    done <"$WORK/check.special"
-  fi
+    fi
+    [ "$got" = "$want" ] || printf '%s\n' "$esc" >>"$CHECK_BAD"
+  done <"$WORK/check.sums"
   CHECK_FAILED=$(wc -l <"$CHECK_BAD")
   local what="'$(visible_text "$UNIT_NAME")' version $UNIT_VER"
-  if [ "$CHECK_FAILED" -eq 0 ] && [ "$CHECK_UNNAMED" -eq 0 ]; then
+  if [ "$CHECK_FAILED" -eq 0 ]; then
     if [ "$nohash" -gt 0 ]; then
       info "File check: $checked restored file(s) of $what match the sha256 recorded in the index ($nohash more not checked: no sha256 recorded)"
     else
@@ -6249,9 +6234,6 @@ finish_damage() { # <destination> <slices not available, or empty>
   CHECK_ADDED=$((all_n - dar_n))
   if [ "$all_n" -gt 0 ]; then
     record_damage "$destdir" "$WORK/damaged.all" "$gone"
-  elif [ "$CHECK_UNNAMED" -gt 0 ]; then
-    UNIT_OK=0
-    INCOMPLETE+=("Unit '$UNIT_NAME' (version $UNIT_VER): $CHECK_UNNAMED file(s) failed the sha256 check and this script could not name them (see the WARNING above); no list is written.")
   else
     clear_stale_list "$destdir"
   fi
@@ -6831,9 +6813,7 @@ fill_end() { # <list> <root>
   # (ADR-0012 item 103): a file that fails stays in the list.
   awk 'FILENAME == ARGV[1] { s[$0] = 1; next } !($0 in s)' "$WORK/fill.still" "$WORK/fill.wanted" >"$WORK/fill.restored"
   file_check "$root" "$WORK/fill.restored"
-  if [ "$CHECK_UNNAMED" -gt 0 ] && [ "$CHECK_FAILED" -eq 0 ]; then
-    cp "$WORK/fill.wanted" "$WORK/fill.still"
-  elif [ "$CHECK_FAILED" -gt 0 ]; then
+  if [ "$CHECK_FAILED" -gt 0 ]; then
     awk '!seen[$0]++' "$WORK/fill.still" "$CHECK_BAD" >"$WORK/fill.still.new"
     mv "$WORK/fill.still.new" "$WORK/fill.still"
   fi
@@ -7530,7 +7510,6 @@ esac
         .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
         .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
         .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
-        .replace("__AWK_FILE_CHECK_FAILED__", AWK_FILE_CHECK_FAILED)
         .replace("__AWK_CUT_VERSIONS__", AWK_CUT_VERSIONS)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
@@ -8390,9 +8369,9 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
-        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_LIST,
+        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
+        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
         AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
@@ -10915,7 +10894,6 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
-            ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
             ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(
@@ -11213,15 +11191,14 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// ADR-0012 item 103: the three fragments of the file check, on text as the
+    /// ADR-0012 item 103: the two fragments of the file check, on text as the
     /// index writes it (names holding a TAB, a newline and a backslash), under
-    /// every awk on the host. Which version an envelope lists; what a version
-    /// asks to be checked; and which names `sha256sum -c --quiet` named, read
-    /// from its REAL output for a changed file, a missing one and a name that
-    /// looks like the checker's own words.
+    /// every awk on the host. Which version an envelope lists, and what a
+    /// version asks to be checked: every file with its hash and its path in the
+    /// index's escaped form, which RESTORE.sh decodes to hash the file from
+    /// standard input (no name is read back from `sha256sum`).
     #[test]
-    fn the_file_check_fragments_read_the_index_and_the_checkers_report() {
-        use std::process::{Command, Stdio};
+    fn the_file_check_fragments_read_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let hash = |n: u8| format!("{n:02x}").repeat(32);
@@ -11298,27 +11275,22 @@ sha256_encrypted = \"bbb\"
                 ("CHK_VER", "1".into()),
                 ("CHK_ONLY", only.into()),
                 ("CHK_SUMS", outs("sums").display().to_string()),
-                ("CHK_SPECIAL", outs("special").display().to_string()),
                 ("CHK_COUNTS", outs("counts").display().to_string()),
             ]
         };
         let (code, _) = run_awk(true, AWK_FILE_CHECK_LIST, &paths, &env(""));
         assert_eq!(code, 0);
-        // rows of the version; regular files; checked; of those special; no hash
+        // rows of the version; regular files; checked; no hash
         assert_eq!(
             std::fs::read_to_string(outs("counts")).unwrap().trim(),
-            "10 8 4 2 4",
+            "10 8 4 4",
             "badhash, nohash, ../escape and /absolute are never hashed"
         );
         assert_eq!(
             std::fs::read_to_string(outs("sums")).unwrap(),
-            format!("{h1}  sub/a\tb\n{h2}  plain\n"),
-            "a TAB stays in the name; no backslash or newline reaches this list"
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("special")).unwrap(),
-            format!("{h2}\tc\\\\d.txt\n{h1}\tl\\nf.txt\n"),
-            "a backslash or a newline is kept in its escaped form"
+            format!("{h1}\tsub/a\\tb\n{h2}\tc\\\\d.txt\n{h1}\tl\\nf.txt\n{h2}\tplain\n"),
+            "every file, in index order, its path kept in its escaped form: a TAB, a backslash \
+             and a newline never reach this list raw"
         );
 
         // Only some paths: a name, and a folder with what is under it.
@@ -11332,9 +11304,8 @@ sha256_encrypted = \"bbb\"
         );
         assert_eq!(
             std::fs::read_to_string(outs("sums")).unwrap(),
-            format!("{h1}  sub/a\tb\n{h2}  plain\n")
+            format!("{h1}\tsub/a\\tb\n{h2}\tplain\n")
         );
-        assert_eq!(std::fs::read_to_string(outs("special")).unwrap(), "");
         std::fs::write(&only, "pla\nsu\n").unwrap();
         run_awk(
             true,
@@ -11358,108 +11329,13 @@ sha256_encrypted = \"bbb\"
         run_awk(true, AWK_FILE_CHECK_LIST, &old, &env(""));
         assert_eq!(
             std::fs::read_to_string(outs("counts")).unwrap().trim(),
-            "2 1 0 0 1"
+            "2 1 0 1"
         );
         assert_eq!(std::fs::read_to_string(outs("sums")).unwrap(), "");
         assert_eq!(
             run_awk(true, AWK_FILE_CHECK_LIST, &bad, &env("")).0,
             2,
             "no path column"
-        );
-
-        // The checker's report, from the real sha256sum: a changed file, two
-        // missing ones, and a file whose name ends in the checker's own words.
-        let tree = d.join("tree");
-        std::fs::create_dir_all(tree.join("sub")).unwrap();
-        let sha = |bytes: &[u8]| {
-            let mut c = Command::new("sha256sum")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            use std::io::Write;
-            c.stdin.take().unwrap().write_all(bytes).unwrap();
-            let o = c.wait_with_output().unwrap();
-            String::from_utf8_lossy(&o.stdout)[..64].to_string()
-        };
-        let files: [(&str, &[u8], &[u8]); 5] = [
-            ("a b", b"one", b"one"),
-            ("ok", b"five", b"five"),
-            ("sub/f", b"four", b"WRONG"),
-            ("tab\tname", b"two", b"two"),
-            ("x: FAILED", b"three", b"three"),
-        ];
-        let mut list = String::new();
-        for (name, on_disk, recorded) in files {
-            std::fs::write(tree.join(name), on_disk).unwrap();
-            list.push_str(&format!("{}  {name}\n", sha(recorded)));
-        }
-        list.push_str(&format!("{}  gone\n{}  z-last\n", hash(1), hash(2)));
-        std::fs::write(outs("list"), &list).unwrap();
-        let out = Command::new("sha256sum")
-            .args(["-c", "--quiet"])
-            .current_dir(&tree)
-            .stdin(std::fs::File::open(outs("list")).unwrap())
-            .output()
-            .unwrap();
-        std::fs::write(outs("report"), &out.stdout).unwrap();
-        let fenv = |report: &std::path::Path| -> Vec<(&'static str, String)> {
-            vec![
-                ("CHK_REPORT", report.display().to_string()),
-                ("CHK_BAD", outs("named").display().to_string()),
-                ("CHK_COUNTS", outs("fcounts").display().to_string()),
-            ]
-        };
-        run_awk(
-            false,
-            AWK_FILE_CHECK_FAILED,
-            &outs("list"),
-            &fenv(&outs("report")),
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("named")).unwrap(),
-            "sub/f\ngone\nz-last\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
-            "3 0 0"
-        );
-        // A failure the list does not hold cannot be named, and is counted.
-        std::fs::write(
-            outs("short"),
-            list.replace(&format!("{}  gone\n", hash(1)), ""),
-        )
-        .unwrap();
-        run_awk(
-            false,
-            AWK_FILE_CHECK_FAILED,
-            &outs("short"),
-            &fenv(&outs("report")),
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("named")).unwrap(),
-            "sub/f\nz-last\n",
-            "a failure the list lacks does not hide the ones after it"
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
-            "2 1 0"
-        );
-        std::fs::write(
-            outs("noise"),
-            "sha256sum: WARNING: 1 computed checksum did NOT match\n",
-        )
-        .unwrap();
-        run_awk(
-            false,
-            AWK_FILE_CHECK_FAILED,
-            &outs("list"),
-            &fenv(&outs("noise")),
-        );
-        assert_eq!(
-            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
-            "0 0 1",
-            "a line that is no failure is counted, not matched"
         );
     }
 
@@ -11713,7 +11589,6 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
-            ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
             ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");

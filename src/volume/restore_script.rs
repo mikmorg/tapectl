@@ -912,19 +912,18 @@ pub(crate) const AWK_FILE_CHECK_LISTED: &str = r##"
     }
   "##;
 
-/// The regular files of one version of a unit, from its `index/paths.tsv`, as
-/// the list `sha256sum -c` takes (the file check, ADR-0012 item 103). `CHK_UNIT`
+/// The regular files of one version of a unit, from its `index/paths.tsv`, with
+/// the sha256 each must have (the file check, ADR-0012 item 103). `CHK_UNIT`
 /// and `CHK_VER` name the version. `CHK_ONLY` is empty (every file) or a file
 /// of escaped paths: only a path equal to one of them, or under one as a
 /// directory, is listed (`--path`, and a fill).
 ///
 /// Writes, to the files named in the environment: `CHK_SUMS`, one line
-/// `HASH  NAME` for each file with a recorded hash whose name `sha256sum -c`
-/// takes as it stands; `CHK_SPECIAL`, `HASH TAB escaped path` for each whose
-/// name holds a backslash, a newline or a carriage return (these are hashed one
-/// at a time, by the caller); and `CHK_COUNTS`, the five figures `ROWS FILES
-/// CHECKED SPECIAL NOHASH`: rows of the version, regular files in scope,
-/// files to check, those among them in `CHK_SPECIAL`, and files with no usable
+/// `HASH TAB escaped path` for each file with a recorded hash, the path in the
+/// escaped form the index gives it (the caller hashes each file on its own,
+/// from standard input, so no name is ever read back from `sha256sum`); and
+/// `CHK_COUNTS`, the four figures `ROWS FILES CHECKED NOHASH`: rows of the
+/// version, regular files in scope, files to check, and files with no usable
 /// hash recorded (or a path that leaves the unit, which is never hashed). A
 /// column that is absent, as in an index written before the hash was added,
 /// reads as no hash. Exit status 2 when `unit`, `version` or `path` is missing.
@@ -948,7 +947,6 @@ pub(crate) const AWK_FILE_CHECK_LIST: &str = r##"
       unit = ENVIRON["CHK_UNIT"]
       ver = ENVIRON["CHK_VER"] + 0
       sums = ENVIRON["CHK_SUMS"]
-      special = ENVIRON["CHK_SPECIAL"]
       counts = ENVIRON["CHK_COUNTS"]
       only = ENVIRON["CHK_ONLY"]
       if (only != "") {
@@ -956,7 +954,6 @@ pub(crate) const AWK_FILE_CHECK_LIST: &str = r##"
         close(only)
       }
       printf "" > sums
-      printf "" > special
     }
     NR == 1 {
       header($0, h)
@@ -976,70 +973,12 @@ pub(crate) const AWK_FILE_CHECK_LIST: &str = r##"
       hash = val(f, h, "sha256")
       if (length(hash) != 64 || hash !~ /^[0-9a-f]+$/ || leaves(p)) { nohash++; next }
       checked++
-      if (index(p, "\\") > 0 || index(p, "\n") > 0 || index(p, "\r") > 0) {
-        nspecial++
-        print hash "\t" raw > special
-      } else {
-        print hash "  " p > sums
-      }
+      print hash "\t" raw > sums
     }
     END {
       if (bad) exit 2
-      print rows + 0, files + 0, checked + 0, nspecial + 0, nohash + 0 > counts
+      print rows + 0, files + 0, checked + 0, nohash + 0 > counts
       close(counts)
       close(sums)
-      close(special)
-    }
-  "##;
-
-/// Which files `sha256sum -c --quiet` failed, named as the index names them.
-/// The program reads the list that was checked (`CHK_SUMS`, lines of `HASH
-/// NAME`, as its input) and the checker's report (the file `CHK_REPORT`: the
-/// failures only, each `NAME: FAILED` or `NAME: FAILED open or read`). It
-/// prints each failed file of the list, escaped as the index escapes a path,
-/// to the file `CHK_BAD` in the list's order, and `NAMED UNMATCHED STRAY` to
-/// `CHK_COUNTS`: failures found in the list, failures whose name was not in
-/// it, and report lines that were not a failure at all. Only the failures are
-/// held in memory.
-pub(crate) const AWK_FILE_CHECK_FAILED: &str = r##"
-    function esc(s,    out, i, n, c) {
-      out = ""
-      n = length(s)
-      for (i = 1; i <= n; i++) {
-        c = substr(s, i, 1)
-        if (c == "\\") out = out "\\\\"
-        else if (c == "\t") out = out "\\t"
-        else if (c == "\n") out = out "\\n"
-        else if (c == "\r") out = out "\\r"
-        else out = out c
-      }
-      return out
-    }
-    function ends(s, t) {
-      return length(s) > length(t) && substr(s, length(s) - length(t) + 1) == t
-    }
-    BEGIN {
-      report = ENVIRON["CHK_REPORT"]
-      bad = ENVIRON["CHK_BAD"]
-      counts = ENVIRON["CHK_COUNTS"]
-      open_fail = ": FAILED open or read"
-      fail = ": FAILED"
-      while ((getline line < report) > 0) {
-        if (ends(line, open_fail)) name = substr(line, 1, length(line) - length(open_fail))
-        else if (ends(line, fail)) name = substr(line, 1, length(line) - length(fail))
-        else { stray++; continue }
-        if (!(name in failed)) { failed[name] = 1; nfail++ }
-      }
-      close(report)
-      printf "" > bad
-    }
-    {
-      name = substr($0, 67)
-      if (name in failed) { print esc(name) > bad; named++; delete failed[name] }
-    }
-    END {
-      print named + 0, nfail - named, stray + 0 > counts
-      close(counts)
-      close(bad)
     }
   "##;
