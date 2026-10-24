@@ -427,7 +427,11 @@ pub enum DotfileLocationRename {
 /// warned: `location rename` names every file it could not rewrite. A file
 /// whose text does not contain `old` at all is not parsed, so an unrelated
 /// malformed dotfile is not reported.
-pub fn rename_location_in_dotfile(current_path: &str, old: &str, new: &str) -> DotfileLocationRename {
+pub fn rename_location_in_dotfile(
+    current_path: &str,
+    old: &str,
+    new: &str,
+) -> DotfileLocationRename {
     let dotfile_path = Path::new(current_path).join(dotfile::UNIT_DOTFILE);
     match std::fs::read_to_string(&dotfile_path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

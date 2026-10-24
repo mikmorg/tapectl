@@ -1241,7 +1241,11 @@ mod tests {
         };
         assert_eq!(frozen("one").as_deref(), Some(r#"{"glacier":1,"house":1}"#));
         assert_eq!(frozen("two").as_deref(), Some(r#"{"glacier":2}"#));
-        assert_eq!(frozen("gone").as_deref(), Some(r#"{"house":3}"#), "no source needed");
+        assert_eq!(
+            frozen("gone").as_deref(),
+            Some(r#"{"house":3}"#),
+            "no source needed"
+        );
 
         let one_after =
             std::fs::read_to_string(std::path::Path::new(&one).join(".tapectl-unit.toml")).unwrap();
@@ -1249,13 +1253,24 @@ mod tests {
             one_after.contains("[policy.copies_at]\nglacier = 1\nhouse = 1\n"),
             "{one_after}"
         );
-        assert!(one_after.contains("slice_size = \"2G\""), "other keys kept: {one_after}");
+        assert!(
+            one_after.contains("slice_size = \"2G\""),
+            "other keys kept: {one_after}"
+        );
         assert!(!one_after.contains("home"), "{one_after}");
         let read = |dir: &str| {
             std::fs::read_to_string(std::path::Path::new(dir).join(".tapectl-unit.toml")).unwrap()
         };
-        assert_eq!(read(&two), two_text, "a dotfile that does not name it is not rewritten");
-        assert_eq!(read(&broken), broken_text, "a broken dotfile is left as it is");
+        assert_eq!(
+            read(&two),
+            two_text,
+            "a dotfile that does not name it is not rewritten"
+        );
+        assert_eq!(
+            read(&broken),
+            broken_text,
+            "a broken dotfile is left as it is"
+        );
         match crate::unit::rename_location_in_dotfile(&broken, "home", "house") {
             crate::unit::DotfileLocationRename::Failed(why) => {
                 assert!(why.contains("could not be parsed"), "{why}")
@@ -1276,14 +1291,28 @@ mod tests {
         assert_eq!(
             events,
             [
-                ("unit".to_string(), "copies_at_frozen".to_string(), "gone".to_string()),
-                ("archive_set".to_string(), "copies_at".to_string(), "media".to_string()),
-                ("unit".to_string(), "copies_at_frozen".to_string(), "one".to_string()),
+                (
+                    "unit".to_string(),
+                    "copies_at_frozen".to_string(),
+                    "gone".to_string()
+                ),
+                (
+                    "archive_set".to_string(),
+                    "copies_at".to_string(),
+                    "media".to_string()
+                ),
+                (
+                    "unit".to_string(),
+                    "copies_at_frozen".to_string(),
+                    "one".to_string()
+                ),
             ]
         );
 
         // The renamed unit resolves: every name it now carries is registered.
-        let unit = crate::db::queries::get_unit_by_name(&conn, "one").unwrap().unwrap();
+        let unit = crate::db::queries::get_unit_by_name(&conn, "one")
+            .unwrap()
+            .unwrap();
         let resolved =
             crate::policy::resolve(&conn, &crate::config::Config::default(), &unit).unwrap();
         assert_eq!(
