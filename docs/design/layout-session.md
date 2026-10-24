@@ -670,11 +670,15 @@ with the owed run K+1..N. The rows are `range`, `completed` and `range`, and
 every slice is on two volumes.
 
 **A spannable set larger than one tape** (item 94) may span, and does not
-wait behind whole units. It starts as early on its first tape as it needs to
-touch the fewest tapes, by an estimate of where the early warning comes taken
-at the cartridge's nominal capacity. The whole units it, or an owed run, leaves
-no room for are deferred to a later tape, not refused, so they fill in after
-its tail on its last tape and tape fill is unchanged. Item 93's whole-tape copy
+wait behind whole units. It starts right after the owed runs on its first tape
+(item 147; from 1.7.1, where 1.7.0 started it as late as it could while touching
+the fewest tapes). The whole units it displaces are deferred on that tape, not
+refused, and are written after its tail on its last tape, within item 113's
+bound (item 123). Tape fill is unchanged, and the last tape keeps slack if the
+early warning comes before the nominal capacity the plan estimates it at. In a
+collection batch those units still ride the batch, written on the span's last
+tape when they fit after its tail. A whole unit an owed run leaves no room for
+is deferred the same way. Item 93's whole-tape copy
 cannot exist for such a set; its copies combine slice by slice. A spannable set
 that fits on one tape keeps item 83's place (item 95).
 
