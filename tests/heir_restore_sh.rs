@@ -8353,9 +8353,10 @@ fn manual_read_slice(
     assert!(ok, "slice {}: {text}", sl.number);
 }
 
-/// The files (not directories) whose data touches slice `lost`, from the
-/// guide's `dar -l CATALOGUE -T slice -N -Q`.
-fn files_touching_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
+/// What dar names with `PATH not restored (user choice)` when slice `lost` is
+/// left out, from the guide's `dar -l CATALOGUE -T slice -N -Q`
+/// (`named_in_listing`).
+fn named_without_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
     let o = Command::new("dar")
         .args([
             "-l",
@@ -8369,9 +8370,21 @@ fn files_touching_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
         .output()
         .expect("dar -l");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let text = String::from_utf8_lossy(&o.stdout).to_string();
-    let mut out = Vec::new();
-    for line in text.lines() {
+    named_in_listing(&String::from_utf8_lossy(&o.stdout), lost)
+}
+
+/// The entries of a `dar -l -T slice` listing that dar names when slice
+/// `lost` is left out: each file whose data touches it, and each directory
+/// whose own entry lies in it. dar skips everything under such a directory
+/// ("No file in this directory will be restored") and names nothing under
+/// it, so the entries under it are not named (File 1, "If a slice or a file
+/// is damaged"). Which entries share a slice follows the order the source
+/// directory listed its entries in when dar read it, which differs from one
+/// file system to another (ext4 hashes the names), so either case can meet
+/// a given unit. Sorted.
+fn named_in_listing(listing: &str, lost: i64) -> Vec<String> {
+    let mut touching: Vec<(String, bool)> = Vec::new();
+    for line in listing.lines() {
         let Some((range, rest)) = line.split_once('\t') else {
             continue;
         };
@@ -8382,17 +8395,66 @@ fn files_touching_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
         let (Ok(lo), Ok(hi)) = (lo, hi) else { continue };
         // "[InRef][ ]  [-L-][-----][ ] -rw-rw-r-- sub/file"
         let mut cols = rest.split_whitespace();
-        let perm = cols.by_ref().find(|c| c.len() == 10 && c.contains('r'));
-        if perm.is_none_or(|p| !p.starts_with('-')) {
+        let Some(perm) = cols.by_ref().find(|c| c.len() == 10 && c.contains('r')) else {
+            continue;
+        };
+        let dir = perm.starts_with('d');
+        if !dir && !perm.starts_with('-') {
             continue;
         }
         let name: Vec<&str> = cols.collect();
         if (lo..=hi).contains(&lost) {
-            out.push(name.join(" "));
+            touching.push((name.join(" "), dir));
         }
     }
+    let skipped: Vec<String> = touching
+        .iter()
+        .filter(|(_, dir)| *dir)
+        .map(|(n, _)| format!("{n}/"))
+        .collect();
+    let mut out: Vec<String> = touching
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !skipped.iter().any(|d| n.starts_with(d.as_str())))
+        .collect();
     out.sort();
     out
+}
+
+/// `named_in_listing` on a listing dar 2.7.13 printed (an archive of ten
+/// 60 kB files and `sub/` with two, in 100 KiB slices) in which `sub`'s own
+/// entry lies in slice 2. With slice 2 left out that dar named f4.bin, f7.bin
+/// and sub, said "No file in this directory will be restored.", named nothing
+/// under sub and left sub an empty directory. A positive control for the
+/// directory case, which the templates' layouts on a given file system may
+/// never meet (on this VM's they do not; on the Ubuntu 26.04 runner's they
+/// do).
+#[test]
+fn a_directory_whose_entry_is_in_the_lost_slice_is_named_instead_of_its_files() {
+    let listing = "Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane\n\
+        --------+--------------------------------+----------+-----------------------------\n\
+        1\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f5.bin\n\
+        1-2\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f4.bin\n\
+        2\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f7.bin\n\
+        2\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x sub\n\
+        2\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- sub/note.txt\n\
+        2-3\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- sub/big.bin\n\
+        3\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f3.bin\n\
+        3-4\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f1.bin\n\
+        4\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f8.bin\n\
+        4-5\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f6.bin\n\
+        5-6\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f0.bin\n\
+        6\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f9.bin\n\
+        6-7\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- f2.bin\n\
+        -----\n\
+        All displayed files have their data in slice range [1-7]\n\
+        -----\n";
+    assert_eq!(named_in_listing(listing, 2), ["f4.bin", "f7.bin", "sub"]);
+    assert_eq!(
+        named_in_listing(listing, 3),
+        ["f1.bin", "f3.bin", "sub/big.bin"],
+        "a directory whose entry is elsewhere is not named; its files are"
+    );
 }
 
 /// S5: with no other copy of a slice, the guide's by-hand commands restore
@@ -8525,12 +8587,15 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
         .filter_map(|p| p.strip_prefix(&format!("{dest}/")))
         .map(str::to_string)
         .collect();
-    let mut want = files_touching_slice(&dir, &stem, lost);
+    let mut want = named_without_slice(&dir, &stem, lost);
     let mut got = named.clone();
     want.sort();
     got.sort();
     assert!(!want.is_empty(), "a positive control: files touch slice 3");
-    assert_eq!(got, want, "dar names the files whose slices are gone");
+    assert_eq!(
+        got, want,
+        "dar names the files whose slices are gone, or the directory they are in when its entry is"
+    );
     let log = std::fs::read_to_string(dir.join("dar.log")).unwrap();
     let ignored: usize = log
         .lines()
