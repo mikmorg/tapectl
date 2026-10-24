@@ -300,7 +300,10 @@ it: ring's SHA-256 behind `pass_count::Sha256`, the HP page-0x34 repositions fig
 `write_feed_ratio` events, `TAPECTL_PIPELINE_TRACE=1`, and the `research` cargo feature's knobs.
 The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) passed all seven steps
 on 2026-10-22, reading back the slice past the warning and the short seal on the real drive
-(`docs/runs/2026-10-21-1.6.0-acceptance.md`); 1.6.0 is tagged `v1.6.0` on `c9c5877`.
+(`docs/runs/2026-10-21-1.6.0-acceptance.md`); 1.6.0 is tagged `v1.6.0` on `c9c5877`. #488's
+drive phase ran on 2026-10-22 with the research build (`docs/runs/2026-10-22-488-drive-phase.md`):
+no load reproduced #426, ring is the one lever the figures support, and the excess that did
+appear came with the drive's own page 0x02 corrections while the feed was steady.
 
 **2026-10-23: 1.7.0, spanning** (`docs/releases/1.7.0.md`; ADR-0012 items 121-144 on the design of
 items 82-95, #478). A unit whose policy sets `allow_spanning` (dotfile > archive set >

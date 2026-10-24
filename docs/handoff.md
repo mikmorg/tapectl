@@ -415,8 +415,9 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
 - **Before it starts:** stop the drive-poll timer, keep vm-desk1 quiet (the coordinator tells
   homorg and lcsas-4c), and start it inside tmux. `--print-plan` prints your part without
   touching anything.
-- **#488's drive phase** (about 2 h, research build) is approved for the same day, in a separate
-  load (item 117). It is `scripts/shaping-drive-phase.sh` (`--print-plan` gives your part), run
+- **#488's drive phase** ran on 2026-10-22 and passed all 14 steps
+  (`docs/runs/2026-10-22-488-drive-phase.md`); its shaping decisions are with the CTO. It was
+  approved for the same day, in a separate load (item 117). It is `scripts/shaping-drive-phase.sh` (`--print-plan` gives your part), run
   with a research binary: a static musl release build with `--features research`, for measuring
   only (item 117, the write-shaping note's §12 item 2, #426's precedent). The coordinator builds
   it and copies it to home2 with its sha256, never into `PATH` or a production home. It runs

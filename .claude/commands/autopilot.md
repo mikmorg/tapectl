@@ -31,9 +31,9 @@ the normative design set named in the Policy block below.
 
   **Waiting on the operator:**
   - the drive-poll timer restart;
-  - the cartridge cleanup: from `~/.cache/tapectl/ssa-home-20261021`, `volume retire SSA-0002`,
-    then `cartridge erase`;
-  - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated).
+  - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated);
+  - optionally, deleting the drive phase's 40 GB under `/srv/google_copy/tapectl-shaping` and its
+    throwaway home (the run record lists them).
 
   **Landed after the tag:** #489 and #490 (b2f1ea6, 71bdaaf, the JSON shape pin cfb87ee; both
   closed), and p488 (5ecccc8..2643b2c) after chain42 went green on its tip:
@@ -42,20 +42,13 @@ the normative design set named in the Policy block below.
 
   Run `cargo test --no-fail-fast` on any landing: cargo stops at the first failing test binary.
 
-  **#488's drive phase is READY; the operator runs it.**
-  - The release research binary is on home2 at `~/tapectl-1.6.0-research-b660a26/` (sha256
-    5bf51d0a..., SHA256SUMS beside it).
-  - The mhvtl rehearsal passed every run, the no-L* branch and the restore leg.
-  - R5w's write under its own load cannot pass on vm-desk1: mhvtl's tape file is on /scratch,
-    the disk that load writes. On home2 the tape is real.
-  - The L1/L2 loads are reviewed only, because vm-desk1 cannot ssh to itself; home2 to vm-desk1
-    works.
-  - Before it runs, the operator cleans SSA-0002 with the acceptance binary (mark-reclaimable,
-    retire, erase) and stops the drive-poll timer.
-  - While it runs, vm-desk1 does no cargo and homorg and lcsas-4c are told: its L1/L2 loads run
-    there on purpose.
-  - Afterwards: read results.tsv and restore.tsv, decide the shaping per the note's §10, and
-    record the run.
+  **#488's drive phase RAN 2026-10-22, 14/14** (`docs/runs/2026-10-22-488-drive-phase.md`, 18afc8c;
+  #488 comment 6356349155). No load reproduced #426 (max 1.0943); the stop rule's fallback ran.
+  The excess came with page 0x02 correction jumps while the feed was steady and 0x34 read 0
+  repositions; ring is the supported lever; the pace helped nothing; release restore reads at
+  46.5 MiB/s. **#488 waits on the CTO**: §12 items 5-7, the warning's text (it blames the host),
+  R0 extended to page 0x02, and whether more drive time is wanted. Do not build shaping before
+  they rule.
 
   **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
   the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
@@ -66,6 +59,22 @@ the normative design set named in the Policy block below.
   (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
+
+  **#478 waves 1-3 are on `p478-span`** (`/scratch/tapectl-p478`, pushed to origin at 71e69dd,
+  2026-10-23): T0, A, D; B, C, L1-L3 (RESTORE.sh across cartridges, re-pinned three times under
+  item 135, now 39d2535e); E1 (the plan order: `CapacityBudget::place`), E2 (confirm's
+  completed/range/cut split, item 128's promotion, the seal's `requires` from File 0), G
+  (per-slice staging release). Gate GREEN: golden 6/6, fmt, clippy ×2, 4205/0/24, and the whole
+  tape chain (chain44: mhvtl gate 52/52, fr414 17/0, lifecycle `--all` 487/472/0/15, erase-proof,
+  plaintext scan, short-seal acceptance). Wave 4 is running: E3 (`volume write` spans), H1
+  (tapectl's restore across cartridges), H2 (rebuild and adoption of a range tape). The plan, the
+  coordinator's forks (X1-X34, X12 amended 2026-10-23) and every worker's report and routing are in
+  the session scratchpad `p478/plan.md` §§12-14. The branch does not land on master before wave 5.
+  For the CTO's 1.7.0 notes: under `--swap-tapes` a seal-less second cartridge (an aborted 1.5.0
+  write) now gives nothing (R8, item 132); `allow_spanning` defers, never refuses, whole units a
+  queued set pushes past the ceiling (X12 as amended).
+  Since 2026-10-23 mhvtl's `/dev/nstN` also moves when needrestart restarts it (now blocked by
+  `/etc/needrestart/conf.d/mhvtl.conf`): chain scripts resolve by-id at start.
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
