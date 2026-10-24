@@ -68,8 +68,10 @@ jobs:
         # perf suite only (house build rule). No $HOME dependence and no tape
         # devices: the mhvtl e2e and perf suites stay gated out (see the
         # header). dar is the one external binary this suite genuinely needs,
-        # installed above.
-        run: cargo test --locked
+        # installed above. --no-fail-fast: cargo otherwise stops at the first
+        # failing test binary, so a red lib binary hid every binary after it
+        # (2026-10-21 to 10-24, when the runner moved to Ubuntu 26).
+        run: cargo test --locked --no-fail-fast
 
   man-drift:
     name: Man pages in sync
