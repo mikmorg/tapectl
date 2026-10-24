@@ -60,21 +60,24 @@ the normative design set named in the Policy block below.
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
 
-  **#478 waves 1-3 are on `p478-span`** (`/scratch/tapectl-p478`, pushed to origin at 71e69dd,
-  2026-10-23): T0, A, D; B, C, L1-L3 (RESTORE.sh across cartridges, re-pinned three times under
-  item 135, now 39d2535e); E1 (the plan order: `CapacityBudget::place`), E2 (confirm's
-  completed/range/cut split, item 128's promotion, the seal's `requires` from File 0), G
-  (per-slice staging release). Gate GREEN: golden 6/6, fmt, clippy ×2, 4205/0/24, and the whole
-  tape chain (chain44: mhvtl gate 52/52, fr414 17/0, lifecycle `--all` 487/472/0/15, erase-proof,
-  plaintext scan, short-seal acceptance). Wave 4 is running: E3 (`volume write` spans), H1
-  (tapectl's restore across cartridges), H2 (rebuild and adoption of a range tape). The plan, the
-  coordinator's forks (X1-X34, X12 amended 2026-10-23) and every worker's report and routing are in
-  the session scratchpad `p478/plan.md` §§12-14. The branch does not land on master before wave 5.
-  For the CTO's 1.7.0 notes: under `--swap-tapes` a seal-less second cartridge (an aborted 1.5.0
-  write) now gives nothing (R8, item 132); `allow_spanning` defers, never refuses, whole units a
-  queued set pushes past the ceiling (X12 as amended).
-  Since 2026-10-23 mhvtl's `/dev/nstN` also moves when needrestart restarts it (now blocked by
-  `/etc/needrestart/conf.d/mhvtl.conf`): chain scripts resolve by-id at start.
+  **#478 spanning is BUILT and on master as 1.7.0 (2026-10-24), NOT tagged yet.** Master `3a921b3`:
+  - **Local gate:** 4336/0/24.
+  - **GitHub CI:** green on the Ubuntu 26 runner (dar 2.8.3). The first green since 10-21: the runner's
+    new sg_logs and sha256sum broke two tests, and `--no-fail-fast` now shows every binary.
+  - **The whole tape chain on `4a23907`:** chain48 — gate 61/61 incl. the nine `span_*` checks (one run
+    held a swap 3603 s, X31), fr414 17/0, lifecycle `--all` 487/472/0/15, erase-proof, plaintext scan,
+    short-seal acceptance and `span-acceptance.sh --mhvtl`.
+  - **The rulings:** ADR-0012 items 121-147. 144: a rebuild promotes a found staged span. 145:
+    RESTORE.sh's damage-handling fixes R1/R2, re-pin #5, `1cd5a405…`. 146: 1.7.0's order. 147: #492
+    in 1.7.x.
+  - **Next, by item 146:** the operator runs `scripts/span-acceptance.sh` on home2's drive with
+    EW7VWMVKF6, using the scratch static musl debug build at `home2:~/tapectl-1.7.0-3a921b3/`
+    (tapectl sha256 ef6b3922…, short_seal_filler 0157359d…, SHA256SUMS beside them; the
+    procedure is in docs/lto6-validation-checklist.md "Spanning on the real drive"). On PASS: tag
+    `v1.7.0` on 3a921b3, then handoff (h).
+  - **Open:** #491 (test fragility), #492 (item 147, 1.7.1), and the CTO's per-location targets and
+    auto-stage design (round 1 asked 2026-10-24).
+  - **The plan and every worker's report:** the session scratchpad `p478/plan.md` §§12-14+.
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
