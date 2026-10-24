@@ -2138,3 +2138,38 @@ a `sha256sum` that shell-quotes file names):
      starts such a set as late as it can while touching the fewest tapes, which leaves no slack
      if the early warning comes before nominal. This changes planning only, never a byte on
      tape, and home2 cannot reach it until staging is larger than one tape.
+
+Ruled 2026-10-24, the CTO's per-location copy targets and auto-stage for a location, round 1
+(built after 1.7.0's tag, as 1.7.x; no on-tape byte changes):
+
+148. **Per-location copy targets are set in the unit's dotfile and frozen into the catalog.** Each
+     time a unit's policy is resolved with its dotfile present, the resolved targets are written
+     to the catalog, so a unit whose source is gone (tape-only, exactly where location policy
+     matters) keeps its last targets instead of silently deferring. Archive sets and `[defaults]`
+     take the same key. This amends the rule that a dotfile never sets a count of copies.
+149. **The targets are a map beside today's keys.** For example `copies_at = { home = 1, offsite =
+     1 }`. `min_copies` stays as the total floor (the floor is the larger of it and the map's
+     sum), `required_locations` is shorthand for one copy at each name, and `min_locations` is
+     unchanged. A unit with no map behaves exactly as before. For a tape-only unit the multiplier
+     raises each per-location target, as item 46 already raises a named location's count.
+150. **A copy "at X"** is an eligible tape whose recorded location is X, or a warehouse deposit at X.
+     Each version counts at its least-covered slice and a unit at its least-covered current
+     version, as every other count does (items 127, 138). A tape written for X counts at X once it
+     is moved there, so the auto-stage flow always writes with `--move-to X`.
+151. **`tapectl stage for-location X --volume LABEL [--dry-run]`** works out each unit's need at X,
+     bin-packs those units into that volume's capacity (the fill ceiling, spannable units last,
+     items 83 and 95) and stages them. **`volume write LABEL --for-location X`** writes only staged
+     sets that still have need at X, and moves the tape to X. Plain `volume write` is unchanged.
+     Staging and writing stay separate. This amends item 134: the destination is a plan input for
+     this flow.
+152. **Priority when the need at X exceeds one tape:**
+     - the largest shortfall at X first (0 copies there before 1 short), with the fewest copies in
+       all breaking ties;
+     - within each group, next-fit in name order (item 69's tape order);
+     - spannable units last.
+153. **Auto-stage takes new and changed units too.** It snapshots and stages them as `collection run`
+     does, since a new version has 0 copies everywhere. A tape-only unit, whose source is gone, is
+     staged by `volume read-slices --from` a holder.
+154. **Staging is released on the copy floor by default**, as now. A later location's copy is staged
+     again, from the source or by read-slices. A run may pass `--keep-staging-for-locations` to hold
+     staging until every per-location target is met, when staging has room.
