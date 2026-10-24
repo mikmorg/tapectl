@@ -50,6 +50,7 @@ pub(crate) fn creation_checksum_mode(
         created_at: String::new(),
         last_scanned: None,
         notes: None,
+        copies_at_frozen: None,
     };
     Ok(crate::policy::resolve(conn, config, &stand_in)?.checksum_mode)
 }

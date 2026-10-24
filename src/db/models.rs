@@ -47,6 +47,16 @@ pub struct Unit {
     pub created_at: String,
     pub last_scanned: Option<String>,
     pub notes: Option<String>,
+    /// `units.copies_at_frozen` (migration 040, #493, ADR-0012 item 148):
+    /// the unit dotfile's own `[policy.copies_at]`, as the JSON object last
+    /// frozen with the source present, or NULL when the dotfile set none.
+    /// `policy::resolve` reads it as the dotfile layer only while the dotfile
+    /// is absent. Carried on the row rather than queried, so resolving a
+    /// unit costs no statement more than it did (`tests/catalog_budget.rs`).
+    /// Not serialized: `unit list --json` keeps its shape, and the resolved
+    /// targets are what a reader wants, not this layer alone.
+    #[serde(skip)]
+    pub copies_at_frozen: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

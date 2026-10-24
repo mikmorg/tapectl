@@ -419,7 +419,8 @@ pub fn insert_unit(
 pub fn get_unit_by_name(conn: &Connection, name: &str) -> Result<Option<Unit>> {
     conn.query_row(
         "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
-                checksum_mode, encrypt, status, created_at, last_scanned, notes
+                checksum_mode, encrypt, status, created_at, last_scanned, notes,
+                copies_at_frozen
          FROM units WHERE name = ?1",
         params![name],
         |row| {
@@ -436,6 +437,7 @@ pub fn get_unit_by_name(conn: &Connection, name: &str) -> Result<Option<Unit>> {
                 created_at: row.get(9)?,
                 last_scanned: row.get(10)?,
                 notes: row.get(11)?,
+                copies_at_frozen: row.get(12)?,
             })
         },
     )
@@ -446,7 +448,8 @@ pub fn get_unit_by_name(conn: &Connection, name: &str) -> Result<Option<Unit>> {
 pub fn get_unit_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Unit>> {
     conn.query_row(
         "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
-                checksum_mode, encrypt, status, created_at, last_scanned, notes
+                checksum_mode, encrypt, status, created_at, last_scanned, notes,
+                copies_at_frozen
          FROM units WHERE uuid = ?1",
         params![uuid],
         |row| {
@@ -463,6 +466,7 @@ pub fn get_unit_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Unit>> {
                 created_at: row.get(9)?,
                 last_scanned: row.get(10)?,
                 notes: row.get(11)?,
+                copies_at_frozen: row.get(12)?,
             })
         },
     )
@@ -473,7 +477,8 @@ pub fn get_unit_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Unit>> {
 pub fn get_unit_by_path(conn: &Connection, path: &str) -> Result<Option<Unit>> {
     conn.query_row(
         "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
-                checksum_mode, encrypt, status, created_at, last_scanned, notes
+                checksum_mode, encrypt, status, created_at, last_scanned, notes,
+                copies_at_frozen
          FROM units WHERE current_path = ?1",
         params![path],
         |row| {
@@ -490,6 +495,7 @@ pub fn get_unit_by_path(conn: &Connection, path: &str) -> Result<Option<Unit>> {
                 created_at: row.get(9)?,
                 last_scanned: row.get(10)?,
                 notes: row.get(11)?,
+                copies_at_frozen: row.get(12)?,
             })
         },
     )
@@ -504,7 +510,8 @@ pub fn list_units(
 ) -> Result<Vec<Unit>> {
     let mut sql = String::from(
         "SELECT id, uuid, name, tenant_id, archive_set_id, current_path,
-                checksum_mode, encrypt, status, created_at, last_scanned, notes
+                checksum_mode, encrypt, status, created_at, last_scanned, notes,
+                copies_at_frozen
          FROM units WHERE 1=1",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -536,6 +543,7 @@ pub fn list_units(
             created_at: row.get(9)?,
             last_scanned: row.get(10)?,
             notes: row.get(11)?,
+            copies_at_frozen: row.get(12)?,
         })
     })?;
     let mut units = Vec::new();
