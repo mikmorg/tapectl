@@ -14110,6 +14110,30 @@ mod tests {
         .unwrap();
     }
 
+    /// Make every envelope of a write heavier, without touching what
+    /// generates them (#491): the catalog's first stage set gets a dar
+    /// catalogue of `bytes` bytes under `dir`, which the tenant's envelope
+    /// and the operator's both pack (`catalogs/`) and their RECOVERY.md then
+    /// names (#449). Nothing when `bytes` is 0.
+    fn grow_envelopes(conn: &Connection, dir: &Path, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("grown.1.dar"), vec![0x5a; bytes]).unwrap();
+        let stem = dir.join("grown").to_string_lossy().into_owned();
+        assert!(
+            crate::volume::envelope::catalogue_on_disk(&stem),
+            "positive control: the build finds the catalogue"
+        );
+        conn.execute(
+            "UPDATE stage_sets SET catalog_path = ?1
+             WHERE id = (SELECT MIN(id) FROM stage_sets)",
+            params![stem],
+        )
+        .unwrap();
+    }
+
     /// The verdict list `assemble_session_keys` hands `validate`, for the
     /// stage sets `find_staged_data` selected.
     fn verdicts(
@@ -24042,9 +24066,10 @@ mod tests {
             /// The volume's own files (everything but the data slices),
             /// block-padded, as a write of `f`'s staged batch onto `label`
             /// builds them — the same function, keys, catalog and index.
-            /// Another build differs only in the volume's identity (its uuid
-            /// and time), a few bytes; the tests below leave a whole slice
-            /// either side of every figure they place.
+            /// Another build differs in what only it decides: the volume's
+            /// identity and time, and the random grease stanza age puts in
+            /// every envelope's header (up to ~170 bytes). Each of these
+            /// files may land one block either side of this figure (#491).
             fn fixed_bytes(f: &Fixture, label: &str) -> u64 {
                 built(f, label, u64::MAX / 4, None)
                     .0
@@ -24244,10 +24269,60 @@ mod tests {
             /// can only end cut is not a plan), before the tape moves.
             #[test]
             fn a_plan_that_commits_no_unit_is_refused() {
-                let mut f = fixture(ABC, &["SE-0"]);
-                let fixed = fixed_bytes(&f, "SE-0");
-                let fill = fixed + PADDED / 2;
-                let capacity = fixed + 6 * PADDED;
+                commits_no_unit_and_is_refused(0);
+            }
+
+            /// #491's positive control: the same refusal however heavy the
+            /// envelopes are, so wherever their sizes fall against a block
+            /// ([`grow_envelopes`]; 512 bytes was enough to break the figures
+            /// this test used to place).
+            #[test]
+            fn a_plan_that_commits_no_unit_is_refused_however_heavy_the_envelopes() {
+                for bytes in [512, 2048, 4096, 4608] {
+                    commits_no_unit_and_is_refused(bytes);
+                }
+            }
+
+            /// One slice of [`WIDE_ABC`], block-padded.
+            const WIDE_PADDED: u64 = 32 * SBS as u64;
+            /// [`ABC`]'s units, with slices wide enough that half of one is
+            /// more than another build can move the volume's own files.
+            const WIDE_ABC: &[(&str, &[usize])] = &[
+                ("a", &[32 * SBS - 100]),
+                ("b", &[32 * SBS - 100, 32 * SBS - 100]),
+                ("c", &[32 * SBS - 100]),
+            ];
+
+            /// The body of the two tests above, with the envelopes grown by
+            /// a dar catalogue of `catalogue_bytes`.
+            ///
+            /// The write builds its own Layout, and its files that are not
+            /// slices are not the probe's to the byte (#491): the volume's
+            /// identity and time differ, and age puts a random "grease"
+            /// stanza in every envelope's header, so one encryption of the
+            /// same envelope is up to ~170 bytes longer than another. Each of
+            /// those files may land one block either side of the probe's, so
+            /// the drift is bounded by one block per file — the rehearsal's
+            /// margin ([`CapacityNumbers::margin`]), counted on the probe.
+            /// The fill budget sits half a slice past the probe's files, which
+            /// leaves the drift on both sides: the real files still fit under
+            /// the ceiling (else the refusal is the capacity gate's, not this
+            /// one) and `a` still does not (else it is committed and the write
+            /// goes ahead).
+            fn commits_no_unit_and_is_refused(catalogue_bytes: usize) {
+                let mut f = fixture(WIDE_ABC, &["SE-0"]);
+                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                let (probe, _dir) = built(&f, "SE-0", u64::MAX / 4, None);
+                let fixed = probe.layout.fixed_on_tape_bytes();
+                let drift = capacity_numbers(&probe.layout).unwrap().margin;
+                assert!(
+                    drift < WIDE_PADDED / 2,
+                    "the fixture needs wider slices: half of one ({}) must exceed the {drift} \
+                     bytes another build may move the volume's own files",
+                    WIDE_PADDED / 2
+                );
+                let fill = fixed + WIDE_PADDED / 2;
+                let capacity = fixed + 6 * WIDE_PADDED;
                 budget(&mut f, "SE-0", capacity, fill, true);
 
                 let mut store = MemStore::new(SBS);
@@ -26883,7 +26958,25 @@ mod tests {
         /// every figure named.
         #[test]
         fn live_data_that_fits_with_metadata_that_does_not_is_refused_naming_the_numbers() {
+            refused_naming_the_numbers(0);
+        }
+
+        /// #491's positive control: the refusal names its own numbers
+        /// however heavy the envelopes are, so wherever their sizes fall
+        /// against a block ([`grow_envelopes`]; 4 KiB was enough to break the
+        /// exact match against the probe this test used to make).
+        #[test]
+        fn the_refusal_names_its_numbers_however_heavy_the_envelopes() {
+            for bytes in [512, 2048, 4096, 4608] {
+                refused_naming_the_numbers(bytes);
+            }
+        }
+
+        /// The body of the two tests above, with the envelopes grown by a
+        /// dar catalogue of `catalogue_bytes`.
+        fn refused_naming_the_numbers(catalogue_bytes: usize) {
             let f = fixture(&[3 * BS + 17, 5 * BS]);
+            grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
             let roomy = rehearse(&f, 1_000_000_000).expect("a roomy cartridge passes");
             assert_eq!(roomy.staged, f.live_bytes, "the live slices, block-padded");
             assert!(
@@ -26898,16 +26991,51 @@ mod tests {
             );
             let msg = rehearse(&f, capacity).unwrap_err().to_string();
             assert!(msg.contains("would not fit its cartridge"), "{msg}");
+            let refused = refusing_numbers(&f, &msg, &roomy, capacity);
             for figure in [
-                crate::util::format_bytes_binary(roomy.staged as i64),
-                crate::util::format_bytes_binary(roomy.generated as i64),
-                crate::util::format_bytes_binary(roomy.margin as i64),
-                crate::util::format_bytes_binary(roomy.reserve as i64),
+                crate::util::format_bytes_binary(refused.staged as i64),
+                crate::util::format_bytes_binary(refused.generated as i64),
+                crate::util::format_bytes_binary(refused.margin as i64),
+                crate::util::format_bytes_binary(refused.reserve as i64),
                 crate::util::format_bytes_decimal(capacity),
             ] {
                 assert!(msg.contains(&figure), "the refusal names {figure}: {msg}");
             }
             assert!(msg.contains("100% of its"), "{msg}");
+        }
+
+        /// The numbers a refusal at `capacity` was made of, as its own
+        /// rehearsal counted them: the probe's live slices, margin and
+        /// reserve (no volume identity moves those), and generated files a
+        /// whole number of blocks within the probe's margin of the probe's.
+        /// A rehearsal builds its Layout afresh (#491): another uuid and
+        /// time, and a random grease stanza in every envelope's age header,
+        /// up to ~170 bytes, so an envelope and its backup can land a block
+        /// above or below the probe's. The margin, one block per generated
+        /// file, is what bounds that drift. Panics unless the whole message
+        /// is the refusal of exactly such numbers.
+        fn refusing_numbers(
+            f: &Fixture,
+            msg: &str,
+            probe: &CapacityNumbers,
+            capacity: i64,
+        ) -> CapacityNumbers {
+            let backend = &f.config.backends.lto[0];
+            let blocks = probe.margin / BS as u64;
+            (0..=2 * blocks)
+                .filter_map(|k| (probe.generated + k * BS as u64).checked_sub(probe.margin))
+                .map(|generated| CapacityNumbers {
+                    generated,
+                    available: backend.fill_budget_bytes(capacity as u64),
+                    ..*probe
+                })
+                .find(|n| n.refusal("NEW", capacity, backend.fill_ceiling) == msg)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the refusal is not of the probe's numbers {probe:?} with the generated \
+                         files within its margin: {msg}"
+                    )
+                })
         }
 
         /// The pin: a rehearsal that passes bounds the real write. At the
