@@ -282,6 +282,7 @@ mod tests {
             preserve_fsa: None,
             dirty_on_metadata_change: None,
             allow_spanning: None,
+            copies_at: None,
         };
         config.archive_sets.push(media.clone());
         let expected = vec![SubsumedAcls {
@@ -345,6 +346,7 @@ mod tests {
                 preserve_fsa: None,
                 dirty_on_metadata_change: None,
                 allow_spanning: None,
+                copies_at: None,
             });
         }
         let only_defaults = vec![SubsumedAcls {

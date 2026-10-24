@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -835,6 +836,13 @@ pub struct ArchiveSetConfig {
     /// Absent means the set does not say, and `[defaults]` decides; `sync`
     /// writes the catalog column only when the table names it.
     pub allow_spanning: Option<bool>,
+    /// #493 (ADR-0012 items 149, 155, 156): how many copies this set's units
+    /// should hold at each named location, `copies_at = { home = 1, offsite
+    /// = 1 }`. Absent means the set does not say; `sync` writes the catalog
+    /// column only when the table names it, and refuses a name that is not
+    /// a registered location, as it does `required_locations`'. Last in the
+    /// struct, so a serialized table puts it after the plain keys.
+    pub copies_at: Option<BTreeMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -906,6 +914,19 @@ pub struct DefaultsConfig {
     /// is absent: every unit is written whole on one tape, as before 1.7.0.
     #[serde(default)]
     pub allow_spanning: bool,
+    /// Per-location copy targets (#493, ADR-0012 items 149, 156), as the
+    /// bottom layer of the policy chain: a map of location name to how many
+    /// copies each unit should hold there. An `[[archive_sets]]` entry's
+    /// `copies_at` (or its `required_locations`), then a unit's dotfile
+    /// `[policy.copies_at]`, replaces it whole: the most specific layer that
+    /// sets the map wins entirely. Empty when the key is absent, which sets
+    /// no target, and then not written back, so `init`'s file is unchanged.
+    /// Each count is 0 or more ([`validate_copies_at`]); whether each name is
+    /// a registered location is checked against the catalog when a unit's
+    /// policy is resolved (`policy::resolve`). Last in the struct, so a
+    /// serialized `[defaults]` puts the table after the plain keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub copies_at: BTreeMap<String, i64>,
 }
 
 /// The `[defaults] verify_interval_days` in force when the key is absent: a
@@ -968,6 +989,7 @@ impl Default for DefaultsConfig {
             warehouse_copies: 0,
             verify_interval_days: DEFAULT_VERIFY_INTERVAL_DAYS,
             allow_spanning: false,
+            copies_at: BTreeMap::new(),
         }
     }
 }
@@ -1828,6 +1850,22 @@ impl Config {
                 }
             }
         }
+        // #493 (ADR-0012 items 149, 155): the per-location copy targets'
+        // counts. Their names are checked against the catalog, not here.
+        if let Err(e) = validate_copies_at(&self.defaults.copies_at) {
+            problems.push(format!("{}: defaults.copies_at {e}", path.display()));
+        }
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(map) = &as_cfg.copies_at {
+                if let Err(e) = validate_copies_at(map) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").copies_at {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
+        }
         // Issue #421: a rise factor below 1 flags a falling rate, and NaN
         // flags nothing; both are switches, not thresholds.
         let factor = self.health().read_error_rise_factor;
@@ -2376,6 +2414,27 @@ pub fn validate_min_locations(locations: i64) -> std::result::Result<(), String>
                 .to_string(),
         )
     }
+}
+
+/// A `copies_at` map (#493, ADR-0012 items 149 and 155), at any layer: each
+/// key names a location, each value how many copies a unit should hold
+/// there. A count is a whole number, 0 or more: 0 is a real choice (no copy
+/// required there, the same as leaving the name out), and a negative count
+/// means nothing. A name must not be blank. Whether each name is a
+/// registered location is a catalog question, answered when a unit's policy
+/// is resolved (`policy::resolve`) and by `archive-set create`/`edit`/`sync`.
+/// The error is the reason only; each caller names the layer and the key.
+pub fn validate_copies_at(map: &BTreeMap<String, i64>) -> std::result::Result<(), String> {
+    if map.keys().any(|name| name.trim().is_empty()) {
+        return Err("names a blank location; each key must be a location name".to_string());
+    }
+    if let Some((name, count)) = map.iter().find(|(_, count)| **count < 0) {
+        return Err(format!(
+            "\"{name}\" = {count} must be >= 0 (how many copies a unit should hold at that \
+             location; 0 asks for none there, and a negative count means nothing)"
+        ));
+    }
+    Ok(())
 }
 
 /// Match a configured `device_tape` against a requested device path.
@@ -4640,6 +4699,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #493 (ADR-0012 items 149, 155): `copies_at` is a `[defaults]` key,
+    /// empty (no target) when absent, and an `[[archive_sets]]` key, `None`
+    /// ("the set does not say") when absent. The inline table and the
+    /// sub-table are the same map; 0 is a legitimate count. `config check`'s
+    /// lenient read finds nothing to report, and a default config writes no
+    /// `copies_at` (so `init`'s file is unchanged) while a set one is
+    /// written back.
+    #[test]
+    fn copies_at_loads_in_defaults_and_an_archive_set_in_either_spelling() {
+        assert!(Config::default().defaults.copies_at.is_empty());
+        assert!(load_text("[defaults]\n").unwrap().defaults.copies_at.is_empty());
+        let want: BTreeMap<String, i64> = [("home".to_string(), 1), ("offsite".to_string(), 0)]
+            .into_iter()
+            .collect();
+
+        let inline = "[defaults]\ncopies_at = { home = 1, offsite = 0 }\n\n\
+                      [[archive_sets]]\nname = \"media\"\ncopies_at = { home = 1, offsite = 0 }\n\n\
+                      [[archive_sets]]\nname = \"silent\"\nmin_copies = 3\n";
+        let tables = "[defaults.copies_at]\nhome = 1\noffsite = 0\n\n\
+                      [[archive_sets]]\nname = \"media\"\n\n\
+                      [archive_sets.copies_at]\nhome = 1\noffsite = 0\n\n\
+                      [[archive_sets]]\nname = \"silent\"\nmin_copies = 3\n";
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for text in [inline, tables] {
+            let cfg = load_text(text).unwrap();
+            assert_eq!(cfg.defaults.copies_at, want, "{text}");
+            assert_eq!(cfg.archive_sets[0].copies_at.as_ref(), Some(&want), "{text}");
+            assert_eq!(cfg.archive_sets[1].copies_at, None, "{text}");
+            std::fs::write(&path, text).unwrap();
+            let report = crate::policy::lenient_config::check(text, &path);
+            assert!(report.valid, "{:?}", report.problems);
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+        }
+
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("copies_at"), "{written}");
+        let cfg = load_text(inline).unwrap();
+        let again = toml::to_string_pretty(&cfg).unwrap();
+        assert!(again.contains("[defaults.copies_at]"), "{again}");
+        assert_eq!(
+            load_text(&again).unwrap().defaults.copies_at,
+            want,
+            "a set map round-trips"
+        );
+    }
+
+    /// #493: a negative count, a blank location name and a count that is not
+    /// a whole number are refused, at either layer, by the load every
+    /// command runs and by `config check`, naming the key.
+    #[test]
+    fn a_bad_copies_at_is_refused_by_name_in_defaults_and_an_archive_set() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for (text, key, says) in [
+            (
+                "[defaults]\ncopies_at = { home = -1 }\n",
+                "defaults.copies_at",
+                "\"home\" = -1 must be >= 0",
+            ),
+            (
+                "[defaults]\ncopies_at = { \"\" = 1 }\n",
+                "defaults.copies_at",
+                "blank location",
+            ),
+            (
+                "[[archive_sets]]\nname = \"a\"\ncopies_at = { vault = -2 }\n",
+                "archive_sets[0] (\"a\").copies_at",
+                "\"vault\" = -2 must be >= 0",
+            ),
+        ] {
+            let msg = load_text(text).unwrap_err();
+            assert!(msg.contains(key), "{key}: {msg}");
+            assert!(msg.contains(says), "{key}: {msg}");
+            std::fs::write(&path, text).unwrap();
+            let report = crate::policy::lenient_config::check(text, &path);
+            assert!(!report.valid, "{key}");
+            assert!(
+                report.problems.iter().any(|p| p.contains(key) && p.contains(says)),
+                "{key}: {:?}",
+                report.problems
+            );
+        }
+        let msg = load_text("[defaults]\ncopies_at = { home = 1.5 }\n").unwrap_err();
+        assert!(msg.contains("copies_at"), "{msg}");
     }
 
     #[test]

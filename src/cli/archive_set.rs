@@ -1515,6 +1515,7 @@ fi
             preserve_fsa: None,
             dirty_on_metadata_change: None,
             allow_spanning: None,
+            copies_at: None,
         }
     }
 
