@@ -472,6 +472,7 @@ mod tests {
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
+                copies_at: None,
                 exclude_patterns: vec![],
             },
         )
