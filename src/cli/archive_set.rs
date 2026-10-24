@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use clap::{Args, Subcommand};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -68,6 +70,42 @@ fn parse_required_locations(conn: &Connection, value: &str) -> Result<Vec<String
     }
     check_registered_locations(conn, "--required-locations", &names)?;
     Ok(names)
+}
+
+/// Parse `--copies-at NAME=N` values (repeatable; #493, ADR-0012 items 149
+/// and 155) into the archive-set layer's map of location to copy count, and
+/// refuse what the policy could never mean: an entry that is not
+/// `NAME=N`, a count that is not a whole number 0 or more, a name given
+/// twice, and a name that is not a registered location (the same check
+/// `--required-locations` gets, #348). Runs before either command's dry-run
+/// return, so a dry run refuses exactly what the real run would (#241).
+fn parse_copies_at(conn: &Connection, values: &[String]) -> Result<BTreeMap<String, i64>> {
+    let mut map = BTreeMap::new();
+    for value in values {
+        let Some((name, count)) = value.split_once('=') else {
+            return Err(TapectlError::Other(format!(
+                "--copies-at {value:?} must be NAME=N, a location and how many copies to \
+                 hold there (e.g. --copies-at home=1 --copies-at offsite=1)"
+            )));
+        };
+        let name = name.trim().to_string();
+        let count: i64 = count.trim().parse().map_err(|_| {
+            TapectlError::Other(format!(
+                "--copies-at {value:?}: the count {:?} is not a whole number",
+                count.trim()
+            ))
+        })?;
+        if map.insert(name.clone(), count).is_some() {
+            return Err(TapectlError::Other(format!(
+                "--copies-at names \"{name}\" twice; give each location once"
+            )));
+        }
+    }
+    crate::config::validate_copies_at(&map)
+        .map_err(|e| TapectlError::Other(format!("--copies-at {e}")))?;
+    let names: Vec<String> = map.keys().cloned().collect();
+    check_registered_locations(conn, "--copies-at", &names)?;
+    Ok(map)
 }
 
 /// The registration check behind [`parse_required_locations`], shared with
@@ -162,6 +200,13 @@ pub struct PolicyArgs {
     /// tapectl 1.7.0). Never set means "defer to [defaults]", which is off
     #[arg(long)]
     pub allow_spanning: Option<bool>,
+    /// Copies each unit should hold at a location, as NAME=N (repeatable,
+    /// e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a
+    /// registered location. Replaces the set's whole map. A unit's dotfile
+    /// [policy.copies_at] replaces it in turn; never set means "defer to
+    /// [defaults]"
+    #[arg(long, value_name = "NAME=N")]
+    pub copies_at: Vec<String>,
     /// Description
     #[arg(long, short)]
     pub description: Option<String>,
@@ -266,6 +311,8 @@ struct PolicyWrite {
     preserve_fsa: Option<bool>,
     dirty_on_metadata_change: Option<bool>,
     allow_spanning: Option<bool>,
+    /// #493: the set's whole `copies_at` map, stored as a JSON object.
+    copies_at: Option<BTreeMap<String, i64>>,
     description: Option<String>,
 }
 
@@ -286,6 +333,7 @@ impl PolicyWrite {
             preserve_fsa,
             dirty_on_metadata_change,
             allow_spanning,
+            copies_at,
             description,
         } = self;
         // Destructured, so a new field cannot be added without deciding here.
@@ -302,6 +350,7 @@ impl PolicyWrite {
             && preserve_fsa.is_none()
             && dirty_on_metadata_change.is_none()
             && allow_spanning.is_none()
+            && copies_at.is_none()
             && description.is_none()
     }
 
@@ -342,6 +391,10 @@ impl PolicyWrite {
             .as_ref()
             .map(|s| crate::staging::parse_size_to_bytes(s))
             .transpose()?;
+        // No flag is "not given", never an empty map.
+        let copies_at = (!args.copies_at.is_empty())
+            .then(|| parse_copies_at(conn, &args.copies_at))
+            .transpose()?;
         Ok(Self {
             min_copies: args.min_copies,
             required_locations,
@@ -356,6 +409,7 @@ impl PolicyWrite {
             preserve_fsa: args.preserve_fsa,
             dirty_on_metadata_change: args.dirty_on_metadata_change,
             allow_spanning: args.allow_spanning,
+            copies_at,
             description: args.description.clone(),
         })
     }
@@ -376,6 +430,10 @@ impl PolicyWrite {
             crate::config::validate_verify_interval_days(i64::from(days))
                 .map_err(|e| TapectlError::Other(format!("verify_interval_days = {days} {e}")))?;
         }
+        if let Some(map) = &as_cfg.copies_at {
+            crate::config::validate_copies_at(map)
+                .map_err(|e| TapectlError::Other(format!("copies_at {e}")))?;
+        }
         Ok(Self {
             min_copies: as_cfg.min_copies.map(i64::from),
             required_locations: as_cfg.required_locations.clone(),
@@ -394,6 +452,7 @@ impl PolicyWrite {
             preserve_fsa: as_cfg.preserve_fsa,
             dirty_on_metadata_change: as_cfg.dirty_on_metadata_change,
             allow_spanning: as_cfg.allow_spanning,
+            copies_at: as_cfg.copies_at.clone(),
             description: None,
         })
     }
@@ -443,6 +502,12 @@ impl PolicyWrite {
             self.dirty_on_metadata_change.map(ColumnValue::Bool),
         );
         push("allow_spanning", self.allow_spanning.map(ColumnValue::Bool));
+        push(
+            "copies_at",
+            self.copies_at
+                .as_ref()
+                .map(|map| ColumnValue::Text(serde_json::to_string(map).unwrap())),
+        );
         push(
             "description",
             self.description.clone().map(ColumnValue::Text),
@@ -595,6 +660,8 @@ struct ArchiveSetInfo {
     preserve_fsa: Option<i64>,
     dirty_on_metadata_change: Option<i64>,
     allow_spanning: Option<i64>,
+    /// The stored JSON object text, or NULL (#493).
+    copies_at: Option<String>,
     unit_count: i64,
     created: String,
     updated: String,
@@ -609,7 +676,7 @@ impl ArchiveSetInfo {
                         a.warehouse_copies, a.preserve_xattrs, a.preserve_acls, a.preserve_fsa,
                         a.dirty_on_metadata_change, a.created_at, a.updated_at,
                         (SELECT COUNT(*) FROM units u WHERE u.archive_set_id = a.id),
-                        a.allow_spanning
+                        a.allow_spanning, a.copies_at
                  FROM archive_sets a WHERE a.name = ?1",
                 params![name],
                 |row| {
@@ -632,6 +699,7 @@ impl ArchiveSetInfo {
                         updated: row.get(14)?,
                         unit_count: row.get(15)?,
                         allow_spanning: row.get(16)?,
+                        copies_at: row.get(17)?,
                     })
                 },
             )
@@ -662,6 +730,12 @@ fn info_json(info: &ArchiveSetInfo) -> serde_json::Value {
         .as_ref()
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
     let flag = |v: Option<i64>| v.map(|n| n != 0);
+    // #493: the map as an object, `null` when never set (defers to
+    // `[defaults]`), like `locations`.
+    let copies_at = info
+        .copies_at
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<BTreeMap<String, i64>>(s).ok());
     serde_json::json!({
         "name": info.name, "description": info.description, "min_copies": info.min_copies,
         "locations": locations, "encrypt": flag(info.encrypt),
@@ -673,6 +747,7 @@ fn info_json(info: &ArchiveSetInfo) -> serde_json::Value {
         "preserve_fsa": flag(info.preserve_fsa),
         "dirty_on_metadata_change": flag(info.dirty_on_metadata_change),
         "allow_spanning": flag(info.allow_spanning),
+        "copies_at": copies_at,
         "units": info.unit_count,
     })
 }
@@ -744,6 +819,7 @@ fn info_text(info: &ArchiveSetInfo) -> String {
         "  Allow spanning:   {}\n",
         flag(info.allow_spanning)
     ));
+    out.push_str(&format!("  Copies at:        {}\n", text(&info.copies_at)));
     out.push_str(&format!("  Units using:      {}\n", info.unit_count));
     out.push_str(&format!("  Created:          {}\n", info.created));
     out.push_str(&format!("  Updated:          {}\n", info.updated));
@@ -922,6 +998,12 @@ pub fn run(
                 if let Some(locs) = &as_cfg.required_locations {
                     check_registered_locations(conn, "required_locations", locs).map_err(named)?;
                 }
+                // #493 (ADR-0012 item 155): `copies_at`'s names, on the same
+                // terms.
+                if let Some(map) = &as_cfg.copies_at {
+                    let names: Vec<String> = map.keys().cloned().collect();
+                    check_registered_locations(conn, "copies_at", &names).map_err(named)?;
+                }
                 // Issue #59: a malformed slice_size must not silently become
                 // 0 or the wrong magnitude in the DB (parsed in `from_config`).
                 writes.push((as_cfg, PolicyWrite::from_config(as_cfg).map_err(named)?));
@@ -1076,6 +1158,7 @@ mod tests {
             "dirty_on_metadata_change",
             "warehouse_copies",
             "allow_spanning",
+            "copies_at",
         ] {
             assert_eq!(value[key], serde_json::Value::Null, "{key}: {value}");
         }
@@ -2482,5 +2565,184 @@ fi
             false,
         )
         .unwrap();
+    }
+
+    fn stored_copies_at(conn: &Connection, name: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT copies_at FROM archive_sets WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn with_copies_at(values: &[&str]) -> PolicyArgs {
+        PolicyArgs {
+            copies_at: values.iter().map(|v| v.to_string()).collect(),
+            ..PolicyArgs::default()
+        }
+    }
+
+    /// #493 (ADR-0012 items 149, 155): `--copies-at NAME=N` (repeatable)
+    /// reaches the column through `create` and `edit`, and `[[archive_sets]]
+    /// copies_at` through `sync`, as a JSON object; each replaces the set's
+    /// whole map, a sync table that does not name the key leaves it alone,
+    /// and `info` shows it. No flag stores NULL ("defer to [defaults]").
+    #[test]
+    fn copies_at_reaches_its_column_through_create_edit_and_sync() {
+        let conn = fresh_conn();
+        for name in ["home", "offsite", "vault"] {
+            add_location(&conn, name);
+        }
+        let mut config = Config::default();
+        run(&conn, &config, &create_cmd("plain", None, None), false, false).unwrap();
+        assert_eq!(stored_copies_at(&conn, "plain"), None, "no flag is NULL");
+
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Create {
+                name: "media".to_string(),
+                policy: with_copies_at(&["home=1", "offsite=2"]),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_copies_at(&conn, "media").as_deref(),
+            Some(r#"{"home":1,"offsite":2}"#)
+        );
+
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Edit {
+                name: "media".to_string(),
+                policy: with_copies_at(&[" vault = 0 "]),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_copies_at(&conn, "media").as_deref(),
+            Some(r#"{"vault":0}"#),
+            "edit replaces the whole map; 0 is a count"
+        );
+        let edited: (Option<String>, String) = conn
+            .query_row(
+                "SELECT old_value, new_value FROM events
+                 WHERE entity_type = 'archive_set' AND action = 'edited' AND field = 'copies_at'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edited,
+            (
+                Some(r#"{"home":1,"offsite":2}"#.to_string()),
+                r#"{"vault":0}"#.to_string()
+            )
+        );
+
+        let mut media = set_config("media");
+        media.min_copies = Some(2);
+        config.archive_sets.push(media);
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(
+            stored_copies_at(&conn, "media").as_deref(),
+            Some(r#"{"vault":0}"#),
+            "a table that does not name the key leaves the column alone"
+        );
+        config.archive_sets[0].copies_at = Some(
+            [("home".to_string(), 2), ("offsite".to_string(), 1)]
+                .into_iter()
+                .collect(),
+        );
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(
+            stored_copies_at(&conn, "media").as_deref(),
+            Some(r#"{"home":2,"offsite":1}"#)
+        );
+
+        let info = ArchiveSetInfo::load(&conn, "media").unwrap();
+        assert_eq!(
+            info_json(&info)["copies_at"],
+            serde_json::json!({"home": 2, "offsite": 1})
+        );
+        assert!(
+            info_text(&info).contains(r#"Copies at:        {"home":2,"offsite":1}"#),
+            "{}",
+            info_text(&info)
+        );
+    }
+
+    /// #493 (item 155): `--copies-at` is refused, naming the problem, for an
+    /// unregistered location (as `--required-locations` is), an entry that
+    /// is not NAME=N, a count that is not a whole number 0 or more, and a
+    /// name given twice; a dry run refuses the same, and nothing is stored.
+    /// `sync` refuses an unregistered `copies_at` name naming the set.
+    #[test]
+    fn a_bad_copies_at_is_refused_by_create_edit_and_sync() {
+        let conn = fresh_conn();
+        add_location(&conn, "home");
+        let config = Config::default();
+        for (values, says) in [
+            (&["atlantis=1"][..], "\"atlantis\", which is not a registered location"),
+            (&["home"][..], "must be NAME=N"),
+            (&["home=one"][..], "is not a whole number"),
+            (&["home=1.5"][..], "is not a whole number"),
+            (&["home=-1"][..], "\"home\" = -1 must be >= 0"),
+            (&["home=1", "home=2"][..], "names \"home\" twice"),
+            (&["=1"][..], "blank location"),
+        ] {
+            for dry_run in [false, true] {
+                let err = run(
+                    &conn,
+                    &config,
+                    &ArchiveSetCommands::Create {
+                        name: "media".to_string(),
+                        policy: with_copies_at(values),
+                    },
+                    false,
+                    dry_run,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains(says), "{values:?} dry_run={dry_run}: {err}");
+            }
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "nothing was created");
+
+        run(&conn, &config, &create_cmd("media", None, None), false, false).unwrap();
+        let err = run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Edit {
+                name: "media".to_string(),
+                policy: with_copies_at(&["home=1", "lemuria=1"]),
+            },
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("\"lemuria\""), "{err}");
+        assert_eq!(stored_copies_at(&conn, "media"), None);
+
+        let mut config = Config::default();
+        let mut media = set_config("media");
+        media.copies_at = Some([("mu".to_string(), 1)].into_iter().collect());
+        config.archive_sets.push(media);
+        let err = run(&conn, &config, &ArchiveSetCommands::Sync, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("archive set \"media\""), "{err}");
+        assert!(err.contains("copies_at names \"mu\""), "{err}");
+        assert_eq!(stored_copies_at(&conn, "media"), None, "sync is all or nothing");
     }
 }
