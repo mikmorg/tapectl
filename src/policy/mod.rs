@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rusqlite::{params, Connection};
 
 use crate::config::Config;
@@ -43,6 +45,41 @@ pub struct ResolvedPolicy {
     /// may span must freeze it when it is planned (`writes.may_span`, item
     /// 121), because the dotfile can change while a span is in progress.
     pub allow_spanning: bool,
+    /// #493 (ADR-0012 items 148, 149, 155, 156): how many copies the unit
+    /// should hold at each named location. Empty when no layer sets a
+    /// target: the unit then behaves exactly as before 1.7.x.
+    ///
+    /// **The most specific layer that sets the map wins entirely** (item
+    /// 156): the dotfile's `[policy.copies_at]`, else the archive set's, else
+    /// `[defaults] copies_at`. Maps never merge across layers: a dotfile that
+    /// names only `offsite` drops a `home` its archive set named. An empty
+    /// map is a setting too (an explicit "no targets" that hides the layers
+    /// below), as `allow_spanning = false` is a choice and not silence.
+    ///
+    /// **An archive set's `required_locations` counts as `{name = 1}` at that
+    /// set's layer** (item 156), with the set's own `copies_at` laid over it
+    /// name by name: `required_locations = ["home", "offsite"]` with
+    /// `copies_at = { home = 2 }` is `{ home = 2, offsite = 1 }`. The set
+    /// "sets" the map when its `copies_at` is not NULL or its
+    /// `required_locations` names at least one location, so a set that only
+    /// requires locations hides `[defaults] copies_at`. `required_locations`
+    /// itself is unchanged and still resolved into its own field.
+    ///
+    /// **The dotfile layer** is the dotfile when it is present, with or
+    /// without the key (present without it, the layer is silent and the
+    /// frozen value is NOT used); and `units.copies_at_frozen` (item 148,
+    /// [`freeze_copies_at`]) when the dotfile is absent or the unit has no
+    /// path, so a unit whose source is gone keeps the targets its dotfile
+    /// last set instead of silently deferring to its archive set.
+    ///
+    /// Every count is 0 or more ([`crate::config::validate_copies_at`]), and
+    /// every name a `copies_at` key brought into the winning map is a
+    /// registered location (item 155), or the unit's policy is
+    /// unresolvable, naming the name and the layer. Names folded in from
+    /// `required_locations` are checked where they are written (`archive-set
+    /// create`/`edit`/`sync`, #348), as before, so a catalog that sets no
+    /// `copies_at` resolves exactly as it did, and with no statement more.
+    pub copies_at: BTreeMap<String, i64>,
 }
 
 /// Resolve the effective policy for a unit.
@@ -110,6 +147,15 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         dirty_on_metadata_change: defaults.dirty_on_metadata_change,
         warehouse_copies: defaults.warehouse_copies,
         allow_spanning: defaults.allow_spanning,
+        copies_at: defaults.copies_at.clone(),
+    };
+    // Which layer set `policy.copies_at`, and the names in it that a
+    // `copies_at` key (not `required_locations`) brought, for the
+    // registered-location check at the end.
+    let mut copies_at_from = CopiesAtSource {
+        layer: PolicyLayer::Defaults,
+        what: "config.toml's [defaults] copies_at".to_string(),
+        keyed: defaults.copies_at.keys().cloned().collect(),
     };
 
     // Layer 2: Archive set (if unit has one)
@@ -126,7 +172,8 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             .query_row(
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
-                    preserve_fsa, dirty_on_metadata_change, warehouse_copies, allow_spanning
+                    preserve_fsa, dirty_on_metadata_change, warehouse_copies, allow_spanning,
+                    copies_at, name
              FROM archive_sets WHERE id = ?1",
                 params![as_id],
                 |row| {
@@ -144,6 +191,8 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, Option<i64>>(11)?,
                         row.get::<_, Option<i64>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, String>(14)?,
                     ))
                 },
             )
@@ -173,6 +222,8 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             dirty_on_meta,
             warehouse_copies,
             allow_spanning,
+            copies_at_json,
+            set_name,
         ) = row;
 
         if let Some(v) = min_copies {
@@ -231,10 +282,49 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         if let Some(v) = allow_spanning {
             policy.allow_spanning = v != 0;
         }
+        // #493: the set's map is its `required_locations` at one copy each,
+        // with its own `copies_at` (migration 040; NULL defers) laid over
+        // it. Either one makes this layer set the map (see the field's doc).
+        // Every writer stores `serde_json::to_string` of a map, so a value
+        // that will not parse is corruption, refused by name like a corrupt
+        // `required_locations` above.
+        let set_copies_at = copies_at_json
+            .map(|text| {
+                serde_json::from_str::<BTreeMap<String, i64>>(&text).map_err(|e| {
+                    TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::ArchiveSet,
+                        detail: format!(
+                            "archive set \"{set_name}\" has an unparseable copies_at value \
+                             ({e}); expected a JSON object of location names to copy counts, \
+                             found: {text}"
+                        ),
+                    }
+                })
+            })
+            .transpose()?;
+        if set_copies_at.is_some() || !policy.required_locations.is_empty() {
+            let mut map: BTreeMap<String, i64> = policy
+                .required_locations
+                .iter()
+                .map(|name| (name.clone(), 1))
+                .collect();
+            let keyed = set_copies_at
+                .as_ref()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            map.extend(set_copies_at.unwrap_or_default());
+            policy.copies_at = map;
+            copies_at_from = CopiesAtSource {
+                layer: PolicyLayer::ArchiveSet,
+                what: format!("archive set \"{set_name}\"'s copies_at"),
+                keyed,
+            };
+        }
     }
 
     // Layer 1: Unit dotfile [policy] section (highest priority)
     // Read from disk if the unit has a path
+    let mut dotfile_present = false;
     if let Some(ref path) = unit.current_path {
         let dotfile_path = std::path::Path::new(path).join(".tapectl-unit.toml");
         // `exists()` is the whole absent-vs-present split: a unit with no
@@ -244,6 +334,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         // and the read, which is NOT the same as never having existed and
         // must not be quietly folded back into "absent".
         if dotfile_path.exists() {
+            dotfile_present = true;
             let contents = std::fs::read_to_string(&dotfile_path).map_err(|e| {
                 TapectlError::PolicyUnresolvable {
                     layer: PolicyLayer::Dotfile,
@@ -377,11 +468,122 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 if let Some(v) = section.allow_spanning {
                     policy.allow_spanning = v;
                 }
+                // #493 (items 155, 156): present, the dotfile's map replaces
+                // the lower layers' whole; absent, they stand.
+                if let Some(map) = section.copies_at {
+                    copies_at_from = CopiesAtSource {
+                        layer: PolicyLayer::Dotfile,
+                        what: format!("the [policy.copies_at] of {}", dotfile_path.display()),
+                        keyed: map.keys().cloned().collect(),
+                    };
+                    policy.copies_at = map;
+                }
             }
         }
     }
 
+    // #493 (item 148): with no dotfile to read, the dotfile layer is what the
+    // dotfile last said with the source present (`freeze_copies_at`). Only
+    // when ABSENT: a present dotfile without the key is silent, and its
+    // frozen value, which the next freeze point clears, must not leak
+    // through. Read from the row, so this costs no statement.
+    if !dotfile_present {
+        if let Some(text) = &unit.copies_at_frozen {
+            let map = serde_json::from_str::<BTreeMap<String, i64>>(text).map_err(|e| {
+                TapectlError::PolicyUnresolvable {
+                    layer: PolicyLayer::Dotfile,
+                    detail: format!(
+                        "unit \"{}\" has an unparseable frozen copies_at \
+                         (units.copies_at_frozen: {e}); expected a JSON object of location \
+                         names to copy counts, found: {text}",
+                        unit.name
+                    ),
+                }
+            })?;
+            copies_at_from = CopiesAtSource {
+                layer: PolicyLayer::Dotfile,
+                what: format!(
+                    "the copies_at its dotfile last set (frozen in the catalog; the \
+                     .tapectl-unit.toml{} is not there to read)",
+                    unit.current_path
+                        .as_deref()
+                        .map(|p| format!(" in {p}"))
+                        .unwrap_or_default()
+                ),
+                keyed: map.keys().cloned().collect(),
+            };
+            policy.copies_at = map;
+        }
+    }
+
+    check_copies_at(conn, unit, &policy.copies_at, &copies_at_from)?;
+
     Ok(policy)
+}
+
+/// Which layer set a resolved `copies_at` map, for [`check_copies_at`].
+struct CopiesAtSource {
+    layer: PolicyLayer,
+    /// The map as an operator finds it, for the message.
+    what: String,
+    /// The names a `copies_at` key brought into the map. Names folded in
+    /// from an archive set's `required_locations` are not here: they were
+    /// checked when written (#348).
+    keyed: Vec<String>,
+}
+
+/// The resolved `copies_at` map's two rules (#493, ADR-0012 items 149 and
+/// 155): every count is 0 or more, and every name a `copies_at` key brought
+/// is a registered location. Either failing makes the unit's policy
+/// unresolvable, naming the unit, the layer and what to fix. The location
+/// list is read in ONE statement, and only when there is a name to check,
+/// so a catalog that sets no `copies_at` pays nothing for it.
+fn check_copies_at(
+    conn: &Connection,
+    unit: &Unit,
+    map: &BTreeMap<String, i64>,
+    from: &CopiesAtSource,
+) -> Result<()> {
+    crate::config::validate_copies_at(map).map_err(|e| TapectlError::PolicyUnresolvable {
+        layer: from.layer,
+        detail: format!("unit \"{}\": {} {e}", unit.name, from.what),
+    })?;
+    if from.keyed.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = conn
+        .prepare("SELECT name FROM locations ORDER BY name")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let unknown: Vec<String> = from
+        .keyed
+        .iter()
+        .filter(|name| !registered.contains(name))
+        .map(|name| format!("\"{name}\""))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let known = if registered.is_empty() {
+        "no locations are registered yet".to_string()
+    } else {
+        format!("registered locations: {}", registered.join(", "))
+    };
+    let what = if unknown.len() == 1 {
+        "which is not a registered location"
+    } else {
+        "which are not registered locations"
+    };
+    Err(TapectlError::PolicyUnresolvable {
+        layer: from.layer,
+        detail: format!(
+            "unit \"{}\": {} names {}, {what} ({known}). Register a location with \
+             `tapectl location add <name>`, or fix the name.",
+            unit.name,
+            from.what,
+            unknown.join(", "),
+        ),
+    })
 }
 
 /// A volume's resolved `verify_interval_days` (ADR-0012 2026-10-07 item 1):
@@ -763,6 +965,303 @@ slice_size = "500M"
             let msg = resolve(&conn, &config, &unit).unwrap_err().to_string();
             assert!(msg.contains(bad), "{bad}: {msg}");
             assert!(msg.contains(".tapectl-unit.toml"), "{bad}: {msg}");
+        }
+    }
+
+    /// A map of location to count, for the `copies_at` tests.
+    fn map(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    }
+
+    /// A unit directory whose dotfile holds `text`.
+    fn dotfile_dir(text: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".tapectl-unit.toml"), text).unwrap();
+        tmp
+    }
+
+    fn path_of(dir: &TempDir) -> Option<String> {
+        Some(dir.path().to_str().unwrap().to_string())
+    }
+
+    /// A catalog with the locations `home`, `offsite` and `vault`.
+    fn conn_with_locations() -> Connection {
+        let conn = fresh_conn();
+        conn.execute_batch(
+            "INSERT INTO locations (name) VALUES ('home');
+             INSERT INTO locations (name) VALUES ('offsite');
+             INSERT INTO locations (name) VALUES ('vault');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn archive_set(conn: &Connection, name: &str, required: Option<&str>, copies_at: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO archive_sets (name, required_locations, copies_at) VALUES (?1, ?2, ?3)",
+            params![name, required, copies_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// #493 (ADR-0012 items 149, 155, 156): `copies_at` resolves at every
+    /// layer (`[defaults]`, the archive set, the dotfile, in its sub-table and
+    /// inline spellings), and the most specific layer that sets it wins
+    /// ENTIRELY: maps never merge, an empty map is a setting, and a layer
+    /// that does not say (a NULL column, a dotfile without the key) defers.
+    #[test]
+    fn copies_at_resolves_at_every_layer_and_the_most_specific_wins_entirely() {
+        let conn = conn_with_locations();
+        let mut config = Config::default();
+        config.defaults.copies_at = map(&[("home", 1), ("vault", 1)]);
+        let set = archive_set(&conn, "media", None, Some(r#"{"home":2,"offsite":1}"#));
+        let silent = archive_set(&conn, "silent", None, None);
+        let empty = archive_set(&conn, "empty", None, Some("{}"));
+        let resolved = |set: Option<i64>, dir: Option<&TempDir>| {
+            resolve(&conn, &config, &make_unit(set, dir.and_then(path_of)))
+                .unwrap()
+                .copies_at
+        };
+
+        assert_eq!(resolved(None, None), map(&[("home", 1), ("vault", 1)]), "defaults");
+        assert_eq!(
+            resolved(Some(silent), None),
+            map(&[("home", 1), ("vault", 1)]),
+            "a NULL archive-set column defers to [defaults]"
+        );
+        assert_eq!(
+            resolved(Some(set), None),
+            map(&[("home", 2), ("offsite", 1)]),
+            "the set over [defaults], whole: no vault from below"
+        );
+        assert_eq!(
+            resolved(Some(empty), None),
+            map(&[]),
+            "an empty map is a setting, and hides [defaults]"
+        );
+
+        let sub_table = dotfile_dir("[policy.copies_at]\noffsite = 3\n");
+        let inline = dotfile_dir("[policy]\ncopies_at = { offsite = 3 }\n");
+        for dir in [&sub_table, &inline] {
+            assert_eq!(
+                resolved(Some(set), Some(dir)),
+                map(&[("offsite", 3)]),
+                "the dotfile over the set, whole: no home from below"
+            );
+        }
+        let says_nothing = dotfile_dir("[policy]\nslice_size = \"500M\"\n");
+        assert_eq!(
+            resolved(Some(set), Some(&says_nothing)),
+            map(&[("home", 2), ("offsite", 1)]),
+            "a dotfile without the key defers to the set"
+        );
+        assert_eq!(
+            resolved(Some(silent), Some(&says_nothing)),
+            map(&[("home", 1), ("vault", 1)]),
+            "...and through a silent set to [defaults]"
+        );
+        let none_here = dotfile_dir("[policy.copies_at]\n");
+        assert_eq!(
+            resolved(Some(set), Some(&none_here)),
+            map(&[]),
+            "an empty dotfile map hides every layer below"
+        );
+    }
+
+    /// #493 (item 156): an archive set's `required_locations` counts as
+    /// `{name = 1}` at the set's layer, with its own `copies_at` laid over it
+    /// name by name. A set that only requires locations still sets the map
+    /// (hiding `[defaults]`); one whose list is empty and whose `copies_at` is
+    /// NULL does not. `required_locations` itself resolves as before.
+    #[test]
+    fn required_locations_folds_into_the_archive_set_layers_map() {
+        let conn = conn_with_locations();
+        let mut config = Config::default();
+        config.defaults.copies_at = map(&[("vault", 4)]);
+        let required = archive_set(&conn, "required", Some(r#"["home","offsite"]"#), None);
+        let both = archive_set(
+            &conn,
+            "both",
+            Some(r#"["home","offsite"]"#),
+            Some(r#"{"home":2,"vault":1}"#),
+        );
+        let empty_list = archive_set(&conn, "empty-list", Some("[]"), None);
+        let resolved = |set: i64| resolve(&conn, &config, &make_unit(Some(set), None)).unwrap();
+
+        let p = resolved(required);
+        assert_eq!(p.copies_at, map(&[("home", 1), ("offsite", 1)]));
+        assert_eq!(p.required_locations, vec!["home", "offsite"], "unchanged");
+        assert_eq!(
+            resolved(both).copies_at,
+            map(&[("home", 2), ("offsite", 1), ("vault", 1)]),
+            "the set's copies_at over its required_locations, name by name"
+        );
+        assert_eq!(
+            resolved(empty_list).copies_at,
+            map(&[("vault", 4)]),
+            "an empty list names no location, so [defaults] stands"
+        );
+
+        // The dotfile over a set's folded map, whole.
+        let here = dotfile_dir("[policy.copies_at]\nvault = 1\n");
+        let p = resolve(&conn, &config, &make_unit(Some(required), path_of(&here))).unwrap();
+        assert_eq!(p.copies_at, map(&[("vault", 1)]));
+        assert_eq!(p.required_locations, vec!["home", "offsite"], "unchanged");
+    }
+
+    /// #493 (item 155): a `copies_at` name with no registered location makes
+    /// the unit's policy unresolvable, naming the name and the layer, at
+    /// every layer. Names an archive set's `required_locations` brought are
+    /// checked where they are written (#348), not here, as before.
+    #[test]
+    fn an_unknown_location_in_copies_at_is_refused_naming_it_and_the_layer() {
+        let conn = conn_with_locations();
+        let refused = |config: &Config, unit: &Unit| match resolve(&conn, config, unit) {
+            Err(TapectlError::PolicyUnresolvable { layer, detail }) => (layer, detail),
+            other => panic!("expected PolicyUnresolvable, got {other:?}"),
+        };
+
+        let mut config = Config::default();
+        config.defaults.copies_at = map(&[("home", 1), ("atlantis", 1)]);
+        let (layer, detail) = refused(&config, &make_unit(None, None));
+        assert_eq!(layer, PolicyLayer::Defaults);
+        assert!(detail.contains("\"atlantis\""), "{detail}");
+        assert!(detail.contains("[defaults] copies_at"), "{detail}");
+        assert!(detail.contains("tapectl location add"), "{detail}");
+        assert!(!detail.contains("\"home\""), "only the unknown name: {detail}");
+
+        let config = Config::default();
+        let set = archive_set(&conn, "media", None, Some(r#"{"lemuria":1}"#));
+        let (layer, detail) = refused(&config, &make_unit(Some(set), None));
+        assert_eq!(layer, PolicyLayer::ArchiveSet);
+        assert!(detail.contains("\"lemuria\""), "{detail}");
+        assert!(detail.contains("archive set \"media\""), "{detail}");
+
+        let dir = dotfile_dir("[policy.copies_at]\nhome = 1\nmu = 1\nhy-brasil = 2\n");
+        let (layer, detail) = refused(&config, &make_unit(None, path_of(&dir)));
+        assert_eq!(layer, PolicyLayer::Dotfile);
+        assert!(detail.contains("\"hy-brasil\", \"mu\""), "{detail}");
+        assert!(detail.contains("which are not registered locations"), "{detail}");
+        assert!(detail.contains(".tapectl-unit.toml"), "{detail}");
+
+        let mut gone = make_unit(None, None);
+        gone.copies_at_frozen = Some(r#"{"thule":1}"#.into());
+        let (layer, detail) = refused(&config, &gone);
+        assert_eq!(layer, PolicyLayer::Dotfile);
+        assert!(detail.contains("\"thule\""), "{detail}");
+        assert!(detail.contains("frozen"), "{detail}");
+
+        // The positive control and the "as before" half: a registered name
+        // resolves, and a `required_locations` name is not checked here.
+        let fine = archive_set(&conn, "fine", Some(r#"["nowhere"]"#), Some(r#"{"home":1}"#));
+        let p = resolve(&conn, &config, &make_unit(Some(fine), None)).unwrap();
+        assert_eq!(p.copies_at, map(&[("home", 1), ("nowhere", 1)]));
+    }
+
+    /// #493 (item 148, the coordinator's freeze mechanics): the frozen
+    /// `units.copies_at_frozen` is the dotfile layer only while the dotfile
+    /// is ABSENT (no file in the unit's folder, the folder gone, or no path
+    /// at all). A present dotfile always wins over it: with the key, its own
+    /// map; without the key, the layer is silent and the frozen value is not
+    /// used.
+    #[test]
+    fn the_frozen_copies_at_is_the_dotfile_layer_only_while_the_dotfile_is_absent() {
+        let conn = conn_with_locations();
+        let config = Config::default();
+        let set = archive_set(&conn, "media", None, Some(r#"{"home":2}"#));
+        let resolved = |path: Option<String>| {
+            let mut unit = make_unit(Some(set), path);
+            unit.copies_at_frozen = Some(r#"{"offsite":1,"vault":1}"#.into());
+            resolve(&conn, &config, &unit).unwrap().copies_at
+        };
+        let frozen = map(&[("offsite", 1), ("vault", 1)]);
+
+        let no_dotfile = TempDir::new().unwrap();
+        assert_eq!(resolved(path_of(&no_dotfile)), frozen, "no dotfile in the folder");
+        assert_eq!(
+            resolved(Some("/nonexistent/tapectl-493".into())),
+            frozen,
+            "the folder is gone (a tape-only unit)"
+        );
+        assert_eq!(resolved(None), frozen, "no path at all");
+
+        let says_nothing = dotfile_dir("[policy]\nslice_size = \"500M\"\n");
+        assert_eq!(
+            resolved(path_of(&says_nothing)),
+            map(&[("home", 2)]),
+            "a present dotfile without the key is silent: the set's, not the frozen value"
+        );
+        let says_home = dotfile_dir("[policy.copies_at]\nhome = 1\n");
+        assert_eq!(resolved(path_of(&says_home)), map(&[("home", 1)]));
+
+        // NULL frozen with the dotfile absent: the lower layers decide.
+        let unit = make_unit(Some(set), path_of(&no_dotfile));
+        assert_eq!(
+            resolve(&conn, &config, &unit).unwrap().copies_at,
+            map(&[("home", 2)])
+        );
+    }
+
+    /// #493: a negative count (in the dotfile, frozen, or an archive set's
+    /// column) and an unparseable stored map are refused by name, never read
+    /// as "no targets".
+    #[test]
+    fn a_bad_copies_at_count_or_stored_map_is_refused_by_layer() {
+        let conn = conn_with_locations();
+        let config = Config::default();
+        let refused = |unit: &Unit| match resolve(&conn, &config, unit) {
+            Err(TapectlError::PolicyUnresolvable { layer, detail }) => (layer, detail),
+            other => panic!("expected PolicyUnresolvable, got {other:?}"),
+        };
+
+        let dir = dotfile_dir("[policy.copies_at]\nhome = -1\n");
+        let (layer, detail) = refused(&make_unit(None, path_of(&dir)));
+        assert_eq!(layer, PolicyLayer::Dotfile);
+        assert!(detail.contains("\"home\" = -1 must be >= 0"), "{detail}");
+
+        let mut gone = make_unit(None, None);
+        gone.copies_at_frozen = Some("[not a map".into());
+        let (layer, detail) = refused(&gone);
+        assert_eq!(layer, PolicyLayer::Dotfile);
+        assert!(detail.contains("copies_at_frozen"), "{detail}");
+
+        gone.copies_at_frozen = Some(r#"{"home":-3}"#.into());
+        let (layer, detail) = refused(&gone);
+        assert_eq!(layer, PolicyLayer::Dotfile);
+        assert!(detail.contains("\"home\" = -3"), "{detail}");
+
+        let corrupt = archive_set(&conn, "corrupt", None, Some(r#"["home"]"#));
+        let (layer, detail) = refused(&make_unit(Some(corrupt), None));
+        assert_eq!(layer, PolicyLayer::ArchiveSet);
+        assert!(detail.contains("unparseable copies_at"), "{detail}");
+        assert!(detail.contains("\"corrupt\""), "{detail}");
+
+        let negative = archive_set(&conn, "negative", None, Some(r#"{"home":-1}"#));
+        let (layer, detail) = refused(&make_unit(Some(negative), None));
+        assert_eq!(layer, PolicyLayer::ArchiveSet);
+        assert!(detail.contains("\"home\" = -1"), "{detail}");
+    }
+
+    /// #493: with no `copies_at` at any layer and no frozen value, a unit's
+    /// policy resolves exactly as before: an empty map, every other field as
+    /// it was, and `required_locations` folded only into the new map.
+    #[test]
+    fn with_no_copies_at_anywhere_a_unit_resolves_exactly_as_before() {
+        let conn = conn_with_locations();
+        let config = Config::default();
+        let plain = archive_set(&conn, "plain", None, None);
+        let dir = dotfile_dir("[policy]\ncompression = \"gzip\"\n");
+        for (set, path) in [
+            (None, None),
+            (Some(plain), None),
+            (Some(plain), path_of(&dir)),
+            (None, path_of(&dir)),
+        ] {
+            let p = resolve(&conn, &config, &make_unit(set, path.clone())).unwrap();
+            assert!(p.copies_at.is_empty(), "{set:?} {path:?}");
+            assert_eq!(p.min_copies, 2);
+            assert!(p.required_locations.is_empty());
         }
     }
 
