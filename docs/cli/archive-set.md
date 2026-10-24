@@ -45,6 +45,7 @@ tapectl archive-set create [OPTIONS] <NAME>
 - `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
 - `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
 - `--allow-spanning <ALLOW_SPANNING>` *(one of `true`, `false`)* — Let this set's units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
+- `--copies-at <NAME=N>` — Copies each unit should hold at a location, as NAME=N (repeatable, e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]"
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set edit
@@ -74,6 +75,7 @@ tapectl archive-set edit [OPTIONS] <NAME>
 - `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
 - `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
 - `--allow-spanning <ALLOW_SPANNING>` *(one of `true`, `false`)* — Let this set's units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
+- `--copies-at <NAME=N>` — Copies each unit should hold at a location, as NAME=N (repeatable, e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]"
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set list
