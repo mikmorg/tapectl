@@ -2173,3 +2173,26 @@ Ruled 2026-10-24, the CTO's per-location copy targets and auto-stage for a locat
 154. **Staging is released on the copy floor by default**, as now. A later location's copy is staged
      again, from the source or by read-slices. A run may pass `--keep-staging-for-locations` to hold
      staging until every per-location target is met, when staging has room.
+
+Ruled 2026-10-24, per-location copy targets, round 2 (the design is complete; #493):
+
+155. **The dotfile spells it `[policy.copies_at]`, one `location = count` line each** (TOML's
+     inline form `copies_at = { home = 1 }` is the same table). A name with no registered location
+     makes the unit's policy unresolvable, refused by name, as an archive set's names are.
+     `location rename` rewrites the frozen catalog targets and every present dotfile, as it
+     already rewrites archive sets.
+156. **The most specific layer that sets `copies_at` wins entirely**: dotfile, then archive set,
+     then `[defaults]`, as every other key overlays. An archive set's `required_locations` counts as
+     `{name = 1}` at that set's layer.
+157. **A target may name a warehouse, counted by its deposits.** `stage for-location` refuses a
+     warehouse, naming `volume deposit add` and the tapes that would meet the target.
+158. **Need at X has two groups.** First, the units whose target at X is unmet, by how far short
+     (item 152). Then the units short of their total copy floor that have no target at X and no copy
+     at X yet. A unit holding all its copies at X is never picked for X.
+159. **A span in progress continues only on a tape bound for the location of its earlier ranges**
+     (items 122, 134), its owed run first. Auto-stage for another location leaves it waiting.
+160. **The reports and audit:**
+     - `report needs [--location X] [--json]` gives each unit's target, copies and shortfall per
+       location;
+     - audit's `location_presence` check extends to the map;
+     - `volume plan --policy-aware` counts a per-location shortfall as a need.
