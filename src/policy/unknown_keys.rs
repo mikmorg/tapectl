@@ -50,6 +50,7 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "warehouse_copies",
     "verify_interval_days",
     "allow_spanning",
+    "copies_at",
 ];
 
 /// Every unknown key in the `[defaults]` table of `toml_text`.
@@ -193,6 +194,21 @@ min_copies = 5
             "DEFAULTS_FIELDS lacks an optional [defaults] key: {:?}",
             scan(&text)
         );
+    }
+
+    /// #493: `[defaults] copies_at` is a real key in both its spellings. The
+    /// inline table is scanned as a `copies_at` key; the `[defaults.copies_at]`
+    /// table (how a serialized config writes it) ends `[defaults]`, so its
+    /// location names are never mistaken for `[defaults]` keys.
+    #[test]
+    fn defaults_copies_at_is_known_inline_and_as_a_table() {
+        let inline = "[defaults]\ncopies_at = { home = 1, offsite = 1 }\n";
+        assert!(scan(inline).is_empty(), "{:?}", scan(inline));
+        let mut cfg = crate::config::Config::default();
+        cfg.defaults.copies_at.insert("home".into(), 1);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("[defaults.copies_at]"), "{text}");
+        assert!(scan(&text).is_empty(), "{:?}", scan(&text));
     }
 
     /// A serialized real config must be clean, or `config check` would warn

@@ -198,6 +198,7 @@ mod tests {
             preserve_fsa: None,
             dirty_on_metadata_change: Some(true),
             allow_spanning: None,
+            copies_at: None,
         });
         let conn = crate::db::open_memory().unwrap();
         for (name, dirty) in [("media", 1), ("docs", 1), ("cold", 0)] {
