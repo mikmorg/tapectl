@@ -7958,9 +7958,9 @@ fn restore_losing_a_folder(
     extra: &[&str],
 ) -> (Heir, String, i32, String, Vec<String>) {
     let u = unit_of(t, "foldered");
-    for idx in 1..u.positions.len() - 1 {
+    for &pos in &u.positions[1..u.positions.len() - 1] {
         let h = Heir::of(t, &[]);
-        flip_in_tape(&h, u.positions[idx]);
+        flip_in_tape(&h, pos);
         let empty = h.sub("empty");
         std::fs::create_dir_all(&empty).unwrap();
         let dest = h.sub("restored");
@@ -8067,6 +8067,10 @@ fn a_folder_whose_entry_is_in_a_lost_slice_is_listed_as_its_files_and_filled() {
     );
     assert!(!text.contains("folder(s): what is missing"), "{text}");
     assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(
+        !text.contains("listed folder(s) only what was missing"),
+        "{text}"
+    );
     assert!(!list.exists(), "the list is removed");
     assert!(same_tree(&src, Path::new(&dest)), "{text}");
 }
@@ -8141,6 +8145,13 @@ fn without_an_index_a_lost_folder_stays_listed_and_the_fill_restores_what_is_mis
         "{ftext}"
     );
     assert!(ftext.contains("FILL COMPLETE"), "{ftext}");
+    assert!(
+        ftext.contains(&format!(
+            "  In the {} listed folder(s) only what was missing was restored: what was there already",
+            dirs.len()
+        )),
+        "the verdict says what a folder's fill left as it was:\n{ftext}"
+    );
     assert!(!list.exists(), "the list is removed");
     assert_eq!(
         std::fs::read_to_string(&kept).unwrap(),

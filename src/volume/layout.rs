@@ -6640,6 +6640,7 @@ restore_end() {
 FILL_ESC=()
 FILL_PATH=()
 FILL_KIND=()
+FILL_DIRS=0
 do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   local destdir=$1 want_version=${2:-} scr=${3:-} list=$FILL_FROM
   local first magic fmt f_unit f_uuid f_ver unit uuid ver line p root listdir todir sub
@@ -6692,7 +6693,7 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   FILL_ESC=()
   FILL_PATH=()
   FILL_KIND=()
-  local dirs=0
+  FILL_DIRS=0
   : >"$WORK/fill.wanted"
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -6709,7 +6710,7 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
     # restored, and nothing there is overwritten.
     if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
       FILL_KIND+=(dir)
-      dirs=$((dirs + 1))
+      FILL_DIRS=$((FILL_DIRS + 1))
     else
       FILL_KIND+=(file)
     fi
@@ -6719,8 +6720,8 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   done < <(tail -n +2 "$list")
   [ ${#FILL_PATH[@]} -gt 0 ] || die "$list names no file"
   info "Filling ${#FILL_PATH[@]} file(s) of unit '$(visible_text "$unit")', version $ver, in $root"
-  if [ "$dirs" -gt 0 ]; then
-    info "  $dirs of them are folder(s): what is missing in each is restored, and nothing there is overwritten"
+  if [ "$FILL_DIRS" -gt 0 ]; then
+    info "  $FILL_DIRS of them are folder(s): what is missing in each is restored, and nothing there is overwritten"
   fi
 
   SCRATCH_PARENT=${scr:-$root}
@@ -6900,6 +6901,10 @@ fill_end() { # <list> <root>
     rm -f "$list"
     info "FILL COMPLETE: every listed file of '$(visible_text "$UNIT_NAME")' was restored from this tape into $root"
     info "  (dar checked each one). $list is removed."
+    if [ "$FILL_DIRS" -gt 0 ]; then
+      info "  In the $FILL_DIRS listed folder(s) only what was missing was restored: what was there already"
+      info "  is as it was."
+    fi
     return 0
   fi
   {
