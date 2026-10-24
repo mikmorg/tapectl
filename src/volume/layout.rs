@@ -2581,9 +2581,9 @@ fewer, and its seal marker says where it ended ("Where the tape ended").
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_LIST,
-        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED,
+        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
         AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
@@ -5958,8 +5958,8 @@ damaged_header() { # <unit> <uuid> <version>
 
 # One unit's note for the end of a run that did not get everything: how many
 # files, where the list is, and the command that fills them from another copy.
-damage_note() { # <count> <list file> <slices not available, or empty>
-  local n=$1 list=$2 gone=${3:-} to=${RESTORE_TO:-DIR}
+damage_note() { # <count> <list file> <slices not available, or empty> [folders on the list]
+  local n=$1 list=$2 gone=${3:-} dirs=${4:-0} to=${RESTORE_TO:-DIR}
   if [ "${CHECK_ADDED:-0}" -eq 0 ]; then
     echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored."
   elif [ "$CHECK_ADDED" -eq "$n" ]; then
@@ -5972,6 +5972,10 @@ damage_note() { # <count> <list file> <slices not available, or empty>
   fi
   if [ -n "$gone" ]; then
     echo "  Slice(s) not available: $gone. The files in them are among those listed."
+  fi
+  if [ "$dirs" -gt 0 ]; then
+    echo "  $dirs of them are folder(s) dar restored nothing in (the slice that holds a folder's own entry"
+    echo "  was not there). A fill restores what is missing in each folder, and overwrites nothing there."
   fi
   echo "  They are listed, one path per line, in"
   echo "    $list"
@@ -5986,15 +5990,21 @@ damage_note() { # <count> <list file> <slices not available, or empty>
 # Write the list of files dar could not restore into the unit's directory and
 # note the unit as incomplete.
 record_damage() { # <destination> <file of escaped paths> <slices not available, or empty>
-  local destdir=$1 paths=$2 gone=${3:-} n list
+  local destdir=$1 paths=$2 gone=${3:-} n list line dirs=0
   list="$destdir/$DAMAGED_NAME"
   n=$(wc -l <"$paths")
   {
     damaged_header "$UNIT_NAME" "$UNIT_UUID" "$UNIT_VER"
     cat "$paths"
   } >"$list"
+  while IFS= read -r line; do
+    unesc_line "$line"
+    if [ -d "$destdir/$UNESC" ] && [ ! -L "$destdir/$UNESC" ]; then
+      dirs=$((dirs + 1))
+    fi
+  done <"$paths"
   UNIT_OK=0
-  INCOMPLETE+=("$(damage_note "$n" "$list" "$gone")")
+  INCOMPLETE+=("$(damage_note "$n" "$list" "$gone" "$dirs")")
 }
 
 # A list left by an earlier run of this very unit and version is out of date
@@ -6070,13 +6080,35 @@ index_for_unit() { # <unit> <version> <unit uuid>
   done
 }
 
+# The paths a --path restore asked for, escaped, one per line, in
+# $WORK/check.only: SCOPE_ONLY names that file, and is empty for a whole unit
+# (no --path, or a --path of the unit's root). dar restored those paths and,
+# for a directory, what is under it.
+SCOPE_ONLY=""
+restored_scope() {
+  local p
+  SCOPE_ONLY=""
+  [ ${#RESTORE_PATHS[@]} -gt 0 ] || return 0
+  : >"$WORK/check.only"
+  for p in "${RESTORE_PATHS[@]}"; do
+    p=${p#/}
+    p=${p#./}
+    while [ "${p%/}" != "$p" ]; do
+      p=${p%/}
+    done
+    [ -n "$p" ] || return 0
+    printf '%s\n' "$(escape_text "$p")" >>"$WORK/check.only"
+  done
+  SCOPE_ONLY="$WORK/check.only"
+}
+
 # Check the regular files of UNIT_NAME, version UNIT_VER, that were restored
 # into $1, against the index. With $2, a file of escaped paths, only those
 # (a fill). With --path, only what was asked for. The files that fail are left
 # in $CHECK_BAD, one per line and escaped as the index escapes a path; their
 # number is CHECK_FAILED.
 file_check() { # <destination> [<file of escaped paths to check>]
-  local destdir=$1 only=${2:-} p whole=0
+  local destdir=$1 only=${2:-} p
   local rows=0 files=0 checked=0 nohash=0
   : >"$CHECK_BAD"
   CHECK_FAILED=0
@@ -6103,22 +6135,10 @@ file_check() { # <destination> [<file of escaped paths to check>]
     fi
     return 0
   fi
-  # --path: dar restored these paths and, for a directory, what is under it.
-  if [ -z "$only" ] && [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
-    : >"$WORK/check.only"
-    for p in "${RESTORE_PATHS[@]}"; do
-      p=${p#/}
-      p=${p#./}
-      while [ "${p%/}" != "$p" ]; do
-        p=${p%/}
-      done
-      if [ -z "$p" ]; then
-        whole=1
-        break
-      fi
-      printf '%s\n' "$(escape_text "$p")" >>"$WORK/check.only"
-    done
-    [ "$whole" = 1 ] || only="$WORK/check.only"
+  # --path: only what it restored.
+  if [ -z "$only" ]; then
+    restored_scope
+    only=$SCOPE_ONLY
   fi
   if ! CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_ONLY="$only" CHK_SUMS="$WORK/check.sums" \
     CHK_COUNTS="$WORK/check.counts" \
@@ -6222,11 +6242,35 @@ dar_result() { # <log> <status> <destination> [slices not available]
   finish_damage "$destdir" "$gone"
 }
 
+# A folder on a list of damaged paths, replaced by what is under it when the
+# tape's index records it (ADR-0012 item 102): with the slice that holds a
+# folder's own entry missing, dar names the folder, restores nothing in it
+# ("No file in this directory will be restored.") and names nothing under it.
+# The list then names those files, a fill restores them like any other, and
+# the count counts files. With no index (a tape written before 1.3.0) the
+# folder stays on the list, and a fill restores what is missing in it
+# (fill_runs). This reads the envelopes on disk, not the tape, and is done
+# with --no-file-check too.
+expand_damaged_dirs() { # <file of escaped paths, rewritten in place>
+  local paths=$1
+  [ -s "$paths" ] || return 0
+  index_for_unit "$UNIT_NAME" "$UNIT_VER" "$UNIT_UUID"
+  [ -n "$CHECK_INDEX" ] || return 0
+  restored_scope
+  if CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_LIST="$paths" CHK_ONLY="$SCOPE_ONLY" \
+    awk '__AWK_INDEX_COMMON__ __AWK_DAMAGED_DIRS__' "$CHECK_INDEX" >"$paths.dirs"; then
+    mv "$paths.dirs" "$paths"
+  else
+    rm -f "$paths.dirs"
+  fi
+}
+
 # One unit's list, from the files dar named and the files the check finds: the
 # list is written when it holds any file, and a list left by an earlier run is
 # removed when it does not.
 finish_damage() { # <destination> <slices not available, or empty>
   local destdir=$1 gone=${2:-} dar_n all_n
+  expand_damaged_dirs "$WORK/damaged.new"
   file_check "$destdir"
   dar_n=$(wc -l <"$WORK/damaged.new")
   awk '!seen[$0]++' "$WORK/damaged.new" "$CHECK_BAD" >"$WORK/damaged.all"
@@ -6588,6 +6632,7 @@ restore_end() {
 # still damaged, and removed when nothing is.
 FILL_ESC=()
 FILL_PATH=()
+FILL_KIND=()
 do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   local destdir=$1 want_version=${2:-} scr=${3:-} list=$FILL_FROM
   local first magic fmt f_unit f_uuid f_ver unit uuid ver line p root listdir todir sub
@@ -6639,6 +6684,8 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
 
   FILL_ESC=()
   FILL_PATH=()
+  FILL_KIND=()
+  local dirs=0
   : >"$WORK/fill.wanted"
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -6650,9 +6697,14 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
     case "/$p/" in
     */../*) die "$list names a path with .. in it ($(visible_text "$p")): a list names paths inside the unit" ;;
     esac
+    # A folder here is one dar restored nothing in (a tape with no index
+    # names the folder, not the files under it): what is missing in it is
+    # restored, and nothing there is overwritten.
     if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
-      die "$list names a directory ($(visible_text "$p")): a fill restores files, and restoring a directory
-       would overwrite everything under it. Remove the line from the list."
+      FILL_KIND+=(dir)
+      dirs=$((dirs + 1))
+    else
+      FILL_KIND+=(file)
     fi
     FILL_ESC+=("$line")
     FILL_PATH+=("$p")
@@ -6660,6 +6712,9 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   done < <(tail -n +2 "$list")
   [ ${#FILL_PATH[@]} -gt 0 ] || die "$list names no file"
   info "Filling ${#FILL_PATH[@]} file(s) of unit '$(visible_text "$unit")', version $ver, in $root"
+  if [ "$dirs" -gt 0 ]; then
+    info "  $dirs of them are folder(s): what is missing in each is restored, and nothing there is overwritten"
+  fi
 
   SCRATCH_PARENT=${scr:-$root}
   mkdir -p "$SCRATCH_PARENT"
@@ -6752,12 +6807,11 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
 FILL_HEADER=""
 FILL_BAD="$WORK/fill.bad"
 
-# dar over the files of a fill, 500 paths to a run, always overwriting (these
-# are the files to replace) and never anything else: -g names a path and
-# takes no pattern. What dar reports it could not restore, and every path it
-# was never asked for because it is not in the catalogue, is still damaged.
+# dar over the paths of a fill: what dar reports it could not restore, and
+# every path it was never asked for because it is not in the catalogue, is
+# still damaged.
 fill_extract() { # <job>
-  local j=$1 root i k rc run=0 errs skipped unmapped failed
+  local j=$1 root
   root=$(abs_dir "${JOB_DEST[$j]}")
   UNIT_NAME=${JOB_UNIT[$j]} UNIT_VER=${JOB_VER[$j]} UNIT_UUID=${JOB_UUID[$j]}
   : >"$FILL_BAD"
@@ -6768,28 +6822,44 @@ fill_extract() { # <job>
     echo "NOTE: filling without slice(s) $gone: the files in them stay in the list." >&2
   fi
   awk 'FILENAME == ARGV[1] { a[$0] = 1; next } ($0 in a) { print FNR }' "$WORK/fill.present" "$WORK/fill.wanted" >"$WORK/fill.rows"
+  fill_runs "$j" "$root" file
+  fill_runs "$j" "$root" dir
+  rm -rf "$SCRATCH/job.$j"
+}
+
+# The listed paths of one kind, 500 to a dar run. A file is restored over its
+# damaged copy (-w: these are the files to replace); a folder with what is
+# missing in it and nothing there overwritten (-n). -g names a path and takes
+# no pattern, and a folder brings what is under it.
+FILL_RUN=0
+fill_runs() { # <job> <root> <file|dir>
+  local j=$1 root=$2 kind=$3 row rc errs skipped unmapped failed opt=-w
+  [ "$kind" = file ] || opt=-n
   local -a g=()
-  local row
-  k=0
   while true; do
     g=()
     while [ ${#g[@]} -lt 1000 ] && IFS= read -r row <&3; do
+      [ "${FILL_KIND[$((row - 1))]}" = "$kind" ] || continue
       g+=(-g "${FILL_PATH[$((row - 1))]}")
     done
     [ ${#g[@]} -gt 0 ] || break
-    run=$((run + 1))
+    FILL_RUN=$((FILL_RUN + 1))
     rc=0
-    info "Restoring $((${#g[@]} / 2)) file(s) over their damaged copies ..."
-    dar -x "$SCRATCH/job.$j/restore" -R "$root" -O -Q -N -w "${g[@]}" >"$WORK/fill.$run.log" 2>&1 </dev/null || rc=$?
-    cat "$WORK/fill.$run.log"
-    if [ "$rc" != 0 ] && grep -i 'no space left' "$WORK/fill.$run.log" >/dev/null 2>&1; then
-      die_io "dar extraction failed" "$WORK/fill.$run.log" "$root"
+    if [ "$kind" = file ]; then
+      info "Restoring $((${#g[@]} / 2)) file(s) over their damaged copies ..."
+    else
+      info "Restoring what is missing in $((${#g[@]} / 2)) folder(s), overwriting nothing there ..."
+    fi
+    dar -x "$SCRATCH/job.$j/restore" -R "$root" -O -Q -N "$opt" "${g[@]}" >"$WORK/fill.$FILL_RUN.log" 2>&1 </dev/null || rc=$?
+    cat "$WORK/fill.$FILL_RUN.log"
+    if [ "$rc" != 0 ] && grep -i 'no space left' "$WORK/fill.$FILL_RUN.log" >/dev/null 2>&1; then
+      die_io "dar extraction failed" "$WORK/fill.$FILL_RUN.log" "$root"
     fi
     if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
       die "dar extraction failed (exit $rc) — dar's own message is above. The list is unchanged."
     fi
     DAMAGED_ROOT=$root DAMAGED_SKIPS=1 DAMAGED_COUNTS="$WORK/damaged.counts" \
-      awk '__AWK_DAR_DAMAGED__' "$WORK/fill.$run.log" >>"$FILL_BAD"
+      awk '__AWK_DAR_DAMAGED__' "$WORK/fill.$FILL_RUN.log" >>"$FILL_BAD"
     errs=0 skipped=0 unmapped=0 failed=0
     read -r errs skipped unmapped failed <"$WORK/damaged.counts" || true
     if [ "$unmapped" -gt 0 ] || [ "$failed" -ne "$errs" ]; then
@@ -6797,7 +6867,6 @@ fill_extract() { # <job>
       echo "         name is missing from the rewritten list. Read dar's messages above." >&2
     fi
   done 3<"$WORK/fill.rows"
-  rm -rf "$SCRATCH/job.$j"
 }
 
 # After the fill: the list now holds the files still damaged, or is gone.
@@ -6817,6 +6886,7 @@ fill_end() { # <list> <root>
     awk '!seen[$0]++' "$WORK/fill.still" "$CHECK_BAD" >"$WORK/fill.still.new"
     mv "$WORK/fill.still.new" "$WORK/fill.still"
   fi
+  expand_damaged_dirs "$WORK/fill.still"
   n=$(wc -l <"$WORK/fill.still")
   echo ""
   if [ "$n" -eq 0 ]; then
@@ -7510,6 +7580,7 @@ esac
         .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
         .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
         .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
+        .replace("__AWK_DAMAGED_DIRS__", AWK_DAMAGED_DIRS)
         .replace("__AWK_CUT_VERSIONS__", AWK_CUT_VERSIONS)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
@@ -8369,9 +8440,9 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_LIST,
-        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED,
+        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
         AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
@@ -10894,6 +10965,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
+            ("AWK_DAMAGED_DIRS", AWK_DAMAGED_DIRS),
             ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(
@@ -11339,6 +11411,136 @@ sha256_encrypted = \"bbb\"
         );
     }
 
+    /// ADR-0012 item 102 (R2): the two fragments a folder dar restored nothing
+    /// in goes through, under every awk on the host. `AWK_DAMAGED_DIRS` puts
+    /// what the index records under a listed folder in its place (each entry
+    /// that is not a directory, and each directory with nothing under it),
+    /// keeps every other path of the list as it stands, never prints a path
+    /// that leaves the unit, and keeps to a `--path` scope. `AWK_FILL_LISTING`
+    /// asks for the slices of each wanted entry, of everything under a wanted
+    /// folder, and of the own entry of each folder above a wanted entry, and
+    /// matches an entry that has no slice (a symlink).
+    #[test]
+    fn the_folder_fragments_read_the_index_and_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let paths = d.join("paths.tsv");
+        std::fs::write(
+            &paths,
+            "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
+             docs\t1\td\t0\t\tbare\n\
+             docs\t1\td\t0\t\tlost\n\
+             docs\t1\tf\t5\t\tlost-not/x.bin\n\
+             docs\t1\tf\t5\t\tlost/../escape\n\
+             docs\t1\tf\t5\t\tlost/a.bin\n\
+             docs\t1\td\t0\t\tlost/deep\n\
+             docs\t1\tf\t5\t\tlost/deep/t\\tab.bin\n\
+             docs\t1\td\t0\t\tlost/empty\n\
+             docs\t1\tl\t0\t\tlost/link\n\
+             docs\t1\tf\t5\t\tnodir/x.bin\n\
+             docs\t1\tf\t5\t\tplain.bin\n\
+             docs\t2\tf\t5\t\tlost/other-version.bin\n\
+             other\t1\tf\t5\t\tlost/other-unit.bin\n",
+        )
+        .unwrap();
+        let list = d.join("list");
+        std::fs::write(&list, "plain.bin\nlost\nghost\nbare\nlost/a.bin\nnodir\n").unwrap();
+        let env = |only: &str| -> Vec<(&'static str, String)> {
+            vec![
+                ("CHK_UNIT", "docs".into()),
+                ("CHK_VER", "1".into()),
+                ("CHK_LIST", list.display().to_string()),
+                ("CHK_ONLY", only.into()),
+            ]
+        };
+        let (code, out) = run_awk(true, AWK_DAMAGED_DIRS, &paths, &env(""));
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "plain.bin\nlost/a.bin\nlost/deep/t\\tab.bin\nlost/empty\nlost/link\nghost\nbare\nnodir\n",
+            "a folder is its files, a symlink and an empty folder, in its place; a path the \
+             index lacks stays, an empty folder stays, a path stays once, and a path the index \
+             records no folder row for stays as it is"
+        );
+        let only = d.join("only");
+        std::fs::write(&only, "lost/deep\n").unwrap();
+        let (_, out) = run_awk(true, AWK_DAMAGED_DIRS, &paths, &env(only.to_str().unwrap()));
+        assert_eq!(
+            out, "plain.bin\nlost/deep/t\\tab.bin\nghost\nlost/a.bin\nnodir\n",
+            "--path lost/deep: only what it asked for comes in a folder's place"
+        );
+        let bad = d.join("bad.tsv");
+        std::fs::write(&bad, "unit\tversion\tpath\ndocs\t1\tlost\n").unwrap();
+        assert_eq!(
+            run_awk(true, AWK_DAMAGED_DIRS, &bad, &env("")).0,
+            2,
+            "no kind column: the caller keeps the list as it is"
+        );
+
+        // The slices a fill reads, from a listing in dar's form.
+        let listing = d.join("listing");
+        std::fs::write(
+            &listing,
+            "Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane\n\
+             --------+--------------------------------+----------+-----------------------------\n\
+             1\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x top\n\
+             1\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/first.bin\n\
+             2-3\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/second.bin\n\
+             4\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x top/sub\n\
+             5\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- top/sub/deep.bin\n\
+             \t [Saved][-]       [---][-----][ ] lrwxrwxrwx top/link\n\
+             6\t [Saved][-]       [-L-][   0%][ ] drwxrwxr-x whole\n\
+             7-8\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- whole/in.bin\n\
+             9\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- nl\n\
+             line.bin\n\
+             10\t [Saved][ ]       [-L-][     ][ ] -rw-rw-r-- other.bin\n\
+             -----\n\
+             All displayed files have their data in slice range [1-10]\n\
+             -----\n",
+        )
+        .unwrap();
+        let wanted = d.join("wanted");
+        std::fs::write(
+            &wanted,
+            "top/second.bin\ntop/sub/deep.bin\ntop/link\nwhole\nnl\\nline.bin\nabsent.bin\n",
+        )
+        .unwrap();
+        let (code, out) = run_awk(
+            false,
+            AWK_FILL_LISTING,
+            &listing,
+            &[("FILL_WANTED", wanted.display().to_string())],
+        );
+        assert_eq!(code, 0);
+        let found: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("P\t")).collect();
+        assert_eq!(
+            found,
+            vec![
+                "top/second.bin",
+                "top/sub/deep.bin",
+                "top/link",
+                "whole",
+                "nl\\nline.bin"
+            ],
+            "{out}"
+        );
+        let mut slices: Vec<u32> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("S\t"))
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let n = slices.len();
+        slices.sort_unstable();
+        slices.dedup();
+        assert_eq!(slices.len(), n, "each slice once: {out}");
+        assert_eq!(
+            slices,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "the files' own slices, all of whole/, and top's and top/sub's entries; \
+             not other.bin's: {out}"
+        );
+    }
+
     /// ADR-0012 item 102: the fragment that reads dar's messages, on dar's
     /// REAL output for names that break a line-by-line reading: a name holding
     /// the very separator dar prints, a newline, a TAB and a backslash. Each
@@ -11589,6 +11791,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
+            ("AWK_DAMAGED_DIRS", AWK_DAMAGED_DIRS),
             ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
