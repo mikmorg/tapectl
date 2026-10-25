@@ -415,6 +415,10 @@ The same script ran on home2's HP drive, on EW7VWMVKF6, at the default 524288. T
 
 ## 9. Open questions for the CTO
 
+**Ruled 2026-10-25: ADR-0012 items 161-166** (Q5 option b; Q1 Reed-Solomon only; Q2 shape B; Q3 tapectl
+clears the page and RESTORE.sh is unchanged; Q4 warn and write without; Q7 a refusal aborts the session,
+no per-slice flush). The questions stay below as they were put.
+
 1. **Reed-Solomon only?** Is an LTO-6-only design (method 1) acceptable, with CRC32C left for
    the day an LTO-7+ drive is bought?
 2. **The SG boundary:** (A) operator sets the page, tapectl checks with `sg_modes`; or (B)

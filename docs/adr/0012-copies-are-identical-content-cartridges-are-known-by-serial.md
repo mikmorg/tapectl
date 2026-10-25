@@ -2196,3 +2196,31 @@ Ruled 2026-10-24, per-location copy targets, round 2 (the design is complete; #4
        location;
      - audit's `location_presence` check extends to the map;
      - `volume plan --policy-aware` counts a per-location shortfall as a need.
+
+Ruled 2026-10-25, Logical Block Protection (#388; the research note
+`docs/research/2026-10-16-logical-block-protection.md` §9, put after #420 and #478 by item 119):
+
+161. **LBP is an extra write-time check; the quick confirm stays the default** (§7.4 option b). It
+     closes the hop the quick-confirm ruling (2026-10-06 item 1) gave up: damage between tapectl
+     and the medium during the write. It does not prove the cartridge reads cold, so
+     `no_full_verify` still names the volume until its first full readback. The write records the
+     LBP check as its own evidence class (ADR-0001: recorded strength matches what ran), and
+     `--full-confirm` still adds the readback.
+162. **Reed-Solomon (method 01h) only, with LBP_W and LBP_R**, on tapectl's own writes, confirms,
+     verifies and restores. LTO-5 and later accept it; the HP LTO-6 refuses CRC32C (measured
+     2026-10-20, §8.2). CRC32C waits for a drive that needs it.
+163. **tapectl sets the drive's Control Data Protection page itself** (§3.4 shape B). The SG
+     boundary (`threat-model.md` §2) widens by exactly one MODE SELECT of that page (0Ah/F0h) and
+     the MODE SENSE that checks it, and `tests/sg_boundary.rs` pins both.
+164. **tapectl clears the page; RESTORE.sh does not change.** tapectl arms it for its own session
+     only, clears it on every exit, and clears one a crash left armed at its next touch of the
+     drive. A crash followed by an heir on the same drive before tapectl runs again ends in a
+     refusal (EIO, measured), never wrong data, and a power cycle clears the page. No re-pin, and
+     sg3-utils stays off the heir path.
+165. **A drive without LBP, or a page that will not take: warn once and write without it**,
+     recorded as such; that write is as strong as today's. No new audit finding: `no_full_verify`
+     stays the one, and `volume info` and `report verify-status` say whether LBP ran.
+166. **An LBP refusal aborts the session to an unsealed tape**, the clean abort a real end of tape
+     gives: nothing counts, the refusal is named, and the operator writes again. No flushing
+     filemark per slice: the seal's synchronous filemark makes any refusal surface before the tape
+     is sealed. No slice is retried.
