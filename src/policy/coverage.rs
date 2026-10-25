@@ -2019,9 +2019,11 @@ pub struct Distinctness {
     /// operator meets.
     pub same_cartridge: Vec<ExistingCopy>,
     /// Existing copies at the destination's location (a tape shelved there,
-    /// or a warehouse deposit there). Named in a WARNING only
-    /// ([`Distinctness::warning`]): location policy is advisory (ADR-0004)
-    /// and `audit` still reports a required location with no copy.
+    /// or a warehouse deposit there): the volume's own, or the location it is
+    /// moved to after the write ([`copy_distinctness_at`]). Named in a
+    /// WARNING only ([`Distinctness::warning`],
+    /// [`Distinctness::warning_moved_to`]): location policy is advisory
+    /// (ADR-0004) and `audit` still reports a required location with no copy.
     pub shared_location: Vec<ExistingCopy>,
 }
 
@@ -2054,13 +2056,30 @@ impl Distinctness {
     /// The warning for writing to `dest_label`, when its versions already
     /// have a copy at the destination's location. Never a refusal.
     pub fn warning(&self, dest_label: &str) -> Option<String> {
+        self.shared_place_warning(|place| {
+            format!("volume \"{dest_label}\" is at location \"{place}\"")
+        })
+    }
+
+    /// [`Distinctness::warning`] for a destination moved to another location
+    /// once it is sealed and confirmed (`volume write --for-location X`,
+    /// `--move-to Y`): the shared place is where the tape goes, judged by
+    /// [`copy_distinctness_at`], and the warning says so. Never a refusal.
+    pub fn warning_moved_to(&self, dest_label: &str) -> Option<String> {
+        self.shared_place_warning(|place| {
+            format!("volume \"{dest_label}\" is moved to location \"{place}\" after this write")
+        })
+    }
+
+    /// Item 26's warning, opened by `opening` (the destination and its
+    /// place, given the place's name).
+    fn shared_place_warning(&self, opening: impl FnOnce(&str) -> String) -> Option<String> {
         let first = self.shared_location.first()?;
         Some(format!(
-            "warning: volume \"{dest_label}\" is at location \"{}\", where these versions \
-             already have a copy: {}. Copies in one place are lost together. Writing anyway: \
-             location policy is advisory (ADR-0004), and `tapectl audit` reports any required \
-             location still without a copy.",
-            first.shared,
+            "warning: {}, where these versions already have a copy: {}. Copies in one place are \
+             lost together. Writing anyway: location policy is advisory (ADR-0004), and \
+             `tapectl audit` reports any required location still without a copy.",
+            opening(&first.shared),
             list_copies(&self.shared_location),
         ))
     }
@@ -2085,7 +2104,8 @@ impl Distinctness {
 /// **The location** is the destination's `location_id` against the same
 /// union [`location_count_expr`] counts: an eligible copy's own
 /// `location_id`, and a warehouse deposit of it. A destination with no
-/// location shares none.
+/// location shares none. A write whose tape is moved once it is sealed and
+/// confirmed is judged where it goes instead ([`copy_distinctness_at`]).
 ///
 /// **A set that spans (#478; ADR-0012 items 122, 127 and 134).** Two holders
 /// of the SAME slice must not share a place (item 127's per-slice location
@@ -2107,6 +2127,27 @@ impl Distinctness {
 pub fn copy_distinctness(
     conn: &Connection,
     dest_volume_id: i64,
+    stage_set_ids: &[i64],
+) -> crate::error::Result<Distinctness> {
+    copy_distinctness_at(conn, dest_volume_id, None, stage_set_ids)
+}
+
+/// [`copy_distinctness`], its location half judged at `moved_to` when that is
+/// `Some`: the location (`locations.id`) the destination is moved to once it
+/// is sealed and confirmed (`volume write --for-location X`, `--move-to Y`;
+/// ADR-0012 2026-10-07 item 26 names "the destination volume's location", and
+/// a moved tape's is where it goes). `None` is the destination's own
+/// location, exactly [`copy_distinctness`]. The cartridge half does not move
+/// with it: the cartridge goes where the tape goes.
+///
+/// Copies at the destination's present shelf are then not named, since the
+/// tape will not be there; copies already at `moved_to` are, and
+/// [`Distinctness::warning_moved_to`] words the warning for a tape still to
+/// be moved.
+pub fn copy_distinctness_at(
+    conn: &Connection,
+    dest_volume_id: i64,
+    moved_to: Option<i64>,
     stage_set_ids: &[i64],
 ) -> crate::error::Result<Distinctness> {
     // The existing copies of stage set ?1's version: writes `holds` admits
@@ -2139,22 +2180,26 @@ pub fn copy_distinctness(
     // shelf, and a warehouse deposit of it; a whole copy's or a range's
     // (`holds_slices`, the counts' own reading of a holder). Each row also
     // carries the holder's stage set and write, and whether it is a range,
-    // for the spanning rule above.
+    // for the spanning rule above. The destination's place is ?3, the
+    // location it is moved to, or its own when ?3 is NULL.
     let holds = holds_slices("cw");
     let range = status_in("cw", &["range"]);
+    let place = "COALESCE(?3, d.location_id)";
     let shared_location = format!(
         "{} UNION {}",
         copies_of(
             &holds,
-            "JOIN locations l ON l.id = d.location_id",
-            "cv.location_id = d.location_id",
+            &format!("JOIN locations l ON l.id = {place}"),
+            &format!("cv.location_id = {place}"),
             &format!("u.name, cs.version, cv.label, l.name, 0, css.id, cw.id, {range}"),
         ),
         copies_of(
             &holds,
-            "JOIN locations l ON l.id = d.location_id
-             JOIN volume_deposits cd ON cd.volume_id = cv.id",
-            "cd.location_id = d.location_id",
+            &format!(
+                "JOIN locations l ON l.id = {place}
+                 JOIN volume_deposits cd ON cd.volume_id = cv.id"
+            ),
+            &format!("cd.location_id = {place}"),
             &format!("u.name, cs.version, cv.label, l.name, 1, css.id, cw.id, {range}"),
         ),
     );
@@ -2183,7 +2228,7 @@ pub fn copy_distinctness(
         // The slices the destination takes next, when the set spans.
         let next = next_slices_of_a_spanning_set(conn, ss)?;
         let rows = stmt
-            .query_map(params![ss, dest_volume_id], |r| {
+            .query_map(params![ss, dest_volume_id, moved_to], |r| {
                 Ok((
                     copy(r)?,
                     r.get::<_, i64>(5)?,
@@ -3234,6 +3279,70 @@ pub(crate) mod tests {
             .warning("L6-0009")
             .unwrap()
             .contains("a warehouse deposit of volume \"L6-0003\""));
+    }
+
+    /// The fixture with an `offsite` shelf beside `home` and `glacier`.
+    fn add_offsite(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// #493 (ADR-0012 2026-10-07 item 26): a destination moved once it is
+    /// written (`volume write --for-location X`, `--move-to Y`) is judged
+    /// where it goes. Shelved at `home` and going `offsite`, the copy at
+    /// home draws no warning (positive control: judged at its own place it
+    /// does, as a plain write still is); a copy already offsite is named,
+    /// and the warning says the tape is moved there.
+    #[test]
+    fn a_destination_moved_after_the_write_is_judged_where_it_goes() {
+        let (conn, dest, ss) = distinctness_fixture(Some("home"), "BC1", "BC2");
+        let offsite = add_offsite(&conn);
+
+        let own = copy_distinctness_at(&conn, dest, None, &[ss]).unwrap();
+        assert_eq!(own, copy_distinctness(&conn, dest, &[ss]).unwrap());
+        assert_eq!(own.shared_location, vec![copy("L6-0003", "home", false)]);
+
+        let going = copy_distinctness_at(&conn, dest, Some(offsite), &[ss]).unwrap();
+        assert_eq!(going, Distinctness::default(), "{going:?}");
+        assert_eq!(going.warning_moved_to("L6-0009"), None);
+
+        conn.execute(
+            "UPDATE volumes SET location_id = ?1 WHERE label = 'L6-0003'",
+            params![offsite],
+        )
+        .unwrap();
+        let going = copy_distinctness_at(&conn, dest, Some(offsite), &[ss]).unwrap();
+        assert_eq!(going.refusal("L6-0009"), None);
+        assert_eq!(
+            going.shared_location,
+            vec![copy("L6-0003", "offsite", false)]
+        );
+        assert_eq!(
+            going.warning_moved_to("L6-0009").unwrap(),
+            "warning: volume \"L6-0009\" is moved to location \"offsite\" after this write, \
+             where these versions already have a copy: photos v1 (volume \"L6-0003\"). Copies \
+             in one place are lost together. Writing anyway: location policy is advisory \
+             (ADR-0004), and `tapectl audit` reports any required location still without a \
+             copy."
+        );
+        // A plain write to the tape at home: the copy left home, so nothing.
+        let own = copy_distinctness_at(&conn, dest, None, &[ss]).unwrap();
+        assert_eq!(own, Distinctness::default(), "{own:?}");
+    }
+
+    /// The cartridge half does not move with the place: the cartridge goes
+    /// where the tape goes, so a copy on it is refused wherever it is bound.
+    #[test]
+    fn a_destination_moved_after_the_write_keeps_the_cartridge_refusal() {
+        let (conn, dest, ss) = distinctness_fixture(Some("home"), "BC1", "BC1");
+        let offsite = add_offsite(&conn);
+        let going = copy_distinctness_at(&conn, dest, Some(offsite), &[ss]).unwrap();
+        assert_eq!(going.same_cartridge, vec![copy("L6-0003", "BC1", false)]);
+        assert!(going.refusal("L6-0009").is_some());
     }
 
     // ── copy_distinctness for a set that spans (#478; items 122, 127, 134) ──
