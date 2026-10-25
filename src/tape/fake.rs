@@ -39,7 +39,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Result, TapectlError};
-use crate::store::{MediumEnd, OpenMode, TapeOps};
+use crate::store::{LbpRefusalAt, MediumEnd, OpenMode, Protection, TapeOps};
 use crate::tape::ioctl::{
     write_block_retrying, write_error, EarlyWarning, EarlyWarningState, ReadEnd, TapePosition,
 };
@@ -132,6 +132,16 @@ pub(crate) struct State {
     /// as a drive or transport error fails one (EIO) — how a test reaches
     /// the reopen after a write has already happened.
     pub fail_opens: Vec<usize>,
+    /// What every open of the drive decides about Logical Block Protection
+    /// (#388): `NotApplicable` unless a test sets it.
+    pub protection: Protection,
+    /// Refusals under LBP, each answered once by the write of its
+    /// `surfaces_in` file (item 174): see [`LbpRefusalAt`].
+    pub lbp_refusals: Vec<LbpRefusalAt>,
+    /// Where the last refusal left the drive, until the head moves.
+    pub refused_at: Option<u64>,
+    /// `arm_read_check` was asked (item 175).
+    pub read_check_armed: bool,
 }
 
 impl State {
@@ -141,6 +151,16 @@ impl State {
             .get(&file)
             .copied()
             .unwrap_or_else(|| self.files.get(file).map_or(0, |f| f.len() as u64))
+    }
+
+    /// Blocks and filemarks before tape file `file`: the drive's logical
+    /// position at its start.
+    pub(crate) fn objects_before(&self, file: usize) -> u64 {
+        let bs = self.block_size.max(1);
+        self.files[..file.min(self.files.len())]
+            .iter()
+            .map(|f| f.len().div_ceil(bs) as u64 + 1)
+            .sum()
     }
 
     /// Where `head` is, in modeled bytes from BOT. Inside a file, the share
@@ -429,6 +449,7 @@ impl TapeOps for FakeTape {
             }
             s.head = (0, 0);
             s.end.moved();
+            s.refused_at = None;
             Ok(())
         })
     }
@@ -438,6 +459,7 @@ impl TapeOps for FakeTape {
             assert!(count > 0, "the store only ever spaces forward: {count}");
             s.ops.push(Op::Space(count as u32));
             s.end.moved();
+            s.refused_at = None;
             let target = s.head.0 + count as usize;
             if target > s.files.len() {
                 // st stops at end of data and reports the space failed.
@@ -481,6 +503,28 @@ impl TapeOps for FakeTape {
             let (file, block) = s.head;
             assert_eq!(block, 0, "the fake only writes at a file boundary");
             s.ops.push(Op::Write(file as u32));
+            // #388, item 174: a refusal set for this file's write. What came
+            // before the refused block stays on the tape (the HP's way:
+            // the block itself too, mhvtl's); everything after is gone.
+            if let Some(k) = s
+                .lbp_refusals
+                .iter()
+                .position(|r| r.surfaces_in == file as u32)
+            {
+                let at = s.lbp_refusals.remove(k);
+                let bad = (at.file as usize).min(s.files.len());
+                let kept = at.block as usize + usize::from(at.stored_before_refusing);
+                let bs = s.block_size.max(1);
+                s.files.truncate(bad + 1);
+                if let Some(partial) = s.files.get_mut(bad) {
+                    partial.truncate(kept * bs);
+                }
+                let objects = s.objects_before(bad);
+                s.refused_at = Some(at.position(objects));
+                s.head = (bad, kept);
+                s.end.moved();
+                return Err(at.error());
+            }
             if s.writes_vanish {
                 return Ok(len.div_ceil(s.block_size.max(1) as u64) * s.block_size.max(1) as u64);
             }
@@ -508,6 +552,24 @@ impl TapeOps for FakeTape {
 
     fn early_warning(&self) -> Option<EarlyWarning> {
         self.warning.warning()
+    }
+
+    fn protection(&self) -> Protection {
+        self.state().protection.clone()
+    }
+
+    /// Where a refusal left the drive, or where the head is.
+    fn logical_position(&self) -> Result<Option<u64>> {
+        let s = self.state();
+        Ok(Some(s.refused_at.unwrap_or_else(|| {
+            s.objects_before(s.head.0) + s.head.1 as u64
+        })))
+    }
+
+    fn arm_read_check(&mut self) -> Result<bool> {
+        let mut s = self.state();
+        s.read_check_armed = true;
+        Ok(s.protection.writes_checked())
     }
 
     fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
