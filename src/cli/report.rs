@@ -2293,7 +2293,8 @@ fn report_health(
     for line in crate::tape::cleaning::block(conn)? {
         println!("{line}");
     }
-    // Issue #439: each write's feed ratio, uneven feeds first. Unlike the two
+    // Issue #439: each write's feed ratio, those above the threshold first
+    // (ADR-0012 item 170: the cause each names is the drive's). Unlike the two
     // fleet-wide blocks above (a TapeAlert or a rising cartridge must not be
     // hidden by a filter), this one is about writes, so `--volume` narrows it.
     for line in feed_ratio_block(&feed_ratio_rows(conn, volume_filter)?) {
@@ -2361,8 +2362,8 @@ fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool
 /// trends cover every cartridge whatever `--volume` says.
 /// `feed_ratios` (issue #439, additive) is the text's feed-ratio block as
 /// data: every recorded write's [`FeedRatioRow`], newest first, narrowed by
-/// `volume_filter` (the text block puts the uneven feeds first; here the
-/// `verdict` says which they are).
+/// `volume_filter` (the text block puts those above the threshold first;
+/// here the `verdict` says which they are, and `cause` what each names).
 pub(crate) fn report_health_json(
     conn: &Connection,
     rows: &[HealthRow],
@@ -2500,6 +2501,25 @@ pub(crate) struct FeedRatioRow {
     /// Where `repositions_per_100mb` came from: [`RepositionsFrom`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) repositions_from: Option<RepositionsFrom>,
+    /// Page 0x02's corrections across the write (ADR-0012 item 170), its
+    /// `details.corrections`: the write's sweep less the previous contact's
+    /// in the same load. ABSENT when the write recorded none (not known, or
+    /// written before the figure was kept).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) corrections: Option<i64>,
+    /// `details.corrections_per_gib`: per GiB of data sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) corrections_per_gib: Option<f64>,
+    /// `details.corrections_threshold_per_gib`: the jump threshold the write
+    /// was judged against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) corrections_threshold_per_gib: Option<f64>,
+    /// The cause an above-threshold, unsuppressed ratio names (item 170),
+    /// from the row's own figures and thresholds: `repositions` (the host),
+    /// `corrections` (the drive or the cartridge) or `unattributed`. ABSENT
+    /// on every other verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cause: Option<crate::tape::feed_ratio::Cause>,
 }
 
 /// Where a write's repositions figure was read from (issue #488).
@@ -2548,6 +2568,28 @@ fn repositions_clause(repositions: Option<u32>) -> String {
         .unwrap_or_default()
 }
 
+/// `", page 0x02 corrections: N (X per GiB)"` (ADR-0012 item 170), or
+/// nothing when the write recorded none — so a line without the figure reads
+/// as it did before.
+fn corrections_clause(corrections: Option<i64>, per_gib: Option<f64>) -> String {
+    match (corrections, per_gib) {
+        (Some(n), Some(x)) => format!(", page 0x02 corrections: {n} ({x:.1} per GiB)"),
+        (Some(n), None) => format!(", page 0x02 corrections: {n}"),
+        _ => String::new(),
+    }
+}
+
+/// [`corrections_clause`] from a `write_feed_ratio` event's stored details.
+fn corrections_clause_of(details: Option<&str>) -> String {
+    use crate::tape::feed_ratio::{CORRECTIONS_KEY, CORRECTIONS_PER_GIB_KEY};
+    let d: Option<serde_json::Value> = details.and_then(|s| serde_json::from_str(s).ok());
+    let get = |k: &str| d.as_ref().and_then(|d| d.get(k));
+    corrections_clause(
+        get(CORRECTIONS_KEY).and_then(serde_json::Value::as_i64),
+        get(CORRECTIONS_PER_GIB_KEY).and_then(serde_json::Value::as_f64),
+    )
+}
+
 impl FeedRatioRow {
     /// Build a row from one event's `new_value` and `details`. `None` when
     /// no finite ratio can be read from either: `details.ratio` (unrounded)
@@ -2588,6 +2630,28 @@ impl FeedRatioRow {
             data_bytes: get("data_bytes").and_then(serde_json::Value::as_u64),
             repositions_per_100mb: None,
             repositions_from: None,
+            corrections: get(crate::tape::feed_ratio::CORRECTIONS_KEY)
+                .and_then(serde_json::Value::as_i64),
+            corrections_per_gib: get(crate::tape::feed_ratio::CORRECTIONS_PER_GIB_KEY)
+                .and_then(serde_json::Value::as_f64),
+            corrections_threshold_per_gib: get(crate::tape::feed_ratio::CORRECTIONS_THRESHOLD_KEY)
+                .and_then(serde_json::Value::as_f64),
+            cause: None,
+        })
+    }
+
+    /// The cause an above-threshold, unsuppressed ratio names (ADR-0012 item
+    /// 170), judged by the row's own repositions and corrections against the
+    /// threshold the write recorded (today's constant for a row that recorded
+    /// none). `None` on every other verdict.
+    fn judged_cause(&self) -> Option<crate::tape::feed_ratio::Cause> {
+        (self.verdict == FeedVerdict::AboveThreshold).then(|| {
+            crate::tape::feed_ratio::judge_cause(
+                self.repositions_per_100mb,
+                self.corrections_per_gib,
+                self.corrections_threshold_per_gib
+                    .unwrap_or(crate::tape::feed_ratio::CORRECTIONS_JUMP_PER_GIB),
+            )
         })
     }
 
@@ -2596,10 +2660,23 @@ impl FeedRatioRow {
         let t = self.threshold;
         match self.verdict {
             FeedVerdict::Streamed => format!("streamed, within {t:.2}"),
-            FeedVerdict::AboveThreshold => format!(
-                "above {t:.2}: the drive was fed unevenly and spent tape repositioning — \
-                 see the operator guide, \"A quiet host while the tape runs\""
-            ),
+            FeedVerdict::AboveThreshold => {
+                use crate::tape::feed_ratio::Cause;
+                match self.cause.unwrap_or(Cause::Unattributed) {
+                    Cause::Repositions => format!(
+                        "above {t:.2}: the drive was fed unevenly and spent tape repositioning — \
+                         see the operator guide, \"A quiet host while the tape runs\""
+                    ),
+                    Cause::Corrections => format!(
+                        "above {t:.2}: the drive corrected heavily, not the host — run a \
+                         cleaning cartridge, and check the medium if it recurs"
+                    ),
+                    Cause::Unattributed => format!(
+                        "above {t:.2}, no cause named: no repositions and no correction jump on \
+                         record"
+                    ),
+                }
+            }
             FeedVerdict::AboveThresholdSuppressed => format!(
                 "above {t:.2}, not judged: warning suppressed ({}) — a drive that declares \
                  its own capacity reports a figure unrelated to the write",
@@ -2658,6 +2735,8 @@ pub(crate) fn feed_ratio_rows(
                 row.repositions_per_100mb = Some(n);
                 row.repositions_from = Some(from);
             }
+            // ADR-0012 item 170: the cause, once both figures are known.
+            row.cause = row.judged_cause();
             Some(row)
         })
         .collect())
@@ -2689,10 +2768,11 @@ pub(crate) fn render_feed_ratio_lines(rows: &[FeedRatioRow], written: bool) -> S
             " ".repeat(LABEL.len())
         };
         out.push_str(&format!(
-            "{lead}{:.4} ({}){}, recorded {}\n",
+            "{lead}{:.4} ({}){}{}, recorded {}\n",
             r.ratio,
             r.verdict_text(),
             repositions_clause(r.repositions_per_100mb),
+            corrections_clause(r.corrections, r.corrections_per_gib),
             r.at
         ));
     }
@@ -2701,15 +2781,17 @@ pub(crate) fn render_feed_ratio_lines(rows: &[FeedRatioRow], written: bool) -> S
 
 /// `report health`'s feed-ratio block (issue #439): one line per recorded
 /// write — its volume, native tape bytes per data byte sent, and the
-/// verdict naming the threshold — with the writes that were fed unevenly
-/// first and marked `!!`. No truncation: a starved write dropped from the
+/// verdict naming the threshold and the cause the drive's evidence names
+/// (ADR-0012 item 170) — with the writes above the threshold first and
+/// marked `!!`. No truncation: a starved write dropped from the
 /// list would read as fine. Empty when no write recorded one.
 pub(crate) fn feed_ratio_block(rows: &[FeedRatioRow]) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
     }
     let mut out = vec![
-        "Write feed ratio (native tape bytes per data byte sent), uneven feeds first:".to_string(),
+        "Write feed ratio (native tape bytes per data byte sent), those above the threshold first:"
+            .to_string(),
     ];
     let starved = |r: &&FeedRatioRow| r.verdict == FeedVerdict::AboveThreshold;
     for r in rows
@@ -2718,12 +2800,13 @@ pub(crate) fn feed_ratio_block(rows: &[FeedRatioRow]) -> Vec<String> {
         .chain(rows.iter().filter(|r| !starved(r)))
     {
         out.push(format!(
-            "  {}{}: {:.4} ({}){}, {}",
+            "  {}{}: {:.4} ({}){}{}, {}",
             if starved(&r) { "!! " } else { "   " },
             r.volume,
             r.ratio,
             r.verdict_text(),
             repositions_clause(r.repositions_per_100mb),
+            corrections_clause(r.corrections, r.corrections_per_gib),
             r.at
         ));
     }
@@ -3487,7 +3570,7 @@ fn report_events(
     } else {
         for (ts, etype, label, action, field, old, new, details) in &rows {
             println!(
-                "  {}{}",
+                "  {}{}{}",
                 event_line(
                     ts,
                     etype,
@@ -3497,7 +3580,12 @@ fn report_events(
                     old.as_deref(),
                     new.as_deref()
                 ),
-                repositions_clause(repositions(action, details).map(|(n, _)| n))
+                repositions_clause(repositions(action, details).map(|(n, _)| n)),
+                if action == crate::tape::feed_ratio::EVENT_ACTION {
+                    corrections_clause_of(details.as_deref())
+                } else {
+                    String::new()
+                }
             );
         }
     }
@@ -6747,14 +6835,19 @@ Read error counter page  [0x3]
             let block = feed_ratio_block(&feed_ratio_rows(&conn, None).unwrap());
             assert_eq!(block.len(), 4, "{block:#?}");
             assert!(block[0].starts_with("Write feed ratio"), "{block:#?}");
-            // The starved write leads and is the only flagged one, although
-            // the virtual drive's is newer and larger.
+            // The write above the threshold leads and is the only flagged
+            // one, although the virtual drive's is newer and larger. It
+            // recorded no repositions and no corrections, so it names no
+            // cause (ADR-0012 item 170): never the host.
             assert!(
-                block[1].starts_with("  !! V-BAD: 1.5050 (above 1.05: the drive was fed unevenly"),
+                block[1].starts_with(
+                    "  !! V-BAD: 1.5050 (above 1.05, no cause named: no repositions and no \
+                     correction jump on record)"
+                ),
                 "{block:#?}"
             );
             assert!(
-                block[1].contains("A quiet host while the tape runs"),
+                !block[1].contains("A quiet host while the tape runs"),
                 "{block:#?}"
             );
             assert!(block[1].ends_with(", 2026-10-14 10:00:00"), "{block:#?}");
@@ -6794,6 +6887,7 @@ Read error counter page  [0x3]
                     "suppressed": null,
                     "native_bop_to_eod_mb": 1505,
                     "data_bytes": GB,
+                    "cause": "unattributed",
                 })
             );
             assert_eq!(rows[0]["verdict"], "above_threshold_suppressed");
@@ -6816,7 +6910,7 @@ Read error counter page  [0x3]
             let text = render_feed_ratio_lines(&bad, true);
             assert_eq!(text.lines().count(), 1, "{text}");
             assert!(
-                text.starts_with("  Feed ratio:  1.5050 (above 1.05: the drive was fed unevenly"),
+                text.starts_with("  Feed ratio:  1.5050 (above 1.05, no cause named"),
                 "{text}"
             );
             assert!(text.ends_with(", recorded 2026-10-14 10:00:00\n"), "{text}");
@@ -6842,6 +6936,180 @@ Read error counter page  [0x3]
             );
             assert_eq!(render_feed_ratio_lines(&[], false), "");
             assert!(!said.to_lowercase().contains("receipt"), "{said}");
+        }
+
+        /// A 1.505 write's event with the drive's evidence, as
+        /// `assess_and_record` writes it.
+        fn record_with(
+            conn: &Connection,
+            label: &str,
+            evidence: crate::tape::feed_ratio::Evidence,
+        ) {
+            let vid = volume(conn, label);
+            let a = Assessment {
+                ratio: FeedRatio::new(1_505, GB).unwrap(),
+                suppressed: None,
+            };
+            events::log_event(
+                conn,
+                "volume",
+                vid,
+                Some(label),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("1.5050"),
+                Some(&a.details_json_with_evidence(7, &evidence)),
+                None,
+            )
+            .unwrap();
+        }
+
+        /// ADR-0012 item 170 in `volume info` and `report health`: the host
+        /// is named only when the drive reported repositions; a correction
+        /// jump with none names the drive or the cartridge; neither names
+        /// nothing. The corrections are shown beside the repositions, and
+        /// `--json` carries them and the cause.
+        #[test]
+        fn the_cause_follows_the_recorded_evidence() {
+            use crate::tape::feed_ratio::{Cause, Corrections, Evidence};
+            let conn = crate::db::open_memory().unwrap();
+            let corrections = |count| {
+                Some(Corrections {
+                    count,
+                    data_bytes: GB,
+                    baseline_contact_id: Some(6),
+                })
+            };
+            record_with(
+                &conn,
+                "V-HOST",
+                Evidence {
+                    repositions_per_100mb: Some(3),
+                    corrections: corrections(99_027),
+                },
+            );
+            record_with(
+                &conn,
+                "V-DRIVE",
+                Evidence {
+                    repositions_per_100mb: Some(0),
+                    corrections: corrections(99_027),
+                },
+            );
+            record_with(
+                &conn,
+                "V-QUIET",
+                Evidence {
+                    repositions_per_100mb: Some(0),
+                    corrections: corrections(5),
+                },
+            );
+            let rows = feed_ratio_rows(&conn, None).unwrap();
+            let by = |l: &str| rows.iter().find(|r| r.volume == l).unwrap().clone();
+
+            let host = by("V-HOST");
+            assert_eq!(host.cause, Some(Cause::Repositions));
+            assert!(
+                host.verdict_text().contains("the drive was fed unevenly"),
+                "{}",
+                host.verdict_text()
+            );
+            let drive = by("V-DRIVE");
+            assert_eq!(drive.cause, Some(Cause::Corrections));
+            assert_eq!(
+                drive.verdict_text(),
+                "above 1.05: the drive corrected heavily, not the host — run a cleaning \
+                 cartridge, and check the medium if it recurs"
+            );
+            assert_eq!(drive.corrections, Some(99_027));
+            assert_eq!(drive.corrections_threshold_per_gib, Some(100.0));
+            assert_eq!(
+                render_feed_ratio_lines(std::slice::from_ref(&drive), true),
+                format!(
+                    "  Feed ratio:  1.5050 ({}), repositions per 100 MB: 0, page 0x02 \
+                     corrections: 99027 (106329.4 per GiB), recorded {}\n",
+                    drive.verdict_text(),
+                    drive.at
+                )
+            );
+            let quiet = by("V-QUIET");
+            assert_eq!(quiet.cause, Some(Cause::Unattributed));
+            assert!(quiet.verdict_text().contains("no cause named"));
+
+            let block = feed_ratio_block(&rows);
+            assert!(
+                block.iter().any(|l| l
+                    .starts_with("  !! V-DRIVE: 1.5050 (above 1.05: the drive corrected")
+                    && l.contains(", page 0x02 corrections: 99027 (106329.4 per GiB), ")),
+                "{block:#?}"
+            );
+
+            let v = serde_json::to_value(&drive).unwrap();
+            assert_eq!(v["cause"], "corrections");
+            assert_eq!(v["corrections"], 99_027);
+            assert_eq!(
+                format!("{:.1}", v["corrections_per_gib"].as_f64().unwrap()),
+                "106329.4"
+            );
+            assert_eq!(v["corrections_threshold_per_gib"], 100.0);
+            // A streamed row names no cause, whatever its figures.
+            assert!(serde_json::to_value(&FeedRatioRow {
+                verdict: FeedVerdict::Streamed,
+                cause: None,
+                ..drive
+            })
+            .unwrap()
+            .get("cause")
+            .is_none());
+        }
+
+        /// The cause is judged against the corrections threshold the write
+        /// recorded, not today's constant, as the ratio is (a row judged
+        /// against 200 per GiB is not a jump at 150).
+        #[test]
+        fn the_cause_is_judged_by_the_rows_own_corrections_threshold() {
+            let conn = crate::db::open_memory().unwrap();
+            let vid = volume(&conn, "V-T");
+            events::log_event(
+                &conn,
+                "volume",
+                vid,
+                Some("V-T"),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("1.2000"),
+                Some(
+                    r#"{"ratio":1.2,"threshold":1.05,"repositions_per_100mb":0,
+                        "corrections":150,"corrections_per_gib":150.0,
+                        "corrections_threshold_per_gib":200.0}"#,
+                ),
+                None,
+            )
+            .unwrap();
+            let rows = feed_ratio_rows(&conn, None).unwrap();
+            assert_eq!(
+                rows[0].cause,
+                Some(crate::tape::feed_ratio::Cause::Unattributed),
+                "150 is within the row's 200; today's 100 would call it a jump"
+            );
+        }
+
+        /// `report events` shows a `write_feed_ratio` event's corrections
+        /// beside its repositions, from the stored details; nothing for a
+        /// row that recorded none.
+        #[test]
+        fn the_events_line_carries_the_corrections_clause() {
+            assert_eq!(
+                corrections_clause_of(Some(
+                    r#"{"corrections":99027,"corrections_per_gib":4947.7}"#
+                )),
+                ", page 0x02 corrections: 99027 (4947.7 per GiB)"
+            );
+            assert_eq!(corrections_clause_of(Some(r#"{"ratio":1.5}"#)), "");
+            assert_eq!(corrections_clause_of(Some("{")), "");
+            assert_eq!(corrections_clause_of(None), "");
         }
     }
 
