@@ -604,12 +604,15 @@ impl Assessed {
             ),
             Cause::Corrections => {
                 let c = ev.corrections.expect("a correction cause has corrections");
-                let steady = match ev.repositions_per_100mb {
-                    Some(_) => " while the feed was steady (page 0x34: 0 repositions per 100 MB)",
-                    None => "",
+                let (steady, page_0x34) = match ev.repositions_per_100mb {
+                    Some(_) => (
+                        " while the feed was steady",
+                        "page 0x34: 0 repositions per 100 MB; ",
+                    ),
+                    None => ("", ""),
                 };
                 format!(
-                    "{measured} The drive corrected heavily{steady} (page 0x02: {n} \
+                    "{measured} The drive corrected heavily{steady} ({page_0x34}page 0x02: {n} \
                      corrections, {per:.1} per GiB written, above {t:.0}); this is about the \
                      drive or the cartridge, not the host: run a cleaning cartridge (`tapectl \
                      drive cleaned` records it), and check the medium if it recurs. The volume is \
@@ -1739,7 +1742,7 @@ mod tests {
                     corrections: Some(jump),
                 },
                 " The drive corrected heavily while the feed was steady (page 0x34: 0 \
-                 repositions per 100 MB) (page 0x02: 99027 corrections, 106329.4 per GiB \
+                 repositions per 100 MB; page 0x02: 99027 corrections, 106329.4 per GiB \
                  written, above 100); this is about the drive or the cartridge, not the host: \
                  run a cleaning cartridge (`tapectl drive cleaned` records it), and check the \
                  medium if it recurs. The volume is complete and correct, and the next tape \
