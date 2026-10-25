@@ -1503,7 +1503,11 @@ pub(crate) fn volume_write_contacted<'c>(
     // `volumes.bytes_written`, which is slices only. It WARNS on stderr
     // (`eprintln!`, the operator-facing channel, as the line-425 convention
     // has it) and never touches `result`: the volume is complete and
-    // sealed; the warning is about the host.
+    // sealed. The warning names the cause the drive's own evidence supports
+    // (ADR-0012 item 170): the host only when page 0x34 reports repositions,
+    // the drive or the cartridge when page 0x02's corrections jumped across
+    // the write (read from this sweep and the previous contact's in the same
+    // load, never a second read of the drive), and otherwise none.
     if let Ok(layout_snapshot) = &result {
         if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
             // Issue #391: the capacity this write actually used, so the
@@ -1530,7 +1534,7 @@ pub(crate) fn volume_write_contacted<'c>(
                 suppressed,
             ) {
                 if assessment.warns() {
-                    eprintln!("{}", assessment.ratio.warning_text(label));
+                    eprintln!("{}", assessment.warning_text(label));
                 }
             }
         }
@@ -12195,8 +12199,7 @@ mod tests {
         );
         assert!(
             body[assess..].contains("assessment.warns()")
-                && body[assess..]
-                    .contains("eprintln!(\"{}\", assessment.ratio.warning_text(label))"),
+                && body[assess..].contains("eprintln!(\"{}\", assessment.warning_text(label))"),
             "above the threshold and unsuppressed it WARNS on stderr, by the pinned text"
         );
         assert!(
