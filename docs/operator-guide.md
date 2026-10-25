@@ -1155,15 +1155,43 @@ running write got, find its process (`pgrep -x tapectl`) and read
 The write itself needs no supervision once it is streaming; the drive's
 counters afterwards say whether the feed held: `tapectl volume info <label>`
 shows each write's feed ratio (native tape bytes per data byte sent, judged
-against 1.05), and `tapectl report health` lists every recorded write, the
-uneven feeds first. On an HP drive each line also gives the drive's own wear
+against 1.05), and `tapectl report health` lists every recorded write, those
+above the threshold first. On an HP drive each line also gives the drive's own wear
 count, `repositions per 100 MB` (its log page 0x34: "tape direction changes per
 100 MB written. The higher the figure the more wear occurs"), and `tapectl report
 events` shows it on the `write_feed_ratio` line. A write recorded before the figure
 was kept still has the page's raw bytes in the catalog, so it is decoded for those too. The
 drive reads it after the whole command, the confirm's rewinds included; it is
 not yet known whether it averages since the cartridge was loaded or over the
-last stretch written (`docs/research/2026-10-20-write-shaping.md` §6).
+last stretch written (`docs/research/2026-10-20-write-shaping.md` §6), and it
+reads 0 below one direction change per 100 MB. Beside it, when it is known, each
+line gives `page 0x02 corrections`: how many times the drive's write error
+correction ran across this write (page 0x02's "Total times correction algorithm
+processed"), and per GiB written.
+
+**A ratio above 1.05 means what the drive's pages say** (ADR-0012 item 170), and
+the warning `volume write` prints names it:
+- **Repositions above 0:** the drive stopped and backed up behind an irregular
+  feed. That is the host: make it quiet (above) before the next write.
+- **No repositions, and a correction jump** (more than 100 corrections per GiB
+  written): the drive corrected heavily while the feed was steady. The host is
+  not the cause; the drive or the cartridge is. Run a cleaning cartridge
+  ([Cleaning the drive](#cleaning-the-drive); `tapectl drive cleaned` records it),
+  and check the medium if it happens again after the cleaning. In the drive
+  phase the clean writes counted 1 to 7 corrections per GiB and the three that
+  used extra tape 1,036 to 7,675, with 0 repositions in every run.
+- **Neither:** the warning gives the ratio and names no cause.
+
+In every case the volume is complete and correct; the excess costs capacity, and
+the next tape will hold less than planned if it continues. The corrections across
+a write are its reading less the drive's previous tapectl contact's, when that
+contact was in the same load (`volume write --init` follows its own `volume
+init`): the drive keeps counting until the tape is unloaded. On an HP drive, a
+write that is the first contact of its load counts from zero, the page having
+been cleared at the last unload. Otherwise they are not known (another vendor's
+first contact of a load, or a previous contact that recorded no cartridge or took
+no reading, such as a drive poll of an empty drive), and no correction cause is
+named.
 
 ### Check what's pending
 
@@ -2397,8 +2425,10 @@ refuses while it is active.
 
 tapectl drives no changer, so cleaning is you inserting the cleaning cartridge when the
 drive asks (`drive status` shows it; `drive poll` and `audit` print the cleaning TapeAlert
-as "clean the drive"). `tapectl drive cleaned` writes down that it happened (ADR-0012,
-2026-10-15 item 60):
+as "clean the drive"), or when a write's feed-ratio warning says the drive corrected
+heavily while the feed was steady ([A quiet host while the tape
+runs](#a-quiet-host-while-the-tape-runs); ADR-0012 item 170). `tapectl drive cleaned` writes
+down that it happened (ADR-0012, 2026-10-15 item 60):
 
 ```bash
 tapectl drive cleaning-cartridge add CLNU01   # once per cleaning cartridge; rated for 50 uses (--rated-uses N)
