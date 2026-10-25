@@ -192,7 +192,7 @@ fn release_scope(ids: &[i64], version: Option<i64>) -> clean::CleanScope<'_> {
 /// wording without scraping `println!` output.
 fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
     let mut msg = format!(
-        "retained {} unit(s) below their policy's min_copies -- not cleaned; \
+        "retained {} unit(s) below their policy's copy floor -- not cleaned; \
          releasing them now would discard the only cheap route to the copy \
          their own policy requires. Pass --force to release \
          them too:\n",
@@ -854,6 +854,12 @@ mod tests {
             "must name the unit and its N/M copies: {msg}"
         );
         assert!(msg.contains("--force"), "must name --force: {msg}");
+        // #493 (ADR-0012 item 149): the floor is the larger of min_copies and
+        // the copies_at sum, so the notice names the floor, not min_copies.
+        assert!(
+            msg.contains("below their policy's copy floor") && !msg.contains("min_copies"),
+            "{msg}"
+        );
     }
 
     /// Trap 5: `--force` must still override the new gate exactly as it
