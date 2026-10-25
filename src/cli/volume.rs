@@ -1523,6 +1523,11 @@ struct DriveWriteSteps<'a> {
     /// The staged sets the write takes: every one, or with `--for-location`
     /// those with need there (#493).
     scope: write::StagedScope,
+    /// Where the tape is moved once it is sealed and confirmed: X for
+    /// `--for-location X`, Y for `--move-to Y`, `None` for neither. The
+    /// write's shared-place warning judges it (#493, ADR-0012 2026-10-07
+    /// item 26); with `--init` too, since the write half is this one.
+    moved_to: Option<String>,
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
@@ -1562,7 +1567,10 @@ impl WriteSteps for DriveWriteSteps<'_> {
             self.prewrite_hash,
             self.full_confirm,
             self.assume_yes,
-            self.scope.clone(),
+            write::WriteScope {
+                staged: self.scope.clone(),
+                moved_to: self.moved_to.clone(),
+            },
         )
     }
 }
@@ -1965,6 +1973,8 @@ pub fn run(
                     Some(ids) => write::StagedScope::ForLocation(ids),
                     None => write::StagedScope::Every,
                 },
+                // `move_to` is X under `--for-location X` (decided above).
+                moved_to: move_to.as_deref().map(|to| to.trim().to_string()),
             };
             let keep = if *keep_staging {
                 StagingKeep::All
@@ -6538,6 +6548,231 @@ mod tests {
             let plain = for_location_json(serde_json::json!({}), None);
             assert_eq!(plain["for_location"], serde_json::Value::Null);
             assert_eq!(plain["not_for_location"], serde_json::json!([]));
+        }
+
+        /// The shared-place fixture (#493): `testlib/alpha` v1 staged whole
+        /// on disk, with one copy on the sealed volume `V-u1-v1-0`; the shelves
+        /// `home` and `offsite`; and the destination `NEW`, initialised and
+        /// shelved at `home` (where `volume init` puts a cartridge shelved
+        /// there). `min_copies` is 2, so alpha is one copy short of its floor.
+        struct SharedPlace {
+            conn: Connection,
+            dir: tempfile::TempDir,
+            copy: String,
+            home: i64,
+            offsite: i64,
+        }
+
+        fn shared_place() -> SharedPlace {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            // Whole at its recorded size, so the write passes the on-disk check.
+            std::fs::write(&s.file, [0u8; 19]).unwrap();
+            let home = add_shelf(&conn, "home");
+            let offsite = add_shelf(&conn, "offsite");
+            add_destination(&conn, home);
+            SharedPlace {
+                conn,
+                dir,
+                copy: s.volumes[0].clone(),
+                home,
+                offsite,
+            }
+        }
+
+        /// `NEW`, initialised at `location`, as `volume init` leaves it.
+        fn add_destination(conn: &Connection, location: i64) -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', ?2)",
+                rusqlite::params![NEW, location],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        impl SharedPlace {
+            fn copy_at(&self, location: i64) {
+                self.conn
+                    .execute(
+                        "UPDATE volumes SET location_id = ?1 WHERE label = ?2",
+                        rusqlite::params![location, self.copy],
+                    )
+                    .unwrap();
+            }
+
+            /// `cmd` through the real arm, with the drive config (no drive
+            /// is there, and no key: the write stops after the check), and
+            /// the shared-place verdicts it reached.
+            fn verdicts(&self, config: &Config, cmd: &VolumeCommands) -> Vec<Option<String>> {
+                crate::volume::write::shared_place_log::take();
+                let tmp = tempfile::TempDir::new().unwrap();
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                run(&self.conn, &paths, config, cmd, false, true, false)
+                    .expect_err("no key and no drive: the write stops after the check");
+                crate::volume::write::shared_place_log::take()
+            }
+        }
+
+        /// The one warning a verdict list holds.
+        fn the_warning(verdicts: Vec<Option<String>>) -> String {
+            match verdicts.as_slice() {
+                [Some(w)] => w.clone(),
+                other => panic!("expected one warning, got {other:?}"),
+            }
+        }
+
+        /// #493 (ADR-0012 2026-10-07 item 26): `volume write --move-to Y`
+        /// judges the shared place where the tape goes. Shelved at home and
+        /// moved offsite, a copy at home draws no warning, and one already
+        /// offsite is named with the tape moved there. Positive controls: the
+        /// check ran each time (one verdict per write), and a plain write
+        /// still judges the volume's own place, as does a `--move-to` naming
+        /// the shelf it is already on.
+        #[test]
+        fn move_to_judges_the_shared_place_where_the_tape_goes() {
+            let f = shared_place();
+            let config = drive_config(f.dir.path());
+            let moved = write_cmd(NEW, false, Some("offsite"));
+            let plain = write_cmd(NEW, false, None);
+
+            f.copy_at(f.home);
+            assert_eq!(f.verdicts(&config, &moved), vec![None]);
+            let w = the_warning(f.verdicts(&config, &plain));
+            assert!(
+                w.starts_with("warning: volume \"V-NEW\" is at location \"home\", where")
+                    && w.contains("testlib/alpha v1 (volume \"V-u1-v1-0\")"),
+                "{w}"
+            );
+            let w = the_warning(f.verdicts(&config, &write_cmd(NEW, false, Some(" home"))));
+            assert!(w.contains("is at location \"home\""), "{w}");
+
+            f.copy_at(f.offsite);
+            let w = the_warning(f.verdicts(&config, &moved));
+            assert!(
+                w.starts_with(
+                    "warning: volume \"V-NEW\" is moved to location \"offsite\" after this \
+                     write, where these versions already have a copy: testlib/alpha v1 (volume \
+                     \"V-u1-v1-0\")."
+                ),
+                "{w}"
+            );
+            assert_eq!(f.verdicts(&config, &plain), vec![None]);
+        }
+
+        /// #493: `volume write --for-location X` judges X, where the tape
+        /// goes. A copy at home: alpha, one short of its floor with no copy
+        /// offsite, is for offsite (item 158), and no warning. A copy
+        /// already offsite: with a target of two there alpha is still for
+        /// offsite (item 158's first group), and the warning names offsite.
+        #[test]
+        fn for_location_judges_the_shared_place_at_x() {
+            let f = shared_place();
+            let mut config = drive_config(f.dir.path());
+            let cmd = for_location_cmd(NEW, "offsite", None);
+
+            f.copy_at(f.home);
+            assert_eq!(f.verdicts(&config, &cmd), vec![None]);
+
+            f.copy_at(f.offsite);
+            config.defaults.copies_at.insert("offsite".into(), 2);
+            let w = the_warning(f.verdicts(&config, &cmd));
+            assert!(
+                w.contains("volume \"V-NEW\" is moved to location \"offsite\" after this write")
+                    && w.contains("testlib/alpha v1 (volume \"V-u1-v1-0\")"),
+                "{w}"
+            );
+        }
+
+        /// #493: `volume write --init --move-to Y`, the one-command copy,
+        /// takes the same path. Its write half is [`DriveWriteSteps::write`]
+        /// with the arm's one `moved_to`, here behind a scripted init (no
+        /// drive here) that shelves the new volume at home as `volume init`
+        /// would. The arm builds its one `DriveWriteSteps` with `moved_to`
+        /// from `move_to` whatever `--init` says, pinned on the source.
+        #[test]
+        fn init_and_move_to_judges_the_shared_place_where_the_tape_goes() {
+            /// The scripted init, then the real write.
+            struct InitThenWrite<'a> {
+                conn: &'a Connection,
+                home: i64,
+                write: DriveWriteSteps<'a>,
+            }
+            impl WriteSteps for InitThenWrite<'_> {
+                fn preflight(&self, _label: &str) -> Result<()> {
+                    Ok(())
+                }
+                fn init(&self, _label: &str, _force: bool) -> Result<Initialized> {
+                    Ok(Initialized {
+                        volume_id: add_destination(self.conn, self.home),
+                        medium: fake_medium(),
+                    })
+                }
+                fn write(&self, label: &str, force: bool) -> Result<()> {
+                    self.write.write(label, force)
+                }
+            }
+
+            for (copy_at_offsite, expect_warning) in [(false, false), (true, true)] {
+                let f = shared_place();
+                f.conn
+                    .execute("DELETE FROM volumes WHERE label = ?1", [NEW])
+                    .unwrap();
+                f.copy_at(if copy_at_offsite { f.offsite } else { f.home });
+                let config = drive_config(f.dir.path());
+                let tmp = tempfile::TempDir::new().unwrap();
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let steps = InitThenWrite {
+                    conn: &f.conn,
+                    home: f.home,
+                    write: DriveWriteSteps {
+                        conn: &f.conn,
+                        paths: &paths,
+                        config: &config,
+                        device: "/nonexistent/tapectl-438-nst",
+                        allow_missing_escrow: false,
+                        prewrite_hash: false,
+                        full_confirm: true,
+                        assume_yes: true,
+                        scope: write::StagedScope::Every,
+                        moved_to: Some("offsite".into()),
+                    },
+                };
+                crate::volume::write::shared_place_log::take();
+                write_and_follow(
+                    &f.conn,
+                    &config,
+                    &steps,
+                    &request(true, false, Some("offsite")),
+                )
+                .expect_err("no key and no drive: the write stops after the check");
+                let verdicts = crate::volume::write::shared_place_log::take();
+                if expect_warning {
+                    let w = the_warning(verdicts);
+                    assert!(w.contains("is moved to location \"offsite\""), "{w}");
+                } else {
+                    assert_eq!(verdicts, vec![None]);
+                }
+            }
+
+            const SRC: &str = include_str!("volume.rs");
+            let prod = SRC.split("#[cfg(test)]").next().unwrap();
+            let arm = &prod[prod.find("VolumeCommands::Write {\n").unwrap()
+                ..prod.find("VolumeCommands::Resume {\n").unwrap()];
+            assert_eq!(
+                arm.matches("DriveWriteSteps {").count(),
+                1,
+                "one set of steps"
+            );
+            assert_eq!(
+                arm.matches("moved_to: move_to.as_deref().map(|to| to.trim().to_string()),")
+                    .count(),
+                1,
+                "the steps' moved_to is the arm's move_to"
+            );
         }
     }
 
