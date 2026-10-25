@@ -8465,7 +8465,7 @@ impl From<Option<&[i64]>> for WriteScope {
 /// the volume `volume_id` already is: where a write moving the tape there
 /// judges and words its shared-place warning ([`WriteScope::moved_to`]).
 /// `None` judges the volume's own location.
-fn moved_elsewhere(
+pub(crate) fn moved_elsewhere(
     conn: &Connection,
     volume_id: i64,
     moved_to: Option<&str>,
