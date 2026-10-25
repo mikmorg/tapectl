@@ -1122,6 +1122,12 @@ pub fn volume_write(
 /// everywhere the write looks at staging — the batch it plans, the
 /// whole-on-disk check, the keys and the pre-flight — so a staged set outside
 /// the scope can neither be written by it nor refuse it.
+///
+/// It is given as a [`WriteScope`], which also carries the location the tape
+/// is moved to once it is sealed and confirmed (`--for-location X`,
+/// `--move-to Y`): the copy-distinctness warning judges that place (#493,
+/// ADR-0012 2026-10-07 item 26). A [`StagedScope`] or an `Option` converts
+/// to a scope that moves nothing, judged where the volume is.
 #[allow(clippy::too_many_arguments)]
 pub fn volume_write_scoped(
     conn: &Connection,
@@ -1135,7 +1141,7 @@ pub fn volume_write_scoped(
     prewrite_hash: bool,
     full_confirm: bool,
     assume_yes: bool,
-    only_stage_sets: impl Into<StagedScope>,
+    only_stage_sets: impl Into<WriteScope>,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
     // `collection run` and `quick-archive` inherit — all three reach the
@@ -1179,11 +1185,14 @@ pub(crate) fn volume_write_contacted<'c>(
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
-    // `None` ([`StagedScope::Every`]): every staged set. See
+    // `None` ([`StagedScope::Every`]): every staged set, moved nowhere. See
     // [`volume_write_scoped`].
-    only_stage_sets: impl Into<StagedScope>,
+    only_stage_sets: impl Into<WriteScope>,
 ) -> Result<()> {
-    let scope: StagedScope = only_stage_sets.into();
+    let WriteScope {
+        staged: scope,
+        moved_to,
+    } = only_stage_sets.into();
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
             "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
@@ -1291,6 +1300,10 @@ pub(crate) fn volume_write_contacted<'c>(
     // cartridge half only ever fires on an inconsistent catalog: binding
     // this volume to a cartridge erased any copy on it at `volume init`
     // (ADR-0010 displacement, `Distinctness::same_cartridge`).
+    // A tape moved once it is sealed and confirmed (`--for-location X`,
+    // `--move-to Y`) has its location half judged where it goes, and the
+    // warning says it is moved there (#493): the copies at its present shelf
+    // are not where it will be.
     // Every write path inherits it — `collection run`, `quick-archive` and
     // `volume compact-write` reach the tape only through here.
     //
@@ -1302,11 +1315,18 @@ pub(crate) fn volume_write_contacted<'c>(
     // deliberate, because two selections that can drift is exactly how
     // issue #96 happened.
     let stage_set_ids = batch.stage_set_ids();
-    let distinct = coverage::copy_distinctness(conn, volume_id, &stage_set_ids)?;
+    let elsewhere = moved_elsewhere(conn, volume_id, moved_to.as_deref())?;
+    let distinct = coverage::copy_distinctness_at(conn, volume_id, elsewhere, &stage_set_ids)?;
     if let Some(refusal) = distinct.refusal(label) {
         return Err(TapectlError::Other(refusal));
     }
-    if let Some(warning) = distinct.warning(label) {
+    let warning = match elsewhere {
+        Some(_) => distinct.warning_moved_to(label),
+        None => distinct.warning(label),
+    };
+    #[cfg(test)]
+    shared_place_log::note(warning.as_deref());
+    if let Some(warning) = warning {
         eprintln!("{warning}");
     }
 
@@ -8402,6 +8422,85 @@ impl From<Option<&[i64]>> for StagedScope {
             None => StagedScope::Every,
             Some(ids) => StagedScope::Rewrite(ids.to_vec()),
         }
+    }
+}
+
+/// One write's scope ([`volume_write_scoped`]): the staged sets it takes and
+/// the location its tape is moved to once it is sealed and confirmed, when
+/// it is moved (#493).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteScope {
+    /// The staged sets the write takes, and its spanning rule.
+    pub staged: StagedScope,
+    /// The location the tape is moved to after the write, by name: `volume
+    /// write --for-location X`'s X or `--move-to Y`'s Y. The location half of
+    /// copy distinctness judges it (ADR-0012 2026-10-07 item 26). `None`, a
+    /// name no location is registered under, or the volume's own location
+    /// judges where the volume is, as a write that moves nothing. `volume
+    /// write` refuses an unregistered or a warehouse `--move-to` before the
+    /// write, so an unregistered name reaches here only from a library
+    /// caller.
+    pub moved_to: Option<String>,
+}
+
+/// A scope that moves nothing: every caller that predates #493's move.
+impl From<StagedScope> for WriteScope {
+    fn from(staged: StagedScope) -> Self {
+        WriteScope {
+            staged,
+            moved_to: None,
+        }
+    }
+}
+
+/// As [`StagedScope`]'s own `From<Option<&[i64]>>`, moving nothing: `volume
+/// write`'s `None`, `volume rewrite`'s own sets and the tests' callers.
+impl From<Option<&[i64]>> for WriteScope {
+    fn from(only: Option<&[i64]>) -> Self {
+        StagedScope::from(only).into()
+    }
+}
+
+/// The location `moved_to` names, when it is registered and is not where
+/// the volume `volume_id` already is: where a write moving the tape there
+/// judges and words its shared-place warning ([`WriteScope::moved_to`]).
+/// `None` judges the volume's own location.
+fn moved_elsewhere(
+    conn: &Connection,
+    volume_id: i64,
+    moved_to: Option<&str>,
+) -> Result<Option<i64>> {
+    let Some(name) = moved_to else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT l.id FROM locations l JOIN volumes v ON v.id = ?2
+             WHERE l.name = ?1 AND l.id IS NOT v.location_id",
+            params![name.trim(), volume_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Test-only: the shared-place verdicts this thread's writes reached, in
+/// order — `None` where the check ran and warned of nothing — so a test can
+/// tell "no warning" from "never got there". The warning itself goes to
+/// stderr.
+#[cfg(test)]
+pub(crate) mod shared_place_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(warning: Option<&str>) {
+        LOG.with(|l| l.borrow_mut().push(warning.map(str::to_string)));
+    }
+
+    pub(crate) fn take() -> Vec<Option<String>> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 }
 
