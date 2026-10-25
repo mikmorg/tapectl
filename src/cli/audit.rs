@@ -744,7 +744,8 @@ fn restage_action(
     // item 149: the larger of `min_copies` and the `copies_at` sum). The
     // unit is active here, so the tape-only multiplier is 1 and the floor
     // is its base.
-    let under_copied = copy_count_for_unit(conn, unit.id)? < resolved.copy_floor_base();
+    let floor = resolved.copy_floor_base();
+    let under_copied = copy_count_for_unit(conn, unit.id)? < floor;
 
     let mut steps: Vec<String> = Vec::new();
     for v in &live_versions {
@@ -769,8 +770,8 @@ fn restage_action(
 
     if any_live && under_copied {
         action.push_str(&format!(
-            " (\"{}\" is below its policy's min_copies, so a bare clean would retain \
-             its staged bytes -- --force releases them here because the write below \
+            " (\"{}\" is below its policy's copy floor of {floor}, so a bare clean would \
+             retain its staged bytes -- --force releases them here because the write below \
              creates the required copy)",
             unit.name
         ));
@@ -3996,8 +3997,8 @@ mod tests {
             "tapectl staging clean --unit reels --version 1 --force && \
              tapectl stage create reels --version 1 && \
              tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> \
-             (\"reels\" is below its policy's min_copies, so a bare clean would retain \
-             its staged bytes -- --force releases them here because the write below \
+             (\"reels\" is below its policy's copy floor of 2, so a bare clean would \
+             retain its staged bytes -- --force releases them here because the write below \
              creates the required copy)"
         );
 
