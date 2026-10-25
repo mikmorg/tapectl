@@ -1451,6 +1451,165 @@ tapectl volume write L6-0002 --init
 tape except those marked reclaimable or purged. The staging directory is checked
 for room first, and a read that does not finish removes what it wrote (#474).
 
+### Copies by location
+
+From 1.7.1 a unit can say how many copies it wants at each location, not only
+how many in all ([ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md)
+items 148-160). These are its **copy targets**, the `copies_at` map. A copy *at*
+a location is an eligible tape whose recorded location is that one (set by
+`volume move` or `--move-to`), or a recorded warehouse deposit there. Like every
+count, it is judged per Version: a unit is as covered at a place as its
+least-covered current Version, and a spanning Version as its least-covered slice.
+
+**Setting targets.** Register the locations first. A target that names a location
+`location add` has not made leaves every unit that takes it unresolvable, and
+`config check` cannot see that, because the names are checked against the catalog
+when a unit's policy is resolved.
+
+```bash
+tapectl location add home-rack --description "Home server rack"
+tapectl location add offsite --description "Fire safe at a relative's house"
+```
+
+Then set the map at whichever layer fits:
+- **one unit**, in its dotfile, a `[policy.copies_at]` table with one
+  `location = count` line each:
+  ```toml
+  [policy.copies_at]
+  home-rack = 1
+  offsite = 2
+  ```
+- **an archive set**, `tapectl archive-set edit critical-media --copies-at
+  home-rack=1 --copies-at offsite=2` (or `copies_at` in its `[[archive_sets]]`
+  table, then `archive-set sync`). Its `required_locations` already counts as one
+  copy at each name, and `--copies-at` counts are laid over those names;
+- **every unit**, `copies_at = { home-rack = 1, offsite = 1 }` in config.toml's
+  `[defaults]`.
+
+The most specific layer that sets the map wins whole: a dotfile that names only
+`offsite` drops the `home-rack` its archive set named. The unit's **copy floor**
+becomes the larger of `min_copies` and the map's sum, so the dotfile above
+(`home-rack = 1`, `offsite = 2`) asks for 3 copies in all at the default
+`min_copies` of 2. For a tape-only unit the floor and each target are multiplied
+by `[compaction] tape_only_safety_multiplier`, as before: at 2x that unit needs 6
+copies, 2 at `home-rack` and 4 at `offsite`. Every key is in
+[configuration.md](configuration.md#defaults).
+
+A unit's source can go (tape-only, or a disk that is not mounted), and its
+dotfile with it. So tapectl keeps the dotfile's own map in the catalog each time
+`snapshot create`, `stage create` or `collection sync`'s adoption of the dotfile
+runs with the dotfile present, and uses that copy while the dotfile is absent.
+`location rename` rewrites a renamed location in the catalog's maps and in every
+dotfile it can reach; change config.toml's `copies_at` by hand.
+
+**What each unit still needs.** `report needs` gives every unit with a target or
+short of its copy floor: its copies against the floor, and at each location its
+target, its copies there and how far short. `--all` lists every unit, `--json`
+gives the same facts.
+
+```text
+$ tapectl report needs
+needs per location (3 unit(s)):
+  family/letters (active): 0 of 3 copies, 3 short
+    home-rack: target 1, 0 copies, 1 short
+    offsite: target 2, 0 copies, 2 short
+  family/photos (active): 0 of 2 copies, 2 short
+    home-rack: no target, 0 copies
+    offsite: no target, 0 copies
+  media/music (active): 0 of 2 copies, 2 short
+    home-rack: no target, 0 copies
+    offsite: no target, 0 copies
+```
+
+With `--location`, it shows one place and each unit's need there, in two groups
+(item 158). Group 1 is a unit whose target there is unmet. Group 2 is a unit short
+of its copy floor that has no target there and no copy there yet; a unit holding
+all its copies at one place is never in group 2 for that place.
+
+```text
+$ tapectl report needs --location offsite
+needs at offsite (3 unit(s)):
+  family/letters (active): target 2, 0 copies here, 2 short; 0 of 3 copies, 3 short — group 1: its target here is unmet
+  family/photos (active): no target, 0 copies here; 0 of 2 copies, 2 short — group 2: short of its copy floor, no target and no copy here
+  media/music (active): no target, 0 copies here; 0 of 2 copies, 2 short — group 2: short of its copy floor, no target and no copy here
+```
+
+`audit`'s `location_presence` reports a location short of its target
+([Audit](#audit)), and `volume plan --policy-aware` and `collection plan
+--policy-aware` count such a unit as one that needs a copy.
+
+**Writing a tape for a location.** Staging and writing stay two commands, and the
+first one never moves a tape:
+
+```bash
+# 1. The cartridge that will go to offsite: initialise it (it stays initialised
+#    and empty until step 3)
+tapectl volume init L6-0007
+# 2. Work out what offsite needs, pack it into L6-0007's room, and stage it
+tapectl stage for-location offsite --volume L6-0007 --dry-run
+tapectl stage for-location offsite --volume L6-0007
+# 3. Write only what offsite needs; once sealed and confirmed, the tape is
+#    recorded at offsite
+tapectl volume write L6-0007 --for-location offsite
+```
+
+`stage for-location` judges each unit's need at the location by the two groups
+above, from the version a write would put on tape: a new or changed unit's next
+version holds no copy anywhere yet, so it is in group 1 or 2 whatever its older
+version holds. It then packs the units into the volume's own room, its capacity at
+the drive's fill ceiling less the end-of-tape reserve (and on to its plan bound
+when the drive declares `post_warning_bytes`):
+- what is already staged for the location goes first, and is never staged again
+  (when it does not all fit, nothing more is planned, and a warning names it);
+- then a span in progress that continues there, then group 1 before group 2.
+  Within group 1 the largest shortfall at the location comes first (0 copies
+  there before 1 short), the fewest copies in all breaking ties; within group 2,
+  the fewest copies in all; then the name (item 152);
+- whole units before units that may span; next-fit, so the first unit that does
+  not fit closes the tape and the rest are named as waiting for the next tape for
+  that location.
+
+`--dry-run` prints the plan and stages nothing:
+
+```text
+$ tapectl stage for-location offsite --volume L6-0007 --dry-run
+stage for-location offsite --volume L6-0007: 3 unit(s), 1.5 MiB, against the volume's 2.21 TiB under its fill ceiling (dry run: nothing was snapshotted or staged)
+  "family/letters" (new version): group 1: 0 of its target 2 at offsite, 0 copies in all; 512.0 KiB — to snapshot and stage (never archived)
+  "family/photos" (new version): group 2: 0 of its copy floor 2, none at offsite; 512.0 KiB — to snapshot and stage (never archived)
+  "media/music" (new version): group 2: 0 of its copy floor 2, none at offsite; 512.0 KiB — to snapshot and stage (never archived)
+then write them: tapectl volume write L6-0007 --for-location offsite
+```
+
+Without it, the command snapshots and stages new and changed units as
+`collection run` does, and stages an unchanged unit's version from its source. A
+unit whose source is gone (tape-only) is read back from a tape that holds it: the
+command prints the `volume read-slices --from <LABEL>` lines, grouped by tape in
+the order to run them, and you run them with each tape loaded in turn before the
+write. A unit whose source is not there is named and skipped. A span in progress
+whose next slices continue a range already on a tape (they start after slice 1)
+goes only onto a tape for the location of that range (item 159); for any other
+location it is named as waiting. A warehouse location is refused: a copy there is
+a recorded deposit of a sealed tape, so the refusal names `volume deposit add` and
+the tapes that would meet its targets.
+
+`volume write --for-location` writes only the staged sets that still need the
+location (and a span that continues there), names the others, which stay staged,
+and refuses before the drive is touched when nothing staged needs it. Once the
+tape is sealed and confirmed it is moved to the location, as `--move-to` does; a
+different `--move-to` is refused. Plain `volume write`, and `collection run`, take
+every staged set and know nothing of where the tape goes.
+
+Staging is released at each unit's copy floor, as after any write (item 154). If a
+target is still unmet at that point because the copies landed elsewhere, the next
+tape for that location stages the unit again, from its source or by
+`read-slices`. When staging has room, `--keep-staging-for-locations` holds it until
+every target of each unit written is met, and the output names the locations still
+short:
+
+```bash
+tapectl volume write L6-0008 --for-location home-rack --keep-staging-for-locations
+```
+
 ### Mark Tape-Only
 
 When local disk copies are no longer needed:
@@ -1480,13 +1639,15 @@ integrity check for "family/letters" against v1's checksums:
 
 `mark-tape-only` checks the unit against the floors it will be held to once it
 is tape-only. They come from its own resolved policy (dotfile > archive set >
-`[defaults]`): `min_copies` copies (2 by default), copies in `[defaults]
-min_locations` distinct locations (2 by default), and a copy at every one of
-its `required_locations`, by name. A tape-only unit's copy floors, the copies
-and the copies at each named location, are multiplied by `[compaction]
-tape_only_safety_multiplier` (2 by default; ADR-0012, 2026-10-12). The number
-of distinct locations is not. So at the defaults it needs 4 copies in 2
-locations, and 2 copies at each named location. It also checks that nothing changed on
+`[defaults]`): its copy floor, the larger of `min_copies` (2 by default) and
+the sum of its `copies_at` targets; copies in `[defaults] min_locations`
+distinct locations (2 by default); and its target at every location of its
+`copies_at` map, by name (an archive set's `required_locations` counts as one
+copy at each; see [Copies by location](#copies-by-location)). A tape-only
+unit's copy floors, the copy floor and each location's target, are multiplied
+by `[compaction] tape_only_safety_multiplier` (2 by default; ADR-0012,
+2026-10-12). The number of distinct locations is not. So at the defaults it
+needs 4 copies in 2 locations, and 2 copies at each named location. It also checks that nothing changed on
 disk since its last snapshot. A unit that meets all of it is marked with no
 question asked.
 
@@ -1526,9 +1687,10 @@ An archive set is a named policy (minimum copies, required locations, verify
 interval, …) that units can be assigned to (`unit init --archive-set`). Policy
 resolves in three layers: the unit's dotfile, then its archive set, then
 `[defaults]` in config.toml. Not every key exists in every layer. A dotfile's
-`[policy]` table takes only `checksum_mode`, `compression`, `slice_size` and
-`warehouse_copies`. `required_locations` exists only on an archive set, so a unit
-outside one names no place. `verify_interval_days` exists on an archive set and in
+`[policy]` table takes only `checksum_mode`, `compression`, `slice_size`,
+`warehouse_copies`, `allow_spanning` and `copies_at`. `required_locations` exists
+only on an archive set; from 1.7.1 every layer can name places, with a count each,
+through `copies_at` ([Copies by location](#copies-by-location)). `verify_interval_days` exists on an archive set and in
 `[defaults]`, where it is 365 days when the file does not say, so every unit has one.
 
 ```bash
@@ -1546,6 +1708,10 @@ tapectl archive-set sync
 [Locations and Movement](#locations-and-movement)), and they are checked by
 name everywhere: `audit`, `unit mark-tape-only` and `snapshot mark-reclaimable`
 all want a copy *at each named place*, not merely copies in that many places.
+From 1.7.1 `required_locations` is shorthand for a copy target of one at each
+name, and the names count towards the copy floor: a set whose
+`required_locations` name more places than its `min_copies` needs one copy per
+name. `--copies-at NAME=N` (repeatable) sets counts other than one.
 A name that is not registered is refused, dry run or not:
 
 ```text
@@ -1596,17 +1762,23 @@ WARNINGS (1):
 audit: 4 violations, 1 warnings (exit 2)
 ```
 
-`location_presence` compares a unit's `required_locations`, by name, with
-where its copies actually are: a missing place reads
+`location_presence` compares a unit's copy targets (its resolved `copies_at`
+map, an archive set's `required_locations` counted as one copy at each name),
+by name, with where its copies actually are: a missing place reads
 `no copy at required location(s) offsite (policy requires home-rack, offsite; copies are in 1 location(s))`,
-and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A name
-that is not a registered location counts as missing. A tape-only unit needs
+and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A target
+above one names its count: `has 1 copy at required location offsite, needs 2
+(policy requires 1 at home-rack, 2 at offsite)`. A `required_locations` name that
+is not a registered location counts as missing; a `copies_at` name that is not one
+makes the unit's policy unresolvable. A tape-only unit needs
 `[compaction] tape_only_safety_multiplier` copies at each named place
 (ADR-0012, 2026-10-07): at the default 2x, one copy at `offsite` reads
 `has 1 copy at required location offsite, needs 2 (tape-only 2x) (policy requires offsite)`.
 Its `copy_count` is multiplied the same way (ADR-0012, 2026-10-12): a
 tape-only unit with `min_copies = 2` and two copies reads
-`has 2 copies, needs 4 (tape-only 2x)`.
+`has 2 copies, needs 4 (tape-only 2x)`. `copy_count` judges the copy floor,
+the larger of `min_copies` and the `copies_at` sum, so a unit whose targets
+add up to more than its `min_copies` needs that many copies in all.
 `location_count` is the places half: a tape-only unit whose current Version sits in
 fewer places than `[defaults] min_locations` (2 by default, never multiplied) reads
 `has copies in 1 location(s), needs 2 ([defaults] min_locations)`.
