@@ -2424,6 +2424,12 @@ mod tests {
         fn stage(&self, plan: &ForLocationPlan) -> Vec<Staged> {
             stage(&self.conn, &self.paths, &self.config, plan, 1, true).unwrap()
         }
+
+        fn count(&self, table: &str) -> i64 {
+            self.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        }
     }
 
     /// Item 153, end to end with dar: `stage` snapshots a new unit and a
@@ -2500,5 +2506,137 @@ mod tests {
         let mut want = vec![fresh_set, set2];
         want.sort_unstable();
         assert_eq!(for_x.stage_set_ids(), want);
+    }
+
+    /// `How::Stage { restage: true }` (items 153 and 154): a unit whose
+    /// current version has need at X, no live staged set and its source
+    /// present is staged again from its source: a new stage set of the same
+    /// version, never a new snapshot, and the write for X takes it.
+    /// Positive control, both sides: while the version has a live staged set
+    /// it is reused, never staged again, before its release and after the
+    /// re-stage.
+    #[test]
+    fn a_current_version_released_from_staging_is_staged_again_from_its_source_and_a_write_for_x_takes_it(
+    ) {
+        let c = DarCat::new();
+        c.unit("kept");
+
+        // Never archived: snapshotted and staged as v1.
+        let staged = c.stage(&c.plan());
+        let [Staged::Now {
+            stage_set_id: set1,
+            version: 1,
+        }] = staged[..]
+        else {
+            panic!("kept v1 is staged: {staged:?}");
+        };
+        let v1: i64 = c
+            .conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![set1],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Positive control: v1's live staged set is reused, not staged again.
+        let live = c.plan();
+        assert_eq!(names(&live.planned), ["\"kept\" v1"]);
+        assert_eq!(
+            live.planned[0].how,
+            How::AlreadyStaged { stage_set_id: set1 }
+        );
+        let (snapshots, sets) = (c.count("snapshots"), c.count("stage_sets"));
+        assert_eq!(c.stage(&live), [Staged::Already]);
+        assert_eq!(
+            (c.count("snapshots"), c.count("stage_sets")),
+            (snapshots, sets)
+        );
+
+        // v1 goes onto one tape at home, short of its floor of 2, and its
+        // staging is released; its folder is unchanged.
+        c.conn
+            .execute(
+                "UPDATE snapshots SET status = 'current' WHERE id = ?1",
+                params![v1],
+            )
+            .unwrap();
+        c.whole_at_home(set1, "H1");
+        c.release(set1);
+
+        let again = c.plan();
+        assert_eq!(names(&again.planned), ["\"kept\" v1"]);
+        let p = &again.planned[0];
+        assert_eq!(
+            p.how,
+            How::Stage {
+                snapshot_id: v1,
+                restage: true
+            }
+        );
+        assert_eq!(
+            p.describe_need("offsite"),
+            "group 2: 1 of its copy floor 2, none at offsite"
+        );
+        let (out, _) = text_lines(&again, None);
+        assert!(
+            out.iter().any(|l| l.starts_with("  \"kept\" v1: ")
+                && l.ends_with(" — to stage again from its source")),
+            "{out:?}"
+        );
+        let json = to_json(&again, None);
+        assert_eq!(json["planned"][0]["staging"], "to_stage");
+        assert_eq!(json["planned"][0]["version"], 1);
+
+        let staged = c.stage(&again);
+        let [Staged::Now {
+            stage_set_id: set2,
+            version: 1,
+        }] = staged[..]
+        else {
+            panic!("kept v1 is staged again: {staged:?}");
+        };
+        assert_ne!(set2, set1);
+        assert_eq!(
+            c.count("snapshots"),
+            snapshots,
+            "staged again, not snapshotted as a new version"
+        );
+        assert_eq!(c.count("stage_sets"), sets + 1);
+        let (of, status): (i64, String) = c
+            .conn
+            .query_row(
+                "SELECT snapshot_id, status FROM stage_sets WHERE id = ?1",
+                params![set2],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((of, status.as_str()), (v1, "staged"));
+        let v1_status: String = c
+            .conn
+            .query_row(
+                "SELECT status FROM snapshots WHERE id = ?1",
+                params![v1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_status, "current");
+
+        // The write for X takes it.
+        assert_eq!(
+            staged_sets_for_location(&c.conn, &c.config, "offsite")
+                .unwrap()
+                .stage_set_ids(),
+            [set2]
+        );
+
+        // Positive control, after: the re-staged set is reused.
+        let after = c.plan();
+        assert_eq!(
+            after.planned[0].how,
+            How::AlreadyStaged { stage_set_id: set2 }
+        );
+        assert_eq!(c.stage(&after), [Staged::Already]);
+        assert_eq!(c.count("stage_sets"), sets + 1);
     }
 }
