@@ -6867,6 +6867,55 @@ pub(crate) mod tests {
         );
     }
 
+    /// #493 (ADR-0012 item 149) reaches the span planner: a span in progress
+    /// owes the slices still short of the unit's copy floor
+    /// (`volume::write::plan_span_set`), which is now the larger of
+    /// `min_copies` and the `copies_at` sum. Tape A holds a range of slices
+    /// 1-2 and tape B the whole set: at the default floor of 2 the owed run is
+    /// 3-4; once the unit's dotfile map (frozen: it has no path) names three
+    /// locations, the floor is 3 and every slice is owed, 1-4.
+    #[test]
+    fn a_spans_owed_run_is_judged_against_the_copies_at_floor() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 4);
+        let a = c.volume("SPAN-A", Some("home"));
+        let b = c.volume("SPAN-B", Some("offsite"));
+        c.range(set, a, 1, 2, 4);
+        c.whole(set, 4, b);
+        c.place("vault");
+        c.conn
+            .execute(
+                "UPDATE stage_slices SET staging_path = '/staged/' || id",
+                [],
+            )
+            .unwrap();
+        let config = crate::config::Config::default();
+        let owed = |c: &SpanCatalog| {
+            let preview = crate::volume::write::plan_preview(&c.conn, &config, 1 << 40, None, 4096)
+                .unwrap()
+                .expect("a span in progress is planned by place");
+            assert_eq!(
+                preview.classes,
+                [crate::volume::layout_model::PlanClass::Owed]
+            );
+            preview.units[0]
+                .slices
+                .iter()
+                .map(|s| s.slice_number)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(owed(&c), [3, 4], "the default floor of 2");
+
+        c.conn
+            .execute(
+                "UPDATE units SET copies_at_frozen = '{\"home\":1,\"offsite\":1,\"vault\":1}'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(owed(&c), [1, 2, 3, 4], "the map's floor of 3");
+    }
+
     /// Items 149, 156 and 160: `Shortfall`'s per-location half comes from the
     /// resolved map alone. A dotfile map naming only `glacier` replaces an
     /// archive set's `home` (still in `required_locations`), so `home` is not
