@@ -2224,3 +2224,25 @@ Ruled 2026-10-25, Logical Block Protection (#388; the research note
      gives: nothing counts, the refusal is named, and the operator writes again. No flushing
      filemark per slice: the seal's synchronous filemark makes any refusal surface before the tape
      is sealed. No slice is retried.
+
+Ruled 2026-10-25, write shaping after the drive phase (#488; `docs/research/2026-10-20-write-shaping.md`
+§12 decisions 5-8, and `docs/runs/2026-10-22-488-drive-phase.md`):
+
+167. **No write shaping.** No fixed pace, adaptive pace or pause and refill is built: the one paced
+     run was worse (1.0154 against 1.0021, at 134.5 MB/s against 158.9), and no load reproduced a
+     feed problem. The knobs stay behind the `research` cargo feature, which no production build
+     has.
+168. **No `[write_shaping]` config keys.**
+169. **`QUEUE_BYTES` stays 256 MiB per file, not locked in memory.** The 1.6.0 acceptance averaged
+     160 MB/s over 2.28 TiB with ring and that queue; a larger queue's share was never measured.
+170. **The feed-ratio warning follows the evidence.** It names the host only when the drive
+     reports repositions (page 0x34). With 0 repositions and a jump in page 0x02's corrections it
+     says the drive corrected heavily while the feed was steady, and suggests a cleaning
+     cartridge, then the medium if it recurs. With neither it states the ratio without a cause.
+171. **R0 extends to page 0x02:** the operator decodes #426's write's correction counters from a
+     copy of a production `db backup`, where its health rows hold the page.
+172. **No more drive time for #488 now.** Every production write records repositions, page 0x02
+     and the feed ratio. A write over 1.05 with repositions reopens shaping with real data; one
+     with a correction jump gets a cleaning first. #488 closes once item 170 is built.
+173. **No CPU reservation on home2 for tape commands** (decision 8). R11 never ran and every write
+     since 1.1.0 streamed on a quiet host; the quiet-host rule stays the lever.
