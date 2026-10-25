@@ -816,11 +816,15 @@ mod tests {
              VALUES ('2026-09-06 02:00:00', 'volume', 16, 'V-LOOSE', 'verify_read_errors',
                      'corrected_per_gib', '0.010000',
                      '{\"session_id\": 33, \"cartridge_id\": null, \"corrected_per_gib\": 0.01,
-                       \"bytes_processed\": 1073741824, \"corrected\": 1, \"uncorrected\": 0}'),
+                       \"rate_denominator\": \"verify_bytes\", \"verify_bytes\": 107374182400,
+                       \"scope\": \"estimated\", \"scope_unknown\": false,
+                       \"data_sets\": 43490, \"corrected\": 1, \"uncorrected\": 0}'),
                     ('2026-09-09 02:00:00', 'volume', 16, 'V-LOOSE', 'verify_read_errors',
                      'corrected_per_gib', '2.000000',
                      '{\"session_id\": 34, \"cartridge_id\": null, \"corrected_per_gib\": 2.0,
-                       \"bytes_processed\": 1073741824, \"corrected\": 200, \"uncorrected\": 0}');",
+                       \"rate_denominator\": \"verify_bytes\", \"verify_bytes\": 107374182400,
+                       \"scope\": \"estimated\", \"scope_unknown\": false,
+                       \"data_sets\": 43490, \"corrected\": 200, \"uncorrected\": 0}');",
         )
         .unwrap();
         // Contact 101 journalled page 0x2E with flag 19 raised (the real HP
