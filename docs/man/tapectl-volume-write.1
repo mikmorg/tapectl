@@ -10,7 +10,7 @@ Write staged data to volume
 .PP
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR\-0012); no flag overrides it.
 .PP
-Once the volume is sealed and confirmed, staging is released if every unit written has reached its resolved `min_copies` (ADR\-0012, 2026\-10\-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `\-\-keep\-staging` never releases; `staging clean` does it later.
+Once the volume is sealed and confirmed, staging is released if every unit written has reached its copy floor (the larger of its policy\*(Aqs `min_copies` and the sum of its `copies_at` targets, times the tape\-only multiplier for a tape\-only unit; ADR\-0012, 2026\-10\-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `\-\-keep\-staging` never releases; `staging clean` does it later.
 .PP
 A further copy in one command (ADR\-0012 2026\-10\-15 item 59): `tapectl volume write L6\-0003 \-\-init \-\-full\-confirm \-\-move\-to offsite` initialises the loaded cartridge, writes the volume, reads every file back, and moves the sealed volume (and its cartridge) to `offsite`. Each step keeps its own checks and the command stops at the first one that fails: an init that refuses writes nothing, and nothing moves unless the write sealed and confirmed.
 .PP
@@ -72,7 +72,7 @@ Fill this volume to at most this fraction of its capacity, for this write only: 
 After sealing, read every file back and hash it against the front index (tri\-layer L3, hours on a full cartridge). Off by default (ADR\-0012, 2026\-10\-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify\-status` name it until `volume verify` runs one
 .TP
 \fB\-\-keep\-staging\fR
-Keep the staged slices after the write seals and confirms, even when every unit written has reached its resolved `min_copies`. Without this flag the staging is released then; release it later with `tapectl staging clean`
+Keep the staged slices after the write seals and confirms, even when every unit written has reached its copy floor. Without this flag the staging is released then; release it later with `tapectl staging clean`
 .TP
 \fB\-\-for\-location\fR \fI<LOCATION>\fR
 Write only the staged sets that still have need at this location (ADR\-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `\-\-move\-to LOCATION` does; a different `\-\-move\-to` is refused. Stage for it with `tapectl stage for\-location`. Without this flag the write takes every staged set

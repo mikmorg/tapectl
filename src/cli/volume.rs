@@ -76,8 +76,10 @@ pub enum VolumeCommands {
     /// (ADR-0012); no flag overrides it.
     ///
     /// Once the volume is sealed and confirmed, staging is released if every
-    /// unit written has reached its resolved `min_copies` (ADR-0012,
-    /// 2026-10-07 item 2: after a quick confirm too); otherwise it is kept
+    /// unit written has reached its copy floor (the larger of its policy's
+    /// `min_copies` and the sum of its `copies_at` targets, times the
+    /// tape-only multiplier for a tape-only unit; ADR-0012, 2026-10-07 item
+    /// 2: after a quick confirm too); otherwise it is kept
     /// and the output names each unit that is still short. A release that
     /// fails is a warning and the exit status stays 0. `--keep-staging`
     /// never releases; `staging clean` does it later.
@@ -179,7 +181,7 @@ pub enum VolumeCommands {
         #[arg(long)]
         full_confirm: bool,
         /// Keep the staged slices after the write seals and confirms, even
-        /// when every unit written has reached its resolved `min_copies`.
+        /// when every unit written has reached its copy floor.
         /// Without this flag the staging is released then; release it later
         /// with `tapectl staging clean`.
         #[arg(long)]

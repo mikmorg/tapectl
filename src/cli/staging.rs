@@ -16,15 +16,16 @@ pub enum StagingCommands {
     Clean {
         /// Clean all staged sets, not just those with completed writes;
         /// also releases a unit's staged data that a bare `staging clean`
-        /// would otherwise retain for being below its policy's resolved
-        /// min_copies
+        /// would otherwise retain for being below its copy floor (the
+        /// larger of its policy's min_copies and the sum of its copies_at
+        /// targets, times the tape-only multiplier for a tape-only unit)
         #[arg(long)]
         force: bool,
 
         /// Narrow which staged sets are considered for release to this
         /// unit (repeatable). Without `--force`, the same
-        /// min_copies split still applies within the named unit(s): one
-        /// below its own resolved min_copies keeps its staged bytes
+        /// copy-floor split still applies within the named unit(s): one
+        /// below its own copy floor keeps its staged bytes
         /// retained (pass `--force` to release it too, exactly as for the
         /// whole-archive form). A `'failed'` stage_set is always swept
         /// regardless of this scope -- see `CleanScope::Units`'s own
