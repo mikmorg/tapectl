@@ -6520,6 +6520,78 @@ mod tests {
         assert_eq!(aware[1].finding, None);
     }
 
+    /// #493 (ADR-0012 item 160): `volume plan --policy-aware` counts a
+    /// per-location shortfall as a need. `big` and `mapped` both have their
+    /// two copies (at `home`) and a newer version staged, `big`'s larger; with
+    /// no map neither has a finding. Once `mapped`'s dotfile map (frozen in
+    /// the catalog: it has no path) asks for a copy at `offsite`, it is listed
+    /// first, short at `offsite` though it meets its copy floor; a map adding
+    /// up to 3 raises the floor too.
+    #[test]
+    fn plan_rows_count_a_per_location_shortfall_as_a_need() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+             INSERT INTO locations (id, name, kind) VALUES (1, 'home', 'shelf'),
+                                                         (2, 'offsite', 'shelf');
+             INSERT INTO units (uuid, name, tenant_id, status) VALUES
+                 ('u-big', 'big', 1, 'active'), ('u-mapped', 'mapped', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path) VALUES
+                 (1, 1, 1, 'full', 'current', '/b'), (2, 1, 2, 'full', 'staged', '/b'),
+                 (3, 2, 1, 'full', 'current', '/m'), (4, 2, 2, 'full', 'staged', '/m');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, total_encrypted_size) VALUES
+                 (1, 1, 'cleaned', 524288, 50), (2, 2, 'staged', 524288, 100),
+                 (3, 3, 'cleaned', 524288, 50), (4, 4, 'staged', 524288, 10);
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  location_id) VALUES
+                 (1, 'S1', 'lto', 'p', 1, 'sealed', 1), (2, 'S2', 'lto', 'p', 1, 'sealed', 1);
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) VALUES
+                 (1, 1, 1, 'completed'), (1, 1, 2, 'completed'),
+                 (3, 3, 1, 'completed'), (3, 3, 2, 'completed');",
+        )
+        .unwrap();
+        let config = Config::default();
+        let listed = |conn: &Connection| {
+            staged_plan_rows(conn, &config, true)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.unit, r.finding))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&conn),
+            [("big".to_string(), None), ("mapped".to_string(), None)],
+            "no map: no finding, largest first"
+        );
+
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"offsite\":1}' WHERE name = 'mapped'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&conn),
+            [
+                ("mapped".to_string(), Some("no copy at offsite".to_string())),
+                ("big".to_string(), None)
+            ]
+        );
+
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":1,\"offsite\":2}'
+              WHERE name = 'mapped'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&conn)[0],
+            (
+                "mapped".to_string(),
+                Some("2 of 3 copies; no copy at offsite".to_string())
+            )
+        );
+    }
+
     /// Issue #144 review: one staged unit whose dotfile `[policy]` cannot be
     /// resolved (edited after staging) must not abort the whole
     /// `volume plan --policy-aware` listing. Like `audit`, the row is shown

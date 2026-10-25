@@ -1178,8 +1178,9 @@ pub fn tape_only_multiplier(config: &crate::config::Config, unit_status: &str) -
 /// ×` [`tape_only_multiplier`]. `base` is the unit's
 /// [`crate::policy::ResolvedPolicy::copy_floor_base`] (the larger of
 /// `min_copies` and the `copies_at` sum, #493 item 149; never `min_copies`
-/// read on its own). Never hand it a count of distinct places: those are not
-/// multiplied (ADR-0012 2026-10-12 item 46).
+/// read on its own) or one location's target ([`location_target`]). Never hand
+/// it a count of distinct places: those are not multiplied (ADR-0012
+/// 2026-10-12 item 46).
 pub fn copy_floor(config: &crate::config::Config, base: i64, unit_status: &str) -> i64 {
     base * tape_only_multiplier(config, unit_status)
 }
@@ -1515,35 +1516,483 @@ fn distinct_names(required: &[String]) -> Vec<&String> {
     wanted
 }
 
+// ── Copies at a location (#493; ADR-0012 items 149, 150, 156-158, 160) ──
+//
+// A unit's per-location targets are its resolved `copies_at` map (item 156:
+// the most specific layer that sets it wins entirely, an archive set's
+// `required_locations` folded in as one copy at each name). That map is the
+// ONE source of per-location targets here: nothing below reads
+// `ResolvedPolicy::required_locations`, which would count a folded name twice
+// or bring back a name a dotfile's map replaced.
+//
+// A copy "at" a location (item 150) is counted by [`Counted::CopiesAt`], the
+// one per-slice derivation every count in this module is: an eligible tape
+// holding the slice and shelved there, or a recorded deposit there of one (a
+// warehouse is counted by its deposits, item 157); per stage set its
+// least-covered slice, summed over the version's stage sets with each tape
+// and deposit credited to one stage set (items 127, 138); and per unit the
+// fewest any current version has there (issue #153).
+
+/// **The** copies-at-a-place expression: a parenthesised SQL scalar counting
+/// `q`'s copies at the place `place_expr` (SQL evaluating to a location id),
+/// by [`Counted::CopiesAt`]. For [`CoverageScope::Unit`] with `current_only`
+/// it is the MINIMUM over the unit's current versions, as
+/// [`copy_count_expr`] is (a unit with no current version holds 0
+/// everywhere); every other scope takes no minimum.
+pub fn copies_at_expr(q: &CoverageQuery, place_expr: &str) -> String {
+    if let CoverageScope::Unit {
+        id_expr,
+        current_only: true,
+    } = q.scope
+    {
+        let per_snapshot = CoverageQuery {
+            scope: CoverageScope::Snapshot { id_expr: "pcur.id" },
+            exclude_volume: q.exclude_volume,
+        };
+        return format!(
+            "(SELECT COALESCE(MIN(per.c), 0) FROM (
+                SELECT ({}) AS c
+                FROM snapshots pcur
+                WHERE pcur.unit_id = {id_expr} AND pcur.status = 'current'
+             ) per)",
+            copies_at_expr(&per_snapshot, place_expr)
+        );
+    }
+    scope_sum(q, Counted::CopiesAt(place_expr))
+}
+
+/// `scope` as a [`CoverageQuery`] over the bound parameter `?1`, with the
+/// volume `?2` pretended away when `exclude`, and the id to bind as `?1`.
+fn named_query(scope: NamedScope, exclude: bool) -> (CoverageQuery<'static>, i64) {
+    let (scope, id) = match scope {
+        NamedScope::Unit(id) => (
+            CoverageScope::Unit {
+                id_expr: "?1",
+                current_only: true,
+            },
+            id,
+        ),
+        NamedScope::Snapshot(id) => (CoverageScope::Snapshot { id_expr: "?1" }, id),
+    };
+    (
+        CoverageQuery {
+            scope,
+            exclude_volume: exclude.then_some("?2"),
+        },
+        id,
+    )
+}
+
+/// The copies `scope` holds at EVERY registered location, by name (item
+/// 150), 0 where it holds none, in one statement. [`NamedScope::Unit`] is the
+/// unit's current coverage, the fewest copies any current version has at
+/// each place; [`NamedScope::Snapshot`] is one version.
+pub fn copies_at_every_location(
+    conn: &Connection,
+    scope: NamedScope,
+) -> crate::error::Result<std::collections::BTreeMap<String, i64>> {
+    let (q, id) = named_query(scope, false);
+    let sql = format!(
+        "SELECT l.name, {} FROM locations l",
+        copies_at_expr(&q, "l.id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The copies `scope` holds at the one location named `location` (item 150),
+/// with `exclude_volume` (a volume id) pretended away when given, as
+/// [`places_held_excluding`] does. A name matching no location holds 0:
+/// nothing can be at a place the catalog does not know.
+pub fn copies_at_location(
+    conn: &Connection,
+    scope: NamedScope,
+    location: &str,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<i64> {
+    let (sql, id) = copies_at_location_sql(scope, exclude_volume.is_some());
+    let mut bound: Vec<rusqlite::types::Value> = vec![id.into()];
+    bound.extend(exclude_volume.map(rusqlite::types::Value::from));
+    bound.push(location.to_string().into());
+    Ok(conn.query_row(&sql, rusqlite::params_from_iter(bound.iter()), |r| r.get(0))?)
+}
+
+/// [`copies_at_location`]'s statement, and the id to bind as `?1`: the scope
+/// `?1`, the volume `?2` pretended away when `exclude`, the name last.
+fn copies_at_location_sql(scope: NamedScope, exclude: bool) -> (String, i64) {
+    let (q, id) = named_query(scope, exclude);
+    let name = if exclude { "?3" } else { "?2" };
+    let sql = format!(
+        "SELECT COALESCE((SELECT {} FROM locations l WHERE l.name = {name}), 0)",
+        copies_at_expr(&q, "l.id")
+    );
+    (sql, id)
+}
+
+/// Every unit's copies at every registered location, keyed by unit id then
+/// location name (item 150), from ONE statement: the whole-catalog form for a
+/// report, where [`copies_at_every_location`] is the one-unit form for a
+/// command. Each unit's current coverage, as [`NamedScope::Unit`]: a unit
+/// with no current version reads 0 at every place.
+pub fn copies_at_every_location_by_unit(
+    conn: &Connection,
+) -> crate::error::Result<std::collections::HashMap<i64, std::collections::BTreeMap<String, i64>>> {
+    let sql = format!(
+        "SELECT u.id, l.name, {} FROM units u CROSS JOIN locations l",
+        copies_at_expr(&CoverageQuery::current_unit("u.id"), "l.id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut by_unit: std::collections::HashMap<i64, std::collections::BTreeMap<String, i64>> =
+        Default::default();
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+    })?;
+    for row in rows {
+        let (unit, location, copies) = row?;
+        by_unit.entry(unit).or_default().insert(location, copies);
+    }
+    Ok(by_unit)
+}
+
+/// One location of a unit's `copies_at` map that holds fewer copies than its
+/// target (#493, ADR-0012 item 149).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationShort {
+    pub location: String,
+    /// The copies there ([`copies_at_expr`]).
+    pub copies: i64,
+    /// The target there: the map's count, times the tape-only multiplier for a
+    /// tape-only unit ([`location_target`]).
+    pub target: i64,
+}
+
+impl LocationShort {
+    /// How many more copies the location needs.
+    pub fn short_by(&self) -> i64 {
+        self.target - self.copies
+    }
+}
+
+/// The copies a unit of status `unit_status` must hold at `location` under
+/// its resolved policy: the `copies_at` map's count there (0 when it names no
+/// count), as a [`copy_floor`], so a tape-only unit's target is multiplied
+/// (item 149, as item 46 raised a named location's count). 0 means no target
+/// there: a 0 in the map asks for nothing (`config::validate_copies_at`).
+pub fn location_target(
+    config: &crate::config::Config,
+    resolved: &crate::policy::ResolvedPolicy,
+    location: &str,
+    unit_status: &str,
+) -> i64 {
+    copy_floor(
+        config,
+        resolved.copies_at.get(location).copied().unwrap_or(0),
+        unit_status,
+    )
+}
+
+/// The locations of `resolved`'s `copies_at` map whose copies (`at`, by name;
+/// a name absent from it holds 0) are under their [`location_target`], in name
+/// order: the per-location half of [`Shortfall`], as a pure judgement so a
+/// report that has fetched every count in one pass judges by the same rule.
+pub fn judge_copies_at(
+    config: &crate::config::Config,
+    resolved: &crate::policy::ResolvedPolicy,
+    unit_status: &str,
+    at: &std::collections::BTreeMap<String, i64>,
+) -> Vec<LocationShort> {
+    resolved
+        .copies_at
+        .keys()
+        .filter_map(|location| {
+            let target = location_target(config, resolved, location, unit_status);
+            let copies = at.get(location).copied().unwrap_or(0);
+            (copies < target).then(|| LocationShort {
+                location: location.clone(),
+                copies,
+                target,
+            })
+        })
+        .collect()
+}
+
+/// **The** per-location predicate (#493, ADR-0012 items 149 and 160): the
+/// locations of `resolved`'s `copies_at` map at which `scope` holds fewer
+/// copies than their [`location_target`] for `unit_status`, in name order,
+/// with `exclude_volume` (a volume id) pretended away when given, as
+/// [`places_held_excluding`] does. Empty when every target is met, and when
+/// the map has no target above 0, in which case no statement is run (so a
+/// catalog without targets costs nothing more). Otherwise one statement,
+/// counting only the target names.
+pub fn short_of_copies_at(
+    conn: &Connection,
+    config: &crate::config::Config,
+    scope: NamedScope,
+    resolved: &crate::policy::ResolvedPolicy,
+    unit_status: &str,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<Vec<LocationShort>> {
+    let at = copies_at_targets(conn, scope, resolved, exclude_volume)?;
+    Ok(judge_copies_at(config, resolved, unit_status, &at))
+}
+
+/// The copies `scope` holds at each location `resolved`'s `copies_at` map
+/// gives a target above 0, by name (a name no location has is absent, so it
+/// holds 0), with `exclude_volume` pretended away: one statement, or none when
+/// the map has no such target.
+fn copies_at_targets(
+    conn: &Connection,
+    scope: NamedScope,
+    resolved: &crate::policy::ResolvedPolicy,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<std::collections::BTreeMap<String, i64>> {
+    let names: Vec<&String> = resolved
+        .copies_at
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(name, _)| name)
+        .collect();
+    if names.is_empty() {
+        return Ok(Default::default());
+    }
+    let (sql, id) = copies_at_targets_sql(scope, exclude_volume.is_some(), names.len());
+    let mut bound: Vec<rusqlite::types::Value> = vec![id.into()];
+    bound.extend(exclude_volume.map(rusqlite::types::Value::from));
+    bound.extend(names.iter().map(|name| (*name).clone().into()));
+    let mut stmt = conn.prepare(&sql)?;
+    let at = stmt
+        .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(at)
+}
+
+/// [`copies_at_targets`]' statement, and the id to bind as `?1`: the scope
+/// `?1`, the volume `?2` pretended away when `exclude`, then `names` names.
+fn copies_at_targets_sql(scope: NamedScope, exclude: bool, names: usize) -> (String, i64) {
+    let (q, id) = named_query(scope, exclude);
+    let first = 2 + usize::from(exclude);
+    let placeholders = (0..names)
+        .map(|i| format!("?{}", first + i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT l.name, {} FROM locations l WHERE l.name IN ({placeholders})",
+        copies_at_expr(&q, "l.id")
+    );
+    (sql, id)
+}
+
+/// One wording for a [`short_of_copies_at`] answer, after a caller's subject:
+/// "1 copy at required location offsite, needs 2", with "at each" when several
+/// share one target, and each location's own "needs N" when the targets
+/// differ ("2 copies at required location home, needs 3; 0 copies at required
+/// location offsite, needs 1"). The caller adds the "(tape-only Nx)" note.
+pub fn describe_short_locations(short: &[LocationShort]) -> String {
+    let at = |s: &LocationShort| {
+        let noun = if s.copies == 1 { "copy" } else { "copies" };
+        format!("{} {noun} at required location {}", s.copies, s.location)
+    };
+    match short.first() {
+        Some(first) if short.iter().all(|s| s.target == first.target) => {
+            let each = if short.len() == 1 { "" } else { " at each" };
+            format!(
+                "{}, needs {}{each}",
+                short.iter().map(at).collect::<Vec<_>>().join(", "),
+                first.target
+            )
+        }
+        _ => short
+            .iter()
+            .map(|s| format!("{}, needs {}", at(s), s.target))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// A `copies_at` map as a policy states it, for "(policy requires …)": the
+/// names alone when every target is 1 (the shorthand `required_locations`
+/// writes, item 149), else each as "N at NAME"; a 0 target asks for nothing
+/// and is left out. Never multiplied: the caller's "(tape-only Nx)" note says
+/// what the multiplier did.
+pub fn describe_targets(copies_at: &std::collections::BTreeMap<String, i64>) -> String {
+    let targets: Vec<(&String, &i64)> = copies_at.iter().filter(|(_, n)| **n > 0).collect();
+    if targets.iter().all(|(_, n)| **n == 1) {
+        targets
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        targets
+            .iter()
+            .map(|(name, n)| format!("{n} at {name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What a unit needs at one location X (#493, ADR-0012 item 158), in item
+/// 158's two groups: the answer `stage for-location X` picks units by, and
+/// `report needs --location X` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeedAt {
+    /// Group 1: the unit's target at X is unmet. `target` is the map's count
+    /// at X times the tape-only multiplier ([`location_target`]); `copies_here`
+    /// the copies at X; `copies` the unit's copies in all (item 152's
+    /// tie-break).
+    Target {
+        target: i64,
+        copies_here: i64,
+        copies: i64,
+    },
+    /// Group 2: the unit is short of its total copy floor (`floor`, through
+    /// [`copy_floor`]), has no target at X and no copy at X yet. A unit
+    /// holding a copy at X is never in this group, so one holding all its
+    /// copies at X is never picked for X by it.
+    Floor { floor: i64, copies: i64 },
+    /// Neither: nothing for X to do for this unit.
+    None,
+}
+
+impl NeedAt {
+    /// The judgement itself, from counts a caller already has: `copies`, the
+    /// unit's copies in all ([`copy_count_expr`]), and `copies_here`, its
+    /// copies at `location` ([`copies_at_expr`]). A 0 target is no target
+    /// (`config::validate_copies_at`: "0 asks for none there"), so a unit whose
+    /// map says `X = 0` and that is short of its floor is in group 2 for X
+    /// while it has no copy there, exactly as one whose map does not name X.
+    pub fn judge(
+        config: &crate::config::Config,
+        resolved: &crate::policy::ResolvedPolicy,
+        unit_status: &str,
+        location: &str,
+        copies: i64,
+        copies_here: i64,
+    ) -> NeedAt {
+        let target = location_target(config, resolved, location, unit_status);
+        if target > 0 {
+            return if copies_here < target {
+                NeedAt::Target {
+                    target,
+                    copies_here,
+                    copies,
+                }
+            } else {
+                NeedAt::None
+            };
+        }
+        let floor = copy_floor(config, resolved.copy_floor_base(), unit_status);
+        if copies < floor && copies_here == 0 {
+            NeedAt::Floor { floor, copies }
+        } else {
+            NeedAt::None
+        }
+    }
+
+    /// 1 or 2, item 158's group, or `None`.
+    pub fn group(&self) -> Option<u8> {
+        match self {
+            NeedAt::Target { .. } => Some(1),
+            NeedAt::Floor { .. } => Some(2),
+            NeedAt::None => None,
+        }
+    }
+
+    /// How far short: of the target at X (group 1) or of the copy floor
+    /// (group 2); 0 for [`NeedAt::None`].
+    pub fn short_by(&self) -> i64 {
+        match *self {
+            NeedAt::Target {
+                target,
+                copies_here,
+                ..
+            } => target - copies_here,
+            NeedAt::Floor { floor, copies } => floor - copies,
+            NeedAt::None => 0,
+        }
+    }
+}
+
+/// [`NeedAt`] for `unit` at `location` under its resolved policy `resolved`:
+/// two statements, its copies in all and its copies at `location` (a name no
+/// location has holds 0).
+pub fn need_at(
+    conn: &Connection,
+    config: &crate::config::Config,
+    unit: &crate::db::models::Unit,
+    resolved: &crate::policy::ResolvedPolicy,
+    location: &str,
+) -> crate::error::Result<NeedAt> {
+    let copies: i64 = conn.query_row(
+        &format!(
+            "SELECT {}",
+            copy_count_expr(&CoverageQuery::current_unit("?1"))
+        ),
+        params![unit.id],
+        |row| row.get(0),
+    )?;
+    let copies_here = copies_at_location(conn, NamedScope::Unit(unit.id), location, None)?;
+    Ok(NeedAt::judge(
+        config,
+        resolved,
+        &unit.status,
+        location,
+        copies,
+        copies_here,
+    ))
+}
+
 // ── What a new copy would resolve (ADR-0012 2026-10-07 item 26, #144) ──
 
 /// How far a unit's CURRENT coverage falls short of its resolved policy, on
 /// exactly the two terms `audit`'s `copy_count` and `location_presence`
 /// checks judge it by: [`copy_count_expr`] against the [`copy_floor`] of
-/// `min_copies`, and [`short_required_locations`] against
-/// `required_locations` (at [`copies_per_named_location`] copies per name —
-/// ADR-0012 2026-10-07 item 34, 2026-10-12 item 43). These are
-/// the two findings a write can resolve, which is what `--policy-aware`
-/// (`collection plan`/`run`, `volume plan`) orders by and what `collection
-/// status` counts as under-copied.
+/// [`crate::policy::ResolvedPolicy::copy_floor_base`] (#493, ADR-0012 item
+/// 149: the larger of `min_copies` and the `copies_at` sum), and each
+/// location of the resolved `copies_at` map against its [`location_target`]
+/// ([`judge_copies_at`]; items 149 and 160 — the map is the one source of
+/// per-location targets, an archive set's `required_locations` folded into it,
+/// so it is never also judged on its own). These are the findings a write can
+/// resolve, which is what `--policy-aware` (`collection plan`/`run`, `volume
+/// plan`) orders by and what `collection status` counts as under-copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortfall {
     pub copies: i64,
-    /// The copy floor: the resolved `min_copies`, times the tape-only
-    /// multiplier for a tape-only unit ([`copy_floor`]).
+    /// The copy floor: the larger of the resolved `min_copies` and the
+    /// `copies_at` sum, times the tape-only multiplier for a tape-only unit
+    /// ([`copy_floor`]).
     pub min_copies: i64,
-    /// Required locations with no copy, in the policy's order.
-    pub missing_locations: Vec<String>,
-    /// Required locations holding at least one copy but fewer than
-    /// `per_name` (a tape-only unit, ADR-0012 2026-10-07 item 34), each with
-    /// the copies it holds, in the policy's order.
-    pub thin_locations: Vec<(String, i64)>,
-    /// Copies each named location must hold ([`copies_per_named_location`]),
-    /// which is also the [`tape_only_multiplier`] `min_copies` was raised by.
-    pub per_name: i64,
+    /// The locations of the `copies_at` map under their target, in name order:
+    /// those with no copy and those with some but too few.
+    pub locations: Vec<LocationShort>,
+    /// The [`tape_only_multiplier`] the floor and every target were raised by.
+    pub multiplier: i64,
 }
 
 impl Shortfall {
+    /// The judgement, from counts a caller already has: `copies`, the unit's
+    /// copies in all, and `at`, its copies at each location by name (a name
+    /// absent holds 0; only the map's names are read). [`shortfall`] fetches
+    /// them for one unit; a report that fetched every unit's in one pass
+    /// ([`copies_at_every_location_by_unit`]) judges by this same rule.
+    pub fn judge(
+        config: &crate::config::Config,
+        resolved: &crate::policy::ResolvedPolicy,
+        unit_status: &str,
+        copies: i64,
+        at: &std::collections::BTreeMap<String, i64>,
+    ) -> Shortfall {
+        Shortfall {
+            copies,
+            min_copies: copy_floor(config, resolved.copy_floor_base(), unit_status),
+            locations: judge_copies_at(config, resolved, unit_status, at),
+            multiplier: tape_only_multiplier(config, unit_status),
+        }
+    }
+
     /// `audit`'s `copy_count` finding.
     pub fn under_copied(&self) -> bool {
         self.copies < self.min_copies
@@ -1551,44 +2000,61 @@ impl Shortfall {
 
     /// Either finding: a write would help this unit.
     pub fn any(&self) -> bool {
-        self.under_copied() || !self.missing_locations.is_empty() || !self.thin_locations.is_empty()
+        self.under_copied() || !self.locations.is_empty()
+    }
+
+    /// The map's locations with no copy at all, in name order.
+    pub fn missing_locations(&self) -> Vec<String> {
+        self.locations
+            .iter()
+            .filter(|s| s.copies == 0)
+            .map(|s| s.location.clone())
+            .collect()
+    }
+
+    /// The map's locations holding some copies but fewer than their target.
+    pub fn thin_locations(&self) -> Vec<LocationShort> {
+        self.locations
+            .iter()
+            .filter(|s| s.copies > 0)
+            .cloned()
+            .collect()
     }
 
     /// The findings in words, for a plan's listing: `"1 of 2 copies; no copy
     /// at offsite"`. Empty when there is no shortfall.
     pub fn describe(&self) -> String {
+        let note = if self.multiplier > 1 {
+            format!(" (tape-only {}x)", self.multiplier)
+        } else {
+            String::new()
+        };
         let mut parts = Vec::new();
         if self.under_copied() {
-            let note = if self.per_name > 1 {
-                format!(" (tape-only {}x)", self.per_name)
-            } else {
-                String::new()
-            };
             parts.push(format!(
                 "{} of {} copies{note}",
                 self.copies, self.min_copies
             ));
         }
-        if !self.missing_locations.is_empty() {
-            parts.push(format!("no copy at {}", self.missing_locations.join(", ")));
+        let missing = self.missing_locations();
+        if !missing.is_empty() {
+            parts.push(format!("no copy at {}", missing.join(", ")));
         }
-        if !self.thin_locations.is_empty() {
-            parts.push(format!(
-                "{} (tape-only {}x)",
-                describe_named_shortfall(&self.thin_locations, self.per_name),
-                self.per_name
-            ));
+        let thin = self.thin_locations();
+        if !thin.is_empty() {
+            parts.push(format!("{}{note}", describe_short_locations(&thin)));
         }
         parts.join("; ")
     }
 }
 
 /// [`Shortfall`] for unit `unit_id`, whose status is `unit_status`, under
-/// its resolved policy `resolved`: `min_copies` and the copies each named
-/// location must hold both through the one tape-only rule ([`copy_floor`],
-/// [`copies_per_named_location`]).
-/// A unit with no current snapshot has 0 copies and is at no location, so a
-/// never-archived unit always falls short of a non-zero `min_copies`.
+/// its resolved policy `resolved`: the copy floor and every per-location
+/// target through the one tape-only rule ([`copy_floor`]). One statement for
+/// the copies, and one more only when the `copies_at` map has a target
+/// ([`short_of_copies_at`]). A unit with no current snapshot has 0 copies and
+/// is at no location, so a never-archived unit always falls short of a
+/// non-zero floor.
 pub fn shortfall(
     conn: &Connection,
     config: &crate::config::Config,
@@ -1596,7 +2062,6 @@ pub fn shortfall(
     unit_status: &str,
     resolved: &crate::policy::ResolvedPolicy,
 ) -> crate::error::Result<Shortfall> {
-    let per_name = copies_per_named_location(config, unit_status);
     let copies: i64 = conn.query_row(
         &format!(
             "SELECT {}",
@@ -1605,19 +2070,8 @@ pub fn shortfall(
         params![unit_id],
         |row| row.get(0),
     )?;
-    let short = short_required_locations(
-        conn,
-        NamedScope::Unit(unit_id),
-        &resolved.required_locations,
-        per_name,
-    )?;
-    Ok(Shortfall {
-        copies,
-        min_copies: copy_floor(config, resolved.copy_floor_base(), unit_status),
-        missing_locations: missing_names(&short),
-        thin_locations: short.into_iter().filter(|(_, n)| *n > 0).collect(),
-        per_name,
-    })
+    let at = copies_at_targets(conn, NamedScope::Unit(unit_id), resolved, None)?;
+    Ok(Shortfall::judge(config, resolved, unit_status, copies, &at))
 }
 
 /// [`shortfall`] under the unit's own resolved policy (`policy::resolve`,
@@ -2703,7 +3157,9 @@ pub(crate) mod tests {
 
     // ── shortfall (issue #144) ──
 
-    /// A resolved policy with `min_copies` and `required_locations` set.
+    /// A resolved policy with `min_copies` and `required_locations` set, the
+    /// names folded into `copies_at` at one copy each as `policy::resolve`
+    /// folds an archive set's (#493, ADR-0012 item 156).
     fn policy(
         conn: &Connection,
         min_copies: i64,
@@ -2716,6 +3172,7 @@ pub(crate) mod tests {
             crate::policy::resolve(conn, &crate::config::Config::default(), &unit).unwrap();
         resolved.min_copies = min_copies;
         resolved.required_locations = names(required);
+        resolved.copies_at = required.iter().map(|n| (n.to_string(), 1)).collect();
         resolved
     }
 
@@ -2737,7 +3194,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(short.copies, 2);
         assert!(short.under_copied());
-        assert_eq!(short.missing_locations, names(&["offsite"]));
+        assert_eq!(short.missing_locations(), names(&["offsite"]));
         assert!(short.any());
         assert_eq!(short.describe(), "2 of 3 copies; no copy at offsite");
 
@@ -2766,8 +3223,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(!thin.under_copied(), "{thin:?}");
-        assert!(thin.missing_locations.is_empty());
-        assert_eq!(thin.thin_locations, vec![("home".to_string(), 1)]);
+        assert!(thin.missing_locations().is_empty());
+        assert_eq!(
+            thin.thin_locations(),
+            vec![LocationShort {
+                location: "home".to_string(),
+                copies: 1,
+                target: 2
+            }]
+        );
         assert!(thin.any());
         assert_eq!(
             thin.describe(),
@@ -6258,6 +6722,12 @@ pub(crate) mod tests {
         let mut statements = vec![
             slice_copies_sql(),
             copies_at_names_sql(true, 2),
+            // #493: the per-location targets and one location, both forms;
+            // a name is found by the locations' unique index.
+            copies_at_targets_sql(NamedScope::Unit(1), true, 2).0,
+            copies_at_targets_sql(NamedScope::Snapshot(1), false, 1).0,
+            copies_at_location_sql(NamedScope::Unit(1), true).0,
+            copies_at_location_sql(NamedScope::Snapshot(1), false).0,
             format!(
                 "SELECT {}",
                 every_slice_on_sealed_volume_sql("?1", Some("?2"))
@@ -6276,5 +6746,425 @@ pub(crate) mod tests {
             let full = tables_read_in_full(sql);
             assert!(full.is_empty(), "{full:#?} in the plan of\n{sql}");
         }
+    }
+
+    // ── copies at a location (#493; ADR-0012 items 149, 150, 156-158, 160) ──
+
+    /// A resolved policy for `unit` (the defaults: `min_copies` 2) with
+    /// `copies_at` set to `map`, as a dotfile's `[policy.copies_at]` resolves.
+    fn policy_with_map(
+        conn: &Connection,
+        unit: &str,
+        map: &[(&str, i64)],
+    ) -> crate::policy::ResolvedPolicy {
+        let unit = crate::db::queries::get_unit_by_name(conn, unit)
+            .unwrap()
+            .unwrap();
+        let mut resolved =
+            crate::policy::resolve(conn, &crate::config::Config::default(), &unit).unwrap();
+        resolved.copies_at = map.iter().map(|(n, c)| (n.to_string(), *c)).collect();
+        resolved
+    }
+
+    fn btree(pairs: &[(&str, i64)]) -> std::collections::BTreeMap<String, i64> {
+        pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    }
+
+    /// Item 150: a copy at X is an eligible tape shelved at X or a deposit at
+    /// X (a warehouse counts by its deposits, item 157), and every location is
+    /// answered, 0 where nothing is. The one-location form agrees, pretends a
+    /// volume away like every `_excluding` count, and reads 0 for a name no
+    /// location has; the whole-catalog form gives the same map in one pass.
+    #[test]
+    fn copies_at_every_location_counts_shelf_holders_and_deposits() {
+        let (conn, unit_id, vol) = setup_unit_with_deposit("active");
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+        let unit = NamedScope::Unit(unit_id);
+        assert_eq!(
+            copies_at_every_location(&conn, unit).unwrap(),
+            btree(&[("glacier", 1), ("home", 1), ("offsite", 0)])
+        );
+
+        add_tape_copy_at(&conn, "L6-0004", "home");
+        let every = copies_at_every_location(&conn, unit).unwrap();
+        assert_eq!(every, btree(&[("glacier", 1), ("home", 2), ("offsite", 0)]));
+        assert_eq!(copies_at_location(&conn, unit, "home", None).unwrap(), 2);
+        assert_eq!(
+            copies_at_location(&conn, unit, "home", Some(vol)).unwrap(),
+            1,
+            "L6-0003 pretended away"
+        );
+        assert_eq!(
+            copies_at_location(&conn, unit, "glacier", Some(vol)).unwrap(),
+            0,
+            "and the deposit made from it"
+        );
+        assert_eq!(copies_at_location(&conn, unit, "nowhere", None).unwrap(), 0);
+
+        let snapshot: i64 = conn
+            .query_row("SELECT id FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            copies_at_every_location(&conn, NamedScope::Snapshot(snapshot)).unwrap(),
+            every
+        );
+        assert_eq!(
+            copies_at_every_location_by_unit(&conn).unwrap()[&unit_id],
+            every
+        );
+    }
+
+    /// Item 150's rule is the least-covered slice's (items 127, 134): two
+    /// range tapes at one place make one copy there between them, and a place
+    /// holding only some slices holds no copy. Per unit, the fewest any
+    /// current version has there (issue #153).
+    #[test]
+    fn copies_at_a_location_count_a_range_slice_by_slice() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let set = c.stage_set(snap, 6);
+        let t1 = c.volume("SPAN-1", Some("offsite"));
+        let t3 = c.volume("SPAN-3", Some("offsite"));
+        c.range(set, t1, 1, 2, 6);
+        c.range(set, t3, 3, 6, 6);
+        c.place("home");
+        let unit = NamedScope::Unit(c.unit_id);
+        assert_eq!(
+            copies_at_every_location(&c.conn, unit).unwrap(),
+            btree(&[("home", 0), ("offsite", 1)])
+        );
+
+        // Tape 3 moved home: neither place holds every slice.
+        c.conn
+            .execute(
+                "UPDATE volumes SET location_id = ?1 WHERE id = ?2",
+                params![c.place("home"), t3],
+            )
+            .unwrap();
+        assert_eq!(
+            copies_at_every_location(&c.conn, unit).unwrap(),
+            btree(&[("home", 0), ("offsite", 0)])
+        );
+        // The control: a whole copy at home is one there.
+        let whole = c.volume("WHOLE", Some("home"));
+        c.whole(set, 6, whole);
+        assert_eq!(copies_at_location(&c.conn, unit, "home", None).unwrap(), 1);
+
+        // A second current version with nothing at home: the unit holds 0
+        // there, the fewest of its versions.
+        let v2 = c.version(2, "current");
+        let s2 = c.stage_set(v2, 1);
+        let other = c.volume("V2", Some("offsite"));
+        c.whole(s2, 1, other);
+        assert_eq!(copies_at_location(&c.conn, unit, "home", None).unwrap(), 0);
+        assert_eq!(
+            copies_at_location(&c.conn, NamedScope::Snapshot(snap), "home", None).unwrap(),
+            1
+        );
+        assert_eq!(
+            copies_at_every_location_by_unit(&c.conn).unwrap()[&c.unit_id]["home"],
+            0
+        );
+    }
+
+    /// Item 138 at a place: two stagings of one version on ONE tape there are
+    /// one copy there; on two tapes there, two copies there (and one place).
+    #[test]
+    fn two_stagings_of_one_version_count_each_tape_at_a_place_once() {
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 2);
+        let s2 = c.stage_set(snap, 3);
+        let tape = c.volume("BOTH", Some("home"));
+        c.whole(s1, 2, tape);
+        c.whole(s2, 3, tape);
+        let unit = NamedScope::Unit(c.unit_id);
+        assert_eq!(copies_at_location(&c.conn, unit, "home", None).unwrap(), 1);
+
+        let c = SpanCatalog::new();
+        let snap = c.version(1, "current");
+        let s1 = c.stage_set(snap, 2);
+        let s2 = c.stage_set(snap, 3);
+        let a = c.volume("A", Some("home"));
+        let b = c.volume("B", Some("home"));
+        c.whole(s1, 2, a);
+        c.whole(s2, 3, b);
+        assert_eq!((c.copies(snap), c.places(snap)), (2, 1));
+        assert_eq!(
+            copies_at_location(&c.conn, NamedScope::Unit(c.unit_id), "home", None).unwrap(),
+            2
+        );
+    }
+
+    /// Item 149: the copy floor is `max(min_copies, Σ copies_at) ×
+    /// multiplier`, and each location's target is its count × multiplier for
+    /// a tape-only unit. With no map the floor is `min_copies`, as before.
+    #[test]
+    fn the_floor_and_each_target_follow_the_map_and_the_multiplier() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = 3;
+
+        let none = policy_with_map(&conn, "photos", &[]);
+        let at = copies_at_every_location(&conn, NamedScope::Unit(unit_id)).unwrap();
+        assert_eq!(
+            Shortfall::judge(&config, &none, "active", 2, &at).min_copies,
+            2
+        );
+        assert_eq!(
+            Shortfall::judge(&config, &none, "tape_only", 2, &at).min_copies,
+            6
+        );
+
+        let map = policy_with_map(&conn, "photos", &[("home", 2), ("glacier", 1)]);
+        let active = Shortfall::judge(&config, &map, "active", 2, &at);
+        assert_eq!(active.min_copies, 3, "max(2, 2 + 1)");
+        assert_eq!(location_target(&config, &map, "home", "active"), 2);
+        assert_eq!(location_target(&config, &map, "offsite", "active"), 0);
+        let tape_only = Shortfall::judge(&config, &map, "tape_only", 2, &at);
+        assert_eq!(tape_only.min_copies, 9, "3 x 3");
+        assert_eq!(location_target(&config, &map, "home", "tape_only"), 6);
+        assert_eq!(
+            tape_only.locations,
+            vec![
+                LocationShort {
+                    location: "glacier".to_string(),
+                    copies: 1,
+                    target: 3
+                },
+                LocationShort {
+                    location: "home".to_string(),
+                    copies: 1,
+                    target: 6
+                },
+            ]
+        );
+    }
+
+    /// Items 149, 156 and 160: `Shortfall`'s per-location half comes from the
+    /// resolved map alone. A dotfile map naming only `glacier` replaces an
+    /// archive set's `home` (still in `required_locations`), so `home` is not
+    /// asked for; and a name in both is asked for once. The DB form agrees
+    /// with the pure judgement.
+    #[test]
+    fn shortfall_is_judged_from_the_map_alone() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        let config = crate::config::Config::default();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+
+        // The archive set's `required_locations` folded in, as resolve does.
+        let mut folded = policy(&conn, 2, &["home", "offsite"]);
+        let short = shortfall(&conn, &config, unit_id, "active", &folded).unwrap();
+        assert_eq!(short.describe(), "no copy at offsite");
+        assert_eq!(short.locations.len(), 1, "{short:?}");
+
+        // A dotfile map replaces it: `home` and `offsite` are no longer asked
+        // for, though `required_locations` still names them.
+        folded.copies_at = btree(&[("glacier", 2)]);
+        assert_eq!(folded.required_locations, names(&["home", "offsite"]));
+        let short = shortfall(&conn, &config, unit_id, "active", &folded).unwrap();
+        assert_eq!(
+            short.locations,
+            vec![LocationShort {
+                location: "glacier".to_string(),
+                copies: 1,
+                target: 2
+            }]
+        );
+        assert_eq!(
+            short.describe(),
+            "1 copy at required location glacier, needs 2",
+            "an active unit's target, no tape-only note"
+        );
+        let at = copies_at_every_location(&conn, NamedScope::Unit(unit_id)).unwrap();
+        assert_eq!(short, Shortfall::judge(&config, &folded, "active", 2, &at));
+
+        // Met, and a 0 target asks for nothing.
+        folded.copies_at = btree(&[("glacier", 1), ("offsite", 0)]);
+        assert!(!shortfall(&conn, &config, unit_id, "active", &folded)
+            .unwrap()
+            .any());
+    }
+
+    thread_local! {
+        static STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_statement(event: rusqlite::trace::TraceEvent<'_>) {
+        if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+            STATEMENTS.with(|n| n.set(n.get() + 1));
+        }
+    }
+
+    /// The statements `f` runs on `conn`.
+    fn statements_run(conn: &Connection, f: impl FnOnce()) -> usize {
+        STATEMENTS.with(|n| n.set(0));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_statement),
+        );
+        f();
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        STATEMENTS.with(|n| n.get())
+    }
+
+    /// The per-location predicate runs no statement when the map has no
+    /// target above 0 (the catalog_budget fixture's case, so `audit` and
+    /// `collection status` cost what they did), and one otherwise.
+    #[test]
+    fn short_of_copies_at_runs_no_statement_without_a_target() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        let config = crate::config::Config::default();
+        let short = |resolved: &crate::policy::ResolvedPolicy| {
+            short_of_copies_at(
+                &conn,
+                &config,
+                NamedScope::Unit(unit_id),
+                resolved,
+                "active",
+                None,
+            )
+            .unwrap()
+        };
+        let none = policy_with_map(&conn, "photos", &[]);
+        let zero = policy_with_map(&conn, "photos", &[("home", 0)]);
+        let two = policy_with_map(&conn, "photos", &[("home", 2), ("glacier", 3)]);
+        assert_eq!(
+            statements_run(&conn, || assert!(short(&none).is_empty())),
+            0
+        );
+        assert_eq!(
+            statements_run(&conn, || assert!(short(&zero).is_empty())),
+            0
+        );
+        assert_eq!(
+            statements_run(&conn, || assert_eq!(short(&two).len(), 2)),
+            1,
+            "the positive control: one statement for every target name"
+        );
+    }
+
+    /// Item 158's two groups and neither, for one location X = `offsite`.
+    #[test]
+    fn need_at_a_location_is_item_158s_two_groups() {
+        let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+        let config = crate::config::Config::default();
+        let judge = |map: &[(&str, i64)], status: &str, copies: i64, here: i64| {
+            NeedAt::judge(
+                &config,
+                &policy_with_map(&conn, "photos", map),
+                status,
+                "offsite",
+                copies,
+                here,
+            )
+        };
+
+        // Group 1: a target at X, unmet, by how far short.
+        let need = judge(&[("offsite", 2)], "active", 3, 0);
+        assert_eq!(
+            need,
+            NeedAt::Target {
+                target: 2,
+                copies_here: 0,
+                copies: 3
+            }
+        );
+        assert_eq!((need.group(), need.short_by()), (Some(1), 2));
+        assert_eq!(judge(&[("offsite", 2)], "active", 3, 1).short_by(), 1);
+        // A tape-only unit's target is multiplied (2 by default).
+        assert_eq!(judge(&[("offsite", 1)], "tape_only", 5, 1).short_by(), 1);
+        // Met: nothing, even short of the floor.
+        assert_eq!(judge(&[("offsite", 1)], "active", 1, 1), NeedAt::None);
+
+        // Group 2: short of the floor (2), no target at X, no copy at X.
+        let need = judge(&[("home", 1)], "active", 1, 0);
+        assert_eq!(
+            need,
+            NeedAt::Floor {
+                floor: 2,
+                copies: 1
+            }
+        );
+        assert_eq!((need.group(), need.short_by()), (Some(2), 1));
+        assert_eq!(
+            judge(&[], "active", 0, 0),
+            NeedAt::Floor {
+                floor: 2,
+                copies: 0
+            },
+            "no map at all"
+        );
+        assert_eq!(
+            judge(&[("offsite", 0)], "active", 0, 0).group(),
+            Some(2),
+            "a 0 target is no target"
+        );
+        // A copy at X already: never group 2, so a unit holding all its
+        // copies at X is never picked for X.
+        assert_eq!(judge(&[("home", 1)], "active", 1, 1), NeedAt::None);
+        // The floor met: nothing.
+        assert_eq!(judge(&[("home", 1)], "active", 2, 0), NeedAt::None);
+    }
+
+    /// `need_at` asks the catalog for the two counts `NeedAt::judge` takes.
+    #[test]
+    fn need_at_reads_the_counts_from_the_catalog() {
+        let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+        let config = crate::config::Config::default();
+        let unit = crate::db::queries::get_unit_by_name(&conn, "photos")
+            .unwrap()
+            .unwrap();
+        let resolved = policy_with_map(&conn, "photos", &[("home", 2)]);
+        assert_eq!(
+            need_at(&conn, &config, &unit, &resolved, "home").unwrap(),
+            NeedAt::Target {
+                target: 2,
+                copies_here: 1,
+                copies: 2
+            }
+        );
+        // 2 copies meet the floor of max(2, 2): nothing for glacier.
+        assert_eq!(
+            need_at(&conn, &config, &unit, &resolved, "glacier").unwrap(),
+            NeedAt::None
+        );
+    }
+
+    /// The wordings: one target shared ("needs 2 at each"), targets that
+    /// differ (each its own "needs N"), and a policy's targets as stated.
+    #[test]
+    fn the_per_location_wordings() {
+        let at = |location: &str, copies: i64, target: i64| LocationShort {
+            location: location.to_string(),
+            copies,
+            target,
+        };
+        assert_eq!(
+            describe_short_locations(&[at("home", 1, 2), at("offsite", 1, 2)]),
+            "1 copy at required location home, 1 copy at required location offsite, \
+             needs 2 at each"
+        );
+        assert_eq!(
+            describe_short_locations(&[at("home", 2, 3), at("offsite", 0, 1)]),
+            "2 copies at required location home, needs 3; 0 copies at required location \
+             offsite, needs 1"
+        );
+        assert_eq!(
+            describe_targets(&btree(&[("home", 1), ("offsite", 1)])),
+            "home, offsite"
+        );
+        assert_eq!(
+            describe_targets(&btree(&[("garage", 0), ("home", 2), ("offsite", 1)])),
+            "2 at home, 1 at offsite"
+        );
     }
 }
