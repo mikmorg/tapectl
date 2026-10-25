@@ -243,6 +243,7 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["report", "failed-stages"], Verdict::ReadOnly),
     (&["report", "fire-risk"], Verdict::ReadOnly),
     (&["report", "health"], Verdict::ReadOnly),
+    (&["report", "needs"], Verdict::ReadOnly),
     (&["report", "pending"], Verdict::ReadOnly),
     (&["report", "summary"], Verdict::ReadOnly),
     (&["report", "supersedable"], Verdict::ReadOnly),
