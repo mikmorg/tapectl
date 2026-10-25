@@ -13,6 +13,7 @@ tapectl stage [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`create`](#tapectl-stage-create) — Create staged slices (validate → dar → encrypt → checksums)
+- [`for-location`](#tapectl-stage-for-location) — Stage what a location needs, packed into one volume bound there
 - [`list`](#tapectl-stage-list) — List stage sets
 - [`info`](#tapectl-stage-info) — Show details for a stage set
 
@@ -34,6 +35,28 @@ tapectl stage create [OPTIONS] <NAME>...
 
 - `--version <VERSION>` — Re-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl staging clean --unit <name> --version <N>` already released that stage set's slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `staging clean --unit <name> --version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its policy's min_copies; add `--force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of min_copies
 - `--jobs <JOBS>` — How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
+
+### tapectl stage for-location
+
+Stage what a location needs, packed into one volume bound there
+
+Works out each unit's need at LOCATION (ADR-0012 items 151-159): group 1, its copy target there is unmet; group 2, it is short of its copy floor with no target there and no copy there yet. A new or changed unit counts as a new version with no copies. The units are packed into `--volume`'s room in priority order (the largest shortfall at LOCATION first, the fewest copies in all breaking ties, then the name), whole units before units that may span, next-fit: the first that does not fit closes the tape, and the rest wait for the next tape for LOCATION. What is already staged for LOCATION is planned first and never staged again. A span in progress continues only on a tape bound for the location of its earlier range.
+
+New and changed units are snapshotted and staged, an unchanged unit's version is staged from its source, and a tape-only unit's version is read back with `volume read-slices`: the commands are printed in the order to run them, and this command moves no tape. Then write the volume with `volume write LABEL --for-location LOCATION`. `--dry-run` prints the plan and stages nothing. A warehouse location is refused: a copy there is a recorded deposit (`volume deposit add`).
+
+```text
+tapectl stage for-location [OPTIONS] --volume <LABEL> <LOCATION>
+```
+
+**Arguments**
+
+- `<LOCATION>` — The location the volume will be kept at (a registered location, not a warehouse)
+
+**Options**
+
+- `--volume <LABEL>` *(required)* — The volume to fill: `volume init` done, nothing written yet
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`
+- `--device <DEVICE>` — The drive whose fill ceiling and end-of-tape reserve size the volume's room (no drive is touched). Defaults to the only configured drive; required when more than one is configured
 
 ### tapectl stage list
 

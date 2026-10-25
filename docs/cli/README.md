@@ -66,6 +66,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`snapshot mark-reclaimable`](snapshot.md#tapectl-snapshot-mark-reclaimable) | Mark a snapshot as reclaimable (with enforced preconditions) |
 | [`stage`](stage.md) | Stage snapshots for writing |
 | &nbsp;&nbsp;[`stage create`](stage.md#tapectl-stage-create) | Create staged slices (validate → dar → encrypt → checksums) |
+| &nbsp;&nbsp;[`stage for-location`](stage.md#tapectl-stage-for-location) | Stage what a location needs, packed into one volume bound there |
 | &nbsp;&nbsp;[`stage list`](stage.md#tapectl-stage-list) | List stage sets |
 | &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show details for a stage set |
 | [`staging`](staging.md) | Manage staging area |

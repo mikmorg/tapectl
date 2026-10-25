@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-write \- Write staged data to volume
 .SH SYNOPSIS
-\fBtapectl volume write\fR [\fB\-\-json\fR] [\fB\-\-loaded\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-init\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-move\-to\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-keep\-staging\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
+\fBtapectl volume write\fR [\fB\-\-json\fR] [\fB\-\-loaded\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-init\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-move\-to\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-keep\-staging\fR] [\fB\-\-for\-location\fR] [\fB\-\-keep\-staging\-for\-locations\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Write staged data to volume
 .PP
@@ -73,6 +73,12 @@ After sealing, read every file back and hash it against the front index (tri\-la
 .TP
 \fB\-\-keep\-staging\fR
 Keep the staged slices after the write seals and confirms, even when every unit written has reached its resolved `min_copies`. Without this flag the staging is released then; release it later with `tapectl staging clean`
+.TP
+\fB\-\-for\-location\fR \fI<LOCATION>\fR
+Write only the staged sets that still have need at this location (ADR\-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `\-\-move\-to LOCATION` does; a different `\-\-move\-to` is refused. Stage for it with `tapectl stage for\-location`. Without this flag the write takes every staged set
+.TP
+\fB\-\-keep\-staging\-for\-locations\fR
+Release the staging only once every per\-location copy target of each unit written is met, not at its copy floor (ADR\-0012 item 154), so the next location\*(Aqs copy reuses these staged slices instead of staging again. Use it when staging has room; the output names the locations that still need each unit
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

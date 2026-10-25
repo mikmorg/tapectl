@@ -1,0 +1,54 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-stage-for-location 1  "tapectl-stage-for-location " 
+.SH NAME
+tapectl\-stage\-for\-location \- Stage what a location needs, packed into one volume bound there
+.SH SYNOPSIS
+\fBtapectl stage for\-location\fR [\fB\-\-json\fR] <\fB\-\-volume\fR> [\fB\-\-dry\-run\fR] [\fB\-\-jobs\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILOCATION\fR> 
+.SH DESCRIPTION
+Stage what a location needs, packed into one volume bound there
+.PP
+Works out each unit\*(Aqs need at LOCATION (ADR\-0012 items 151\-159): group 1, its copy target there is unmet; group 2, it is short of its copy floor with no target there and no copy there yet. A new or changed unit counts as a new version with no copies. The units are packed into `\-\-volume`\*(Aqs room in priority order (the largest shortfall at LOCATION first, the fewest copies in all breaking ties, then the name), whole units before units that may span, next\-fit: the first that does not fit closes the tape, and the rest wait for the next tape for LOCATION. What is already staged for LOCATION is planned first and never staged again. A span in progress continues only on a tape bound for the location of its earlier range.
+.PP
+New and changed units are snapshotted and staged, an unchanged unit\*(Aqs version is staged from its source, and a tape\-only unit\*(Aqs version is read back with `volume read\-slices`: the commands are printed in the order to run them, and this command moves no tape. Then write the volume with `volume write LABEL \-\-for\-location LOCATION`. `\-\-dry\-run` prints the plan and stages nothing. A warehouse location is refused: a copy there is a recorded deposit (`volume deposit add`).
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-volume\fR \fI<LABEL>\fR
+The volume to fill: `volume init` done, nothing written yet
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-\-jobs\fR \fI<JOBS>\fR
+How many units to stage at once (1 to 16), as `stage create \-\-jobs`. Defaults to `[staging] jobs`
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+The drive whose fill ceiling and end\-of\-tape reserve size the volume\*(Aqs room (no drive is touched). Defaults to the only configured drive; required when more than one is configured
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fILOCATION\fR>
+The location the volume will be kept at (a registered location, not a warehouse)
