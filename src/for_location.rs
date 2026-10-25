@@ -2168,6 +2168,125 @@ mod tests {
         );
     }
 
+    /// `staged_overflow` (item 151): the staged sets for X alone overflow
+    /// the volume. The one that does not fit is named, in the text (a
+    /// warning on stderr) and in `--json`, and nothing more is planned: a
+    /// new unit that would fit beside the sets that do is left waiting, and
+    /// `stage` stages nothing. Every riding set stays listed, since the write
+    /// for X is given every one of them (`staged_sets_for_location`).
+    /// Positive control: with one fewer staged set they fit, and planning
+    /// goes on to the new unit.
+    #[test]
+    fn staged_sets_that_alone_overflow_the_volume_are_named_and_nothing_more_is_planned() {
+        let c = Cat::new();
+        let mut sets = Vec::new();
+        for (name, bytes) in [("s1", 4 * MIB), ("s2", 4 * MIB), ("s3", 3 * MIB)] {
+            let u = c.unit(name, "active", None);
+            let v = c.version(u, 1, "staged");
+            sets.push(c.set(v, &[bytes], "staged", true));
+        }
+        c.unit("new", "active", Some(&[("f", MIB as usize)]));
+
+        // 4 + 4 + 3 MiB against 10: s3 does not fit.
+        let plan = c.plan("offsite").unwrap();
+        assert_eq!(plan.staged_overflow, ["\"s3\" v1"]);
+        assert_eq!(
+            names(&plan.planned),
+            ["\"s1\" v1", "\"s2\" v1", "\"s3\" v1"]
+        );
+        assert!(
+            plan.planned
+                .iter()
+                .all(|p| matches!(p.how, How::AlreadyStaged { .. })),
+            "nothing but the staged sets is planned: {:?}",
+            plan.planned
+        );
+        assert_eq!(
+            names(&plan.waiting),
+            ["\"new\" (new version)"],
+            "1 MiB would fit beside s1 and s2 (8 MiB of 10), but nothing more is planned"
+        );
+        assert_eq!(
+            staged_sets_for_location(&c.conn, &c.config, "offsite")
+                .unwrap()
+                .stage_set_ids(),
+            sets
+        );
+        let overflow_warning = |err: &[String]| {
+            err.iter()
+                .find(|l| l.starts_with("warning: what is already staged"))
+                .cloned()
+        };
+        let (out, err) = text_lines(&plan, None);
+        assert_eq!(
+            overflow_warning(&err).as_deref(),
+            Some(
+                "warning: what is already staged for offsite does not all fit volume \"L1\" \
+                 (\"s3\" v1): nothing more was planned, and `tapectl volume write L1 \
+                 --for-location offsite` leaves what does not fit staged for the next tape, or \
+                 refuses"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            out.iter().any(|l| l
+                == "waiting for the next tape for offsite (1 unit(s)): the units above fill \
+                    this one"),
+            "{out:?}"
+        );
+        let json = to_json(&plan, None);
+        assert_eq!(json["staged_overflow"], serde_json::json!(["\"s3\" v1"]));
+        assert_eq!(json["waiting"][0]["unit"], "new");
+        assert_eq!(json["planned"].as_array().unwrap().len(), 3);
+        let counts = (c.count("snapshots"), c.count("stage_sets"));
+        let paths = TapectlPaths::new(c.tmp.path().join("home"));
+        let staged = stage(&c.conn, &paths, &c.config, &plan, 1, true).unwrap();
+        assert_eq!(staged, vec![Staged::Already; 3]);
+        assert_eq!(
+            (c.count("snapshots"), c.count("stage_sets")),
+            counts,
+            "no further unit is snapshotted or staged"
+        );
+
+        // Positive control: s3 released from staging, the staged sets fit
+        // and planning goes on to the new unit.
+        c.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                params![sets[2]],
+            )
+            .unwrap();
+        c.conn
+            .execute(
+                "UPDATE stage_slices SET staging_path = NULL WHERE stage_set_id = ?1",
+                params![sets[2]],
+            )
+            .unwrap();
+        let plan = c.plan("offsite").unwrap();
+        assert!(
+            plan.staged_overflow.is_empty(),
+            "{:?}",
+            plan.staged_overflow
+        );
+        assert_eq!(
+            names(&plan.planned),
+            ["\"s1\" v1", "\"s2\" v1", "\"new\" (new version)"]
+        );
+        assert_eq!(
+            plan.planned[2].how,
+            How::Snapshot {
+                reason: PendingReason::New
+            }
+        );
+        assert!(plan.waiting.is_empty(), "{:?}", plan.waiting);
+        let (_, err) = text_lines(&plan, None);
+        assert_eq!(overflow_warning(&err), None, "{err:?}");
+        assert_eq!(
+            to_json(&plan, None)["staged_overflow"],
+            serde_json::json!([])
+        );
+    }
+
     /// The volume must be a write target, as `volume write` requires.
     #[test]
     fn a_volume_that_is_not_a_write_target_is_refused() {
