@@ -15963,6 +15963,88 @@ mod tests {
         assert_eq!(writes, 0, "a refused write plans nothing");
     }
 
+    /// #493: a write whose `WriteScope` names where its tape is moved judges
+    /// the shared place there, and falls back to the volume's own location
+    /// for a name no location is registered under (`volume write` refuses
+    /// such a `--move-to` before the write; this is the library's guard) and
+    /// for the volume's own shelf. The copy and the destination are both at
+    /// `home`; the write stops at backend resolution (none is configured),
+    /// after the check, whose verdicts the test log holds.
+    #[test]
+    fn a_write_moved_elsewhere_is_judged_there_and_an_unknown_name_falls_back() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't1', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-photos', 'photos', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'current', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);
+             INSERT INTO locations (id, name, kind) VALUES (1, 'home', 'shelf'), (2, 'offsite', 'shelf');
+             INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status, location_id)
+                 VALUES (1, 'L6-COPY1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 1),
+                        (2, 'L6-DEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', 1);
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) VALUES (1, 1, 1, 'completed');",
+        )
+        .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slice = tmp.path().join("x.dar.age");
+        std::fs::write(&slice, b"0123456789").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (1, 1, 10, 10, 'a', 'b', ?1)",
+            params![slice.to_string_lossy()],
+        )
+        .unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let verdict = |moved_to: Option<&str>| {
+            shared_place_log::take();
+            let err = volume_write_scoped(
+                &conn,
+                &paths,
+                &Config::default(),
+                "L6-DEST",
+                "/nonexistent/tapectl-distinct-test-nst",
+                512 * 1024,
+                false,
+                false,
+                false,
+                false,
+                true,
+                WriteScope {
+                    staged: StagedScope::Every,
+                    moved_to: moved_to.map(str::to_string),
+                },
+            )
+            .expect_err("no backend is configured");
+            assert!(matches!(err, TapectlError::Config(_)), "{err:?}");
+            let mut log = shared_place_log::take();
+            assert_eq!(log.len(), 1, "the check ran once: {log:?}");
+            log.pop().unwrap()
+        };
+        let at_home = "warning: volume \"L6-DEST\" is at location \"home\", where these \
+                       versions already have a copy: photos v1 (volume \"L6-COPY1\").";
+
+        assert_eq!(verdict(Some("offsite")), None);
+        for own in [None, Some("nowhere"), Some("home")] {
+            let w = verdict(own).unwrap_or_else(|| panic!("{own:?}: no warning"));
+            assert!(w.starts_with(at_home), "{own:?}: {w}");
+        }
+        conn.execute("UPDATE volumes SET location_id = 2 WHERE id = 1", [])
+            .unwrap();
+        let w = verdict(Some("offsite")).expect("the copy is where the tape goes");
+        assert!(
+            w.starts_with(
+                "warning: volume \"L6-DEST\" is moved to location \"offsite\" after this \
+                 write, where these versions already have a copy: photos v1 (volume \
+                 \"L6-COPY1\")."
+            ),
+            "{w}"
+        );
+        assert_eq!(verdict(Some("nowhere")), None, "judged at home: nothing");
+    }
+
     /// ADR-0012 (issue #161, amended 2026-09-17 for issue #242): `volume
     /// resume` must refuse a quarantined volume BEFORE `rehydrate` -- named
     /// by its condition, not answered with `nothing_to_resume`'s message
