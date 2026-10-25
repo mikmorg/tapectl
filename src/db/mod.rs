@@ -506,6 +506,13 @@ fn migrations() -> Migrations<'static> {
         // Two nullable columns added in place, no rows touched, so no
         // `.foreign_key_check()`. See the header.
         M::up(include_str!("migrations/040_copies_at.sql")),
+        // 041 adds `volumes.write_lbp` ('on'|'off'|'mixed') and
+        // `volumes.write_lbp_note` (issue #388, Logical Block Protection;
+        // ADR-0012 items 161, 165): whether the drive checked tapectl's CRC
+        // on every block the volume's write session wrote, merged across its
+        // runs. Two nullable columns added in place, no rows touched, so no
+        // `.foreign_key_check()`. See the header.
+        M::up(include_str!("migrations/041_volume_write_lbp.sql")),
     ])
 }
 
@@ -6106,6 +6113,95 @@ mod tests {
             [],
         )
         .expect("a unit records its dotfile's map");
+    }
+
+    // --- Migration 041 (issue #388, Logical Block Protection; ADR-0012 items 161, 165) ---
+
+    /// THE test for 041: on 040's seeded catalog, `volumes.write_lbp` and
+    /// `volumes.write_lbp_note` are added last, nullable, NULL on every
+    /// existing row (nothing written before 1.7.2 says whether LBP ran);
+    /// nothing else moves. The CHECK admits the three words and NULL, and
+    /// refuses anything else.
+    #[test]
+    fn test_migrate_040_populated_db_to_041_adds_the_write_lbp_columns() {
+        let mut conn = open_memory_at_038_seeded();
+        migrate_to(&mut conn, Some(40)).expect("the seed migrates to 40");
+        assert_eq!(user_version(&conn), 40, "precondition: at schema 40");
+
+        let mut rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let mut cols = table_info(&conn, "volumes");
+        assert!(!rows_before["volumes"].is_empty(), "positive control");
+        assert!(
+            !cols.iter().any(|c| c.0 == "write_lbp"),
+            "positive control: no volumes.write_lbp before 041"
+        );
+
+        migrate_to(&mut conn, Some(41)).expect("041 must migrate a populated catalog");
+        assert_eq!(user_version(&conn), 41);
+
+        let mut rows_after = every_row(&conn);
+        let mut widened: Vec<Vec<String>> = rows_before
+            .remove("volumes")
+            .unwrap()
+            .into_iter()
+            .map(|mut row| {
+                row.push("NULL".into());
+                row.push("NULL".into());
+                row
+            })
+            .collect();
+        widened.sort();
+        assert_eq!(
+            widened,
+            rows_after.remove("volumes").unwrap(),
+            "every volumes row keeps every cell and gains two NULLs last"
+        );
+        assert_eq!(rows_before, rows_after, "no other table's row moves");
+        let untouched = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && o.1 == "volumes"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            untouched(&objects_before),
+            untouched(&schema_objects(&conn))
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "041 moves no foreign key");
+        cols.push(("write_lbp".into(), "TEXT".into(), 0, None, 0));
+        cols.push(("write_lbp_note".into(), "TEXT".into(), 0, None, 0));
+        assert_eq!(cols, table_info(&conn, "volumes"));
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+
+        let id: i64 = conn
+            .query_row("SELECT MIN(id) FROM volumes", [], |r| r.get(0))
+            .unwrap();
+        for word in ["on", "off", "mixed"] {
+            conn.execute(
+                "UPDATE volumes SET write_lbp = ?1 WHERE id = ?2",
+                rusqlite::params![word, id],
+            )
+            .unwrap_or_else(|e| panic!("{word} is admitted: {e}"));
+        }
+        let refused = conn.execute(
+            "UPDATE volumes SET write_lbp = 'yes' WHERE id = ?1",
+            rusqlite::params![id],
+        );
+        assert!(refused.is_err(), "the CHECK refuses another word");
+        conn.execute(
+            "UPDATE volumes SET write_lbp = NULL, write_lbp_note = 'x' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .expect("NULL passes the CHECK");
     }
 
     /// The live `writes.status` vocabulary, pinned to the schema rather than

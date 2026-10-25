@@ -1825,6 +1825,39 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
     }
 
+    /// #388: the short erase's filemark refused with Logical Block
+    /// Protection armed (`TapectlError::LbpRefusal`, ADR-0012 item 174) is
+    /// reported as any failed erase is — exit 4, part-way, nothing recorded
+    /// — with the refusal's own words kept. Outside a write session nothing
+    /// retries it.
+    #[test]
+    fn an_lbp_refusal_of_the_erase_is_an_erase_that_failed_part_way() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = sealed_tape("L6-0001");
+        {
+            let mut s = fake.state();
+            s.protection = crate::store::Protection::Lbp { reads: true };
+            s.lbp_refusals
+                .push(crate::store::LbpRefusalAt::deferred(0, 0, 0));
+        }
+        let err = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some("L6-0001"), false),
+            &[Some(SERIAL)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, TapectlError::EraseIncomplete(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("part-way"), "{msg}");
+        assert!(
+            msg.contains("refused with Logical Block Protection armed"),
+            "the refusal named: {msg}"
+        );
+        assert_eq!(exit_code(err), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
+    }
+
     /// No File 0 label and no chip serial: refused, untouched.
     #[test]
     fn no_label_and_no_serial_refuses() {
