@@ -339,6 +339,24 @@ real-drive proof (item 137, `scripts/span-acceptance.sh`, with a scratch build o
 before the `v1.7.0` tag, and handoff (h) after it. Item 147 (#492) aligns item 94's start with its
 own text in a 1.7.x patch.
 
+**1.7.1: per-location copy targets and auto-stage** (`docs/releases/1.7.1.md`; ADR-0012 items
+147-160; #491, #492, #493). A patch: no byte on tape changes. A unit's *copy targets* are a map of
+location to count, `copies_at`: the dotfile's `[policy.copies_at]`, an archive set's `copies_at`
+(its `required_locations` folded in at one copy each) or `[defaults] copies_at`; the most specific
+layer wins whole (`ResolvedPolicy.copies_at`). The dotfile layer is frozen into
+`units.copies_at_frozen` at snapshot, stage and adoption (`policy::freeze_copies_at`) and read only
+while the dotfile is absent. **The copy floor is `ResolvedPolicy::copy_floor_base`** (the larger
+of `min_copies` and the map's sum) through `coverage::copy_floor`; each target is
+`coverage::location_target`, and every per-location check asks `coverage::short_of_copies_at`.
+Item 158's need at one location is `coverage::NeedAt` (`need_at`, `NeedAt::judge`); `report needs`
+is `cli::report::needs_rows`. Auto-stage lives in `src/for_location.rs` (`plan`, `stage`, and
+`staged_sets_for_location`, which `volume write --for-location` takes as
+`volume::write::StagedScope::ForLocation`); `--keep-staging-for-locations` is
+`staging::release::Hold::EveryLocation`. Item 159 as built binds an owed run to a location only
+when it starts after slice 1. Item 147 (#492) is `CapacityBudget::place`'s start;
+`CapacityBudget::span_last_run` and `collection::selector::after_the_tail` keep the whole units it
+displaces in the collection batch (`after_tail`). #491's fix is `volume::write::read_back_span_plan`. Migration 040.
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
@@ -476,7 +494,7 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 - **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
-- **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again
+- **Policy** (`src/policy/`): 3-level resolver (dotfile > archive_set > defaults), advisory audit; `coverage.rs` owns the copy/location SQL and every `volumes.status` predicate, `escrow.rs` owns escrow coverage (verdict AND query) — never inline either again. A copy floor is always `copy_floor(config, resolved.copy_floor_base(), status)`, never `min_copies` read directly (1.7.1)
 - **Store trait** (`src/store.rs`): built (ADR-0006) — `capacity`/`execute`/`confirm`/`read_file`, streaming so RAM tracks block size not slice size. `TapeStore` and `MemStore` share one chain-walk implementation, so MemStore-based tests exercise the real confirm path. `WarehouseStore`/`ExportStore` stay ADR-0006 peers but are unbuilt and untracked: #72 (closed) rescoped warehouse copies to a documented rclone/aws-cli procedure over sealed volumes (`docs/design-errata.md`), #73 (closed) is the warehouse-location model, and no issue tracks an `ExportStore` — `export` does not go through the trait
 - **Cross-volume index** (`src/volume/index.rs`, `policy::coverage::index_versions`): `index/units.tsv` and `index/paths.tsv` built in the home work dir, streamed into each envelope by `build()` after `catalogs/`; RESTORE.sh's `--where`/`--find` read it; `catalog rebuild` reads the operator map as a to-do list and never imports it (`volume-format-v2.md` §1.5)
 - **Collection** (`src/collection/`): `[[collections]]` config → `collection sync|status|plan|run`; folder-per-unit registration, alphabetical next-fit batch selector, stage-once/write-N-copies/release
