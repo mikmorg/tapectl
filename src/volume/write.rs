@@ -1812,8 +1812,10 @@ pub(crate) fn plan_preview(
 ///
 /// 1. A probe build of every candidate, grouped by class (owed runs, whole
 ///    units, spannable sets; the caller's order within each), gives the
-///    volume's own files: an upper bound on the plan's, since leaving a unit
-///    out only shrinks the envelopes (the coordinator's ruling).
+///    volume's own files: an upper bound on the plan's content, since leaving
+///    a unit out only shrinks what the envelopes hold (the coordinator's
+///    ruling). Not on their bytes to the block: a build of fewer units can
+///    land up to one block per file above the probe (#491, step 4).
 /// 2. Spannable sets larger than one tape (more than the plan bound less
 ///    those files) are taken ahead of those that fit, so item 94's early
 ///    start is not deferred behind a fitting set's tail (X13).
@@ -1822,8 +1824,11 @@ pub(crate) fn plan_preview(
 ///    pre-write validation's refusal, before any byte is written.
 /// 4. The units it places, in its order, deferred ones dropped, are built
 ///    (the probe stands when that is what it built), and the built Layout's
-///    own placement is read back: it must place every unit as the plan did,
-///    or the write is refused.
+///    placement is read back ([`read_back_span_plan`]): it must place every
+///    unit as the plan did, on the built bytes or, when those exceed the
+///    probe's by no more than a rebuild's drift, on the plan's own; or the
+///    write is refused. Whether the built Layout fits is the capacity gate's
+///    to say, in the pre-flight that follows.
 #[allow(clippy::too_many_arguments)]
 fn build_span_layout(
     conn: &Connection,
@@ -1920,35 +1925,18 @@ fn build_span_layout(
             session_dir,
         )?
     };
-    let placement = built.place(&inputs.units, &final_classes);
-    let in_order: Vec<usize> = (0..inputs.units.len()).collect();
-    let disagrees: Vec<&BuildUnit> = inputs
-        .units
-        .iter()
-        .zip(&placement.placed)
-        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
-        .map(|(u, _)| u)
-        .collect();
-    if !placement.is_ok() || placement.order != in_order || !disagrees.is_empty() {
-        let _ = fs::remove_dir_all(session_dir);
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\": internal error: the built Layout does not place its units as \
-             the plan made before the build did ({}; {}). Nothing was written and no session \
-             was recorded. Report this: the plan order of a tape that holds a unit that may \
-             span disagrees with itself",
-            if disagrees.is_empty() {
-                "a unit moved".to_string()
-            } else {
-                format!("{} no longer fit", unit_names(disagrees.iter().copied()))
-            },
-            placement
-                .errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        )));
-    }
+    let placement = match read_back_span_plan(&built, &inputs.units, &final_classes, fixed) {
+        Ok(placement) => placement,
+        Err(why) => {
+            let _ = fs::remove_dir_all(session_dir);
+            return Err(TapectlError::Other(format!(
+                "volume \"{label}\": internal error: the built Layout does not place its units \
+                 as the plan made before the build did ({why}). Nothing was written and no \
+                 session was recorded. Report this: the plan order of a tape that holds a unit \
+                 that may span disagrees with itself"
+            )));
+        }
+    };
     Ok((
         built,
         inputs,
@@ -2156,6 +2144,87 @@ fn build_write_layout(
     let built = build::build_with_plan_bound(&inputs, plan_bound_bytes, session_dir)?;
     drop(catalog_work);
     Ok((built, inputs))
+}
+
+/// Step 4 of [`build_span_layout`]: the built Layout's placement of its
+/// units (`units`, in the built order; `classes[i]` is `units[i]`'s), when it
+/// is the plan's: every unit placed, in that order, none deferred or refused.
+/// `Err` says how it is not.
+///
+/// `planned_fixed` is the probe's files that are not slices, the figure the
+/// plan was made on. A Layout built again from fewer units holds no more
+/// content than the probe, but its files are not smaller to the byte (#491):
+/// tar pads each member to 512 bytes, so a dropped unit's text can shrink
+/// nothing, and every envelope gets a fresh random grease stanza in its age
+/// header (up to ~170 bytes). Its files can land up to one block each above
+/// the probe's, the drift [`CapacityNumbers::margin`] allows, and that is
+/// enough to move a unit near the bound or item 94's start. So when the
+/// placement on the built bytes is not the plan and the built files exceed
+/// the probe's by no more than that drift, the units are placed on the
+/// plan's own bytes instead, and that placement is the read-back. Whether
+/// the built Layout fits is not decided here: the capacity gate
+/// ([`Layout::validate`], the write's pre-flight on the real bytes) refuses
+/// a Layout that does not, with its numbers.
+fn read_back_span_plan(
+    built: &build::BuiltLayout,
+    units: &[BuildUnit],
+    classes: &[PlanClass],
+    planned_fixed: u64,
+) -> std::result::Result<Placement, String> {
+    let own = built.place(units, classes);
+    let Err(why) = placement_is_the_plan(&own, units) else {
+        return Ok(own);
+    };
+    let built_fixed = built.layout.fixed_on_tape_bytes();
+    let drift = capacity_numbers(&built.layout).map_or(0, |n| n.margin);
+    if built_fixed > planned_fixed && built_fixed - planned_fixed <= drift {
+        let items: Vec<PlanItem> = units
+            .iter()
+            .zip(classes)
+            .map(|(u, &class)| PlanItem {
+                class,
+                bytes: padded_slice_bytes(u, built.layout.block_size),
+            })
+            .collect();
+        let planned = built.layout.budget.place(planned_fixed, &items);
+        if placement_is_the_plan(&planned, units).is_ok() {
+            return Ok(planned);
+        }
+    }
+    Err(why)
+}
+
+/// `Ok` when `placement` places every one of `units` in their order, none
+/// deferred or refused; otherwise how it does not, in the words of
+/// [`build_span_layout`]'s refusal.
+fn placement_is_the_plan(
+    placement: &Placement,
+    units: &[BuildUnit],
+) -> std::result::Result<(), String> {
+    let in_order: Vec<usize> = (0..units.len()).collect();
+    let disagrees: Vec<&BuildUnit> = units
+        .iter()
+        .zip(&placement.placed)
+        .filter(|(_, p)| matches!(p, Placed::Deferred | Placed::Refused))
+        .map(|(u, _)| u)
+        .collect();
+    if placement.is_ok() && placement.order == in_order && disagrees.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}; {}",
+        if disagrees.is_empty() {
+            "a unit moved".to_string()
+        } else {
+            format!("{} no longer fit", unit_names(disagrees.iter().copied()))
+        },
+        placement
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }
 
 /// `slices 1-2`, or `slice 3` for a run of one: a range as a message names it.
@@ -24898,6 +24967,138 @@ mod tests {
                         "{:?}",
                         writes_of(&f, "SD-2")
                     );
+                }
+
+                // ── #491: the read-back of a span plan built again ──
+
+                /// `units` staged on "SR-1", every one but `a` allowed to
+                /// span, the envelopes grown by `catalogue_bytes`
+                /// ([`grow_envelopes`]): the batch in its plan order (whole
+                /// units, then the spannable sets in name order), the write's
+                /// own build of it, and that build's files that are not
+                /// slices. The build's budget is the test's to place.
+                fn read_back_case(
+                    units: &[(&str, &[usize])],
+                    catalogue_bytes: usize,
+                ) -> (StagedBatch, build::BuiltLayout, tempfile::TempDir, u64) {
+                    let f = fixture(units, &["SR-1"]);
+                    for (name, _) in &units[1..] {
+                        allow_spanning(&f, name);
+                    }
+                    grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                    let batch =
+                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
+                    let (built, dir) = built(&f, "SR-1", u64::MAX / 4, None);
+                    let fixed = built.layout.fixed_on_tape_bytes();
+                    (batch, built, dir, fixed)
+                }
+
+                /// The capacity gate of the write's pre-flight on `built`, its
+                /// real bytes against its own budget.
+                fn gate(
+                    built: &build::BuiltLayout,
+                ) -> Vec<crate::volume::layout_model::LayoutError> {
+                    built
+                        .layout
+                        .capacity_errors_against(built.layout.budget.available_bytes)
+                }
+
+                /// The false refusal (#491): a rebuild of fewer units holds no
+                /// more content than the probe the plan was made on, but its
+                /// files can land a block above the probe's (tar pads each
+                /// member to 512 bytes, so a dropped unit's text can shrink
+                /// nothing, and every envelope gets a fresh random grease
+                /// stanza in its age header). Here the probe was one block
+                /// lighter. Item 94: `b`, five slices, is larger than one tape
+                /// of three past the probe's files, and the room it leaves on
+                /// this tape is exactly `a`. On the built bytes that room is a
+                /// third of a slice, so the build's own placement pushes `a`
+                /// out and step 4 used to refuse ("internal error") a Layout
+                /// the capacity gate accepts. Within the drift (one block per
+                /// generated file), the plan's own bytes are read instead.
+                /// Positive control: a probe lighter than that drift allows is
+                /// a defect, and still refused.
+                #[test]
+                fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_on_the_plans_bytes() {
+                    for bytes in [0, 512, 2048, 4096, 4608] {
+                        let (batch, mut built, _dir, fixed) =
+                            read_back_case(&[("a", &[SLICE]), ("b", &[SLICE; 5])], bytes);
+                        assert_eq!(batch.classes, [PlanClass::Whole, PlanClass::Spannable]);
+                        let planned = fixed - SBS as u64;
+                        built.layout.budget.plan_bound_bytes = Some(planned + 3 * PADDED);
+                        built.layout.budget.available_bytes = planned + 2 * PADDED;
+
+                        let own = built.place(&batch.units, &batch.classes);
+                        assert_eq!(
+                            own.placed,
+                            [Placed::Deferred, Placed::Tail],
+                            "the build's own bytes push `a` out"
+                        );
+                        assert!(
+                            gate(&built).is_empty(),
+                            "the Layout fits: {:?}",
+                            gate(&built)
+                        );
+
+                        let plan =
+                            read_back_span_plan(&built, &batch.units, &batch.classes, planned)
+                                .unwrap_or_else(|why| panic!("{bytes} bytes: {why}"));
+                        assert_eq!(plan.placed, [Placed::Committed, Placed::Tail]);
+                        assert_eq!(plan.order, [0, 1]);
+
+                        let margin = capacity_numbers(&built.layout).unwrap().margin;
+                        let why = read_back_span_plan(
+                            &built,
+                            &batch.units,
+                            &batch.classes,
+                            fixed - margin - SBS as u64,
+                        )
+                        .expect_err("a drift past the margin is not one");
+                        assert!(why.starts_with("\"a\" v1 no longer fit"), "{why}");
+                    }
+                }
+
+                /// The capacity gate stays the authority (#491): a rebuild a
+                /// block heavier than the probe puts `b` a block past the
+                /// bound, where the plan had it end exactly at it, so the
+                /// build's own placement makes `b` the tail and defers `c`.
+                /// The read-back takes the plan's bytes, and the Layout, which
+                /// does not fit, is refused by the gate with its own numbers:
+                /// everything before the tail ends a block past the bound.
+                #[test]
+                fn a_rebuild_past_the_bound_is_still_refused_by_the_capacity_gate() {
+                    for bytes in [0, 512, 2048, 4096, 4608] {
+                        let (batch, mut built, _dir, fixed) = read_back_case(
+                            &[("a", &[SLICE]), ("b", &[SLICE; 3]), ("c", &[SLICE])],
+                            bytes,
+                        );
+                        let planned = fixed - SBS as u64;
+                        let bound = planned + 4 * PADDED;
+                        built.layout.budget.plan_bound_bytes = Some(bound);
+                        built.layout.budget.available_bytes = planned + 2 * PADDED;
+
+                        let own = built.place(&batch.units, &batch.classes);
+                        assert_eq!(
+                            own.placed,
+                            [Placed::Committed, Placed::Tail, Placed::Deferred]
+                        );
+                        let plan =
+                            read_back_span_plan(&built, &batch.units, &batch.classes, planned)
+                                .unwrap_or_else(|why| panic!("{bytes} bytes: {why}"));
+                        assert_eq!(
+                            plan.placed,
+                            [Placed::Committed, Placed::PastCeiling, Placed::Tail]
+                        );
+                        assert_eq!(
+                            gate(&built),
+                            [
+                                crate::volume::layout_model::LayoutError::PlanBoundExceeded {
+                                    needed: fixed + 4 * PADDED,
+                                    bound,
+                                }
+                            ]
+                        );
+                    }
                 }
 
                 /// With `allow_spanning` off at every layer (the dotfile says
