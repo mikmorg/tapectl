@@ -564,8 +564,12 @@ impl TapeDevice {
         if wire == self.block_size.max(1) as u64 {
             return wire_bytes;
         }
-        debug_assert_eq!(wire_bytes % wire, 0, "st accepts whole blocks");
-        wire_bytes / wire * self.block_size as u64
+        // Whole wire blocks scale exactly; a part of one (a short write st
+        // should never give in fixed mode) counts its bytes up to the
+        // payload's end. Never an assertion: home2's acceptance runs debug
+        // builds, and a counter must not stop a tape write.
+        let whole = wire_bytes / wire * self.block_size as u64;
+        whole + (wire_bytes % wire).min(self.block_size as u64)
     }
 
     /// st's block size set to `n` if it is not already: only under item
