@@ -12961,6 +12961,57 @@ mod tests {
             assert_eq!(write_lbp(&f.conn, f.volume_id), (Some("on".into()), None));
         }
 
+        /// Block n of file k, n > 0: the fixture built at a 4 KiB block, so
+        /// RESTORE.sh (file 2) is many blocks. A refusal of its fourth block,
+        /// deferred by write-behind to file 4's write, sends the retry back to
+        /// file 2's planned start, the HP's way and mhvtl's; the session seals
+        /// and the confirm holds the tape to the planned positions.
+        #[test]
+        fn a_refusal_of_a_later_block_of_an_earlier_file_returns_to_that_file() {
+            const SMALL: u64 = 4096;
+            for stored in [false, true] {
+                let f = make_fixture();
+                let mut inputs = f.inputs.clone();
+                inputs.block_size = SMALL;
+                inputs.enospc_buffer = SMALL;
+                inputs.usable_bytes = 1 << 30;
+                let dir = tempfile::tempdir().unwrap();
+                let built = build::build(&inputs, dir.path()).unwrap();
+                let restore_sh = &built.layout.entries[2];
+                assert!(
+                    restore_sh.on_tape_bytes(SMALL).unwrap() >= 5 * SMALL,
+                    "positive control: file 2 is several blocks"
+                );
+                let at = LbpRefusalAt {
+                    stored_before_refusing: stored,
+                    ..LbpRefusalAt::deferred(2, 3, 4)
+                };
+                let mut store = MemStore::new(SMALL as usize)
+                    .with_protection(Protection::Lbp { reads: true })
+                    .with_lbp_refusal(at);
+                let planned = built
+                    .into_validated(&f.keys, SliceCheck::Size, &mut store)
+                    .unwrap()
+                    .plan(&f.conn, f.volume_id, &f.units)
+                    .unwrap();
+                let outcome = planned
+                    .execute_checking(&f.conn, &mut store, || false)
+                    .unwrap();
+                let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+                assert_eq!(retries(&f.conn), ["2"], "{at:?}");
+                match sealed
+                    .confirm(&f.conn, &mut store, Tier::Integrity)
+                    .unwrap()
+                {
+                    ConfirmOutcome::Sealed(_) => {}
+                    ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+                    ConfirmOutcome::Inconclusive(i) => {
+                        panic!("inconclusive: {:?}", i.evidence.mismatches)
+                    }
+                }
+            }
+        }
+
         /// The same rule at the seal: the second refusal is an error that
         /// names the path, never an abort, and nothing of the seal counts.
         #[test]
