@@ -523,9 +523,10 @@ fn largest_unit_line(l: &collection::plan::LargestUnit) -> String {
 /// The lines naming where a batch's units sit on its tape past the fill
 /// ceiling ([`collection::plan::BatchPlacement`]): the whole units past it
 /// (ADR-0012 item 113), the units that allow spanning past it (items 83 and
-/// 95), and the one that spans (items 94 and 123). None when the batch fits
-/// under the ceiling, as every batch does unless the drive declares
-/// `post_warning_bytes`.
+/// 95), and the one that spans (items 94 and 123), with the whole units that
+/// go after its tail on its last tape when it is larger than one tape (item
+/// 147). None when the batch fits under the ceiling, as every batch does
+/// unless the drive declares `post_warning_bytes`.
 fn placement_lines(at: &collection::plan::BatchPlacement) -> Vec<String> {
     let mut lines = Vec::new();
     if !at.past_ceiling.is_empty() {
@@ -543,9 +544,20 @@ fn placement_lines(at: &collection::plan::BatchPlacement) -> Vec<String> {
         ));
     }
     if let Some(unit) = &at.spans {
-        lines.push(format!(
-            "spans: last on its batch's tape, continued on the next: {unit}"
-        ));
+        if at.after_tail.is_empty() {
+            lines.push(format!(
+                "spans: last on its batch's tape, continued on the next: {unit}"
+            ));
+        } else {
+            lines.push(format!(
+                "spans: larger than one tape, first on its batch's first tape, continued on \
+                 the next: {unit}"
+            ));
+            lines.push(format!(
+                "after the span's tail, on its last tape (ADR-0012 item 147): {}",
+                at.after_tail.join(", ")
+            ));
+        }
     }
     lines
 }
@@ -647,11 +659,12 @@ fn cmd_plan(
                             // ADR-0012 item 113: empty unless the drive
                             // declares post_warning_bytes.
                             "past_ceiling": at.past_ceiling,
-                            // #478 (items 83, 94, 95 and 123): empty and
+                            // #478 (items 83, 94, 95, 123 and 147): empty and
                             // null unless a unit allows spanning, and the
                             // drive declares post_warning_bytes.
                             "may_span": at.may_span,
                             "spans": at.spans,
+                            "after_tail": at.after_tail,
                             "findings": b
                                 .unit_names()
                                 .into_iter()
@@ -847,6 +860,7 @@ fn cmd_run(
                     "past_ceiling": at.past_ceiling,
                     "may_span": at.may_span,
                     "spans": at.spans,
+                    "after_tail": at.after_tail,
                     "units": batch.unit_names(),
                     "labels": labels,
                     "dry_run": true,
@@ -918,6 +932,7 @@ fn cmd_run(
                 "past_ceiling": at.past_ceiling,
                 "may_span": at.may_span,
                 "spans": at.spans,
+                "after_tail": at.after_tail,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
                 "staging_released": report.cleaned.is_some(),
@@ -1495,7 +1510,7 @@ mod checksum_mode_tests {
         assert!(lines[0].ends_with(": lib/b, lib/c"), "{lines:?}");
     }
 
-    /// #478 (ADR-0012 items 94, 95 and 123): the preview names the unit
+    /// #478 (ADR-0012 items 94, 95, 123 and 147): the preview names the unit
     /// that spans, last on its batch's tape and continued on the next, and
     /// a unit that allows spanning past the fill ceiling as one that may. A
     /// 10-block tape at a 6-block ceiling: `lib/a` (3) and `lib/m` (4,
@@ -1533,6 +1548,17 @@ mod checksum_mode_tests {
             ]
         );
         assert!(lines(vec![unit("lib/a", 1), unit("lib/m", 1)]).is_empty());
+        // Item 147: beside whole units, `lib/z`, larger than one tape, starts
+        // its batch's first tape; by X11's estimate (10 blocks a tape) its
+        // last tape holds its last 2, and `lib/a` goes after that tail.
+        assert_eq!(
+            lines(vec![unit("lib/a", 1), unit("lib/z", 12)]),
+            [
+                "spans: larger than one tape, first on its batch's first tape, continued on the \
+                 next: lib/z",
+                "after the span's tail, on its last tape (ADR-0012 item 147): lib/a",
+            ]
+        );
     }
 
     /// #478 (ADR-0012 item 129): `collection run` names each spanning set's
