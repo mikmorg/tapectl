@@ -14,6 +14,7 @@ tapectl report [OPTIONS] <COMMAND>
 
 - [`summary`](#tapectl-report-summary) — Overview: units, tapes, tenants, capacity
 - [`fire-risk`](#tapectl-report-fire-risk) — Units at risk: below min copies/locations
+- [`needs`](#tapectl-report-needs) — Each unit's copy target, copies and shortfall at every location
 - [`copies`](#tapectl-report-copies) — Copy count distribution per unit
 - [`tape-only`](#tapectl-report-tape-only) — Tape-only unit status
 - [`dirty`](#tapectl-report-dirty) — Units with changes since last snapshot
@@ -43,6 +44,23 @@ Units at risk: below min copies/locations
 ```text
 tapectl report fire-risk [OPTIONS]
 ```
+
+### tapectl report needs
+
+Each unit's copy target, copies and shortfall at every location
+
+A unit's targets are its resolved `copies_at` map (an archive set's `required_locations` counts as one copy at each name), raised by the tape-only multiplier for a tape-only unit, and its copy floor is the larger of `min_copies` and the map's sum. Lists the units that have a target or are short of their copy floor; `--all` lists every unit.
+
+With `--location`, only that location, and each unit's need there: group 1 when its target there is unmet, group 2 when it is short of its copy floor with no target there and no copy there yet.
+
+```text
+tapectl report needs [OPTIONS]
+```
+
+**Options**
+
+- `--location <LOCATION>` — Only this location, with each unit's need there
+- `--all` — Every unit, not only those with a target or a copy shortfall
 
 ### tapectl report copies
 
