@@ -128,7 +128,10 @@ pub const SCOPE_FACTOR: i64 = 2;
 /// 8,695 for 21,474,836,480 bytes in the 2026-09-23 runs 1 and 2, 2,468,940
 /// and 2,469,791 bytes a data set (`docs/research/2026-10-20-write-shaping.md`
 /// §2.2, OBSERVED on `HUJ808A5L4` and the cartridge `EW7VWMVKF6`). Run 1's
-/// figure; run 2's differs by 0.03%.
+/// figure; run 2's differs by 0.03%. Measured on writes: no capture yet
+/// reconciles page 0x03's count with a known read (the no-medium capture's
+/// 296 against page 0x17's 18,050 MB read is about 61 MB a count), so on
+/// the read side this weighs by HP-V3's text, not a measurement.
 pub const LTO6_DATA_SET_BYTES: u64 = 2_468_940;
 
 /// The data-set size a reading's parameter 5 is weighed by, when there is an
@@ -887,6 +890,13 @@ pub(crate) mod tests {
     /// kind: page 0x17 says the last mount wrote 30,043 MB, and page 0x02
     /// counted 12,820 — 2.34 MB each, within 10% of the LTO-6 data set the
     /// drive phase measured, and nowhere near one byte each.
+    ///
+    /// The read side does NOT reconcile on this capture: page 0x17 says the
+    /// last mount read 18,050 MB against page 0x03's 296, about 61 MB a
+    /// count. Page 0x03's data-set semantics rest on HP-V3's text and page
+    /// 0x02's analogy, not on a reconciled read figure; if parameter 5
+    /// undercounts reads, the weighed scope check fires later than it should
+    /// (a same-load difference is unaffected).
     #[test]
     fn the_hp_fixture_counts_data_sets_not_bytes() {
         const NOMEDIA: &str = "../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia";
