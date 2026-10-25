@@ -1561,13 +1561,13 @@ the drive's fill ceiling less the end-of-tape reserve (and on to its plan bound
 when the drive declares `post_warning_bytes`):
 - what is already staged for the location goes first, and is never staged again
   (when it does not all fit, nothing more is planned, and a warning names it);
-- then a span in progress that continues there, then group 1 before group 2.
-  Within group 1 the largest shortfall at the location comes first (0 copies
-  there before 1 short), the fewest copies in all breaking ties; within group 2,
-  the fewest copies in all; then the name (item 152);
-- whole units before units that may span; next-fit, so the first unit that does
-  not fit closes the tape and the rest are named as waiting for the next tape for
-  that location.
+- then a span in progress that continues there, then whole units, then units
+  that may span, and within each, group 1 before group 2. Within group 1 the
+  largest shortfall at the location comes first (0 copies there before 1 short),
+  the fewest copies in all breaking ties; within group 2, the fewest copies in
+  all; then the name (item 152);
+- next-fit: the first unit that does not fit closes the tape, and the rest are
+  named as waiting for the next tape for that location.
 
 `--dry-run` prints the plan and stages nothing:
 
