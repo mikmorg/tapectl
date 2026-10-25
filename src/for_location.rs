@@ -2304,55 +2304,72 @@ mod tests {
         );
     }
 
-    /// Item 153, end to end with dar: `stage` snapshots a new unit and a
-    /// changed one and stages each, and the round trip holds: what it staged
-    /// for X is exactly what `volume write --for-location X` takes, the
-    /// changed unit's new version included although its old version has
-    /// every copy its floor asks for.
-    #[test]
-    fn new_and_changed_units_are_snapshotted_and_staged_and_a_write_for_x_takes_them() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = TapectlPaths::new(tmp.path().join("home"));
-        paths.ensure_dirs().unwrap();
-        let conn = crate::db::open(&paths.db_file).unwrap();
-        let staging = tmp.path().join("staging");
-        std::fs::create_dir_all(&staging).unwrap();
-        let mut config = Cat::new().config;
-        config.dar.binary = "dar".into();
-        config.staging.directory = staging.to_string_lossy().into_owned();
-        config.defaults.slice_size = "1M".into();
-        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
-        crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
-        conn.execute(
-            "INSERT INTO tenants (name, is_operator, status) VALUES ('escrow-holder', 0, 'active')",
-            [],
-        )
-        .unwrap();
-        let holder = conn.last_insert_rowid();
-        let kp = crate::crypto::keys::generate_keypair();
-        crate::db::queries::insert_escrow_key(
-            &conn,
-            holder,
-            "test-escrow",
-            &kp.fingerprint,
-            &kp.public_key,
-            None,
-        )
-        .unwrap();
-        conn.execute_batch(
-            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf');
-             INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');
-             INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
-             VALUES ('L1', 'lto', 'p', 10485760, 'initialized');",
-        )
-        .unwrap();
-        for name in ["fresh", "changed"] {
-            let src = tmp.path().join("src").join(name);
+    /// A catalog on disk that [`stage`] runs against with dar (on `PATH`):
+    /// the operator `op`, the tenant `alice`, a registered escrow recipient,
+    /// `home` and `offsite` (shelves), and the volume `L1` (initialized,
+    /// 10 MiB) on [`Cat`]'s drive, staging at 1 MiB slices.
+    struct DarCat {
+        conn: Connection,
+        paths: TapectlPaths,
+        config: Config,
+        tmp: tempfile::TempDir,
+    }
+
+    impl DarCat {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            paths.ensure_dirs().unwrap();
+            let conn = crate::db::open(&paths.db_file).unwrap();
+            let staging = tmp.path().join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            let mut config = Cat::new().config;
+            config.dar.binary = "dar".into();
+            config.staging.directory = staging.to_string_lossy().into_owned();
+            config.defaults.slice_size = "1M".into();
+            crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+            crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status)
+                 VALUES ('escrow-holder', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let holder = conn.last_insert_rowid();
+            let kp = crate::crypto::keys::generate_keypair();
+            crate::db::queries::insert_escrow_key(
+                &conn,
+                holder,
+                "test-escrow",
+                &kp.fingerprint,
+                &kp.public_key,
+                None,
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO locations (name, kind) VALUES ('home', 'shelf');
+                 INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');
+                 INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('L1', 'lto', 'p', 10485760, 'initialized');",
+            )
+            .unwrap();
+            DarCat {
+                conn,
+                paths,
+                config,
+                tmp,
+            }
+        }
+
+        /// A unit `name` of `alice`, its source a folder holding one
+        /// 4000-byte file.
+        fn unit(&self, name: &str) {
+            let src = self.tmp.path().join("src").join(name);
             std::fs::create_dir_all(&src).unwrap();
             std::fs::write(src.join("f.bin"), vec![3u8; 4000]).unwrap();
             crate::unit::init_unit(
-                &conn,
-                &paths,
+                &self.conn,
+                &self.paths,
                 src.to_str().unwrap(),
                 "alice",
                 Some(name),
@@ -2361,15 +2378,73 @@ mod tests {
             )
             .unwrap();
         }
-        let plan_x = || plan(&conn, &config, "offsite", "L1", "/dev/null").unwrap();
+
+        /// A sealed volume `label` at `home` holding a whole copy of `set`.
+        fn whole_at_home(&self, set: i64, label: &str) {
+            self.conn
+                .execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes,
+                                          status, location_id)
+                     VALUES (?1, 'lto', 'p', 10485760, 'sealed',
+                             (SELECT id FROM locations WHERE name = 'home'))",
+                    params![label],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ss.id, ss.snapshot_id, (SELECT id FROM volumes WHERE label = ?2),
+                            'completed'
+                       FROM stage_sets ss WHERE ss.id = ?1",
+                    params![set, label],
+                )
+                .unwrap();
+        }
+
+        /// `set`'s staging released, as after its copies are made.
+        fn release(&self, set: i64) {
+            self.conn
+                .execute(
+                    "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                    params![set],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE stage_slices SET staging_path = NULL WHERE stage_set_id = ?1",
+                    params![set],
+                )
+                .unwrap();
+        }
+
+        fn plan(&self) -> ForLocationPlan {
+            plan(&self.conn, &self.config, "offsite", "L1", "/dev/null").unwrap()
+        }
+
+        fn stage(&self, plan: &ForLocationPlan) -> Vec<Staged> {
+            stage(&self.conn, &self.paths, &self.config, plan, 1, true).unwrap()
+        }
+    }
+
+    /// Item 153, end to end with dar: `stage` snapshots a new unit and a
+    /// changed one and stages each, and the round trip holds: what it staged
+    /// for X is exactly what `volume write --for-location X` takes, the
+    /// changed unit's new version included although its old version has
+    /// every copy its floor asks for.
+    #[test]
+    fn new_and_changed_units_are_snapshotted_and_staged_and_a_write_for_x_takes_them() {
+        let c = DarCat::new();
+        for name in ["fresh", "changed"] {
+            c.unit(name);
+        }
 
         // Both never archived: both snapshotted and staged.
-        let first = plan_x();
+        let first = c.plan();
         assert_eq!(
             names(&first.planned),
             ["\"changed\" (new version)", "\"fresh\" (new version)"]
         );
-        let staged = stage(&conn, &paths, &config, &first, 1, true).unwrap();
+        let staged = c.stage(&first);
         assert!(
             staged
                 .iter()
@@ -2379,7 +2454,8 @@ mod tests {
 
         // `changed` v1 goes onto two tapes (its floor) and its staging is
         // released; then its folder changes.
-        let (v1, set1): (i64, i64) = conn
+        let (v1, set1): (i64, i64) = c
+            .conn
             .query_row(
                 "SELECT sn.id, ss.id FROM snapshots sn
                    JOIN units u ON u.id = sn.unit_id
@@ -2389,46 +2465,25 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        conn.execute(
-            "UPDATE snapshots SET status = 'current' WHERE id = ?1",
-            params![v1],
-        )
-        .unwrap();
+        c.conn
+            .execute(
+                "UPDATE snapshots SET status = 'current' WHERE id = ?1",
+                params![v1],
+            )
+            .unwrap();
         for label in ["H1", "H2"] {
-            conn.execute(
-                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status,
-                                      location_id)
-                 VALUES (?1, 'lto', 'p', 10485760, 'sealed',
-                         (SELECT id FROM locations WHERE name = 'home'))",
-                params![label],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-                 VALUES (?1, ?2, (SELECT id FROM volumes WHERE label = ?3), 'completed')",
-                params![set1, v1, label],
-            )
-            .unwrap();
+            c.whole_at_home(set1, label);
         }
-        conn.execute(
-            "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
-            params![set1],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE stage_slices SET staging_path = NULL WHERE stage_set_id = ?1",
-            params![set1],
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join("src/changed/g.bin"), b"new content").unwrap();
+        c.release(set1);
+        std::fs::write(c.tmp.path().join("src/changed/g.bin"), b"new content").unwrap();
 
-        let second = plan_x();
+        let second = c.plan();
         assert_eq!(
             names(&second.planned),
             ["\"fresh\" v1", "\"changed\" (new version)"],
             "the staged set rides first; the changed unit is a new version"
         );
-        let staged = stage(&conn, &paths, &config, &second, 1, true).unwrap();
+        let staged = c.stage(&second);
         assert_eq!(staged[0], Staged::Already);
         let Staged::Now {
             stage_set_id: set2,
@@ -2437,7 +2492,7 @@ mod tests {
         else {
             panic!("the changed unit's v2 is staged: {staged:?}");
         };
-        let for_x = staged_sets_for_location(&conn, &config, "offsite").unwrap();
+        let for_x = staged_sets_for_location(&c.conn, &c.config, "offsite").unwrap();
         let fresh_set = match &second.planned[0].how {
             How::AlreadyStaged { stage_set_id } => *stage_set_id,
             other => panic!("{other:?}"),
