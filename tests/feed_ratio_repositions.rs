@@ -220,5 +220,12 @@ fn report_health_and_volume_info_show_it_too() {
         "{info}"
     );
     let ibm = stdout(home.path(), &["volume", "info", "L6-IBM"]);
-    assert!(!ibm.contains("repositions"), "{ibm}");
+    // No figure, so no clause. (Since ADR-0012 item 170 the verdict itself
+    // may say there are "no repositions ... on record", so the clause is
+    // looked for, not the word.)
+    assert!(!ibm.contains("repositions per 100 MB"), "{ibm}");
+    assert!(
+        ibm.contains("no cause named: no repositions and no correction jump on record"),
+        "positive control: the line is there, without the clause: {ibm}"
+    );
 }

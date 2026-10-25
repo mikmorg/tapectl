@@ -117,8 +117,10 @@ fn volume_info_shows_the_write_feed_ratio_or_says_there_is_none() {
         "{ok}"
     );
     let bad = stdout(h, &["volume", "info", "L6-BAD"]);
+    // ADR-0012 item 170: no repositions and no corrections recorded, so no
+    // cause is named, never the host.
     assert!(
-        bad.contains("  Feed ratio:  1.5050 (above 1.05: the drive was fed unevenly"),
+        bad.contains("  Feed ratio:  1.5050 (above 1.05, no cause named"),
         "{bad}"
     );
     let virt = stdout(h, &["volume", "info", "L6-VIRT"]);
