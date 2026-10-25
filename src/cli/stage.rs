@@ -27,9 +27,12 @@ pub enum StageCommands {
         /// consume them, or `staging clean --unit <name> --version <N>`
         /// to release them first. A plain clean releases it only when it
         /// already has a completed write AND the unit is not currently
-        /// below its policy's min_copies; add `--force` otherwise —
-        /// including for a stage set that was never written anywhere,
-        /// which a plain clean leaves untouched regardless of min_copies.
+        /// below its copy floor (the larger of its policy's min_copies and
+        /// the sum of its copies_at targets, times [compaction]
+        /// tape_only_safety_multiplier for a tape-only unit); add `--force`
+        /// otherwise — including for a stage set that was never written
+        /// anywhere, which a plain clean leaves untouched regardless of the
+        /// copy floor.
         #[arg(long)]
         version: Option<i64>,
 
@@ -653,13 +656,14 @@ fn snapshot_to_stage(
                 let head = format!("unit \"{name}\" v{v} already has a stage set with live slices");
                 let msg = match &worst {
                     // A candidate: a bare clean WOULD release it,
-                    // unless the unit is below its policy's
-                    // min_copies. Today's wording, unchanged.
+                    // unless the unit is below its policy's copy floor
+                    // (#493, ADR-0012 item 149: the larger of `min_copies`
+                    // and the `copies_at` sum, `copy_floor_base`).
                     staging::clean::ReleaseBlocker::None => format!(
                         "{head} — use `tapectl volume write` to consume them, or \
                          `tapectl staging clean --unit {name}` to release them first \
                          (retained by default if \"{name}\" is below its policy's \
-                         min_copies — add --force to release it anyway)"
+                         copy floor — add --force to release it anyway)"
                     ),
                     // Never written: #279's wording, unchanged.
                     staging::clean::ReleaseBlocker::NeverWritten => format!(
@@ -1077,10 +1081,10 @@ mod tests {
     /// NEVER been written anywhere (no `writes` row exists for it at all)
     /// -- a plain `tapectl staging clean --unit <name>` is a silent no-op
     /// on it (`cleaned 0 stage set(s)`), so `--force` is the only thing
-    /// that releases it, regardless of the unit's min_copies standing.
-    /// The refusal must say exactly that, and must NOT mention
-    /// min_copies at all -- mentioning it here would misdirect an
-    /// operator whose unit is not under min_copies into concluding
+    /// that releases it, regardless of where the unit stands against its
+    /// copy floor. The refusal must say exactly that, and must NOT mention
+    /// the copy floor at all -- mentioning it here would misdirect an
+    /// operator whose unit is not under its copy floor into concluding
     /// `--force` does not apply to them, when it is the only thing that
     /// would help. The positive control for this test is
     /// Issue #292: a write row in a NON-`completed` state is not one fact
@@ -1213,8 +1217,8 @@ mod tests {
              acts on the first command they read: {msg}"
         );
         assert!(
-            !msg.contains("min_copies"),
-            "min_copies is not why a clean leaves this one alone: {msg}"
+            !msg.contains("copy floor"),
+            "the copy floor is not why a clean leaves this one alone: {msg}"
         );
     }
 
@@ -1440,7 +1444,7 @@ mod tests {
         );
         assert!(!msg.contains("volume resume"), "{msg}");
         assert!(!msg.contains("aborted"), "{msg}");
-        assert!(!msg.contains("min_copies"), "{msg}");
+        assert!(!msg.contains("copy floor"), "{msg}");
     }
 
     /// #478 (ADR-0012 items 85 and 129): a version spanning cartridges,
@@ -1507,9 +1511,9 @@ mod tests {
         assert!(!msg.contains("aborted"), "{msg}");
     }
 
-    /// `create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set`
+    /// `create_with_version_refusal_names_the_copy_floor_for_a_written_under_copied_set`
     /// below: without it, this test alone cannot distinguish "says the
-    /// right thing" from "stopped mentioning min_copies anywhere".
+    /// right thing" from "stopped mentioning the copy floor anywhere".
     #[test]
     fn create_with_version_refusal_names_never_written_unconditionally() {
         let (conn, paths, config, _tmp) = setup();
@@ -1570,21 +1574,22 @@ mod tests {
             "must name --force unconditionally: {msg}"
         );
         assert!(
-            !msg.contains("min_copies"),
-            "a never-written stage set has nothing to do with min_copies -- \
+            !msg.contains("copy floor"),
+            "a never-written stage set has nothing to do with the copy floor -- \
              mentioning it here misdirects an operator whose unit is not \
-             under min_copies into thinking --force does not apply: {msg}"
+             under its copy floor into thinking --force does not apply: {msg}"
         );
     }
 
     /// Issue #279, the other branch and this test module's positive
     /// control: the live stage set DOES have a completed write, and the
-    /// unit is below its policy's min_copies -- a plain
+    /// unit is below its policy's copy floor -- a plain
     /// `tapectl staging clean --unit <name>` retains it for exactly that
-    /// reason, so the refusal keeps today's wording, min_copies mention
-    /// included.
+    /// reason, so the refusal says so, naming the copy floor (#493,
+    /// ADR-0012 item 149: the larger of `min_copies` and the `copies_at`
+    /// sum, so `min_copies` alone could name the wrong number).
     #[test]
-    fn create_with_version_refusal_keeps_min_copies_wording_for_a_written_under_copied_set() {
+    fn create_with_version_refusal_names_the_copy_floor_for_a_written_under_copied_set() {
         let (conn, paths, config, _tmp) = setup();
         crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         run(
@@ -1650,8 +1655,8 @@ mod tests {
         assert!(msg.contains("volume write"), "{msg}");
         assert!(msg.contains("staging clean"), "{msg}");
         assert!(
-            msg.contains("min_copies"),
-            "a written, under-copied set keeps today's min_copies wording: {msg}"
+            msg.contains("below its policy's copy floor"),
+            "a written, under-copied set names the copy floor: {msg}"
         );
         assert!(msg.contains("--force"), "{msg}");
     }
@@ -1663,7 +1668,7 @@ mod tests {
     /// alone would read as a release candidate); "unit1"'s own stage_set
     /// still has none. If the refusal wrongly asked "does ANY stage_set
     /// have a completed write" instead of "does unit1's OWN live
-    /// stage_set", it would emit the min_copies-flavoured message here --
+    /// stage_set", it would emit the copy-floor-flavoured message here --
     /// this test fails on that wrong composition even though both of the
     /// tests above still pass.
     #[test]
@@ -1752,7 +1757,7 @@ mod tests {
             "unit1's own stage_set is still never-written: {msg}"
         );
         assert!(
-            !msg.contains("min_copies"),
+            !msg.contains("copy floor"),
             "a different unit's completed write must not leak into unit1's \
              refusal message: {msg}"
         );
