@@ -138,6 +138,17 @@ Version. Seal status decides eligibility; evidence age qualifies presentation
 (warnings at destructive moments) but never eligibility.
 _Avoid_: backup, replica, "a copy of the unit" (coverage is per Version)
 
+**Copy target**:
+How many Copies a unit wants at one named location (1.7.1, ADR-0012 items
+148-160): its `copies_at` map, set in the dotfile's `[policy.copies_at]`, on an
+archive set (whose `required_locations` counts as one at each name) or in
+`[defaults]`, the most specific layer winning whole. A Copy is *at* a location
+when its tape is shelved there or a warehouse deposit of it is there. The map's
+sum can raise the **copy floor**, the total a unit needs: the larger of
+`min_copies` and that sum, multiplied for a tape-only unit, as each target is.
+_Avoid_: required copies (that is the floor), quota, placement (the planner's
+word for where a unit sits on one tape)
+
 **Version**:
 A snapshot's ordinal within its unit, minted only when the unit's content
 differs from its latest current snapshot. Two Versions of a unit therefore
