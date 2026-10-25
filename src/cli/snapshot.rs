@@ -66,9 +66,12 @@ pub enum SnapshotCommands {
         #[arg(long)]
         version: i64,
         /// Confirm in advance, as the global --yes does: mark the version
-        /// even though the version superseding it is short of its policy's
-        /// min_copies or required_locations (for a tape-only unit, the
-        /// multiplied floors). Without either flag a terminal asks, and a
+        /// even though the version superseding it is short of its copy floor
+        /// (the larger of its policy's min_copies and the sum of its
+        /// copies_at targets) or of a copy target at a location of its
+        /// copies_at map (an archive set's required_locations counts as one
+        /// copy at each name); for a tape-only unit, the multiplied floors.
+        /// Without either flag a terminal asks, and a
         /// non-interactive run refuses, naming the shortfall. Only --force
         /// (not --yes, not a prompt) marks a version no current version
         /// supersedes — that releases the unit's only current version

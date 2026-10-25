@@ -97,11 +97,13 @@ pub enum UnitCommands {
         /// Unit name
         name: String,
         /// Confirm in advance, as the global --yes does: mark the unit even
-        /// though it is short of its policy's min_copies, the copies at each
-        /// of its required_locations (both times [compaction]
-        /// tape_only_safety_multiplier, the tape-only floor) or the
-        /// [defaults] min_locations count of places (never multiplied), or
-        /// is dirty (changed since its last snapshot). Without either flag a
+        /// though it is short of its copy floor (the larger of its policy's
+        /// min_copies and the sum of its copies_at targets), the copy target
+        /// at each location of its copies_at map (an archive set's
+        /// required_locations counts as one copy at each name), both times
+        /// [compaction] tape_only_safety_multiplier, the tape-only floor, or
+        /// the [defaults] min_locations count of places (never multiplied),
+        /// or is dirty (changed since its last snapshot). Without either flag a
         /// terminal asks, and a non-interactive run refuses, naming each
         /// shortfall. A unit that was never archived is refused whatever
         /// the flags (ADR-0008 Tier 3)
@@ -432,15 +434,17 @@ pub fn run(
 
         UnitCommands::MarkTapeOnly { name, force } => {
             // Issue #241: `unit_mark_tape_only` (cli::operations, outside
-            // this fix's file scope) enforces min_copies/min_locations —
+            // this fix's file scope) enforces the copy floor, the copy
+            // targets and min_locations —
             // a gate a dry run must reproduce exactly or it lies about
             // what the real run would refuse. Refuse rather than risk
             // that divergence.
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
                     "unit mark-tape-only",
-                    "it enforces the resolved policy's min_copies/min_locations, a gate a \
-                     preview would have to reproduce exactly or risk being wrong.",
+                    "it enforces the resolved policy's copy floor, copy targets and \
+                     min_locations, a gate a preview would have to reproduce exactly or risk \
+                     being wrong.",
                 ));
             }
             // Issue #348: the global `--yes` is the same advance Tier-2
