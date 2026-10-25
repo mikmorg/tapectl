@@ -553,6 +553,64 @@ fn collection_run_dry_run_json_carries_the_marker() {
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM stage_sets"), 0);
 }
 
+/// #493 (ADR-0012 items 151 and 153): `stage for-location X --volume L
+/// --dry-run` prints the plan — every unit that needs X, here two
+/// never-archived units, each a new version to snapshot and stage — and
+/// snapshots nothing, stages nothing and writes nothing. `--json` carries
+/// `dry_run: true`. Positive control for the plan: both units are named.
+#[test]
+fn stage_for_location_dry_run_snapshots_and_stages_nothing() {
+    let (home, _root) = home_with_a_collection_ready_to_run();
+    ok(home.path(), &["location", "add", "offsite"]);
+
+    let out = ok(
+        home.path(),
+        &[
+            "stage",
+            "for-location",
+            "offsite",
+            "--volume",
+            "L1",
+            "--dry-run",
+        ],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("microlib/alpha") && text.contains("microlib/beta"),
+        "the plan names both units: {text}"
+    );
+    assert!(text.contains("dry run"), "{text}");
+    assert!(
+        text.contains("tapectl volume write L1 --for-location offsite"),
+        "{text}"
+    );
+
+    let out = ok(
+        home.path(),
+        &[
+            "--json",
+            "stage",
+            "for-location",
+            "offsite",
+            "--volume",
+            "L1",
+            "--dry-run",
+        ],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["dry_run"], serde_json::json!(true), "{parsed}");
+    assert_eq!(parsed["planned"].as_array().unwrap().len(), 2, "{parsed}");
+
+    let conn = db(home.path());
+    for table in ["snapshots", "stage_sets", "writes"] {
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
+            0,
+            "--dry-run left a {table} row"
+        );
+    }
+}
+
 /// A dry run must still refuse what the real run would refuse — an unknown
 /// `--label` here — rather than report a plan the operator cannot execute.
 /// `plan_for_run` resolves the destination budget before planning anything,

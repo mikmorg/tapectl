@@ -43,6 +43,46 @@ pub enum StageCommands {
         jobs: Option<usize>,
     },
 
+    /// Stage what a location needs, packed into one volume bound there
+    ///
+    /// Works out each unit's need at LOCATION (ADR-0012 items 151-159): group
+    /// 1, its copy target there is unmet; group 2, it is short of its copy
+    /// floor with no target there and no copy there yet. A new or changed
+    /// unit counts as a new version with no copies. The units are packed into
+    /// `--volume`'s room in priority order (the largest shortfall at LOCATION
+    /// first, the fewest copies in all breaking ties, then the name), whole
+    /// units before units that may span, next-fit: the first that does not
+    /// fit closes the tape, and the rest wait for the next tape for LOCATION.
+    /// What is already staged for LOCATION is planned first and never staged
+    /// again. A span in progress continues only on a tape bound for the
+    /// location of its earlier range.
+    ///
+    /// New and changed units are snapshotted and staged, an unchanged unit's
+    /// version is staged from its source, and a tape-only unit's version is
+    /// read back with `volume read-slices`: the commands are printed in the
+    /// order to run them, and this command moves no tape. Then write the
+    /// volume with `volume write LABEL --for-location LOCATION`. `--dry-run`
+    /// prints the plan and stages nothing. A warehouse location is refused:
+    /// a copy there is a recorded deposit (`volume deposit add`).
+    ForLocation {
+        /// The location the volume will be kept at (a registered location,
+        /// not a warehouse).
+        #[arg(value_name = "LOCATION")]
+        location: String,
+        /// The volume to fill: `volume init` done, nothing written yet.
+        #[arg(long, value_name = "LABEL")]
+        volume: String,
+        /// How many units to stage at once (1 to 16), as `stage create
+        /// --jobs`. Defaults to `[staging] jobs`.
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// The drive whose fill ceiling and end-of-tape reserve size the
+        /// volume's room (no drive is touched). Defaults to the only
+        /// configured drive; required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
+    },
+
     /// List stage sets
     List {
         /// Filter by status (staging, staged, failed, cleaned)
@@ -295,6 +335,51 @@ pub fn run(
                             sha.as_deref().unwrap_or("(none)"),
                         );
                     }
+                }
+            }
+        }
+
+        StageCommands::ForLocation {
+            location,
+            volume,
+            jobs,
+            device,
+        } => {
+            // #493 (ADR-0012 item 151): `--dry-run` is honoured — the plan
+            // is made from the catalog and the sources alone, and nothing is
+            // snapshotted or staged.
+            let jobs = jobs.unwrap_or(config.staging.jobs);
+            if !(1..=staging::jobs::MAX_JOBS).contains(&jobs) {
+                return Err(TapectlError::Other(format!(
+                    "--jobs {jobs}: stage between 1 and {} units at once",
+                    staging::jobs::MAX_JOBS
+                )));
+            }
+            let device = crate::cli::write_device(config, device.as_deref())?;
+            let plan = crate::for_location::plan(conn, config, location, volume, &device)?;
+            let staged = if dry_run {
+                None
+            } else {
+                crate::progress::stderr_println(&format!(
+                    "stage for-location {} --volume {}: {} unit(s) planned; staging what is \
+                     not staged yet",
+                    plan.location,
+                    plan.volume,
+                    plan.planned.len()
+                ));
+                Some(crate::for_location::stage(
+                    conn, paths, config, &plan, jobs, assume_yes,
+                )?)
+            };
+            if json_output {
+                println!("{}", crate::for_location::to_json(&plan, staged.as_deref()));
+            } else {
+                let (out, err) = crate::for_location::text_lines(&plan, staged.as_deref());
+                for line in out {
+                    println!("{line}");
+                }
+                for line in err {
+                    eprintln!("{line}");
                 }
             }
         }
