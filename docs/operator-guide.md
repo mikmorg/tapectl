@@ -2628,11 +2628,11 @@ write-protect tab set: it verifies without sliding the tab. So does a
 A verify that passes can still be a warning. The drive corrects read errors
 as it goes, and a cartridge whose surface is wearing makes it correct more of
 them each year, long before a sha256 fails. So every completed full `volume verify`
-records the read errors its drive corrected (log page 0x03: corrected with and
-without delay, rereads, uncorrected), each per GiB the drive read, as a
-`verify_read_errors` event naming its verification session. There is no
-separate scrub command (ADR-0012, 2026-10-06): your rotating verifies are the
-scrub.
+records the read errors its drive corrected during that verify (log page 0x03:
+corrected with and without delay, rereads, uncorrected), each per GiB the
+verify read back, as a `verify_read_errors` event naming its verification
+session. There is no separate scrub command (ADR-0012, 2026-10-06): your
+rotating verifies are the scrub.
 
 `tapectl report health` shows the figures per cartridge, oldest verify first:
 
@@ -2673,11 +2673,26 @@ How to read it:
   front index and the seal — a few MB — and a rate over that is a sample of
   nothing, so a quick verify (before moving a tape, say) adds no point and
   cannot make a healthy cartridge look as if it is rising.
-- A rate of `-` is a verify whose drive counted no bytes read on page 0x03
-  (mhvtl always does this). It is skipped, never read as zero.
-- The counters are the drive's since it last cleared the page, which the HP
-  LTO-6 does when a cartridge is loaded. Verify a cartridge on a fresh load and
-  the figure is that verify's readback.
+- A rate of `-` is a verify whose page 0x03 counted no read (mhvtl always
+  does this), or a full verify that continued an interrupted one and so read
+  only part of the tape in this contact. It is skipped, never read as zero.
+- The drive counts page 0x03 from the load and clears it when the tape is
+  unloaded (HP's manual). The verify's figure is its reading less the reading
+  of tapectl's previous contact on the same drive in the same load (same
+  cartridge, same chip load count), or the whole reading when the verify is
+  the first contact of its load on an HP drive. Either way the figure is that
+  verify's readback alone, whatever read the tape earlier in the load.
+- With no such reading to subtract (another vendor's drive at the first contact
+  of a load, a contact that named no cartridge, an earlier contact in the load
+  that took no reading), the whole reading is weighed instead. On the HP drive
+  page 0x03 counts data sets, not bytes, about 2.47 MB each on LTO-6, and the
+  reading is used when the data sets it counted come to no more than twice
+  what the verify read. Past that, or on another drive or generation, where
+  there is no honest data-set size, the rate is shown with a `?` and never
+  compared: the page may have counted reads this verify did not make.
+- A rate shown as `old` was recorded before 1.7.1, divided by that data-set
+  count as if it were bytes (#495). It stays as it was recorded and is never
+  compared. The next two full verifies start the cartridge's trend again.
 - One verify's rate means little; the same cartridge's rates over time are the
   signal. A climb that shows on one drive and not on another is the drive, not
   the tape: compare across drives before you act (`report health` lists each
