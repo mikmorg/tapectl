@@ -141,27 +141,60 @@ the density probe) leave it alone. The one other kernel-facing mechanism is
 the seccomp filter installed in the `dar -c` child (#441), which neutralises
 dar's `fadvise` and touches no device.
 
-**SCSI generic (`/dev/sgN`) is used only to ask the drive and the cartridge
-questions**, through three sg3-utils tools and no others:
+**SCSI generic (`/dev/sgN`) is used to ask the drive and the cartridge
+questions**, through three sg3-utils tools, **and to set one mode page**, through
+two more (1.7.2, #388; ADR-0012 item 163), and no others:
 
 | Tool | SCSI command | Used for |
 |---|---|---|
 | `sg_inq` | INQUIRY (standard, and the unit-serial VPD page 0x80) | the drive's identity (`tape::drive_identity`), and the identity header of a health record (`tape::log_pages::inquiry_header`) |
 | `sg_logs` | LOG SENSE | the drive's health and error-counter pages (`tape::log_pages`, `tape::health`) — never `--reset`/`--select`, which would issue LOG SELECT and clear counters |
 | `sg_read_attr` | READ ATTRIBUTE | the cartridge's MAM: medium serial, density, load count (`tape::mam`) |
+| `sg_modes` | MODE SENSE of the Control Data Protection page (0Ah/F0h), current values | reading the Logical Block Protection page (`tape::lbp`) |
+| `sg_wr_mode` | MODE SENSE, then MODE SELECT, of page 0Ah/F0h only, no block descriptor, PS clear, never `--save` | arming and clearing Logical Block Protection (`tape::lbp`) |
 
-None of the three moves the medium or changes the drive's state, so the st
-driver's position cannot drift underneath it. tapectl never sends a WRITE
-ATTRIBUTE, a MODE SELECT, a LOAD/UNLOAD or a raw CDB over SG, and never runs
-`mt` or `sg_raw` itself (the operator's tools; `first-run.sh` and the
-lifecycle suite use `mt`, the binary does not). `tests/sg_boundary.rs` pins
+None of the five moves the medium, so the st driver's position cannot drift
+underneath them. The three asking tools change no state at all; `sg_wr_mode`
+changes exactly one thing, the Control Data Protection page, and never saves
+it, so a power cycle always clears it. tapectl never sends a WRITE ATTRIBUTE,
+a MODE SELECT of any page but 0Ah/F0h, a LOAD/UNLOAD or a raw CDB over SG, and
+never runs `mt` or `sg_raw` itself (the operator's tools; `first-run.sh` and
+the lifecycle suite use `mt`, the binary does not). `tests/sg_boundary.rs` pins
 both sets — the `sg_*` tools the source names and every program the binary
-starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the three above, and
+starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the five above, and
 `sh -c` over the operator's own `snapshot_command` / `release_command` of a
 `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
 line, run as the user tapectl runs as, given the collection's name and root and
-the snapshot's path and no device) — and the exact `sg_logs` argument list: a new SG tool, a new program, or a
-counter-resetting flag on `sg_logs` fails it.
+the snapshot's path and no device) — and the exact `sg_logs` argument list and
+the two page argument lists: a new SG tool, a new program, a
+counter-resetting flag on `sg_logs`, or a saving or other-page flag on the page
+tools fails it.
+
+**The page's life (item 164).** `TapeDevice::open`/`open_read` arm the page
+right after st's exclusive open succeeds — so another process can never be
+doing data I/O on the drive while it is armed — through the sg node the kernel
+binds to the st node just opened (sysfs), never one named in config: a MODE
+SELECT on the wrong node would arm another drive. The device's `Drop` clears
+it before the st descriptor closes: first a synchronous filemark when the last
+st operation was a block write, which also flushes the drive's buffer under
+the page that wrote it, then the page put back as found, read back to check.
+An open that finds the page already armed (a crashed or killed tapectl, a
+hand-run `sg_wr_mode`) names it and clears it. A second signal, a SIGKILL or a
+crash leaves it armed until the next tapectl tape command or a power cycle;
+in between, another program's read of the drive (RESTORE.sh, `dd`) fails with
+EIO, never wrong data. A drive or host that cannot take the page is written
+without it, once warned and recorded (item 165).
+
+**What LBP covers, and what it does not.** On a write, from tapectl's device
+buffer (the CRC is computed on the tape-writer thread, over the block as
+`write(2)` sends it) to the drive, which refuses a block whose CRC does not
+match before writing it (item 174 retries once, in place); on a read with
+LBP_R, from the drive back to tapectl. Not covered: the one in-process copy
+from the write pipeline's hashed buffer into the device buffer (the readback
+covers it); an all-zero block with an all-zero CRC, which is valid under the
+code's seed 0 and linearity, so a fault that zeroes a whole buffer passes it
+(the sha256 checks catch it); and the cartridge reading back cold, which only
+a full readback proves (`no_full_verify` stays, item 161).
 
 **Filemarks.** Every file of a volume ends with an *immediate* filemark
 (`MTWEOFI`: queued, returns at once), so the drive keeps streaming between
