@@ -304,6 +304,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
             probe_args: &["nonexistent-unit"],
         },
     ),
+    // #493 (ADR-0012 item 151): plans from the catalog and the sources and
+    // stages nothing under `--dry-run` — proven in `tests/dry_run_global.rs`.
+    (&["stage", "for-location"], Verdict::Honours),
     (&["stage", "info"], Verdict::ReadOnly),
     (&["stage", "list"], Verdict::ReadOnly),
     (&["staging", "clean"], Verdict::Refuses { probe_args: &[] }),
