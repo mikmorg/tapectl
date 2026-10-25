@@ -1111,16 +1111,19 @@ pub fn volume_write(
 
 /// [`volume_write`], optionally writing only some of the staged sets.
 ///
-/// `only_stage_sets` is `None` for every ordinary write: the selection is
-/// every `staged` set in the catalog ([`find_staged_data`]). `volume rewrite`
-/// passes the stage sets it staged and holds (issue #483, ADR-0012
+/// `only_stage_sets` is a [`StagedScope`]: [`StagedScope::Every`] (`None`)
+/// for every ordinary write, the selection being every `staged` set in the
+/// catalog ([`find_staged_data`]). `volume rewrite` passes the stage sets it
+/// staged and holds (`Some`, [`StagedScope::Rewrite`]; issue #483, ADR-0012
 /// 2026-10-19 item 106): its new volume carries those slices and nothing else
-/// that happens to be staged (its `--with-staged` is `None`). The selection
-/// is narrowed everywhere the write looks at staging — the batch it plans,
-/// the whole-on-disk check, the keys and the pre-flight — so a staged set
-/// outside the scope can neither be written by it nor refuse it.
+/// that happens to be staged (its `--with-staged` is `None`). `volume write
+/// --for-location X` passes [`StagedScope::ForLocation`] (#493, ADR-0012 item
+/// 151): the staged sets that still have need at X. The selection is narrowed
+/// everywhere the write looks at staging — the batch it plans, the
+/// whole-on-disk check, the keys and the pre-flight — so a staged set outside
+/// the scope can neither be written by it nor refuse it.
 #[allow(clippy::too_many_arguments)]
-pub fn volume_write_scoped(
+pub fn volume_write_scoped<'s>(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -1132,7 +1135,7 @@ pub fn volume_write_scoped(
     prewrite_hash: bool,
     full_confirm: bool,
     assume_yes: bool,
-    only_stage_sets: Option<&[i64]>,
+    only_stage_sets: impl Into<StagedScope<'s>>,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
     // `collection run` and `quick-archive` inherit — all three reach the
@@ -1160,7 +1163,7 @@ pub fn volume_write_scoped(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn volume_write_contacted<'c>(
+pub(crate) fn volume_write_contacted<'c, 's>(
     conn: &'c Connection,
     // The tapectl home: where the write's plaintext `catalog.db` is built
     // (ADR-0012 2026-10-06 item 4), never under staging.
@@ -1176,9 +1179,11 @@ pub(crate) fn volume_write_contacted<'c>(
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
-    // `None`: every staged set. See [`volume_write_scoped`].
-    only_stage_sets: Option<&[i64]>,
+    // `None` ([`StagedScope::Every`]): every staged set. See
+    // [`volume_write_scoped`].
+    only_stage_sets: impl Into<StagedScope<'s>>,
 ) -> Result<()> {
+    let scope: StagedScope<'_> = only_stage_sets.into();
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
             "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
@@ -1272,11 +1277,7 @@ pub(crate) fn volume_write_contacted<'c>(
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
     // them BEFORE it initialises a cartridge ([`write_catalog_preflight`]).
-    let batch = checked_staged_units(
-        conn,
-        Spanning::for_write(config, only_stage_sets),
-        only_stage_sets,
-    )?;
+    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
@@ -8278,16 +8279,23 @@ pub(crate) fn write_catalog_preflight(
     label: &str,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    write_catalog_preflight_in(conn, config, label, allow_missing_escrow, None)
+    write_catalog_preflight_in(
+        conn,
+        config,
+        label,
+        allow_missing_escrow,
+        StagedScope::Every,
+    )
 }
 
-/// [`write_catalog_preflight`] for a write of only `only` (a `volume
-/// rewrite`'s own stage sets, issue #483; `None` is every staged set). A
-/// rewrite asks it after its slices are staged and verified and BEFORE it
-/// retires anything: the write that follows the erase must not be able to
-/// refuse for a reason the catalog and the disk already knew.
+/// [`write_catalog_preflight`] for a write of only `scope`'s stage sets (a
+/// `volume rewrite`'s own, issue #483, or those `volume write --for-location`
+/// writes, #493; [`StagedScope::Every`] is every staged set). A rewrite asks
+/// it after its slices are staged and verified and BEFORE it retires
+/// anything: the write that follows the erase must not be able to refuse for
+/// a reason the catalog and the disk already knew.
 ///
-/// The batch is planned as the write plans it ([`Spanning::for_write`]), so
+/// The batch is planned as the write plans it ([`StagedScope::spanning`]), so
 /// a refusal the plan of a span raises from the catalog alone (a released
 /// slice the tape would plan, a unit whose policy cannot be resolved) is
 /// raised here too. Item 86's generation refusal needs the volume, which
@@ -8297,9 +8305,9 @@ pub(crate) fn write_catalog_preflight_in(
     config: &Config,
     label: &str,
     allow_missing_escrow: bool,
-    only: Option<&[i64]>,
+    scope: StagedScope<'_>,
 ) -> Result<()> {
-    let batch = checked_staged_units(conn, Spanning::for_write(config, only), only)?;
+    let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
     let stage_set_ids = batch.stage_set_ids();
     let session = assemble_keys_for_units(conn, &batch.units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow
@@ -8348,14 +8356,48 @@ pub(crate) enum Spanning<'a> {
     Never,
 }
 
-impl<'a> Spanning<'a> {
-    /// `volume write`'s rule: a write scoped to `only` some stage sets is
-    /// `volume rewrite`'s ([`volume_write_scoped`]), which never spans.
-    fn for_write(config: &'a Config, only: Option<&[i64]>) -> Self {
-        if only.is_some() {
-            Spanning::Never
-        } else {
-            Spanning::ByPolicy(config)
+/// Which staged sets a write takes ([`volume_write_scoped`]), and with them
+/// whether it may plan a set to span ([`Spanning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedScope<'a> {
+    /// Every `staged` set: an ordinary `volume write`, spanning by policy.
+    Every,
+    /// `volume rewrite`'s own stage sets (issue #483), and nothing else that
+    /// happens to be staged. A rewrite never spans (ADR-0012 item 142).
+    Rewrite(&'a [i64]),
+    /// `volume write --for-location X` (#493, ADR-0012 item 151): the staged
+    /// sets that still have need at X, chosen by `for_location`. Planned by
+    /// policy like any ordinary write, so a span in progress whose earlier
+    /// ranges sit at X continues with its owed run first (items 122 and 159).
+    ForLocation(&'a [i64]),
+}
+
+impl<'a> StagedScope<'a> {
+    /// The stage sets the scope names; `None` is every staged set.
+    pub(crate) fn only(self) -> Option<&'a [i64]> {
+        match self {
+            StagedScope::Every => None,
+            StagedScope::Rewrite(ids) | StagedScope::ForLocation(ids) => Some(ids),
+        }
+    }
+
+    /// The write's spanning rule: by policy, except for a rewrite.
+    pub(crate) fn spanning(self, config: &Config) -> Spanning<'_> {
+        match self {
+            StagedScope::Rewrite(_) => Spanning::Never,
+            StagedScope::Every | StagedScope::ForLocation(_) => Spanning::ByPolicy(config),
+        }
+    }
+}
+
+/// What a scope given as an `Option` meant before #493: `None` every staged
+/// set, `Some` a rewrite's own (`volume rewrite` and the callers that
+/// predate [`StagedScope::ForLocation`]).
+impl<'a> From<Option<&'a [i64]>> for StagedScope<'a> {
+    fn from(only: Option<&'a [i64]>) -> Self {
+        match only {
+            None => StagedScope::Every,
+            Some(ids) => StagedScope::Rewrite(ids),
         }
     }
 }
@@ -13862,6 +13904,79 @@ mod tests {
         assert!(
             names(Some(&[])).is_empty(),
             "an empty scope selects nothing"
+        );
+    }
+
+    /// #493 (ADR-0012 items 142, 151 and 159): `volume write --for-location`
+    /// scopes the write as `volume rewrite` does, but plans it by policy, so
+    /// a set that may span is planned as one (its owed run first when a span
+    /// is in progress); a rewrite's scope never spans, and an ordinary write
+    /// spans by policy as before.
+    #[test]
+    fn a_for_location_scope_spans_by_policy_and_a_rewrite_scope_never_does() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('big', 'big', ?1, 'mtime_size', 1, 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'a', 'b', '/tmp/x')",
+            params![ss_id],
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.defaults.allow_spanning = true;
+        let ids = [ss_id];
+        let classes = |scope: StagedScope<'_>| -> Vec<PlanClass> {
+            find_staged_data(&conn, scope.spanning(&config), scope.only())
+                .unwrap()
+                .classes
+        };
+        assert_eq!(classes(StagedScope::Every), [PlanClass::Spannable]);
+        assert_eq!(
+            classes(StagedScope::ForLocation(&ids)),
+            [PlanClass::Spannable],
+            "a write for a location plans a set that may span by policy"
+        );
+        assert_eq!(
+            classes(StagedScope::Rewrite(&ids)),
+            [PlanClass::Whole],
+            "a rewrite never spans (item 142)"
+        );
+        assert!(
+            classes(StagedScope::ForLocation(&[])).is_empty(),
+            "an empty scope selects nothing"
+        );
+        // The callers that predate #493 pass an `Option`: `None` is every
+        // staged set, `Some` a rewrite's.
+        assert_eq!(StagedScope::from(None), StagedScope::Every);
+        assert_eq!(
+            StagedScope::from(Some(&ids[..])),
+            StagedScope::Rewrite(&ids)
         );
     }
 
