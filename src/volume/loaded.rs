@@ -378,6 +378,21 @@ impl Store for Peeked<'_> {
         self.inner.early_warning()
     }
 
+    /// #388: what the drive's open decided about Logical Block Protection,
+    /// the drive's position after a refused write (item 174) and item 175's
+    /// read check are the store's own; the peeked File 0 changes none.
+    fn protection(&self) -> crate::store::Protection {
+        self.inner.protection()
+    }
+
+    fn logical_position(&mut self) -> Result<Option<u64>> {
+        self.inner.logical_position()
+    }
+
+    fn arm_read_check(&mut self) -> Result<bool> {
+        self.inner.arm_read_check()
+    }
+
     fn files_on_medium(&mut self) -> Result<Option<u32>> {
         self.inner.files_on_medium()
     }
