@@ -2251,8 +2251,9 @@ check heir_big_catalogue   step_heir_big_catalogue
 #   span_rebuild_tape_3    proof 7, home R: catalog rebuild of tape 3 alone records its range and
 #                          names the missing slices and their tapes; tape 1 then completes it.
 #   span_three_tapes       proof 8, home C (copy target 1, small cartridges, post_warning_bytes):
-#                          a unit larger than one tape starts first on tape 1, ahead of a whole
-#                          unit it defers, spans three tapes, and restores across both swaps.
+#                          a unit larger than one tape starts first on tape 1 (item 147), the
+#                          whole units it displaces follow its tail on tape 3, even one that
+#                          1.7.0's late start put ahead of it, and it restores across both swaps.
 SP="$RUN/span"
 SP_WAIT="${TAPECTL_GATE_SWAP_WAIT:-300}"
 SP_DRIVER="$(cd "$(dirname "$0")" && pwd)/mhvtl-prompt-driver.py"
@@ -2932,12 +2933,16 @@ check span_rebuild_tape_3 step_span_rebuild_tape_3
 
 # Home C's figures (MiB on tape: a 4 MiB slice takes nine 512 KiB blocks, 4.5 MiB; files 0-7
 # take one block each, 4 MiB). pb-big, 57 full slices and a short one, is 257 MiB, more than a
-# 94 MiB cartridge (98566144 bytes, its room 90 MiB past the fixed files): item 94. Starting
-# early to touch the fewest tapes leaves 3 x 90 - 257 = 13 MiB before it on tape 1, too little
-# for pa-whole (27.5 MiB), which waits. The hook at 114 MiB, 20 MiB past the cartridge's end as
-# a real drive's warning comes past nominal, ends tapes 1 and 2 after 25 slices each, so tape 3
-# holds the last 8 (32 MiB) and pa-whole after them. Each tape needs post_warning_bytes (item
-# 123); 64M leaves a 4 MiB slice and the seal inside half of it (W8), with a 4 MiB reserve.
+# 94 MiB cartridge (98566144 bytes, its room 90 MiB past the fixed files): item 94's case. It
+# starts right after the owed runs, here none, so first on tape 1, and the whole units it
+# displaces are written after its tail on its last tape (item 147). pc-small (7 MiB) is the
+# discriminating one: 1.7.0 started pb-big as late as it could while touching the fewest tapes,
+# which left 3 x 90 - 257 = 13 MiB before it on tape 1, room for pc-small though not for
+# pa-whole (27.5 MiB); under item 147 both wait for tape 3. The hook at 114 MiB, 20 MiB past
+# the cartridge's end as a real drive's warning comes past nominal, ends tapes 1 and 2 after 25
+# slices each, so tape 3 holds the last 8 (32 MiB), then pa-whole and pc-small. Each tape needs
+# post_warning_bytes (item 123); 64M leaves a 4 MiB slice and the seal inside half of it (W8),
+# with a 4 MiB reserve.
 SP_C_CAPACITY=98566144
 SP_C_HOOK_AT=119537664
 step_span_three_tapes() {
@@ -2948,10 +2953,11 @@ step_span_three_tapes() {
         && SPC config set 'backends.lto[0].post_warning_bytes' '"64M"' \
         && SPC config set 'backends.lto[0].enospc_buffer' '"4M"' \
         && SPC config check || { echo "home C's drive keys were refused"; return 1; }
-    mkdir -p "$SP/c/src/pa-whole" "$SP/c/src/pb-big"
+    mkdir -p "$SP/c/src/pa-whole" "$SP/c/src/pb-big" "$SP/c/src/pc-small"
     head -c 25165824 /dev/urandom >"$SP/c/src/pa-whole/whole.bin"
     head -c 239075328 /dev/urandom >"$SP/c/src/pb-big/big.bin"
-    sp_units SPC "$SP/c" pb-big pa-whole pb-big || return 1
+    head -c 6291456 /dev/urandom >"$SP/c/src/pc-small/small.bin"
+    sp_units SPC "$SP/c" pb-big pa-whole pc-small pb-big || return 1
     for t in SPC-0001 SPC-0002 SPC-0003; do
         sp_assign "$t" \
             && SPC cartridge register --barcode "${SP_TAG[${SP_SLOT[$t]}]}" --generation LTO-8 \
@@ -2975,8 +2981,11 @@ B = 512 * 1024
 sizes = dict(q("""SELECT u.name, SUM((sl.encrypted_bytes + ? - 1) / ? * ?) FROM stage_slices sl
     JOIN stage_sets ss ON ss.id = sl.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id GROUP BY u.name""", B, B, B))
-print(f"on tape: pb-big {sizes['pb-big']} bytes, pa-whole {sizes['pa-whole']} bytes; cartridges {cap} bytes")
+print(f"on tape: pb-big {sizes['pb-big']}, pa-whole {sizes['pa-whole']}, pc-small {sizes['pc-small']} bytes; cartridges {cap} bytes")
 assert sizes["pb-big"] > cap, "pb-big is not larger than one tape: this is not item 94's case"
+late = 3 * (cap - 8 * B) - sizes["pb-big"]
+assert sizes["pc-small"] <= late < sizes["pa-whole"], \
+    f"1.7.0's late start leaves {late} bytes before pb-big: pc-small must fit there and pa-whole must not, or the leg cannot tell item 147 from it"
 n = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
     JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'pb-big'""")[0][0]
 def rows(label):
@@ -3001,21 +3010,22 @@ for t, ending in (("SPC-0001", "short"), ("SPC-0002", "short"), ("SPC-0003", "fu
     nxt = hi + 1
     if t != "SPC-0003":
         assert rows(t) == {"pb-big": "range"}, f"{t}'s rows: {rows(t)}"
-        assert j["deferred_units"] == ["pa-whole"], f"{t}: pa-whole should wait for the next tape (item 94): {j['deferred_units']}"
+        assert sorted(j["deferred_units"]) == ["pa-whole", "pc-small"], f"{t}: both whole units should wait for pb-big's last tape (item 147): {j['deferred_units']}"
 assert nxt == n + 1, f"the runs {runs} do not reach slice {n}"
 first_data = q("""SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
     JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id WHERE v.label = 'SPC-0001'""")[0][0]
-assert written("SPC-0001", "pb-big")[0][1] == first_data, "pb-big does not start first on tape 1 (item 94)"
-assert rows("SPC-0003") == {"pb-big": "range", "pa-whole": "completed"}, f"tape 3's rows: {rows('SPC-0003')}"
+assert written("SPC-0001", "pb-big")[0][1] == first_data, "pb-big does not start first on tape 1 (item 147)"
+assert rows("SPC-0003") == {"pb-big": "range", "pa-whole": "completed", "pc-small": "completed"}, f"tape 3's rows: {rows('SPC-0003')}"
 tail_end = written("SPC-0003", "pb-big")[-1][1]
-whole_at = [p for _, p in written("SPC-0003", "pa-whole")]
-assert whole_at and min(whole_at) > tail_end, f"pa-whole at {whole_at} is not after pb-big's tail (ends {tail_end})"
+for whole in ("pa-whole", "pc-small"):
+    whole_at = [p for _, p in written("SPC-0003", whole)]
+    assert whole_at and min(whole_at) > tail_end, f"{whole} at {whole_at} is not after pb-big's tail (ends {tail_end})"
 want = [{"unit": "pb-big", "version": 1, "tapes": [
     {"label": t, "first_slice": lo, "last_slice": hi} for t, lo, hi in runs]}]
 assert J["SPC-0003"]["keep_together"] == want, J["SPC-0003"]["keep_together"]
 st = dict(q("SELECT u.name, s.status FROM snapshots s JOIN units u ON u.id = s.unit_id"))
-assert st == {"pb-big": "current", "pa-whole": "current"}, f"snapshots {st}"
-print(f"pb-big over {runs} of {n}, starting first on tape 1; pa-whole deferred twice, then after the tail on tape 3")
+assert st == {"pb-big": "current", "pa-whole": "current", "pc-small": "current"}, f"snapshots {st}"
+print(f"pb-big over {runs} of {n}, starting first on tape 1; pa-whole and pc-small deferred twice, then after the tail on tape 3")
 PY
     # The restore from tape 1, in the default mode, across both swaps.
     sp_load SPC-0001 && sp_restore_sh "$h" || return 1
