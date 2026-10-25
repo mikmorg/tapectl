@@ -564,7 +564,8 @@ impl CartridgeTrend {
         }
         if self.points.iter().any(|p| p.recorded_before_fix) {
             marks.push_str(
-                "; old = recorded before 1.7.1 in another unit (#495), so it is not compared",
+                "; old = recorded before 1.7.1 over a count of data sets, not bytes, so it is \
+                 not compared",
             );
         }
         format!(
