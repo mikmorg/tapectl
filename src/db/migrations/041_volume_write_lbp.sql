@@ -1,0 +1,45 @@
+-- 041: `volumes.write_lbp` and `volumes.write_lbp_note` (issue #388, Logical
+-- Block Protection; ADR-0012 items 161 and 165).
+--
+-- WHY
+-- ---
+-- From 1.7.2 tapectl arms the drive's Logical Block Protection for its own
+-- writes: the drive checks a CRC tapectl computed over every block before it
+-- writes the block (item 161). That is a write-time evidence class of its own
+-- (ADR-0001: the recorded strength matches what ran), and it is a property of
+-- the WRITE SESSION, not of a readback: LBP proves the bytes reached the drive
+-- intact, not that the cartridge reads back cold, so it never rides on
+-- `verification_sessions` (`no_full_verify` stays the one finding, item 161).
+-- One volume is written by exactly one session (ADR-0003), possibly over
+-- several runs (resumes), so the record is on the volume, merged across runs:
+--
+--   * `write_lbp`: 'on' when every run of the session that wrote had LBP
+--     armed; 'off' when none did (a drive, an sg node or an st path that
+--     could not take it, item 165: warned once and written without it, as
+--     strong as a write by 1.7.1); 'mixed' when the runs differed. NULL means
+--     written before 1.7.2, nothing written yet, or rebuilt from tape (the
+--     tape does not say).
+--   * `write_lbp_note`: why LBP did not run ('off'), or which run lacked it
+--     ('mixed'); NULL when 'on'.
+--
+-- The read check (LBP_R) is not recorded: a read error it raises is already
+-- an inconclusive read, never a verdict, and it shows in the session log.
+--
+-- THE GUARD (026's rule)
+-- ----------------------
+-- 041 has nothing to refuse: it adds two columns, NULL on every existing row,
+-- and changes no existing value. The CHECK admits only the three words; a
+-- NULL passes it.
+--
+-- No table is rebuilt (SQLite adds a nullable column in place, and a column
+-- CHECK that a NULL default satisfies is allowed), so no foreign key moves and
+-- the registry entry needs no `.foreign_key_check()`.
+--
+-- The operator envelope's `catalog.db` (`volume-format-v2.md` §1.4) has no
+-- `volumes` table, so its shape (generation 3) is unchanged and no byte of a
+-- tape's format moves. Its `PRAGMA user_version` mirrors this catalog's
+-- schema level, as §1.4 says, as it did for 038 to 040.
+
+ALTER TABLE volumes ADD COLUMN write_lbp TEXT CHECK (write_lbp IN ('on', 'off', 'mixed'));
+
+ALTER TABLE volumes ADD COLUMN write_lbp_note TEXT;

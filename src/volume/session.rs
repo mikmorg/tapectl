@@ -75,15 +75,16 @@ use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool, Verdict};
 use crate::store::{
-    Checkpoint, Checkpoints, ConfirmPlan, EarlyWarning, Evidence, ReadOrder, SealLocation, Store,
-    Tier,
+    Checkpoint, Checkpoints, ConfirmPlan, EarlyWarning, Evidence, Protection, ReadOrder,
+    SealLocation, Store, Tier,
 };
+use crate::tape::lbp::LbpReadPolicy;
 
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
 use super::layout;
 use super::layout_model::{
-    ContentSource, KeyAvailability, LayoutEntry, LayoutError, SliceCheck, ZoneKind,
+    ContentSource, KeyAvailability, Layout, LayoutEntry, LayoutError, SliceCheck, ZoneKind,
 };
 
 // ── the ending (#420, 1.6.0) ──
@@ -615,6 +616,12 @@ pub struct ReadyToSeal {
     /// cases): the confirm reads back the entry at `ended_after` and the
     /// seal under every tier (§4.3 W9, ADR-0012 item 114).
     warning_in_data: bool,
+    /// This run already spent item 174's one retry after a write the drive
+    /// refused with Logical Block Protection armed (#388).
+    lbp_retried: bool,
+    /// The first tape file this run's store wrote, or was to write: a
+    /// refusal can only be in a file from here to the seal.
+    run_first_position: u32,
 }
 
 impl ReadyToSeal {
@@ -2657,6 +2664,8 @@ impl InterruptedSession {
             write_ids: self.write_ids,
             ending,
             warning_in_data: true,
+            lbp_retried: false,
+            run_first_position: seal_at,
         }))
     }
 }
@@ -2670,6 +2679,78 @@ impl ReadyToSeal {
     /// `sync=true` (the only entry in the whole session that uses a
     /// synchronous filemark).
     pub fn seal(self, store: &mut dyn Store) -> Result<SealedPending> {
+        let marker = self.seal_marker()?;
+        execute_seal(store, &marker)?;
+        Ok(self.sealed(&*store))
+    }
+
+    /// [`Self::seal`] for the write session itself — `write::finish_session`,
+    /// its one production caller — with ADR-0012 item 174's retry (#388): when
+    /// the drive refuses a write with Logical Block Protection armed — the
+    /// seal's own blocks, or a block of an earlier file whose refusal st and
+    /// the drive deferred to the seal's synchronous filemark — and this run
+    /// has not retried yet, the session returns to the planned start of the
+    /// file holding the first block the drive did not accept, writes every
+    /// file from there again from staging (each through the same verified
+    /// pipeline, its hash restarted, every block's CRC fresh), and then the
+    /// seal. Nothing of the seal is recorded until it returns `Ok`, as
+    /// before. A second refusal, or a retry that cannot be made, is an
+    /// error that leaves the session resumable (`finish_session`'s
+    /// `in_write_session`), the files the drive's position shows unwritten
+    /// demoted to `pending` first.
+    pub fn seal_with_retry(
+        self,
+        conn: &Connection,
+        store: &mut dyn Store,
+    ) -> Result<SealedPending> {
+        let marker = self.seal_marker()?;
+        let first = match execute_seal(store, &marker) {
+            Ok(()) => return Ok(self.sealed(&*store)),
+            Err(e @ TapectlError::LbpRefusal(_)) if !self.lbp_retried => e,
+            Err(e) => return Err(e),
+        };
+        let planned = planned_seal_position(&self.built.layout)?;
+        let seal_at = self.ending.seal_position(planned);
+        let from = retry_from_refusal(
+            conn,
+            store,
+            &self.built.layout,
+            self.volume_id,
+            &self.write_ids,
+            self.run_first_position,
+            seal_at,
+        )
+        .map_err(|why| {
+            TapectlError::LbpRefusal(format!(
+                "the seal at tape file {seal_at}: {first}. It was not retried: {why}. \
+                 {CHECK_THE_DRIVE_PATH}"
+            ))
+        })?;
+        resend_entries(
+            conn,
+            store,
+            &self.built.layout,
+            &self.write_ids,
+            from,
+            seal_at,
+        )?;
+        match execute_seal(store, &marker) {
+            Ok(()) => Ok(self.sealed(&*store)),
+            Err(e @ TapectlError::LbpRefusal(_)) => {
+                if let Some(again) =
+                    locate_refused_file(store, &self.built.layout, self.run_first_position, seal_at)
+                {
+                    demote_positions_from(conn, &self.write_ids, again as usize)?;
+                }
+                Err(TapectlError::LbpRefusal(second_refusal(seal_at, &e)))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The seal marker's bytes: regenerated with the REAL `sealed_at`, and
+    /// checked against the frozen placeholder's length.
+    fn seal_marker(&self) -> Result<String> {
         let seal_entry = self
             .built
             .layout
@@ -2779,13 +2860,11 @@ impl ReadyToSeal {
                 real
             }
         };
+        Ok(real_seal_bytes)
+    }
 
-        store.execute(
-            &mut Cursor::new(real_seal_bytes.as_bytes()),
-            real_seal_bytes.len() as u64,
-            true,
-        )?;
-
+    /// The session once its seal marker is on the tape.
+    fn sealed(self, store: &dyn Store) -> SealedPending {
         // `layout-session.md`: a warning first seen in the seal's own blocks
         // changes nothing — the store retried them (W2), no event is
         // written, and the seal stays the kind it was. The session log says so.
@@ -2803,7 +2882,7 @@ impl ReadyToSeal {
             }
         }
 
-        Ok(SealedPending {
+        SealedPending {
             built: self.built,
             volume_id: self.volume_id,
             write_ids: self.write_ids,
@@ -2814,8 +2893,315 @@ impl ReadyToSeal {
             seal_bytes: None,
             ending: self.ending,
             warning_in_data: self.warning_in_data,
-        })
+        }
     }
+}
+
+/// Write the seal marker: the session's one synchronous filemark.
+fn execute_seal(store: &mut dyn Store, marker: &str) -> Result<()> {
+    store
+        .execute(
+            &mut Cursor::new(marker.as_bytes()),
+            marker.len() as u64,
+            true,
+        )
+        .map(|_| ())
+}
+
+// ── Logical Block Protection in the session (#388) ──
+
+/// What a refusal under LBP asks of the operator before resuming (ADR-0012
+/// item 174).
+const CHECK_THE_DRIVE_PATH: &str = "A write the drive refuses with Logical Block Protection armed \
+     is a block that changed between tapectl and the drive: check the host-to-drive path (the \
+     HBA, the SAS cable and its connectors, the drive itself) before you resume";
+
+/// The reason a second refusal in one run gives (item 174).
+fn second_refusal(position: u32, e: &TapectlError) -> String {
+    format!(
+        "the write of tape file {position} stopped: {e}. This is the second write the drive \
+         refused with Logical Block Protection armed in this run; the first was retried \
+         (ADR-0012 item 174), and a second is not. {CHECK_THE_DRIVE_PATH}"
+    )
+}
+
+/// The planned tape file holding logical object `lba` — the drive's
+/// position, counted in blocks and filemarks from the beginning of the tape
+/// — by the Layout's own sizes: every file is its padded blocks and one
+/// filemark, in position order. `None` past the plan, or for a Layout with
+/// an unsized entry.
+fn planned_file_at(layout: &Layout, lba: u64) -> Option<u32> {
+    let block_size = layout.block_size.max(1);
+    let mut entries: Vec<&LayoutEntry> = layout.entries.iter().collect();
+    entries.sort_by_key(|e| e.position);
+    let mut start = 0u64;
+    for e in entries {
+        let end = start + e.on_tape_bytes(block_size)? / block_size + 1;
+        if lba < end {
+            return Some(e.position as u32);
+        }
+        start = end;
+    }
+    None
+}
+
+/// Where a refusal left the drive, as the planned file holding the first
+/// block it did not accept — only when the store can tell and the file is
+/// one this run wrote, from `first` to `failed`.
+fn locate_refused_file(
+    store: &mut dyn Store,
+    layout: &Layout,
+    first: u32,
+    failed: u32,
+) -> Option<u32> {
+    let lba = store.logical_position().ok().flatten()?;
+    planned_file_at(layout, lba).filter(|f| (first..=failed).contains(f))
+}
+
+/// ADR-0012 item 174: after a write the drive refused with LBP armed, read
+/// the drive's position, find the planned file holding the first block it
+/// did not accept (an earlier file than `failed`, the one being sent, when
+/// st and the drive wrote behind), demote that file's and every later
+/// file's catalog positions to `pending` (they are not whole on the tape),
+/// and return the store to its planned start (`Store::reposition_for_resume`).
+/// No skip, no extra filemark, and no position of the Layout moves. The
+/// file it returns to; or why it could not, in which case nothing was
+/// changed and the caller leaves the session `interrupted` (#408).
+#[allow(clippy::too_many_arguments)]
+fn retry_from_refusal(
+    conn: &Connection,
+    store: &mut dyn Store,
+    layout: &Layout,
+    volume_id: i64,
+    write_ids: &[(i64, i64)],
+    first: u32,
+    failed: u32,
+) -> std::result::Result<u32, String> {
+    let lba = match store.logical_position() {
+        Ok(Some(lba)) => lba,
+        Ok(None) => return Err("the store cannot tell where the drive stopped".to_string()),
+        Err(e) => return Err(format!("the drive's position could not be read ({e})")),
+    };
+    let from = planned_file_at(layout, lba)
+        .filter(|f| (first..=failed).contains(f))
+        .ok_or_else(|| {
+            format!(
+                "the drive's position, logical object {lba}, is not in a file this run wrote \
+                 (tape files {first} to {failed})"
+            )
+        })?;
+    demote_positions_from(conn, write_ids, from as usize)
+        .map_err(|e| format!("the catalog could not be updated ({e})"))?;
+    store
+        .reposition_for_resume(from)
+        .map_err(|e| format!("returning to the start of tape file {from} failed ({e})"))?;
+    let line = format!(
+        "the drive refused a write with Logical Block Protection armed in tape file {failed}; \
+         its position (logical object {lba}) is in tape file {from}: writing on again from the \
+         start of tape file {from}, once (ADR-0012 item 174)"
+    );
+    tracing::warn!("{line}");
+    crate::progress::log(&line);
+    let details = format!("{{\"refused_in\": {failed}, \"position\": {lba}, \"from\": {from}}}");
+    busy::retry(BusyPolicy::DEFAULT, "the LBP retry's event", || {
+        crate::db::events::log_event(
+            conn,
+            "volume",
+            volume_id,
+            Some(&layout.label),
+            "write_lbp_retry",
+            Some("from"),
+            None,
+            Some(&from.to_string()),
+            Some(&details),
+            None,
+        )
+    })
+    .map_err(|e| format!("the catalog could not record the retry ({e})"))?;
+    Ok(from)
+}
+
+/// Item 174's re-send before a retried seal: the Layout's content entries
+/// at positions `from` to `until - 1`, each through the verified write
+/// pipeline from its staged file, its slice's catalog position recorded
+/// `written` again with the hash of the bytes the store took. Any failure —
+/// a refusal, a staged file that cannot be read, a hash that no longer
+/// matches — is returned, the session left resumable; the file it stopped
+/// in stays `pending`.
+fn resend_entries(
+    conn: &Connection,
+    store: &mut dyn Store,
+    layout: &Layout,
+    write_ids: &[(i64, i64)],
+    from: u32,
+    until: u32,
+) -> Result<()> {
+    let mut pool =
+        BufferPool::with_queue_bytes(layout.block_size.max(1) as usize, pipeline::QUEUE_BYTES);
+    let mut entries: Vec<&LayoutEntry> = layout
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.kind, ZoneKind::SealMarker))
+        .filter(|e| (from..until).contains(&(e.position as u32)))
+        .collect();
+    entries.sort_by_key(|e| e.position);
+    for entry in entries {
+        let path = entry_path(entry)?;
+        let size = entry.size_bytes.ok_or_else(|| {
+            TapectlError::Other(format!(
+                "entry at position {} has no recorded size",
+                entry.position
+            ))
+        })?;
+        let expected = entry.sha256.as_deref();
+        let file = crate::util::DropBehind::open(path).map_err(|e| {
+            TapectlError::SourceIo(format!("open entry at position {}: {e}", entry.position))
+        })?;
+        let streamed = pipeline::write_verified(&mut pool, file, size, expected, |src| {
+            store.execute(&mut crate::progress::CountingReader(src), size, false)
+        });
+        let actual = match streamed.verdict(expected) {
+            Verdict::Written(actual) => actual,
+            Verdict::Mismatch(actual) => {
+                return Err(TapectlError::Other(format!(
+                    "hash mismatch at position {} on the re-send after a refusal under Logical \
+                     Block Protection: expected {}, got {actual}",
+                    entry.position,
+                    expected.unwrap_or("no recorded hash")
+                )))
+            }
+            Verdict::Failed(e) => return Err(e),
+        };
+        crate::progress::log(&format!(
+            "wrote file {} ({}) again after the refusal",
+            entry.position,
+            entry.kind.type_label()
+        ));
+        if let ZoneKind::Slice { stage_slice_id } = entry.kind {
+            for (write_id, _) in write_ids {
+                busy::retry(BusyPolicy::DEFAULT, "a slice's write position", || {
+                    Ok(conn.execute(
+                        "UPDATE write_positions
+                         SET status = 'written', written_at = datetime('now'),
+                             sha256_on_volume = ?1
+                         WHERE write_id = ?2 AND stage_slice_id = ?3",
+                        params![actual, write_id, stage_slice_id],
+                    )?)
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Record what a run's store decided about Logical Block Protection on the
+/// volume its session writes (#388, migration 041; ADR-0012 items 161,
+/// 165), merged with the session's earlier runs: the first run's word
+/// stands while every later run agrees, and any disagreement is `mixed`.
+/// `write_lbp_note` says why LBP did not run (`off`), or that a run lacked
+/// it (`mixed`). A change writes a `write_lbp` event. Idempotent: the same
+/// store recorded twice changes nothing. [`Protection::NotApplicable`] — a
+/// test double, variable-block mode — records nothing.
+pub fn record_run_protection(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    protection: &Protection,
+) -> Result<()> {
+    let (word, reason) = match protection {
+        Protection::Lbp { .. } => ("on", None),
+        Protection::Unavailable(reason) => ("off", Some(reason.as_str())),
+        Protection::NotApplicable => return Ok(()),
+    };
+    busy::retry(BusyPolicy::DEFAULT, "the volume's write check", || {
+        let tx = busy::immediate_tx(conn)?;
+        let (was, was_note): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT write_lbp, write_lbp_note FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (now, note) = merge_write_lbp(was.as_deref(), was_note.as_deref(), word, reason);
+        if was.as_deref() != Some(now) || was_note != note {
+            tx.execute(
+                "UPDATE volumes SET write_lbp = ?2, write_lbp_note = ?3 WHERE id = ?1",
+                params![volume_id, now, note],
+            )?;
+            crate::db::events::log_event(
+                &tx,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_lbp",
+                Some("write_lbp"),
+                was.as_deref(),
+                Some(now),
+                note.as_deref(),
+                None,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// The merge [`record_run_protection`] makes: `(write_lbp, write_lbp_note)`
+/// from what the volume holds and this run's word and reason.
+fn merge_write_lbp(
+    was: Option<&str>,
+    was_note: Option<&str>,
+    word: &'static str,
+    reason: Option<&str>,
+) -> (&'static str, Option<String>) {
+    match (was, word) {
+        (None, _) => (word, reason.map(str::to_string)),
+        (Some("on"), "on") => ("on", None),
+        (Some("off"), "off") => ("off", reason.or(was_note).map(str::to_string)),
+        (_, "off") => (
+            "mixed",
+            Some(format!(
+                "a run of this session wrote without it: {}",
+                reason.unwrap_or("no reason given")
+            )),
+        ),
+        (Some("off"), _) => (
+            "mixed",
+            Some(format!(
+                "an earlier run of this session wrote without it: {}",
+                was_note.unwrap_or("no reason given")
+            )),
+        ),
+        (_, _) => ("mixed", was_note.map(str::to_string)),
+    }
+}
+
+/// Item 175's fallback read policy, before a write session's confirm: arm
+/// LBP_R for it when every run of the session wrote with LBP
+/// (`volumes.write_lbp = 'on'`), so the readback never asks the drive for a
+/// CRC of a block written without one. Under [`LbpReadPolicy::AllReads`]
+/// (item 162) every open armed LBP_R already, and this asks nothing. Returns
+/// whether it armed the read check.
+pub fn arm_read_check_for_confirm(
+    conn: &Connection,
+    store: &mut dyn Store,
+    volume_id: i64,
+    policy: LbpReadPolicy,
+) -> Result<bool> {
+    if policy != LbpReadPolicy::OnlyConfirmOfLbpWrite {
+        return Ok(false);
+    }
+    let write_lbp: Option<String> = conn.query_row(
+        "SELECT write_lbp FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if write_lbp.as_deref() != Some("on") {
+        crate::progress::log(
+            "Logical Block Protection: the confirm reads without the read check — not every \
+             block of this session was written with LBP",
+        );
+        return Ok(false);
+    }
+    store.arm_read_check()
 }
 
 /// The seal marker is on tape; confirm has not run yet. Its only operation
@@ -3488,7 +3874,7 @@ fn run_entries(
     // Issue #386: the write phase — every byte streamed to the store is
     // counted, and the file being written is the current item. A resume
     // counts only what is left to write.
-    let to_write: u64 = content_entries[start_index..]
+    let mut to_write: u64 = content_entries[start_index..]
         .iter()
         .filter_map(|e| e.size_bytes)
         .sum();
@@ -3523,7 +3909,18 @@ fn run_entries(
             .collect(),
     );
 
-    for entry in &content_entries[start_index..] {
+    // #388, ADR-0012 item 174: one retry per run after a write the drive
+    // refused with Logical Block Protection armed. `resending` holds, while
+    // the retry re-sends the files before the one the refusal surfaced in,
+    // that file's index and the early warning the store held then.
+    let run_first_position = content_entries
+        .get(start_index)
+        .map_or(planned_seal, |e| e.position as u32);
+    let mut retried = false;
+    let mut resending: Option<(usize, Option<EarlyWarning>)> = None;
+    let mut protection_recorded = false;
+    let mut index = start_index;
+    while let Some(&entry) = content_entries.get(index) {
         phase.item(format!(
             "file {} of {file_count} ({})",
             entry.position,
@@ -3612,6 +4009,15 @@ fn run_entries(
         // are measured from it (`finished` below is the other reading).
         let streamed_at = std::time::Instant::now();
 
+        // #388 (migration 041): once per run, after the first entry whose
+        // blocks went to the store, what its open decided about Logical
+        // Block Protection, merged into the volume's record. A run that
+        // wrote nothing records nothing.
+        if !protection_recorded && waits.is_some() {
+            record_run_protection(conn, volume_id, &built.layout.label, &store.protection())?;
+            protection_recorded = true;
+        }
+
         // Issue #408: only a full medium and a tri-layer L2 mismatch end
         // the session `aborted` — the two ADR-0007 and §2.4 name. Any other
         // failure (a staged file the disk could not read, a drive error that
@@ -3630,6 +4036,16 @@ fn run_entries(
                 "execute failed at position {}: {e}",
                 entry.position
             ))),
+            // #388, ADR-0012 item 174: a write the drive refused with LBP
+            // armed is retried once in this run, from the planned start of
+            // the file holding the first block it did not accept; a second
+            // leaves the session `interrupted`, as any failed write does.
+            Verdict::Failed(e @ TapectlError::LbpRefusal(_)) if !retried => Some(Stop::Retry(
+                format!("execute stopped at position {}: {e}", entry.position),
+            )),
+            Verdict::Failed(e @ TapectlError::LbpRefusal(_)) => {
+                Some(Stop::Interrupt(second_refusal(entry.position as u32, e)))
+            }
             Verdict::Failed(e) => Some(Stop::Interrupt(format!(
                 "execute stopped at position {}: {e}",
                 entry.position
@@ -3668,7 +4084,7 @@ fn run_entries(
                         // when the session aborts; `pending` when it stays
                         // resumable, since resume writes it again (#408).
                         let status = match &stop {
-                            Some(Stop::Interrupt(_)) => "pending",
+                            Some(Stop::Interrupt(_) | Stop::Retry(_)) => "pending",
                             _ => "failed",
                         };
                         conn.execute(
@@ -3722,6 +4138,7 @@ fn run_entries(
             match &stop {
                 Some(Stop::Abort(_)) => " — ABORTED",
                 Some(Stop::Interrupt(_)) => " — INTERRUPTED",
+                Some(Stop::Retry(_)) => " — REFUSED UNDER LBP, RETRYING",
                 None => "",
             }
         ));
@@ -3735,7 +4152,69 @@ fn run_entries(
                     reason,
                 }));
             }
+            Some(Stop::Retry(reason)) => {
+                let retry = retry_from_refusal(
+                    conn,
+                    store,
+                    &built.layout,
+                    volume_id,
+                    &write_ids,
+                    run_first_position,
+                    entry.position as u32,
+                )
+                .and_then(|from| {
+                    content_entries
+                        .iter()
+                        .position(|e| e.position as u32 == from)
+                        .ok_or_else(|| format!("tape file {from} is not one this session writes"))
+                });
+                match retry {
+                    Ok(from_index) => {
+                        // The files it sends again count toward the phase
+                        // again.
+                        to_write += content_entries[from_index..=index]
+                            .iter()
+                            .filter_map(|e| e.size_bytes)
+                            .sum::<u64>();
+                        crate::progress::set_total(to_write);
+                        retried = true;
+                        resending = Some((index, store.early_warning()));
+                        index = from_index;
+                        continue;
+                    }
+                    Err(why) => {
+                        let reason =
+                            format!("{reason}. It was not retried: {why}. {CHECK_THE_DRIVE_PATH}");
+                        crate::progress::log(&reason);
+                        mark_writes(conn, &write_ids, "interrupted")?;
+                        return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
+                            built,
+                            volume_id,
+                            write_ids,
+                            slice_write_id,
+                            adopted_from_aborted: false,
+                            reason: Some(reason),
+                            recorded: RecordedEnding::default(),
+                            post_warning_bytes,
+                        }));
+                    }
+                }
+            }
             Some(Stop::Interrupt(reason)) => {
+                // #388: st and the drive write behind, so a second refusal's
+                // block may be in an earlier file than this one. Where the
+                // drive's position says so, those files are not whole on the
+                // tape either, and resume writes them again.
+                if matches!(verdict, Verdict::Failed(TapectlError::LbpRefusal(_))) {
+                    if let Some(from) = locate_refused_file(
+                        store,
+                        &built.layout,
+                        run_first_position,
+                        entry.position as u32,
+                    ) {
+                        demote_positions_from(conn, &write_ids, from as usize)?;
+                    }
+                }
                 mark_writes(conn, &write_ids, "interrupted")?;
                 return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
                     built,
@@ -3755,8 +4234,15 @@ fn run_entries(
         // warning. The store retried every refused block itself (W2), so
         // this entry is whole, its filemark included. The warning is sticky
         // and this loop ends at the first entry that shows it, so that entry
-        // is the one the warning came in.
-        if let Some(warning) = store.early_warning() {
+        // is the one the warning came in. #388: while item 174's retry
+        // re-sends the files before the one its refusal surfaced in, a
+        // warning the store already held then came in that later file's
+        // first attempt, not here.
+        let warning = match (store.early_warning(), resending) {
+            (Some(w), Some((surfaced, before))) if index < surfaced && Some(w) == before => None,
+            (w, _) => w,
+        };
+        if let Some(warning) = warning {
             let position = entry.position as u32;
             if !matches!(entry.kind, ZoneKind::Slice { .. }) {
                 // W6: a tape that ends inside its metadata holds no unit.
@@ -3814,8 +4300,11 @@ fn run_entries(
                 write_ids,
                 ending,
                 warning_in_data: true,
+                lbp_retried: retried,
+                run_first_position,
             }));
         }
+        index += 1;
     }
 
     phase.done();
@@ -3825,6 +4314,8 @@ fn run_entries(
         write_ids,
         ending: Ending::Full,
         warning_in_data: false,
+        lbp_retried: retried,
+        run_first_position,
     }))
 }
 
@@ -3855,6 +4346,10 @@ enum Stop {
     Abort(String),
     /// Any other failure: `interrupted`, resumable once the cause is fixed.
     Interrupt(String),
+    /// #388, ADR-0012 item 174: the drive refused a write with Logical Block
+    /// Protection armed, and this run has not retried yet: return to the
+    /// file holding the first block it did not accept and write on.
+    Retry(String),
 }
 
 fn entry_path(entry: &LayoutEntry) -> Result<&Path> {
@@ -12229,6 +12724,486 @@ mod tests {
                 parsed_seal(&store.files[m as usize]).requires,
                 layout::REQUIRES_SPAN
             );
+        }
+    }
+
+    /// #388: Logical Block Protection in the write session — item 174's
+    /// retry, migration 041's record and item 175's read check.
+    mod lbp {
+        use super::*;
+        use crate::store::{LbpRefusalAt, Protection};
+
+        fn lbp_store() -> MemStore {
+            MemStore::new(BS as usize).with_protection(Protection::Lbp { reads: true })
+        }
+
+        /// The fixture's session planned over `store` and executed.
+        fn execute(f: Fixture, store: &mut MemStore) -> (ExecuteOutcome, Fixture2) {
+            let Fixture {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                inputs: _,
+                _slices_dir,
+                _session_dir,
+            } = f;
+            let planned = built
+                .into_validated(&keys, SliceCheck::Size, store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap();
+            let outcome = planned.execute_checking(&conn, store, || false).unwrap();
+            (
+                outcome,
+                Fixture2 {
+                    conn,
+                    keys,
+                    volume_id,
+                    _slices_dir,
+                    _session_dir,
+                },
+            )
+        }
+
+        /// What a test still needs once the session owns the Layout.
+        struct Fixture2 {
+            conn: Connection,
+            keys: KeyAvailability,
+            volume_id: i64,
+            _slices_dir: TempDir,
+            _session_dir: TempDir,
+        }
+
+        fn ready(outcome: ExecuteOutcome) -> ReadyToSeal {
+            match outcome {
+                ExecuteOutcome::Ready(r) => r,
+                ExecuteOutcome::Interrupted(i) => {
+                    panic!("expected Ready, got Interrupted: {:?}", i.reason())
+                }
+                ExecuteOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+            }
+        }
+
+        fn assert_sealed(f: &Fixture2, sealed: SealedPending, store: &mut MemStore) {
+            match sealed.confirm(&f.conn, store, Tier::Integrity).unwrap() {
+                ConfirmOutcome::Sealed(_) => {}
+                ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+                ConfirmOutcome::Inconclusive(i) => {
+                    panic!("inconclusive: {:?}", i.evidence.mismatches)
+                }
+            }
+            let written: i64 = f
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(written, 2, "both slices written");
+        }
+
+        /// The `write_lbp_retry` events: the file each retry returned to.
+        fn retries(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT new_value FROM events WHERE action = 'write_lbp_retry' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        fn write_lbp(conn: &Connection, volume_id: i64) -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT write_lbp, write_lbp_note FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn slice_statuses(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT status FROM write_positions ORDER BY CAST(position AS INTEGER)")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// The fixture's files in position order: id_thunk 0 … front index 3
+        /// … slice_1 8, slice_2 9; the seal 10.
+        const SLICE_1: u32 = 8;
+        const SLICE_2: u32 = 9;
+        const SEAL: u32 = 10;
+
+        /// Item 174 in the file being sent: the drive's position is in that
+        /// file, the session returns to its planned start, writes it again
+        /// and seals; the front index — every planned position — is the one
+        /// it planned, and the confirm's chain walk holds the tape to it.
+        #[test]
+        fn a_refusal_is_retried_from_the_start_of_its_file_and_the_session_seals() {
+            let f = make_fixture();
+            let front_index: Vec<u8> = {
+                let e = &f.built.layout.entries[3];
+                assert!(matches!(e.kind, ZoneKind::FrontIndex), "positive control");
+                let mut bytes = std::fs::read(entry_path(e).unwrap()).unwrap();
+                bytes.resize(bytes.len().div_ceil(BS as usize) * BS as usize, 0);
+                bytes
+            };
+            let mut store =
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SLICE_2));
+            let (outcome, f) = execute(f, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(retries(&f.conn), ["9"]);
+            assert_eq!(store.files.len(), 10, "every content file, once each");
+            assert_eq!(store.files[3], front_index, "the front index as planned");
+            let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
+            assert_sealed(&f, sealed, &mut store);
+            assert_eq!(write_lbp(&f.conn, f.volume_id), (Some("on".into()), None));
+        }
+
+        /// st and the drive write behind: the refusal of a block of slice_1
+        /// comes back on slice_2's write, and the drive's position sends the
+        /// retry back to slice_1, the earlier file. mhvtl's way (the block
+        /// stored, the position one past it) lands in the same file.
+        #[test]
+        fn a_refusal_deferred_to_a_later_file_returns_to_the_file_it_was_in() {
+            for at in [
+                LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2),
+                LbpRefusalAt {
+                    stored_before_refusing: true,
+                    ..LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1)
+                },
+                LbpRefusalAt::deferred(3, 0, SLICE_2),
+            ] {
+                let f = make_fixture();
+                let mut store = lbp_store().with_lbp_refusal(at);
+                let (outcome, f) = execute(f, &mut store);
+                let ready = ready(outcome);
+                assert_eq!(retries(&f.conn), [at.file.to_string()], "{at:?}");
+                let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
+                assert_sealed(&f, sealed, &mut store);
+            }
+        }
+
+        /// A refusal st and the drive deferred to the seal's synchronous
+        /// filemark — a block of slice_2, or of the seal itself: the session
+        /// returns to the file it was in, writes on from staging, and seals.
+        #[test]
+        fn a_refusal_at_the_seal_rewrites_from_the_file_it_was_in() {
+            for (at, from) in [
+                (LbpRefusalAt::deferred(SLICE_2, 0, SEAL), "9"),
+                (LbpRefusalAt::deferred(SEAL, 0, SEAL), "10"),
+            ] {
+                let f = make_fixture();
+                let mut store = lbp_store().with_lbp_refusal(at);
+                let (outcome, f) = execute(f, &mut store);
+                let ready = ready(outcome);
+                assert!(
+                    retries(&f.conn).is_empty(),
+                    "nothing refused before the seal"
+                );
+                let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
+                assert_eq!(retries(&f.conn), [from]);
+                assert_eq!(store.files.len(), 11);
+                assert_eq!(store.syncs.iter().filter(|s| **s).count(), 1, "one seal");
+                assert_sealed(&f, sealed, &mut store);
+            }
+        }
+
+        /// One retry per run: a second refusal leaves the session
+        /// `interrupted` (#408), naming the host-to-drive path. Its block is
+        /// in slice_1 again, deferred to slice_2's write, so slice_1 goes
+        /// back to `pending` too; `volume resume` then writes both and seals.
+        #[test]
+        fn a_second_refusal_leaves_the_session_interrupted_and_resume_completes_it() {
+            let f = make_fixture();
+            let mut store = lbp_store()
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1))
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2));
+            let (outcome, f) = execute(f, &mut store);
+            let interrupted = match outcome {
+                ExecuteOutcome::Interrupted(i) => i,
+                ExecuteOutcome::Ready(_) => panic!("expected Interrupted, got Ready"),
+                ExecuteOutcome::Aborted(a) => panic!("never aborted for this cause: {}", a.reason),
+            };
+            let reason = interrupted.reason().unwrap().to_string();
+            assert!(
+                reason.contains("second write the drive refused"),
+                "{reason}"
+            );
+            assert!(reason.contains("host-to-drive path"), "{reason}");
+            assert_eq!(
+                retries(&f.conn),
+                ["8"],
+                "the first was retried, the second not"
+            );
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["interrupted"]);
+            assert_eq!(slice_statuses(&f.conn), ["pending", "pending"]);
+
+            let ready = match interrupted
+                .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            {
+                ResumeOutcome::Ready(r) => r,
+                _ => panic!("expected Ready after the resume"),
+            };
+            let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
+            assert_sealed(&f, sealed, &mut store);
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["completed"]);
+            assert_eq!(write_lbp(&f.conn, f.volume_id), (Some("on".into()), None));
+        }
+
+        /// The same rule at the seal: the second refusal is an error that
+        /// names the path, never an abort, and nothing of the seal counts.
+        #[test]
+        fn a_second_refusal_at_the_seal_is_an_error_naming_the_path() {
+            let f = make_fixture();
+            let mut store = lbp_store()
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SEAL))
+                .with_lbp_refusal(LbpRefusalAt::deferred(SEAL, 0, SEAL));
+            let (outcome, f) = execute(f, &mut store);
+            let err = match ready(outcome).seal_with_retry(&f.conn, &mut store) {
+                Err(e) => e,
+                Ok(_) => panic!("a second refusal must not seal"),
+            };
+            assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+            let msg = err.to_string();
+            assert!(msg.contains("second write the drive refused"), "{msg}");
+            assert!(msg.contains("host-to-drive path"), "{msg}");
+            assert_eq!(retries(&f.conn), ["9"]);
+            assert_eq!(
+                store.syncs.iter().filter(|s| **s).count(),
+                0,
+                "no seal on the tape"
+            );
+        }
+
+        /// A position the plan does not place in a file this run wrote is no
+        /// basis for a retry: the session is `interrupted` exactly as a
+        /// failed write is today (#408), the refused file `pending`.
+        #[test]
+        fn a_refusal_the_drives_position_does_not_place_is_not_retried() {
+            let f = make_fixture();
+            let mut store =
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 1_000, SLICE_1));
+            let (outcome, f) = execute(f, &mut store);
+            let ExecuteOutcome::Interrupted(i) = outcome else {
+                panic!("expected Interrupted");
+            };
+            let reason = i.reason().unwrap();
+            assert!(reason.contains("It was not retried"), "{reason}");
+            assert!(reason.contains("not in a file this run wrote"), "{reason}");
+            assert!(retries(&f.conn).is_empty());
+            assert_eq!(slice_statuses(&f.conn), ["pending", "pending"]);
+        }
+
+        /// The drive's position, in blocks and filemarks, maps to the
+        /// planned file holding it by the Layout's own sizes.
+        #[test]
+        fn the_drives_position_maps_to_the_planned_file_holding_it() {
+            let f = make_fixture();
+            let mut layout = f.built.layout.clone();
+            // Slice_1 is made four blocks: 8 one-block files and their
+            // filemarks before it (16 objects), then 4 blocks and its mark.
+            layout.entries[SLICE_1 as usize].size_bytes = Some(3 * BS + 1);
+            assert_eq!(planned_file_at(&layout, 0), Some(0));
+            assert_eq!(planned_file_at(&layout, 1), Some(0), "file 0's filemark");
+            assert_eq!(planned_file_at(&layout, 15), Some(7));
+            for lba in 16..=20 {
+                assert_eq!(planned_file_at(&layout, lba), Some(SLICE_1), "{lba}");
+            }
+            assert_eq!(planned_file_at(&layout, 21), Some(SLICE_2));
+            assert_eq!(planned_file_at(&layout, 23), Some(SEAL));
+            assert_eq!(planned_file_at(&layout, 25), None, "past the plan");
+        }
+
+        /// Migration 041's record: a run on an armed store records `on`; one
+        /// that could not arm records `off` with the reason; a test double
+        /// that was never asked records nothing. A change writes an event.
+        #[test]
+        fn a_run_records_whether_lbp_ran_on_the_volume() {
+            for (protection, want) in [
+                (
+                    Protection::Lbp { reads: true },
+                    (Some("on".to_string()), None),
+                ),
+                (
+                    Protection::Unavailable("st cannot carry it".into()),
+                    (
+                        Some("off".to_string()),
+                        Some("st cannot carry it".to_string()),
+                    ),
+                ),
+                (Protection::NotApplicable, (None, None)),
+            ] {
+                let f = make_fixture();
+                let mut store = MemStore::new(BS as usize).with_protection(protection.clone());
+                let (outcome, f) = execute(f, &mut store);
+                let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+                assert_sealed(&f, sealed, &mut store);
+                assert_eq!(write_lbp(&f.conn, f.volume_id), want, "{protection:?}");
+                let events: i64 = f
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE action = 'write_lbp'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(events, i64::from(want.0.is_some()), "{protection:?}");
+            }
+        }
+
+        /// A session's runs merge: `on`, then a resume on a drive that could
+        /// not arm, is `mixed`, and the note says which run lacked it.
+        #[test]
+        fn an_interrupted_run_resumed_without_lbp_records_mixed() {
+            let f = make_fixture();
+            let mut store = lbp_store();
+            let Fixture {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                ..
+            } = f;
+            let planned = built
+                .into_validated(&keys, SliceCheck::Size, &mut store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap();
+            let calls = AtomicU32::new(0);
+            let interrupted = match planned
+                .execute_checking(&conn, &mut store, move || {
+                    calls.fetch_add(1, Ordering::SeqCst) >= 9
+                })
+                .unwrap()
+            {
+                ExecuteOutcome::Interrupted(i) => i,
+                _ => panic!("expected Interrupted"),
+            };
+            assert_eq!(write_lbp(&conn, volume_id), (Some("on".into()), None));
+
+            let mut off = MemStore::new(BS as usize)
+                .with_protection(Protection::Unavailable("no sg node".into()));
+            off.files = store.files.clone();
+            off.syncs = store.syncs.clone();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&conn, &keys, SliceCheck::Size, &mut off, || false)
+                .unwrap()
+            else {
+                panic!("expected Ready");
+            };
+            ready.seal_with_retry(&conn, &mut off).unwrap();
+            assert_eq!(
+                write_lbp(&conn, volume_id),
+                (
+                    Some("mixed".into()),
+                    Some("a run of this session wrote without it: no sg node".into())
+                )
+            );
+        }
+
+        /// A run that wrote nothing records nothing.
+        #[test]
+        fn a_run_interrupted_before_its_first_entry_records_nothing() {
+            let f = make_fixture();
+            let mut store = lbp_store();
+            let Fixture {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                ..
+            } = f;
+            let planned = built
+                .into_validated(&keys, SliceCheck::Size, &mut store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap();
+            let outcome = planned
+                .execute_checking(&conn, &mut store, || true)
+                .unwrap();
+            assert!(matches!(outcome, ExecuteOutcome::Interrupted(_)));
+            assert_eq!(write_lbp(&conn, volume_id), (None, None));
+        }
+
+        #[test]
+        fn the_merge_of_a_sessions_runs() {
+            assert_eq!(merge_write_lbp(None, None, "on", None), ("on", None));
+            assert_eq!(
+                merge_write_lbp(None, None, "off", Some("why")),
+                ("off", Some("why".into()))
+            );
+            assert_eq!(merge_write_lbp(Some("on"), None, "on", None), ("on", None));
+            assert_eq!(
+                merge_write_lbp(Some("off"), Some("old"), "off", Some("new")),
+                ("off", Some("new".into()))
+            );
+            assert_eq!(
+                merge_write_lbp(Some("on"), None, "off", Some("why")),
+                (
+                    "mixed",
+                    Some("a run of this session wrote without it: why".into())
+                )
+            );
+            assert_eq!(
+                merge_write_lbp(Some("off"), Some("why"), "on", None),
+                (
+                    "mixed",
+                    Some("an earlier run of this session wrote without it: why".into())
+                )
+            );
+            assert_eq!(
+                merge_write_lbp(Some("mixed"), Some("kept"), "on", None),
+                ("mixed", Some("kept".into()))
+            );
+        }
+
+        /// Item 175's switch, both settings: under `AllReads` every open armed
+        /// LBP_R and the confirm asks nothing; under the fallback policy the
+        /// confirm arms it only when every run wrote with LBP.
+        #[test]
+        fn the_confirm_arms_the_read_check_only_under_the_fallback_after_an_lbp_write() {
+            let conn = db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                      status)
+                 VALUES ('RC-1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            for (write_lbp, policy, armed) in [
+                (Some("on"), LbpReadPolicy::AllReads, false),
+                (Some("on"), LbpReadPolicy::OnlyConfirmOfLbpWrite, true),
+                (Some("mixed"), LbpReadPolicy::OnlyConfirmOfLbpWrite, false),
+                (Some("off"), LbpReadPolicy::OnlyConfirmOfLbpWrite, false),
+                (None, LbpReadPolicy::OnlyConfirmOfLbpWrite, false),
+            ] {
+                conn.execute(
+                    "UPDATE volumes SET write_lbp = ?1 WHERE id = ?2",
+                    params![write_lbp, id],
+                )
+                .unwrap();
+                let mut store = lbp_store();
+                assert_eq!(
+                    arm_read_check_for_confirm(&conn, &mut store, id, policy).unwrap(),
+                    armed,
+                    "{write_lbp:?} {policy:?}"
+                );
+                assert_eq!(store.read_check_armed, armed, "{write_lbp:?} {policy:?}");
+            }
         }
     }
 }

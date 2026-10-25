@@ -4031,7 +4031,11 @@ fn finish_session(
             // recorded of the seal (`sealed_at` is written only once
             // `seal()` returns `Ok`), so the abort leaves an unsealed tape
             // and `aborted` rows, the clean abort of ADR-0007.
-            let sealed_pending = match ready.seal(store) {
+            // #388: `seal_with_retry` carries ADR-0012 item 174's one retry
+            // after a write the drive refused with Logical Block Protection
+            // armed; a second refusal is a plain error here, so the session
+            // stays resumable.
+            let sealed_pending = match ready.seal_with_retry(conn, store) {
                 Ok(sealed_pending) => sealed_pending,
                 Err(e @ TapectlError::MediumFull(_)) => {
                     let reason = format!("the seal could not be written: {e}");
@@ -4075,6 +4079,12 @@ fn finish_session(
                 )?)
             })
             .map_err(|e| e.in_write_session(label))?;
+            // #388 (migration 041): the seal is a write of this run, so what
+            // its store decided about Logical Block Protection is recorded —
+            // a resume whose only write is the seal has no other place;
+            // idempotent for a run whose entries already recorded it.
+            super::session::record_run_protection(conn, volume_id, label, &store.protection())
+                .map_err(|e| e.in_write_session(label))?;
             phase.done();
 
             // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
@@ -4122,6 +4132,7 @@ fn finish_session(
                 )));
             }
 
+            arm_read_check_for_confirm(conn, store, volume_id);
             finish_confirm(
                 conn,
                 store,
@@ -4141,17 +4152,20 @@ fn finish_session(
         // here (sacred invariant 1) — the seal marker is already on the
         // tape; re-enter confirm directly on the `SealedPending` resume
         // already produced.
-        ResumeOutcome::Confirming(sealed_pending) => finish_confirm(
-            conn,
-            store,
-            volume_id,
-            label,
-            layout,
-            block_size,
-            sealed_pending,
-            confirm_tier,
-            default_verify_interval_days,
-        ),
+        ResumeOutcome::Confirming(sealed_pending) => {
+            arm_read_check_for_confirm(conn, store, volume_id);
+            finish_confirm(
+                conn,
+                store,
+                volume_id,
+                label,
+                layout,
+                block_size,
+                sealed_pending,
+                confirm_tier,
+                default_verify_interval_days,
+            )
+        }
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         ResumeOutcome::Interrupted(i) => {
             events::log_event(
@@ -4189,6 +4203,26 @@ fn finish_session(
             })
         }
         ResumeOutcome::Aborted(a) => Err(write_aborted(conn, volume_id, label, &a.reason)),
+    }
+}
+
+/// ADR-0012 item 175, before a write session's confirm: under the fallback
+/// read policy, LBP_R for the confirm of a session that wrote every block
+/// with LBP (`session::arm_read_check_for_confirm`). A failure only means the
+/// confirm reads as before #388, so it is logged, never raised.
+fn arm_read_check_for_confirm(conn: &Connection, store: &mut dyn Store, volume_id: i64) {
+    if let Err(e) = super::session::arm_read_check_for_confirm(
+        conn,
+        store,
+        volume_id,
+        crate::tape::lbp::LBP_R_POLICY,
+    ) {
+        let line = format!(
+            "Logical Block Protection: the read check could not be armed for the confirm ({e}); \
+             it reads without it"
+        );
+        tracing::warn!("{line}");
+        progress::log(&line);
     }
 }
 
@@ -23160,6 +23194,161 @@ mod tests {
             assert!(
                 err.to_string().contains("the seal could not be written"),
                 "{err}"
+            );
+        }
+
+        // ── #388, ADR-0012 item 174: a write the drive refuses with Logical
+        //    Block Protection armed, through `volume write` itself ──
+
+        /// One `volume write` of a fresh fixture over `store`, as
+        /// [`write_outcome`], keeping the catalog to look at afterwards.
+        fn lbp_write(
+            label: &str,
+            store: &mut dyn Store,
+        ) -> (Result<()>, i32, Connection, i64, tempfile::TempDir) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture(label, tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                label,
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(store),
+                None,
+            );
+            let r = slot.finish_result(r).map(|_| ());
+            let code = match &r {
+                Ok(()) => crate::error::EXIT_SUCCESS,
+                Err(e) => crate::error::ErrorContract::Write.exit_code(&clone_error(e).into()),
+            };
+            (r, code, conn, volume_id, tmp)
+        }
+
+        fn lbp_store() -> MemStore {
+            MemStore::new(512 * 1024).with_protection(crate::store::Protection::Lbp { reads: true })
+        }
+
+        /// The fixture's tape files, seal included, from a write with no
+        /// refusal: the seal is the last.
+        fn fixture_files() -> u32 {
+            let mut plain = MemStore::new(512 * 1024);
+            let (r, ..) = lbp_write("LBP-N", &mut plain);
+            r.expect("the control write seals");
+            plain.files.len() as u32
+        }
+
+        fn lbp_retries(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT new_value FROM events WHERE action = 'write_lbp_retry' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        fn write_lbp_of(conn: &Connection, volume_id: i64) -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT write_lbp, write_lbp_note FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        /// 0: one refusal is retried in place and the write seals — a block
+        /// of the front index whose refusal came back two files later, and a
+        /// block of the last slice whose refusal came back on the seal. The
+        /// volume records that the drive checked every block.
+        #[test]
+        fn exit_0_an_lbp_refusal_is_retried_once_and_the_write_seals() {
+            use crate::store::LbpRefusalAt;
+            let seal = fixture_files() - 1;
+            for (at, from) in [
+                (LbpRefusalAt::deferred(3, 0, 5), "3"),
+                (
+                    LbpRefusalAt::deferred(seal - 1, 0, seal),
+                    &*(seal - 1).to_string(),
+                ),
+            ] {
+                let mut store = lbp_store().with_lbp_refusal(at);
+                let (r, code, conn, volume_id, _tmp) = lbp_write("LBP-0", &mut store);
+                r.unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                assert_eq!(code, 0);
+                assert_eq!(lbp_retries(&conn), [from], "{at:?}");
+                assert_eq!(
+                    write_lbp_of(&conn, volume_id),
+                    (Some("on".into()), None),
+                    "{at:?}"
+                );
+                assert_eq!(store.files.len() as u32, seal + 1);
+            }
+        }
+
+        /// 4: a second refusal in the run stops the write resumably — never
+        /// the abort (5) a full medium is — and names the host-to-drive path;
+        /// in a data file and at the seal alike.
+        #[test]
+        fn exit_4_a_second_lbp_refusal_is_resumable_and_names_the_path() {
+            use crate::store::LbpRefusalAt;
+            let seal = fixture_files() - 1;
+            for at in [
+                LbpRefusalAt::deferred(3, 0, 5),
+                LbpRefusalAt::deferred(seal, 0, seal),
+            ] {
+                let mut store = lbp_store().with_lbp_refusal(at).with_lbp_refusal(at);
+                let (r, code, conn, volume_id, _tmp) = lbp_write("LBP-4", &mut store);
+                let err = r.unwrap_err();
+                assert!(
+                    matches!(err, TapectlError::WriteInterrupted(_)),
+                    "{at:?}: {err:?}"
+                );
+                assert_eq!(code, 4, "{err}");
+                let msg = err.to_string();
+                assert!(msg.contains("host-to-drive path"), "{msg}");
+                assert!(msg.contains("volume resume LBP-4"), "{msg}");
+                assert_eq!(lbp_retries(&conn).len(), 1, "one retry, then no more");
+                let sealed: Option<String> = conn
+                    .query_row(
+                        "SELECT sealed_at FROM volumes WHERE id = ?1",
+                        params![volume_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(sealed, None, "nothing of a seal is recorded");
+            }
+        }
+
+        /// Item 165: a drive that could not take LBP is written without it,
+        /// and the volume says so, with the reason.
+        #[test]
+        fn a_write_without_lbp_records_off_and_the_reason() {
+            let mut store =
+                MemStore::new(512 * 1024).with_protection(crate::store::Protection::Unavailable(
+                    "st cannot carry a 524292-byte block on this host's SCSI path".into(),
+                ));
+            let (r, code, conn, volume_id, _tmp) = lbp_write("LBP-OFF", &mut store);
+            r.expect("seals without LBP");
+            assert_eq!(code, 0);
+            assert_eq!(
+                write_lbp_of(&conn, volume_id),
+                (
+                    Some("off".into()),
+                    Some("st cannot carry a 524292-byte block on this host's SCSI path".into())
+                )
             );
         }
 
