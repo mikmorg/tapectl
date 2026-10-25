@@ -38,7 +38,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::Config;
 use crate::error::{Result, TapectlError};
-use crate::policy::coverage::{copy_count_expr, copy_floor, tape_only_note, CoverageQuery};
+use crate::policy::coverage::{
+    copy_count_expr, copy_floor, describe_short_locations, short_of_copies_at, tape_only_note,
+    CoverageQuery, LocationShort, NamedScope,
+};
 use crate::staging::clean::{
     clean_staging, release_blocker, release_covered_slices, slices_short_of,
     staged_sets_holding_a_range, CleanReport, CleanScope, ReleaseBlocker,
@@ -58,17 +61,51 @@ pub struct CopyProgress {
     /// otherwise ([`tape_only_note`]), so [`CopyProgress::describe`] never
     /// shows a number the policy alone does not explain.
     pub floor_note: String,
+    /// Under [`Hold::EveryLocation`] (`--keep-staging-for-locations`, #493,
+    /// ADR-0012 item 154): the per-location targets of its unit still unmet
+    /// ([`short_of_copies_at`]). Always empty under [`Hold::CopyFloor`].
+    pub short_at: Vec<LocationShort>,
 }
 
 impl CopyProgress {
-    /// `unit alpha has 1 copy, needs 2` — why a release was refused.
+    /// `unit alpha has 1 copy, needs 2` — why a release was refused; with
+    /// its unmet per-location targets after it when a release held for them
+    /// (#493): `unit alpha has 2 copies, its floor 2; still needed: 0 copies
+    /// at required location offsite, needs 1`.
     pub fn describe(&self) -> String {
         let noun = if self.copies == 1 { "copy" } else { "copies" };
-        format!(
-            "unit {} has {} {noun}, needs {}{}",
-            self.unit_name, self.copies, self.min_copies, self.floor_note
-        )
+        let mut text = if self.copies < self.min_copies || self.short_at.is_empty() {
+            format!(
+                "unit {} has {} {noun}, needs {}{}",
+                self.unit_name, self.copies, self.min_copies, self.floor_note
+            )
+        } else {
+            format!(
+                "unit {} has {} {noun}, its floor {}{}",
+                self.unit_name, self.copies, self.min_copies, self.floor_note
+            )
+        };
+        if !self.short_at.is_empty() {
+            text.push_str(&format!(
+                "; still needed: {}",
+                describe_short_locations(&self.short_at)
+            ));
+        }
+        text
     }
+}
+
+/// What a release after a write waits for (#493, ADR-0012 item 154).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Hold {
+    /// The copy floor, as since #440: staging is released once every unit
+    /// judged meets its floor.
+    #[default]
+    CopyFloor,
+    /// `--keep-staging-for-locations`: also every per-location target of
+    /// each unit (its `copies_at` map, [`short_of_copies_at`]), so the next
+    /// location's copy reuses this staging instead of staging again.
+    EveryLocation,
 }
 
 /// What [`release_if_covered`] decided and did.
@@ -127,8 +164,68 @@ pub fn release_if_covered(
     config: &Config,
     unit_ids: &[i64],
 ) -> Result<ReleaseOutcome> {
+    release_if_covered_holding(conn, config, unit_ids, Hold::CopyFloor)
+}
+
+/// [`release_if_covered`], waiting for `hold` (#493, ADR-0012 item 154).
+/// [`Hold::CopyFloor`] is that function exactly. Under
+/// [`Hold::EveryLocation`] a unit is also short while any per-location
+/// target of its unit is unmet ([`short_of_copies_at`], its current
+/// coverage: the write just promoted the version it wrote): a unit the
+/// whole-set gate judges keeps every unit's staging then, as a unit short of
+/// its floor does, and is reported with the locations
+/// ([`CopyProgress::short_at`]); a unit whose staged data is sets that hold
+/// a range keeps all of its slices, since there is no per-slice
+/// per-location count to release them by.
+pub fn release_if_covered_holding(
+    conn: &Connection,
+    config: &Config,
+    unit_ids: &[i64],
+    hold: Hold,
+) -> Result<ReleaseOutcome> {
     let gate_ids = units_judged_whole(conn, unit_ids)?;
-    let under_copied = under_copied_units(conn, config, &gate_ids)?;
+    let mut under_copied = under_copied_units(conn, config, &gate_ids)?;
+    let mut held_for_locations: Vec<i64> = Vec::new();
+    if hold == Hold::EveryLocation {
+        for &unit_id in unit_ids {
+            let (unit, resolved) = unit_and_policy(conn, config, unit_id)?;
+            let short = short_of_copies_at(
+                conn,
+                config,
+                NamedScope::Unit(unit_id),
+                &resolved,
+                &unit.status,
+                None,
+            )?;
+            if short.is_empty() {
+                continue;
+            }
+            held_for_locations.push(unit_id);
+            if !gate_ids.contains(&unit_id) {
+                continue;
+            }
+            match under_copied.iter_mut().find(|p| p.unit_name == unit.name) {
+                Some(p) => p.short_at = short,
+                None => {
+                    let copies: i64 = conn.query_row(
+                        &format!(
+                            "SELECT {}",
+                            copy_count_expr(&CoverageQuery::current_unit("?1"))
+                        ),
+                        params![unit_id],
+                        |row| row.get(0),
+                    )?;
+                    under_copied.push(CopyProgress {
+                        unit_name: unit.name.clone(),
+                        copies,
+                        min_copies: copy_floor(config, resolved.copy_floor_base(), &unit.status),
+                        floor_note: tape_only_note(config, &unit.status),
+                        short_at: short,
+                    });
+                }
+            }
+        }
+    }
     let cleaned = if under_copied.is_empty() {
         Some(clean_staging(
             conn,
@@ -139,12 +236,46 @@ pub fn release_if_covered(
     } else {
         None
     };
-    let slices = release_ranges(conn, config, CleanScope::Units(unit_ids))?;
+    let released: Vec<i64> = unit_ids
+        .iter()
+        .copied()
+        .filter(|id| !held_for_locations.contains(id))
+        .collect();
+    let slices = release_ranges(conn, config, CleanScope::Units(&released))?;
     Ok(ReleaseOutcome {
         cleaned,
         under_copied,
         slices,
     })
+}
+
+/// `unit_id`'s row and resolved policy, refusing an id the catalog lost.
+fn unit_and_policy(
+    conn: &Connection,
+    config: &Config,
+    unit_id: i64,
+) -> Result<(crate::db::models::Unit, crate::policy::ResolvedPolicy)> {
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM units WHERE id = ?1",
+            params![unit_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => TapectlError::Other(format!(
+                "releasing staging: unit id {unit_id} is missing from the catalog — \
+                 the catalog is inconsistent"
+            )),
+            other => other.into(),
+        })?;
+    let unit = crate::db::queries::get_unit_by_name(conn, &name)?.ok_or_else(|| {
+        TapectlError::Other(format!(
+            "releasing staging: unit \"{name}\" is missing from the catalog — \
+             the catalog is inconsistent"
+        ))
+    })?;
+    let resolved = crate::policy::resolve(conn, config, &unit)?;
+    Ok((unit, resolved))
 }
 
 /// `unit_ids` less the units whose `'staged'` data is only stage sets that
@@ -314,6 +445,7 @@ pub fn under_copied_units(
                 copies,
                 min_copies,
                 floor_note: tape_only_note(config, &unit.status),
+                short_at: Vec::new(),
             });
         }
     }
@@ -735,6 +867,93 @@ mod tests {
         );
     }
 
+    /// `home` and `offsite`, and `unit`'s dotfile layer `{"home":1,
+    /// "offsite":1}` (frozen: the fixture's units have no source).
+    fn two_targets(conn: &Connection, unit_id: i64) {
+        conn.execute_batch(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf');
+             INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":1,\"offsite\":1}' WHERE id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+    }
+
+    fn shelve(conn: &Connection, label: &str, location: &str) {
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = ?2)
+              WHERE label = ?1",
+            params![label, location],
+        )
+        .unwrap();
+    }
+
+    /// #493 (ADR-0012 item 154): `--keep-staging-for-locations` holds a
+    /// written set while a per-location target of its unit is unmet, though
+    /// its copy floor is met, and says which; once every target is met the
+    /// set is released.
+    #[test]
+    fn keep_staging_for_locations_holds_a_set_until_every_target_is_met() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        two_targets(&conn, alpha);
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+        for label in &s.volumes {
+            shelve(&conn, label, "home");
+        }
+
+        let out =
+            release_if_covered_holding(&conn, &config, &[alpha], Hold::EveryLocation).unwrap();
+        assert!(out.cleaned.is_none(), "held for offsite");
+        assert_eq!(out.under_copied.len(), 1);
+        assert_eq!(
+            out.under_copied[0].describe(),
+            "unit testlib/alpha has 2 copies, its floor 2; still needed: 0 copies at required \
+             location offsite, needs 1"
+        );
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+        assert!(s.file.exists());
+
+        add_write(&conn, &s, "V-offsite", "sealed", "completed");
+        shelve(&conn, "V-offsite", "offsite");
+        let out =
+            release_if_covered_holding(&conn, &config, &[alpha], Hold::EveryLocation).unwrap();
+        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+        assert_eq!(out.cleaned.expect("every target met").sets_cleaned, 1);
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+    }
+
+    /// The default is unchanged (ADR-0012 item 154): released at the copy
+    /// floor whatever a per-location target says, by `release_if_covered`
+    /// and by its `Hold::CopyFloor` form alike.
+    #[test]
+    fn the_default_release_is_the_copy_floor_whatever_the_targets_say() {
+        for holding in [false, true] {
+            let conn = db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = config(dir.path(), 2);
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            two_targets(&conn, alpha);
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+            for label in &s.volumes {
+                shelve(&conn, label, "home");
+            }
+            let out = if holding {
+                release_if_covered_holding(&conn, &config, &[alpha], Hold::CopyFloor).unwrap()
+            } else {
+                release_if_covered(&conn, &config, &[alpha]).unwrap()
+            };
+            assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+            assert_eq!(out.cleaned.expect("at the floor").sets_cleaned, 1);
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+        }
+    }
+
     #[test]
     fn the_reason_is_plural_for_zero_copies() {
         let p = CopyProgress {
@@ -742,6 +961,7 @@ mod tests {
             copies: 0,
             min_copies: 2,
             floor_note: String::new(),
+            short_at: Vec::new(),
         };
         assert_eq!(p.describe(), "unit u has 0 copies, needs 2");
     }
