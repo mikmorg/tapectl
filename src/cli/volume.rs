@@ -184,6 +184,23 @@ pub enum VolumeCommands {
         /// with `tapectl staging clean`.
         #[arg(long)]
         keep_staging: bool,
+        /// Write only the staged sets that still have need at this location
+        /// (ADR-0012 item 151): a copy target there unmet, or short of the
+        /// copy floor with no copy there yet, or a span whose earlier range
+        /// is on a tape there. The other staged sets stay staged and are
+        /// named. Once sealed and confirmed the volume is moved there, as
+        /// `--move-to LOCATION` does; a different `--move-to` is refused.
+        /// Stage for it with `tapectl stage for-location`. Without this flag
+        /// the write takes every staged set.
+        #[arg(long, value_name = "LOCATION")]
+        for_location: Option<String>,
+        /// Release the staging only once every per-location copy target of
+        /// each unit written is met, not at its copy floor (ADR-0012 item
+        /// 154), so the next location's copy reuses these staged slices
+        /// instead of staging again. Use it when staging has room; the
+        /// output names the locations that still need each unit.
+        #[arg(long, conflicts_with = "keep_staging")]
+        keep_staging_for_locations: bool,
     },
 
     /// Resume an interrupted write session. Reload the SAME
@@ -887,6 +904,31 @@ pub enum StagingRelease {
     Failed(String),
 }
 
+/// What a write keeps of its staging once it is sealed and confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingKeep {
+    /// The default: released once every unit written meets its copy floor
+    /// (issue #440).
+    Release,
+    /// `--keep-staging`: everything kept.
+    All,
+    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): released
+    /// once every unit written also meets every per-location target.
+    UntilEveryLocation,
+}
+
+/// `--keep-staging` as a flag: `true` keeps everything, `false` releases by
+/// the copy floor (`volume resume`, and every caller before #493).
+impl From<bool> for StagingKeep {
+    fn from(keep_staging: bool) -> Self {
+        if keep_staging {
+            StagingKeep::All
+        } else {
+            StagingKeep::Release
+        }
+    }
+}
+
 /// The release step of `volume write` / `volume resume`, run only after the
 /// write returned `Ok` — sealed and confirmed, quick or full. The rule is
 /// the one `collection run` applies, through the same function
@@ -898,16 +940,18 @@ pub fn release_staging_after_write(
     conn: &Connection,
     config: &Config,
     label: &str,
-    keep_staging: bool,
+    keep_staging: impl Into<StagingKeep>,
 ) -> StagingRelease {
-    if keep_staging {
-        return StagingRelease::Kept;
-    }
+    let hold = match keep_staging.into() {
+        StagingKeep::All => return StagingRelease::Kept,
+        StagingKeep::Release => crate::staging::release::Hold::CopyFloor,
+        StagingKeep::UntilEveryLocation => crate::staging::release::Hold::EveryLocation,
+    };
     let outcome = crate::staging::release::unit_ids_written_to(conn, label).and_then(|ids| {
         if ids.is_empty() {
             Ok(None)
         } else {
-            crate::staging::release::release_if_covered(conn, config, &ids).map(Some)
+            crate::staging::release::release_if_covered_holding(conn, config, &ids, hold).map(Some)
         }
     });
     match outcome {
@@ -958,6 +1002,13 @@ pub(crate) fn staging_release_json(
                     "unit": p.unit_name,
                     "copies": p.copies,
                     "min_copies": p.min_copies,
+                    // #493, additive: with `--keep-staging-for-locations`,
+                    // the per-location targets still unmet; empty otherwise.
+                    "short_locations": p.short_at.iter().map(|l| serde_json::json!({
+                        "location": l.location,
+                        "copies": l.copies,
+                        "target": l.target,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect(),
@@ -1066,17 +1117,28 @@ pub(crate) fn render_staging_release(
         ),
         StagingRelease::NothingWritten => {}
         StagingRelease::Retained { units, slices } => {
-            out.push(
+            // #493 (ADR-0012 item 154): held for a per-location target.
+            let for_locations = units.iter().any(|p| !p.short_at.is_empty());
+            out.push(if for_locations {
+                "staging kept (--keep-staging-for-locations): not every unit written has its \
+                 policy's copies, at every location its targets name, yet, and the next copy \
+                 reuses these staged slices:"
+                    .to_string()
+            } else {
                 "staging kept: not every unit written has its policy's copies yet, and the next \
                  copy reuses these staged slices:"
-                    .to_string(),
-            );
+                    .to_string()
+            });
             out.extend(units.iter().map(|p| format!("  {}", p.describe())));
-            out.push(
+            out.push(if for_locations {
+                "  write the next copy with `tapectl volume write <label> --for-location \
+                 <location>`; `tapectl staging clean` releases the units that are covered"
+                    .to_string()
+            } else {
                 "  write another copy with `tapectl volume write <label>`; `tapectl staging \
                  clean` releases the units that are covered"
-                    .to_string(),
-            );
+                    .to_string()
+            });
             out.extend(slice_release_lines(slices));
             err.extend(stranded_lines(label, &slices.stranded));
         }
@@ -1261,6 +1323,104 @@ fn move_after_write(conn: &Connection, label: &str, move_to: Option<&str>) -> Mo
     }
 }
 
+/// `volume write --for-location X`'s selection, from the catalog alone
+/// (#493, ADR-0012 items 150, 151 and 159): `x` checked (a warehouse is
+/// refused, naming deposits, item 157), an explicit `--move-to` that is not
+/// X refused, and the staged sets with need at X
+/// ([`crate::for_location::staged_sets_for_location`]); none is a refusal
+/// naming the staged sets left and why. Returns X, trimmed, with the
+/// selection.
+fn staged_for_location(
+    conn: &Connection,
+    config: &Config,
+    x: &str,
+    move_to: Option<&str>,
+) -> Result<(String, crate::for_location::StagedForLocation)> {
+    let x = x.trim();
+    if let Some(to) = move_to {
+        if to.trim() != x {
+            return Err(TapectlError::Other(format!(
+                "--move-to \"{}\" contradicts --for-location \"{x}\": a tape written for a \
+                 location is moved there once it is sealed and confirmed (ADR-0012 items 150 \
+                 and 151). Nothing was written.",
+                to.trim()
+            )));
+        }
+    }
+    let staged = crate::for_location::staged_sets_for_location(conn, config, x)?;
+    if staged.for_location.is_empty() {
+        let left = if staged.not_for_location.is_empty() {
+            "nothing is staged".to_string()
+        } else {
+            format!(
+                "staged, but not for {x}: {}",
+                not_for_location_list(&staged.not_for_location)
+            )
+        };
+        return Err(TapectlError::Other(format!(
+            "volume write --for-location {x}: no staged set has need at {x} ({left}). Nothing \
+             was written and the drive was not touched. Stage what {x} needs with `tapectl \
+             stage for-location {x} --volume <LABEL>`."
+        )));
+    }
+    Ok((x.to_string(), staged))
+}
+
+/// `"a" v1 (no need at offsite), "b" v2 (...)`.
+fn not_for_location_list(not: &[crate::for_location::NotForLocation]) -> String {
+    not.iter()
+        .map(|n| format!("\"{}\" v{} ({})", n.set.unit, n.set.version, n.why))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The staged sets a write for `x` leaves staged, named ("not for X"), or
+/// `None` when it takes every staged set.
+fn not_for_location_line(
+    x: &str,
+    staged: &crate::for_location::StagedForLocation,
+) -> Option<String> {
+    (!staged.not_for_location.is_empty()).then(|| {
+        format!(
+            "volume write --for-location {x}: {} staged set(s) not for {x} stay staged: {}",
+            staged.not_for_location.len(),
+            not_for_location_list(&staged.not_for_location)
+        )
+    })
+}
+
+/// `volume write --json` with `--for-location`'s additive keys (#493):
+/// `for_location` (null without the flag) and `not_for_location`, the
+/// staged sets left staged with why (empty without it).
+fn for_location_json(
+    mut base: serde_json::Value,
+    for_x: Option<&(String, crate::for_location::StagedForLocation)>,
+) -> serde_json::Value {
+    let (x, not): (Option<&str>, Vec<serde_json::Value>) = match for_x {
+        Some((x, staged)) => (
+            Some(x.as_str()),
+            staged
+                .not_for_location
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "unit": n.set.unit,
+                        "version": n.set.version,
+                        "stage_set_id": n.set.stage_set_id,
+                        "why": n.why,
+                    })
+                })
+                .collect(),
+        ),
+        None => (None, Vec::new()),
+    };
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("for_location".into(), x.into());
+        obj.insert("not_for_location".into(), not.into());
+    }
+    base
+}
+
 /// Refuse a `--move-to` the real move would refuse for its DESTINATION,
 /// before the tape is touched: a mistyped location found after hours of
 /// writing is a warning about a copy that is already done, and one found
@@ -1358,11 +1518,20 @@ struct DriveWriteSteps<'a> {
     prewrite_hash: bool,
     full_confirm: bool,
     assume_yes: bool,
+    /// The staged sets the write takes: every one, or with `--for-location`
+    /// those with need there (#493).
+    scope: write::StagedScope<'a>,
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
     fn preflight(&self, label: &str) -> Result<()> {
-        write::write_catalog_preflight(self.conn, self.config, label, self.allow_missing_escrow)
+        write::write_catalog_preflight_in(
+            self.conn,
+            self.config,
+            label,
+            self.allow_missing_escrow,
+            self.scope,
+        )
     }
 
     fn init(&self, label: &str, force: bool) -> Result<Initialized> {
@@ -1379,7 +1548,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
     }
 
     fn write(&self, label: &str, force: bool) -> Result<()> {
-        write::volume_write(
+        write::volume_write_scoped(
             self.conn,
             self.paths,
             self.config,
@@ -1391,6 +1560,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
             self.prewrite_hash,
             self.full_confirm,
             self.assume_yes,
+            self.scope,
         )
     }
 }
@@ -1403,7 +1573,7 @@ struct WriteRequest<'a> {
     init: bool,
     force: bool,
     move_to: Option<&'a str>,
-    keep_staging: bool,
+    keep_staging: StagingKeep,
     /// `--json`: a write that fails after `--init` initialised the volume
     /// says so on stdout ([`left_initialized_json`]).
     json_output: bool,
@@ -1713,6 +1883,8 @@ pub fn run(
             fill_ceiling,
             full_confirm,
             keep_staging,
+            for_location,
+            keep_staging_for_locations,
         } => {
             // Issue #241: a real preview would have to open the drive and
             // re-derive the whole layout (session build/validate/plan) —
@@ -1734,9 +1906,21 @@ pub fn run(
             // and once per session log: the write pool's own call adds
             // nothing after it.
             crate::research::announce();
+            // #493 (ADR-0012 items 150 and 151): `--for-location X` writes
+            // only the staged sets with need at X and moves the tape to X,
+            // so a different `--move-to` contradicts it. Both are decided
+            // from the catalog, before the tape is touched.
+            let for_x = match for_location {
+                Some(x) => Some(staged_for_location(conn, config, x, move_to.as_deref())?),
+                None => None,
+            };
+            let move_to: Option<String> = match &for_x {
+                Some((x, _)) => Some(x.clone()),
+                None => move_to.clone(),
+            };
             // Issue #438: a mistyped `--move-to` is refused before the tape
             // is touched, not found after the copy is done.
-            if let Some(to) = move_to {
+            if let Some(to) = &move_to {
                 check_move_destination(conn, to)?;
             }
             let device = write_device(config, device.as_deref())?;
@@ -1759,6 +1943,13 @@ pub fn run(
             };
             // Issue #391: `--fill-ceiling` for this write only.
             let config = &config.with_fill_ceiling(*fill_ceiling);
+            let for_x_sets: Option<Vec<i64>> =
+                for_x.as_ref().map(|(_, staged)| staged.stage_set_ids());
+            if let Some((x, staged)) = &for_x {
+                if let Some(line) = not_for_location_line(x, staged) {
+                    eprintln!("{line}");
+                }
+            }
             let steps = DriveWriteSteps {
                 conn,
                 paths,
@@ -1768,6 +1959,17 @@ pub fn run(
                 prewrite_hash: *prewrite_hash,
                 full_confirm: *full_confirm,
                 assume_yes: yes,
+                scope: match &for_x_sets {
+                    Some(ids) => write::StagedScope::ForLocation(ids),
+                    None => write::StagedScope::Every,
+                },
+            };
+            let keep = if *keep_staging {
+                StagingKeep::All
+            } else if *keep_staging_for_locations {
+                StagingKeep::UntilEveryLocation
+            } else {
+                StagingKeep::Release
             };
             let done = write_and_follow(
                 conn,
@@ -1779,12 +1981,15 @@ pub fn run(
                     init: *init,
                     force: *force,
                     move_to: move_to.as_deref(),
-                    keep_staging: *keep_staging,
+                    keep_staging: keep,
                     json_output,
                 },
             )?;
             if json_output {
-                println!("{}", write_done_json(label, &done));
+                println!(
+                    "{}",
+                    for_location_json(write_done_json(label, &done), for_x.as_ref())
+                );
             } else {
                 println!("volume \"{label}\" write completed");
                 print_staging_release(label, &done.release);
@@ -5090,7 +5295,9 @@ mod tests {
             assert_eq!(json["staging_released"], false);
             assert_eq!(
                 json["under_copied"],
-                serde_json::json!([{"unit": "testlib/alpha", "copies": 1, "min_copies": 2}])
+                serde_json::json!([{
+                    "unit": "testlib/alpha", "copies": 1, "min_copies": 2, "short_locations": []
+                }])
             );
         }
 
@@ -5182,6 +5389,8 @@ mod tests {
                 fill_ceiling: None,
                 full_confirm: false,
                 keep_staging: false,
+                for_location: None,
+                keep_staging_for_locations: false,
             };
 
             let err = run(&conn, &paths, &config, &cmd, false, true, false)
@@ -5223,6 +5432,8 @@ mod tests {
                     fill_ceiling: None,
                     full_confirm: false,
                     keep_staging: false,
+                    for_location: None,
+                    keep_staging_for_locations: false,
                 },
                 VolumeCommands::Resume {
                     label: Some(s.volumes[1].clone()),
@@ -5311,7 +5522,7 @@ mod tests {
             );
             let drive = SRC.find("impl WriteSteps for DriveWriteSteps").unwrap();
             assert!(
-                SRC[drive..drive + 1500].contains("write::volume_write(")
+                SRC[drive..drive + 1500].contains("write::volume_write_scoped(")
                     && SRC[drive..drive + 1500].contains("write::volume_init("),
                 "DriveWriteSteps is the real init and the real write"
             );
@@ -5549,7 +5760,7 @@ mod tests {
                 init,
                 force,
                 move_to,
-                keep_staging: false,
+                keep_staging: StagingKeep::Release,
                 json_output: false,
             }
         }
@@ -6106,6 +6317,8 @@ mod tests {
                 fill_ceiling: None,
                 full_confirm: false,
                 keep_staging: false,
+                for_location: None,
+                keep_staging_for_locations: false,
             }
         }
 
@@ -6205,6 +6418,124 @@ mod tests {
                 "{err:?}"
             );
             assert_eq!(location_of(&conn, &s.volumes[1]), None);
+        }
+
+        /// `volume write LABEL --for-location X [--move-to M]` (#493).
+        fn for_location_cmd(label: &str, x: &str, move_to: Option<&str>) -> VolumeCommands {
+            let mut cmd = write_cmd(label, false, move_to);
+            if let VolumeCommands::Write { for_location, .. } = &mut cmd {
+                *for_location = Some(x.to_string());
+            }
+            cmd
+        }
+
+        fn write_error(conn: &Connection, config: &Config, cmd: &VolumeCommands) -> String {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            run(conn, &paths, config, cmd, false, true, false)
+                .expect_err("refused")
+                .to_string()
+        }
+
+        /// #493 (ADR-0012 items 150 and 151): a tape written for X is moved
+        /// to X, so a `--move-to` that is not X is refused first, before the
+        /// catalog is asked and before a device is resolved (this config has
+        /// none). The same location twice is no contradiction.
+        #[test]
+        fn for_location_refuses_a_different_move_to_before_anything_else() {
+            let conn = crate::db::open_memory().unwrap();
+            let text = write_error(
+                &conn,
+                &Config::default(),
+                &for_location_cmd(NEW, "offsite", Some("home")),
+            );
+            assert!(
+                text.contains("--move-to \"home\" contradicts --for-location \"offsite\""),
+                "{text}"
+            );
+            let text = write_error(
+                &conn,
+                &Config::default(),
+                &for_location_cmd(NEW, "offsite", Some("offsite")),
+            );
+            assert!(!text.contains("contradicts"), "{text}");
+            assert!(text.contains("location \"offsite\" not found"), "{text}");
+        }
+
+        /// #493: with nothing staged that has need at X the write is refused
+        /// from the catalog, before the device is resolved, naming what stays
+        /// staged and why. A warehouse X is refused naming deposits (item
+        /// 157). Positive control: a staged set short of its floor with no
+        /// copy at X is for X, so the write goes on to the volume (here
+        /// absent, refused by name).
+        #[test]
+        fn for_location_writes_only_what_has_need_there_and_refuses_when_nothing_does() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = config(dir.path(), 2);
+            add_shelf(&conn, "offsite");
+            conn.execute(
+                "INSERT INTO locations (name, kind) VALUES ('vault', 'warehouse')",
+                [],
+            )
+            .unwrap();
+            let t = tenant(&conn);
+            let alpha = unit(&conn, t, "testlib/alpha");
+            staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+
+            let text = write_error(&conn, &config, &for_location_cmd(NEW, "offsite", None));
+            assert_eq!(
+                text,
+                "volume write --for-location offsite: no staged set has need at offsite \
+                 (staged, but not for offsite: \"testlib/alpha\" v1 (no need at offsite)). \
+                 Nothing was written and the drive was not touched. Stage what offsite needs \
+                 with `tapectl stage for-location offsite --volume <LABEL>`."
+            );
+            let text = write_error(&conn, &config, &for_location_cmd(NEW, "vault", None));
+            assert!(text.contains("volume deposit add"), "{text}");
+
+            let beta = unit(&conn, t, "testlib/beta");
+            staged_version(&conn, beta, 1, "current", dir.path(), 1);
+            let mut config = drive_config(dir.path());
+            config.defaults.min_copies = 2;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let err = run(
+                &conn,
+                &paths,
+                &config,
+                &for_location_cmd(NEW, "offsite", None),
+                false,
+                true,
+                false,
+            )
+            .expect_err("no such volume");
+            assert!(matches!(err, TapectlError::VolumeNotFound(_)), "{err:?}");
+            let selected =
+                crate::for_location::staged_sets_for_location(&conn, &config, "offsite").unwrap();
+            assert_eq!(
+                selected
+                    .for_location
+                    .iter()
+                    .map(|s| s.unit.as_str())
+                    .collect::<Vec<_>>(),
+                ["testlib/beta"]
+            );
+            assert_eq!(
+                not_for_location_line("offsite", &selected).unwrap(),
+                "volume write --for-location offsite: 1 staged set(s) not for offsite stay \
+                 staged: \"testlib/alpha\" v1 (no need at offsite)"
+            );
+            let json = for_location_json(
+                serde_json::json!({"label": "L"}),
+                Some(&("offsite".to_string(), selected)),
+            );
+            assert_eq!(json["for_location"], "offsite");
+            assert_eq!(json["not_for_location"][0]["unit"], "testlib/alpha");
+            assert_eq!(json["not_for_location"][0]["why"], "no need at offsite");
+            let plain = for_location_json(serde_json::json!({}), None);
+            assert_eq!(plain["for_location"], serde_json::Value::Null);
+            assert_eq!(plain["not_for_location"], serde_json::json!([]));
         }
     }
 
@@ -6393,6 +6724,8 @@ mod tests {
                     fill_ceiling: None,
                     full_confirm: false,
                     keep_staging: false,
+                    for_location: None,
+                    keep_staging_for_locations: false,
                 },
                 VolumeCommands::Resume {
                     label: None,
@@ -7307,6 +7640,8 @@ mod tests {
                 fill_ceiling: None,
                 full_confirm: false,
                 keep_staging: false,
+                for_location: None,
+                keep_staging_for_locations: false,
             },
             VolumeCommands::Resume {
                 label: Some("L".into()),

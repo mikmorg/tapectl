@@ -1276,7 +1276,7 @@ pub(crate) fn volume_write_contacted<'c, 's>(
 
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
-    // them BEFORE it initialises a cartridge ([`write_catalog_preflight`]).
+    // them BEFORE it initialises a cartridge ([`write_catalog_preflight_in`]).
     let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
@@ -8215,7 +8215,7 @@ impl VerifyReport {
 /// catalog and the disk can raise on their own: every staged set whole and
 /// at its recorded size on disk (issue #402), and at least one of them. The
 /// first half of what `volume write` can know before it touches a backend, a
-/// MAM or the drive; [`write_catalog_preflight`] runs it, and then
+/// MAM or the drive; [`write_catalog_preflight_in`] runs it, and then
 /// [`assemble_keys_for_units`], ahead of `volume write --init`'s `volume
 /// init` (issue #445).
 fn checked_staged_units(
@@ -8251,6 +8251,23 @@ fn assemble_keys_for_units(
     assemble_session_keys(conn, &distinct_tenant_ids, stage_set_ids)
 }
 
+/// [`write_catalog_preflight_in`] of every staged set: an ordinary write's.
+#[cfg(test)]
+pub(crate) fn write_catalog_preflight(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    allow_missing_escrow: bool,
+) -> Result<()> {
+    write_catalog_preflight_in(
+        conn,
+        config,
+        label,
+        allow_missing_escrow,
+        StagedScope::Every,
+    )
+}
+
 /// What `volume write` refuses from the catalog and the disk alone, asked
 /// of a volume that does not exist yet (issue #445, ADR-0012 2026-10-15
 /// item 59): `volume write --init` runs it BEFORE `volume init` writes File
@@ -8273,24 +8290,10 @@ fn assemble_keys_for_units(
 /// (init erased any copy on the cartridge), its location half is a warning;
 /// and the quiet-host question and the capacity gate need the contact (and
 /// the built Layout), so they stay in the write.
-pub(crate) fn write_catalog_preflight(
-    conn: &Connection,
-    config: &Config,
-    label: &str,
-    allow_missing_escrow: bool,
-) -> Result<()> {
-    write_catalog_preflight_in(
-        conn,
-        config,
-        label,
-        allow_missing_escrow,
-        StagedScope::Every,
-    )
-}
-
-/// [`write_catalog_preflight`] for a write of only `scope`'s stage sets (a
-/// `volume rewrite`'s own, issue #483, or those `volume write --for-location`
-/// writes, #493; [`StagedScope::Every`] is every staged set). A rewrite asks
+///
+/// It asks this of `scope`'s stage sets: every staged set
+/// ([`StagedScope::Every`]), a `volume rewrite`'s own (issue #483), or those
+/// `volume write --for-location` writes (#493). A rewrite asks
 /// it after its slices are staged and verified and BEFORE it retires
 /// anything: the write that follows the erase must not be able to refuse for
 /// a reason the catalog and the disk already knew.
@@ -24997,6 +25000,49 @@ mod tests {
                     write(&f, "SR-2", &mut store, false).0.expect("seals short");
                     assert_eq!(writes_of(&f, "SR-2"), pairs(&[("b", "range")]));
                     assert!(may_span(&f, "SR-2", "b"));
+                }
+
+                /// #493 (ADR-0012 items 151 and 159): a write scoped as `volume
+                /// write --for-location` scopes it writes only its sets and plans
+                /// them by policy, so a unit that allows spanning makes a range
+                /// where a rewrite's scope (above) would cut it; a staged set
+                /// outside the scope is left staged, untouched.
+                #[test]
+                fn a_for_location_scoped_write_spans_by_policy_and_leaves_the_rest_staged() {
+                    let f = fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE, SLICE])], &["SL-1"]);
+                    allow_spanning(&f, "b");
+                    let b = stage_set_of(&f, "b");
+
+                    let mut store = ArmedAt::new(9, warning);
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &f.conn,
+                        &f.paths,
+                        &f.config,
+                        "SL-1",
+                        GENCHK_DEVICE,
+                        SBS,
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(&mut store),
+                        StagedScope::ForLocation(&[b]),
+                    );
+                    slot.finish_result(r).expect("a short seal is a success");
+                    assert_eq!(writes_of(&f, "SL-1"), pairs(&[("b", "range")]));
+                    assert!(may_span(&f, "SL-1", "b"));
+                    let a_status: String = f
+                        .conn
+                        .query_row(
+                            "SELECT status FROM stage_sets WHERE id = ?1",
+                            params![stage_set_of(&f, "a")],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(a_status, "staged", "the set outside the scope stays staged");
                 }
 
                 /// X18: a slice the tape plans whose staged file was released
