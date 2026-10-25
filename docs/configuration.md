@@ -79,7 +79,7 @@ config: INVALID
   |
 7 | slize_size = "5G"
   | ^^^^^^^^^^
-unknown field `slize_size`, expected one of `slice_size`, `compression`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`
+unknown field `slize_size`, expected one of `slice_size`, `compression`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`, `copies_at`
 
   - unknown key: defaults.slize_size
   - ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4
@@ -277,18 +277,21 @@ These are the system-wide defaults. They form the bottom layer of
 | `dirty_on_metadata_change` | bool | `false` | Resolved, but not read by any command in this version: dirty detection compares path, size and modification time only. `config check` prints a note when it is `true`. | `config check` (advisory) |
 | `global_excludes` | list of globs | `["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]` (written by `init`) | What is never archived from any unit, added to each unit's own `[excludes]` patterns. **The default list applies only when the whole `[defaults]` table is missing.** A `[defaults]` table without this key means `[]`, so nothing is excluded: if you trim `[defaults]` by hand, keep this line. `config check` does not warn about it. Case never matters. A plain pattern (`*.tmp`) matches a file's **name only** and never a directory. A pattern ending in `/` (`.cache/`) excludes the directory of that name, at any depth in the unit, with everything inside it, and a file of that name too. That subtree stays out of the dar archive as well; the directory itself is archived empty. See [`[excludes]`](#excludes-yours-to-edit). | `snapshot create`, `stage create`, `unit status --dirty`, `report dirty`, `audit` (its dirty check), `collection sync/status/plan`, `unit mark-tape-only` |
 | `large_file_warn_threshold` | size (binary) | `"100G"` | `snapshot create` warns about any file bigger than this. It only warns and never refuses. | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) |
-| `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. A tape-only unit needs it times [`tape_only_safety_multiplier`](#compaction) everywhere it is judged. At least 1: 0 or below is refused by name at load, `config check` and `config set` (#453). | `audit`, `report summary/fire-risk/pending/supersedable`, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
+| `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. From 1.7.1 the unit's **copy floor** is the larger of its resolved `min_copies` and the sum of its resolved [`copies_at`](#defaults) targets, so a map asking for more copies in all raises it; with no map the floor is `min_copies`. A tape-only unit needs the floor times [`tape_only_safety_multiplier`](#compaction) everywhere it is judged. At least 1: 0 or below is refused by name at load, `config check` and `config set` (#453). | `audit`, `report summary/fire-risk/pending/supersedable`, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
 | `min_locations` | integer | `2` | How many distinct locations a tape-only unit's copies must span, as set. [`tape_only_safety_multiplier`](#compaction) never raises it (a tape-only unit needs more copies, not more places), and a unit that is not tape-only has no such floor. [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) asks it before accepting a unit without consent. After that, `audit` holds the unit to it (`location_count`, a violation) and `snapshot mark-reclaimable` / `report supersedable` ask it of the version that supersedes the one released. It exists only here: an archive set names places with `required_locations` instead. 0 or more: a negative value is refused by name (#453). | `unit mark-tape-only`, `audit`, `snapshot mark-reclaimable`, `report supersedable` |
+| `copies_at` | table: location name = count | none | How many copies each unit should hold at each named location, its **copy targets** (from 1.7.1; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 148-160). A copy *at* a location is an eligible tape whose recorded location is that one, or a recorded warehouse deposit there; it is counted per Version, at the Version's least-covered slice, as every copy count is. Write it inline, `copies_at = { home-rack = 1, offsite = 1 }`, or as a `[defaults.copies_at]` table with one `name = count` line each. **The most specific layer that sets `copies_at` wins whole**: a unit's dotfile [`[policy.copies_at]`](#policy-yours-to-edit), else its archive set's `copies_at` (where `required_locations` counts as one copy at each name), else this one. Maps never merge, and an empty map is a setting that hides the layers below. The copy floor becomes the larger of `min_copies` and the map's sum, and a tape-only unit's target at each location is multiplied by [`tape_only_safety_multiplier`](#compaction), as its floor is. Each count is 0 or more (0 asks for none there), refused by name at load and by `config check`. Each name must be a registered location, but that is checked when a unit's policy is resolved, not at load: a name with no [`location add`](cli/location.md#tapectl-location-add) behind it makes every unit that takes this map unresolvable, so add the locations first. [`location rename`](cli/location.md#tapectl-location-rename) rewrites the names stored in the catalog and in unit dotfiles, but not this key: change it here too. Absent, no unit has a target unless its archive set or dotfile gives one. | `audit` (`copy_count`, `location_presence`), [`report needs`](cli/report.md#tapectl-report-needs), [`stage for-location`](cli/stage.md#tapectl-stage-for-location), `volume write --for-location`, `volume plan --policy-aware`, and every reader of the copy floor (the `min_copies` row) |
 | `verify_interval_days` | integer | `365` | The full-readback clock for every unit whose archive set gives none (#453): `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit's copies, or a volume, have had no passing full readback within this many days. At least 1, refused by name otherwise. An archive set's own `verify_interval_days` overrides it; a dotfile cannot set it. Absent from the file means 365 (1.2.0); `init` writes it. There is no way to switch the clock off; a very large number is the nearest thing. `config check` prints the value in force. | [`audit`](cli/audit.md#tapectl-audit) |
 | `warehouse_copies` | integer | `0` | How many warehouse deposits each unit should have in addition to its tape copies ([ADR-0006](adr/0006-storage-interface-first-class-stores.md)). `0` means none are expected, and `audit` says nothing about warehouses. | `audit` |
-| `allow_spanning` | bool | `false` | Whether a unit may span tapes (from tapectl 1.7.0; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 82-84): a unit that allows it may have its slices run across more than one tape. It is packed after the units that may not span (one larger than a tape starts earlier, to touch the fewest tapes), and it is cut where the drive reports early warning, not where the plan ends, its remaining slices continuing on the next cartridge; its tapes then belong together, in order, to restore it. A drive needs its measured [`post_warning_bytes`](#backendslto) for this: without it, a spannable unit that would pass the fill ceiling is refused. A unit larger than one cartridge is refused unless it allows spanning, and the refusal names this key; one that allows it is still refused if the staging area cannot hold it whole. Off by default: every unit is written whole on one tape. An archive set's `allow_spanning`, then a dotfile's, overrides it, either way. `init` writes it. | `volume write`, `collection run`, `stage create` (from 1.7.0) |
+| `allow_spanning` | bool | `false` | Whether a unit may span tapes (from tapectl 1.7.0; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 82-84): a unit that allows it may have its slices run across more than one tape. It is packed after the units that may not span (one larger than a tape starts right after the slices a span in progress still owes, and the whole units it displaces go after its tail on its last tape: 1.7.1, ADR-0012 item 147), and it is cut where the drive reports early warning, not where the plan ends, its remaining slices continuing on the next cartridge; its tapes then belong together, in order, to restore it. A drive needs its measured [`post_warning_bytes`](#backendslto) for this: without it, a spannable unit that would pass the fill ceiling is refused. A unit larger than one cartridge is refused unless it allows spanning, and the refusal names this key; one that allows it is still refused if the staging area cannot hold it whole. Off by default: every unit is written whole on one tape. An archive set's `allow_spanning`, then a dotfile's, overrides it, either way. `init` writes it. | `volume write`, `collection run`, `stage create` (from 1.7.0) |
 
 `unit mark-tape-only` checks the unit against the floors of a tape-only unit, which
-it is about to be: its resolved `min_copies` and the copies at each place its
-`required_locations` names, both times `[compaction] tape_only_safety_multiplier`,
-and the `[defaults] min_locations` floor as set, which the multiplier never raises
-(ADR-0012, 2026-10-12). So at 2x an archive set asking for three copies needs six,
-each named place needs two copies, and the default location floor is still 2 places:
+it is about to be: its copy floor (the larger of its resolved `min_copies` and its
+`copies_at` sum) and its target at each location of its resolved `copies_at` map (an
+archive set's `required_locations` counts as one copy at each name), both times
+`[compaction] tape_only_safety_multiplier`, and the `[defaults] min_locations` floor as
+set, which the multiplier never raises (ADR-0012, 2026-10-12). So at 2x an archive set
+asking for three copies needs six, each named place needs two copies, and the default
+location floor is still 2 places:
 at the defaults a tape-only unit needs 4 copies in 2 places. Each fact whose floor the
 multiplier raised names it: `(tape-only 2x)`. A unit that falls short of any of them, or is
 dirty, is a Tier-2 shortfall ([ADR-0008](adr/0008-destructive-consent-tiers.md)): a
@@ -301,12 +304,13 @@ The retire gate uses the same resolved policy. [`volume retire`](cli/volume.md#t
 [`volume compact-finish`](cli/volume.md#tapectl-volume-compact-finish) (so also step 3
 of `volume compact`) refuse outright when a live version would be left with no copy,
 and no flag gets past that. When a version would keep some copies but fewer than its
-resolved `min_copies`, or would keep no copy at one of its `required_locations`
-(judged by name, as `audit` does), or, for a tape-only unit, would span fewer places
+copy floor, or fewer copies at a location of its resolved `copies_at` map than its
+target there (judged by name, as `audit` does; an archive set's `required_locations`
+counts as one copy at each name), or, for a tape-only unit, would span fewer places
 than `[defaults] min_locations`, that is a Tier-2 shortfall (#463). For a tape-only
-unit the copy number is multiplied by `[compaction] tape_only_safety_multiplier`
-(ADR-0012, 2026-10-12), and so is the number of copies each required location must
-keep; those facts end `(tape-only Nx)`: `below its policy of 4 (tape-only 2x)`. The
+unit the copy floor is multiplied by `[compaction] tape_only_safety_multiplier`
+(ADR-0012, 2026-10-12), and so is each location's target; those facts end
+`(tape-only Nx)`: `below its policy of 4 (tape-only 2x)`. The
 number of places is not multiplied. The command lists the shortfalls and asks on a
 terminal. `--yes` confirms in advance (`--force` too, for `cartridge retire` and the
 compact commands), and a non-interactive run without it refuses.
@@ -402,8 +406,9 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | Key | Type | What it does | `create`/`edit` flag |
 |---|---|---|---|
 | `name` | string | The set's name. `unit init --archive-set`, a dotfile's `archive_set`, and a collection's `archive_set` refer to it. `sync` matches existing sets by it. | the `<NAME>` argument |
-| `min_copies` | integer | Copies each Version of the unit needs. Overrides `[defaults] min_copies`. `audit`, the reports, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable` and the [retire gate](#defaults) all use it. At least 1 (`archive-set create`, `edit` and `sync` refuse less). | `--min-copies` |
-| `required_locations` | list of location names | The places that must each hold a copy. Every current Version of the unit needs an eligible copy (or a warehouse deposit) at **each named location**: copies at two other places do not count. `audit` reports each missing place as a `location_presence` violation, and `unit mark-tape-only` and `snapshot mark-reclaimable` check the same names. The retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` is the exception: it compares only the **number** of places, so there copies at two other places do count. Every name must be a location registered with [`location add`](cli/location.md#tapectl-location-add). | `--required-locations a,b` |
+| `min_copies` | integer | Copies each Version of the unit needs. Overrides `[defaults] min_copies`. The copy floor is the larger of it and the unit's `copies_at` sum (see [`[defaults] min_copies`](#defaults)). `audit`, the reports, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable` and the [retire gate](#defaults) all use it. At least 1 (`archive-set create`, `edit` and `sync` refuse less). | `--min-copies` |
+| `required_locations` | list of location names | The places that must each hold a copy. Every current Version of the unit needs an eligible copy (or a warehouse deposit) at **each named location**: copies at two other places do not count. From 1.7.1 it is shorthand for a copy target of one at each name: it is folded into this set's `copies_at` map, whose own counts are laid over it name by name, and the names then count towards the copy floor. So a set whose `required_locations` name more places than its `min_copies` has a floor of the number of names. `audit` reports each missing place as a `location_presence` violation, and `unit mark-tape-only`, `snapshot mark-reclaimable` and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` check the same names. A unit's dotfile `[policy.copies_at]` replaces the whole map, these names included. Every name must be a location registered with [`location add`](cli/location.md#tapectl-location-add). | `--required-locations a,b` |
+| `copies_at` | table: location name = count | This set's copy targets per location (from 1.7.1; see [`[defaults] copies_at`](#defaults)), laid over `required_locations` name by name: `required_locations = ["home-rack", "offsite"]` with `copies_at = { home-rack = 2 }` is `{ home-rack = 2, offsite = 1 }`. Either key makes this set's layer set the map, which then hides `[defaults] copies_at`; a unit's dotfile `[policy.copies_at]` replaces it in turn. Each name must be a registered location and each count 0 or more: `create`, `edit` and `sync` refuse otherwise, by name. `--copies-at` replaces the set's whole map; it takes `NAME=N` and is repeated for each location. | `--copies-at NAME=N` (repeatable) |
 | `encrypt` | bool | See `[defaults] encrypt`: `false` is warned about and the data is encrypted anyway, but `audit` stops checking this set's units for unencrypted stage sets. | `--encrypt true\|false` |
 | `compression` | closed set, as in `[defaults]` | Overrides `[defaults] compression`. | `--compression` |
 | `checksum_mode` | closed set, as in `[defaults]` | Overrides `[defaults] checksum_mode` for units registered into this set. Units already registered keep their mode. | `--checksum-mode` |
@@ -429,8 +434,8 @@ and in a dotfile's `[policy]`.
 > file are left alone, and `sync` never deletes a set.
 
 `sync` validates every entry before it writes any row: compression against your dar,
-checksum mode, slice size, and each `required_locations` name against the registered
-locations. A bad entry changes nothing:
+checksum mode, slice size, and each `required_locations` and `copies_at` name against
+the registered locations. A bad entry changes nothing:
 
 ```text
 error: archive set "critical": required_locations names "offsite", which is not a registered location (registered locations: home-rack). Register a location first with `tapectl location add <name>`, or fix the spelling.
@@ -821,7 +826,7 @@ are not kept.
 `unit init` never writes this table. Add it by hand to give one unit its own
 policy. It is read from disk every time the unit's policy is resolved, which happens
 at `stage create`, `audit`, `collection status/plan/run` and elsewhere. So a change
-takes effect straight away. It accepts exactly five keys:
+takes effect straight away. It accepts exactly six keys:
 
 | Key | Type | Overrides |
 |---|---|---|
@@ -830,10 +835,12 @@ takes effect straight away. It accepts exactly five keys:
 | `checksum_mode` | closed set, as in `[defaults]` | Read when a unit is registered from this dotfile (`unit discover`, `collection sync`), where it wins over the archive set and `[defaults]`. Changing it later does not change the registered unit's mode (see [above](#keys-that-are-accepted-but-do-less-than-their-name-says)). It is still validated every time the policy is resolved, so a bad value makes every command that resolves the unit's policy refuse it. |
 | `warehouse_copies` | integer | the archive set, then `[defaults]` |
 | `allow_spanning` | bool | the archive set, then `[defaults]`. From tapectl 1.7.0, `true` lets this unit span tapes (see [`[defaults] allow_spanning`](#defaults)), and `false` keeps it whole on one tape even when its archive set allows spanning. |
+| `copies_at` | table: location name = count | the archive set's map (its `required_locations` included), then `[defaults]`, **whole**. From tapectl 1.7.1, the unit's own copy targets per location (see [`[defaults] copies_at`](#defaults)): written as a `[policy.copies_at]` table with one `location = count` line each, or inline as `copies_at = { offsite = 2 }` under `[policy]`. A map that names only `offsite` drops a `home-rack` its archive set named, and an empty table means "no targets". Every name must be a registered location, or the unit's policy is unresolvable, naming the name. |
 
 `min_copies`, `required_locations` and `verify_interval_days` are **not** dotfile
-keys. Copy and location requirements come from the archive set or `[defaults]`.
-If one of them appears here, it is refused. So is any misspelled key. Then
+keys. The total copy requirement and the places an archive set names come from the
+archive set or `[defaults]`; a dotfile names its places, with counts, through
+`[policy.copies_at]`. If one of the three appears here, it is refused. So is any misspelled key. Then
 `snapshot create`, `stage create` and `unit status --dirty` refuse that unit (exit 2).
 `audit` reports it as a `policy_unresolvable` violation, skips its policy checks for
 that unit, and exits 2. `report dirty` lists it as `UNREADABLE`. Plain `unit status`
@@ -844,9 +851,41 @@ warning: unit 'family/letters' dotfile cannot be read, so every command that res
    |
 12 | min_copies = 3
    | ^^^^^^^^^^
-unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `slice_size`, `warehouse_copies`, `allow_spanning`
+unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `slice_size`, `warehouse_copies`, `allow_spanning`, `copies_at`
  (…/letters/.tapectl-unit.toml)
   hint: an unrecognised key under [policy] is refused by name; an ABSENT key is always fine and defers to the archive set or defaults
+```
+
+**A dotfile's `copies_at` is kept in the catalog.** A unit whose source is gone has
+no dotfile to read, and it is exactly the tape-only unit whose places matter most. So
+at `snapshot create`, `stage create` (once the unit's policy has resolved) and
+`collection sync`'s adoption of a dotfile, and so at `collection run` through its own
+snapshot and stage, tapectl stores the dotfile's own `copies_at` in the catalog
+(`units.copies_at_frozen`) while the dotfile is present, logging a change as a
+`copies_at_frozen` event. While the dotfile is absent (its source unmounted, moved or
+deleted), the stored map stands in for it. A dotfile that
+is present always wins: one without the key means "no targets of its own", whatever
+was stored. Only the dotfile's own map is kept; the archive set and `[defaults]` stay
+live and are read at use, as every other key is. `unit discover` and `collection
+sync`'s re-finding of a known unit do not store it.
+
+Here is a dotfile that keeps two copies at `offsite` and one at `home-rack`:
+
+```toml
+[unit]
+uuid = "d580a814-ce23-40e7-9c00-93a8fbab9459"
+name = "family/letters"
+created = "2026-09-28T21:48:18.261950335+00:00"
+tags = ["letters"]
+tenant = "family"
+archive_set = "critical"
+
+[policy.copies_at]
+offsite = 2
+home-rack = 1
+
+[excludes]
+patterns = []
 ```
 
 ### `[excludes]`: yours to edit
@@ -900,6 +939,7 @@ shows which layer can carry which field:
 |---|---|---|---|
 | copies required | — | `min_copies` | `min_copies` |
 | places required | — | `required_locations` (names) | — (none named) |
+| copies at each place (from 1.7.1) | `[policy.copies_at]` | `copies_at`, with `required_locations` at one copy each | `copies_at` |
 | verify interval | — | `verify_interval_days` | `verify_interval_days` (365 when absent) |
 | slice size | `slice_size` | `slice_size` | `slice_size` |
 | compression | `compression` | `compression` | `compression` |
@@ -908,6 +948,13 @@ shows which layer can carry which field:
 | spanning tapes (from 1.7.0) | `allow_spanning` | `allow_spanning` | `allow_spanning` (off) |
 | encryption | — | `encrypt` (always on) | `encrypt` (always on) |
 | xattrs, ACLs, FSA | — | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` |
+
+`copies_at` resolves as one value, not name by name: the most specific layer that sets
+it wins whole, and the layers below it are not read for any name. An archive set sets
+it when it has a `copies_at` or a non-empty `required_locations`. The unit's **copy
+floor** is then the larger of its resolved `min_copies` and the map's sum, and its
+target at each location is the map's count there, both multiplied for a tape-only unit
+by `[compaction] tape_only_safety_multiplier`.
 
 `[defaults] min_locations` is not a layer of this chain. It is a separate floor on the
 number of distinct places, which only a tape-only unit has: `unit mark-tape-only` applies it to the unit it marks, `audit` (`location_count`) to every tape-only unit afterwards, and `snapshot mark-reclaimable` and `report supersedable` to the version that supersedes the one released, always as set:
@@ -939,10 +986,18 @@ bound to `critical`, and its dotfile adds `[policy] slice_size = "2G"`.
 |---|---|---|
 | copies required | 3 | archive set |
 | places required | a copy of every current version at `home-rack` **and** at `offsite` | archive set |
+| copy targets | one at `home-rack`, one at `offsite` (its `required_locations`) | archive set |
+| copy floor | 3, the larger of `min_copies` (3) and the targets' sum (2) | archive set |
 | verify interval | 365 days | archive set |
 | slice size | 2 GiB | dotfile |
 | compression | zstd | archive set |
 | warehouse deposits | 0 | defaults |
+
+Suppose the dotfile also had a `[policy.copies_at]` table with `offsite = 2`. That
+map replaces the archive set's whole: the unit's targets become two copies at `offsite`
+and none named at `home-rack`, so `audit` no longer asks for a copy at `home-rack`, and
+the floor stays 3 (the larger of 3 and 2). With `offsite = 2` and `home-rack = 2` the
+floor would be 4.
 
 Now suppose the dotfile also set `compression = "none"`. The unit would archive
 uncompressed, and `config check` would point out that the dotfile overrides the
@@ -989,6 +1044,7 @@ Archive set: critical
   Preserve FSA:     -
   Dirty on metadata change: -
   Allow spanning:   -
+  Copies at:        -
   Units using:      1
   Created:          2026-09-29 08:33:13
   Updated:          2026-09-29 08:33:13
@@ -1000,7 +1056,7 @@ not name alone (see [`[[archive_sets]]`](#archive_sets)).
 
 | Command | Flags that set policy |
 |---|---|
-| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--encrypt true\|false`, `--compression`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--preserve-fsa true\|false`, `--dirty-on-metadata-change true\|false`, `--allow-spanning true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
+| [`archive-set create <NAME>`](cli/archive-set.md#tapectl-archive-set-create) | `--min-copies`, `--required-locations a,b` (registered locations only), `--copies-at NAME=N` (repeatable, registered locations only), `--encrypt true\|false`, `--compression`, `--checksum-mode`, `--slice-size`, `--verify-interval-days`, `--warehouse-copies`, `--preserve-xattrs true\|false`, `--preserve-acls true\|false`, `--preserve-fsa true\|false`, `--dirty-on-metadata-change true\|false`, `--allow-spanning true\|false`, `-d/--description`. A flag you leave out stays empty and defers to `[defaults]`. |
 | [`archive-set edit <NAME>`](cli/archive-set.md#tapectl-archive-set-edit) | the same flags. Only the ones you pass change, and each change is recorded in the event log. |
 | [`archive-set sync`](cli/archive-set.md#tapectl-archive-set-sync) | none. It reads `[[archive_sets]]` from `config.toml` and writes the keys each table names. `--dry-run` is refused. |
 | [`archive-set list`](cli/archive-set.md#tapectl-archive-set-list) / [`info <NAME>`](cli/archive-set.md#tapectl-archive-set-info) | none. These show what is stored. |
