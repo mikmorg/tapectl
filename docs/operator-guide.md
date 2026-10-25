@@ -1790,6 +1790,7 @@ fewer places than `[defaults] min_locations` (2 by default, never multiplied) re
 tapectl report summary
 tapectl report fire-risk
 tapectl report copies --unit family/letters
+tapectl report needs --location offsite
 tapectl report tape-only
 tapectl report capacity --per-volume
 tapectl report compaction-candidates
@@ -1841,6 +1842,9 @@ has no end, and is left out of the total. With none recorded it prints
 `no failed stages recorded`. `--json` gives `failed_stages` (each with
 `unit`, `version`, `stage_set_id`, `started`, `failed` and `hours_lost`),
 `count`, `total_hours_lost` and `without_recorded_end`.
+
+`report needs` (1.7.1) gives each unit's copy targets, copies and shortfall per
+location; it is described under [Copies by location](#copies-by-location).
 
 The full list of reports is in the [command reference](cli/report.md).
 
