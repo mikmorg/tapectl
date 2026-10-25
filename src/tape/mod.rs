@@ -8,6 +8,7 @@ pub(crate) mod fake;
 pub mod feed_ratio;
 pub mod health;
 pub mod ioctl;
+pub mod lbp;
 pub mod log_pages;
 pub mod mam;
 pub mod mam_journal;

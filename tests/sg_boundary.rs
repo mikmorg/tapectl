@@ -1,12 +1,17 @@
 //! Issue #394: the st / SG boundary (`docs/design/threat-model.md` §2).
 //!
 //! The st driver does every data transfer and every movement of the medium;
-//! SCSI generic is used only to ASK — INQUIRY (`sg_inq`), LOG SENSE
-//! (`sg_logs`) and READ ATTRIBUTE (`sg_read_attr`) — so the st driver's own
-//! position accounting can never drift under a command it did not see. This
-//! pins the set of sg3-utils tools the binary's source names, the absence of
-//! the `sg_logs` flags that turn a LOG SENSE into a LOG SELECT (which clears
-//! the drive's counters), and that the binary never runs `mt` or `sg_raw`.
+//! SCSI generic is used to ASK — INQUIRY (`sg_inq`), LOG SENSE (`sg_logs`)
+//! and READ ATTRIBUTE (`sg_read_attr`) — and, since #388 (ADR-0012 item
+//! 163), to set exactly one page: the Control Data Protection page (0Ah/F0h)
+//! that arms Logical Block Protection, read with `sg_modes` (MODE SENSE) and
+//! written with `sg_wr_mode` (MODE SENSE, then MODE SELECT), never saved. No
+//! SG command moves the medium, so the st driver's own position accounting
+//! can never drift under a command it did not see. This pins the set of
+//! sg3-utils tools the binary's source names, the absence of the `sg_logs`
+//! flags that turn a LOG SENSE into a LOG SELECT (which clears the drive's
+//! counters), the page argv, and that the binary never runs `mt` or
+//! `sg_raw`.
 //!
 //! A source scan, deliberately: the tools are spawned from half a dozen
 //! modules and several only on real hardware, so no ungated run reaches them
@@ -15,11 +20,15 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The sg3-utils tools tapectl may run, and the one SCSI command each sends.
+/// The sg3-utils tools tapectl may run, and the SCSI command each sends.
+/// `sg_wr_mode` sends a MODE SENSE before its MODE SELECT, of the Control
+/// Data Protection page only (`lbp_page_argv_is_pinned_and_never_saves`).
 const ALLOWED: &[(&str, &str)] = &[
     ("sg_inq", "INQUIRY"),
     ("sg_logs", "LOG SENSE"),
     ("sg_read_attr", "READ ATTRIBUTE"),
+    ("sg_modes", "MODE SENSE"),
+    ("sg_wr_mode", "MODE SELECT"),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -84,7 +93,7 @@ fn the_scan_finds_a_tool_name() {
 }
 
 #[test]
-fn only_the_three_asking_tools_are_named() {
+fn only_the_asking_tools_and_the_page_tools_are_named() {
     let allowed: BTreeSet<&str> = ALLOWED.iter().map(|(t, _)| *t).collect();
     let mut tools: BTreeSet<String> = BTreeSet::new();
     for (path, text) in sources() {
@@ -136,6 +145,61 @@ fn sg_logs_only_ever_reads() {
     );
 }
 
+/// ADR-0012 item 163: the one page tapectl sets, exactly. The MODE SENSE
+/// reads the current values; the MODE SELECT names page 0Ah/F0h, sends no
+/// block descriptor (st's block length is st's), clears PS and is never
+/// saved — a saved page would survive the power cycle that is the last way
+/// to clear it (item 164). Any other page is refused before a program could
+/// start. A flag added to either argv fails here, as for `sg_logs`.
+#[test]
+fn lbp_page_argv_is_pinned_and_never_saves() {
+    use tapectl::tape::lbp::{self, ProtectionPage, LBP_R, LBP_W, METHOD_RS, RS_INFO_LEN};
+    assert_eq!(
+        lbp::sense_argv("/dev/sg9"),
+        [
+            "sg_modes",
+            "--page=0x0a,0xf0",
+            "--control=0",
+            "--raw",
+            "/dev/sg9"
+        ]
+    );
+    let hp = ProtectionPage::from_page_bytes(&[0x4a, 0xf0, 0x00, 0x04, 0, 0, 0, 0]).unwrap();
+    let arming = hp.with_protection(METHOD_RS, RS_INFO_LEN, LBP_W | LBP_R);
+    let select = lbp::select_argv("/dev/sg9", &arming).unwrap();
+    assert_eq!(
+        select,
+        [
+            "sg_wr_mode",
+            "--page=0x0a,0xf0",
+            "--dbd",
+            "--contents=4a,f0,00,04,01,04,c0,00",
+            "/dev/sg9"
+        ]
+    );
+    let clearing = lbp::select_argv("/dev/sg9", &arming.cleared()).unwrap();
+    assert_eq!(clearing[3], "--contents=4a,f0,00,04,00,00,00,00");
+    // PS set on the page the drive reported comes out clear.
+    let savable = ProtectionPage::from_page_bytes(&[0xca, 0xf0, 0x00, 0x04, 0, 0, 0, 0]).unwrap();
+    let from_savable = lbp::select_argv("/dev/sg9", &savable).unwrap();
+    assert!(
+        from_savable[3].starts_with("--contents=4a,"),
+        "{from_savable:?}"
+    );
+    for argv in [lbp::sense_argv("/dev/sg9"), select, clearing, from_savable] {
+        for word in &argv {
+            for banned in [
+                "--save", "-s", "--force", "-f", "--mask", "-m", "-6", "--six",
+            ] {
+                assert_ne!(word, banned, "{argv:?}");
+                assert!(!word.starts_with(&format!("{banned}=")), "{argv:?}");
+            }
+        }
+    }
+    // Another page never gets as far as an argv.
+    assert!(ProtectionPage::from_page_bytes(&[0x4f, 0xf0, 0x00, 0x04, 0, 0, 0, 0]).is_err());
+}
+
 /// The program each `Command::new(…)` in `text` starts, as written (a
 /// literal with its quotes, or the expression), outside the file's test
 /// module and outside comments: what the binary itself can run.
@@ -176,6 +240,9 @@ const SPAWNS: &[(&str, &str)] = &[
     ("src/tape/log_pages.rs", "LOG_TOOL"),        // `sg_logs -V`
     ("src/tape/log_pages.rs", "&argv[0]"),        // SgLogs::read_argv / decode_argv, pinned above
     ("src/tape/mam.rs", "MAM_TOOL"),              // sg_read_attr: READ ATTRIBUTE
+    // sg_modes / sg_wr_mode: the Control Data Protection page (#388, ADR-0012
+    // item 163), lbp::sense_argv / select_argv, pinned below.
+    ("src/tape/lbp.rs", "&argv[0]"),
     // `sh -c` over the operator's own `snapshot_command` / `release_command` of a
     // `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
     // line, run as the user tapectl runs as, given the collection's name and root
