@@ -24137,20 +24137,6 @@ mod tests {
             /// One slice of [`ABC`], block-padded.
             const PADDED: u64 = 3 * SBS as u64;
 
-            /// The volume's own files (everything but the data slices),
-            /// block-padded, as a write of `f`'s staged batch onto `label`
-            /// builds them — the same function, keys, catalog and index.
-            /// Another build differs in what only it decides: the volume's
-            /// identity and time, and the random grease stanza age puts in
-            /// every envelope's header (up to ~170 bytes). Each of these
-            /// files may land one block either side of this figure (#491).
-            fn fixed_bytes(f: &Fixture, label: &str) -> u64 {
-                built(f, label, u64::MAX / 4, None)
-                    .0
-                    .layout
-                    .fixed_on_tape_bytes()
-            }
-
             /// The write's own build of `f`'s staged batch onto `label`, at
             /// the fill budget `usable` and the plan bound `bound`, and the
             /// session directory it materialised into.
@@ -24221,18 +24207,23 @@ mod tests {
                 assert!(got.abs_diff(fill) <= 1, "the fill budget: {got} for {fill}");
             }
 
-            /// One slice of [`WIDE_ABC`], block-padded.
+            /// A slice wide enough that half of one is more than another
+            /// build can move the volume's own files ([`wide_fixed`]).
+            const WIDE_SLICE: usize = 32 * SBS - 100;
+            /// One [`WIDE_SLICE`], block-padded.
             const WIDE_PADDED: u64 = 32 * SBS as u64;
-            /// [`ABC`]'s units, with slices wide enough that half of one is
-            /// more than another build can move the volume's own files.
+            /// [`ABC`]'s units, of [`WIDE_SLICE`]s.
             const WIDE_ABC: &[(&str, &[usize])] = &[
-                ("a", &[32 * SBS - 100]),
-                ("b", &[32 * SBS - 100, 32 * SBS - 100]),
-                ("c", &[32 * SBS - 100]),
+                ("a", &[WIDE_SLICE]),
+                ("b", &[WIDE_SLICE, WIDE_SLICE]),
+                ("c", &[WIDE_SLICE]),
             ];
 
-            /// [`fixed_bytes`] of a [`WIDE_ABC`] fixture, for the tests below
-            /// that place a budget against the write's own build.
+            /// The volume's own files (everything but the data slices),
+            /// block-padded, as a write of `f`'s staged batch onto `label`
+            /// builds them — the same function, keys, catalog and index — for
+            /// a fixture of [`WIDE_SLICE`]s, whose tests place a budget
+            /// against the write's own build.
             ///
             /// The write builds its own Layout, and its files that are not
             /// slices are not this probe's to the byte (#491): the volume's
@@ -24796,15 +24787,32 @@ mod tests {
                 /// this medium takes it whole.
                 #[test]
                 fn without_post_warning_bytes_a_span_past_the_ceiling_is_refused_naming_the_key() {
+                    span_past_the_ceiling_is_refused_naming_the_key(0);
+                }
+
+                /// #491's positive control: the same refusal and write however
+                /// heavy the envelopes are ([`grow_envelopes`]).
+                #[test]
+                fn a_span_past_the_ceiling_is_refused_however_heavy_the_envelopes() {
+                    for bytes in [512, 2048, 4096, 4608] {
+                        span_past_the_ceiling_is_refused_naming_the_key(bytes);
+                    }
+                }
+
+                /// The body of the two tests above, with the envelopes grown
+                /// by a dar catalogue of `catalogue_bytes`. Every figure is
+                /// placed from [`wide_fixed`], a slice or more from its edge.
+                fn span_past_the_ceiling_is_refused_naming_the_key(catalogue_bytes: usize) {
                     let mut f =
-                        fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE, SLICE])], &["SN-1"]);
+                        fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-1"]);
                     allow_spanning(&f, "b");
-                    let fixed = fixed_bytes(&f, "SN-1");
+                    grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                    let fixed = wide_fixed(&f, "SN-1");
                     budget(
                         &mut f,
                         "SN-1",
-                        fixed + 6 * PADDED,
-                        fixed + 2 * PADDED,
+                        fixed + 6 * WIDE_PADDED,
+                        fixed + 2 * WIDE_PADDED,
                         false,
                     );
 
@@ -24824,7 +24832,13 @@ mod tests {
                     assert!(store.files.is_empty(), "nothing was written");
                     assert!(writes_of(&f, "SN-1").is_empty(), "no session was planned");
 
-                    budget(&mut f, "SN-1", fixed + 6 * PADDED, fixed + 2 * PADDED, true);
+                    budget(
+                        &mut f,
+                        "SN-1",
+                        fixed + 6 * WIDE_PADDED,
+                        fixed + 2 * WIDE_PADDED,
+                        true,
+                    );
                     let mut store = MemStore::new(SBS);
                     write(&f, "SN-1", &mut store, false)
                         .0
@@ -24935,14 +24949,40 @@ mod tests {
                 /// The next write takes it.
                 #[test]
                 fn whole_units_a_spannable_set_leaves_no_room_for_wait_for_the_next_tape() {
-                    let mut f = fixture(A_B3_C, &["SD-1", "SD-2"]);
+                    whole_units_the_span_leaves_no_room_for_wait(0);
+                }
+
+                /// #491's positive control: the same plan, rows and next write
+                /// however heavy the envelopes are ([`grow_envelopes`]).
+                #[test]
+                fn a_unit_the_span_leaves_no_room_for_waits_however_heavy_the_envelopes() {
+                    for bytes in [512, 2048, 4096, 4608] {
+                        whole_units_the_span_leaves_no_room_for_wait(bytes);
+                    }
+                }
+
+                /// The body of the two tests above, with the envelopes grown
+                /// by a dar catalogue of `catalogue_bytes`. The fill budget
+                /// sits half a slice past `a` on the probe ([`wide_fixed`]):
+                /// `a` under it and `c` past it, whichever way the write's
+                /// own build drifts.
+                fn whole_units_the_span_leaves_no_room_for_wait(catalogue_bytes: usize) {
+                    let mut f = fixture(
+                        &[
+                            ("a", &[WIDE_SLICE]),
+                            ("b", &[WIDE_SLICE; 3]),
+                            ("c", &[WIDE_SLICE]),
+                        ],
+                        &["SD-1", "SD-2"],
+                    );
                     allow_spanning(&f, "b");
-                    let fixed = fixed_bytes(&f, "SD-1");
+                    grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
+                    let fixed = wide_fixed(&f, "SD-1");
                     budget(
                         &mut f,
                         "SD-1",
-                        fixed + 5 * PADDED,
-                        fixed + 3 * PADDED / 2,
+                        fixed + 5 * WIDE_PADDED,
+                        fixed + 3 * WIDE_PADDED / 2,
                         true,
                     );
 
