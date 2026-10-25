@@ -1035,24 +1035,25 @@ pub(crate) fn refuse_last_eligible_copy(
 /// **Locations are judged by NAME, as `audit`, `unit mark-tape-only` and
 /// `snapshot mark-reclaimable` judge them** (issue #463; ADR-0012 2026-10-07
 /// items 15 and 34), asked of the present tense "after this volume is given
-/// up": for each version the act consumes, the names in
-/// `required_locations` where it would hold fewer than
-/// [`copies_per_named_location`](crate::policy::coverage::copies_per_named_location)
-/// copies ([`short_required_locations_excluding`](crate::policy::coverage::short_required_locations_excluding)),
-/// and — for a tape-only unit — fewer distinct places than
-/// `[defaults] min_locations`
+/// up": for each version the act consumes, the locations of the resolved
+/// `copies_at` map (#493, ADR-0012 items 149 and 156: an archive set's
+/// `required_locations` folded in at one copy each) where it would hold
+/// fewer than their target
+/// ([`short_of_copies_at`](crate::policy::coverage::short_of_copies_at), the
+/// volume pretended away), and — for a tape-only unit — fewer distinct
+/// places than `[defaults] min_locations`
 /// ([`short_of_location_floor_excluding`](crate::policy::coverage::short_of_location_floor_excluding)).
 /// A COUNT of locations is not that question: copies at `home`, `garage` and
 /// `offsite`, with `offsite` the volume retired, leave two places and no
-/// copy at the required name `offsite`. An empty `required_locations` and a
-/// status with no place floor mean no location requirement, and silence is
-/// then correct rather than a gate on a number nobody set.
+/// copy at the required name `offsite`. A map with no target and a status
+/// with no place floor mean no location requirement, and silence is then
+/// correct rather than a gate on a number nobody set.
 ///
 /// For a tape-only unit the copy floor is multiplied by the one tape-only
 /// rule (`policy::coverage::copy_floor`, ADR-0012 2026-10-12 item 43), and so
-/// is the number of copies each NAME must hold; the place floor is a count
-/// of distinct places, which the multiplier never raises (item 46), so its
-/// fact carries no multiplier note.
+/// is each location's target (`coverage::location_target`); the place floor
+/// is a count of distinct places, which the multiplier never raises (item
+/// 46), so its fact carries no multiplier note.
 ///
 /// An unresolvable policy PROPAGATES (issue #105's rule, applied at a
 /// destructive moment): tapectl cannot say whether the retirement is within
@@ -1075,9 +1076,8 @@ pub(crate) fn below_policy_facts(
             .ok_or_else(|| TapectlError::UnitNotFound(impact.unit_name.clone()))?;
         let policy = crate::policy::resolve(conn, config, &unit)?;
         let needed_copies = coverage::copy_floor(config, policy.copy_floor_base(), &unit.status);
-        let per_name = coverage::copies_per_named_location(config, &unit.status);
         let note = coverage::tape_only_note(config, &unit.status);
-        let requires = policy.required_locations.join(", ");
+        let requires = coverage::describe_targets(&policy.copies_at);
         for version in &impact.at_stake {
             if version.copies_after == 0 {
                 continue;
@@ -1094,14 +1094,15 @@ pub(crate) fn below_policy_facts(
             // the per-unit form would take the minimum over versions the act
             // never touches.
             let scope = coverage::NamedScope::Snapshot(version.snapshot_id);
-            let short = coverage::short_required_locations_excluding(
+            let short = coverage::short_of_copies_at(
                 conn,
+                config,
                 scope,
-                &policy.required_locations,
-                per_name,
+                &policy,
+                &unit.status,
                 Some(version.volume_id),
             )?;
-            let missing = coverage::missing_names(&short);
+            let missing = coverage::locations_without_a_copy(&short);
             if !missing.is_empty() {
                 facts.push(format!(
                     "unit \"{}\" v{} would be left with no copy at required location(s) {} \
@@ -1111,19 +1112,17 @@ pub(crate) fn below_policy_facts(
                     missing.join(", ")
                 ));
             }
-            // Names that keep a copy but fewer than a tape-only unit needs
-            // there (item 34); a name with none is already named above.
-            let partly: Vec<(String, i64)> = short
-                .iter()
-                .filter(|(_, copies)| *copies > 0)
-                .cloned()
-                .collect();
+            // Locations that keep a copy but fewer than their target (a
+            // tape-only unit's multiplied one, item 34, or a map's count above
+            // 1, #493); a location with none is already named above.
+            let partly: Vec<coverage::LocationShort> =
+                short.iter().filter(|s| s.copies > 0).cloned().collect();
             if !partly.is_empty() {
                 facts.push(format!(
                     "unit \"{}\" v{} would be left with {}{note} (policy requires {requires})",
                     impact.unit_name,
                     version.version,
-                    coverage::describe_named_shortfall(&partly, per_name)
+                    coverage::describe_short_locations(&partly)
                 ));
             }
             if let Some(places) = coverage::short_of_location_floor_excluding(
@@ -2648,7 +2647,7 @@ pub fn unit_mark_tape_only(
     // ADR-0012 2026-10-12 items 43 and 46: every COPY floor below is the one
     // the unit will be held to once it IS tape-only, so each goes through
     // the one tape-only rule (`policy::coverage::copy_floor`,
-    // `copies_per_named_location`) asked for status `tape_only` — not
+    // `location_target`) asked for status `tape_only` — not
     // `unit.status`, which is still what it was. A unit is not marked
     // tape-only, freeing its source, with fewer copies than tape-only policy
     // demands without the consent below naming the shortfall (item 47: a
@@ -2660,7 +2659,8 @@ pub fn unit_mark_tape_only(
     // The distinct-place floor has no per-unit or per-archive-set layer: it
     // exists only in `[defaults]`, and `policy::coverage::location_floor`
     // reads it from there, for the status the unit is about to have. The
-    // named `required_locations` below is the per-set location policy. The
+    // per-location targets below (the resolved `copies_at` map) are the
+    // per-unit location policy. The
     // floor counts distinct places, which the multiplier never raises (item
     // 46): at the defaults a tape-only unit needs 4 copies in 2 places, not
     // 4 in 4. Issue #425: the predicate is the one `audit`'s `location_count`
@@ -2697,18 +2697,22 @@ pub fn unit_mark_tape_only(
     let place_shortfall =
         crate::policy::coverage::PlaceShortfall::judge(config, "tape_only", location_count);
 
-    // Issue #348: `required_locations` checked BY NAME, through the one
-    // predicate `audit`'s `location_presence` also uses — and, the unit
-    // being about to be tape-only, with the multiplier's copies at each name
-    // (ADR-0012 2026-10-07 item 34).
-    let per_name = crate::policy::coverage::copies_per_named_location(config, "tape_only");
-    let short_locations = crate::policy::coverage::short_required_locations(
+    // Issue #348: the locations checked BY NAME, through the one predicate
+    // `audit`'s `location_presence` also uses — and, the unit being about to
+    // be tape-only, with each target multiplied (ADR-0012 2026-10-07 item
+    // 34). #493 (items 149, 156): the locations and their counts are the
+    // resolved `copies_at` map, an archive set's `required_locations` folded
+    // in at one copy each, so a dotfile's map is judged here as `audit`
+    // judges it.
+    let short_locations = crate::policy::coverage::short_of_copies_at(
         conn,
+        config,
         crate::policy::coverage::NamedScope::Unit(unit.id),
-        &policy.required_locations,
-        per_name,
+        &policy,
+        "tape_only",
+        None,
     )?;
-    let missing_locations = crate::policy::coverage::missing_names(&short_locations);
+    let missing_locations = crate::policy::coverage::locations_without_a_copy(&short_locations);
 
     // Issue #153 / ADR-0012: `copy_count` above is already the MINIMUM
     // across the unit's current versions -- this names WHICH version that
@@ -2814,13 +2818,13 @@ pub fn unit_mark_tape_only(
         facts.push(format!(
             "insufficient locations: no copy at required location(s) {} (policy requires {})",
             missing_locations.join(", "),
-            policy.required_locations.join(", ")
+            crate::policy::coverage::describe_targets(&policy.copies_at)
         ));
     } else if !short_locations.is_empty() {
         facts.push(format!(
-            "insufficient locations: has {} (tape-only {per_name}x) (policy requires {})",
-            crate::policy::coverage::describe_named_shortfall(&short_locations, per_name),
-            policy.required_locations.join(", ")
+            "insufficient locations: has {}{tape_only_note} (policy requires {})",
+            crate::policy::coverage::describe_short_locations(&short_locations),
+            crate::policy::coverage::describe_targets(&policy.copies_at)
         ));
     }
     // Dirty is Tier 2, not Tier 3: the tape copy is stale relative to
@@ -5386,6 +5390,62 @@ mod tests {
             assert_eq!(photos_status(&conn), "active");
         }
 
+        /// #493 (ADR-0012 items 149 and 156): the gate judges the unit's
+        /// resolved `copies_at` map, as `audit` does. The archive set requires
+        /// `[home, offsite]` and nothing is at `offsite`; a dotfile map
+        /// (frozen in the catalog: the unit has no path) of `home = 2` is short
+        /// at `home` by its own count (no tape-only note at 1x), and one of
+        /// `glacier = 1, home = 1` is met by the tape at `home` and the deposit
+        /// at `glacier`, so the unit is marked with no prompt.
+        #[test]
+        fn gates_on_the_resolved_copies_at_map() {
+            let conn = photos_in_archive_set("required_locations", "'[\"home\",\"offsite\"]'");
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 1;
+            let refused = |conn: &Connection| {
+                unit_mark_tape_only(conn, &config, "photos", false, false)
+                    .expect_err("a location short of its target is a Tier-2 fact")
+                    .to_string()
+            };
+            let msg = refused(&conn);
+            assert!(
+                msg.contains(
+                    "insufficient locations: no copy at required location(s) offsite \
+                     (policy requires home, offsite)"
+                ),
+                "the positive control, the set's names: {msg}"
+            );
+
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"home\":2}' WHERE name = 'photos'",
+                [],
+            )
+            .unwrap();
+            let msg = refused(&conn);
+            assert!(
+                msg.contains(
+                    "insufficient locations: has 1 copy at required location home, needs 2 \
+                     (policy requires 2 at home)"
+                ),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("offsite"),
+                "the map replaced the set's names: {msg}"
+            );
+            assert_eq!(photos_status(&conn), "active");
+
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"glacier\":1,\"home\":1}' \
+                 WHERE name = 'photos'",
+                [],
+            )
+            .unwrap();
+            unit_mark_tape_only(&conn, &config, "photos", false, false)
+                .expect("the map is met: nothing to confirm");
+            assert_eq!(photos_status(&conn), "tape_only");
+        }
+
         /// Positive control for the one above: the names met, nothing to
         /// confirm, no prompt — a compliant unit must never reach the gate
         /// (a non-interactive run would otherwise refuse it). The multiplier
@@ -6943,6 +7003,63 @@ mod tests {
             volume_retire(&conn, &Config::default(), "L6-GARAGE", false, false, false)
                 .expect("a compliant retirement needs no consent");
             assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// #493 (ADR-0012 items 149 and 156): the retire family judges the
+        /// unit's resolved `copies_at` map, as `audit` does. The archive set
+        /// requires `[home, offsite]`, so retiring the one copy at `home` is a
+        /// fact; once the unit's dotfile map (frozen in the catalog: it has no
+        /// path) is `garage = 1, offsite = 1`, it is not, and retiring the one
+        /// at `garage` is. A count above 1 is named with its own target and,
+        /// for an active unit, no tape-only note.
+        #[test]
+        fn the_retire_facts_judge_the_resolved_copies_at_map() {
+            let (conn, _) = setup_sealed("L6-HOME", 2);
+            shelve(
+                &conn,
+                &[
+                    ("L6-HOME", "home"),
+                    ("COPY-0", "garage"),
+                    ("COPY-1", "offsite"),
+                ],
+            );
+            require(&conn, "[\"home\",\"offsite\"]", "active");
+            let config = Config::default();
+            assert_eq!(
+                facts_for(&conn, &config, "L6-HOME"),
+                vec![
+                    "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                     home (policy requires home, offsite)"
+                        .to_string()
+                ],
+                "the positive control: the set's names"
+            );
+
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"garage\":1,\"offsite\":1}'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(facts_for(&conn, &config, "L6-HOME"), Vec::<String>::new());
+            assert_eq!(
+                facts_for(&conn, &config, "COPY-0"),
+                vec![
+                    "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                     garage (policy requires garage, offsite)"
+                        .to_string()
+                ]
+            );
+
+            conn.execute("UPDATE units SET copies_at_frozen = '{\"offsite\":2}'", [])
+                .unwrap();
+            assert_eq!(
+                facts_for(&conn, &config, "L6-HOME"),
+                vec![
+                    "unit \"unitA\" v1 would be left with 1 copy at required location offsite, \
+                     needs 2 (policy requires 2 at offsite)"
+                        .to_string()
+                ]
+            );
         }
 
         /// Item 34 reaches the retire family: a tape-only unit's names each

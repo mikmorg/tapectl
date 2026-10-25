@@ -180,26 +180,28 @@ fn superseding_verdict(
         });
     }
 
-    // Issue #348: `required_locations` is a list of NAMES, and each must
-    // hold a copy of the superseding version — checked through the one
-    // named-location predicate `audit` and `unit mark-tape-only` share, in
-    // its one-version form (the version being released must not count).
-    // Checked by count alone, copies at `home` and `garage` met
-    // `["home","offsite"]` and the older version was released with nothing
-    // offsite.
-    // ADR-0012 2026-10-07 items 15 and 34: for a tape-only unit each named
-    // location must hold `multiplier` copies of the superseding version —
-    // the per-name count of the same one predicate
-    // (`copies_per_named_location`). One copy at `offsite` meets
+    // Issue #348: the policy names LOCATIONS, and each must hold its copies
+    // of the superseding version — checked through the one per-location
+    // predicate `audit` and `unit mark-tape-only` share, in its one-version
+    // form (the version being released must not count). Checked by count
+    // alone, copies at `home` and `garage` met `["home","offsite"]` and the
+    // older version was released with nothing offsite.
+    // #493 (ADR-0012 items 149, 156): the locations and their counts are the
+    // resolved `copies_at` map, an archive set's `required_locations` folded
+    // in at one copy each, so a dotfile's map is judged here exactly as
+    // `audit`'s `location_presence` judges it. ADR-0012 2026-10-07 items 15
+    // and 34: for a tape-only unit each target is multiplied
+    // (`coverage::location_target`). One copy at `offsite` meets
     // `["offsite"]` for an active unit, not at 2x.
-    let per_name = super::coverage::copies_per_named_location(config, &unit.status);
-    let short = super::coverage::short_required_locations(
+    let short = super::coverage::short_of_copies_at(
         conn,
+        config,
         super::coverage::NamedScope::Snapshot(superseding.0),
-        &resolved.required_locations,
-        per_name,
+        &resolved,
+        &unit.status,
+        None,
     )?;
-    let missing = super::coverage::missing_names(&short);
+    let missing = super::coverage::locations_without_a_copy(&short);
     if !missing.is_empty() {
         return Ok(ReclaimVerdict::Blocked {
             superseding_version: Some(superseding.1),
@@ -208,7 +210,7 @@ fn superseding_verdict(
                 "superseding v{} has no copy at required location(s) {} (policy requires {})",
                 superseding.1,
                 missing.join(", "),
-                resolved.required_locations.join(", "),
+                super::coverage::describe_targets(&resolved.copies_at),
             ),
         });
     }
@@ -217,9 +219,9 @@ fn superseding_verdict(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} has {} (tape-only {per_name}x)",
+                "superseding v{} has {}{tape_only_note}",
                 superseding.1,
-                super::coverage::describe_named_shortfall(&short, per_name),
+                super::coverage::describe_short_locations(&short),
             ),
         });
     }
@@ -878,6 +880,63 @@ pub(crate) mod tests {
             }
             other => panic!("home + garage must not satisfy [home, offsite]: {other:?}"),
         }
+    }
+
+    /// #493 (ADR-0012 items 149 and 156): the superseding version is judged
+    /// on the unit's resolved `copies_at` map, as `audit` judges it. The
+    /// archive set requires `["home","offsite"]` and the copies are at `home`
+    /// and `garage`; a dotfile map (frozen in the catalog: the unit has no
+    /// path) of `garage = 1, home = 1` replaces the set's names, and they meet
+    /// it. A map naming `offsite` twice is short there by its own count, and
+    /// `home = 2` on an active unit names its target with no tape-only note.
+    #[test]
+    fn the_superseding_version_is_judged_on_the_resolved_copies_at_map() {
+        let (conn, _unit) = setup("sup-map", 2, "sealed", "active");
+        place_and_require(&conn, "sup-map", "home", "garage", r#"["home","offsite"]"#);
+        conn.execute(
+            "INSERT OR IGNORE INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+        let with_map = |json: &str| {
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = ?1 WHERE name = 'sup-map'",
+                [json],
+            )
+            .unwrap();
+            let unit = crate::db::queries::get_unit_by_name(&conn, "sup-map")
+                .unwrap()
+                .unwrap();
+            assess(&conn, &Config::default(), &unit, 1).unwrap()
+        };
+        let reason = |verdict: ReclaimVerdict| match verdict {
+            ReclaimVerdict::Blocked { reason, .. } => reason,
+            other => panic!("expected Blocked: {other:?}"),
+        };
+
+        assert_eq!(
+            with_map(r#"{"garage":1,"home":1}"#),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            },
+            "the dotfile's map replaces the set's offsite"
+        );
+        assert_eq!(
+            reason(with_map(r#"{"home":1,"offsite":1}"#)),
+            "superseding v2 has no copy at required location(s) offsite \
+             (policy requires home, offsite)",
+            "the positive control: the set's own names, as a map"
+        );
+        assert_eq!(
+            reason(with_map(r#"{"offsite":2}"#)),
+            "superseding v2 has no copy at required location(s) offsite \
+             (policy requires 2 at offsite)"
+        );
+        assert_eq!(
+            reason(with_map(r#"{"home":2}"#)),
+            "superseding v2 has 1 copy at required location home, needs 2"
+        );
     }
 
     /// ADR-0012, 2026-10-07 amendment, item 15: for a tape-only unit the

@@ -532,7 +532,7 @@ pub enum CoverageScope<'a> {
     /// version's copies (ADR-0012: a copy is identical content, counted
     /// per version), not the unit as a whole. It is the building block of
     /// every per-version question: the MIN that [`CoverageScope::Unit`]
-    /// takes across current versions, [`short_required_locations`],
+    /// takes across current versions, [`short_of_copies_at`],
     /// [`versions_at_stake`], `snapshot mark-reclaimable` (the SUPERSEDING
     /// snapshot), `report pending`/`report summary` (a stage set's own
     /// version) and `unit mark-tape-only`'s thinnest-version line.
@@ -1126,7 +1126,7 @@ pub fn every_slice_on_sealed_volume_sql(set_expr: &str, also_sealed: Option<&str
 
 // ── Named required locations (issue #348; ADR-0012 2026-10-07 items 15, 34) ──
 
-/// Whose coverage [`short_required_locations`] and
+/// Whose coverage [`short_of_copies_at`], [`copies_at_every_location`] and
 /// [`short_of_location_floor`] judge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamedScope {
@@ -1160,8 +1160,8 @@ pub enum NamedScope {
 /// retire family's Tier-2 facts, the staging retention gate and `report
 /// pending` all judge a tape-only unit's copies against `floor × this`.
 /// Item 46 bounds it: the multiplier raises copy floors only — the resolved
-/// `min_copies` ([`copy_floor`]) and the copies each named required
-/// location must hold ([`copies_per_named_location`]) — and NEVER a count
+/// `min_copies` ([`copy_floor`]) and the copies each location of the
+/// `copies_at` map must hold ([`location_target`]) — and NEVER a count
 /// of distinct places (`[defaults] min_locations`, the number of named
 /// locations), which a tape-only unit meets as set. At the defaults that is
 /// 4 copies in 2 places, not 4 in 4. A copy floor is never multiplied
@@ -1196,15 +1196,6 @@ pub fn tape_only_note(config: &crate::config::Config, unit_status: &str) -> Stri
     }
 }
 
-/// How many copies each NAMED required location must hold for a unit whose
-/// status is (or, for `unit mark-tape-only`, is about to be) `unit_status`:
-/// one copy per name, as a [`copy_floor`] — 1, or `[compaction]
-/// tape_only_safety_multiplier` for a `tape_only` unit (ADR-0012 2026-10-07
-/// items 15 and 34 — named locations take the multiplier everywhere).
-pub fn copies_per_named_location(config: &crate::config::Config, unit_status: &str) -> i64 {
-    copy_floor(config, 1, unit_status)
-}
-
 // ── The distinct-place floor (ADR-0012 2026-10-12 items 46, 47; issue #425) ──
 
 /// **The** distinct-place floor: how many different places a unit's copies
@@ -1218,8 +1209,8 @@ pub fn copies_per_named_location(config: &crate::config::Config, unit_status: &s
 /// set a count of places (an archive set names places with
 /// `required_locations`). It is `config`, never an `i64`, so no caller can
 /// hand it a multiplied number: ADR-0012 2026-10-12 item 46 — the tape-only
-/// multiplier raises copy floors ([`copy_floor`],
-/// [`copies_per_named_location`]) and never a count of distinct places. At
+/// multiplier raises copy floors ([`copy_floor`], [`location_target`]) and
+/// never a count of distinct places. At
 /// the defaults a tape-only unit needs 4 copies in 2 places, not 4 in 4.
 ///
 /// It is a tape-only floor because the claim it guards is the one `unit
@@ -1357,163 +1348,6 @@ pub fn short_of_location_floor_excluding(
         unit_status,
         places_held_excluding(conn, scope, exclude_volume)?,
     ))
-}
-
-/// **The** named-location predicate: the names in `required` at which
-/// `scope` holds FEWER than `per_name` copies, each with the copies it holds
-/// there, in `required`'s order (duplicates collapsed). Empty means every
-/// named location is met. A name with no copy at all is listed with 0.
-///
-/// `audit`'s `location_presence`, `unit mark-tape-only`'s location gate,
-/// `snapshot mark-reclaimable` and `report supersedable` all ask this one
-/// function, with `per_name` from [`copies_per_named_location`], so they
-/// can never disagree about whether `required_locations` is met (issue
-/// #348 replaced a count-only comparison under which copies at `home-rack`
-/// and `garage` satisfied `["home-rack","offsite"]`; ADR-0012 2026-10-07
-/// item 34 put the tape-only multiplier into it for every caller).
-///
-/// A copy "at" a location is counted on the same terms [`copy_count_expr`]
-/// counts copies and [`location_count_expr`] places them, the one per-slice
-/// derivation (#478, ADR-0012 items 127, 134 and 138): at each slice, a
-/// distinct [`eligible`] volume holding it, shelved there, plus each recorded
-/// warehouse deposit there of such a volume (ADR-0006); per stage set its
-/// least-covered slice, summed over the version's stage sets, each tape and
-/// deposit credited to one stage set — so one volume with several writes of
-/// the version is one copy, and two tapes there that each hold a range of it
-/// make one copy there between them. With whole writes only: the distinct
-/// eligible volumes there with a completed write, plus the deposits there.
-///
-/// A name matching no `locations` row (a typo, or a location since renamed)
-/// holds 0: nothing can be at a place the catalog does not know.
-pub fn short_required_locations(
-    conn: &Connection,
-    scope: NamedScope,
-    required: &[String],
-    per_name: i64,
-) -> crate::error::Result<Vec<(String, i64)>> {
-    short_required_locations_excluding(conn, scope, required, per_name, None)
-}
-
-/// [`short_required_locations`] asked "after `exclude_volume` is given up":
-/// the volume (an id) and any deposit recorded from it are pretended away
-/// (see [`places_held_excluding`]). This is the question the retire family's
-/// Tier-2 gate puts to each version a retirement consumes coverage from, by
-/// the same predicate `audit` asks of the present — so a retirement that
-/// leaves a required NAME empty is named, whatever the copy count says.
-/// `None` is [`short_required_locations`] itself.
-pub fn short_required_locations_excluding(
-    conn: &Connection,
-    scope: NamedScope,
-    required: &[String],
-    per_name: i64,
-    exclude_volume: Option<i64>,
-) -> crate::error::Result<Vec<(String, i64)>> {
-    let wanted = distinct_names(required);
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let snapshot_ids: Vec<i64> = match scope {
-        NamedScope::Snapshot(id) => vec![id],
-        NamedScope::Unit(unit_id) => conn
-            .prepare("SELECT id FROM snapshots WHERE unit_id = ?1 AND status = 'current'")?
-            .query_map(params![unit_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-    };
-    let mut stmt = conn.prepare(&copies_at_names_sql(exclude_volume.is_some(), wanted.len()))?;
-    // The fewest copies any examined version holds at each name; a version
-    // holding none there makes it 0, and no version at all leaves every
-    // name at 0.
-    let mut fewest: Option<std::collections::HashMap<String, i64>> = None;
-    for snapshot_id in snapshot_ids {
-        let mut bound: Vec<rusqlite::types::Value> = vec![snapshot_id.into()];
-        bound.extend(exclude_volume.map(rusqlite::types::Value::from));
-        bound.extend(wanted.iter().map(|name| (*name).clone().into()));
-        let held: std::collections::HashMap<String, i64> = stmt
-            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        fewest = Some(match fewest {
-            None => held,
-            Some(so_far) => so_far
-                .into_iter()
-                .map(|(name, n)| {
-                    let here = held.get(&name).copied().unwrap_or(0);
-                    (name, n.min(here))
-                })
-                .collect(),
-        });
-    }
-    let fewest = fewest.unwrap_or_default();
-    Ok(wanted
-        .into_iter()
-        .map(|name| {
-            (
-                name.clone(),
-                fewest.get(name.as_str()).copied().unwrap_or(0),
-            )
-        })
-        .filter(|(_, copies)| *copies < per_name)
-        .collect())
-}
-
-/// [`short_required_locations_excluding`]' statement: each of `names` named
-/// locations (`?2`.. or, with `exclude`, `?3`..) that exists, with the copies
-/// version `?1` has there, the volume `?2` pretended away when `exclude`.
-fn copies_at_names_sql(exclude: bool, names: usize) -> String {
-    let q = CoverageQuery {
-        scope: CoverageScope::Snapshot { id_expr: "?1" },
-        exclude_volume: exclude.then_some("?2"),
-    };
-    let first_name = 2 + usize::from(exclude);
-    let names = (0..names)
-        .map(|i| format!("?{}", first_name + i))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "SELECT l.name, {} FROM locations l WHERE l.name IN ({names})",
-        scope_sum(&q, Counted::CopiesAt("l.id")),
-    )
-}
-
-/// The names in a [`short_required_locations`] answer that hold no copy at
-/// all — the "no copy at required location(s) …" half every caller reports
-/// first.
-pub fn missing_names(short: &[(String, i64)]) -> Vec<String> {
-    short
-        .iter()
-        .filter(|(_, copies)| *copies == 0)
-        .map(|(name, _)| name.clone())
-        .collect()
-}
-
-/// One wording for a [`short_required_locations`] answer whose names each
-/// hold at least one copy, but fewer than `per_name` (a tape-only unit, item
-/// 34): "1 copy at required location offsite, needs 2" — with "at each"
-/// when more than one name is short. The callers add their subject before
-/// it and the "(tape-only Nx)" after it.
-pub fn describe_named_shortfall(short: &[(String, i64)], per_name: i64) -> String {
-    let held = short
-        .iter()
-        .map(|(name, copies)| {
-            let noun = if *copies == 1 { "copy" } else { "copies" };
-            format!("{copies} {noun} at required location {name}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let each = if short.len() == 1 { "" } else { " at each" };
-    format!("{held}, needs {per_name}{each}")
-}
-
-/// `required`, first occurrence of each name kept, in order.
-fn distinct_names(required: &[String]) -> Vec<&String> {
-    let mut wanted: Vec<&String> = Vec::new();
-    for name in required {
-        if !wanted.contains(&name) {
-            wanted.push(name);
-        }
-    }
-    wanted
 }
 
 // ── Copies at a location (#493; ADR-0012 items 149, 150, 156-158, 160) ──
@@ -1724,7 +1558,19 @@ pub fn judge_copies_at(
 /// [`places_held_excluding`] does. Empty when every target is met, and when
 /// the map has no target above 0, in which case no statement is run (so a
 /// catalog without targets costs nothing more). Otherwise one statement,
-/// counting only the target names.
+/// counting only the target names. A name matching no `locations` row holds
+/// 0: nothing can be at a place the catalog does not know.
+///
+/// `audit`'s `location_presence`, `unit mark-tape-only`'s location gate,
+/// `snapshot mark-reclaimable`/`report supersedable` (of the superseding
+/// version) and the retire family's Tier-2 facts (each version, the volume
+/// given up excluded) all ask this one function, so they can never disagree
+/// about whether a location's target is met. It replaced a count-only
+/// comparison under which copies at `home-rack` and `garage` satisfied
+/// `["home-rack","offsite"]` (issue #348), and since #493 it reads the
+/// resolved map, not `required_locations`, which the map already holds at
+/// one copy each (item 156): a name a dotfile's map replaced is not asked
+/// for, and a folded name is not asked for twice.
 pub fn short_of_copies_at(
     conn: &Connection,
     config: &crate::config::Config,
@@ -1783,6 +1629,17 @@ fn copies_at_targets_sql(scope: NamedScope, exclude: bool, names: usize) -> (Str
         copies_at_expr(&q, "l.id")
     );
     (sql, id)
+}
+
+/// The locations in a [`short_of_copies_at`] answer that hold no copy at all,
+/// in name order: the "no copy at required location(s) …" half every caller
+/// reports first.
+pub fn locations_without_a_copy(short: &[LocationShort]) -> Vec<String> {
+    short
+        .iter()
+        .filter(|s| s.copies == 0)
+        .map(|s| s.location.clone())
+        .collect()
 }
 
 /// One wording for a [`short_of_copies_at`] answer, after a caller's subject:
@@ -2005,11 +1862,7 @@ impl Shortfall {
 
     /// The map's locations with no copy at all, in name order.
     pub fn missing_locations(&self) -> Vec<String> {
-        self.locations
-            .iter()
-            .filter(|s| s.copies == 0)
-            .map(|s| s.location.clone())
-            .collect()
+        locations_without_a_copy(&self.locations)
     }
 
     /// The map's locations holding some copies but fewer than their target.
@@ -2438,7 +2291,7 @@ fn range_held(conn: &Connection, write_id: i64) -> crate::error::Result<Vec<(i64
 #[derive(Debug, Clone)]
 pub struct VersionAtStake {
     /// `snapshots.id` of the version's snapshot — what the by-name location
-    /// predicates ([`short_required_locations_excluding`],
+    /// predicates ([`short_of_copies_at`] with a volume excluded,
     /// [`short_of_location_floor_excluding`]) take as `NamedScope::Snapshot`.
     pub snapshot_id: i64,
     /// The volume being given up: the one [`versions_at_stake`] excluded to
@@ -3595,17 +3448,61 @@ pub(crate) mod tests {
         assert_eq!(scalar(&conn, &copy_count_expr(&q), unit_id), 0);
     }
 
-    // ── short_required_locations (issue #348; ADR-0012 2026-10-07 item 34) ──
+    // ── by-name location targets (issue #348; ADR-0012 2026-10-07 item 34; #493) ──
 
-    /// The names with no copy, at `per_name` 1: what the predicate answered
-    /// before the multiplier reached it.
+    /// A default resolved policy whose `copies_at` map is `map`.
+    fn targets(map: &[(&str, i64)]) -> crate::policy::ResolvedPolicy {
+        let conn = crate::db::open_memory().unwrap();
+        let unit = crate::db::models::Unit {
+            id: 0,
+            uuid: "u-targets".into(),
+            name: "targets".into(),
+            tenant_id: 0,
+            archive_set_id: None,
+            current_path: None,
+            checksum_mode: "mtime_size".into(),
+            encrypt: true,
+            status: "active".into(),
+            created_at: String::new(),
+            last_scanned: None,
+            notes: None,
+            copies_at_frozen: None,
+        };
+        let mut p =
+            crate::policy::resolve(&conn, &crate::config::Config::default(), &unit).unwrap();
+        p.copies_at = map.iter().map(|(n, c)| (n.to_string(), *c)).collect();
+        p
+    }
+
+    /// The by-name question as an archive set's `required_locations` asks it
+    /// since #493: the names folded into the `copies_at` map at one copy each
+    /// (item 156), each target raised to `per_name` (a tape-only unit at that
+    /// multiplier), asked of `scope` by [`short_of_copies_at`] with `exclude`
+    /// pretended away: `(name, copies)` of each short name, in name order.
+    fn short_named(
+        conn: &Connection,
+        scope: NamedScope,
+        required: &[String],
+        per_name: i64,
+        exclude: Option<i64>,
+    ) -> Vec<(String, i64)> {
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = per_name.try_into().unwrap();
+        let map: Vec<(&str, i64)> = required.iter().map(|n| (n.as_str(), 1)).collect();
+        short_of_copies_at(conn, &config, scope, &targets(&map), "tape_only", exclude)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.location, s.copies))
+            .collect()
+    }
+
+    /// The names with no copy, at one copy each.
     fn missing_required_locations(
         conn: &Connection,
         unit_id: i64,
         required: &[String],
     ) -> crate::error::Result<Vec<String>> {
-        short_required_locations(conn, NamedScope::Unit(unit_id), required, 1)
-            .map(|s| missing_names(&s))
+        missing_required_locations_in(conn, NamedScope::Unit(unit_id), required)
     }
 
     fn missing_required_locations_for_snapshot(
@@ -3613,35 +3510,61 @@ pub(crate) mod tests {
         snapshot_id: i64,
         required: &[String],
     ) -> crate::error::Result<Vec<String>> {
-        short_required_locations(conn, NamedScope::Snapshot(snapshot_id), required, 1)
-            .map(|s| missing_names(&s))
+        missing_required_locations_in(conn, NamedScope::Snapshot(snapshot_id), required)
+    }
+
+    fn missing_required_locations_in(
+        conn: &Connection,
+        scope: NamedScope,
+        required: &[String],
+    ) -> crate::error::Result<Vec<String>> {
+        let map: Vec<(&str, i64)> = required.iter().map(|n| (n.as_str(), 1)).collect();
+        let short = short_of_copies_at(
+            conn,
+            &crate::config::Config::default(),
+            scope,
+            &targets(&map),
+            "active",
+            None,
+        )?;
+        Ok(locations_without_a_copy(&short))
     }
 
     /// Item 34: each name is asked for `per_name` copies, and the count is
     /// copies there — tape and warehouse alike, so the deposit at `glacier`
-    /// is one copy there. At 1 both names are met; at 2 each holds one.
+    /// is one copy there. At 1 both names are met; at 2 each holds one. A
+    /// name given twice is asked for once (the map has one key).
     #[test]
     fn each_named_location_is_asked_for_per_name_copies() {
         let (conn, unit_id, _vol) = setup_unit_with_deposit("tape_only");
         let req = names(&["home", "glacier", "home"]);
         let unit = NamedScope::Unit(unit_id);
-        assert!(short_required_locations(&conn, unit, &req, 1)
-            .unwrap()
-            .is_empty());
-        let short = short_required_locations(&conn, unit, &req, 2).unwrap();
+        assert!(short_named(&conn, unit, &req, 1, None).is_empty());
+        let short = short_named(&conn, unit, &req, 2, None);
         assert_eq!(
             short,
-            vec![("home".to_string(), 1), ("glacier".to_string(), 1)]
+            vec![("glacier".to_string(), 1), ("home".to_string(), 1)]
         );
-        assert!(missing_names(&short).is_empty());
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = 2;
+        let short = short_of_copies_at(
+            &conn,
+            &config,
+            unit,
+            &targets(&[("home", 1), ("glacier", 1)]),
+            "tape_only",
+            None,
+        )
+        .unwrap();
+        assert!(locations_without_a_copy(&short).is_empty());
         assert_eq!(
-            describe_named_shortfall(&short, 2),
-            "1 copy at required location home, 1 copy at required location glacier, \
+            describe_short_locations(&short),
+            "1 copy at required location glacier, 1 copy at required location home, \
              needs 2 at each"
         );
         assert_eq!(
-            describe_named_shortfall(&short[..1], 2),
-            "1 copy at required location home, needs 2"
+            describe_short_locations(&short[..1]),
+            "1 copy at required location glacier, needs 2"
         );
     }
 
@@ -3665,16 +3588,11 @@ pub(crate) mod tests {
             assert_eq!(places_held_excluding(&conn, scope, None).unwrap(), 2);
             assert_eq!(places_held(&conn, scope).unwrap(), 2);
             assert_eq!(places_held_excluding(&conn, scope, Some(vol)).unwrap(), 0);
-            assert!(
-                short_required_locations_excluding(&conn, scope, &req, 1, None)
-                    .unwrap()
-                    .is_empty()
-            );
-            let short =
-                short_required_locations_excluding(&conn, scope, &req, 1, Some(vol)).unwrap();
+            assert!(short_named(&conn, scope, &req, 1, None).is_empty());
+            let short = short_named(&conn, scope, &req, 1, Some(vol));
             assert_eq!(
                 short,
-                vec![("home".to_string(), 0), ("glacier".to_string(), 0)]
+                vec![("glacier".to_string(), 0), ("home".to_string(), 0)]
             );
             assert_eq!(
                 short_of_location_floor_excluding(&conn, &config, scope, "tape_only", None)
@@ -3713,9 +3631,7 @@ pub(crate) mod tests {
         .unwrap();
         let unit = NamedScope::Unit(unit_id);
         let req = names(&["home-rack"]);
-        assert!(short_required_locations(&conn, unit, &req, 1)
-            .unwrap()
-            .is_empty());
+        assert!(short_named(&conn, unit, &req, 1, None).is_empty());
         conn.execute_batch(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                   capacity_bytes, status, location_id)
@@ -3732,7 +3648,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            short_required_locations(&conn, unit, &req, 2).unwrap(),
+            short_named(&conn, unit, &req, 2, None),
             vec![("home-rack".to_string(), 1)],
             "v2 holds one copy at home-rack, so the unit holds one"
         );
@@ -3744,9 +3660,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(
-            short_required_locations(&conn, NamedScope::Snapshot(v1), &req, 2)
-                .unwrap()
-                .is_empty(),
+            short_named(&conn, NamedScope::Snapshot(v1), &req, 2, None).is_empty(),
             "v1 alone holds two"
         );
     }
@@ -3755,9 +3669,14 @@ pub(crate) mod tests {
     fn the_named_location_multiplier_applies_to_a_tape_only_unit_only() {
         let mut config = crate::config::Config::default();
         config.compaction.tape_only_safety_multiplier = 3;
-        assert_eq!(copies_per_named_location(&config, "tape_only"), 3);
+        let one_each = targets(&[("home", 1)]);
+        assert_eq!(location_target(&config, &one_each, "home", "tape_only"), 3);
         for status in ["active", "missing"] {
-            assert_eq!(copies_per_named_location(&config, status), 1, "{status}");
+            assert_eq!(
+                location_target(&config, &one_each, "home", status),
+                1,
+                "{status}"
+            );
         }
     }
 
@@ -3824,7 +3743,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             missing_required_locations(&conn, unit_id, &names(&["home", "glacier"])).unwrap(),
-            names(&["home", "glacier"])
+            names(&["glacier", "home"])
         );
     }
 
@@ -3837,7 +3756,7 @@ pub(crate) mod tests {
             setup_unit_with_two_current_snapshots("mv-named", Some("home-rack"), Some("garage"));
         assert_eq!(
             missing_required_locations(&conn, unit_id, &names(&["home-rack", "garage"])).unwrap(),
-            names(&["home-rack", "garage"])
+            names(&["garage", "home-rack"])
         );
     }
 
@@ -6083,9 +6002,13 @@ pub(crate) mod tests {
         c.whole(s1, 2, a);
         c.whole(s2, 3, b);
         assert_eq!((c.copies(snap), c.places(snap)), (2, 1));
-        let short =
-            short_required_locations(&c.conn, NamedScope::Snapshot(snap), &names(&["home"]), 3)
-                .unwrap();
+        let short = short_named(
+            &c.conn,
+            NamedScope::Snapshot(snap),
+            &names(&["home"]),
+            3,
+            None,
+        );
         assert_eq!(short, vec![("home".to_string(), 2)], "two tapes at home");
 
         // (c) A stage set with no slice rows counts its whole writes.
@@ -6184,18 +6107,18 @@ pub(crate) mod tests {
         c.range(set, t1, 1, 2, 6);
         c.range(set, t3, 3, 6, 6);
         let short = |per_name: i64| {
-            short_required_locations(
+            short_named(
                 &c.conn,
                 NamedScope::Snapshot(snap),
                 &names(&["offsite", "home"]),
                 per_name,
+                None,
             )
-            .unwrap()
         };
         assert_eq!(short(1), vec![("home".to_string(), 0)]);
         assert_eq!(
             short(2),
-            vec![("offsite".to_string(), 1), ("home".to_string(), 0)]
+            vec![("home".to_string(), 0), ("offsite".to_string(), 1)]
         );
 
         // Tape 3 moved home: neither place holds every slice.
@@ -6207,7 +6130,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             short(1),
-            vec![("offsite".to_string(), 0), ("home".to_string(), 0)]
+            vec![("home".to_string(), 0), ("offsite".to_string(), 0)]
         );
         assert_eq!(
             c.places(snap),
@@ -6721,7 +6644,6 @@ pub(crate) mod tests {
         ];
         let mut statements = vec![
             slice_copies_sql(),
-            copies_at_names_sql(true, 2),
             // #493: the per-location targets and one location, both forms;
             // a name is found by the locations' unique index.
             copies_at_targets_sql(NamedScope::Unit(1), true, 2).0,
