@@ -356,6 +356,9 @@ is `cli::report::needs_rows`. Auto-stage lives in `src/for_location.rs` (`plan`,
 when it starts after slice 1. Item 147 (#492) is `CapacityBudget::place`'s start;
 `CapacityBudget::span_last_run` and `collection::selector::after_the_tail` keep the whole units it
 displaces in the collection batch (`after_tail`). #491's fix is `volume::write::read_back_span_plan`. Migration 040.
+Item 26's shared-place warning judges where a moved tape goes (`--for-location X`, `--move-to Y`):
+`volume::write::WriteScope` carries the destination beside the `StagedScope`, and
+`coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
