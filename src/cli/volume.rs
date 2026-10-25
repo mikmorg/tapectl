@@ -1520,7 +1520,7 @@ struct DriveWriteSteps<'a> {
     assume_yes: bool,
     /// The staged sets the write takes: every one, or with `--for-location`
     /// those with need there (#493).
-    scope: write::StagedScope<'a>,
+    scope: write::StagedScope,
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
@@ -1530,7 +1530,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
             self.config,
             label,
             self.allow_missing_escrow,
-            self.scope,
+            &self.scope,
         )
     }
 
@@ -1560,7 +1560,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
             self.prewrite_hash,
             self.full_confirm,
             self.assume_yes,
-            self.scope,
+            self.scope.clone(),
         )
     }
 }
@@ -1959,7 +1959,7 @@ pub fn run(
                 prewrite_hash: *prewrite_hash,
                 full_confirm: *full_confirm,
                 assume_yes: yes,
-                scope: match &for_x_sets {
+                scope: match for_x_sets {
                     Some(ids) => write::StagedScope::ForLocation(ids),
                     None => write::StagedScope::Every,
                 },

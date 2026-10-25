@@ -1123,7 +1123,7 @@ pub fn volume_write(
 /// whole-on-disk check, the keys and the pre-flight — so a staged set outside
 /// the scope can neither be written by it nor refuse it.
 #[allow(clippy::too_many_arguments)]
-pub fn volume_write_scoped<'s>(
+pub fn volume_write_scoped(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
@@ -1135,7 +1135,7 @@ pub fn volume_write_scoped<'s>(
     prewrite_hash: bool,
     full_confirm: bool,
     assume_yes: bool,
-    only_stage_sets: impl Into<StagedScope<'s>>,
+    only_stage_sets: impl Into<StagedScope>,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
     // `collection run` and `quick-archive` inherit — all three reach the
@@ -1163,7 +1163,7 @@ pub fn volume_write_scoped<'s>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn volume_write_contacted<'c, 's>(
+pub(crate) fn volume_write_contacted<'c>(
     conn: &'c Connection,
     // The tapectl home: where the write's plaintext `catalog.db` is built
     // (ADR-0012 2026-10-06 item 4), never under staging.
@@ -1181,9 +1181,9 @@ pub(crate) fn volume_write_contacted<'c, 's>(
     store: ContactStore<'_>,
     // `None` ([`StagedScope::Every`]): every staged set. See
     // [`volume_write_scoped`].
-    only_stage_sets: impl Into<StagedScope<'s>>,
+    only_stage_sets: impl Into<StagedScope>,
 ) -> Result<()> {
-    let scope: StagedScope<'_> = only_stage_sets.into();
+    let scope: StagedScope = only_stage_sets.into();
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
             "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
@@ -8264,7 +8264,7 @@ pub(crate) fn write_catalog_preflight(
         config,
         label,
         allow_missing_escrow,
-        StagedScope::Every,
+        &StagedScope::Every,
     )
 }
 
@@ -8308,7 +8308,7 @@ pub(crate) fn write_catalog_preflight_in(
     config: &Config,
     label: &str,
     allow_missing_escrow: bool,
-    scope: StagedScope<'_>,
+    scope: &StagedScope,
 ) -> Result<()> {
     let batch = checked_staged_units(conn, scope.spanning(config), scope.only())?;
     let stage_set_ids = batch.stage_set_ids();
@@ -8361,23 +8361,23 @@ pub(crate) enum Spanning<'a> {
 
 /// Which staged sets a write takes ([`volume_write_scoped`]), and with them
 /// whether it may plan a set to span ([`Spanning`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StagedScope<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedScope {
     /// Every `staged` set: an ordinary `volume write`, spanning by policy.
     Every,
     /// `volume rewrite`'s own stage sets (issue #483), and nothing else that
     /// happens to be staged. A rewrite never spans (ADR-0012 item 142).
-    Rewrite(&'a [i64]),
+    Rewrite(Vec<i64>),
     /// `volume write --for-location X` (#493, ADR-0012 item 151): the staged
     /// sets that still have need at X, chosen by `for_location`. Planned by
     /// policy like any ordinary write, so a span in progress whose earlier
     /// ranges sit at X continues with its owed run first (items 122 and 159).
-    ForLocation(&'a [i64]),
+    ForLocation(Vec<i64>),
 }
 
-impl<'a> StagedScope<'a> {
+impl StagedScope {
     /// The stage sets the scope names; `None` is every staged set.
-    pub(crate) fn only(self) -> Option<&'a [i64]> {
+    pub(crate) fn only(&self) -> Option<&[i64]> {
         match self {
             StagedScope::Every => None,
             StagedScope::Rewrite(ids) | StagedScope::ForLocation(ids) => Some(ids),
@@ -8385,7 +8385,7 @@ impl<'a> StagedScope<'a> {
     }
 
     /// The write's spanning rule: by policy, except for a rewrite.
-    pub(crate) fn spanning(self, config: &Config) -> Spanning<'_> {
+    pub(crate) fn spanning<'c>(&self, config: &'c Config) -> Spanning<'c> {
         match self {
             StagedScope::Rewrite(_) => Spanning::Never,
             StagedScope::Every | StagedScope::ForLocation(_) => Spanning::ByPolicy(config),
@@ -8396,11 +8396,11 @@ impl<'a> StagedScope<'a> {
 /// What a scope given as an `Option` meant before #493: `None` every staged
 /// set, `Some` a rewrite's own (`volume rewrite` and the callers that
 /// predate [`StagedScope::ForLocation`]).
-impl<'a> From<Option<&'a [i64]>> for StagedScope<'a> {
-    fn from(only: Option<&'a [i64]>) -> Self {
+impl From<Option<&[i64]>> for StagedScope {
+    fn from(only: Option<&[i64]>) -> Self {
         match only {
             None => StagedScope::Every,
-            Some(ids) => StagedScope::Rewrite(ids),
+            Some(ids) => StagedScope::Rewrite(ids.to_vec()),
         }
     }
 }
@@ -13954,24 +13954,24 @@ mod tests {
         let mut config = Config::default();
         config.defaults.allow_spanning = true;
         let ids = [ss_id];
-        let classes = |scope: StagedScope<'_>| -> Vec<PlanClass> {
+        let classes = |scope: StagedScope| -> Vec<PlanClass> {
             find_staged_data(&conn, scope.spanning(&config), scope.only())
                 .unwrap()
                 .classes
         };
         assert_eq!(classes(StagedScope::Every), [PlanClass::Spannable]);
         assert_eq!(
-            classes(StagedScope::ForLocation(&ids)),
+            classes(StagedScope::ForLocation(ids.to_vec())),
             [PlanClass::Spannable],
             "a write for a location plans a set that may span by policy"
         );
         assert_eq!(
-            classes(StagedScope::Rewrite(&ids)),
+            classes(StagedScope::Rewrite(ids.to_vec())),
             [PlanClass::Whole],
             "a rewrite never spans (item 142)"
         );
         assert!(
-            classes(StagedScope::ForLocation(&[])).is_empty(),
+            classes(StagedScope::ForLocation(Vec::new())).is_empty(),
             "an empty scope selects nothing"
         );
         // The callers that predate #493 pass an `Option`: `None` is every
@@ -13979,7 +13979,7 @@ mod tests {
         assert_eq!(StagedScope::from(None), StagedScope::Every);
         assert_eq!(
             StagedScope::from(Some(&ids[..])),
-            StagedScope::Rewrite(&ids)
+            StagedScope::Rewrite(ids.to_vec())
         );
     }
 
@@ -25029,7 +25029,7 @@ mod tests {
                         true,
                         &mut slot,
                         ContactStore::Injected(&mut store),
-                        StagedScope::ForLocation(&[b]),
+                        StagedScope::ForLocation(vec![b]),
                     );
                     slot.finish_result(r).expect("a short seal is a success");
                     assert_eq!(writes_of(&f, "SL-1"), pairs(&[("b", "range")]));
