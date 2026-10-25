@@ -339,7 +339,8 @@ pub struct ForLocationPlan {
     /// Spans in progress that continue at another location (item 159).
     pub spans_waiting: Vec<SpanWaiting>,
     pub skipped: Vec<Skipped>,
-    /// The destination's own warnings (`collection::plan::destination_budget`).
+    /// Item 26's shared-place warning for the staged sets it rides, judged
+    /// at X (`shared_place_warnings`).
     pub warnings: Vec<String>,
 }
 
@@ -1189,6 +1190,10 @@ pub fn plan(
         }
         waiting.push(c);
     }
+    // The budget's own warnings are item 26's shared-place warning over
+    // every staged set at the volume's present shelf; the write for X takes
+    // only the sets for X and moves the tape to X (#493).
+    let warnings = shared_place_warnings(conn, label, &location, &planned)?;
     Ok(ForLocationPlan {
         location,
         volume: label.to_string(),
@@ -1198,8 +1203,46 @@ pub fn plan(
         staged_overflow,
         spans_waiting,
         skipped,
-        warnings: destination.warnings,
+        warnings,
     })
+}
+
+/// Item 26's shared-place warning (ADR-0012 2026-10-07) for the staged sets
+/// this plan rides, judged at X, where `volume write LABEL --for-location X`
+/// moves the tape once it is sealed and confirmed — or where the volume is,
+/// when that is X already — as that write judges it ([`copy_distinctness_at`]).
+/// Units still to be staged are judged by the write itself.
+///
+/// [`copy_distinctness_at`]: crate::policy::coverage::copy_distinctness_at
+fn shared_place_warnings(
+    conn: &Connection,
+    label: &str,
+    location: &str,
+    planned: &[Candidate],
+) -> Result<Vec<String>> {
+    let sets: Vec<i64> = planned
+        .iter()
+        .filter_map(|c| match c.how {
+            How::AlreadyStaged { stage_set_id } => Some(stage_set_id),
+            _ => None,
+        })
+        .collect();
+    if sets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let volume_id: i64 =
+        conn.query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| {
+            r.get(0)
+        })?;
+    let elsewhere = crate::volume::write::moved_elsewhere(conn, volume_id, Some(location))?;
+    let distinct =
+        crate::policy::coverage::copy_distinctness_at(conn, volume_id, elsewhere, &sets)?;
+    Ok(match elsewhere {
+        Some(_) => distinct.warning_moved_to(label),
+        None => distinct.warning(label),
+    }
+    .into_iter()
+    .collect())
 }
 
 /// What staging one planned unit did.
@@ -2165,6 +2208,89 @@ mod tests {
         assert_eq!(
             json["next"],
             "tapectl volume write L1 --for-location offsite"
+        );
+    }
+
+    /// Item 26's shared-place warning in the plan judges only the staged sets
+    /// for X, and at X, where `volume write --for-location X` moves the tape
+    /// (#493). L1 sits at `home`. `athome` (one copy at home) and `atx` (a
+    /// target of 2 at offsite, one copy there) ride; `notforx` (two copies at
+    /// home, its floor met) is staged but has no need at offsite. The plan
+    /// warns of `atx`'s copy at offsite alone, worded for a tape still to be
+    /// moved. Positive controls: the collection budget's own warning, judged
+    /// over every staged set at L1's present shelf, names `athome` and
+    /// `notforx` at home, so the fixture has what the old warning saw; and
+    /// with L1 at offsite already the plan says it is there.
+    #[test]
+    fn the_plans_shared_place_warning_judges_the_sets_for_x_at_x() {
+        let c = Cat::new();
+        c.conn
+            .execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')
+                  WHERE label = 'L1'",
+                [],
+            )
+            .unwrap();
+        let h1 = c.tape("H1", Some("home"));
+        let h2 = c.tape("H2", Some("home"));
+        let o1 = c.tape("O1", Some("offsite"));
+        let copied_and_staged = |name: &str, holders: &[i64]| -> (i64, i64) {
+            let u = c.unit(name, "active", None);
+            let v = c.version(u, 1, "current");
+            let written = c.set(v, &[MIB], "cleaned", false);
+            for &h in holders {
+                c.whole(written, h, 1);
+            }
+            (u, c.set(v, &[MIB], "staged", true))
+        };
+        copied_and_staged("athome", &[h1]);
+        let (atx, _) = copied_and_staged("atx", &[o1]);
+        c.targets(atx, r#"{"offsite": 2}"#);
+        copied_and_staged("notforx", &[h1, h2]);
+
+        let plan = c.plan("offsite").unwrap();
+        assert_eq!(names(&plan.planned), ["\"atx\" v1", "\"athome\" v1"]);
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let w = &plan.warnings[0];
+        assert!(
+            w.contains("volume \"L1\" is moved to location \"offsite\" after this write"),
+            "{w}"
+        );
+        assert!(w.contains("atx v1 (volume \"O1\")"), "{w}");
+        assert!(!w.contains("athome") && !w.contains("notforx"), "{w}");
+
+        let budget = crate::collection::plan::destination_budget(
+            &c.conn,
+            &c.config,
+            "/dev/null",
+            &["L1".to_string()],
+        )
+        .unwrap();
+        assert_eq!(budget.warnings.len(), 1, "{:?}", budget.warnings);
+        let old = &budget.warnings[0];
+        assert!(
+            old.contains("volume \"L1\" is at location \"home\""),
+            "{old}"
+        );
+        assert!(
+            old.contains("athome v1 (volume \"H1\")") && old.contains("notforx v1 (volume \"H1\")"),
+            "{old}"
+        );
+
+        c.conn
+            .execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'offsite')
+                  WHERE label = 'L1'",
+                [],
+            )
+            .unwrap();
+        let there = c.plan("offsite").unwrap();
+        assert_eq!(there.warnings.len(), 1, "{:?}", there.warnings);
+        assert!(
+            there.warnings[0].contains("volume \"L1\" is at location \"offsite\"")
+                && there.warnings[0].contains("atx v1 (volume \"O1\")"),
+            "{}",
+            there.warnings[0]
         );
     }
 
