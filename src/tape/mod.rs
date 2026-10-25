@@ -15,5 +15,6 @@ pub mod media_detect;
 pub mod mtget_journal;
 pub mod poll;
 pub mod read_errors;
+pub mod same_load;
 pub mod st_stats;
 pub mod wear;

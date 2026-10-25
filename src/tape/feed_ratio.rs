@@ -102,13 +102,15 @@
 //! same load (same cartridge, same MAM load count) — `volume init`'s sweep for
 //! `volume write --init` — or less zero when the write is the first contact
 //! of its load on an HP drive. Anything else is not known, and no correction
-//! cause is named.
+//! cause is named. The rule is [`crate::tape::same_load`]'s, the one
+//! `read_errors` takes page 0x03 across a verify by (#495).
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use tracing::warn;
 
 use crate::db::events;
 use crate::error::Result;
+use crate::tape::same_load::{self, LoadBaseline};
 
 /// Warn when the drive used more than this many bytes of native capacity
 /// per byte of data sent.
@@ -284,17 +286,9 @@ impl Corrections {
 /// The page 0x02 a contact's sweep journalled, parsed. The newest successful
 /// decode, as [`journalled_0x0c_decode`] takes page 0x0c's.
 fn journalled_0x02(conn: &Connection, contact_id: i64) -> Result<Option<WriteCounters>> {
-    let decoded: Option<String> = conn
-        .query_row(
-            "SELECT decoded FROM log_page_journal
-              WHERE contact_id = ?1 AND page_code = 0x02 AND subpage_code = 0
-                AND ok = 1 AND decoded IS NOT NULL
-              ORDER BY id DESC LIMIT 1",
-            [contact_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(decoded.as_deref().map(WriteCounters::from_decoded_0x02))
+    Ok(same_load::journalled_decode(conn, contact_id, 0x02)?
+        .as_deref()
+        .map(WriteCounters::from_decoded_0x02))
 }
 
 /// What page 0x02 read before a contact's write, when it is known.
@@ -306,85 +300,18 @@ enum Baseline {
     Contact(i64, WriteCounters),
 }
 
-/// A contact's drive, cartridge and MAM load count, each as recorded.
-struct ContactLoad {
-    drive_id: Option<i64>,
-    cartridge_id: Option<i64>,
-    chip_load_count: Option<i64>,
-}
-
 /// What page 0x02 read before this contact's write ([`Baseline`]), `None`
-/// when it is not known.
-///
-/// The previous contact is the one immediately before this one on the same
-/// drive (`cartridge_contacts.drive_id`), never an older one: a contact
-/// between them that took no sweep may have written. It is in the same load
-/// when it names the same cartridge and the same MAM load count
-/// (`chip_load_count`), and then its page 0x02 is the baseline, or nothing is
-/// known if it journalled none. A previous contact on another cartridge or
-/// load count, or none at all, makes this the first contact of its load: the
-/// baseline is zero on an HP drive (HP-V3 p63: "cleared when the tape is
-/// unloaded"), and not known on another vendor's, whose page 0x02 has no such
-/// statement behind it. A NULL drive, cartridge or load count on either side
-/// is not known.
+/// when it is not known: the shared same-load rule
+/// ([`same_load::same_load_baseline`], one rule for page 0x02 here and page
+/// 0x03 in `read_errors`), and the previous contact's journalled page 0x02
+/// when that rule names one — or nothing known if it journalled none.
 fn baseline_0x02(conn: &Connection, contact_id: i64) -> Result<Option<Baseline>> {
-    let row = |r: &rusqlite::Row<'_>| {
-        Ok(ContactLoad {
-            drive_id: r.get(0)?,
-            cartridge_id: r.get(1)?,
-            chip_load_count: r.get(2)?,
-        })
-    };
-    let this = conn
-        .query_row(
-            "SELECT drive_id, cartridge_id, chip_load_count FROM cartridge_contacts
-              WHERE id = ?1",
-            [contact_id],
-            row,
-        )
-        .optional()?;
-    let Some(ContactLoad {
-        drive_id: Some(drive_id),
-        cartridge_id: Some(cartridge_id),
-        chip_load_count: Some(load_count),
-    }) = this
-    else {
-        return Ok(None);
-    };
-    let vendor: Option<String> = conn
-        .query_row("SELECT vendor FROM drives WHERE id = ?1", [drive_id], |r| {
-            r.get(0)
-        })
-        .optional()?
-        .flatten();
-    let first_of_load =
-        crate::tape::log_pages::is_hp_vendor(vendor.as_deref()).then_some(Baseline::LoadZero);
-    let previous: Option<(i64, ContactLoad)> = conn
-        .query_row(
-            "SELECT id, drive_id, cartridge_id, chip_load_count FROM cartridge_contacts
-              WHERE drive_id = ?1 AND id < ?2
-              ORDER BY id DESC LIMIT 1",
-            rusqlite::params![drive_id, contact_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    ContactLoad {
-                        drive_id: r.get(1)?,
-                        cartridge_id: r.get(2)?,
-                        chip_load_count: r.get(3)?,
-                    },
-                ))
-            },
-        )
-        .optional()?;
-    let Some((prev, load)) = previous else {
-        return Ok(first_of_load);
-    };
-    Ok(match (load.cartridge_id, load.chip_load_count) {
-        (Some(other), _) if other != cartridge_id => first_of_load,
-        (Some(_), Some(loads)) if loads != load_count => first_of_load,
-        (Some(_), Some(_)) => journalled_0x02(conn, prev)?.map(|c| Baseline::Contact(prev, c)),
-        _ => None,
+    Ok(match same_load::same_load_baseline(conn, contact_id)? {
+        LoadBaseline::LoadZero => Some(Baseline::LoadZero),
+        LoadBaseline::Contact(prev) => {
+            journalled_0x02(conn, prev)?.map(|c| Baseline::Contact(prev, c))
+        }
+        LoadBaseline::Unknown => None,
     })
 }
 
@@ -664,16 +591,7 @@ pub fn from_decoded_0x0c(decoded_0x0c: Option<&str>, data_bytes: u64) -> Option<
 /// a failed decode is `None`: the row exists, but says nothing about
 /// capacity.
 pub fn journalled_0x0c_decode(conn: &Connection, contact_id: i64) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT decoded FROM log_page_journal
-              WHERE contact_id = ?1 AND page_code = 0x0c AND subpage_code = 0
-                AND ok = 1 AND decoded IS NOT NULL
-              ORDER BY id DESC LIMIT 1",
-            [contact_id],
-            |r| r.get(0),
-        )
-        .optional()?)
+    same_load::journalled_decode(conn, contact_id, 0x0c)
 }
 
 /// Compute the write's feed ratio from the journal and record it as an
