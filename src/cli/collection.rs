@@ -86,7 +86,8 @@ pub enum CollectionCommands {
 
     /// Execute one batch: stage every unit in it once, write one session to
     /// the destination label, then release staging IF that copy already
-    /// satisfies every unit's resolved `min_copies` — otherwise staging is
+    /// meets every unit's copy floor (the larger of its policy's
+    /// `min_copies` and the sum of its `copies_at` targets) — otherwise staging is
     /// retained for the further copies still needed. Targets a
     /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
