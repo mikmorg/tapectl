@@ -1174,10 +1174,12 @@ pub fn tape_only_multiplier(config: &crate::config::Config, unit_status: &str) -
     }
 }
 
-/// A copy floor `base` (a resolved `min_copies`) as a unit of status
-/// `unit_status` must meet it: `base ×` [`tape_only_multiplier`]. Never hand
-/// it a count of distinct places: those are not multiplied (ADR-0012
-/// 2026-10-12 item 46).
+/// A copy floor `base` as a unit of status `unit_status` must meet it: `base
+/// ×` [`tape_only_multiplier`]. `base` is the unit's
+/// [`crate::policy::ResolvedPolicy::copy_floor_base`] (the larger of
+/// `min_copies` and the `copies_at` sum, #493 item 149; never `min_copies`
+/// read on its own). Never hand it a count of distinct places: those are not
+/// multiplied (ADR-0012 2026-10-12 item 46).
 pub fn copy_floor(config: &crate::config::Config, base: i64, unit_status: &str) -> i64 {
     base * tape_only_multiplier(config, unit_status)
 }
@@ -1611,7 +1613,7 @@ pub fn shortfall(
     )?;
     Ok(Shortfall {
         copies,
-        min_copies: copy_floor(config, resolved.min_copies, unit_status),
+        min_copies: copy_floor(config, resolved.copy_floor_base(), unit_status),
         missing_locations: missing_names(&short),
         thin_locations: short.into_iter().filter(|(_, n)| *n > 0).collect(),
         per_name,

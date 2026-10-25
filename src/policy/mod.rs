@@ -82,6 +82,26 @@ pub struct ResolvedPolicy {
     pub copies_at: BTreeMap<String, i64>,
 }
 
+impl ResolvedPolicy {
+    /// **The** copy floor's base, before the tape-only multiplier (#493,
+    /// ADR-0012 item 149): the larger of `min_copies` and the sum of the
+    /// per-location targets in [`Self::copies_at`]. `min_copies` stays the
+    /// total floor; a map whose targets add up to more raises it, since a
+    /// copy is on one shelf and so can meet one location's target only.
+    /// With an empty map it is `min_copies`, today's floor exactly.
+    ///
+    /// Every copy floor goes through this and then
+    /// [`coverage::copy_floor`] (which multiplies it for a tape-only unit,
+    /// item 46): never read `min_copies` as a floor directly.
+    pub fn copy_floor_base(&self) -> i64 {
+        let targets = self
+            .copies_at
+            .values()
+            .fold(0i64, |sum, n| sum.saturating_add(*n));
+        self.min_copies.max(targets)
+    }
+}
+
 /// Resolve the effective policy for a unit.
 ///
 /// Resolution order (first non-NULL wins):
@@ -754,6 +774,31 @@ mod tests {
         assert!(p.required_locations.is_empty());
         // 365 days with no archive set and no `[defaults]` key (ADR-0012 item 75).
         assert_eq!(p.verify_interval_days, Some(365));
+    }
+
+    /// #493 (ADR-0012 item 149): the copy floor's base is the larger of
+    /// `min_copies` and the map's sum. With no map it is `min_copies`
+    /// exactly; a map adding up to less leaves `min_copies` the floor; one
+    /// adding up to more raises it. A 0 target adds nothing.
+    #[test]
+    fn the_copy_floor_base_is_the_larger_of_min_copies_and_the_maps_sum() {
+        let conn = fresh_conn();
+        let mut p = resolve(&conn, &Config::default(), &make_unit(None, None)).unwrap();
+        assert!(p.copies_at.is_empty());
+        assert_eq!(p.copy_floor_base(), 2, "no map: min_copies, as before");
+
+        p.copies_at = BTreeMap::from([("home".to_string(), 1)]);
+        assert_eq!(p.copy_floor_base(), 2, "a sum below min_copies");
+
+        p.copies_at = BTreeMap::from([
+            ("home".to_string(), 2),
+            ("offsite".to_string(), 1),
+            ("garage".to_string(), 0),
+        ]);
+        assert_eq!(p.copy_floor_base(), 3, "a sum above min_copies raises it");
+
+        p.min_copies = 5;
+        assert_eq!(p.copy_floor_base(), 5);
     }
 
     #[test]

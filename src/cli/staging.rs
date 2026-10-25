@@ -156,7 +156,7 @@ fn under_copied_release_candidates(
         // again by `volume read-slices`) are retained until it has
         // `min_copies` times the multiplier, the floor `audit` judges it by.
         let min_copies =
-            crate::policy::coverage::copy_floor(config, resolved.min_copies, &unit.status);
+            crate::policy::coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
         if copies < min_copies {
             under.push(UnderCopiedUnit {
                 unit_id: unit.id,

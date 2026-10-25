@@ -689,10 +689,14 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
         };
         let (min_copies, risk) = match crate::policy::resolve(conn, config, &unit) {
             Ok(p) => {
+                // The one copy floor (#493, ADR-0012 item 149: the larger of
+                // `min_copies` and the `copies_at` sum), as `audit` judges.
+                let floor =
+                    crate::policy::coverage::copy_floor(config, p.copy_floor_base(), &unit.status);
                 if copies == 0 {
-                    (Some(p.min_copies), FireRisk::NoCopies)
-                } else if copies < p.min_copies {
-                    (Some(p.min_copies), FireRisk::BelowMinimum)
+                    (Some(floor), FireRisk::NoCopies)
+                } else if copies < floor {
+                    (Some(floor), FireRisk::BelowMinimum)
                 } else {
                     continue;
                 }
@@ -1389,7 +1393,7 @@ pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<
                     Some(u) => match crate::policy::resolve(conn, config, &u) {
                         Ok(p) => Some(crate::policy::coverage::copy_floor(
                             config,
-                            p.min_copies,
+                            p.copy_floor_base(),
                             &u.status,
                         )),
                         Err(crate::error::TapectlError::PolicyUnresolvable { .. }) => None,
