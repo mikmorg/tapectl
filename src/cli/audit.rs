@@ -110,7 +110,7 @@ fn render(
 /// moment coverage/encryption/verify-age/escrow matter most, and `missing`
 /// ("source path gone, not yet declared tape-only") is the same situation
 /// with less paperwork.
-const ACTIVE_TAPE_ONLY_MISSING: &[&str] = &["active", "tape_only", "missing"];
+pub(crate) const ACTIVE_TAPE_ONLY_MISSING: &[&str] = &["active", "tape_only", "missing"];
 
 /// Everything a check function reads, gathered once per [`collect_findings`]
 /// call so no check needs its own `conn.prepare` boilerplate for context
@@ -228,8 +228,9 @@ const CHECKS: &[Check] = &[
     },
     Check {
         // Issue #425: the other half of `unit mark-tape-only`'s location
-        // gate. `location_presence` is the NAMES an archive set requires and
-        // returns early without any; this is `[defaults] min_locations`, a
+        // gate. `location_presence` is the per-location targets (the resolved
+        // `copies_at` map, an archive set's `required_locations` folded in,
+        // #493) and returns early without any; this is `[defaults] min_locations`, a
         // count of distinct places that applies to every tape-only unit, set
         // or not, and not multiplied (ADR-0012 2026-10-12 item 46) — the
         // sibling of `copy_count` for places. The row runs for every status
@@ -841,8 +842,13 @@ fn check_warehouse_copies(
 
 // Check location presence BY NAME (issue #348). Copies at two places that
 // are not the two the policy names do not satisfy it — the check used to
-// compare only the count. The predicate is `policy::coverage`'s, shared with
-// `unit mark-tape-only`'s location gate, so the two cannot disagree.
+// compare only the count. Since #493 (ADR-0012 items 149, 156 and 160) the
+// names and their counts are the resolved `copies_at` map, the one source of
+// per-location targets (an archive set's `required_locations` is folded into
+// it at one copy each), so a location the map asks 2 copies of needs 2, and a
+// name a dotfile's map replaced is not asked for. The predicate is
+// `policy::coverage::short_of_copies_at`, the one `--policy-aware` and
+// `report needs` judge by.
 fn check_location_presence(
     ctx: &Ctx<'_>,
     unit: &Unit,
@@ -850,29 +856,39 @@ fn check_location_presence(
 ) -> Result<Findings> {
     let resolved = policy.expect("location_presence is a needs_policy check");
     let mut f = Findings::default();
-    if resolved.required_locations.is_empty() {
+    if resolved.copies_at.values().all(|n| *n <= 0) {
         return Ok(f);
     }
 
-    // ADR-0012 2026-10-07 item 34: a tape-only unit needs the multiplier's
-    // copies at each name, as `snapshot mark-reclaimable` asks.
-    let per_name = policy::coverage::copies_per_named_location(ctx.config, &unit.status);
-    let short = policy::coverage::short_required_locations(
+    // ADR-0012 2026-10-07 item 34, item 149: a tape-only unit needs the
+    // multiplier's copies at each location, as `snapshot mark-reclaimable`
+    // asks.
+    let short = policy::coverage::short_of_copies_at(
         ctx.conn,
+        ctx.config,
         policy::coverage::NamedScope::Unit(unit.id),
-        &resolved.required_locations,
-        per_name,
+        resolved,
+        &unit.status,
+        None,
     )?;
-    let missing = policy::coverage::missing_names(&short);
+    let requires = policy::coverage::describe_targets(&resolved.copies_at);
+    let missing: Vec<&str> = short
+        .iter()
+        .filter(|s| s.copies == 0)
+        .map(|s| s.location.as_str())
+        .collect();
     if missing.is_empty() && !short.is_empty() {
-        let extra = format!(" && tapectl volume move <OTHER-LABEL> --to {}", short[0].0);
+        let extra = format!(
+            " && tapectl volume move <OTHER-LABEL> --to {}",
+            short[0].location
+        );
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "location_presence".into(),
             message: format!(
-                "has {} (tape-only {per_name}x) (policy requires {})",
-                policy::coverage::describe_named_shortfall(&short, per_name),
-                resolved.required_locations.join(", "),
+                "has {}{} (policy requires {requires})",
+                policy::coverage::describe_short_locations(&short),
+                policy::coverage::tape_only_note(ctx.config, &unit.status),
             ),
             action: additional_copy_action(ctx.conn, unit, &extra)?,
         });
@@ -893,10 +909,9 @@ fn check_location_presence(
             unit: unit.name.clone(),
             check: "location_presence".into(),
             message: format!(
-                "no copy at required location(s) {} (policy requires {}; copies are in \
+                "no copy at required location(s) {} (policy requires {requires}; copies are in \
                  {location_count} location(s))",
                 missing.join(", "),
-                resolved.required_locations.join(", "),
             ),
             action: additional_copy_action(ctx.conn, unit, &extra)?,
         });
@@ -4775,6 +4790,70 @@ mod tests {
                     .all(|f| f.check != "copy_count" && f.check != "location_presence"),
                 "4 copies in 2 places meets a tape-only unit's floors at the defaults: \
                  {violations:?}"
+            );
+        }
+
+        /// #493 (ADR-0012 items 149, 156 and 160): `location_presence` judges
+        /// the resolved `copies_at` map. A dotfile map (frozen in the
+        /// catalog: the unit has no path) of `garage = 1, offsite = 2`
+        /// replaces the archive set's two names, so `home-rack` is no longer
+        /// asked for, `garage` is, and `offsite` needs two copies; and the
+        /// copy floor rises to the map's sum, 3.
+        #[test]
+        fn location_presence_judges_the_resolved_copies_at_map() {
+            let conn = setup(&["home-rack", "offsite"]);
+            let config = Config::default();
+            assert!(location_findings(&conn).is_empty(), "the set's names, met");
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"garage\":1,\"offsite\":2}'",
+                [],
+            )
+            .unwrap();
+
+            let findings = location_findings(&conn);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].message,
+                "no copy at required location(s) garage (policy requires 1 at garage, \
+                 2 at offsite; copies are in 2 location(s))"
+            );
+            assert!(
+                findings[0]
+                    .action
+                    .ends_with("tapectl volume move <OTHER-LABEL> --to garage"),
+                "{}",
+                findings[0].action
+            );
+            assert_eq!(
+                copy_findings(&conn, &config)[0].message,
+                "has 2 copies, needs 3",
+                "the floor is the larger of min_copies (2) and the map's sum (3)"
+            );
+
+            add_copy_at(&conn, "V-garage", "garage");
+            let findings = location_findings(&conn);
+            assert_eq!(
+                findings[0].message,
+                "has 1 copy at required location offsite, needs 2 \
+                 (policy requires 1 at garage, 2 at offsite)",
+                "an active unit's own target of 2, with no tape-only note"
+            );
+            assert!(findings[0]
+                .action
+                .ends_with("tapectl volume move <OTHER-LABEL> --to offsite"));
+
+            // `home-rack`'s copy is not what meets the map: retired, the map
+            // is still met once `offsite` holds two.
+            add_copy_at(&conn, "V-offsite-2", "offsite");
+            conn.execute(
+                "UPDATE volumes SET status = 'retired' WHERE label = 'V-home-rack'",
+                [],
+            )
+            .unwrap();
+            assert!(location_findings(&conn).is_empty());
+            assert!(
+                copy_findings(&conn, &config).is_empty(),
+                "3 copies, floor 3"
             );
         }
     }
