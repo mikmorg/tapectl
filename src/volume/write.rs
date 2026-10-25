@@ -8609,8 +8609,14 @@ fn find_staged_data(
                 |r| r.get(0),
             )?;
             if policy.allow_spanning || has_range {
-                let (slices, span, class) =
-                    plan_span_set(conn, config, ss_id, &unit, policy.min_copies, snap_ver)?;
+                let (slices, span, class) = plan_span_set(
+                    conn,
+                    config,
+                    ss_id,
+                    &unit,
+                    policy.copy_floor_base(),
+                    snap_ver,
+                )?;
                 if !slices.is_empty() {
                     batch.units.push(BuildUnit {
                         stage_set_id: ss_id,
