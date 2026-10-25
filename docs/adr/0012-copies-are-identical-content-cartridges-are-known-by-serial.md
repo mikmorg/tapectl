@@ -2252,3 +2252,19 @@ Ruled 2026-10-25, write shaping after the drive phase (#488; `docs/research/2026
      with a correction jump gets a cleaning first. #488 closes once item 170 is built.
 173. **No CPU reservation on home2 for tape commands** (decision 8). R11 never ran and every write
      since 1.1.0 streamed on a quiet host; the quiet-host rule stays the lever.
+
+Ruled 2026-10-25 (later), Logical Block Protection's two forks from its build plan (#388):
+
+174. **A write error with LBP armed is retried once, in place** (amends item 166). LBP refusals are
+     data damaged before the drive, which refuses the block before writing it, so there is no bad
+     tape area to skip, and Layout v2's front index fixes every file's position, so a skip or an
+     extra filemark is never made. On a write `EIO` while LBP is armed (st cannot tell a refusal
+     from another error), tapectl reads the drive's position, finds the file holding the first
+     block the drive did not accept, returns to that file's planned start
+     (`Store::reposition_for_resume`) and writes on from there, from staging, with fresh hashes and
+     CRCs. Every re-sent block is checked by the drive again, so a retry cannot land bad data. A
+     second failure in the session leaves it `interrupted`, as a failed write is today (#408), for
+     `volume resume` once the operator has checked the host-to-drive path; the message says so.
+175. **If the HP drive returns no valid CRC for blocks written without LBP**, LBP_R is armed only for
+     the confirm of a session that wrote with LBP, never for `volume verify` or a restore. The
+     build carries the switch; the probe on EW7VWMVKF6 decides it.
