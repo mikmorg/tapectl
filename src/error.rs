@@ -449,6 +449,17 @@ pub enum TapectlError {
     #[error("tape full: {0}")]
     MediumFull(String),
 
+    /// #388 (ADR-0012 items 166, 174): a tape write failed with EIO while
+    /// Logical Block Protection was armed, from a block write or a filemark.
+    /// With LBP armed this is how the drive reports a block whose CRC did not
+    /// match the bytes it received, and st cannot tell it from any other
+    /// EIO, so every such error is classified so. A write session retries
+    /// once, from the planned start of the file holding the first block the
+    /// drive did not accept, and leaves the session `interrupted` on a second
+    /// (item 174); anywhere else it is a tape I/O error like any other.
+    #[error("tape write refused with Logical Block Protection armed: {0}")]
+    LbpRefusal(String),
+
     /// Issue #408: reading a STAGED file (the source of a tape write)
     /// failed — the disk, not the tape. Named apart from [`Self::TapeIo`],
     /// which it used to be reported as, so the operator looks at the right
