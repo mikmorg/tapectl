@@ -123,6 +123,7 @@ Accepted by every command, before or after the subcommand.
 | [`report`](report.md) | Generate reports |
 | &nbsp;&nbsp;[`report summary`](report.md#tapectl-report-summary) | Overview: units, tapes, tenants, capacity |
 | &nbsp;&nbsp;[`report fire-risk`](report.md#tapectl-report-fire-risk) | Units at risk: below min copies/locations |
+| &nbsp;&nbsp;[`report needs`](report.md#tapectl-report-needs) | Each unit's copy target, copies and shortfall at every location |
 | &nbsp;&nbsp;[`report copies`](report.md#tapectl-report-copies) | Copy count distribution per unit |
 | &nbsp;&nbsp;[`report tape-only`](report.md#tapectl-report-tape-only) | Tape-only unit status |
 | &nbsp;&nbsp;[`report dirty`](report.md#tapectl-report-dirty) | Units with changes since last snapshot |
