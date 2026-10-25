@@ -12,6 +12,25 @@ pub enum ReportCommands {
     Summary,
     /// Units at risk: below min copies/locations
     FireRisk,
+    /// Each unit's copy target, copies and shortfall at every location
+    ///
+    /// A unit's targets are its resolved `copies_at` map (an archive set's
+    /// `required_locations` counts as one copy at each name), raised by the
+    /// tape-only multiplier for a tape-only unit, and its copy floor is the
+    /// larger of `min_copies` and the map's sum. Lists the units that have a
+    /// target or are short of their copy floor; `--all` lists every unit.
+    ///
+    /// With `--location`, only that location, and each unit's need there:
+    /// group 1 when its target there is unmet, group 2 when it is short of
+    /// its copy floor with no target there and no copy there yet.
+    Needs {
+        /// Only this location, with each unit's need there
+        #[arg(long)]
+        location: Option<String>,
+        /// Every unit, not only those with a target or a copy shortfall
+        #[arg(long)]
+        all: bool,
+    },
     /// Copy count distribution per unit
     Copies {
         /// Filter to specific unit
@@ -103,6 +122,9 @@ pub fn run(
     match command {
         ReportCommands::Summary => report_summary(conn, config, json_output),
         ReportCommands::FireRisk => report_fire_risk(conn, config, json_output),
+        ReportCommands::Needs { location, all } => {
+            report_needs(conn, config, location.as_deref(), *all, json_output)
+        }
         ReportCommands::Copies { unit } => report_copies(conn, unit.as_deref(), json_output),
         ReportCommands::TapeOnly { unit } => report_tape_only(conn, unit.as_deref(), json_output),
         ReportCommands::Dirty { unit } => report_dirty(
@@ -783,6 +805,307 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                     );
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// One location of a [`NeedsRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeedsLocation {
+    pub location: String,
+    /// The unit's target there, times the tape-only multiplier for a
+    /// tape-only unit (`coverage::location_target`); 0 is no target.
+    pub target: i64,
+    /// The unit's copies there (`coverage::copies_at_expr`).
+    pub copies: i64,
+}
+
+impl NeedsLocation {
+    fn short(&self) -> i64 {
+        (self.target - self.copies).max(0)
+    }
+}
+
+/// One unit of `report needs` (#493, ADR-0012 item 160).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeedsRow {
+    pub unit: String,
+    pub status: String,
+    /// Its copies in all (`coverage::copy_count_expr`).
+    pub copies: i64,
+    /// Its copy floor (`coverage::copy_floor` of `copy_floor_base`), `None`
+    /// when its policy would not resolve.
+    pub floor: Option<i64>,
+    /// The tape-only multiplier its floor and targets were raised by.
+    pub multiplier: i64,
+    /// Every registered location (and any its map names that is not one), or
+    /// only `--location`'s, in name order.
+    pub locations: Vec<NeedsLocation>,
+    /// With `--location`, its need there (item 158's groups).
+    pub need: Option<crate::policy::coverage::NeedAt>,
+    /// Why its policy would not resolve, as `audit` reports it.
+    pub unresolvable: Option<String>,
+}
+
+impl NeedsRow {
+    fn floor_short(&self) -> i64 {
+        self.floor.map_or(0, |f| (f - self.copies).max(0))
+    }
+}
+
+/// `report needs`'s rows (#493, ADR-0012 item 160): each unit `audit` checks
+/// (active, tape-only, missing — a tape-only unit is exactly where location
+/// policy matters, item 148) with its target, copies and shortfall at every
+/// location, or at `location` with its [`NeedAt`] group there.
+///
+/// Listed: a unit with a target (at `location`, when given) or short of its
+/// copy floor, every unit with `all`, and always one whose policy would not
+/// resolve (its coverage cannot be judged, so it is never left out silently).
+/// The per-location half is judged by the rule `audit`'s `location_presence`
+/// uses (`coverage::location_target`), from counts fetched for the whole
+/// catalog in one pass each: four statements, then each unit's
+/// `policy::resolve`.
+///
+/// [`NeedAt`]: crate::policy::coverage::NeedAt
+pub(crate) fn needs_rows(
+    conn: &Connection,
+    config: &Config,
+    location: Option<&str>,
+    all: bool,
+) -> Result<Vec<NeedsRow>> {
+    use crate::policy::coverage;
+
+    let known: Vec<String> = conn
+        .prepare("SELECT name FROM locations ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let location = location.map(str::trim);
+    if let Some(x) = location {
+        if !known.iter().any(|k| k == x) {
+            let list = if known.is_empty() {
+                "no locations are defined yet — add one with `tapectl location add <NAME>`"
+                    .to_string()
+            } else {
+                format!("known locations: {}", known.join(", "))
+            };
+            return Err(crate::error::TapectlError::Other(format!(
+                "location \"{x}\" not found ({list})"
+            )));
+        }
+    }
+
+    let copies_by_unit: std::collections::HashMap<i64, i64> = conn
+        .prepare(&format!(
+            "SELECT u.id, {} FROM units u",
+            coverage::copy_count_expr(&coverage::CoverageQuery::current_unit("u.id"))
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let at_by_unit = coverage::copies_at_every_location_by_unit(conn)?;
+    let no_copies = std::collections::BTreeMap::new();
+
+    let mut rows = Vec::new();
+    for unit in queries::list_units(conn, None, None)? {
+        if !crate::cli::audit::ACTIVE_TAPE_ONLY_MISSING.contains(&unit.status.as_str()) {
+            continue;
+        }
+        let copies = copies_by_unit.get(&unit.id).copied().unwrap_or(0);
+        let at = at_by_unit.get(&unit.id).unwrap_or(&no_copies);
+        let multiplier = coverage::tape_only_multiplier(config, &unit.status);
+        let resolved = match crate::policy::resolve(conn, config, &unit) {
+            Ok(p) => p,
+            Err(e @ crate::error::TapectlError::PolicyUnresolvable { .. }) => {
+                rows.push(NeedsRow {
+                    unit: unit.name.clone(),
+                    status: unit.status.clone(),
+                    copies,
+                    floor: None,
+                    multiplier,
+                    locations: Vec::new(),
+                    need: None,
+                    unresolvable: Some(e.to_string()),
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let names: Vec<String> = match location {
+            Some(x) => vec![x.to_string()],
+            None => {
+                let mut names: std::collections::BTreeSet<String> = known.iter().cloned().collect();
+                names.extend(resolved.copies_at.keys().cloned());
+                names.into_iter().collect()
+            }
+        };
+        let locations: Vec<NeedsLocation> = names
+            .into_iter()
+            .map(|name| NeedsLocation {
+                target: coverage::location_target(config, &resolved, &name, &unit.status),
+                copies: at.get(&name).copied().unwrap_or(0),
+                location: name,
+            })
+            .collect();
+        let shortfall = coverage::Shortfall::judge(config, &resolved, &unit.status, copies, at);
+        let need = location.map(|x| {
+            coverage::NeedAt::judge(
+                config,
+                &resolved,
+                &unit.status,
+                x,
+                copies,
+                at.get(x).copied().unwrap_or(0),
+            )
+        });
+        let has_target = locations.iter().any(|l| l.target > 0);
+        if !(all || has_target || shortfall.under_copied()) {
+            continue;
+        }
+        rows.push(NeedsRow {
+            unit: unit.name.clone(),
+            status: unit.status.clone(),
+            copies,
+            floor: Some(shortfall.min_copies),
+            multiplier,
+            locations,
+            need,
+            unresolvable: None,
+        });
+    }
+    Ok(rows)
+}
+
+/// `report needs`'s text form, separate from the printing so a test pins the
+/// wording.
+fn needs_text_lines(rows: &[NeedsRow], location: Option<&str>) -> Vec<String> {
+    use crate::policy::coverage::NeedAt;
+
+    let copies_noun = |n: i64| if n == 1 { "copy" } else { "copies" };
+    let mut lines = Vec::new();
+    if rows.is_empty() {
+        lines.push(match location {
+            Some(x) => {
+                format!("needs at {x}: no unit has a target there or is short of its copy floor")
+            }
+            None => "needs: no unit has a copy target or is short of its copy floor".to_string(),
+        });
+        return lines;
+    }
+    lines.push(match location {
+        Some(x) => format!("needs at {x} ({} unit(s)):", rows.len()),
+        None => format!("needs per location ({} unit(s)):", rows.len()),
+    });
+    for r in rows {
+        let Some(floor) = r.floor else {
+            lines.push(format!(
+                "  {} ({}): {} {} — POLICY UNRESOLVABLE, needs NOT checked ({})",
+                r.unit,
+                r.status,
+                r.copies,
+                copies_noun(r.copies),
+                r.unresolvable.as_deref().unwrap_or("")
+            ));
+            continue;
+        };
+        let note = if r.multiplier > 1 {
+            format!(" (tape-only {}x)", r.multiplier)
+        } else {
+            String::new()
+        };
+        let mut floor_text = format!("{} of {floor} copies{note}", r.copies);
+        if r.floor_short() > 0 {
+            floor_text.push_str(&format!(", {} short", r.floor_short()));
+        }
+        let at = |l: &NeedsLocation, here: &str| {
+            let target = if l.target > 0 {
+                format!("target {}", l.target)
+            } else {
+                "no target".to_string()
+            };
+            let short = if l.short() > 0 {
+                format!(", {} short", l.short())
+            } else {
+                String::new()
+            };
+            format!(
+                "{target}, {} {}{here}{short}",
+                l.copies,
+                copies_noun(l.copies)
+            )
+        };
+        match (location, r.locations.first()) {
+            (Some(_), Some(l)) => {
+                let group = match r.need {
+                    Some(NeedAt::Target { .. }) => " — group 1: its target here is unmet",
+                    Some(NeedAt::Floor { .. }) => {
+                        " — group 2: short of its copy floor, no target and no copy here"
+                    }
+                    _ => "",
+                };
+                lines.push(format!(
+                    "  {} ({}): {}; {floor_text}{group}",
+                    r.unit,
+                    r.status,
+                    at(l, " here")
+                ));
+            }
+            _ => {
+                lines.push(format!("  {} ({}): {floor_text}", r.unit, r.status));
+                for l in &r.locations {
+                    lines.push(format!("    {}: {}", l.location, at(l, "")));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// `report needs --json`, separate from the printing so a test pins it.
+/// `floor` is null and `policy_unresolvable` the reason when a unit's policy
+/// would not resolve; `group` is item 158's (1, 2 or null) with `--location`,
+/// null without it.
+fn needs_json(rows: &[NeedsRow], location: Option<&str>) -> serde_json::Value {
+    let units: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "unit": r.unit,
+                "status": r.status,
+                "copies": r.copies,
+                "floor": r.floor,
+                "floor_short": r.floor_short(),
+                "multiplier": r.multiplier,
+                "locations": r.locations.iter().map(|l| serde_json::json!({
+                    "location": l.location,
+                    "target": l.target,
+                    "copies": l.copies,
+                    "short": l.short(),
+                })).collect::<Vec<_>>(),
+                "group": r.need.and_then(|n| n.group()),
+                "policy_unresolvable": r.unresolvable,
+            })
+        })
+        .collect();
+    serde_json::json!({ "location": location, "units": units })
+}
+
+fn report_needs(
+    conn: &Connection,
+    config: &Config,
+    location: Option<&str>,
+    all: bool,
+    json_output: bool,
+) -> Result<()> {
+    let rows = needs_rows(conn, config, location, all)?;
+    let location = location.map(str::trim);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&needs_json(&rows, location)).unwrap()
+        );
+    } else {
+        for line in needs_text_lines(&rows, location) {
+            println!("{line}");
         }
     }
     Ok(())
@@ -7116,6 +7439,242 @@ Read error counter page  [0x3]
             assert!(rows.is_empty());
             assert_eq!(failed_stages_lines(&rows), ["no failed stages recorded"]);
             assert_eq!(failed_stages_json(&rows)["total_hours_lost"], 0.0);
+        }
+    }
+
+    /// `report needs` (#493, ADR-0012 item 160): each unit's target, copies
+    /// and shortfall per location, and item 158's group with `--location`.
+    mod needs {
+        use super::*;
+        use crate::policy::coverage::tests::setup_unit_with_deposit;
+
+        /// `photos` (a tape at `home` and its deposit at `glacier`: 2 copies,
+        /// the default floor, no target) and `docs` (never archived: 0 copies,
+        /// short of its floor, no target), with `offsite` registered too.
+        fn fixture() -> Connection {
+            let (conn, _unit, _vol) = setup_unit_with_deposit("active");
+            conn.execute_batch(
+                "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');
+                 INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-docs', 'docs', 1, 'mtime_size', 1, 'active');",
+            )
+            .unwrap();
+            conn
+        }
+
+        /// `photos` gets a dotfile map, frozen in the catalog (it has no path,
+        /// so `policy::resolve` reads the frozen layer).
+        fn give_photos_a_map(conn: &Connection, json: &str) {
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = ?1 WHERE name = 'photos'",
+                [json],
+            )
+            .unwrap();
+        }
+
+        fn names(rows: &[NeedsRow]) -> Vec<&str> {
+            rows.iter().map(|r| r.unit.as_str()).collect()
+        }
+
+        /// With no map anywhere only a unit short of its floor is listed, and
+        /// `--all` lists the rest.
+        #[test]
+        fn only_units_with_a_target_or_a_floor_shortfall_are_listed() {
+            let conn = fixture();
+            let config = Config::default();
+            let rows = needs_rows(&conn, &config, None, false).unwrap();
+            assert_eq!(names(&rows), ["docs"]);
+            assert_eq!((rows[0].copies, rows[0].floor), (0, Some(2)));
+            assert_eq!(
+                names(&needs_rows(&conn, &config, None, true).unwrap()),
+                ["docs", "photos"]
+            );
+
+            give_photos_a_map(&conn, r#"{"home":1,"offsite":1}"#);
+            let rows = needs_rows(&conn, &config, None, false).unwrap();
+            assert_eq!(names(&rows), ["docs", "photos"], "photos has a target");
+            let at = |location: &str, target: i64, copies: i64| NeedsLocation {
+                location: location.to_string(),
+                target,
+                copies,
+            };
+            assert_eq!(
+                rows[1].locations,
+                vec![at("glacier", 0, 1), at("home", 1, 1), at("offsite", 1, 0)],
+                "every location, each with its target and copies"
+            );
+            assert_eq!(rows[1].floor, Some(2));
+        }
+
+        /// The text form, per location and at one location.
+        #[test]
+        fn the_text_form() {
+            let conn = fixture();
+            let config = Config::default();
+            give_photos_a_map(&conn, r#"{"home":1,"offsite":2}"#);
+            let rows = needs_rows(&conn, &config, None, false).unwrap();
+            assert_eq!(
+                needs_text_lines(&rows, None),
+                [
+                    "needs per location (2 unit(s)):",
+                    "  docs (active): 0 of 2 copies, 2 short",
+                    "    glacier: no target, 0 copies",
+                    "    home: no target, 0 copies",
+                    "    offsite: no target, 0 copies",
+                    "  photos (active): 2 of 3 copies, 1 short",
+                    "    glacier: no target, 1 copy",
+                    "    home: target 1, 1 copy",
+                    "    offsite: target 2, 0 copies, 2 short",
+                ]
+            );
+
+            let rows = needs_rows(&conn, &config, Some("offsite"), false).unwrap();
+            assert_eq!(
+                needs_text_lines(&rows, Some("offsite")),
+                [
+                    "needs at offsite (2 unit(s)):",
+                    "  docs (active): no target, 0 copies here; 0 of 2 copies, 2 short \
+                     — group 2: short of its copy floor, no target and no copy here",
+                    "  photos (active): target 2, 0 copies here, 2 short; 2 of 3 copies, \
+                     1 short — group 1: its target here is unmet",
+                ]
+            );
+
+            assert_eq!(
+                needs_text_lines(&[], None),
+                ["needs: no unit has a copy target or is short of its copy floor"]
+            );
+        }
+
+        /// `--location X`: item 158's groups. A target met at X is listed with
+        /// no group; a unit with no target at X that meets its floor is not
+        /// listed unless `--all`.
+        #[test]
+        fn location_gives_each_unit_its_group_there() {
+            let conn = fixture();
+            let config = Config::default();
+            give_photos_a_map(&conn, r#"{"home":1,"offsite":1}"#);
+            let groups = |x: &str, all: bool| -> Vec<(String, Option<u8>)> {
+                needs_rows(&conn, &config, Some(x), all)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.unit, r.need.and_then(|n| n.group())))
+                    .collect()
+            };
+            assert_eq!(
+                groups("offsite", false),
+                [
+                    ("docs".to_string(), Some(2)),
+                    ("photos".to_string(), Some(1))
+                ]
+            );
+            assert_eq!(
+                groups("home", false),
+                [("docs".to_string(), Some(2)), ("photos".to_string(), None)],
+                "photos' target at home is met"
+            );
+            assert_eq!(groups("glacier", false), [("docs".to_string(), Some(2))]);
+            assert_eq!(
+                groups("glacier", true),
+                [("docs".to_string(), Some(2)), ("photos".to_string(), None)]
+            );
+        }
+
+        /// The `--json` shape.
+        #[test]
+        fn the_json_form() {
+            let conn = fixture();
+            let config = Config::default();
+            give_photos_a_map(&conn, r#"{"offsite":1}"#);
+            let rows = needs_rows(&conn, &config, Some("offsite"), false).unwrap();
+            let json = needs_json(&rows, Some("offsite"));
+            assert_eq!(json["location"], "offsite");
+            let photos = &json["units"][1];
+            assert_eq!(
+                *photos,
+                serde_json::json!({
+                    "unit": "photos", "status": "active", "copies": 2, "floor": 2,
+                    "floor_short": 0, "multiplier": 1,
+                    "locations": [
+                        {"location": "offsite", "target": 1, "copies": 0, "short": 1}
+                    ],
+                    "group": 1, "policy_unresolvable": null,
+                })
+            );
+            assert_eq!(json["units"][0]["group"], 2);
+            assert_eq!(json["units"][0]["floor_short"], 2);
+
+            let rows = needs_rows(&conn, &config, None, false).unwrap();
+            let json = needs_json(&rows, None);
+            assert_eq!(json["location"], serde_json::Value::Null);
+            assert_eq!(json["units"][1]["group"], serde_json::Value::Null);
+            assert_eq!(json["units"][1]["locations"].as_array().unwrap().len(), 3);
+        }
+
+        /// A tape-only unit's targets and floor are multiplied (2 by default).
+        #[test]
+        fn a_tape_only_units_targets_are_multiplied() {
+            let conn = fixture();
+            conn.execute(
+                "UPDATE units SET status = 'tape_only' WHERE name = 'photos'",
+                [],
+            )
+            .unwrap();
+            give_photos_a_map(&conn, r#"{"home":1}"#);
+            let rows = needs_rows(&conn, &Config::default(), Some("home"), false).unwrap();
+            let photos = rows.iter().find(|r| r.unit == "photos").unwrap();
+            assert_eq!((photos.floor, photos.multiplier), (Some(4), 2));
+            assert_eq!(photos.locations[0].target, 2);
+            assert_eq!(photos.locations[0].short(), 1);
+            assert_eq!(photos.need.unwrap().group(), Some(1));
+        }
+
+        /// An unregistered `--location` is refused by name; a unit whose
+        /// policy will not resolve is always listed, with the reason.
+        #[test]
+        fn an_unknown_location_is_refused_and_an_unresolvable_policy_listed() {
+            let conn = fixture();
+            let config = Config::default();
+            let err = needs_rows(&conn, &config, Some("nowhere"), false).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "location \"nowhere\" not found (known locations: glacier, home, offsite)"
+            );
+
+            give_photos_a_map(&conn, "not json");
+            let rows = needs_rows(&conn, &config, None, false).unwrap();
+            let photos = rows.iter().find(|r| r.unit == "photos").unwrap();
+            assert_eq!(photos.floor, None);
+            assert!(
+                photos
+                    .unresolvable
+                    .as_deref()
+                    .unwrap()
+                    .contains("unparseable frozen copies_at"),
+                "{photos:?}"
+            );
+            assert!(needs_text_lines(&rows, None)
+                .iter()
+                .any(|l| l.starts_with("  photos (active): 2 copies — POLICY UNRESOLVABLE")));
+        }
+
+        /// Through the dispatcher, both output modes.
+        #[test]
+        fn report_needs_runs_end_to_end() {
+            let conn = fixture();
+            let config = Config::default();
+            for json in [false, true] {
+                run(
+                    &conn,
+                    &config,
+                    &ReportCommands::Needs {
+                        location: Some("offsite".to_string()),
+                        all: true,
+                    },
+                    json,
+                )
+                .unwrap();
+            }
         }
     }
 }
