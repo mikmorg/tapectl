@@ -757,14 +757,34 @@ pub fn note_unavailable(device: &str, reason: &str, write_open: bool) {
     }
 }
 
-/// The note when an open found the page armed by someone else (§4.4).
-pub fn leftover_note(device: &str, node: &str) -> String {
+/// The note when an open found the page armed by someone else (§4.4):
+/// cleared at once by an open that does not arm, or re-armed for this
+/// command and cleared when it closes the drive.
+pub fn leftover_note(device: &str, node: &str, cleared_now: bool) -> String {
     format!(
         "note: the drive behind {device} ({node}) had its Logical Block Protection page \
          armed when tapectl opened it: a tapectl that crashed or was killed, or a hand-run \
          sg_wr_mode, left it so. Until it is cleared, other programs' reads of this drive \
-         (RESTORE.sh, dd) fail with I/O errors, never wrong data. tapectl clears it when this \
-         command closes the drive."
+         (RESTORE.sh, dd) fail with I/O errors, never wrong data. {}",
+        if cleared_now {
+            "tapectl has cleared it."
+        } else {
+            "tapectl clears it when this command closes the drive."
+        }
+    )
+}
+
+/// The operator text of an EIO on a write while LBP is armed
+/// ([`crate::error::TapectlError::LbpRefusal`]): what failed, and what an
+/// EIO means under LBP.
+pub fn refusal_text(what: &str, e: &io::Error) -> String {
+    format!(
+        "{what}: {e}. With Logical Block Protection armed this is how the drive refuses a block \
+         whose CRC did not match the bytes it received: a block changed between tapectl and \
+         the drive (memory, the HBA, the cable or the drive's buffer). A drive or medium error \
+         reads the same through st, and the refused block may be in an earlier file, since st \
+         and the drive write behind. The kernel log names a refusal \"logical block guard check \
+         failed\"."
     )
 }
 

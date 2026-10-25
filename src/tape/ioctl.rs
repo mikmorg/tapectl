@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 
 use crate::error::{Result, TapectlError};
+use crate::tape::lbp::{self, Protection};
 
 // Linux tape ioctl constants from <linux/mtio.h>
 const MTIOCTOP: nix::libc::Ioctl = 0x40086d01;
@@ -14,6 +16,19 @@ const MTIOCTOP: nix::libc::Ioctl = 0x40086d01;
 /// code casts a raw pointer through is a drift hazard of a nastier kind than
 /// most — a divergence would not fail to compile, it would read garbage.
 pub(crate) const MTIOCGET: nix::libc::Ioctl = 0x80306d02u32 as nix::libc::Ioctl;
+/// `_IOR('m', 3, struct mtpos)` from `<linux/mtio.h>`: st sends READ
+/// POSITION and answers the drive's logical object position — blocks and
+/// filemarks from the beginning of the tape (#388, ADR-0012 item 174: where
+/// a refused write left the drive). 64-bit `long`, as [`MTIOCGET`]'s layout
+/// assumes.
+const MTIOCPOS: nix::libc::Ioctl = 0x80086d03u32 as nix::libc::Ioctl;
+
+/// `struct mtpos` from `<linux/mtio.h>`.
+#[repr(C)]
+#[derive(Debug, Default)]
+struct MtPos {
+    mt_blkno: nix::libc::c_long,
+}
 
 // mtop operation codes
 const MTREW: i16 = 6;
@@ -253,11 +268,60 @@ pub struct TapeDevice {
     /// set ([`Self::fake_early_warning_at`]). `None` on every open but a
     /// write store's with the hook set.
     fake_warning: Option<crate::store::MediumEnd>,
+    /// The drive's Control Data Protection page while this open has it
+    /// armed (#388, ADR-0012 items 163-164): set by the open, cleared by
+    /// `Drop`.
+    lbp: Option<ArmedPage>,
+    /// What this open decided about Logical Block Protection: what a write
+    /// session records (migration 041).
+    protection: Protection,
+    /// The block size st holds now: [`Self::block_size`], or four bytes more
+    /// while a check puts the CRC on the wire.
+    st_block: usize,
+    /// The last st operation was a block write: the close writes the
+    /// filemark st's own close would, before it clears the page (§4.3).
+    pending_data: Cell<bool>,
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5): the block write, counted
+    /// from 1 since the open, whose CRC gets one bit flipped.
+    corrupt_block: Option<u64>,
+    /// Block writes sent since the open, for [`Self::corrupt_block`].
+    blocks_sent: Cell<u64>,
+    /// A test's record of every `MTIOCTOP` this device issues, in order,
+    /// beside the page commands of a recording page control (§4.3's close
+    /// order). `None` on every open: only a test over a plain file sets it.
+    /// Not compiled out of production builds, because this file's source
+    /// pins read everything before its test module as the device.
+    op_log: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
+/// The page an open armed, and the control that clears it.
+struct ArmedPage {
+    control: Box<dyn lbp::PageControl + Send>,
+    armed: lbp::Armed,
+}
+
+/// The close sequence (§4.3). Unarmed, the close reading alone, as before
+/// #388. Armed: the close reading (its `MTIOCGET` flushes st's write-behind
+/// buffer under the armed page); a synchronous filemark when the last st
+/// operation was a block write, which is the filemark st's own close would
+/// write and flushes the DRIVE's buffer while the page that wrote it is still
+/// armed (risk R6); the page put back as found and read back; the block size
+/// back to the format's. Nothing here panics: a failure is one loud line.
 impl Drop for TapeDevice {
     fn drop(&mut self) {
         self.note(crate::tape::mtget_journal::POINT_CLOSE, None, None);
+        if let Some(page) = self.lbp.take() {
+            if self.pending_data.get() {
+                let _ = self.mt_ioctl_raw(MTWEOF, 1);
+            }
+            if let Err(reason) = lbp::disarm(&*page.control, &page.armed) {
+                let line = lbp::clear_failed_line(&self.path, &reason);
+                tracing::warn!("{line}");
+                crate::progress::stderr_println(&line);
+                crate::progress::log(&line);
+            }
+            let _ = self.mt_ioctl_raw(MTSETBLK, self.block_size as i32);
+        }
     }
 }
 
@@ -326,18 +390,7 @@ impl TapeDevice {
             || OpenOptions::new().read(true).write(true).open(device_path),
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
-
-        let mut dev = Self {
-            file,
-            block_size,
-            path: device_path.to_string(),
-            recovered: Default::default(),
-            warning: EarlyWarningState::default(),
-            fake_warning: None,
-        };
-        dev.set_block_size(block_size)?;
-        dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
-        Ok(dev)
+        Self::open_with(file, device_path, block_size, true)
     }
 
     /// Open read-only.
@@ -347,7 +400,20 @@ impl TapeDevice {
             || OpenOptions::new().read(true).open(device_path),
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
+        Self::open_with(file, device_path, block_size, false)
+    }
 
+    /// Both opens, once st's exclusive open has succeeded (§2.2): the block
+    /// size, then Logical Block Protection (item 164: armed only inside st's
+    /// exclusive open, so no other process does data I/O on the drive while
+    /// it is), then the open reading — which therefore shows st at the wire
+    /// block size while armed.
+    fn open_with(
+        file: File,
+        device_path: &str,
+        block_size: usize,
+        write_open: bool,
+    ) -> Result<Self> {
         let mut dev = Self {
             file,
             block_size,
@@ -355,10 +421,225 @@ impl TapeDevice {
             recovered: Default::default(),
             warning: EarlyWarningState::default(),
             fake_warning: None,
+            lbp: None,
+            protection: Protection::NotApplicable,
+            st_block: block_size,
+            pending_data: Cell::new(false),
+            corrupt_block: None,
+            blocks_sent: Cell::new(0),
+            op_log: None,
         };
         dev.set_block_size(block_size)?;
+        let control =
+            lbp::control_for(device_path).map(|c| Box::new(c) as Box<dyn lbp::PageControl + Send>);
+        dev.arm_protection(write_open, lbp::LBP_R_POLICY, control);
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
+    }
+
+    /// Logical Block Protection for this open (items 162-165; F2: every
+    /// `TapeStore` open comes here). `policy` says what an open of this kind
+    /// arms ([`lbp::LbpReadPolicy::open_bits`]); variable-block mode arms
+    /// nothing. Never fails the open: a drive, an sg node or an st that
+    /// cannot take it is [`Protection::Unavailable`], warned once on a write
+    /// open (item 165) and logged on a read (F4). An open that arms nothing
+    /// still clears a page a crash left armed (§4.4).
+    fn arm_protection(
+        &mut self,
+        write_open: bool,
+        policy: lbp::LbpReadPolicy,
+        control: Option<Box<dyn lbp::PageControl + Send>>,
+    ) {
+        let bits = if self.block_size == 0 {
+            None
+        } else {
+            policy.open_bits(write_open)
+        };
+        let Some(control) = control else {
+            if bits.is_some() {
+                let reason = lbp::reason_no_sg_node(&self.path);
+                lbp::note_unavailable(&self.path, &reason, write_open);
+                self.protection = Protection::Unavailable(reason);
+            }
+            return;
+        };
+        let Some(bits) = bits else {
+            if let Ok(true) = lbp::clear_leftover(&*control) {
+                self.say_leftover(control.node(), true);
+            }
+            return;
+        };
+        let payload = self.block_size;
+        let armed = {
+            let this = &*self;
+            let mut set_block_size =
+                |n: usize| this.mt_ioctl(MTSETBLK, n as i32).map_err(|e| e.to_string());
+            // F12: one read of a wire block where the head is, before the
+            // store's rewind — st answers EBUSY/EOVERFLOW without sending it
+            // when the path cannot carry it.
+            let mut probe = |n: usize| {
+                let mut buf = vec![0u8; n];
+                (&this.file).read(&mut buf)
+            };
+            lbp::arm(&*control, bits, payload, &mut set_block_size, &mut probe)
+        };
+        match armed {
+            Ok(armed) => {
+                if armed.leftover {
+                    self.say_leftover(control.node(), false);
+                }
+                self.st_block = payload + lbp::CRC_LEN;
+                self.protection = Protection::Lbp {
+                    reads: bits & lbp::LBP_R != 0,
+                };
+                let line = format!(
+                    "Logical Block Protection armed on {} ({}): the drive checks tapectl's CRC \
+                     on every block written{}",
+                    self.path,
+                    control.node(),
+                    if bits & lbp::LBP_R != 0 {
+                        ", and sends its own with every block read"
+                    } else {
+                        ""
+                    }
+                );
+                tracing::info!("{line}");
+                crate::progress::log(&line);
+                self.lbp = Some(ArmedPage { control, armed });
+            }
+            Err(not_armed) => {
+                if not_armed.leftover {
+                    self.say_leftover(control.node(), true);
+                }
+                self.st_block = payload;
+                lbp::note_unavailable(&self.path, &not_armed.reason, write_open);
+                self.protection = Protection::Unavailable(not_armed.reason);
+            }
+        }
+    }
+
+    /// The leftover note (§4.4): on stderr, traced and logged, read or write.
+    fn say_leftover(&self, node: &str, cleared_now: bool) {
+        let line = lbp::leftover_note(&self.path, node, cleared_now);
+        tracing::warn!("{line}");
+        crate::progress::stderr_println(&line);
+        crate::progress::log(&line);
+    }
+
+    /// What this open decided about Logical Block Protection.
+    pub fn protection(&self) -> Protection {
+        self.protection.clone()
+    }
+
+    /// The flag bits armed now (0 when not armed).
+    fn armed_bits(&self) -> u8 {
+        self.lbp.as_ref().map_or(0, |p| p.armed.bits)
+    }
+
+    /// The drive checks what this device writes: every block carries a CRC.
+    fn writes_checked(&self) -> bool {
+        self.armed_bits() & lbp::LBP_W != 0
+    }
+
+    /// The drive sends its CRC with every block this device reads.
+    fn reads_checked(&self) -> bool {
+        self.armed_bits() & lbp::LBP_R != 0
+    }
+
+    /// One block on the wire when writing: the payload, and the CRC when
+    /// the drive checks it.
+    fn write_wire(&self) -> usize {
+        if self.writes_checked() {
+            self.block_size + lbp::CRC_LEN
+        } else {
+            self.block_size
+        }
+    }
+
+    /// Bytes `write(2)` accepted, in payload bytes: what every count above
+    /// the device is in (the early warning's `bytes_at`, the test hook's
+    /// figure). Fixed-mode st accepts whole blocks or nothing.
+    fn payload_bytes(&self, wire_bytes: u64) -> u64 {
+        let wire = self.write_wire().max(1) as u64;
+        if wire == self.block_size.max(1) as u64 {
+            return wire_bytes;
+        }
+        debug_assert_eq!(wire_bytes % wire, 0, "st accepts whole blocks");
+        wire_bytes / wire * self.block_size as u64
+    }
+
+    /// st's block size set to `n` if it is not already: only under item
+    /// 175's fallback policy, where a write-armed page reads at the payload
+    /// size until the confirm arms the read check, does it ever change after
+    /// the open.
+    fn ensure_st_block(&mut self, n: usize) -> Result<()> {
+        if self.st_block != n {
+            self.mt_ioctl(MTSETBLK, n as i32)?;
+            self.st_block = n;
+        }
+        Ok(())
+    }
+
+    /// Item 175: add LBP_R to a page this open armed for writes, for the
+    /// confirm of a session that wrote with LBP. `Ok(true)` when reads are
+    /// checked from here on (already, under [`lbp::LbpReadPolicy::AllReads`]);
+    /// `Ok(false)` when this open has no page armed, or the drive would not
+    /// take it, which the session log says — the confirm then reads as
+    /// before #388.
+    pub fn arm_read_check(&mut self) -> Result<bool> {
+        let Some(page) = self.lbp.as_mut() else {
+            return Ok(false);
+        };
+        if page.armed.bits & lbp::LBP_R != 0 {
+            return Ok(true);
+        }
+        let bits = page.armed.bits | lbp::LBP_R;
+        match lbp::rearm(&*page.control, &mut page.armed, bits) {
+            Ok(()) => {
+                self.ensure_st_block(self.block_size + lbp::CRC_LEN)?;
+                self.protection = Protection::Lbp { reads: true };
+                crate::progress::log(&format!(
+                    "Logical Block Protection: read check armed on {} for the confirm",
+                    self.path
+                ));
+                Ok(true)
+            }
+            Err(reason) => {
+                let line = format!(
+                    "Logical Block Protection: the read check could not be armed on {} for the \
+                     confirm ({reason}); the confirm reads without it",
+                    self.path
+                );
+                tracing::warn!("{line}");
+                crate::progress::log(&line);
+                Ok(false)
+            }
+        }
+    }
+
+    /// The drive's logical object position: READ POSITION through st
+    /// (`MTIOCPOS`), blocks and filemarks from the beginning of the tape.
+    /// Asked by a write session after a refused write (item 174) to find the
+    /// first block the drive did not accept. Moves no tape.
+    pub fn logical_position(&self) -> Result<u64> {
+        let mut pos = MtPos::default();
+        let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCPOS, &mut pos as *mut MtPos) };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            self.note_failure("read position", &e);
+            return Err(TapectlError::TapeIo(format!("MTIOCPOS: {e}")));
+        }
+        u64::try_from(pos.mt_blkno)
+            .map_err(|_| TapectlError::TapeIo(format!("MTIOCPOS: position {}", pos.mt_blkno)))
+    }
+
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5; read and announced by
+    /// `store::TapeStore::open`, which refuses it on an open that is not
+    /// write-armed): the `n`th block write since this open, counted from 1,
+    /// goes to the drive with one bit of its CRC flipped, so the drive
+    /// refuses it as it refuses a block damaged on the way.
+    pub fn fake_lbp_corrupt_block(&mut self, n: u64) {
+        self.corrupt_block = Some(n);
     }
 
     /// The block size reads and writes use (0: variable-block mode).
@@ -371,11 +652,25 @@ impl TapeDevice {
     }
 
     fn mt_ioctl(&self, op: i16, count: i32) -> Result<()> {
+        self.mt_ioctl_raw(op, count)
+            .map_err(|e| TapectlError::TapeIo(format!("ioctl op={op} count={count}: {e}")))
+    }
+
+    /// [`Self::mt_ioctl`] with the kernel's error itself, for the callers
+    /// that tell errnos apart (a filemark's ENOSPC and, armed, its EIO). A
+    /// filemark, a rewind, a space or an erase that succeeded ends a run of
+    /// block writes, so the close owes no filemark.
+    fn mt_ioctl_raw(&self, op: i16, count: i32) -> io::Result<()> {
         let mtop = MtOp {
             mt_op: op,
             _pad: 0,
             mt_count: count,
         };
+        if let Some(log) = &self.op_log {
+            log.lock()
+                .unwrap()
+                .push(format!("ioctl {}", mt_op_name(op, count)));
+        }
         // Issue #386: a rewind, a space or a synchronous filemark can hold
         // the process for minutes with no byte moving; it names itself in
         // the session log when it passes the wait threshold.
@@ -386,9 +681,10 @@ impl TapeDevice {
         if rc != 0 {
             let e = io::Error::last_os_error();
             self.note_failure(&mt_op_name(op, count), &e);
-            return Err(TapectlError::TapeIo(format!(
-                "ioctl op={op} count={count}: {e}"
-            )));
+            return Err(e);
+        }
+        if matches!(op, MTWEOF | MTWEOFI | MTREW | MTFSF | MTERASE) {
+            self.pending_data.set(false);
         }
         Ok(())
     }
@@ -397,6 +693,7 @@ impl TapeDevice {
     pub fn set_block_size(&mut self, bs: usize) -> Result<()> {
         self.mt_ioctl(MTSETBLK, bs as i32)?;
         self.block_size = bs;
+        self.st_block = bs;
         Ok(())
     }
 
@@ -412,14 +709,47 @@ impl TapeDevice {
         self.mt_ioctl(MTCOMP, 0)
     }
 
-    /// Write a file mark (immediate, no flush).
-    pub fn write_filemark_immediate(&self) -> Result<()> {
-        self.mt_ioctl(MTWEOFI, 1)
+    /// Write a file mark (immediate, no flush). The kernel's error itself:
+    /// [`Self::write_stream`] tells a full medium, and an armed refusal,
+    /// from the rest by errno.
+    pub fn write_filemark_immediate(&self) -> io::Result<()> {
+        self.mt_ioctl_raw(MTWEOFI, 1)
     }
 
-    /// Write a file mark (synchronous flush).
-    pub fn write_filemark_sync(&self) -> Result<()> {
-        self.mt_ioctl(MTWEOF, 1)
+    /// Write a file mark (synchronous flush). The kernel's error itself, as
+    /// [`Self::write_filemark_immediate`].
+    pub fn write_filemark_sync(&self) -> io::Result<()> {
+        self.mt_ioctl_raw(MTWEOF, 1)
+    }
+
+    /// A failed filemark, classified (issue #408, #420 W3, #388): ENOSPC is
+    /// a full medium (never retried); EIO while the page is armed is
+    /// [`TapectlError::LbpRefusal`] — the WRITE FILEMARKS carries the
+    /// drive's deferred refusal of a block written before it (item 174);
+    /// anything else a tape I/O error.
+    fn filemark_error(&self, op: i16, e: &io::Error) -> TapectlError {
+        let what = format!("ioctl op={op} count=1: {e}");
+        if e.raw_os_error() == Some(nix::libc::ENOSPC) {
+            TapectlError::MediumFull(TapectlError::TapeIo(what).to_string())
+        } else if self.writes_checked() && e.raw_os_error() == Some(nix::libc::EIO) {
+            TapectlError::LbpRefusal(lbp::refusal_text(
+                &format!("the {} after this file ({what})", mt_op_name(op, 1)),
+                e,
+            ))
+        } else {
+            TapectlError::TapeIo(what)
+        }
+    }
+
+    /// A failed block write, classified: [`write_error`]'s, except EIO while
+    /// the page is armed, which is [`TapectlError::LbpRefusal`] (item 174;
+    /// st cannot tell a refusal from another EIO, so every one is).
+    fn block_write_error(&self, what: &str, e: &io::Error) -> TapectlError {
+        if self.writes_checked() && e.raw_os_error() == Some(nix::libc::EIO) {
+            TapectlError::LbpRefusal(lbp::refusal_text(what, e))
+        } else {
+            write_error(what, e)
+        }
     }
 
     /// Erase the whole medium from the head onward — `mt erase`, the LONG
@@ -458,6 +788,9 @@ impl TapeDevice {
     /// fails the write. The filemark is one ioctl, never retried
     /// (`volume-format-v2.md` §4.3 W3): refused, it is a full medium.
     pub fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        if self.writes_checked() {
+            self.ensure_st_block(self.write_wire())?;
+        }
         let mut warning = std::mem::take(&mut self.warning);
         let mut fake = self.fake_warning.take();
         let refusals_before = warning.refusals();
@@ -484,22 +817,21 @@ impl TapeDevice {
         }
         self.fake_warning = fake;
         // A refused filemark is a full medium too (issue #408), and is not
-        // retried (#420 W3).
+        // retried (#420 W3); armed, an EIO is a refusal (#388).
         if let Err(e) = marked {
-            let full = matches!(&e, TapectlError::TapeIo(m) if m.contains("(os error 28)"));
-            return Err(if full {
-                TapectlError::MediumFull(e.to_string())
-            } else {
-                e
-            });
+            return Err(self.filemark_error(if sync { MTWEOF } else { MTWEOFI }, &e));
         }
         Ok(committed)
     }
 
     /// The early warning, once st refused a block write on this device
-    /// (#420): sticky for the device's life, which is its store's.
+    /// (#420): sticky for the device's life, which is its store's. Its
+    /// `bytes_at` is in payload bytes, the CRC of an armed page not counted.
     pub fn early_warning(&self) -> Option<EarlyWarning> {
-        self.warning.warning()
+        self.warning.warning().map(|w| EarlyWarning {
+            bytes_at: self.payload_bytes(w.bytes_at),
+            ..w
+        })
     }
 
     /// The test hook `TAPECTL_TEST_EARLY_WARNING_AT` (#420; read and
@@ -526,7 +858,12 @@ impl TapeDevice {
         fake: &mut Option<crate::store::MediumEnd>,
     ) -> Result<u64> {
         let bs = self.block_size.max(1);
-        let mut buf = vec![0u8; bs];
+        // #388: the wire block. Armed, the payload's CRC follows it in the
+        // same `write(2)`; `committed` and every count above the device stay
+        // in payload bytes, and `pad_to_blocks` and the trim do not change.
+        let wire = self.write_wire().max(1);
+        let protect = self.writes_checked();
+        let mut buf = vec![0u8; wire];
         let mut remaining = len;
         let mut committed = 0u64;
         let mut first_refusal = warning.warning().is_none();
@@ -553,8 +890,18 @@ impl TapeDevice {
                     *b = 0;
                 }
             }
+            if protect {
+                lbp::protect(&mut buf);
+                let sent = self.blocks_sent.get() + 1;
+                self.blocks_sent.set(sent);
+                if self.corrupt_block == Some(sent) {
+                    // The test hook: one CRC bit flipped (F5).
+                    buf[wire - 1] ^= 0x01;
+                }
+            }
+            self.pending_data.set(true);
             let started = std::time::Instant::now();
-            let accepted_before = warning.accepted();
+            let accepted_before = self.payload_bytes(warning.accepted());
             let mut landed = 0u64;
             let written = write_block_retrying(
                 |block| {
@@ -567,8 +914,9 @@ impl TapeDevice {
                         (&self.file).write(block)
                     };
                     if let (Ok(n), Some(end)) = (&attempt, fake.as_mut()) {
-                        end.block_landed(accepted_before + landed, *n as u64);
-                        landed += *n as u64;
+                        let n = self.payload_bytes(*n as u64);
+                        end.block_landed(accepted_before + landed, n);
+                        landed += n;
                     }
                     if let Err(e) = &attempt {
                         if first_refusal && e.raw_os_error() == Some(nix::libc::ENOSPC) {
@@ -596,7 +944,7 @@ impl TapeDevice {
                     }
                     attempt
                 },
-                &buf[..bs],
+                &buf[..wire],
                 warning,
             );
             if let Err(e) = written {
@@ -609,7 +957,7 @@ impl TapeDevice {
                     "write".to_string()
                 };
                 self.note_failure(&what, &e);
-                return Err(write_error(&what, &e));
+                return Err(self.block_write_error(&what, &e));
             }
             crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
@@ -621,7 +969,7 @@ impl TapeDevice {
     /// The session log's summary of one file's refusals past the early
     /// warning, when it had any (#420): how many, and the device's total.
     fn summarize_refusals(&self, before: u64) {
-        let Some(w) = self.warning.warning() else {
+        let Some(w) = self.early_warning() else {
             return;
         };
         let here = w.refusals - before;
@@ -647,12 +995,9 @@ impl TapeDevice {
     /// in different places (issue #389).
     pub fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
         let mut total = 0u64;
-        let read_size = if self.block_size > 0 {
-            self.block_size
-        } else {
-            1024 * 1024
-        };
+        let (read_size, checked) = self.read_shape()?;
         let mut buf = vec![0u8; read_size];
+        let mut block = 0u64;
         loop {
             let started = std::time::Instant::now();
             let got = self.file.read(&mut buf);
@@ -660,9 +1005,11 @@ impl TapeDevice {
             match got {
                 Ok(0) => return Ok((total, ReadEnd::Filemark)),
                 Ok(n) => {
-                    sink.write_all(&buf[..n])
+                    let payload = self.read_payload(&buf, n, checked, block)?;
+                    sink.write_all(payload)
                         .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
-                    total += n as u64;
+                    total += payload.len() as u64;
+                    block += 1;
                 }
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
@@ -693,21 +1040,20 @@ impl TapeDevice {
         sink: &mut dyn Write,
     ) -> Result<(u64, ReadEnd)> {
         let mut total = 0u64;
-        let read_size = if self.block_size > 0 {
-            self.block_size
-        } else {
-            1024 * 1024
-        };
+        let (read_size, checked) = self.read_shape()?;
         let mut buf = vec![0u8; read_size];
+        let mut block = 0u64;
         while total < max_bytes {
             match self.file.read(&mut buf) {
                 // File mark: the file is shorter than asked.
                 Ok(0) => return Ok((total, ReadEnd::Filemark)),
                 Ok(n) => {
-                    let take = (n as u64).min(max_bytes - total) as usize;
-                    sink.write_all(&buf[..take])
+                    let payload = self.read_payload(&buf, n, checked, block)?;
+                    let take = (payload.len() as u64).min(max_bytes - total) as usize;
+                    sink.write_all(&payload[..take])
                         .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
                     total += take as u64;
+                    block += 1;
                 }
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
@@ -719,6 +1065,57 @@ impl TapeDevice {
             }
         }
         Ok((total, ReadEnd::Stopped))
+    }
+
+    /// How a read takes its blocks: the size of one `read(2)` and whether
+    /// each carries the drive's CRC (LBP_R armed), st's block size set to
+    /// match (§2.4).
+    fn read_shape(&mut self) -> Result<(usize, bool)> {
+        if self.block_size == 0 {
+            return Ok((1024 * 1024, false));
+        }
+        let checked = self.reads_checked();
+        let size = if checked {
+            self.block_size + lbp::CRC_LEN
+        } else {
+            self.block_size
+        };
+        if self.lbp.is_some() {
+            self.ensure_st_block(size)?;
+        }
+        Ok((size, checked))
+    }
+
+    /// The payload of one block read: `buf[..n]` as it came, or, with LBP_R
+    /// armed, the block checked against the CRC the drive sent and stripped
+    /// of it. A short block or a mismatch is a read error — never a verdict
+    /// about the medium (`MismatchKind::ContentUnreadable`): the bytes
+    /// changed between the drive and tapectl.
+    fn read_payload<'b>(
+        &self,
+        buf: &'b [u8],
+        n: usize,
+        checked: bool,
+        block: u64,
+    ) -> Result<&'b [u8]> {
+        if !checked {
+            return Ok(&buf[..n]);
+        }
+        if n != buf.len() {
+            return Err(TapectlError::TapeIo(format!(
+                "Logical Block Protection read: st returned a {n}-byte block, expected {}",
+                buf.len()
+            )));
+        }
+        lbp::check(buf).map_err(|m| {
+            TapectlError::TapeIo(format!(
+                "Logical Block Protection check failed on block {block} of this file: the drive \
+                 sent CRC {:08X}, the block tapectl received computes to {:08X}; the bytes \
+                 changed between the drive and tapectl, not on the medium",
+                m.got, m.want
+            ))
+        })?;
+        Ok(&buf[..n - lbp::CRC_LEN])
     }
 }
 
@@ -1372,7 +1769,390 @@ mod density_tests {
             recovered: Default::default(),
             warning: EarlyWarningState::default(),
             fake_warning: None,
+            lbp: None,
+            protection: Protection::NotApplicable,
+            st_block: block_size,
+            pending_data: Cell::new(false),
+            corrupt_block: None,
+            blocks_sent: Cell::new(0),
+            op_log: None,
         }
+    }
+
+    /// [`device_over`] with the page armed (`bits`) over a recorded page
+    /// control, as a successful open leaves it: st at the wire size, and one
+    /// log for the device's ioctls and the page's commands.
+    fn device_over_armed(
+        file: File,
+        block_size: usize,
+        bits: u8,
+    ) -> (
+        TapeDevice,
+        crate::tape::lbp::fake::FakePage,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::tape::lbp::fake::{FakePage, HP_PAGE};
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut page = FakePage::new(&HP_PAGE);
+        let found = lbp::ProtectionPage::from_page_bytes(&HP_PAGE).unwrap();
+        page.log = Some(log.clone());
+        let armed_page = found.with_protection(lbp::METHOD_RS, lbp::RS_INFO_LEN, bits);
+        lbp::PageControl::select(&page, &armed_page).unwrap();
+        log.lock().unwrap().clear();
+        let mut dev = device_over(file, block_size);
+        dev.lbp = Some(ArmedPage {
+            control: Box::new(page.clone()),
+            armed: lbp::Armed {
+                found,
+                leftover: false,
+                bits,
+            },
+        });
+        dev.protection = Protection::Lbp {
+            reads: bits & lbp::LBP_R != 0,
+        };
+        dev.st_block = block_size + lbp::CRC_LEN;
+        dev.op_log = Some(log.clone());
+        (dev, page, log)
+    }
+
+    /// The protected blocks a write of `payload` puts on the wire: each
+    /// `bs` payload bytes (the last zero-padded), then their CRC big-endian.
+    fn protected(payload: &[u8], bs: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in payload.chunks(bs) {
+            let mut block = chunk.to_vec();
+            block.resize(bs, 0);
+            let crc = lbp::rs_crc(&block, 0);
+            out.extend_from_slice(&block);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        out
+    }
+
+    /// #388 §2.3: armed, every block goes to the drive as its padded
+    /// payload and its CRC, big-endian, in one `write(2)`; the write still
+    /// commits payload bytes (`pad_to_blocks`, the trim, unchanged).
+    #[test]
+    fn armed_writes_put_a_big_endian_crc_after_every_padded_block() {
+        let bs = 4096usize;
+        let source: Vec<u8> = (0..(2 * bs + bs / 2)).map(|i| (i % 251) as u8).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (dev, _page, _log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        let mut warning = EarlyWarningState::default();
+        let committed = dev
+            .write_blocks(
+                &mut io::Cursor::new(&source),
+                source.len() as u64,
+                &mut warning,
+                &mut None,
+            )
+            .unwrap();
+        assert_eq!(committed, 3 * bs as u64, "payload bytes, padded");
+        let on_wire = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(on_wire.len(), 3 * (bs + 4));
+        assert_eq!(on_wire, protected(&source, bs));
+        for record in on_wire.chunks(bs + 4) {
+            assert!(lbp::check(record).is_ok());
+        }
+        assert!(
+            dev.pending_data.get(),
+            "the last st operation was a block write"
+        );
+        assert_eq!(
+            warning.accepted(),
+            3 * (bs as u64 + 4),
+            "st counted wire bytes"
+        );
+    }
+
+    /// §2.4: armed with LBP_R, each wire block is checked against the CRC
+    /// the drive sent and delivered as payload; a flipped CRC bit is a read
+    /// error naming the block, and so is a short record.
+    #[test]
+    fn armed_reads_strip_and_check() {
+        let bs = 4096usize;
+        let payload: Vec<u8> = (0..3 * bs).map(|i| (i % 253) as u8).collect();
+        let wire = protected(&payload, bs);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &wire).unwrap();
+        let (mut dev, _page, log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        let mut out = Vec::new();
+        let (n, end) = dev.read_file_streaming(&mut out).unwrap();
+        assert_eq!((n, end), (3 * bs as u64, ReadEnd::Filemark));
+        assert_eq!(out, payload);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "st already at the wire size: no block size set"
+        );
+
+        // A bounded head read strips too.
+        let (mut dev, _page, _log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        let mut head = Vec::new();
+        let (n, end) = dev.read_file_head(10, &mut head).unwrap();
+        assert_eq!(
+            (n, end, head.as_slice()),
+            (10, ReadEnd::Stopped, &payload[..10])
+        );
+
+        let mut bad = wire.clone();
+        bad[2 * (bs + 4) - 1] ^= 0x01;
+        std::fs::write(tmp.path(), &bad).unwrap();
+        let (mut dev, _page, _log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        let err = dev
+            .read_file_streaming(&mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("check failed on block 1 of this file")
+                && err.contains("not on the medium"),
+            "{err}"
+        );
+
+        std::fs::write(tmp.path(), &wire[..wire.len() - 10]).unwrap();
+        let (mut dev, _page, _log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        let err = dev
+            .read_file_streaming(&mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("st returned a 4090-byte block, expected 4100"),
+            "{err}"
+        );
+
+        // Unarmed, the same bytes come back as they are, CRC and all.
+        let tmp2 = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp2.path(), &payload).unwrap();
+        let mut plain = device_over(tmp2.reopen().unwrap(), bs);
+        let mut out = Vec::new();
+        plain.read_file_streaming(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// §2.3: the early warning, the test hook's figure and the log lines
+    /// count payload bytes, though st accepts wire bytes.
+    #[test]
+    fn armed_early_warning_counts_payload_bytes() {
+        let bs = 8usize;
+        let source: Vec<u8> = (0..6 * bs as u8).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (mut dev, _page, _log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
+        dev.fake_early_warning_at(20);
+        let mut warning = EarlyWarningState::default();
+        let mut fake = dev.fake_warning.take();
+        dev.write_blocks(
+            &mut io::Cursor::new(&source),
+            source.len() as u64,
+            &mut warning,
+            &mut fake,
+        )
+        .unwrap();
+        dev.warning = warning;
+        assert_eq!(
+            dev.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 24,
+                refusals: 3
+            }),
+            "the unarmed figures of the_test_hook_refuses_like_st_and_every_block_lands_once"
+        );
+        assert_eq!(
+            dev.warning.warning().unwrap().bytes_at,
+            36,
+            "st's own: 3 x 12"
+        );
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), protected(&source, bs));
+    }
+
+    /// F5: the hook flips one CRC bit of the nth block write, and only that
+    /// one; the payload is untouched.
+    #[test]
+    fn the_corrupt_block_hook_flips_one_crc_bit_of_one_block() {
+        let bs = 64usize;
+        let source = vec![7u8; 3 * bs];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (mut dev, _page, _log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
+        dev.fake_lbp_corrupt_block(2);
+        dev.write_blocks(
+            &mut io::Cursor::new(&source),
+            source.len() as u64,
+            &mut EarlyWarningState::default(),
+            &mut None,
+        )
+        .unwrap();
+        let on_wire = std::fs::read(tmp.path()).unwrap();
+        let mut want = protected(&source, bs);
+        want[2 * (bs + 4) - 1] ^= 0x01;
+        assert_eq!(on_wire, want);
+        let checks: Vec<bool> = on_wire
+            .chunks(bs + 4)
+            .map(|r| lbp::check(r).is_ok())
+            .collect();
+        assert_eq!(checks, [true, false, true]);
+    }
+
+    /// §4.3: the close of an armed device after a block write: the
+    /// synchronous filemark first, then the page put back and read back,
+    /// then the format's block size. Without a pending write there is no
+    /// filemark; unarmed, the close touches neither.
+    #[test]
+    fn drop_clears_the_page_after_the_closing_filemark() {
+        let bs = 4096usize;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (dev, page, log) =
+            device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W | lbp::LBP_R);
+        dev.write_blocks(
+            &mut io::Cursor::new(vec![1u8; 10]),
+            10,
+            &mut EarlyWarningState::default(),
+            &mut None,
+        )
+        .unwrap();
+        drop(dev);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "ioctl filemark (synchronous)",
+                "select 4a,f0,00,04,00,00,00,00",
+                "sense",
+                "ioctl set block size 4096"
+            ]
+        );
+        assert_eq!(page.current(), crate::tape::lbp::fake::HP_PAGE);
+
+        let (dev, page, log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
+        drop(dev);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "select 4a,f0,00,04,00,00,00,00",
+                "sense",
+                "ioctl set block size 4096"
+            ],
+            "no write, no filemark"
+        );
+        assert_eq!(page.current(), crate::tape::lbp::fake::HP_PAGE);
+
+        let mut plain = device_over(tmp.reopen().unwrap(), bs);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        plain.op_log = Some(log.clone());
+        plain.pending_data.set(true);
+        drop(plain);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "unarmed: the close as before"
+        );
+    }
+
+    /// Items 166/174: armed, a write's EIO — a block's or a filemark's — is
+    /// an LBP refusal; ENOSPC stays a full medium; unarmed, nothing changes.
+    #[test]
+    fn an_armed_write_eio_is_a_refusal_and_nothing_else_changes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (armed, _page, _log) = device_over_armed(tmp.reopen().unwrap(), 4096, lbp::LBP_W);
+        let plain = device_over(tmp.reopen().unwrap(), 4096);
+        let eio = io::Error::from_raw_os_error(nix::libc::EIO);
+        let full = io::Error::from_raw_os_error(nix::libc::ENOSPC);
+
+        let e = armed.block_write_error("write", &eio);
+        assert!(
+            matches!(&e, TapectlError::LbpRefusal(m) if m.starts_with("write: ")),
+            "{e}"
+        );
+        assert!(
+            e.to_string().contains("logical block guard check failed"),
+            "{e}"
+        );
+        let e = armed.filemark_error(MTWEOFI, &eio);
+        assert!(
+            matches!(&e, TapectlError::LbpRefusal(m) if m.starts_with("the filemark after this file")),
+            "{e}"
+        );
+        assert!(matches!(
+            armed.block_write_error("write", &full),
+            TapectlError::MediumFull(_)
+        ));
+        let e = armed.filemark_error(MTWEOF, &full);
+        assert_eq!(
+            e.to_string(),
+            "tape full: tape I/O error: ioctl op=5 count=1: No space left on device (os error 28)"
+        );
+        assert!(matches!(
+            plain.block_write_error("write", &eio),
+            TapectlError::TapeIo(_)
+        ));
+        assert!(matches!(
+            plain.filemark_error(MTWEOFI, &eio),
+            TapectlError::TapeIo(_)
+        ));
+    }
+
+    /// Item 175's fallback policy on a write-armed device: reads before the
+    /// confirm are unprotected at the payload size (st set back to it);
+    /// arming the read check for the confirm sets the page and the wire size.
+    #[test]
+    fn under_the_fallback_policy_reads_follow_the_read_check() {
+        let bs = 4096usize;
+        let payload = vec![9u8; bs];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &payload).unwrap();
+        let (mut dev, page, log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
+        let mut out = Vec::new();
+        // On a plain file the MTSETBLK fails: the read reports it.
+        let err = dev.read_file_streaming(&mut out).unwrap_err().to_string();
+        assert!(err.contains("ioctl op=20 count=4096"), "{err}");
+        assert_eq!(*log.lock().unwrap(), ["ioctl set block size 4096"]);
+        log.lock().unwrap().clear();
+
+        // The set failed, so st is still at the wire size the open left.
+        std::fs::write(tmp.path(), protected(&payload, bs)).unwrap();
+        assert!(dev.arm_read_check().unwrap());
+        assert_eq!(page.current()[6], 0xc0, "LBP_R added");
+        assert_eq!(dev.armed_bits(), lbp::LBP_W | lbp::LBP_R);
+        assert_eq!(dev.protection(), Protection::Lbp { reads: true });
+        let mut out = Vec::new();
+        dev.read_file_streaming(&mut out).unwrap();
+        assert_eq!(out, payload, "checked and stripped");
+        assert!(dev.arm_read_check().unwrap(), "already armed: nothing sent");
+        assert_eq!(page.selects(), 2, "the open's arm and the one rearm");
+
+        // An unarmed device has no read check to arm.
+        let mut plain = device_over(tmp.reopen().unwrap(), bs);
+        assert!(!plain.arm_read_check().unwrap());
+    }
+
+    /// #388: the page is armed in one place (the open's
+    /// `arm_protection`), re-armed in one (`arm_read_check`, item 175) and
+    /// cleared in one (`Drop`); `sg_wr_mode` is lbp.rs's alone.
+    #[test]
+    fn the_page_is_set_in_one_place() {
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]\nmod density_tests").next().unwrap();
+        for (call, inside, ends) in [
+            ("lbp::arm(", "    fn arm_protection(", "\n    }\n"),
+            ("lbp::rearm(", "    pub fn arm_read_check(", "\n    }\n"),
+            ("lbp::disarm(", "impl Drop for TapeDevice", "\n}\n"),
+            (
+                "lbp::clear_leftover(",
+                "    fn arm_protection(",
+                "\n    }\n",
+            ),
+        ] {
+            assert_eq!(body.matches(call).count(), 1, "{call}");
+            let start = body.find(inside).expect(inside);
+            let end = start + body[start..].find(ends).unwrap();
+            assert!(body[start..end].contains(call), "{call} inside {inside}");
+        }
+        assert!(!body.contains("sg_wr_mode\""), "no sg tool named here");
+        assert!(
+            !body.contains("Command::new"),
+            "the device starts no program"
+        );
     }
 
     /// `TAPECTL_TEST_EARLY_WARNING_AT` (#420) on the device's real write
