@@ -29,6 +29,7 @@ use crate::util::{HashingWriter, TruncatingWriter};
 /// The drive's early warning, as [`Store::early_warning`] reports it
 /// (`volume-format-v2.md` §4.3; #420).
 pub use crate::tape::ioctl::EarlyWarning;
+pub use crate::tape::lbp::Protection;
 use crate::volume::format;
 use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 
@@ -583,6 +584,33 @@ pub trait Store {
     /// [`Self::eod_at_or_before`] pattern).
     fn early_warning(&self) -> Option<EarlyWarning> {
         None
+    }
+
+    /// What this store's open decided about Logical Block Protection (#388;
+    /// ADR-0012 items 161-165): [`Protection::Lbp`] when the drive checks
+    /// every block written, [`Protection::Unavailable`] with the reason when
+    /// it was tried and could not be armed. The write session records it on
+    /// the volume (`volumes.write_lbp`, migration 041). The default is
+    /// [`Protection::NotApplicable`]: a store with no drive to arm, whose
+    /// session records nothing.
+    fn protection(&self) -> Protection {
+        Protection::NotApplicable
+    }
+
+    /// The drive's logical object position — blocks and filemarks from the
+    /// beginning of the tape (READ POSITION) — asked by a write session after
+    /// [`TapectlError::LbpRefusal`] to find the file holding the first block
+    /// the drive did not accept (item 174). `Ok(None)` is a store that cannot
+    /// tell, the default: the session then does not retry.
+    fn logical_position(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Item 175's fallback policy: arm LBP_R for the confirm of a session
+    /// that wrote with LBP. `Ok(true)` when the store's reads are checked
+    /// from here on; `Ok(false)`, the default, when there is nothing to arm.
+    fn arm_read_check(&mut self) -> Result<bool> {
+        Ok(false)
     }
 
     /// Run the keyless integrity chain walk (`volume-format-v2.md` §5)
@@ -1856,11 +1884,27 @@ pub(crate) trait TapeOps: Send {
     /// (#420): [`Store::early_warning`]'s answer, sticky for the device's
     /// life.
     fn early_warning(&self) -> Option<EarlyWarning>;
+    /// [`Store::protection`]'s answer (#388).
+    fn protection(&self) -> Protection;
+    /// [`Store::logical_position`]'s answer (#388, item 174): READ POSITION
+    /// through st. Moves no tape.
+    fn logical_position(&self) -> Result<Option<u64>>;
+    /// [`Store::arm_read_check`]'s answer (#388, item 175).
+    fn arm_read_check(&mut self) -> Result<bool>;
 }
 
 impl TapeOps for TapeDevice {
     fn early_warning(&self) -> Option<EarlyWarning> {
         TapeDevice::early_warning(self)
+    }
+    fn protection(&self) -> Protection {
+        TapeDevice::protection(self)
+    }
+    fn logical_position(&self) -> Result<Option<u64>> {
+        TapeDevice::logical_position(self).map(Some)
+    }
+    fn arm_read_check(&mut self) -> Result<bool> {
+        TapeDevice::arm_read_check(self)
     }
     fn block_size(&self) -> usize {
         TapeDevice::block_size(self)
@@ -1995,7 +2039,11 @@ pub struct TapeStore {
 /// ([`crate::tape::st_stats`]). Never recorded anywhere.
 ///
 /// The open's own commands (its rewind, block size and compression) are
-/// before the count starts. A rewind or a space is counted when issued,
+/// before the count starts. Logical Block Protection's are not counted
+/// either (#388): the page commands go to the sg node, never st; the probe
+/// read and the wire block size are the open's; the close sequence is the
+/// close's; and the READ POSITION a write session asks for after a refused
+/// write (item 174) is only ever on that error path. A rewind or a space is counted when issued,
 /// whether or not it succeeded, since st counts the command either way; a
 /// write's filemark is counted when the write succeeded, since a write that
 /// failed may have stopped before issuing it.
@@ -2065,6 +2113,15 @@ impl TapeOps for CountedOps {
     }
     fn early_warning(&self) -> Option<EarlyWarning> {
         self.inner.early_warning()
+    }
+    fn protection(&self) -> Protection {
+        self.inner.protection()
+    }
+    fn logical_position(&self) -> Result<Option<u64>> {
+        self.inner.logical_position()
+    }
+    fn arm_read_check(&mut self) -> Result<bool> {
+        self.inner.arm_read_check()
     }
 }
 
@@ -2334,6 +2391,22 @@ impl Store for TapeStore {
         self.dev.early_warning()
     }
 
+    /// The device's: what its open decided (#388).
+    fn protection(&self) -> Protection {
+        self.dev.protection()
+    }
+
+    /// The drive's own (READ POSITION through st). Moves no tape, so the
+    /// cursor stands.
+    fn logical_position(&mut self) -> Result<Option<u64>> {
+        self.dev.logical_position()
+    }
+
+    /// The device's (item 175). Moves no tape.
+    fn arm_read_check(&mut self) -> Result<bool> {
+        self.dev.arm_read_check()
+    }
+
     // confirm: default trait method (T6 finding #1) — identical to what this
     // impl used to define directly. Its chain walk reads in ascending
     // position order after the seal marker, which is what lets the cursor
@@ -2506,6 +2579,64 @@ pub struct MemStore {
     /// The bytes `execute` has accepted since the store was made, and the
     /// early warning once a block was refused (#420).
     warning: EarlyWarningState,
+    /// What the store reports its open decided about LBP (#388).
+    protection: Protection,
+    /// The refusals a test set, each answered once ([`LbpRefusalAt`]).
+    lbp_refusals: Vec<LbpRefusalAt>,
+    /// Where the last refusal left the drive, until the next reposition.
+    refused_at: Option<u64>,
+    /// [`Store::arm_read_check`] was asked (item 175).
+    pub read_check_armed: bool,
+}
+
+/// A refusal under Logical Block Protection a test sets on a double (#388,
+/// ADR-0012 item 174), as the drive gives one: the block it refused, the
+/// tape file whose write the EIO comes back on (the same file, or a later
+/// one — st and the drive write behind), and where the drive's position is
+/// afterwards. When it comes, the files from the refused one onward are
+/// gone from the medium (the drive discards what follows a refused block),
+/// the write fails with [`TapectlError::LbpRefusal`], and
+/// [`Store::logical_position`] answers the drive's position until the next
+/// reposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LbpRefusalAt {
+    /// The tape file holding the refused block.
+    pub file: u32,
+    /// The refused block within it, from 0.
+    pub block: u64,
+    /// The tape file whose write returns the EIO: `file` or later.
+    pub surfaces_in: u32,
+    /// mhvtl's way: the block was stored before it was refused, so the
+    /// position is one past it. The HP's: at the refused block.
+    pub stored_before_refusing: bool,
+}
+
+impl LbpRefusalAt {
+    /// The HP's way: the EIO on file `surfaces_in`'s write, for block
+    /// `block` of file `file`, the position at that block.
+    pub fn deferred(file: u32, block: u64, surfaces_in: u32) -> Self {
+        Self {
+            file,
+            block,
+            surfaces_in,
+            stored_before_refusing: false,
+        }
+    }
+
+    /// The logical position after it, on a medium holding
+    /// `objects_before` blocks and filemarks before `self.file`.
+    pub(crate) fn position(&self, objects_before: u64) -> u64 {
+        objects_before + self.block + u64::from(self.stored_before_refusing)
+    }
+
+    /// The error the write returns.
+    pub(crate) fn error(&self) -> TapectlError {
+        TapectlError::LbpRefusal(format!(
+            "write: Input/output error (os error 5) — the drive refused block {} of tape file {} \
+             (the test double's refusal, surfacing in the write of file {})",
+            self.block, self.file, self.surfaces_in
+        ))
+    }
 }
 
 /// How a test double's medium answers block writes and filemarks at its end
@@ -2637,7 +2768,34 @@ impl MemStore {
             enospc_after_bytes: None,
             end: MediumEnd::default(),
             warning: EarlyWarningState::default(),
+            protection: Protection::NotApplicable,
+            lbp_refusals: Vec::new(),
+            refused_at: None,
+            read_check_armed: false,
         }
+    }
+
+    /// Report `protection` as the store's open's decision (#388): what a
+    /// write session records on the volume.
+    pub fn with_protection(mut self, protection: Protection) -> Self {
+        self.protection = protection;
+        self
+    }
+
+    /// Refuse a write under LBP as `at` says (#388, item 174), once. Several
+    /// can be set; each is answered by the write of its `surfaces_in` file.
+    pub fn with_lbp_refusal(mut self, at: LbpRefusalAt) -> Self {
+        self.lbp_refusals.push(at);
+        self
+    }
+
+    /// Blocks and filemarks before tape file `file` on this medium.
+    fn objects_before(&self, file: usize) -> u64 {
+        let bs = self.block_size.max(1) as u64;
+        self.files[..file.min(self.files.len())]
+            .iter()
+            .map(|f| f.len() as u64 / bs + 1)
+            .sum()
     }
 
     /// The drive's early warning after `bytes` stored bytes on the medium
@@ -2716,6 +2874,22 @@ impl Store for MemStore {
     /// filemark, a short source — records nothing: a MemStore file is a
     /// whole file.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        // #388: a refusal set for this file's write. The drive discarded the
+        // refused block and everything after it.
+        let index = self.files.len() as u32;
+        if let Some(k) = self
+            .lbp_refusals
+            .iter()
+            .position(|r| r.surfaces_in == index)
+        {
+            let at = self.lbp_refusals.remove(k);
+            let keep = (at.file as usize).min(self.files.len());
+            self.files.truncate(keep);
+            self.syncs.truncate(keep);
+            self.refused_at = Some(at.position(self.objects_before(keep)));
+            self.end.moved();
+            return Err(at.error());
+        }
         let bs = self.block_size.max(1);
         let padded_len = pad_to_blocks(len, bs as u64);
         let before: u64 = self.files.iter().map(|f| f.len() as u64).sum();
@@ -2765,6 +2939,24 @@ impl Store for MemStore {
         self.warning.warning()
     }
 
+    fn protection(&self) -> Protection {
+        self.protection.clone()
+    }
+
+    /// Where a refusal left the drive, or the end of what is recorded.
+    fn logical_position(&mut self) -> Result<Option<u64>> {
+        Ok(Some(
+            self.refused_at
+                .unwrap_or_else(|| self.objects_before(self.files.len())),
+        ))
+    }
+
+    /// Recorded, for item 175's tests; true when the store reports LBP.
+    fn arm_read_check(&mut self) -> Result<bool> {
+        self.read_check_armed = true;
+        Ok(self.protection.writes_checked())
+    }
+
     // confirm: default trait method (T6 finding #1) — identical to what this
     // impl used to define directly.
 
@@ -2781,6 +2973,7 @@ impl Store for MemStore {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
         self.end.moved();
+        self.refused_at = None;
         Ok(())
     }
 
@@ -5923,5 +6116,97 @@ mod tests {
                 .mismatches
                 .is_empty());
         }
+    }
+
+    // --- #388: Logical Block Protection through the seam ---------------------
+
+    /// A store reports what its open decided, and the drive's position:
+    /// `TapeStore` from its device (here the in-memory tape), `MemStore`
+    /// from what a test set. Neither moves the tape to answer.
+    #[test]
+    fn the_seam_carries_protection_and_the_drives_position() {
+        let fake =
+            crate::tape::fake::FakeTape::with_files(vec![vec![1; 8192], vec![2; 4096]], 4096);
+        fake.state().protection = Protection::Lbp { reads: true };
+        let mut tape = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        assert_eq!(tape.protection(), Protection::Lbp { reads: true });
+        assert_eq!(tape.logical_position().unwrap(), Some(0), "at BOT");
+        tape.read_file(1, &mut io::sink()).unwrap();
+        // File 0 (2 blocks + filemark) and file 1 (1 block + filemark).
+        assert_eq!(tape.logical_position().unwrap(), Some(5));
+        let before = tape.motions();
+        assert!(tape.arm_read_check().unwrap());
+        assert!(fake.state().read_check_armed);
+        assert_eq!(tape.motions(), before, "nothing counted, nothing moved");
+
+        let unarmed = crate::tape::fake::FakeTape::with_files(Vec::new(), 4096);
+        let mut tape = TapeStore::from_ops(unarmed.boxed(), u64::MAX).unwrap();
+        assert_eq!(tape.protection(), Protection::NotApplicable);
+        assert!(!tape.arm_read_check().unwrap());
+
+        let mem = MemStore::new(4096);
+        assert_eq!(mem.protection(), Protection::NotApplicable, "the default");
+        let mut mem = MemStore::new(4096).with_protection(Protection::Unavailable("why".into()));
+        assert_eq!(mem.protection(), Protection::Unavailable("why".into()));
+        assert!(!mem.arm_read_check().unwrap() && mem.read_check_armed);
+    }
+
+    /// Item 174's double: a refusal of block 2 of file 1, surfacing in the
+    /// write of file 3 (write-behind). The files from the refused one on are
+    /// gone, the write is an `LbpRefusal`, and the position is the refused
+    /// block until the next reposition — on both doubles.
+    #[test]
+    fn a_refusal_set_on_a_double_comes_back_as_the_drive_gives_it() {
+        let bs = 4096usize;
+        let three_blocks = vec![5u8; 3 * bs];
+        let at = LbpRefusalAt::deferred(1, 2, 3);
+
+        let mut mem = MemStore::new(bs).with_lbp_refusal(at);
+        for _ in 0..3 {
+            mem.execute(&mut &three_blocks[..], three_blocks.len() as u64, false)
+                .unwrap();
+        }
+        let err = mem
+            .execute(&mut &three_blocks[..], three_blocks.len() as u64, false)
+            .unwrap_err();
+        assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+        assert_eq!(mem.files.len(), 1, "file 1 on is gone");
+        assert_eq!(mem.logical_position().unwrap(), Some(4 + 2));
+        mem.reposition_for_resume(1).unwrap();
+        assert_eq!(
+            mem.logical_position().unwrap(),
+            Some(4),
+            "the start of file 1"
+        );
+        mem.execute(&mut &three_blocks[..], three_blocks.len() as u64, false)
+            .unwrap();
+        assert_eq!(mem.files.len(), 2, "set once, answered once");
+
+        let fake = crate::tape::fake::FakeTape::with_files(Vec::new(), bs);
+        fake.state().lbp_refusals.push(LbpRefusalAt {
+            stored_before_refusing: true,
+            ..at
+        });
+        let mut tape = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        for _ in 0..3 {
+            tape.execute(&mut &three_blocks[..], three_blocks.len() as u64, false)
+                .unwrap();
+        }
+        let err = tape
+            .execute(&mut &three_blocks[..], three_blocks.len() as u64, false)
+            .unwrap_err();
+        assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+        assert_eq!(
+            tape.logical_position().unwrap(),
+            Some(4 + 3),
+            "mhvtl: one past it"
+        );
+        assert_eq!(
+            fake.state().files.iter().map(Vec::len).collect::<Vec<_>>(),
+            [3 * bs, 3 * bs],
+            "file 0 whole; file 1 up to and with the stored block"
+        );
+        tape.reposition_for_resume(1).unwrap();
+        assert_eq!(tape.logical_position().unwrap(), Some(4));
     }
 }

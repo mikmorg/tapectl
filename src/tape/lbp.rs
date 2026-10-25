@@ -422,7 +422,7 @@ pub fn control_for(device_tape: &str) -> Option<SgPageControl> {
 
 /// What a device's open decided about Logical Block Protection: what the
 /// write session records (migration 041, `volumes.write_lbp`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Protection {
     /// The page is armed: the drive checks tapectl's CRC on every block
     /// written (LBP_W), and, when `reads`, sends its CRC with every block
@@ -433,6 +433,7 @@ pub enum Protection {
     Unavailable(String),
     /// Not tried: a test double, variable-block mode, or a read open the
     /// read policy leaves unarmed ([`LbpReadPolicy`]).
+    #[default]
     NotApplicable,
 }
 
