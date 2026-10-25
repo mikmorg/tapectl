@@ -2158,7 +2158,7 @@ fn build_write_layout(
 /// nothing, and every envelope gets a fresh random grease stanza in its age
 /// header (up to ~170 bytes). Its files can land up to one block each above
 /// the probe's, the drift [`CapacityNumbers::margin`] allows, and that is
-/// enough to move a unit near the bound or item 94's start. So when the
+/// enough to move a unit near the fill ceiling or the bound. So when the
 /// placement on the built bytes is not the plan and the built files exceed
 /// the probe's by no more than that drift, the units are placed on the
 /// plan's own bytes instead, and that placement is the read-back. Whether
@@ -25017,18 +25017,20 @@ mod tests {
 
                 // ── #491: the read-back of a span plan built again ──
 
-                /// `units` staged on "SR-1", every one but `a` allowed to
+                /// `units` staged on "SR-1", those in `spannable` allowed to
                 /// span, the envelopes grown by `catalogue_bytes`
                 /// ([`grow_envelopes`]): the batch in its plan order (whole
-                /// units, then the spannable sets in name order), the write's
-                /// own build of it, and that build's files that are not
-                /// slices. The build's budget is the test's to place.
+                /// units, then the spannable sets, each in name order, so the
+                /// whole units are named first), the write's own build of it,
+                /// and that build's files that are not slices. The build's
+                /// budget is the test's to place.
                 fn read_back_case(
                     units: &[(&str, &[usize])],
+                    spannable: &[&str],
                     catalogue_bytes: usize,
                 ) -> (StagedBatch, build::BuiltLayout, tempfile::TempDir, u64) {
                     let f = fixture(units, &["SR-1"]);
-                    for (name, _) in &units[1..] {
+                    for name in spannable {
                         allow_spanning(&f, name);
                     }
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
@@ -25055,30 +25057,42 @@ mod tests {
                 /// member to 512 bytes, so a dropped unit's text can shrink
                 /// nothing, and every envelope gets a fresh random grease
                 /// stanza in its age header). Here the probe was one block
-                /// lighter. Item 94: `b`, five slices, is larger than one tape
-                /// of three past the probe's files, and the room it leaves on
-                /// this tape is exactly `a`. On the built bytes that room is a
-                /// third of a slice, so the build's own placement pushes `a`
-                /// out and step 4 used to refuse ("internal error") a Layout
-                /// the capacity gate accepts. Within the drift (one block per
-                /// generated file), the plan's own bytes are read instead.
-                /// Positive control: a probe lighter than that drift allows is
-                /// a defect, and still refused.
+                /// lighter. Items 83 and 95: the whole units `a` and `b` fill
+                /// the fill ceiling exactly on the probe's bytes, and `c`, a
+                /// spannable set that fits one tape (four slices past the
+                /// probe's files), goes last and is the tail by crossing the
+                /// bound. On the built bytes `b` ends a block past the
+                /// ceiling, so the build's own placement defers it and step 4
+                /// used to refuse ("internal error") a Layout the capacity gate
+                /// accepts. Within the drift (one block per generated file),
+                /// the plan's own bytes are read instead. Positive control: a
+                /// probe lighter than that drift allows is a defect, and still
+                /// refused.
                 #[test]
                 fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_on_the_plans_bytes() {
                     for bytes in [0, 512, 2048, 4096, 4608] {
-                        let (batch, mut built, _dir, fixed) =
-                            read_back_case(&[("a", &[SLICE]), ("b", &[SLICE; 5])], bytes);
-                        assert_eq!(batch.classes, [PlanClass::Whole, PlanClass::Spannable]);
+                        let (batch, mut built, _dir, fixed) = read_back_case(
+                            &[("a", &[SLICE]), ("b", &[SLICE]), ("c", &[SLICE; 3])],
+                            &["c"],
+                            bytes,
+                        );
+                        assert_eq!(
+                            batch.classes,
+                            [PlanClass::Whole, PlanClass::Whole, PlanClass::Spannable]
+                        );
                         let planned = fixed - SBS as u64;
-                        built.layout.budget.plan_bound_bytes = Some(planned + 3 * PADDED);
+                        built.layout.budget.plan_bound_bytes = Some(planned + 4 * PADDED);
                         built.layout.budget.available_bytes = planned + 2 * PADDED;
+                        assert!(
+                            3 * PADDED <= built.layout.budget.plan_bound_bytes.unwrap() - fixed,
+                            "positive control: `c` fits one tape on the built bytes too"
+                        );
 
                         let own = built.place(&batch.units, &batch.classes);
                         assert_eq!(
                             own.placed,
-                            [Placed::Deferred, Placed::Tail],
-                            "the build's own bytes push `a` out"
+                            [Placed::Committed, Placed::Deferred, Placed::Tail],
+                            "the build's own bytes push `b` off the ceiling"
                         );
                         assert!(
                             gate(&built).is_empty(),
@@ -25089,8 +25103,11 @@ mod tests {
                         let plan =
                             read_back_span_plan(&built, &batch.units, &batch.classes, planned)
                                 .unwrap_or_else(|why| panic!("{bytes} bytes: {why}"));
-                        assert_eq!(plan.placed, [Placed::Committed, Placed::Tail]);
-                        assert_eq!(plan.order, [0, 1]);
+                        assert_eq!(
+                            plan.placed,
+                            [Placed::Committed, Placed::Committed, Placed::Tail]
+                        );
+                        assert_eq!(plan.order, [0, 1, 2]);
 
                         let margin = capacity_numbers(&built.layout).unwrap().margin;
                         let why = read_back_span_plan(
@@ -25100,7 +25117,7 @@ mod tests {
                             fixed - margin - SBS as u64,
                         )
                         .expect_err("a drift past the margin is not one");
-                        assert!(why.starts_with("\"a\" v1 no longer fit"), "{why}");
+                        assert!(why.starts_with("\"b\" v1 no longer fit"), "{why}");
                     }
                 }
 
@@ -25116,6 +25133,7 @@ mod tests {
                     for bytes in [0, 512, 2048, 4096, 4608] {
                         let (batch, mut built, _dir, fixed) = read_back_case(
                             &[("a", &[SLICE]), ("b", &[SLICE; 3]), ("c", &[SLICE])],
+                            &["b", "c"],
                             bytes,
                         );
                         let planned = fixed - SBS as u64;
