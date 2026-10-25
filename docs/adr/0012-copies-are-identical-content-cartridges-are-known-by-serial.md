@@ -2241,6 +2241,12 @@ Ruled 2026-10-25, write shaping after the drive phase (#488; `docs/research/2026
      cartridge, then the medium if it recurs. With neither it states the ratio without a cause.
 171. **R0 extends to page 0x02:** the operator decodes #426's write's correction counters from a
      copy of a production `db backup`, where its health rows hold the page.
+     *Fact correction, 2026-10-25 (the coordinator):* #426's write was never in the production
+     catalog. It ran in the 1.1.0 proof's measurement home on home2
+     (`~/.cache/tapectl/measure/homes/`, made by `measure.sh`), which no longer exists; only its
+     `results/` text files remain, and they hold no page 0x02. So this decode cannot run. Item
+     172's rule (a write over 1.05 with a correction jump gets a cleaning first) carries the
+     question to the next such write.
 172. **No more drive time for #488 now.** Every production write records repositions, page 0x02
      and the feed ratio. A write over 1.05 with repositions reopens shaping with real data; one
      with a correction jump gets a cleaning first. #488 closes once item 170 is built.
