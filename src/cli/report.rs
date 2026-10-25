@@ -2364,6 +2364,9 @@ fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool
 /// data: every recorded write's [`FeedRatioRow`], newest first, narrowed by
 /// `volume_filter` (the text block puts those above the threshold first;
 /// here the `verdict` says which they are, and `cause` what each names).
+/// Each trend point carries `scope`, `scope_unknown` and
+/// `recorded_before_fix` (issue #495, additive), and its `gib_read` is the
+/// GiB the verify read, null when the point recorded none.
 pub(crate) fn report_health_json(
     conn: &Connection,
     rows: &[HealthRow],
@@ -2385,6 +2388,9 @@ pub(crate) fn report_health_json(
                         "corrected": p.corrected,
                         "uncorrected": p.uncorrected,
                         "corrected_per_gib": p.corrected_per_gib,
+                        "scope": p.scope,
+                        "scope_unknown": p.scope_unknown,
+                        "recorded_before_fix": p.recorded_before_fix,
                     })
                 })
                 .collect();

@@ -5979,6 +5979,25 @@ pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Optio
         .sum()
 }
 
+/// The bytes a full verify's readback of `layout` reads, for its read-error
+/// rates (issue #495): every file the front index sizes, block-padded — on
+/// a tape that sealed short after `ended_after` (#420), the ones at or
+/// before it. The seal marker is left out: the front index gives no size for
+/// it (`volume-format-v2.md` §3), and it is a block or two against the
+/// gigabytes of slices. `None` when that leaves nothing.
+///
+/// Not [`readback_bytes`], which is `None` whenever an entry is unsized —
+/// and on a Layout rebuilt from a tape's front index the seal always is.
+fn verify_read_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
+    let bytes: u64 = layout
+        .entries
+        .iter()
+        .filter(|e| ended_after.is_none_or(|k| e.position as u32 <= k))
+        .filter_map(|e| e.on_tape_bytes(layout.block_size))
+        .sum();
+    (bytes > 0).then_some(bytes)
+}
+
 /// Map a [`crate::store::MismatchKind`] onto the fixed `verification_results.
 /// result` vocabulary (`001_initial.sql`: passed / failed_checksum /
 /// failed_read / failed_decrypt / skipped).
@@ -6322,6 +6341,9 @@ fn close_verify_contact(
     // corrected during this verify, per GiB read, from the page 0x03 the
     // sweep above just journalled — recorded for a FULL verify that made a
     // session, so `audit` and `report health` can trend them per cartridge.
+    // Issue #495: per GiB of the bytes this verify's readback read
+    // (`VerifyReport::verify_bytes`), never page 0x03's own parameter 5,
+    // which counts data sets on the HP drive.
     // Not for `--quick` (Tier::Navigable): it reads File 0, the front index
     // and the seal, a few MB, and a rate over that sample is 0 or huge —
     // either one beside full readbacks flags a healthy cartridge or hides a
@@ -6329,10 +6351,12 @@ fn close_verify_contact(
     // quick verify has none.
     if tier == Tier::Integrity {
         if let (
-            Ok(VerifyReport {
-                session_id: Some(session_id),
-                ..
-            }),
+            Ok(
+                report @ VerifyReport {
+                    session_id: Some(session_id),
+                    ..
+                },
+            ),
             Some((volume_id, label)),
         ) = (&*r, volume)
         {
@@ -6343,6 +6367,7 @@ fn close_verify_contact(
                 volume_id,
                 label,
                 tier,
+                report.verify_bytes,
             );
         }
     }
@@ -6520,6 +6545,13 @@ fn verify_contacted(
         Tier::Integrity => readback_bytes(&layout, ended_after),
         Tier::Navigable => None,
     };
+    // Issue #495: what this contact's readback reads, for the read-error
+    // rates — only when it reads the whole tape (a full verify that
+    // continues nothing).
+    let verify_bytes = match (tier, &resume) {
+        (Tier::Integrity, None) => verify_read_bytes(&layout, ended_after),
+        _ => None,
+    };
     conn.execute(
         "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
          VALUES (?1, ?2, 'in_progress')",
@@ -6652,6 +6684,7 @@ fn verify_contacted(
         // Set by `volume_verify`, which is the only caller with a device and
         // a backend to resolve; this store-injectable half has neither.
         drive_health_note: None,
+        verify_bytes,
     })
 }
 
@@ -8208,6 +8241,16 @@ pub struct VerifyReport {
     /// Verify still runs and still verifies either way; this is advisory
     /// only, never a reason to fail the command.
     pub drive_health_note: Option<String>,
+    /// The bytes this verify's readback read (issue #495), the denominator
+    /// of its read-error rates ([`crate::tape::read_errors`]): every file
+    /// the tape's front index sizes, block-padded, at or before the
+    /// recorded `ended_after` on a short tape ([`verify_read_bytes`]).
+    ///
+    /// `None` on a quick verify (it reads no content file), and on a full
+    /// one that continued an interrupted readback (issue #410): that contact
+    /// read only the files the interrupted one had not, so the figure would
+    /// overstate what it read and understate every rate.
+    pub verify_bytes: Option<u64>,
 }
 
 impl VerifyReport {
@@ -17067,6 +17110,16 @@ mod tests {
         assert_eq!(readback_bytes(&layout, Some(1)), Some(4 * bs));
         // After file 2: files 0 to 2, and the seal.
         assert_eq!(readback_bytes(&layout, Some(2)), Some(7 * bs));
+
+        // Issue #495: a verify's Layout is rebuilt from the tape's front
+        // index, which sizes no seal (`volume-format-v2.md` §3). The
+        // read-error denominator counts every sized file, at or before
+        // `ended_after` on a short tape.
+        let mut from_tape = layout.clone();
+        from_tape.entries[4].size_bytes = None;
+        assert_eq!(verify_read_bytes(&from_tape, None), Some(11 * bs));
+        assert_eq!(verify_read_bytes(&from_tape, Some(1)), Some(3 * bs));
+        assert_eq!(verify_read_bytes(&layout, Some(2)), Some(6 * bs));
     }
 
     /// Issue #392: `first_write` was stamped when the write session
@@ -20051,15 +20104,49 @@ mod tests {
             );
         }
 
+        /// A cartridge `RE-CHIP` registered by its chip serial, and the MAM
+        /// reading a drive gives with it loaded at load count 7: the contact
+        /// names the cartridge and the load, so the read-error figures have
+        /// a same-load baseline (issue #495).
+        fn re_chip(conn: &Connection) -> crate::tape::mam::MamInfo {
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+                 VALUES ('RE-CART', 'LTO-6', 2500000000000, 'RE-CHIP')",
+                [],
+            )
+            .unwrap();
+            crate::tape::mam::MamInfo {
+                serial: Some("RE-CHIP".to_string()),
+                load_count: Some(7),
+                ..Default::default()
+            }
+        }
+
+        /// A page 0x03 decode in sg_logs's shape; `data_sets` is the line
+        /// sg_logs calls "Total bytes processed" (HP-V3 p64: data sets).
+        fn page_0x03(corrected: i64, rereads: i64, data_sets: i64) -> String {
+            format!(
+                "Read error counter page  [0x3]\n  Errors corrected without substantial \
+                 delay = {corrected}\n  Errors corrected with possible delays = 0\n  Total \
+                 rewrites or rereads = {rereads}\n  Total errors corrected = 0\n  Total times \
+                 correction algorithm processed = 0\n  Total bytes processed = {data_sets}\n  \
+                 Total uncorrected errors = 0\n"
+            )
+        }
+
         /// Issue #421 (ADR-0012 2026-10-06 item 12): a completed verify
         /// records the read errors its drive corrected, per GiB read, from
         /// the page 0x03 its own sweep journalled — one `events` row naming
-        /// the verification session and the contact. Two verifies of the
-        /// same volume, the drive's page 0x03 answering 8 then 40 corrected
-        /// errors over 4 GiB: the trend reads 2.0 -> 10.0 and is a rise past
-        /// the default factor. Positive control for the "a verify that made
-        /// no session records nothing" half: a verify whose tape is empty
-        /// fails before any session, takes its sweep, and adds no row.
+        /// the verification session and the contact. Issue #495: the counts
+        /// are the verify's own and the denominator is its own bytes. Two
+        /// verifies of the same volume in one load (one cartridge, one chip
+        /// load count) on an HP drive, the page counting 8 corrected errors
+        /// by the first sweep and 48 by the second: the first counts from
+        /// the load's zero, the second less the first, so 8 then 40 over the
+        /// bytes each readback read, and a rise past the default factor.
+        /// Positive control for the "a verify that made no session records
+        /// nothing" half: a verify whose tape is empty fails before any
+        /// session, takes its sweep, and adds no row.
         #[test]
         fn a_verify_records_its_corrected_read_errors_per_gib() {
             use crate::tape::log_pages::tests::FixtureSource;
@@ -20071,20 +20158,13 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = swept_config(tmp.path());
             let identity = identity_with_serial(Some("XYZZY_A1"));
-            let page = |corrected: i64| {
-                format!(
-                    "Read error counter page  [0x3]\n  Errors corrected without substantial \
-                     delay = {corrected}\n  Errors corrected with possible delays = 0\n  Total \
-                     rewrites or rereads = 1\n  Total errors corrected = 0\n  Total times \
-                     correction algorithm processed = 0\n  Total bytes processed = {}\n  Total \
-                     uncorrected errors = 0\n",
-                    4u64 << 30
-                )
-            };
-            let mut sessions = Vec::new();
-            for corrected in [8, 40] {
+            let mam = re_chip(&conn);
+            let mut verifies = Vec::new();
+            for (corrected, rereads, data_sets) in [(8, 1, 10), (48, 1, 20)] {
                 let src = std::cell::RefCell::new(FixtureSource::default());
-                src.borrow_mut().text.insert(0x03, page(corrected));
+                src.borrow_mut()
+                    .text
+                    .insert(0x03, page_0x03(corrected, rereads, data_sets));
                 let mut store = mem_store_v2_tape("RE-VOL", &data, &data);
                 let report = volume_verify_with_store(
                     &conn,
@@ -20097,14 +20177,26 @@ mod tests {
                         &config,
                         Operation::VolumeVerify,
                         TEST_DEVICE,
-                        Medium::NoBackend,
+                        Medium::Observed {
+                            backend: &config.backends.lto[0],
+                            mam: &mam,
+                        },
                     )
                     .with_drive_identity(&identity)
                     .with_log_source(&src),
                 )
                 .unwrap();
-                sessions.push((report.session_id.unwrap(), report.contact_id.unwrap()));
+                verifies.push((
+                    report.session_id.unwrap(),
+                    report.contact_id.unwrap(),
+                    report
+                        .verify_bytes
+                        .expect("a full verify reads the whole tape"),
+                ));
             }
+            let bytes = verifies[0].2;
+            assert_eq!(verifies[1].2, bytes, "the same tape, the same readback");
+            let gib = bytes as f64 / (1u64 << 30) as f64;
 
             let rows: Vec<(i64, Option<String>, String)> = conn
                 .prepare(
@@ -20119,30 +20211,40 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert_eq!(rows.len(), 2, "one row per completed verify: {rows:?}");
-            for ((entity, value, details), ((session, contact), rate)) in rows
-                .iter()
-                .zip(sessions.iter().zip(["2.000000", "10.000000"]))
-            {
+            let first_contact = verifies[0].1;
+            for (
+                ((entity, value, details), (session, contact, _)),
+                (corrected, rereads, baseline),
+            ) in rows.iter().zip(&verifies).zip([
+                (8, 1, serde_json::Value::Null),
+                (40, 0, first_contact.into()),
+            ]) {
                 assert_eq!(*entity, v);
-                assert_eq!(value.as_deref(), Some(rate));
+                let rate = corrected as f64 / gib;
+                assert_eq!(value.as_deref(), Some(format!("{rate:.6}").as_str()));
                 let d: serde_json::Value = serde_json::from_str(details).unwrap();
                 assert_eq!(d["session_id"], *session, "{d}");
                 assert_eq!(d["contact_id"], *contact, "{d}");
                 assert_eq!(d["drive_serial"], "XYZZY_A1", "{d}");
-                assert_eq!(d["rereads_per_gib"], 0.25, "{d}");
+                assert_eq!(d["verify_bytes"], bytes, "{d}");
+                assert_eq!(d["scope"], "same_load", "{d}");
+                assert_eq!(d["baseline_contact_id"], baseline, "{d}");
+                assert_eq!(d["corrected"], corrected, "{d}");
+                assert_eq!(d["data_sets"], 10, "{d}");
+                assert_eq!(d["rereads_per_gib"], rereads as f64 / gib, "{d}");
             }
             let trends = read_errors::trends(&conn).unwrap();
             assert_eq!(trends.len(), 1, "{trends:?}");
-            assert_eq!(trends[0].cartridge, "volume:RE-VOL", "no cartridge bound");
+            assert_eq!(trends[0].cartridge, "RE-CART", "the contact names it");
             let rise = trends[0]
                 .rising(read_errors::DEFAULT_RISE_FACTOR)
-                .expect("2 -> 10 per GiB is past a 2x factor");
-            assert_eq!((rise.previous, rise.newest), (2.0, 10.0));
+                .expect("8 -> 40 errors over the same bytes is past a 2x factor");
+            assert_eq!((rise.previous, rise.newest), (8.0 / gib, 40.0 / gib));
 
             // A verify that made no session (the volume's tape is empty: the
             // front-index read fails) is swept, and records no figures.
             let src = std::cell::RefCell::new(FixtureSource::default());
-            src.borrow_mut().text.insert(0x03, page(999));
+            src.borrow_mut().text.insert(0x03, page_0x03(999, 0, 30));
             let mut empty = crate::store::MemStore::new(4096);
             let failed = volume_verify_with_store(
                 &conn,
@@ -20175,10 +20277,12 @@ mod tests {
         /// and the seal — a few MB — so its page 0x03 rate is a sample of
         /// nothing, and comparing it with full readbacks flags a healthy
         /// cartridge (0.0 then anything is a rise past any factor). Only a
-        /// full verify is recorded. Full (8 corrected over 4 GiB = 2.0),
-        /// quick (0 corrected over 1 MiB = 0.0), full (9 over 4 GiB = 2.25):
-        /// two points, no rise. Seen failing before the tier guard: three
-        /// rows, and the trend rose from 0.000 to 2.250.
+        /// full verify is recorded. Full, quick, full, in one load: the page
+        /// counts 8 corrected, then 8 (the quick read corrected none), then
+        /// 17. Two points, 8 and 9 per GiB of the readback (#495: the third
+        /// counts from the quick verify's reading, the previous contact in
+        /// the load), and no rise. Seen failing before the tier guard: three
+        /// rows, and the trend rose from 0.000.
         #[test]
         fn a_quick_verify_records_no_read_error_figures() {
             use crate::tape::log_pages::tests::FixtureSource;
@@ -20190,22 +20294,17 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = swept_config(tmp.path());
             let identity = identity_with_serial(Some("XYZZY_A1"));
-            let page = |corrected: i64, bytes: u64| {
-                format!(
-                    "Read error counter page  [0x3]\n  Errors corrected without substantial \
-                     delay = {corrected}\n  Errors corrected with possible delays = 0\n  Total \
-                     rewrites or rereads = 0\n  Total errors corrected = 0\n  Total times \
-                     correction algorithm processed = 0\n  Total bytes processed = {bytes}\n  \
-                     Total uncorrected errors = 0\n"
-                )
-            };
-            for (tier, corrected, bytes) in [
-                (Tier::Integrity, 8, 4u64 << 30),
-                (Tier::Navigable, 0, 1u64 << 20),
-                (Tier::Integrity, 9, 4u64 << 30),
+            let mam = re_chip(&conn);
+            let mut bytes = Vec::new();
+            for (tier, corrected, data_sets) in [
+                (Tier::Integrity, 8, 10),
+                (Tier::Navigable, 8, 11),
+                (Tier::Integrity, 17, 21),
             ] {
                 let src = std::cell::RefCell::new(FixtureSource::default());
-                src.borrow_mut().text.insert(0x03, page(corrected, bytes));
+                src.borrow_mut()
+                    .text
+                    .insert(0x03, page_0x03(corrected, 0, data_sets));
                 let mut store = mem_store_v2_tape("RQ-VOL", &data, &data);
                 let report = volume_verify_with_store(
                     &conn,
@@ -20218,14 +20317,20 @@ mod tests {
                         &config,
                         Operation::VolumeVerify,
                         TEST_DEVICE,
-                        Medium::NoBackend,
+                        Medium::Observed {
+                            backend: &config.backends.lto[0],
+                            mam: &mam,
+                        },
                     )
                     .with_drive_identity(&identity)
                     .with_log_source(&src),
                 )
                 .unwrap();
                 assert!(report.session_id.is_some(), "{tier:?} made a session");
+                bytes.push(report.verify_bytes);
             }
+            assert!(bytes[1].is_none(), "a quick verify has no readback bytes");
+            let gib = bytes[0].unwrap() as f64 / (1u64 << 30) as f64;
             let tiers: Vec<String> = conn
                 .prepare("SELECT details FROM events WHERE action = ?1 ORDER BY id")
                 .unwrap()
@@ -20248,11 +20353,11 @@ mod tests {
                 .iter()
                 .map(|p| p.corrected_per_gib)
                 .collect();
-            assert_eq!(rates, [Some(2.0), Some(2.25)]);
+            assert_eq!(rates, [Some(8.0 / gib), Some(9.0 / gib)]);
             assert_eq!(
                 trends[0].rising(read_errors::DEFAULT_RISE_FACTOR),
                 None,
-                "2.0 -> 2.25 is no rise"
+                "8 -> 9 is no rise"
             );
         }
 
