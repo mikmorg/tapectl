@@ -2202,6 +2202,86 @@ fn test_early_warning_announcement(device: &str, at: u64) -> Vec<String> {
     ]
 }
 
+/// The test hook's environment variable (#388, F5): a write store whose
+/// `n`th block write since it opened goes to the drive with one bit of its
+/// Logical Block Protection CRC flipped.
+pub const TEST_LBP_CORRUPT_BLOCK: &str = "TAPECTL_TEST_LBP_CORRUPT_BLOCK";
+
+/// The ONE place `TAPECTL_TEST_LBP_CORRUPT_BLOCK` is read (#388, F5), by
+/// [`TapeStore::open`], the write store's open. `None` when unset.
+///
+/// **What it does.** The `n`th block write since the store opened (from 1)
+/// goes to the drive with one bit of its CRC flipped
+/// (`TapeDevice::fake_lbp_corrupt_block`), so the drive refuses it exactly as
+/// it refuses a block damaged between tapectl and the drive, and the write
+/// session meets the refusal as it meets a real one (ADR-0012 item 174: one
+/// retry, then `interrupted`). How the gate and the real-drive acceptance
+/// provoke a refusal.
+///
+/// **Why it is safe in a production build** (a runtime check, as
+/// [`TEST_EARLY_WARNING_AT`] is):
+/// - it changes no byte of the data: only the CRC, which the drive checks and
+///   never writes to the medium, so a refused block never lands, and the
+///   retry sends the same bytes with their true CRC;
+/// - it is refused, with the open failing, when the open could not arm LBP:
+///   a hook with no drive to check it would pass vacuously;
+/// - it is loud: the open prints it on stderr, in the tracing output and in
+///   the session log before the first byte is written.
+fn test_lbp_corrupt_block_from_env() -> Option<String> {
+    std::env::var_os(TEST_LBP_CORRUPT_BLOCK).map(|raw| raw.to_string_lossy().into_owned())
+}
+
+/// The hook's decision for one open (#388, F5): `raw` is its value, if set,
+/// and `protection` what the open decided. `Ok(None)` unset; the block number
+/// and the lines to announce when it applies; an error when the value is not
+/// a block count from 1, or the open is not write-armed.
+fn lbp_corrupt_hook(
+    raw: Option<&str>,
+    protection: &Protection,
+    device: &str,
+) -> std::result::Result<Option<(u64, Vec<String>)>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let digits = raw.trim();
+    let n = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| {
+            format!(
+                "{TEST_LBP_CORRUPT_BLOCK}={raw:?} is not a block number: give the block write, \
+                 counted from 1 since the drive opened, whose CRC the test hook corrupts, in \
+                 plain decimal digits, or unset it"
+            )
+        })?;
+    if !protection.writes_checked() {
+        let why = match protection {
+            Protection::Unavailable(reason) => reason.clone(),
+            _ => "this open does not arm it".to_string(),
+        };
+        return Err(format!(
+            "{TEST_LBP_CORRUPT_BLOCK}={n} is set, but Logical Block Protection is not armed on \
+             {device} ({why}): no drive would check the corrupted CRC, so the hook would test \
+             nothing. Refusing to write; unset it, or run where LBP arms"
+        ));
+    }
+    Ok(Some((
+        n,
+        vec![
+            format!(
+                "warning: {TEST_LBP_CORRUPT_BLOCK}={n} is set: block write {n} since {device} \
+                 opened goes to the drive with one bit of its Logical Block Protection CRC \
+                 flipped, so the drive refuses it."
+            ),
+            "warning: this is a TEST hook. It changes no byte of the data, but it makes the \
+             drive refuse a write, which the session retries once. Never set it for a real \
+             write."
+                .to_string(),
+        ],
+    )))
+}
+
 /// How a command opens the drive (issue #407).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -2231,6 +2311,22 @@ impl TapeStore {
             return store;
         }
         let mut dev = TapeDevice::open(device, block_size)?;
+        // #388, F5: refused unless the open armed LBP for writes; the device
+        // drops (and clears the page) on the way out.
+        let corrupt = lbp_corrupt_hook(
+            test_lbp_corrupt_block_from_env().as_deref(),
+            &dev.protection(),
+            device,
+        )
+        .map_err(TapectlError::Other)?;
+        if let Some((n, lines)) = corrupt {
+            for line in lines {
+                tracing::warn!("{line}");
+                crate::progress::stderr_println(&line);
+                crate::progress::log(&line);
+            }
+            dev.fake_lbp_corrupt_block(n);
+        }
         if let Some(at) = test_early_warning_at_from_env() {
             let at = at.map_err(TapectlError::Other)?;
             for line in test_early_warning_announcement(device, at) {
@@ -3519,6 +3615,67 @@ mod tests {
         ] {
             assert!(said.contains(want), "{want:?} not in {said}");
         }
+    }
+
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5) is read in one place and
+    /// is not set here; if it were, every write store would refuse unless
+    /// armed.
+    #[test]
+    fn the_lbp_corrupt_block_hook_is_absent_by_default() {
+        assert!(
+            test_lbp_corrupt_block_from_env().is_none(),
+            "{TEST_LBP_CORRUPT_BLOCK} must not be set in the test environment"
+        );
+        let src = include_str!("store.rs");
+        let body = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            body.matches("var_os(TEST_LBP_CORRUPT_BLOCK)").count(),
+            1,
+            "read in one place"
+        );
+        assert_eq!(
+            body.matches("test_lbp_corrupt_block_from_env().as_deref()")
+                .count(),
+            1,
+            "and asked in one: the write store's open"
+        );
+    }
+
+    /// F5: the hook takes a block number from 1 and nothing else, applies
+    /// only to an open that armed LBP for writes, and refuses — loudly,
+    /// naming why — an open that did not, so a test cannot pass vacuously.
+    #[test]
+    fn the_lbp_corrupt_block_hook_refuses_an_open_that_is_not_armed() {
+        let armed = Protection::Lbp { reads: true };
+        assert_eq!(lbp_corrupt_hook(None, &armed, "/dev/nstX"), Ok(None));
+        let (n, lines) = lbp_corrupt_hook(Some(" 3 "), &armed, "/dev/nstX")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 3);
+        let said = lines.join("\n");
+        for want in [
+            "TAPECTL_TEST_LBP_CORRUPT_BLOCK=3 is set",
+            "/dev/nstX",
+            "TEST hook",
+            "Never set it for a real write",
+        ] {
+            assert!(said.contains(want), "{want:?} not in {said}");
+        }
+        for bad in ["", "0", "-1", "2k", "0x10", "99999999999999999999999"] {
+            let err = lbp_corrupt_hook(Some(bad), &armed, "/dev/nstX").unwrap_err();
+            assert!(err.contains(TEST_LBP_CORRUPT_BLOCK), "{bad:?}: {err}");
+        }
+        let err = lbp_corrupt_hook(
+            Some("3"),
+            &Protection::Unavailable("st cannot carry it".into()),
+            "/dev/nstX",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not armed on /dev/nstX (st cannot carry it)") && err.contains("Refusing"),
+            "{err}"
+        );
+        assert!(lbp_corrupt_hook(Some("3"), &Protection::NotApplicable, "/dev/nstX").is_err());
     }
 
     /// A store with no early warning answers `None` (the trait's default).
