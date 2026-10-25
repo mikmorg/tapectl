@@ -33,9 +33,10 @@
 //!
 //! **Staging** (items 153 and 154): a new or changed unit is snapshotted and
 //! staged as `collection run` does; an unchanged unit's version is staged
-//! from its source; a tape-only unit's version is read back with `volume
-//! read-slices`, which this command prints and never runs (it moves no
-//! tape); a unit whose source is unavailable is named and skipped.
+//! from its source; a tape-only unit's version, and a span in progress no
+//! longer staged (from its own stage set, never staged afresh), is read back
+//! with `volume read-slices`, which this command prints and never runs (it
+//! moves no tape); a unit whose source is unavailable is named and skipped.
 //!
 //! [`CapacityBudget::place`]: crate::volume::layout_model::CapacityBudget::place
 
@@ -708,6 +709,41 @@ fn judge_staged_set(
     })
 }
 
+/// The span in progress of `snapshot_id`, if any: a stage set with a
+/// `range` row on a sealed volume and slices short of the copy floor
+/// (`layout-session.md` "What the plan works from"), with its owed run from
+/// the lowest owed slice to the highest.
+fn span_in_progress(
+    conn: &Connection,
+    config: &Config,
+    unit: &Unit,
+    resolved: &ResolvedPolicy,
+    snapshot_id: i64,
+) -> Result<Option<(i64, (i64, i64))>> {
+    let sets: Vec<i64> = conn
+        .prepare(
+            "SELECT DISTINCT w.stage_set_id FROM writes w
+               JOIN volumes v ON v.id = w.volume_id
+               JOIN stage_sets ss ON ss.id = w.stage_set_id
+              WHERE ss.snapshot_id = ?1 AND w.status = 'range' AND v.status = 'sealed'
+              ORDER BY w.stage_set_id",
+        )?
+        .query_map(params![snapshot_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let floor = coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
+    for set in sets {
+        let owed: Vec<i64> = coverage::slice_copies(conn, set)?
+            .into_iter()
+            .filter(|s| s.copies < floor)
+            .map(|s| s.slice_number)
+            .collect();
+        if let (Some(&first), Some(&last)) = (owed.iter().min(), owed.iter().max()) {
+            return Ok(Some((set, (first, last))));
+        }
+    }
+    Ok(None)
+}
+
 /// Where a unit's files can be read from to stage it.
 enum Source {
     /// Its folder is there: `pending` is the fingerprint's verdict (`None`:
@@ -926,6 +962,7 @@ fn judge_unit(
     let latest = versions.last().map(|v| v.snapshot_id);
     let mut options: Vec<Candidate> = Vec::new();
     let mut unreadable: Vec<i64> = Vec::new();
+    let mut lost_span: Option<i64> = None;
     let mut unavailable = false;
 
     if let Source::Available {
@@ -952,16 +989,42 @@ fn judge_unit(
         .iter()
         .filter(|v| !staged_snapshots.contains(&v.snapshot_id))
     {
-        let from_source =
-            matches!(source, Source::Available { pending: None }) && Some(v.snapshot_id) == latest;
+        // A span in progress no longer staged goes on from its own stage set:
+        // read back from the tapes holding it, never staged afresh
+        // (`layout-session.md` "Refusals": a released owed slice), and only
+        // toward the location of the range its owed run continues (item 159).
+        let span = span_in_progress(conn, config, unit, &resolved, v.snapshot_id)?;
+        let mut continues_span = false;
+        if let Some((set, (first, _))) = span {
+            let at = if first > 1 {
+                continued_range_locations(conn, set, first)?
+            } else {
+                Vec::new()
+            };
+            if !at.is_empty() {
+                if at.iter().all(|l| l.as_deref() == Some(location)) {
+                    continues_span = true;
+                } else {
+                    out.spans_waiting.push(SpanWaiting {
+                        unit: unit.name.clone(),
+                        version: v.version,
+                        at,
+                    });
+                    continue;
+                }
+            }
+        }
+        let from_source = span.is_none()
+            && matches!(source, Source::Available { pending: None })
+            && Some(v.snapshot_id) == latest;
         // An older version, or any version of a changed unit, comes only
         // from tape; and a version never written is on no tape.
-        if !from_source && v.status != "current" {
+        if !from_source && span.is_none() && v.status != "current" {
             continue;
         }
         let (copies, here) = version_counts(conn, v.snapshot_id, location)?;
         let need = judge(copies, here);
-        if need == NeedAt::None {
+        if need == NeedAt::None && !continues_span {
             continue;
         }
         let (how, bytes) = if from_source {
@@ -972,24 +1035,33 @@ fn judge_unit(
                 },
                 pad_to_blocks(v.total_size.unwrap_or(0).max(0) as u64, BLOCK_SIZE),
             )
-        } else if matches!(source, Source::Unavailable(_)) {
+        } else if matches!(source, Source::Unavailable(_)) && span.is_none() {
             unavailable = true;
             continue;
         } else {
             match read_back(conn, &unit.name, v.snapshot_id, v.version)? {
                 Some((commands, bytes)) => (How::ReadSlices { commands }, bytes),
+                None if span.is_some() => {
+                    lost_span = Some(v.version);
+                    continue;
+                }
                 None => {
                     unreadable.push(v.version);
                     continue;
                 }
             }
         };
+        // Read back, a span in progress is planned as its owed run.
+        let (class, bytes) = match span {
+            Some((set, run)) => (PlanClass::Owed, padded_slices(conn, set, false, Some(run))?),
+            None => (class, bytes),
+        };
         options.push(Candidate {
             unit: unit.name.clone(),
             unit_status: unit.status.clone(),
             version: Some(v.version),
             need,
-            continues_span: false,
+            continues_span,
             class,
             bytes,
             how,
@@ -998,29 +1070,32 @@ fn judge_unit(
     options.sort_by_key(Candidate::priority);
     out.to_stage = options.into_iter().next();
     if out.to_stage.is_none() {
-        if let Source::Unavailable(why) = &source {
-            // A unit never archived whose folder is gone has need too: it
-            // has no copy anywhere.
-            let never_archived = versions.is_empty() && judge(0, 0) != NeedAt::None;
-            if unavailable || never_archived {
-                out.skipped = Some(Skipped {
-                    unit: unit.name.clone(),
-                    reason: format!("{why}, so it cannot be staged (item 153)"),
-                });
+        // A unit never archived whose folder is gone has need too: it has no
+        // copy anywhere.
+        let never_archived = versions.is_empty() && judge(0, 0) != NeedAt::None;
+        let reason = match (&source, lost_span) {
+            (_, Some(version)) => Some(format!(
+                "its span in progress (v{version}) has owed slices neither staged nor on a live \
+                 tape, so it cannot be read back and continued"
+            )),
+            (Source::Unavailable(why), None) if unavailable || never_archived => {
+                Some(format!("{why}, so it cannot be staged (item 153)"))
             }
-        } else if !unreadable.is_empty() {
-            out.skipped = Some(Skipped {
-                unit: unit.name.clone(),
-                reason: format!(
-                    "no live volume holds every slice of {}, so it cannot be read back",
-                    unreadable
-                        .iter()
-                        .map(|v| format!("v{v}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
+            (Source::Unavailable(_), None) => None,
+            (_, None) if !unreadable.is_empty() => Some(format!(
+                "no live volume holds every slice of {}, so it cannot be read back",
+                unreadable
+                    .iter()
+                    .map(|v| format!("v{v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => None,
+        };
+        out.skipped = reason.map(|reason| Skipped {
+            unit: unit.name.clone(),
+            reason,
+        });
     }
     Ok(out)
 }
@@ -1804,6 +1879,31 @@ mod tests {
             [set]
         );
 
+        // Released from staging, the span is not staged afresh: it is named,
+        // to be read back from its own stage set.
+        c.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                params![set],
+            )
+            .unwrap();
+        let released = c.plan("home").unwrap();
+        assert!(released.planned.is_empty());
+        assert_eq!(released.skipped.len(), 1);
+        assert!(
+            released.skipped[0].reason.starts_with(
+                "its span in progress (v1) has owed slices neither staged nor on a live tape"
+            ),
+            "{:?}",
+            released.skipped
+        );
+        c.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'staged' WHERE id = ?1",
+                params![set],
+            )
+            .unwrap();
+
         // At a copy floor of 2 every slice is owed: the run starts at slice 1
         // and begins a copy of its own, so it goes where it has need.
         c.config.defaults.min_copies = 2;
@@ -1985,15 +2085,29 @@ mod tests {
         let set = c.set(v, &[MIB, MIB, MIB], "cleaned", false);
         c.write(set, h2, "range", 1, 2);
         c.write(set, home, "range", 3, 3);
+        // Its one copy is on a tape since retired: nothing holds it.
         let lost = c.unit("lost", "tape_only", None);
         c.targets(lost, r#"{"offsite":1}"#);
         let v = c.version(lost, 1, "current");
         let set = c.set(v, &[MIB, MIB], "cleaned", false);
-        c.write(set, home, "range", 1, 1);
+        let gone = c.tape("GONE", Some("home"));
+        c.conn
+            .execute(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                params![gone],
+            )
+            .unwrap();
+        c.whole(set, gone, 2);
 
         let plan = c.plan("offsite").unwrap();
         assert_eq!(names(&plan.planned), ["\"split\" v1", "\"whole\" v2"]);
         assert_eq!(plan.planned[1].bytes, 2 * MIB);
+        assert_eq!(
+            (plan.planned[0].class, plan.planned[0].bytes),
+            (PlanClass::Owed, 3 * MIB),
+            "split's ranges hold one copy of each slice, short of its floor: a span in \
+             progress, read back from its own stage set and planned as its owed run"
+        );
         let commands: Vec<String> = plan.read_slices().iter().map(|r| r.command()).collect();
         assert_eq!(
             commands,
