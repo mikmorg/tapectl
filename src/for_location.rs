@@ -560,7 +560,7 @@ fn padded_slices(
     conn: &Connection,
     stage_set_id: i64,
     live: bool,
-    run: Option<(i64, i64)>,
+    run: Option<OwedRun>,
 ) -> Result<u64> {
     let sizes: Vec<(i64, i64, Option<String>)> = conn
         .prepare(
@@ -584,6 +584,9 @@ fn padded_slices(
         .sum())
 }
 
+/// An owed run of a span in progress: its first and last slice numbers.
+type OwedRun = (i64, i64);
+
 /// How the write plans a staged set (`volume::write::find_staged_data` and
 /// its `plan_span_set`, mirrored from the catalog): a set whose unit allows
 /// spanning or that has a `range` row is planned as a span, its owed run
@@ -598,7 +601,7 @@ fn staged_set_plan(
     unit: &Unit,
     resolved: &ResolvedPolicy,
     stage_set_id: i64,
-) -> Result<(PlanClass, Option<(i64, i64)>, u64)> {
+) -> Result<(PlanClass, Option<OwedRun>, u64)> {
     let (has_range, sealed_range): (bool, bool) = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM writes WHERE stage_set_id = ?1 AND status = 'range'),
                 EXISTS(SELECT 1 FROM writes w JOIN volumes v ON v.id = w.volume_id
@@ -746,10 +749,10 @@ fn span_in_progress(
 
 /// Where a unit's files can be read from to stage it.
 enum Source {
-    /// Its folder is there: `pending` is the fingerprint's verdict (`None`:
-    /// its latest snapshot matches the folder).
+    /// Its folder is there: `pending` is the fingerprint's verdict, why and
+    /// its size (`None`: its latest snapshot matches the folder).
     Available {
-        pending: Option<fingerprint::PendingUnit>,
+        pending: Option<(PendingReason, u64)>,
     },
     /// A tape-only unit: read back from tape.
     TapeOnly,
@@ -775,7 +778,8 @@ fn source_of(conn: &Connection, config: &Config, unit: &Unit) -> Result<Source> 
             if path.is_empty() { "(no path)" } else { path }
         )));
     }
-    let pending = fingerprint::classify(conn, unit, &config.defaults.global_excludes)?;
+    let pending = fingerprint::classify(conn, unit, &config.defaults.global_excludes)?
+        .map(|p| (p.reason, p.estimated_bytes));
     Ok(Source::Available { pending })
 }
 
@@ -966,7 +970,7 @@ fn judge_unit(
     let mut unavailable = false;
 
     if let Source::Available {
-        pending: Some(pending),
+        pending: Some((reason, estimated_bytes)),
     } = &source
     {
         let need = judge(0, 0);
@@ -978,10 +982,8 @@ fn judge_unit(
                 need,
                 continues_span: false,
                 class,
-                bytes: pad_to_blocks(pending.estimated_bytes, BLOCK_SIZE),
-                how: How::Snapshot {
-                    reason: pending.reason,
-                },
+                bytes: pad_to_blocks(*estimated_bytes, BLOCK_SIZE),
+                how: How::Snapshot { reason: *reason },
             });
         }
     }
