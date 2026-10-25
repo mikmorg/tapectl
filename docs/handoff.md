@@ -561,9 +561,10 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   about one read of the source).
 - **The 1.1.2 queue, #444–#475:** done and tagged `v1.1.2`. The real-drive half of #444 (both
   blank proofs, the sub-MiB chip measurement) waits for the step-12 rehearsal in (f).
-- **2026-10-07 item 6:** the read-error rate assumes the drive clears log page 0x03 at
-  load. Check it on home2's first two full verifies (L6-0001 and L6-0002), and revisit
-  the rate if the drive keeps the counters.
+- **2026-10-07 item 6:** settled in 1.7.1 (#495). HP-V3 says the drive clears pages 0x02 and
+  0x03 when the tape is unloaded, and parameter 5 counts data sets, not bytes. The rates now take
+  the difference against the previous contact in the same load and divide by the verify's own
+  bytes.
 
 ## Decisions already ratified: do not re-litigate
 
