@@ -443,9 +443,8 @@ impl CapacityBudget {
             owed_end.saturating_add(bytes(&held_whole[..kept])),
             !open,
         );
-        if let (Some(t), Some(bound)) = (spans.tail, self.plan_bound_bytes) {
-            let room = bound.saturating_sub(fixed_bytes);
-            if room > 0 && items[t].bytes > room && kept > 0 {
+        if let Some(t) = spans.tail {
+            if kept > 0 && self.larger_than_one_tape(fixed_bytes, items[t].bytes) {
                 kept = 0;
                 spans = self.place_spans(&spannable, items, owed_end, false);
             }
@@ -474,6 +473,52 @@ impl CapacityBudget {
             placed,
             errors,
         }
+    }
+
+    /// X11's room per tape for a span: the plan bound less `fixed_bytes`,
+    /// the early warning estimated at the nominal capacity. `None` without
+    /// a bound (nothing spans, item 123) or with no room under it.
+    fn span_room(&self, fixed_bytes: u64) -> Option<u64> {
+        self.plan_bound_bytes
+            .map(|bound| bound.saturating_sub(fixed_bytes))
+            .filter(|&room| room > 0)
+    }
+
+    /// A spannable set of `bytes` is larger than one tape by X11's estimate
+    /// (item 94): [`Self::place`] starts it right after the owed runs (item
+    /// 147).
+    fn larger_than_one_tape(&self, fixed_bytes: u64, bytes: u64) -> bool {
+        self.span_room(fixed_bytes).is_some_and(|room| bytes > room)
+    }
+
+    /// Item 147's last tape, by X11's estimate: when `placement`'s tail is a
+    /// spannable set larger than one tape, the bytes of it left for its last
+    /// tape. There its owed run comes first and the whole units it displaced
+    /// follow within item 113's bound (item 123). Its first tape is taken to
+    /// hold the plan bound less where it starts there, and each later tape
+    /// the bound less `fixed_bytes`, as [`Self::place`] decides it is larger
+    /// than one tape. `None` for any other placement: no tail, an owed run
+    /// as the tail, or a set that fits one tape (item 95).
+    pub fn span_last_run(
+        &self,
+        fixed_bytes: u64,
+        items: &[PlanItem],
+        placement: &Placement,
+    ) -> Option<u64> {
+        let t = placement.tail()?;
+        let (bound, room) = (self.plan_bound_bytes?, self.span_room(fixed_bytes)?);
+        let set = items[t].bytes;
+        if items[t].class != PlanClass::Spannable || set <= room {
+            return None;
+        }
+        let start = placement
+            .order
+            .iter()
+            .take_while(|&&i| i != t)
+            .fold(fixed_bytes, |end, &i| end.saturating_add(items[i].bytes));
+        let rest = set.saturating_sub(bound.saturating_sub(start));
+        let later_tapes = rest.div_ceil(room).max(1);
+        Some(rest - (later_tapes - 1) * room)
     }
 
     /// One spannable unit ending the plan at `end` ([`Self::span_placed`]);
@@ -2031,6 +2076,40 @@ mod tests {
             [LayoutError::SpanNeedsPostWarningBytes { .. }]
         ));
         assert!(p.deferred().is_empty());
+    }
+
+    /// Item 147's last tape by X11's estimate: what a set larger than one
+    /// tape leaves for its last tape, past its first tape (the bound less
+    /// where it starts) and each whole tape of the room after it. Its
+    /// displaced whole units fill in after that run (the collection selector
+    /// packs them there, `collection::selector::after_the_tail`).
+    #[test]
+    fn a_set_larger_than_one_tape_leaves_its_last_run_by_x11s_estimate() {
+        use PlanClass::{Owed, Spannable, Whole};
+        // Fixed 1 and a bound of 26: a tape holds 25 blocks of a set.
+        let b = budget(24 * BS, 0, Some(26 * BS));
+        let run = |items: &[PlanItem]| b.span_last_run(BS, items, &b.place(BS, items));
+        // 35 blocks from block 1: 25 on its first tape, 10 on its last.
+        assert_eq!(run(&[item(Whole, 5), item(Spannable, 35)]), Some(10 * BS));
+        // 51: 25, 25, then 1; exactly two tapes' room: a whole room last.
+        assert_eq!(run(&[item(Spannable, 51)]), Some(BS));
+        assert_eq!(run(&[item(Spannable, 50)]), Some(25 * BS));
+        // After a 3-block owed run, or a 3-block set that fits queued first
+        // (X13), it starts at block 4: 22 on its first tape, 13 on its last.
+        assert_eq!(run(&[item(Owed, 3), item(Spannable, 35)]), Some(13 * BS));
+        assert_eq!(
+            run(&[item(Spannable, 3), item(Spannable, 35)]),
+            Some(13 * BS)
+        );
+        // None: a set that fits one tape (item 95), an owed run as the tail,
+        // no tail, and no bound (nothing spans, item 123).
+        assert_eq!(run(&[item(Whole, 5), item(Spannable, 25)]), None);
+        assert_eq!(run(&[item(Owed, 30), item(Whole, 5)]), None);
+        assert_eq!(run(&[item(Whole, 5)]), None);
+        let unbounded = budget(24 * BS, 0, None);
+        let items = [item(Spannable, 35)];
+        let p = unbounded.place(BS, &items);
+        assert_eq!(unbounded.span_last_run(BS, &items, &p), None);
     }
 
     /// X12: a whole unit the whole units alone would hold, but that an owed

@@ -311,8 +311,14 @@ pub struct BatchPlacement {
     pub may_span: Vec<String>,
     /// The unit that allows spanning and crosses the plan bound (items 84,
     /// 94 and 123): last on its batch's tape, cut by the drive's early
-    /// warning, and continued on the next cartridge.
+    /// warning, and continued on the next cartridge. One larger than one
+    /// tape starts its batch's first tape instead (item 147).
     pub spans: Option<String>,
+    /// The whole units the unit that spans displaces when it is larger than
+    /// one tape (items 94 and 147): written after its tail on its last tape,
+    /// in the batch's order ([`selector::after_the_tail`]). Those past that
+    /// tape's fill ceiling are in `past_ceiling` too. Empty otherwise.
+    pub after_tail: Vec<String>,
 }
 
 /// [`BatchPlacement`] of `batch`, packed against `room`, whose units named
@@ -320,7 +326,9 @@ pub struct BatchPlacement {
 /// after the first whose running block-padded total passes `room.fill` (the
 /// batch's room under the ceiling: [`TapeBudget::bytes`] for `collection
 /// plan`, [`DestinationBudget::bytes`] for `collection run`), in the batch's
-/// order — whole units, never reordered, as 1.6.0 names them.
+/// order — whole units, never reordered, as 1.6.0 names them. When a unit
+/// larger than one tape spans, the whole units it displaces are placed on
+/// its last tape after its tail, as the selector packed them (item 147).
 pub fn placement(batch: &Batch, room: BatchRoom, spannable: &HashSet<String>) -> BatchPlacement {
     let items: Vec<PlanItem> = batch
         .units
@@ -334,9 +342,19 @@ pub fn placement(batch: &Batch, room: BatchRoom, spannable: &HashSet<String>) ->
             bytes: pad_to_blocks(u.size_bytes, BLOCK_SIZE),
         })
         .collect();
-    let placed = room.budget().place(0, &items);
+    let budget = room.budget();
+    let first = budget.place(0, &items);
+    let mut placed = first.placed.clone();
+    let mut after_tail = vec![false; items.len()];
+    for (i, last) in selector::after_the_tail(&budget, &items, &first).unwrap_or_default() {
+        placed[i] = last;
+        after_tail[i] = true;
+    }
     let mut out = BatchPlacement::default();
-    for ((unit, item), at) in batch.units.iter().zip(&items).zip(&placed.placed) {
+    for (((unit, item), at), after) in batch.units.iter().zip(&items).zip(&placed).zip(after_tail) {
+        if after {
+            out.after_tail.push(unit.name.clone());
+        }
         match (item.class, at) {
             (PlanClass::Whole, Placed::PastCeiling) => out.past_ceiling.push(unit.name.clone()),
             (PlanClass::Spannable, Placed::PastCeiling) => out.may_span.push(unit.name.clone()),
@@ -3153,12 +3171,13 @@ compression = "bogus"
         conn
     }
 
-    /// Item 94: a unit that allows spanning and is larger than one tape (12
-    /// MiB against a 10 MB cartridge, 5 MB under its fill ceiling) is
-    /// admitted by `collection plan` and `collection run` alike, packed last
-    /// in its batch — after `zulu`, later in the alphabet — and the preview
-    /// names it as the unit that spans. Until its dotfile allows spanning it
-    /// is refused, naming the key (item 82).
+    /// Items 94 and 147: a unit that allows spanning and is larger than one
+    /// tape (12 MiB against a 10 MB cartridge, 5 MB under its fill ceiling)
+    /// is admitted by `collection plan` and `collection run` alike, listed
+    /// last in its batch — after `zulu`, later in the alphabet — and the
+    /// preview names it as the unit that spans, first on the batch's first
+    /// tape, with the whole units after its tail on its last tape. Until its
+    /// dotfile allows spanning it is refused, naming the key (item 82).
     #[test]
     fn a_unit_that_allows_spanning_larger_than_one_tape_is_planned_last_and_spans() {
         let _total = crate::staging::TotalSpaceOverride::set(1 << 40);
@@ -3188,6 +3207,10 @@ compression = "bogus"
             packed.spannable,
             HashSet::from(["testlib/huge".to_string()])
         );
+        // Item 147: huge starts the batch's first tape, and alpha and zulu
+        // ride its batch to its last tape, after its tail: by X11's estimate
+        // (10 MB a tape) that tape holds huge's last 2.6 MB, alpha takes it
+        // to 4.7 MB under the 5 MB ceiling, and zulu to 5.7 MB past it.
         assert_eq!(
             batch_names(&packed.batches),
             [vec!["testlib/alpha", "testlib/zulu", "testlib/huge"]]
@@ -3195,7 +3218,9 @@ compression = "bogus"
         assert_eq!(
             packed.placement(&packed.batches[0]),
             BatchPlacement {
+                past_ceiling: vec!["testlib/zulu".into()],
                 spans: Some("testlib/huge".into()),
+                after_tail: vec!["testlib/alpha".into(), "testlib/zulu".into()],
                 ..Default::default()
             }
         );
@@ -3205,10 +3230,9 @@ compression = "bogus"
         let (run, budget) =
             plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".into()], false).unwrap();
         assert_eq!(batch_names(&run.batches), batch_names(&packed.batches));
-        assert_eq!(
-            run.placement(&run.batches[0]).spans.as_deref(),
-            Some("testlib/huge")
-        );
+        let at = run.placement(&run.batches[0]);
+        assert_eq!(at.spans.as_deref(), Some("testlib/huge"));
+        assert_eq!(at.after_tail, ["testlib/alpha", "testlib/zulu"]);
         assert_eq!(run.room.bound, Some(budget.packing_bytes()));
     }
 

@@ -21,18 +21,22 @@
 //! generation's capacity (ADR-0012 2026-10-15 item 69); `collection plan`
 //! prints the largest pending unit's share of the tape so that is visible.
 //!
-//! **Spanning** (1.7.0, #478; ADR-0012 items 82, 83, 94, 95 and 123;
+//! **Spanning** (1.7.0, #478; ADR-0012 items 82, 83, 94, 95, 123 and 147;
 //! `layout-session.md` "Spanning"). A unit that allows spanning may be cut
 //! by the drive's early warning and continue on the next tape, so it is not
 //! held to one tape: [`plan_batches_spanning`] admits it at any size up to
 //! the staging area, and fills each batch by the per-tape plan order
 //! ([`CapacityBudget::place`], never a copy of it): whole units first, the
-//! spannable ones last. With no spannable unit pending it is exactly
+//! spannable ones last, except that one larger than one tape comes first and
+//! the whole units it displaces ride its batch to its last tape, after its
+//! tail ([`after_the_tail`]). With no spannable unit pending it is exactly
 //! [`plan_batches`] (or [`plan_batches_prioritised`]).
 
 use std::collections::HashSet;
 
-use crate::volume::layout_model::{pad_to_blocks, CapacityBudget, Placed, PlanClass, PlanItem};
+use crate::volume::layout_model::{
+    pad_to_blocks, CapacityBudget, Placed, Placement, PlanClass, PlanItem,
+};
 
 /// One pending unit as the selector sees it: a name (the sort key) and a
 /// size in bytes. Sourcing the size is the caller's concern — see
@@ -267,11 +271,16 @@ fn sort_prioritised(units: &mut [PendingUnit], prioritised: &HashSet<String>) {
 ///   next. So whole units are committed to the fill ceiling and, with no
 ///   spannable unit in their batch, past it within the bound (item 113);
 ///   spannable units go last (items 83 and 95); the first that crosses the
-///   bound spans and nothing after it is planned on that tape (item 123);
-///   and one larger than one tape starts early, the whole units it leaves
-///   no room for starting the next batch (item 94).
+///   bound spans and nothing after it is planned on that tape (item 123).
+///   One larger than one tape starts its batch's first tape instead (items
+///   94 and 147), and the batch is one write across its tapes: the whole
+///   units it displaces stay in the batch while they fit after its tail on
+///   its last tape, by X11's estimate ([`after_the_tail`]), and the first
+///   that does not starts the next batch.
 /// - **Order within a batch**: its whole units in the order taken, then its
-///   spannable units in the order taken (the tape's order).
+///   spannable units in the order taken (the tape's order; with a unit
+///   larger than one tape, that unit comes first on the first tape and the
+///   whole units after its tail on its last, `collection::plan::placement`).
 ///
 /// A batch's `padded_bytes` counts each spannable unit whole, including what
 /// continues on the next tape. Which unit of a batch spans is
@@ -357,7 +366,9 @@ pub fn plan_batches_spanning(
 }
 
 /// Whether the per-tape plan order places every unit of `current` and
-/// `next` on one tape: none deferred to a later tape, none refused.
+/// `next` in one batch: on its tape, none deferred to a later tape and none
+/// refused, or, when a unit larger than one tape spans, every whole unit it
+/// displaces after its tail on its last tape ([`after_the_tail`]).
 fn every_unit_placed(
     budget: &CapacityBudget,
     current: &[(PendingUnit, PlanItem)],
@@ -368,15 +379,65 @@ fn every_unit_placed(
         .map(|(_, item)| *item)
         .chain(std::iter::once(next))
         .collect();
-    budget
-        .place(0, &items)
+    let first = budget.place(0, &items);
+    all_placed(&first) || after_the_tail(budget, &items, &first).is_some()
+}
+
+/// Nothing of the plan waits for a later tape or is refused.
+fn all_placed(placement: &Placement) -> bool {
+    placement
         .placed
         .iter()
         .all(|p| !matches!(p, Placed::Deferred | Placed::Refused))
 }
 
+/// ADR-0012 item 147 in a batch, one write across the tapes of a span. When
+/// the batch's first tape (`first`, [`CapacityBudget::place`] of `items`
+/// against `budget` with no fixed files) is spanned by a unit larger than
+/// one tape, the whole units it displaces are written after its tail on its
+/// last tape: they belong to the batch while they all fit there. That tape
+/// is the per-tape plan order of the span's last run by X11's estimate (the
+/// bound per tape, [`CapacityBudget::span_last_run`]) as its owed run, then
+/// those whole units in the batch's order, within item 113's bound (item
+/// 123). `Some` with each one's index and where it sits there (under the
+/// fill ceiling or past it) when every one fits and nothing else of the
+/// batch waits or is refused; `None` otherwise, and for any other `first`.
+/// A unit deferred for another reason (one queued after the tail, X13) or
+/// refused (X12) closes the batch exactly as before.
+pub fn after_the_tail(
+    budget: &CapacityBudget,
+    items: &[PlanItem],
+    first: &Placement,
+) -> Option<Vec<(usize, Placed)>> {
+    let run = budget.span_last_run(0, items, first)?;
+    let mut displaced = Vec::new();
+    for (i, p) in first.placed.iter().enumerate() {
+        match (items[i].class, p) {
+            (PlanClass::Whole, Placed::Deferred) => displaced.push(i),
+            (_, Placed::Deferred | Placed::Refused) => return None,
+            _ => {}
+        }
+    }
+    let last_tape: Vec<PlanItem> = std::iter::once(PlanItem {
+        class: PlanClass::Owed,
+        bytes: run,
+    })
+    .chain(displaced.iter().map(|&i| items[i]))
+    .collect();
+    let last = budget.place(0, &last_tape);
+    all_placed(&last).then(|| {
+        displaced
+            .into_iter()
+            .zip(last.placed[1..].iter().copied())
+            .collect()
+    })
+}
+
 /// One batch of `units`, in its tape's order: the whole units, then the
-/// spannable ones (items 83 and 95), each group in the order taken.
+/// spannable ones (items 83 and 95), each group in the order taken. A unit
+/// larger than one tape starts the tape instead, and the whole units go
+/// after its tail on its last tape (item 147); the batch keeps this order and
+/// `collection::plan::placement` says where each sits.
 fn batch_in_tape_order(units: Vec<(PendingUnit, PlanItem)>) -> Batch {
     let (whole, spannable): (Vec<_>, Vec<_>) = units
         .into_iter()
@@ -626,12 +687,41 @@ mod tests {
         assert!(err.larger_than_staging.is_empty());
     }
 
-    /// Item 94: a spannable unit larger than one tape is admitted. It goes
-    /// last on its batch's tape (items 83 and 95): `z`, after it in the
-    /// alphabet, is on the tape before it. Its early start leaves 5 for whole
-    /// units before it (it touches three tapes either way), and a, z take 5.
+    /// Where the per-tape plan order puts `items` (sizes, `true` for a unit
+    /// that allows spanning) against [`ROOM`]: the first tape, and the whole
+    /// units that go after a span's tail on its last tape.
+    fn first_and_after_the_tail(
+        items: &[(u64, bool)],
+    ) -> (Vec<Placed>, Option<Vec<(usize, Placed)>>) {
+        let items: Vec<PlanItem> = items
+            .iter()
+            .map(|&(bytes, span)| PlanItem {
+                class: if span {
+                    PlanClass::Spannable
+                } else {
+                    PlanClass::Whole
+                },
+                bytes,
+            })
+            .collect();
+        let budget = ROOM.budget();
+        let first = budget.place(0, &items);
+        let after = after_the_tail(&budget, &items, &first);
+        (first.placed, after)
+    }
+
+    /// Items 94 and 147: a spannable unit larger than one tape is admitted,
+    /// and its batch is one write across its tapes. It starts the first
+    /// tape, and the whole units it displaces ride the batch to its last
+    /// tape: by X11's estimate (10 per tape) that tape holds the last 5 of
+    /// `m`, and `a` and `z` (5 together) fit after that tail within the
+    /// bound, `z` past the fill ceiling of 8. So `z`, after `m` in the
+    /// alphabet, joins the batch too, and the batch keeps its class order.
+    /// Moved and moved back by item 147 (#492): 1.7.0 put `a` and `z`
+    /// before `m` on its first tape, its late start leaving them 5 there.
     #[test]
-    fn a_spannable_unit_larger_than_one_tape_is_admitted_and_goes_last() {
+    fn a_spannable_unit_larger_than_one_tape_is_admitted_and_its_whole_units_ride_its_batch() {
+        use Placed::{Committed, Deferred, PastCeiling, Tail};
         let units = vec![unit("a", 3), unit("m", 25), unit("z", 2)];
         let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
         assert_eq!(names_of(&batches), [vec!["a", "z", "m"]]);
@@ -639,15 +729,60 @@ mod tests {
             batches[0].padded_bytes, 30,
             "the spanning unit is counted whole"
         );
+        let (first, after) = first_and_after_the_tail(&[(3, false), (2, false), (25, true)]);
+        assert_eq!(
+            first,
+            [Deferred, Deferred, Tail],
+            "m alone on its first tape"
+        );
+        assert_eq!(after, Some(vec![(0, Committed), (1, PastCeiling)]));
     }
 
-    /// Item 94's displacement: a whole unit the early start leaves no room
-    /// for starts the next batch rather than pushing the span later.
+    /// Item 147: a whole unit that does not fit after the tail on the span's
+    /// last tape starts the next batch. `a` (3) after the tail of 5 ends at
+    /// 8; `z` (4) would end at 12, past the bound of 10.
     #[test]
-    fn a_whole_unit_the_early_start_leaves_no_room_for_starts_the_next_batch() {
+    fn a_whole_unit_that_does_not_fit_after_the_tail_starts_the_next_batch() {
         let units = vec![unit("a", 3), unit("m", 25), unit("z", 4)];
         let batches = plan_batches_spanning(units, None, &spanning(&["m"], None), ROOM, 1).unwrap();
         assert_eq!(names_of(&batches), [vec!["a", "m"], vec!["z"]]);
+        let (_, after) = first_and_after_the_tail(&[(3, false), (4, false), (25, true)]);
+        assert_eq!(after, None);
+    }
+
+    /// Item 147 with next-fit: the whole units ride a span's batch, in name
+    /// order, until the first that does not fit after its tail, which closes
+    /// the batch for good. After `m`'s tail of 5, `a` ends at 7 and `n` at 9
+    /// (past the fill ceiling of 8, within the bound); `p` would end at 11,
+    /// so it starts the next batch, and `q`, which would have fitted (10),
+    /// goes with it: a closed batch is never reopened. Positive control:
+    /// without `p`, `q` rides too.
+    #[test]
+    fn a_spans_batch_closes_at_the_first_whole_unit_not_fitting_after_its_tail() {
+        let span = spanning(&["m"], None);
+        let units = vec![
+            unit("a", 2),
+            unit("m", 25),
+            unit("n", 2),
+            unit("p", 2),
+            unit("q", 1),
+        ];
+        let batches = plan_batches_spanning(units.clone(), None, &span, ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "n", "m"], vec!["p", "q"]]);
+
+        let without_p: Vec<PendingUnit> = units.into_iter().filter(|u| u.name != "p").collect();
+        let batches = plan_batches_spanning(without_p, None, &span, ROOM, 1).unwrap();
+        assert_eq!(names_of(&batches), [vec!["a", "n", "q", "m"]]);
+        let (_, after) =
+            first_and_after_the_tail(&[(2, false), (2, false), (1, false), (25, true)]);
+        assert_eq!(
+            after,
+            Some(vec![
+                (0, Placed::Committed),
+                (1, Placed::PastCeiling),
+                (2, Placed::PastCeiling)
+            ])
+        );
     }
 
     /// Items 83 and 95: a spannable unit that fits one tape goes last in its
