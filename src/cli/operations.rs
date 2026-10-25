@@ -1074,7 +1074,7 @@ pub(crate) fn below_policy_facts(
         let unit = queries::get_unit_by_name(conn, &impact.unit_name)?
             .ok_or_else(|| TapectlError::UnitNotFound(impact.unit_name.clone()))?;
         let policy = crate::policy::resolve(conn, config, &unit)?;
-        let needed_copies = coverage::copy_floor(config, policy.min_copies, &unit.status);
+        let needed_copies = coverage::copy_floor(config, policy.copy_floor_base(), &unit.status);
         let per_name = coverage::copies_per_named_location(config, &unit.status);
         let note = coverage::tape_only_note(config, &unit.status);
         let requires = policy.required_locations.join(", ");
@@ -2655,7 +2655,8 @@ pub fn unit_mark_tape_only(
     // Tier-2 gate, not an absolute one). `tape_only_note` names the
     // multiplier in the copy fact.
     let tape_only_note = crate::policy::coverage::tape_only_note(config, "tape_only");
-    let min_copies = crate::policy::coverage::copy_floor(config, policy.min_copies, "tape_only");
+    let min_copies =
+        crate::policy::coverage::copy_floor(config, policy.copy_floor_base(), "tape_only");
     // The distinct-place floor has no per-unit or per-archive-set layer: it
     // exists only in `[defaults]`, and `policy::coverage::location_floor`
     // reads it from there, for the status the unit is about to have. The
@@ -6968,12 +6969,19 @@ mod tests {
             assert_eq!(
                 facts,
                 vec![
+                    // #493 (ADR-0012 item 149): the two names are a copy each
+                    // in the map, so the floor is max(1, 2) x 3 = 6, which
+                    // the 3 copies left are below.
+                    "unit \"unitA\" v1 would be left with 3 copy/copies, below its policy of \
+                     6 (tape-only 3x)"
+                        .to_string(),
                     "unit \"unitA\" v1 would be left with 1 copy at required location home, \
                      2 copies at required location offsite, needs 3 at each (tape-only 3x) \
                      (policy requires home, offsite)"
                         .to_string()
                 ],
-                "home keeps 1 of 3 and offsite 2 of 3 (the retired volume was a third there)"
+                "home keeps 1 of 3 and offsite 2 of 3 (the retired volume was a third there), \
+                 and the floor is the names' 2 times 3"
             );
         }
 

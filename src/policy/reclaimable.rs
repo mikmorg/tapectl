@@ -152,7 +152,8 @@ fn superseding_verdict(
     // #425): it applies with no names at all, or one, so it is asked last,
     // as set, through the one predicate `audit`'s `location_count` and `unit
     // mark-tape-only` ask too.
-    let required_copies = super::coverage::copy_floor(config, resolved.min_copies, &unit.status);
+    let required_copies =
+        super::coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
     let tape_only_note = super::coverage::tape_only_note(config, &unit.status);
 
     // ADR-0004 (issue #89): this query previously had no JOIN to
@@ -910,7 +911,24 @@ pub(crate) mod tests {
             other => panic!("one copy at offsite must not meet [offsite] at 2x: {other:?}"),
         }
 
-        // The configured multiplier, not a literal 2 (#215's lesson).
+        // The configured multiplier, not a literal 2 (#215's lesson). Since
+        // #493 (ADR-0012 item 149) `["offsite"]` is one copy in the map, so
+        // the copy floor is max(0, 1) x 3 = 3: a warehouse deposit of the tape
+        // at `home` is a third copy, not one at `offsite`, so the copy floor
+        // is met and the named location is what blocks.
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id)
+             SELECT v.id, l.id FROM volumes v, locations l
+             WHERE v.location_id = (SELECT id FROM locations WHERE name = 'home')
+               AND l.name = 'glacier'",
+            [],
+        )
+        .unwrap();
         config.compaction.tape_only_safety_multiplier = 3;
         config.defaults.min_copies = 0;
         match assess(&conn, &config, &unit, 1).unwrap() {

@@ -177,8 +177,10 @@ fn units_judged_whole(conn: &Connection, unit_ids: &[i64]) -> Result<Vec<i64>> {
 }
 
 /// The copy floor the slices of `unit_id`'s stage sets are released
-/// against: its resolved `min_copies` through the one tape-only rule
-/// ([`copy_floor`]), the floor [`under_copied_units`] judges the unit by.
+/// against: its resolved policy's `copy_floor_base` (the larger of
+/// `min_copies` and the `copies_at` sum, #493 ADR-0012 item 149) through the
+/// one tape-only rule ([`copy_floor`]), the floor [`under_copied_units`]
+/// judges the unit by.
 fn unit_copy_floor(conn: &Connection, config: &Config, unit_id: i64) -> Result<i64> {
     let name: String = conn
         .query_row(
@@ -200,7 +202,7 @@ fn unit_copy_floor(conn: &Connection, config: &Config, unit_id: i64) -> Result<i
         ))
     })?;
     let resolved = crate::policy::resolve(conn, config, &unit)?;
-    Ok(copy_floor(config, resolved.min_copies, &unit.status))
+    Ok(copy_floor(config, resolved.copy_floor_base(), &unit.status))
 }
 
 /// The per-slice release (1.7.0, issue #478; ADR-0012 items 85 and 129) of
@@ -305,7 +307,7 @@ pub fn under_copied_units(
             copy_count_expr(&CoverageQuery::current_unit("?1"))
         );
         let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
-        let min_copies = copy_floor(config, resolved.min_copies, &unit.status);
+        let min_copies = copy_floor(config, resolved.copy_floor_base(), &unit.status);
         if copies < min_copies {
             under.push(CopyProgress {
                 unit_name: name,

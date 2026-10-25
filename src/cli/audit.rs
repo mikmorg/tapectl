@@ -739,8 +739,11 @@ fn restage_action(
 
     // Issue #274: the same `copy_count_for_unit` derivation
     // `check_copy_count`/`under_copied_release_candidates` use (issue
-    // #96) — never a second count.
-    let under_copied = copy_count_for_unit(conn, unit.id)? < resolved.min_copies;
+    // #96) — never a second count — against the same floor (#493, ADR-0012
+    // item 149: the larger of `min_copies` and the `copies_at` sum). The
+    // unit is active here, so the tape-only multiplier is 1 and the floor
+    // is its base.
+    let under_copied = copy_count_for_unit(conn, unit.id)? < resolved.copy_floor_base();
 
     let mut steps: Vec<String> = Vec::new();
     for v in &live_versions {
@@ -788,7 +791,7 @@ fn check_copy_count(
     let resolved = policy.expect("copy_count is a needs_policy check");
     let mut f = Findings::default();
     let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
-    let needed = policy::coverage::copy_floor(ctx.config, resolved.min_copies, &unit.status);
+    let needed = policy::coverage::copy_floor(ctx.config, resolved.copy_floor_base(), &unit.status);
 
     if copy_count < needed {
         f.violations.push(AuditFinding {
