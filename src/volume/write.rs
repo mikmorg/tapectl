@@ -27332,26 +27332,52 @@ mod tests {
         /// exact budget the rehearsal accepts (live + files + margin +
         /// reserve), the write's own pre-flight validate on its own build,
         /// for a volume with every identity detail different, finds no
-        /// capacity problem; one byte under, the rehearsal refuses.
+        /// capacity problem; one byte under, the rehearsal's rule refuses.
         #[test]
         fn a_passing_rehearsal_means_the_write_after_the_erase_cannot_refuse_on_capacity() {
+            a_passing_rehearsal_bounds_the_real_write(0);
+        }
+
+        /// #491's positive control: the pin holds however heavy the
+        /// envelopes are ([`grow_envelopes`]).
+        #[test]
+        fn a_passing_rehearsal_bounds_the_real_write_however_heavy_the_envelopes() {
+            for bytes in [512, 2048, 4096, 4608] {
+                a_passing_rehearsal_bounds_the_real_write(bytes);
+            }
+        }
+
+        /// The body of the two tests above, with the envelopes grown by a
+        /// dar catalogue of `catalogue_bytes`.
+        fn a_passing_rehearsal_bounds_the_real_write(catalogue_bytes: usize) {
             let f = fixture(&[2 * BS + 1, BS, 7 * BS - 3]);
+            grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
             let probe = rehearse(&f, 1_000_000_000).unwrap();
             let threshold = probe.staged + probe.generated + probe.margin + probe.reserve;
 
-            let at = rehearse(&f, threshold as i64).expect("exactly the threshold passes");
-            assert!(at.fits());
+            // Exactly the threshold passes and one byte under refuses, as the
+            // rehearsal's RULE on the probe's own numbers
+            // ([`CapacityNumbers::fits`], which `rehearse_write_capacity`
+            // applies to the build it makes). Not a second rehearsal: every
+            // call builds afresh, with another uuid and time and a new random
+            // grease stanza in every envelope, so its threshold is not the
+            // probe's to the block (#491).
+            let backend = &f.config.backends.lto[0];
+            let at = |capacity: u64| CapacityNumbers {
+                available: backend.fill_budget_bytes(capacity),
+                ..probe
+            };
+            assert!(at(threshold).fits(), "exactly the threshold passes");
+            assert!(!at(threshold - 1).fits(), "one byte under refuses");
+
             let errs = real_write_layout_errors(&f, threshold);
             assert!(errs.is_empty(), "the real write refused: {errs:?}");
-            // Even with the margin taken away, the real build fits: the margin
-            // is slack, not the fit.
-            let errs = real_write_layout_errors(&f, threshold - probe.margin);
-            assert!(
-                errs.is_empty(),
-                "the real write needs less than the bound: {errs:?}"
-            );
+            // Removed (#491): "even with the margin taken away, the real
+            // build fits: the margin is slack, not the fit". It asserted that
+            // the real write's build never needs more than the probe's, and
+            // a build can land up to one block per generated file above
+            // another: the drift the margin exists for.
 
-            rehearse(&f, threshold as i64 - 1).expect_err("one byte under refuses");
             // Control: the real write DOES refuse a budget below what it
             // needs, so the empty answers above are not an empty check.
             let errs = real_write_layout_errors(&f, probe.staged);
@@ -27434,36 +27460,86 @@ mod tests {
         /// plans past the fill ceiling — it may hold a unit's only copy, and
         /// a cut there would leave it none. With the drive declaring
         /// `post_warning_bytes` (a plan bound at the whole capacity) and a
-        /// fill ceiling of half of it, a rehearsal one byte short of the
-        /// ceiling refuses exactly as it does without the key, though the
-        /// plan would fit under the bound; and passes at the ceiling.
+        /// fill ceiling of half of it, the rehearsal's rule refuses one byte
+        /// short of the ceiling; a rehearsal past the ceiling refuses exactly
+        /// as it does without the key, though the plan would fit under the
+        /// bound; and one within the ceiling passes.
         #[test]
         fn a_rewrite_never_plans_past_the_fill_ceiling_even_when_the_drive_declares_post_warning_bytes(
         ) {
+            a_rewrite_never_plans_past_the_fill_ceiling(0);
+        }
+
+        /// #491's positive control: the same however heavy the envelopes
+        /// are ([`grow_envelopes`]).
+        #[test]
+        fn a_rewrite_never_plans_past_the_fill_ceiling_however_heavy_the_envelopes() {
+            for bytes in [512, 2048, 4096, 4608] {
+                a_rewrite_never_plans_past_the_fill_ceiling(bytes);
+            }
+        }
+
+        /// The body of the two tests above, with the envelopes grown by a
+        /// dar catalogue of `catalogue_bytes`.
+        ///
+        /// The one-byte edge is the rehearsal's rule on the probe's own
+        /// numbers ([`CapacityNumbers::fits`]): every rehearsal builds
+        /// afresh, so another's threshold is the probe's only within the
+        /// margin, one block per generated file (#491). The rehearsals past
+        /// and within the ceiling sit that margin beyond the edge, where
+        /// every build of the batch lands on the same side of it.
+        fn a_rewrite_never_plans_past_the_fill_ceiling(catalogue_bytes: usize) {
             let mut f = fixture(&[3 * BS + 17, 5 * BS]);
+            grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
             f.config.backends.lto[0].fill_ceiling = 0.5;
             let probe = rehearse(&f, 1_000_000_000).unwrap();
             let threshold = probe.staged + probe.generated + probe.margin + probe.reserve;
-            // At the 50% ceiling: one byte short of the threshold, and a
-            // capacity whose whole (the bound) holds the plan twice over.
-            let short = 2 * (threshold as i64 - 1);
-            let without = rehearse(&f, short).unwrap_err().to_string();
+            let at = |f: &Fixture, capacity: u64| CapacityNumbers {
+                available: f.config.backends.lto[0].fill_budget_bytes(capacity),
+                ..probe
+            };
+            // At the 50% ceiling the rule refuses one byte short of the
+            // threshold and passes at it.
+            assert!(
+                !at(&f, 2 * (threshold - 1)).fits(),
+                "one byte short refuses"
+            );
+            assert!(at(&f, 2 * threshold).fits(), "at the ceiling it fits");
+
+            // Past the ceiling for every build of the batch, and a capacity
+            // whose whole (the bound) holds any of them.
+            let short = 2 * (threshold - probe.margin - 1);
+            assert!(
+                threshold + probe.margin <= short,
+                "positive control: the bound holds the heaviest build of the batch"
+            );
+            let without = rehearse(&f, short as i64).unwrap_err().to_string();
             assert!(without.contains("would not fit its cartridge"), "{without}");
+            let without = refusing_numbers(&f, &without, &probe, short as i64);
 
             f.config.backends.lto[0].post_warning_bytes = Some("1G".into());
             assert_eq!(
-                f.config.backends.lto[0]
-                    .plan_bound_bytes(short as u64)
-                    .unwrap(),
-                Some(short as u64),
+                f.config.backends.lto[0].plan_bound_bytes(short).unwrap(),
+                Some(short),
                 "positive control: the drive WOULD plan to the whole capacity"
             );
-            let with = rehearse(&f, short).unwrap_err().to_string();
+            let with = rehearse(&f, short as i64).unwrap_err().to_string();
+            // Each refusal is of its own build's numbers against the fill
+            // budget, never the bound (`refusing_numbers` puts the fill budget
+            // in `available`), and the key changes none of them but the
+            // build's own generated files.
+            let with = refusing_numbers(&f, &with, &probe, short as i64);
+            assert_eq!(with.available, short / 2, "the fill budget, not the bound");
             assert_eq!(
-                with, without,
+                with,
+                CapacityNumbers {
+                    generated: with.generated,
+                    ..without
+                },
                 "post_warning_bytes changes nothing for a rewrite"
             );
-            rehearse(&f, 2 * threshold as i64).expect("at the ceiling it fits");
+            rehearse(&f, 2 * (threshold + probe.margin) as i64)
+                .expect("within the ceiling it fits");
         }
     }
 }
