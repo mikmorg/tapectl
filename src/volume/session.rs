@@ -12994,6 +12994,48 @@ mod tests {
             assert_eq!(write_lbp(&f.conn, f.volume_id), (Some("on".into()), None));
         }
 
+        /// The coordinator's 388b addition 2: `TAPECTL_TEST_LBP_CORRUPT_BLOCK`
+        /// takes a list, counted from 1 since the open with every re-sent
+        /// block counted too (`lbp::CorruptBlocks`, which the test double
+        /// shares with `TapeDevice`). One number, slice_2's first block, is
+        /// refused and retried, and the session seals. Two, the second the
+        /// retry's first block (slice_2 sent again), are the second refusal:
+        /// the session is left `interrupted` after one retry.
+        #[test]
+        fn two_corrupt_blocks_retry_once_then_leave_the_session_interrupted() {
+            let blocks_before = |f: &Fixture, file: u32| -> u64 {
+                f.built.layout.entries[..file as usize]
+                    .iter()
+                    .map(|e| e.on_tape_bytes(BS).unwrap() / BS)
+                    .sum()
+            };
+
+            let f = make_fixture();
+            let first = blocks_before(&f, SLICE_2) + 1;
+            let mut store = lbp_store().with_lbp_corrupt_blocks(&[first]);
+            let (outcome, f) = execute(f, &mut store);
+            let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+            assert_eq!(retries(&f.conn), ["9"], "one number: refused, retried");
+            assert_sealed(&f, sealed, &mut store);
+
+            let f = make_fixture();
+            let first = blocks_before(&f, SLICE_2) + 1;
+            let mut store = lbp_store().with_lbp_corrupt_blocks(&[first, first + 1]);
+            let (outcome, f) = execute(f, &mut store);
+            let interrupted = match outcome {
+                ExecuteOutcome::Interrupted(i) => i,
+                ExecuteOutcome::Ready(_) => panic!("expected Interrupted, got Ready"),
+                ExecuteOutcome::Aborted(a) => panic!("never aborted for this cause: {}", a.reason),
+            };
+            let reason = interrupted.reason().unwrap().to_string();
+            assert!(
+                reason.contains("second write the drive refused"),
+                "{reason}"
+            );
+            assert_eq!(retries(&f.conn), ["9"], "the first was retried, the second not");
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["interrupted"]);
+        }
+
         /// Block n of file k, n > 0: the fixture built at a 4 KiB block, so
         /// RESTORE.sh (file 2) is many blocks. A refusal of its fourth block,
         /// deferred by write-behind to file 4's write, sends the retry back to

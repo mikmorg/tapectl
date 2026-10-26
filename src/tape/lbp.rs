@@ -24,6 +24,7 @@
 //! nothing else does. They work over [`PageControl`] and two closures, so
 //! every refusal and every restore is unit-tested without a drive.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io;
 use std::process::{Command, Stdio};
@@ -712,6 +713,38 @@ pub fn clear_leftover(control: &dyn PageControl) -> Result<bool, String> {
         .select(&cleared)
         .map_err(|e| reason_select(control.node(), &e))?;
     Ok(true)
+}
+
+// ── the test hook's count ───────────────────────────────────────────────────
+
+/// `TAPECTL_TEST_LBP_CORRUPT_BLOCK`'s blocks (#388, F5): the block writes,
+/// counted from 1 since a store opened, whose CRC the hook corrupts. Every
+/// block sent counts, re-sent ones too: item 174's retry sends its files
+/// again on the same open, so a second number can land inside the retry and
+/// provoke the second refusal. One count for `TapeDevice` and for the test
+/// double that stands in for a drive (`store::MemStore`), so the two cannot
+/// count differently.
+#[derive(Debug, Clone, Default)]
+pub struct CorruptBlocks {
+    listed: Vec<u64>,
+    sent: Cell<u64>,
+}
+
+impl CorruptBlocks {
+    /// The hook for `listed` block writes (none: the hook is off).
+    pub fn new(listed: &[u64]) -> Self {
+        Self {
+            listed: listed.to_vec(),
+            sent: Cell::new(0),
+        }
+    }
+
+    /// Count one more block sent; whether the hook corrupts it.
+    pub fn next_block(&self) -> bool {
+        let sent = self.sent.get() + 1;
+        self.sent.set(sent);
+        self.listed.contains(&sent)
+    }
 }
 
 // ── what the operator is told ───────────────────────────────────────────────
