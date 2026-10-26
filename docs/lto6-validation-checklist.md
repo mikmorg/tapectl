@@ -445,7 +445,9 @@ the switch can be decided in about 15 minutes, before the long steps.
       emulation). mhvtl cannot carry the 524,292-byte wire block in one command, so every open
       there falls back (item 165, cause 8). The rehearsal proves the script, the fallback's
       record and warning, the hook refusing an open that is not armed, and the leftover clear on
-      a page it arms by hand. Its step 1a runs at a 262,144-byte payload, and mhvtl computes a
+      a page it arms by hand. mhvtl hangs a read at BOT while LBP_R is armed (it answers EIO
+      past it), so the rehearsal's heir reads only file 2 against the leftover; on the real
+      drive every heir read there runs under a time limit, and a hang is a FAIL. Its step 1a runs at a 262,144-byte payload, and mhvtl computes a
       CRC for every block it returns, so its R1 "yes" says nothing of the HP.
 - [ ] Both binaries on home2: the 1.7.2 candidate (`TAPECTL_BIN`) and a tapectl from 1.6.0 to
       1.7.1 (`OLD_BIN`; the installed production one will do). A debug candidate writes at
