@@ -2005,6 +2005,139 @@ hold fewer files than the catalog recorded (a power loss can lose the last
 few), resume continues from what the tape holds and says so in the session
 log. Releases without issue #408's fix aborted the session for good on both.
 
+### `warning: Logical Block Protection is not available on <device>: …`
+
+From 1.7.2 every open of the drive arms its Logical Block Protection: each
+block tapectl writes carries a CRC the drive checks before it writes it
+(ADR-0012 items 161-166). When the open cannot arm it, a write prints this
+once per drive per command and goes on without it:
+
+```text
+warning: Logical Block Protection is not available on <device>: <why>. tapectl writes without it; the write is
+as strong as one by tapectl 1.7.1 (its sha256 checks are unchanged), and the catalog records that LBP did not run.
+```
+
+Nothing is wrong with the tape. The write is checked as every write before
+1.7.2 was, `volume info` shows `Write check: none (Logical Block Protection
+did not run: <why>)`, and `report verify-status` shows `write check: no LBP
+(<why>)`. A read that cannot arm it says so in the session log only
+(`Logical Block Protection is not available on <device> for this read:
+<why>`). There is no config key that turns LBP off. To have it, fix what
+`<why>` names:
+
+| `<why>` begins | Means | Fix |
+|---|---|---|
+| `no SCSI generic node is bound to <device>` | the kernel's `sg` module is not loaded | `sudo modprobe sg` (and add it to `/etc/modules`) |
+| `sg_modes could not be run` or `sg_wr_mode could not be run` | sg3-utils is not installed | `sudo apt install sg3-utils` (`scripts/first-run.sh` step 2 checks for both tools) |
+| `sg_wr_mode could not open <sg> for writing` | the user tapectl runs as cannot write the drive's sg node | add it to the node's group (usually `tape`, as for the `nst` node) and log in again |
+| `the drive has no Control Data Protection page` or `the drive refused Reed-Solomon LBP (method 01h)` | the drive has no LBP, or not the Reed-Solomon kind tapectl arms (LTO-5 and later do; mhvtl's TD7 and later speak only CRC32C) | none: the write is as strong as one by 1.7.1 |
+| `the drive's page did not take` | the drive accepted the setting and reads back another | none; report it with `sg_modes --page=0x0a,0xf0 <sg>`'s output |
+| `st refused a 524292-byte block size` or `st cannot carry a 524292-byte block on this host's SCSI path` | the host's st driver or HBA cannot move the 512 KiB block and its 4-byte CRC in one command (mhvtl cannot either) | none short of another HBA; the write is as strong as one by 1.7.1 |
+
+### The drive refused a block: `writing on again from the start of tape file <n>, once`
+
+With Logical Block Protection armed, a write error is how the drive refuses a
+block whose CRC does not match the bytes that reached it: the block changed
+between tapectl and the drive (memory, the HBA, the cable or the drive's
+buffer). st cannot tell that from any other write error, so every one counts
+as a refusal. The drive writes nothing for a refused block, and the tape's
+layout fixes where every file starts, so tapectl reads where the drive
+stopped, goes back to the start of the file that holds the first block the
+drive did not take, and writes on from there, from staging, with fresh
+hashes and CRCs (ADR-0012 item 174). It prints, and writes to the session
+log:
+
+```text
+the drive refused a write with Logical Block Protection armed in tape file <n>; its position (logical object
+<lba>) is in tape file <m>: writing on again from the start of tape file <m>, once (ADR-0012 item 174)
+```
+
+The catalog records a `write_lbp_retry` event naming the file. If the rest of
+the write goes through, the session seals and confirms as usual and exits 0:
+every block on the tape was checked by the drive, the re-sent ones too. The
+kernel log names each refusal `logical block guard check failed` (`sudo
+dmesg`); one is worth a look at the HBA and the cable even when the retry
+worked.
+
+There is **one retry per run**. A second refusal in the same run is not
+retried (next entry). A `volume resume` is a new run, so it gets one retry of
+its own.
+
+### `… the second write the drive refused with Logical Block Protection armed in this run …` (exit 4)
+
+A second refusal in one run stops the write, as any other drive error does.
+Nothing is sealed, so the tape is unsealed and nothing on it counts as a copy;
+the session is `interrupted`, not aborted, and exits 4. The error reads:
+
+```text
+error: volume "<label>" write interrupted: the write of tape file <n> stopped: tape write refused with Logical Block
+Protection armed: write: Input/output error (os error 5). With Logical Block Protection armed this is how the drive
+refuses a block whose CRC did not match the bytes it received: a block changed between tapectl and the drive
+(memory, the HBA, the cable or the drive's buffer). A drive or medium error reads the same through st, and the
+refused block may be in an earlier file, since st and the drive write behind. The kernel log names a refusal
+"logical block guard check failed". This is the second write the drive refused with Logical Block Protection armed
+in this run; the first was retried (ADR-0012 item 174), and a second is not. A write the drive refuses with Logical
+Block Protection armed is a block that changed between tapectl and the drive: check the host-to-drive path (the
+HBA, the SAS cable and its connectors, the drive itself) before you resume. The tape is left unsealed and the
+session is `interrupted`, not aborted: ...
+```
+
+When the second refusal surfaces at the seal, the error begins `tape write
+refused with Logical Block Protection armed: the write of tape file <n>
+stopped:`, names the filemark after the file instead of `write:`, and ends
+`— volume "<label>"'s write session stopped part-way and is left resumable:
+…`; it exits 4 as well. When tapectl cannot tell from the drive's position
+which file to go back to, the first refusal already stops the run, with `It
+was not retried: <why>.` and the same advice, and exits 4 too.
+
+Two refusals in one run point at the path between the host and the drive,
+not at the cartridge. Check `sudo dmesg` for `logical block guard check
+failed`, reseat the SAS cable at both ends, look at the HBA (its firmware, and
+whether another card or slot behaves), and clean the drive. Then, with the
+same cartridge loaded:
+
+```bash
+tapectl volume resume <label>
+```
+
+Resume writes again from the start of the first file the drive's position
+says is not whole, with one retry of its own. If refusals keep coming, write
+the staged data from another host or through another HBA.
+
+### `note: the drive behind <device> (<sg>) had its Logical Block Protection page armed when tapectl opened it`
+
+tapectl clears the drive's Logical Block Protection page before it lets the
+drive go. A tapectl that could not (killed with SIGKILL, a second Ctrl-C, a
+host power loss) leaves it armed, and the next tapectl command that opens
+the drive finds it and says so (ADR-0012 item 164):
+
+```text
+note: the drive behind <device> (<sg>) had its Logical Block Protection page armed when tapectl opened it: a tapectl
+that crashed or was killed, or a hand-run sg_wr_mode, left it so. Until it is cleared, other programs' reads of
+this drive (RESTORE.sh, dd) fail with I/O errors, never wrong data. tapectl has cleared it.
+```
+
+An open that arms the page itself ends the note with `tapectl clears it when
+this command closes the drive.` Either way there is nothing to do: the
+command goes on, and the page is clear when it exits.
+[`tapectl drive status`](cli/drive.md) shows the page without changing it:
+`LBP page:  ARMED (<sg>), and no program has the tape node open: …`, or
+`LBP page:  not armed (<sg>)`.
+
+If a close cannot clear the page, it says so:
+
+```text
+warning: could not clear the Logical Block Protection page of the drive behind <device> (<why>): until it is
+cleared, other programs' reads of this drive (RESTORE.sh, dd) fail with I/O errors, never wrong data. Run any
+tapectl tape command, which clears it first, or power the drive off and on.
+```
+
+Run any tapectl command that opens a tape in the drive (`tapectl volume
+identify` will do), or switch the drive off and on: a power cycle clears the
+page too. Without tapectl, as for an heir with only RESTORE.sh, the power
+cycle is the way ([`RESTORE.sh`: every read fails with an I/O
+error](#restoresh-every-read-fails-with-an-io-error)).
+
 ### A real end of tape during the write
 
 The drive's early warning is not this. Since 1.6.0 a write that reaches the
@@ -2764,6 +2897,24 @@ A leftover `.tapectl-restore.*` directory is named and refused even with
 `--overwrite`: a killed `--path` restore may have left decrypted slices in it.
 Remove it and run again. If dar still declines a file, the restore fails as
 `INCOMPLETE` and names it.
+
+### RESTORE.sh: every read fails with an I/O error
+
+If every read of a tape fails at once with `Input/output error` (RESTORE.sh,
+`dd`, `tar` from the drive), on a drive and cartridge that read fine before,
+and tapectl 1.7.2 or later crashed or was killed on this machine just before,
+the drive's Logical Block Protection check is probably still on: tapectl arms
+it for its own session and clears it on every exit it gets to make (ADR-0012
+item 164). While it is on, the drive expects every reader to take a CRC with
+each block, so a reader that does not fails; it never returns wrong data. A
+read at the start of the tape may also hang before it fails (mhvtl hangs
+there for over a minute); treat that the same way.
+
+Switch the tape drive off and on, then try again: a power cycle clears it.
+Nothing on the tape is harmed. With tapectl at hand, any tapectl command that
+opens a tape in the drive clears it too (`tapectl volume identify`), and
+`tapectl drive status` shows whether it is on (`LBP page:  ARMED`) without
+changing it. The Heir Kit's cover sheet says the same.
 
 ### RESTORE.sh: `missing required tool`
 
