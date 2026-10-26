@@ -4354,14 +4354,20 @@ mod tests {
             };
 
             let (t, j) = text("V-ON");
-            assert!(t.ends_with("checked/passed/failed); write check: LBP"), "{t}");
+            assert!(
+                t.ends_with("checked/passed/failed); write check: LBP"),
+                "{t}"
+            );
             assert_eq!(j["write_lbp"], "on");
             assert!(j["write_lbp_note"].is_null(), "{j}");
 
             let (t, j) = text("V-OLD");
             assert!(t.ends_with("; write check: not recorded"), "{t}");
             assert!(!t.contains("no LBP"), "not recorded is never off: {t}");
-            assert!(j["write_lbp"].is_null() && j["write_lbp_note"].is_null(), "{j}");
+            assert!(
+                j["write_lbp"].is_null() && j["write_lbp_note"].is_null(),
+                "{j}"
+            );
 
             let (t, j) = text("N-OFF");
             assert_eq!(t, "  N-OFF: never verified (write check: no LBP)");

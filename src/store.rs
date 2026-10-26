@@ -3706,11 +3706,17 @@ mod tests {
             .unwrap();
         assert_eq!(n, vec![3u64, 7]);
         let said = lines.join("\n");
-        assert!(said.contains("TAPECTL_TEST_LBP_CORRUPT_BLOCK=3,7 is set"), "{said}");
+        assert!(
+            said.contains("TAPECTL_TEST_LBP_CORRUPT_BLOCK=3,7 is set"),
+            "{said}"
+        );
         assert!(said.contains("re-sent ones too"), "{said}");
         for bad in ["3,", ",3", "3,,7", "3,0", "3;7", "3 7"] {
             let err = lbp_corrupt_hook(Some(bad), &armed, "/dev/nstX").unwrap_err();
-            assert!(err.contains("not a list of block numbers"), "{bad:?}: {err}");
+            assert!(
+                err.contains("not a list of block numbers"),
+                "{bad:?}: {err}"
+            );
         }
         assert!(lbp_corrupt_hook(Some("3,7"), &Protection::NotApplicable, "/dev/nstX").is_err());
         let err = lbp_corrupt_hook(

@@ -808,9 +808,9 @@ pub fn status(
         // (F13), never config's `device_sg`. Nothing is selected: a leftover
         // is reported, not cleared. A page that cannot be read says nothing,
         // and is never an error.
-        let control = probe.lbp_page.or_else(|| {
-            lbp::control_for(device).map(|c| Box::new(c) as Box<dyn lbp::PageControl>)
-        });
+        let control = probe
+            .lbp_page
+            .or_else(|| lbp::control_for(device).map(|c| Box::new(c) as Box<dyn lbp::PageControl>));
         if let Some(control) = control {
             if let Ok(page) = control.sense() {
                 report.drive.lbp_page = Some(LbpPageFacts {
@@ -2725,7 +2725,10 @@ mod tests {
             })
         );
         let text = status_text(&ok);
-        assert!(text.contains("LBP page:  not armed (/dev/sg-fake)"), "{text}");
+        assert!(
+            text.contains("LBP page:  not armed (/dev/sg-fake)"),
+            "{text}"
+        );
         assert!(!text.contains("ARMED"), "{text}");
 
         for e in [
@@ -2742,7 +2745,11 @@ mod tests {
             );
             assert_eq!(page.ops(), ["sense"], "{e:?}: it was asked");
             assert_eq!(r.drive.lbp_page, None, "{e:?}");
-            assert!(!status_text(&r).contains("LBP"), "{e:?}: {}", status_text(&r));
+            assert!(
+                !status_text(&r).contains("LBP"),
+                "{e:?}: {}",
+                status_text(&r)
+            );
             assert_eq!(r.notes, ok.notes, "{e:?}: no note");
             assert_eq!(status_exit_code(&r), 0, "{e:?}");
             assert!(serde_json::to_value(&r).unwrap()["drive"]["lbp_page"].is_null());
@@ -2789,12 +2796,7 @@ mod tests {
         assert_eq!(held.tape_node.probe, NodeProbe::SkippedDriveHeld);
         let busy = look_at_page(&conn, DriveLockState::Free, errno(nix::libc::EBUSY), &page);
         assert_eq!(busy.tape_node.probe, NodeProbe::InUse);
-        let absent = look_at_page(
-            &conn,
-            DriveLockState::Free,
-            errno(nix::libc::ENOENT),
-            &page,
-        );
+        let absent = look_at_page(&conn, DriveLockState::Free, errno(nix::libc::ENOENT), &page);
         assert_eq!(absent.tape_node.probe, NodeProbe::Absent);
         for r in [&held, &busy, &absent] {
             assert_eq!(r.drive.lbp_page, None, "{:?}", r.tape_node.probe);
