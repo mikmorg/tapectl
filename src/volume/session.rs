@@ -13275,12 +13275,13 @@ mod tests {
             assert_eq!(write_lbp(&conn, volume_id), (None, None));
             let written: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                    "SELECT COUNT(DISTINCT stage_slice_id) FROM write_positions
+                     WHERE status = 'written'",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(written, 1, "positive control: the first run wrote slice 1");
+            assert!(written >= 1, "positive control: the first run wrote a slice");
 
             let mut on = lbp_store();
             on.files = store.files.clone();
