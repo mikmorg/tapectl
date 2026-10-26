@@ -781,8 +781,11 @@ pub fn note_unavailable(device: &str, reason: &str, write_open: bool) {
         return;
     }
     if write_open {
+        // Once on stderr: this line, never also a tracing event at WARN,
+        // whose stderr layer would print it a second time (and a `[logging]`
+        // level above WARN would hide it, which item 165's warning must not
+        // be).
         let line = unavailable_warning(device, reason);
-        tracing::warn!("{line}");
         crate::progress::stderr_println(&line);
         crate::progress::log(&line);
     } else {
@@ -1411,6 +1414,21 @@ mod tests {
             reason_no_sg_node("/dev/nst0"),
             "no SCSI generic node is bound to /dev/nst0 (is the sg module loaded?)"
         );
+    }
+
+    /// The coordinator's 388b addition 4: a write open's warning goes to
+    /// stderr once — `progress::stderr_println`, never also a
+    /// `tracing::warn!`, whose stderr layer printed it a second time — and
+    /// to the session log.
+    #[test]
+    fn the_unavailable_warning_is_printed_once_on_stderr() {
+        let src = include_str!("lbp.rs");
+        let start = src.find("pub fn note_unavailable(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        assert_eq!(body.matches("stderr_println(").count(), 1, "{body}");
+        assert!(!body.contains("tracing::warn!"), "{body}");
+        assert!(body.contains("progress::log(&line)"), "{body}");
     }
 
     /// The coordinator's 388b addition 3: a read open's note (log only, F4)
