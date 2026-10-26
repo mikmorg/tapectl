@@ -54,9 +54,11 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
       write; the record shows `DCE 1→0` verified.
 - [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
 - [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst3
-      TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`, 40 checks since #355 added
-      `empty_drive_refused`). The gate always runs `cargo build` and tests the
-      checkout's own debug binary; it has no `TAPECTL_BIN`, so a green gate says
+      TAPECTL_GATE_TAPE_TD6=/dev/nst4 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`,
+      64 checks since #388; `TAPECTL_GATE_TAPE_TD6` names a TD6 emulation for the
+      `rust_lbp` leg, from `readlink -f /dev/tape/by-id/scsi-XYZZY_A3-nst`). The gate
+      always runs `cargo build` and tests the checkout's own debug binary; it has no
+      `TAPECTL_BIN`, so a green gate says
       nothing about an installed release binary. The rehearsal's `TAPECTL_BIN=` run
       below is what tests that one. The gate is the one exception to by-id addressing: it
       wants the `/dev/nstN` spelling of an **LTO-8** emulated drive (`lsscsi` shows
@@ -409,6 +411,104 @@ tapectl --home "$TAPECTL_HOME" cartridge erase --device /dev/tape/by-id/scsi-HUJ
 The run directory (`/scratch/tapectl-span/spn-<UTC>-<serial>/`, or under `~/.cache/tapectl/span`
 where there is no `/scratch`) keeps every command's output, the catalog after each tape, both
 manifests, and the drive's state before and after every step, as for 1.6.0's run.
+
+## LBP on the real drive (1.7.2 acceptance)
+
+ADR-0012 items 161-166, 174 and 175 (#388). From 1.7.2 tapectl arms the drive's Logical Block
+Protection for its own open of the drive: every block it writes carries a Reed-Solomon CRC the
+drive checks before it writes the block, and every block it reads comes with the drive's CRC,
+which tapectl checks. `scripts/lbp-acceptance.sh` proves it on the test cartridge EW7VWMVKF6 in
+throwaway homes. `--print-plan` prints the operator's part and the drive time without touching
+anything.
+
+**R1 comes first, because it decides item 175's switch.** Production's tapes were written
+without LBP. If the HP returns no valid CRC for such blocks when LBP_R is armed, 1.7.2 cannot
+verify or restore them with LBP_R, and item 175's fallback applies: LBP_R only for the confirm
+of a session that wrote with LBP. The build carries the switch (`tape::lbp::LBP_R_POLICY`).
+Step 1 answers it two ways:
+- **The prototype's route** (`docs/research/lbp-prototype/`). 16 random blocks go to the tape
+  with `dd` and the page clear. They are read back with the page armed by hand (method 01h,
+  LBP_W and LBP_R) and st at 524,292 bytes. `lbp.py`, a CRC implementation that is not
+  tapectl's, checks every CRC, and every payload is compared with what was written. This
+  answers for the drive alone, in a minute.
+- **tapectl's route.** `OLD_BIN`, a tapectl before 1.7.2, writes and seals `LBA-0001`. The
+  candidate's `volume verify --full` reads it back, and its session log says what the
+  candidate armed for the read. This is the path the switch governs.
+
+Both yes, with the candidate built for every read: item 162 stands. The prototype's route says
+no: the run stops and names the policy to build. `--r1-only` stops after step 1 either way, so
+the switch can be decided in about 15 minutes, before the long steps.
+
+**Before the run.**
+- [ ] The whole chain is green on the candidate, including the mhvtl rehearsal:
+      `scripts/lbp-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst` (a TD6
+      emulation). mhvtl cannot carry the 524,292-byte wire block in one command, so every open
+      there falls back (item 165, cause 8). The rehearsal proves the script, the fallback's
+      record and warning, the hook refusing an open that is not armed, and the leftover clear on
+      a page it arms by hand. Its step 1a runs at a 262,144-byte payload, and mhvtl computes a
+      CRC for every block it returns, so its R1 "yes" says nothing of the HP.
+- [ ] Both binaries on home2: the 1.7.2 candidate (`TAPECTL_BIN`) and a tapectl from 1.6.0 to
+      1.7.1 (`OLD_BIN`; the installed production one will do). A debug candidate writes at
+      about 117 MB/s with the CRC (build plan F9); the rate step says which it measured.
+- [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
+      drive; the host quiet (`docs/operator-guide.md`, "A quiet host while the tape runs").
+      Start it inside tmux, with a second terminal for `sudo dmesg` at step 3.
+
+```bash
+TAPECTL_HOME="$HOME/.cache/tapectl/lba-home-$(date +%Y%m%d)" \
+TAPECTL_BIN=/path/to/tapectl-1.7.2 OLD_BIN=/usr/local/bin/tapectl \
+  scripts/lbp-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
+    --i-will-lose-the-cartridge EW7VWMVKF6
+```
+
+It refuses (exit 2, nothing touched) when any of these fails:
+- `TAPECTL_HOME` is unset, not empty, or one of production's homes (as for 1.6.0's run).
+- The drive is not HUJ808A5L4, or the chip serial is not EW7VWMVKF6.
+- `TAPECTL_BIN` is older than 1.7.2, or `OLD_BIN` is missing, or not from 1.6.0 to 1.7.1.
+- `TAPECTL_TEST_LBP_CORRUPT_BLOCK` or `TAPECTL_TEST_EARLY_WARNING_AT` is set.
+- The drive's page does not read method 0 with neither check on, or this login cannot open the
+  sg node read-write.
+- The drive-poll timer is active, or the tape lock is held.
+
+**The steps and what each must show.** Each new volume goes onto the same cartridge after one
+filemark at BOT and `volume init --force`, which marks the volume it displaces `erased` (item
+139's route).
+
+| step | must show | time |
+|---|---|---|
+| 0 preflight | read only: the page (current and changeable), block limits, `sg_inq`; the page reads method 0 | ~1 min |
+| 1 r1 | 1a: 16 blocks written without LBP read back with LBP_R, every CRC valid by `lbp.py`, every payload equal; 1b: `OLD_BIN` seals `LBA-0001`, the candidate's verify passes with LBP_R armed. `R1.txt` says what the answer means for item 175 | ~15 min |
+| 2 write | three units staged; `LBA-0002` written with `--full-confirm`: `write_lbp` `on`, the session log names the page armed, no fallback warning, a passed full readback; `volume info`'s Write check line | ~45 min (debug staging) |
+| 3 refusal | `LBA-0003` with `TAPECTL_TEST_LBP_CORRUPT_BLOCK` in the middle of the data: exit 0, one `write_lbp_retry` event, the session log's item 174 line, sealed, a passed full readback; `dmesg` and the log pages around it | ~5 min |
+| 4 second | not run in 1.7.2: the hook corrupts one block per open, so two refusals in one run need a hook that takes two block numbers (`--second-refusal-blocks A,B`) | — |
+| 5 crash | `LBA-0005`'s write killed with SIGKILL after 2 GiB: the page reads armed; the heir's `dd` and RESTORE.sh `--info` fail with nothing of the tape printed; `volume identify` prints the leftover note and leaves the page method 0; RESTORE.sh reads again; `volume resume` seals it with `write_lbp` `on` | ~5 min |
+| 6 verify | `volume verify LBA-0005` passes, its session log naming LBP_R armed (none under item 175's fallback) | ~2 min |
+| 7 heir | RESTORE.sh off `LBA-0005` with the real tools, the page clear, no manual step: `--verify` passes, one unit restored identical; one record read in variable mode is 524,288 bytes | ~5 min |
+| 8 r11 | the `tapectl` service user can open the sg node read-write (owner, group or ACL) | no tape |
+| 9 rate | step 2's write phase in MB/s beside 1.6.0's 160 MB/s | no tape |
+
+About 1.5-2 hours, most of it staging. Exit 3 means every step that ran passed and step 4 was
+not run (or `--r1-only` stopped after step 1).
+
+**What only the real drive proves** (the rehearsal cannot): R1's answer; a write with LBP on
+through home2's SAS path; the drive's own refusal (the real drive refuses before writing the
+block; mhvtl writes it, then refuses) and item 174's retry; the leftover a SIGKILL leaves; a
+verify with LBP_R; the heir on a tape written with LBP; the write rate.
+
+- [ ] Record: R1's answer and what it means for item 175 (`R1.txt`), the refused block's file
+      and the retry's `from` (step 3's `write_lbp_retry` event), what `dmesg` named, the rate
+      (`RATE.txt`), R11, and each step's duration (`steps.tsv`).
+- [ ] A FAIL stops the run and leaves the cartridge as that step left it. Read the failure first
+      (`RESULT.txt`, the step's `.err`, `.out` and `.logs/`, `drive-at-fail/`). The exit trap
+      only puts back a page the script armed by hand, or the leftover of step 5, after the
+      at-fail snapshot recorded it.
+- [ ] Afterwards the cartridge holds `LBA-0005`, owned by the throwaway home. The closing lines
+      give the commands that retire it and erase the cartridge from that home. Then start the
+      drive-poll timer.
+
+The run directory (`/scratch/tapectl-lbp/lba-<UTC>-<serial>/`, or under `~/.cache/tapectl/lbp`
+where there is no `/scratch`) keeps every command's output and session logs, the catalogs, and
+the drive's state before and after every step, the page among it (`lbp-page.bin`).
 
 ## After a pass
 
