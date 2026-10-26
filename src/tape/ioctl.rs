@@ -314,10 +314,7 @@ impl Drop for TapeDevice {
                 let _ = self.mt_ioctl_raw(MTWEOF, 1);
             }
             if let Err(reason) = lbp::disarm(&*page.control, &page.armed) {
-                let line = lbp::clear_failed_line(&self.path, &reason);
-                tracing::warn!("{line}");
-                crate::progress::stderr_println(&line);
-                crate::progress::log(&line);
+                crate::progress::say(&lbp::clear_failed_line(&self.path, &reason));
             }
             let _ = self.mt_ioctl_raw(MTSETBLK, self.block_size as i32);
         }
@@ -515,7 +512,6 @@ impl TapeDevice {
                         ""
                     }
                 );
-                tracing::info!("{line}");
                 crate::progress::log(&line);
                 self.lbp = Some(ArmedPage { control, armed });
             }
@@ -531,12 +527,10 @@ impl TapeDevice {
         Ok(())
     }
 
-    /// The leftover note (§4.4): on stderr, traced and logged, read or write.
+    /// The leftover note (§4.4), read or write: once on stderr and once in
+    /// the session log (`progress::say`, never also a tracing event).
     fn say_leftover(&self, node: &str, cleared_now: bool) {
-        let line = lbp::leftover_note(&self.path, node, cleared_now);
-        tracing::warn!("{line}");
-        crate::progress::stderr_println(&line);
-        crate::progress::log(&line);
+        crate::progress::say(&lbp::leftover_note(&self.path, node, cleared_now));
     }
 
     /// What this open decided about Logical Block Protection.
@@ -622,13 +616,11 @@ impl TapeDevice {
                 Ok(true)
             }
             Err(reason) => {
-                let line = format!(
+                crate::progress::say(&format!(
                     "Logical Block Protection: the read check could not be armed on {} for the \
                      confirm ({reason}); the confirm reads without it",
                     self.path
-                );
-                tracing::warn!("{line}");
-                crate::progress::log(&line);
+                ));
                 Ok(false)
             }
         }
@@ -2262,6 +2254,75 @@ mod density_tests {
         assert!(
             f.find("self.rewind()?").unwrap() < f.find("lbp::arm(").unwrap(),
             "the rewind precedes the arming and its probe"
+        );
+    }
+
+    /// #388: each note an open or a close gives is one line on stderr and one
+    /// in the session log, counted over a run as `main` sets it up
+    /// (`progress::heard`): a leftover the open clears, a write open's
+    /// item-165 warning, a read open's note (the log alone, F4), and a close
+    /// that cannot clear the page. They were two and two, the second of each
+    /// through a `tracing` event main prints and tees as well.
+    #[test]
+    fn each_lbp_note_is_one_print_and_one_log_line() {
+        use crate::progress::heard;
+        use crate::tape::lbp::fake::{FakePage, HP_PAGE};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let armed_page = lbp::ProtectionPage::from_page_bytes(&HP_PAGE)
+            .unwrap()
+            .with_protection(lbp::METHOD_RS, lbp::RS_INFO_LEN, lbp::LBP_W | lbp::LBP_R);
+
+        // A leftover, cleared by an open that arms nothing.
+        let leftover = FakePage::new(armed_page.bytes());
+        let mut dev = device_over(tmp.reopen().unwrap(), 4096);
+        dev.path = "/dev/nst-heard-leftover".into();
+        let (armed, heard) = heard::during(|| {
+            dev.arm_protection(
+                false,
+                lbp::LbpReadPolicy::OnlyConfirmOfLbpWrite,
+                Some(Box::new(leftover.clone())),
+            )
+        });
+        armed.unwrap();
+        assert_eq!(leftover.current(), HP_PAGE, "positive control: cleared");
+        assert_eq!(
+            heard.count("had its Logical Block Protection page armed"),
+            (1, 1),
+            "{:?}",
+            heard.stderr
+        );
+
+        // No sg node: the write open's warning, then a read open's note.
+        let mut dev = device_over(tmp.reopen().unwrap(), 4096);
+        dev.path = "/dev/nst-heard-no-sg".into();
+        let ((), heard) = heard::during(|| {
+            dev.arm_protection(true, lbp::LbpReadPolicy::AllReads, None)
+                .unwrap();
+            dev.arm_protection(false, lbp::LbpReadPolicy::AllReads, None)
+                .unwrap();
+        });
+        assert_eq!(
+            heard.count("warning: Logical Block Protection is not available on"),
+            (1, 1),
+            "{:?}",
+            heard.stderr
+        );
+        assert_eq!(
+            heard.count("is not available on /dev/nst-heard-no-sg for this read"),
+            (0, 1),
+            "{:?}",
+            heard.log
+        );
+
+        // The close of an armed device whose page will not clear.
+        let (dev, page, _log) = device_over_armed(tmp.reopen().unwrap(), 4096, lbp::LBP_W);
+        page.fail_select(lbp::PageError::Other("sg_wr_mode exited 99".into()));
+        let ((), heard) = heard::during(|| drop(dev));
+        assert_eq!(
+            heard.count("could not clear the Logical Block Protection page"),
+            (1, 1),
+            "{:?}",
+            heard.stderr
         );
     }
 

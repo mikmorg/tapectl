@@ -2227,8 +2227,8 @@ pub const TEST_LBP_CORRUPT_BLOCK: &str = "TAPECTL_TEST_LBP_CORRUPT_BLOCK";
 ///   retry sends the same bytes with their true CRC;
 /// - it is refused, with the open failing, when the open could not arm LBP:
 ///   a hook with no drive to check it would pass vacuously;
-/// - it is loud: the open prints it on stderr, in the tracing output and in
-///   the session log before the first byte is written.
+/// - it is loud: the open prints it on stderr, once, and in the session log
+///   before the first byte is written.
 fn test_lbp_corrupt_block_from_env() -> Option<String> {
     std::env::var_os(TEST_LBP_CORRUPT_BLOCK).map(|raw| raw.to_string_lossy().into_owned())
 }
@@ -2338,10 +2338,10 @@ impl TapeStore {
         )
         .map_err(TapectlError::Other)?;
         if let Some((blocks, lines)) = corrupt {
+            // Once on stderr and once in the session log (#388), never also
+            // a tracing event, which main prints and tees a second time.
             for line in lines {
-                tracing::warn!("{line}");
-                crate::progress::stderr_println(&line);
-                crate::progress::log(&line);
+                crate::progress::say(&line);
             }
             dev.fake_lbp_corrupt_blocks(&blocks);
         }
@@ -3678,6 +3678,23 @@ mod tests {
             1,
             "and asked in one: the write store's open"
         );
+        // #388: the open announces it once on stderr and once in the
+        // session log (`progress::say`, counted in progress.rs), never also
+        // through a tracing event, which main printed and teed a second time.
+        let start = body
+            .find("if let Some((blocks, lines)) = corrupt {")
+            .expect("the open's announcement");
+        let end = start
+            + body[start..]
+                .find("dev.fake_lbp_corrupt_blocks(&blocks);")
+                .unwrap();
+        let announce = &body[start..end];
+        assert!(
+            announce.contains("crate::progress::say(&line);"),
+            "{announce}"
+        );
+        assert!(!announce.contains("tracing::"), "{announce}");
+        assert!(!announce.contains("stderr_println"), "{announce}");
     }
 
     /// F5: the hook takes a block number from 1 and nothing else, applies

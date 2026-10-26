@@ -4225,12 +4225,10 @@ fn arm_read_check_for_confirm(conn: &Connection, store: &mut dyn Store, volume_i
         volume_id,
         crate::tape::lbp::LBP_R_POLICY,
     ) {
-        let line = format!(
+        progress::say(&format!(
             "Logical Block Protection: the read check could not be armed for the confirm ({e}); \
              it reads without it"
-        );
-        tracing::warn!("{line}");
-        progress::log(&line);
+        ));
     }
 }
 

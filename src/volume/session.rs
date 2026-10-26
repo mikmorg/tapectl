@@ -3000,8 +3000,7 @@ fn retry_from_refusal(
          its position (logical object {lba}) is in tape file {from}: writing on again from the \
          start of tape file {from}, once (ADR-0012 item 174)"
     );
-    tracing::warn!("{line}");
-    crate::progress::log(&line);
+    crate::progress::say(&line);
     let details = format!("{{\"refused_in\": {failed}, \"position\": {lba}, \"from\": {from}}}");
     busy::retry(BusyPolicy::DEFAULT, "the LBP retry's event", || {
         crate::db::events::log_event(
@@ -12900,6 +12899,26 @@ mod tests {
             let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
             assert_sealed(&f, sealed, &mut store);
             assert_eq!(write_lbp(&f.conn, f.volume_id), (Some("on".into()), None));
+        }
+
+        /// #388: item 174's retry tells the operator once on stderr and once
+        /// in the session log, counted over the run as `main` sets it up
+        /// (`progress::heard`). It was one print and two log lines: a WARN
+        /// event, which main's file layer tees, beside its own log line.
+        #[test]
+        fn the_retry_is_one_print_and_one_log_line() {
+            let f = make_fixture();
+            let mut store =
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SLICE_2));
+            let ((outcome, f), heard) = crate::progress::heard::during(|| execute(f, &mut store));
+            let _ready = ready(outcome);
+            assert_eq!(retries(&f.conn), ["9"], "positive control: one retry");
+            assert_eq!(
+                heard.count("writing on again from the start of tape file 9, once"),
+                (1, 1),
+                "{:?}",
+                heard.log
+            );
         }
 
         /// st and the drive write behind: the refusal of a block of slice_1

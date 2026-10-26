@@ -795,11 +795,11 @@ pub fn note_unavailable(device: &str, reason: &str, write_open: bool) {
         crate::progress::stderr_println(&line);
         crate::progress::log(&line);
     } else {
-        let line = format!(
+        // The session log alone: never also a tracing event, which main's
+        // file layer would tee into the log a second time.
+        crate::progress::log(&format!(
             "Logical Block Protection is not available on {device} for this read: {reason}"
-        );
-        tracing::info!("{line}");
-        crate::progress::log(&line);
+        ));
     }
 }
 
