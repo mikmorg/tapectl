@@ -202,10 +202,10 @@ impl Drop for LeaveDrive {
             }
         }
         if let Some(d) = tape_dev() {
-            for args in [["setblk", "524288"], ["rewind", ""]] {
-                let args: Vec<&str> = args.into_iter().filter(|a| !a.is_empty()).collect();
-                let _ = Command::new("mt").arg("-f").arg(&d).args(&args).status();
-            }
+            let _ = Command::new("mt")
+                .args(["-f", &d, "setblk", &FORMAT_BLOCK.to_string()])
+                .status();
+            let _ = Command::new("mt").args(["-f", &d, "rewind"]).status();
         }
     }
 }
@@ -664,15 +664,15 @@ fn gate_parse(resp: &[u8]) -> (bool, String) {
 #[test]
 fn the_gates_page_reader_reads_what_the_library_reads() {
     let mhvtl = |method: u8, len: u8, flags: u8| {
-        let mut r = vec![0x00, 0x2c, 0x68, 0x10, 0x00, 0x00, 0x00, 0x08];
+        let mut r: Vec<u8> = vec![0x00, 0x2c, 0x68, 0x10, 0x00, 0x00, 0x00, 0x08];
         r.extend([0x5a, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00]);
-        let mut page = vec![0x0a, 0xf0, 0x00, 0x1c, method, len, flags, 0x00];
+        let mut page: Vec<u8> = vec![0x0a, 0xf0, 0x00, 0x1c, method, len, flags, 0x00];
         page.resize(32, 0);
         r.extend(page);
         r
     };
     let hp = |method: u8, len: u8, flags: u8| {
-        let mut r = vec![0x00, 0x0e, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00];
+        let mut r: Vec<u8> = vec![0x00, 0x0e, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00];
         r.extend([0x4a, 0xf0, 0x00, 0x04, method, len, flags, 0x00]);
         r
     };
@@ -700,7 +700,8 @@ fn the_gates_page_reader_reads_what_the_library_reads() {
     // Not the page, and too short: refused, never read as method 0.
     let mut other = hp(0, 0, 0);
     other[8] = 0x0f;
-    for (what, resp) in [("page 0Fh", other), ("short", vec![0x00, 0x06, 0x00])] {
+    let short: Vec<u8> = vec![0x00, 0x06, 0x00];
+    for (what, resp) in [("page 0Fh", other), ("short", short)] {
         let (ok, got) = gate_parse(&resp);
         assert!(!ok, "{what}: the gate's reader must refuse it, said {got:?}");
     }
