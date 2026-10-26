@@ -801,6 +801,12 @@ WHAT TO DO FIRST
             support (Debian's and Ubuntu's is): that dar refuses
             to start without it.
 
+   If every read of a tape fails with an I/O error, and tapectl
+   crashed or was killed on that machine just before, switch the
+   tape drive off and on, then try again. tapectl can leave the
+   drive's block-protection check on; a power cycle clears it.
+   Nothing on the tape is harmed.
+
 4. If you do have tapectl, the first commands are:
 
        tapectl restore raw-volume --device /dev/nst0 --to ./out
@@ -1576,6 +1582,35 @@ mod tests {
             "A tape written by tapectl before 1.1.0 carries an older script",
         ] {
             assert!(prose.contains(required), "missing {required:?}: {prose}");
+        }
+    }
+
+    /// #388 (ADR-0012 item 164, build plan F10): a tapectl killed while the
+    /// drive's Logical Block Protection page was armed leaves it armed, and
+    /// until tapectl runs again every plain read of that drive fails with an
+    /// I/O error. The heir's sheet says what clears it without tapectl: a
+    /// power cycle. File 1 stays as it is (a re-pin item 164 excludes).
+    #[test]
+    fn the_cover_sheet_says_a_power_cycle_clears_a_drive_whose_reads_all_fail() {
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        let prose = flat(&txt);
+        for required in [
+            "If every read of a tape fails with an I/O error",
+            "tapectl crashed or was killed on that machine just before",
+            "switch the tape drive off and on, then try again",
+            "Nothing on the tape is harmed",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+        let start = txt.find("If every read of a tape fails").unwrap();
+        let end = start + txt[start..].find("4. If you do have tapectl").unwrap();
+        let step3 = txt.find("3. Every cartridge is SELF-DESCRIBING").unwrap();
+        assert!(step3 < start, "the line belongs with step 3, before step 4");
+        for line in txt[start..end].lines() {
+            assert!(
+                line.chars().count() <= 64,
+                "wider than the sheet's 64 columns: {line:?}"
+            );
         }
     }
 

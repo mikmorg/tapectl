@@ -1179,6 +1179,10 @@ tapectl, needs to know this:
   at File 0 after every command). RESTORE.sh takes the device as an environment
   prefix: `TAPE_DEVICE=/dev/nst1 ./RESTORE.sh --info`. A wrong device reads a
   different tape, or fails.
+- **Every read fails with an I/O error?** If tapectl crashed or was killed on that machine just
+  before, it can leave the drive's Logical Block Protection check on (1.7.2 and later): switch
+  the drive off and on, then try again. Nothing on the tape is harmed, and no read returns wrong
+  data.
 - **Other tapes:** a tape written by 1.3.0 or later carries an index of the other
   tapes. `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` lists every version of a
   unit and the tapes holding it; `--where --all` lists every unit the index names, no
