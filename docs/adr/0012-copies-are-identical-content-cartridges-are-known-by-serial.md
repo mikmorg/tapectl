@@ -2217,6 +2217,13 @@ Ruled 2026-10-25, Logical Block Protection (#388; the research note
      drive. A crash followed by an heir on the same drive before tapectl runs again ends in a
      refusal (EIO, measured), never wrong data, and a power cycle clears the page. No re-pin, and
      sg3-utils stays off the heir path.
+     *Fact correction, 2026-10-26 (the coordinator, from #388's test work):* "measured" overstates
+     it. What was measured on the HP was a read with the page off and st set to 524,292 bytes; the
+     case this item rules on, the page left armed and RESTORE.sh reading 524,288-byte blocks, was
+     not. On mhvtl that read hangs at BOT for over a minute (and answers EIO past it), so the
+     rehearsal does not try it. Step 5 of `scripts/lbp-acceptance.sh` on home2 measures it on the
+     real drive, every heir read there under a time limit, and a hang is a FAIL. The ruling
+     stands; its premise is confirmed or corrected by that step.
 165. **A drive without LBP, or a page that will not take: warn once and write without it**,
      recorded as such; that write is as strong as today's. No new audit finding: `no_full_verify`
      stays the one, and `volume info` and `report verify-status` say whether LBP ran.
