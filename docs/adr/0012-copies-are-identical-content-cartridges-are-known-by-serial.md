@@ -2265,6 +2265,37 @@ Ruled 2026-10-25 (later), Logical Block Protection's two forks from its build pl
      CRCs. Every re-sent block is checked by the drive again, so a retry cannot land bad data. A
      second failure in the session leaves it `interrupted`, as a failed write is today (#408), for
      `volume resume` once the operator has checked the host-to-drive path; the message says so.
+     *Applied reading, ratified 2026-10-26:* the one retry is per run of a session: a session
+     that a second failure left `interrupted` gets its own one retry when `volume resume` continues
+     it.
 175. **If the HP drive returns no valid CRC for blocks written without LBP**, LBP_R is armed only for
      the confirm of a session that wrote with LBP, never for `volume verify` or a restore. The
      build carries the switch; the probe on EW7VWMVKF6 decides it.
+
+Ruled 2026-10-26, after the 1.7.0 real-drive proof's step 5 (#497). Steps 1a to 4b passed on the HP
+drive. In step 5 the held RESTORE.sh restored `spn-span` across SPN-0001 and SPN-0002, 9843 files
+and 135,001,825,291 bytes, identical to the source by a manifest taken afterwards. dar exited 0, and
+RESTORE.sh then said `FATAL: dar extraction failed (exit 0)` and exited 1. The cause: given the
+isolated catalogue (`-A`, on every tape since v1.1.0), `dar --sequential-read` stops before the
+archive's own trailing catalogue and exits 0, and `stream_unit` takes a dar gone while a slice is
+still being fed for a failure once that unread tail is larger than the pipe buffer (measured: about
+1 MB left unread of a 10,000-file unit's last slice).
+
+176. **The fix ships in 1.7.0, before its tag.** RESTORE.sh's `stream_unit`, and tapectl's own
+     streamed restore if it shares the defect, read every slice to its end after dar has closed
+     its pipe: age still authenticates every chunk, the sha256 is still of the whole ciphertext,
+     and the tape head ends where the next read expects it. dar's own exit status decides the
+     result: 0 goes on to `dar_result` and the per-file check, anything else stays a failure. The
+     golden RESTORE.sh pin moves once for it, in its own commit; nothing else on tape changes,
+     `requires` stays as 1.7.0 has it. 1.7.1 and 1.7.2 rebase onto it.
+177. **The real-drive proof runs again in full** (amends item 146's commit, not its order):
+     `scripts/span-acceptance.sh` on home2 with a debug build of the fixed commit, and only on a
+     PASS is `v1.7.0` tagged, on that commit. Handoff (h) follows as before. The steps that passed
+     on 2026-10-26 are not carried over: the cartridge was re-initialised by step 4a, and step 5
+     needs a tape 1 whose RESTORE.sh has the fix.
+178. **The tapes already written are not rewritten.** L6-0001 and L6-0002 (`keepsake`) keep the
+     RESTORE.sh with #497. The Heir Kit and `docs/troubleshooting.md` say now that a restore
+     ending in `FATAL: dar extraction failed (exit 0)` after dar's summary names 0 failed files is
+     #497 and not damage, and give the way to a checked restore (`--slices-from`, which reads the
+     slices to disk first, or tapectl's `restore unit --spool`). The kit is regenerated with the
+     fixed tapectl when it is installed (its fourth file).
