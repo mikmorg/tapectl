@@ -623,7 +623,10 @@ reinit() { # <label>
     mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
     mt -f "$TAPE_DEV" setblk "$FORMAT_BLOCK" || fail "mt setblk failed"
     mt -f "$TAPE_DEV" weof 1 || fail "mt weof 1 at BOT failed"
+    mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
     run "init-$1" 0 tctl --json volume init "$1" --device "$TAPE_DEV" --force
+    grep -F "it is now marked erased" "$STEP_DIR/init-$1.err" >/dev/null \
+        || fail "volume init $1 does not say the volume it displaced is now marked erased (binding)"
 }
 
 # The LBP expectations of a tapectl write, by mode: on the real drive the page armed and
@@ -733,8 +736,10 @@ else
     R1_RAW=no
 fi
 log "  1a: R1 by the prototype's route: $R1_RAW"
-# A filemark at BOT: File 0 EMPTY for OLD_BIN's volume init.
+# A filemark at BOT: File 0 EMPTY for OLD_BIN's volume init (on mhvtl it reads the old bytes
+# as an unparseable File 0, issue #327; --force takes either).
 mt -f "$TAPE_DEV" weof 1 || fail "mt weof 1 at BOT failed"
+mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
 
 # 1b, tapectl's route.
 R1_POLICY=""
