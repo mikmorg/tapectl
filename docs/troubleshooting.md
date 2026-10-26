@@ -2419,6 +2419,21 @@ moves from "<old>" to "ok" and it counts as a copy again (ADR-0012, 2026-09-18).
 This does not happen for a `retired` volume. A clean read changes its
 condition, but it still counts for nothing, and the message says so.
 
+**A read the Logical Block Protection check refused** (1.7.2). With LBP armed
+for a read, the drive sends its CRC with every block and tapectl checks it. A
+block that fails the check is a read error, listed as `content_unreadable (not
+medium evidence)`, so the verify exits 3 and the volume is left alone:
+
+```text
+    position <n>: content_unreadable (not medium evidence) — expected file readable, found read failed: tape I/O
+error: Logical Block Protection check failed on block <b> of this file: the drive sent CRC <X>, the block tapectl
+received computes to <Y>; the bytes changed between the drive and tapectl, not on the medium
+```
+
+The bytes changed on their way from the drive to tapectl, as a refused write
+means on the way to it ([above](#writing-a-volume)): check the HBA, the cable
+and the drive, then verify again.
+
 ---
 
 ## Restoring
