@@ -1030,6 +1030,52 @@ file — unless what it kept is older than the volume's `verify_interval_days`,
 in which case it reads everything again (see
 [the verify section](#monthly--verify-a-rotating-slice-of-the-library)).
 
+**Logical Block Protection** (1.7.2; ADR-0012 items 161-166). tapectl arms the drive's
+Logical Block Protection for each open of the drive it makes, and clears it before it lets the
+drive go. Every block it writes carries a CRC that the drive checks before it writes the block;
+on reads the drive sends its own CRC with each block, and tapectl checks it. This closes the hop
+the default quick confirm leaves open: damage between tapectl and the drive while the tape is
+written. It does not read the cartridge back, so `no_full_verify`, `--full-confirm` and
+`volume verify` are unchanged. A read whose CRC does not match is a read error, inconclusive
+(exit 3), never a quarantine. Nothing on the tape changes: a tape written with LBP reads like any
+other, RESTORE.sh included.
+
+`volume info` says what ran on its "Write check" line:
+- "Logical Block Protection on every block (the drive checked tapectl's CRC)";
+- "none (Logical Block Protection did not run: …); as strong as a write by tapectl 1.7.1";
+- "Logical Block Protection on part of the write (…)", when one run of a resumed write had it
+  and another did not;
+- "not recorded (…)" for a volume written before 1.7.2 or rebuilt from tape, which does not say.
+
+`--json` gives `write_lbp` (`on`, `off`, `mixed` or null) and `write_lbp_note`, and
+`report verify-status` ends each row with the same fact.
+
+*When the drive cannot take it.* Some setups cannot arm it: a drive without LBP, an sg node the
+service user cannot open for writing, no `sg_modes` or `sg_wr_mode` (sg3-utils), or an HBA that
+cannot carry a 524,292-byte block. tapectl then prints one warning per drive per command,
+"warning: Logical Block Protection is not available on <device>: <why>", and writes without
+it, as strong as a write by 1.7.1 (item 165). A read that cannot arm it says so in the session
+log only. No config key turns LBP off. The service user needs read-write on the drive's sg
+node, the one the kernel binds to the tape node; on home2 the tape group has it.
+
+*When the drive refuses a block.* With LBP armed, a write error is how the drive refuses a
+block whose CRC did not match what arrived: the block changed between tapectl and the drive (in
+memory, the HBA, the cable or the drive's buffer). st cannot tell that from any other write
+error, so every one is treated as a refusal (item 174). tapectl reads where the drive stopped,
+goes back to the start of the file that holds the first block the drive did not take, and writes
+on from there, once, from staging, with fresh hashes and CRCs. The session log and a
+`write_lbp_retry` event record it. A second refusal in the same run stops the write and leaves
+the volume interrupted (exit 4). Check the host-to-drive path first (the HBA, the SAS cable and
+its connectors, the drive), then run `tapectl volume resume <label>`. The kernel log names a
+refusal "logical block guard check failed".
+
+*After a crash.* A tapectl killed with SIGKILL, a second Ctrl-C or a host power loss can leave
+the page armed. Until it is cleared, other programs' reads of the drive (RESTORE.sh, `dd`) fail
+with I/O errors; they never return wrong data. The next tapectl command that opens the drive
+clears it and says so in a note. Switching the drive off and on clears it too.
+`tapectl drive status` shows the page
+([What is in the drive right now](#what-is-in-the-drive-right-now)).
+
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
 short of its second copy keeps its staged bytes — the release cannot quietly
@@ -2392,6 +2438,13 @@ another process, is reported with the holder's pid and command and is sent no SC
 command, so it is safe to run during a write. It exits 0 whenever the probe ran (an
 empty drive is an answer) and 2 when the tape node cannot be read or no drive is
 configured; `--json` still prints the report.
+
+It also reads the drive's Logical Block Protection page, one MODE SENSE through the sg node the
+kernel binds to the tape node, and only when the tape node has just answered. The normal answer
+is `LBP page:  not armed (/dev/sgN)`. A page a crashed tapectl left armed is reported as such:
+readers that are not LBP-aware (RESTORE.sh, `dd`) get I/O errors until the next tapectl open of
+the drive clears it, or a power cycle does. When the page cannot be read, `drive status` says
+nothing about LBP. `--json` gives `drive.lbp_page`: `{"node", "armed"}`, or null.
 
 #### Ejecting the cartridge
 
