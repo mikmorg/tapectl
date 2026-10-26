@@ -68,7 +68,7 @@
 #   - the drive's serial is HUJ808A5L4 and the cartridge's chip serial is EW7VWMVKF6, named
 #     again with --i-will-lose-the-cartridge (the barcode is a sticker; ADR-0012) -- or --mhvtl,
 #     on an mhvtl drive, never that one;
-#   - TAPECTL_BIN is 1.7.2 or later and OLD_BIN (required on the real drive) is 1.6.0 or later
+#   - on the real drive, TAPECTL_BIN is 1.7.2 or later and OLD_BIN (required on the real drive) is 1.6.0 or later
 #     and before 1.7.2 (the commands this script gives it are 1.6.0's; any tapectl before 1.7.2
 #     writes without LBP, as 1.1.0 wrote production's tapes);
 #   - TAPECTL_TEST_LBP_CORRUPT_BLOCK and TAPECTL_TEST_EARLY_WARNING_AT are unset;
@@ -267,7 +267,11 @@ sys.exit(0 if v >= lo and (hi is None or v < hi) else 1)
 PY
 }
 TAPECTL_VERSION="$(version_of "$TAPECTL_BIN")"
-version_in "$TAPECTL_VERSION" 1.7.2 "" || die "TAPECTL_BIN reports '$TAPECTL_VERSION': the acceptance run is for tapectl 1.7.2 or later"
+# The run is the 1.7.2 candidate's; a rehearsal may run a build of the branch before its
+# version moves (an older tapectl fails the rehearsal's first catalog check instead).
+if [ "$MHVTL" = 0 ]; then
+    version_in "$TAPECTL_VERSION" 1.7.2 "" || die "TAPECTL_BIN reports '$TAPECTL_VERSION': the acceptance run is for tapectl 1.7.2 or later"
+fi
 OLD_VERSION=""
 if [ -n "${OLD_BIN:-}" ]; then
     [ -x "$OLD_BIN" ] || die "OLD_BIN=$OLD_BIN is not an executable file"

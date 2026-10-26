@@ -395,8 +395,8 @@ PY
 # once and written without it, and the catalog says so (migration 041: volumes.write_lbp,
 # write_lbp_note; a write_lbp event). On this gate's TD8 drive every write falls back: mhvtl
 # cannot carry the 524,292-byte wire block in one command (cause 8: st answers the open's probe
-# read EBUSY), or its CRC32C personality refuses Reed-Solomon at the select (cause 5) or does
-# not take it (cause 6). Read from the catalog, not `volume info --json`, so the leg judges
+# read EBUSY; cause 7 if st refuses the block size outright), or its CRC32C personality refuses
+# Reed-Solomon at the select (cause 5) or does not take it (cause 6). Read from the catalog, not `volume info --json`, so the leg judges
 # what the session recorded. The warning is counted in the write's own log as its plain
 # stderr line: once per process per drive (lbp::note_unavailable). R12: no other leg asserts
 # an empty stderr, and step_feed_ratio_recorded's needle ("warning: volume") does not match it.
@@ -414,6 +414,7 @@ assert lbp == "off", (
     "so the write must record 'off' (NULL: the session recorded nothing)")
 causes = {
     "8 (st cannot carry the wire block)": "st cannot carry a 524292-byte block",
+    "7 (st refused the wire block size)": "st refused a 524292-byte block size",
     "5 (Reed-Solomon refused)": "the drive refused Reed-Solomon LBP (method 01h)",
     "6 (the page did not take)": "the drive's page did not take",
 }
