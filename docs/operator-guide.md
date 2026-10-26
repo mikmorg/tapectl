@@ -1044,12 +1044,13 @@ other, RESTORE.sh included.
 - "Logical Block Protection on every block (the drive checked tapectl's CRC)";
 - "none (Logical Block Protection did not run: …); as strong as a write by tapectl 1.7.1";
 - "Logical Block Protection on part of the write (…)", when one run of a resumed write had it
-  and another did not;
+  and another did not, as when 1.7.2 resumes a write that an older tapectl began;
 - "not recorded (…)" for a volume written before 1.7.2 or rebuilt from tape, which does not say;
 - "none yet (no write recorded)" for a volume nothing has been written to.
 
-`--json` gives `write_lbp` (`on`, `off`, `mixed` or null) and `write_lbp_note`, and
-`report verify-status` ends each row with the same fact.
+`--json` gives `write_lbp` (`on`, `off`, `mixed` or null) and `write_lbp_note`.
+`report verify-status` ends each row with the same fact ("write check: LBP", "no LBP", "LBP on
+part" or "not recorded"), and every element of its `--json` carries the same two keys.
 
 *When the drive cannot take it.* Some setups cannot arm it: a drive without LBP, an sg node the
 service user cannot open for writing, no `sg_modes` or `sg_wr_mode` (sg3-utils), or an HBA that
