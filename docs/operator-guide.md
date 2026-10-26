@@ -1045,7 +1045,8 @@ other, RESTORE.sh included.
 - "none (Logical Block Protection did not run: …); as strong as a write by tapectl 1.7.1";
 - "Logical Block Protection on part of the write (…)", when one run of a resumed write had it
   and another did not;
-- "not recorded (…)" for a volume written before 1.7.2 or rebuilt from tape, which does not say.
+- "not recorded (…)" for a volume written before 1.7.2 or rebuilt from tape, which does not say;
+- "none yet (no write recorded)" for a volume nothing has been written to.
 
 `--json` gives `write_lbp` (`on`, `off`, `mixed` or null) and `write_lbp_note`, and
 `report verify-status` ends each row with the same fact.
@@ -2442,9 +2443,9 @@ configured; `--json` still prints the report.
 It also reads the drive's Logical Block Protection page, one MODE SENSE through the sg node the
 kernel binds to the tape node, and only when the tape node has just answered. The normal answer
 is `LBP page:  not armed (/dev/sgN)`. A page a crashed tapectl left armed is reported as such:
-readers that are not LBP-aware (RESTORE.sh, `dd`) get I/O errors until the next tapectl open of
-the drive clears it, or a power cycle does. When the page cannot be read, `drive status` says
-nothing about LBP. `--json` gives `drive.lbp_page`: `{"node", "armed"}`, or null.
+readers that are not LBP-aware (RESTORE.sh, `dd`) get I/O errors until the next tapectl command
+that opens a tape in the drive clears it, or a power cycle does; `drive status` and `drive eject`
+do not clear it. When the page cannot be read, `drive status` says nothing about LBP. `--json` gives `drive.lbp_page`: `{"node", "armed"}`, or null.
 
 #### Ejecting the cartridge
 
