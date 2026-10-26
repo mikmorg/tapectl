@@ -681,12 +681,32 @@ fn the_gates_page_reader_reads_what_the_library_reads() {
         r
     };
     let cases = [
-        ("mhvtl clear", mhvtl(0x00, 0x04, 0x00), "method=00 info_len=04 flags=00"),
-        ("mhvtl armed", mhvtl(0x01, 0x04, 0xc0), "method=01 info_len=04 flags=c0"),
-        ("hp clear", hp(0x00, 0x00, 0x00), "method=00 info_len=00 flags=00"),
-        ("hp armed", hp(0x01, 0x04, 0xc0), "method=01 info_len=04 flags=c0"),
+        (
+            "mhvtl clear",
+            mhvtl(0x00, 0x04, 0x00),
+            "method=00 info_len=04 flags=00",
+        ),
+        (
+            "mhvtl armed",
+            mhvtl(0x01, 0x04, 0xc0),
+            "method=01 info_len=04 flags=c0",
+        ),
+        (
+            "hp clear",
+            hp(0x00, 0x00, 0x00),
+            "method=00 info_len=00 flags=00",
+        ),
+        (
+            "hp armed",
+            hp(0x01, 0x04, 0xc0),
+            "method=01 info_len=04 flags=c0",
+        ),
         // Bits of byte 6 beside LBP_W and LBP_R are not the checks.
-        ("hp write only, RBDP", hp(0x01, 0x04, 0xa0), "method=01 info_len=04 flags=80"),
+        (
+            "hp write only, RBDP",
+            hp(0x01, 0x04, 0xa0),
+            "method=01 info_len=04 flags=80",
+        ),
     ];
     for (what, resp, want) in cases {
         let lib = ProtectionPage::from_mode_sense10(&resp).unwrap();
@@ -699,7 +719,10 @@ fn the_gates_page_reader_reads_what_the_library_reads() {
         assert_eq!(lib_says, want, "{what}: the library");
         let (ok, got) = gate_parse(&resp);
         assert!(ok, "{what}: the gate's reader failed: {got}");
-        assert_eq!(got, want, "{what}: the gate's reader disagrees with the library");
+        assert_eq!(
+            got, want,
+            "{what}: the gate's reader disagrees with the library"
+        );
     }
     // Not the page, and too short: refused, never read as method 0.
     let mut other = hp(0, 0, 0);
@@ -707,6 +730,9 @@ fn the_gates_page_reader_reads_what_the_library_reads() {
     let short: Vec<u8> = vec![0x00, 0x06, 0x00];
     for (what, resp) in [("page 0Fh", other), ("short", short)] {
         let (ok, got) = gate_parse(&resp);
-        assert!(!ok, "{what}: the gate's reader must refuse it, said {got:?}");
+        assert!(
+            !ok,
+            "{what}: the gate's reader must refuse it, said {got:?}"
+        );
     }
 }
