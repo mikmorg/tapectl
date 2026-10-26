@@ -203,9 +203,12 @@ impl Drop for LeaveDrive {
         }
         if let Some(d) = tape_dev() {
             let _ = Command::new("mt")
-                .args(["-f", &d, "setblk", &FORMAT_BLOCK.to_string()])
+                .arg("-f")
+                .arg(&d)
+                .arg("setblk")
+                .arg(FORMAT_BLOCK.to_string())
                 .status();
-            let _ = Command::new("mt").args(["-f", &d, "rewind"]).status();
+            let _ = Command::new("mt").arg("-f").arg(&d).arg("rewind").status();
         }
     }
 }
