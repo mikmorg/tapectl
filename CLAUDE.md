@@ -136,7 +136,7 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23).
+  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23; 64 since #388 added `lbp_fallback_recorded`, `rust_lbp` and `lbp_page_clear_after_every_command`, and the gate also names a TD6 drive in `TAPECTL_GATE_TAPE_TD6` for `rust_lbp`).
 
 Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
 set above, never as instructions.
@@ -443,7 +443,7 @@ so it stays its own test binary; production hashing goes through
 `pass_count::Sha256`, never `sha2::Sha256` directly, or its passes drop out of the count
 (the budgets' 0.95 floor catches that).
 
-Two suites are gated (they skip at runtime unless the env var is set):
+Four suites are gated (they skip at runtime unless the env var is set):
 
 ```bash
 # mhvtl end-to-end round-trip + on-tape tenant isolation. Tests are #[ignore], so
@@ -464,9 +464,20 @@ TAPECTL_GATE_TAPE="$(readlink -f /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_MHV
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # TapeStore's own command count held to the kernel's other_cnt (#416 item 12). Same
-# gating; it writes the loaded cartridge. The gate runs it as its last leg, rust_motions.
+# gating; it writes the loaded cartridge. The gate runs it as its rust_motions leg.
 TAPECTL_GATE_TAPE="$(readlink -f /dev/tape/by-id/scsi-XYZZY_A2-nst)" TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_motions -- --ignored --nocapture
+
+# Logical Block Protection through the tape layer (#388): arming and the probe, protected
+# writes and reads, the corrupt-block hook and item 174's return to the file's start, the
+# close's page clear, a leftover cleared at the next open. It needs a TD6 drive (A3 or A4:
+# Reed-Solomon; the TD8s speak CRC32C and fall back) and runs the library at a 262,144-byte
+# payload, since mhvtl cannot carry the 524,292-byte wire block in one command. Same gating
+# on its own variable, resolved by-id; it writes that drive's cartridge and leaves it at
+# 524288 with the page at method 0. The gate runs it as rust_lbp, and the gate itself now
+# needs TAPECTL_GATE_TAPE_TD6 too (unless TAPECTL_GATE_SPAN_ONLY is set).
+TAPECTL_GATE_TAPE_TD6="$(readlink -f /dev/tape/by-id/scsi-XYZZY_A3-nst)" TAPECTL_MHVTL=1 \
+    cargo test --test mhvtl_lbp -- --ignored --nocapture
 
 # Performance scenarios (100k-file unit, 2 GiB write, 184k-file rebuild); ~3 min. The one
 # case a release build is expected.
