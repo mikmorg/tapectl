@@ -749,15 +749,18 @@ impl CorruptBlocks {
 
 // ── what the operator is told ───────────────────────────────────────────────
 
-/// The st nodes this process has already warned about (§5.2: once per
-/// process per node).
-static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// The st nodes this process has already told about, each with the
+/// direction of the open (§5.2: once per process per node). Keyed by
+/// direction too, so a read open of a node never swallows a later write
+/// open's item-165 warning (`volume rewrite` reads the tape it then writes).
+static WARNED: Mutex<BTreeSet<(String, bool)>> = Mutex::new(BTreeSet::new());
 
-/// Whether this is the first time this process warns about `device`.
-fn first_warning(device: &str) -> bool {
+/// Whether this is the first time this process tells about `device` for an
+/// open in this direction (`write_open`).
+fn first_warning(device: &str, write_open: bool) -> bool {
     WARNED
         .lock()
-        .map(|mut seen| seen.insert(device.to_string()))
+        .map(|mut seen| seen.insert((device.to_string(), write_open)))
         .unwrap_or(true)
 }
 
@@ -770,11 +773,11 @@ pub fn unavailable_warning(device: &str, reason: &str) -> String {
     )
 }
 
-/// Tell the operator, once per process per st node, that LBP could not be
-/// armed: a write open on stderr and in the session log (item 165); a read
-/// open in the session log only (F4: it cannot weaken a read).
+/// Tell the operator, once per process per st node and direction, that LBP
+/// could not be armed: a write open on stderr and in the session log (item
+/// 165); a read open in the session log only (F4: it cannot weaken a read).
 pub fn note_unavailable(device: &str, reason: &str, write_open: bool) {
-    if !first_warning(device) {
+    if !first_warning(device, write_open) {
         return;
     }
     if write_open {
@@ -1394,9 +1397,9 @@ mod tests {
 
     #[test]
     fn the_unavailable_warning_is_once_per_node() {
-        assert!(first_warning("/dev/nst-lbp-test-a"));
-        assert!(!first_warning("/dev/nst-lbp-test-a"));
-        assert!(first_warning("/dev/nst-lbp-test-b"));
+        assert!(first_warning("/dev/nst-lbp-test-a", true));
+        assert!(!first_warning("/dev/nst-lbp-test-a", true));
+        assert!(first_warning("/dev/nst-lbp-test-b", true));
         assert_eq!(
             unavailable_warning("/dev/nst0", "st refused a 524292-byte block size: x"),
             "warning: Logical Block Protection is not available on /dev/nst0: st refused a \
@@ -1408,6 +1411,19 @@ mod tests {
             reason_no_sg_node("/dev/nst0"),
             "no SCSI generic node is bound to /dev/nst0 (is the sg module loaded?)"
         );
+    }
+
+    /// The coordinator's 388b addition 3: a read open's note (log only, F4)
+    /// does not use up the write open's item-165 warning for the same node,
+    /// as `volume rewrite` opens it: read first, then write. Each direction
+    /// is still told once.
+    #[test]
+    fn a_read_open_never_swallows_the_write_opens_warning() {
+        let node = "/dev/nst-lbp-test-read-then-write";
+        assert!(first_warning(node, false), "the read's note");
+        assert!(first_warning(node, true), "the write's warning, still due");
+        assert!(!first_warning(node, true), "once per write");
+        assert!(!first_warning(node, false), "once per read");
     }
 
     #[test]
