@@ -2722,8 +2722,9 @@ impl ReadyToSeal {
         )
         .map_err(|why| {
             TapectlError::LbpRefusal(format!(
-                "the seal at tape file {seal_at}: {first}. It was not retried: {why}. \
-                 {CHECK_THE_DRIVE_PATH}"
+                "the seal at tape file {seal_at}: {} It was not retried: {why}. \
+                 {CHECK_THE_DRIVE_PATH}",
+                as_sentence(&first)
             ))
         })?;
         resend_entries(
@@ -2919,10 +2920,23 @@ const CHECK_THE_DRIVE_PATH: &str = "A write the drive refuses with Logical Block
 /// The reason a second refusal in one run gives (item 174).
 fn second_refusal(position: u32, e: &TapectlError) -> String {
     format!(
-        "the write of tape file {position} stopped: {e}. This is the second write the drive \
+        "the write of tape file {position} stopped: {} This is the second write the drive \
          refused with Logical Block Protection armed in this run; the first was retried \
-         (ADR-0012 item 174), and a second is not. {CHECK_THE_DRIVE_PATH}"
+         (ADR-0012 item 174), and a second is not. {CHECK_THE_DRIVE_PATH}",
+        as_sentence(e)
     )
+}
+
+/// A refusal's text as a sentence, so the advice can follow it: its own
+/// closing period when it has one (`lbp::refusal_text` ends with one),
+/// never a second.
+fn as_sentence(e: &dyn std::fmt::Display) -> String {
+    let text = e.to_string();
+    if text.ends_with('.') {
+        text
+    } else {
+        format!("{text}.")
+    }
 }
 
 /// The planned tape file holding logical object `lba` — the drive's
@@ -4215,8 +4229,10 @@ fn run_entries(
                         continue;
                     }
                     Err(why) => {
-                        let reason =
-                            format!("{reason}. It was not retried: {why}. {CHECK_THE_DRIVE_PATH}");
+                        let reason = format!(
+                            "{} It was not retried: {why}. {CHECK_THE_DRIVE_PATH}",
+                            as_sentence(&reason)
+                        );
                         crate::progress::log(&reason);
                         mark_writes(conn, &write_ids, "interrupted")?;
                         return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
@@ -13133,6 +13149,30 @@ mod tests {
                 0,
                 "no seal on the tape"
             );
+        }
+
+        /// A refusal's text runs into the advice as one sentence each: the
+        /// device's text (`lbp::refusal_text`) ends with its own period and
+        /// gets no second (it read `failed".. This is the second`); a text
+        /// without one, as the test double's, gets one.
+        #[test]
+        fn a_refusal_and_its_advice_read_as_sentences() {
+            let eio = std::io::Error::from_raw_os_error(nix::libc::EIO);
+            let device = TapectlError::LbpRefusal(crate::tape::lbp::refusal_text("write", &eio));
+            let said = second_refusal(9, &device);
+            assert!(
+                said.contains("check failed\". This is the second write the drive refused"),
+                "{said}"
+            );
+            assert!(!said.contains(".."), "{said}");
+            let double = TapectlError::LbpRefusal("write: refused (the test double)".into());
+            let said = second_refusal(9, &double);
+            assert!(
+                said.contains("(the test double). This is the second write"),
+                "{said}"
+            );
+            assert_eq!(as_sentence(&"x."), "x.");
+            assert_eq!(as_sentence(&"x"), "x.");
         }
 
         /// A position the plan does not place in a file this run wrote is no
