@@ -5996,37 +5996,83 @@ pub(crate) fn record_verification_results(
     Ok(recorded)
 }
 
-/// The bytes a full readback of `layout`'s tape reads, for its progress
-/// total (issue #386): every file of the plan, or — on a tape that sealed
-/// short after `ended_after` (#420, `volume-format-v2.md` §5 step 4) — the
-/// files at or before it and the seal, which is never longer than the
-/// plan's. `None` when an entry is unsized.
-pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
-    let Some(k) = ended_after else {
-        return layout.on_tape_bytes().ok();
-    };
-    layout
-        .entries
-        .iter()
-        .filter(|e| e.position as u32 <= k || matches!(e.kind, ZoneKind::SealMarker))
-        .map(|e| e.on_tape_bytes(layout.block_size))
-        .sum()
+/// The Layout a verify walks: the tape's own plan, rebuilt from its front
+/// index (File 3) as read back, `fi_trimmed` with its NUL padding stripped
+/// (`volume-format-v2.md` §4). File 3's own entry takes its true length from
+/// those bytes (the entry omits it, self-referentially, by design); the seal
+/// marker's stays unsized, since the front index gives it none (§3).
+fn layout_from_front_index(label: &str, block_size: u64, fi_trimmed: &str) -> Result<Layout> {
+    let fi_true_len = fi_trimmed.len() as u64;
+
+    let parsed_fi = format::parse_front_index(fi_trimmed).map_err(|e| {
+        TapectlError::Other(format!(
+            "volume \"{label}\": front index (File 3) unparseable: {e}"
+        ))
+    })?;
+
+    let mut entries: Vec<LayoutEntry> = Vec::with_capacity(parsed_fi.len());
+    for p in &parsed_fi {
+        let kind = ZoneKind::from_type_label(&p.type_label).ok_or_else(|| {
+            TapectlError::Other(format!(
+                "volume \"{label}\": front index position {} has an unrecognized type \"{}\"",
+                p.position, p.type_label
+            ))
+        })?;
+        entries.push(LayoutEntry {
+            position: p.position,
+            // File 3's own true length is the one fact this reconstruction
+            // takes from a source other than the parsed entry (its own
+            // entry omits it, self-referentially, by design).
+            size_bytes: if p.position == 3 {
+                Some(fi_true_len)
+            } else {
+                p.size_bytes
+            },
+            sha256: p.sha256_encrypted.clone(),
+            kind,
+            // Not read by `chain_walk` (position/kind/size_bytes/sha256
+            // only) — this reconstruction has no real backing file per
+            // entry, so there is nothing truer to put here.
+            source: ContentSource::Generated,
+        });
+    }
+
+    Ok(Layout {
+        label: label.to_string(),
+        volume_uuid: String::new(),
+        media_type: String::new(),
+        block_size,
+        // Unused by `chain_walk` (capacity is a build/validate-time concern).
+        budget: CapacityBudget {
+            available_bytes: 0,
+            reserve_bytes: 0,
+            plan_bound_bytes: None,
+            span_tail_from: None,
+        },
+        entries,
+    })
 }
 
-/// The bytes a full verify's readback of `layout` reads, for its read-error
-/// rates (issue #495): every file the front index sizes, block-padded — on
-/// a tape that sealed short after `ended_after` (#420), the ones at or
-/// before it. The seal marker is left out: the front index gives no size for
-/// it (`volume-format-v2.md` §3), and it is a block or two against the
-/// gigabytes of slices. `None` when that leaves nothing.
+/// The bytes a full readback of `layout`'s tape reads, block-padded: the
+/// one sum behind a confirm's and a verify's progress total (issue #386)
+/// and a verify's read-error rates (issue #495), so the two cannot drift
+/// (issue #496). Every file of the plan, or — on a tape that sealed short
+/// after `ended_after` (#420, `volume-format-v2.md` §5 step 4) — the files
+/// at or before it and the seal, which is never longer than the plan's.
 ///
-/// Not [`readback_bytes`], which is `None` whenever an entry is unsized —
-/// and on a Layout rebuilt from a tape's front index the seal always is.
-fn verify_read_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
+/// An unsized entry is left out. A write session's built Layout sizes every
+/// file, so only a Layout rebuilt from a tape's front index has one: its
+/// seal marker, for which the front index gives no size
+/// (`volume-format-v2.md` §3) — a block or two against the gigabytes of
+/// slices. `None` when nothing is sized.
+pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
     let bytes: u64 = layout
         .entries
         .iter()
-        .filter(|e| ended_after.is_none_or(|k| e.position as u32 <= k))
+        .filter(|e| {
+            ended_after.is_none_or(|k| e.position as u32 <= k)
+                || matches!(e.kind, ZoneKind::SealMarker)
+        })
         .filter_map(|e| e.on_tape_bytes(layout.block_size))
         .sum();
     (bytes > 0).then_some(bytes)
@@ -6475,55 +6521,7 @@ fn verify_contacted(
     let fi_raw = crate::store::read_small_bytes(store, 3, "front index")?;
     let fi_text = String::from_utf8_lossy(&fi_raw);
     let fi_trimmed = fi_text.trim_end_matches('\0');
-    let fi_true_len = fi_trimmed.len() as u64;
-
-    let parsed_fi = format::parse_front_index(fi_trimmed).map_err(|e| {
-        TapectlError::Other(format!(
-            "volume \"{label}\": front index (File 3) unparseable: {e}"
-        ))
-    })?;
-
-    let mut entries: Vec<LayoutEntry> = Vec::with_capacity(parsed_fi.len());
-    for p in &parsed_fi {
-        let kind = ZoneKind::from_type_label(&p.type_label).ok_or_else(|| {
-            TapectlError::Other(format!(
-                "volume \"{label}\": front index position {} has an unrecognized type \"{}\"",
-                p.position, p.type_label
-            ))
-        })?;
-        entries.push(LayoutEntry {
-            position: p.position,
-            // File 3's own true length is the one fact this reconstruction
-            // takes from a source other than the parsed entry (its own
-            // entry omits it, self-referentially, by design).
-            size_bytes: if p.position == 3 {
-                Some(fi_true_len)
-            } else {
-                p.size_bytes
-            },
-            sha256: p.sha256_encrypted.clone(),
-            kind,
-            // Not read by `chain_walk` (position/kind/size_bytes/sha256
-            // only) — this reconstruction has no real backing file per
-            // entry, so there is nothing truer to put here.
-            source: ContentSource::Generated,
-        });
-    }
-
-    let layout = Layout {
-        label: label.to_string(),
-        volume_uuid: String::new(),
-        media_type: String::new(),
-        block_size: block_size as u64,
-        // Unused by `chain_walk` (capacity is a build/validate-time concern).
-        budget: CapacityBudget {
-            available_bytes: 0,
-            reserve_bytes: 0,
-            plan_bound_bytes: None,
-            span_tail_from: None,
-        },
-        entries,
-    };
+    let layout = layout_from_front_index(label, block_size as u64, fi_trimmed)?;
 
     phase.done();
 
@@ -6574,16 +6572,18 @@ fn verify_contacted(
         .transpose()?;
     // Issue #386: the readback is the phase that takes hours; a quick
     // verify reads no content file, so only a full one has a byte total —
-    // on a short tape, of the files the walk reads (#420).
+    // on a short tape, of the files the walk reads (#420). This Layout is
+    // the front index's, whose seal is unsized: the total leaves it out
+    // (#496), where it once made the whole total `None`.
     let total = match tier {
         Tier::Integrity => readback_bytes(&layout, ended_after),
         Tier::Navigable => None,
     };
     // Issue #495: what this contact's readback reads, for the read-error
     // rates — only when it reads the whole tape (a full verify that
-    // continues nothing).
+    // continues nothing). The same sum as the total (#496).
     let verify_bytes = match (tier, &resume) {
-        (Tier::Integrity, None) => verify_read_bytes(&layout, ended_after),
+        (Tier::Integrity, None) => total,
         _ => None,
     };
     conn.execute(
@@ -8278,7 +8278,7 @@ pub struct VerifyReport {
     /// The bytes this verify's readback read (issue #495), the denominator
     /// of its read-error rates ([`crate::tape::read_errors`]): every file
     /// the tape's front index sizes, block-padded, at or before the
-    /// recorded `ended_after` on a short tape ([`verify_read_bytes`]).
+    /// recorded `ended_after` on a short tape ([`readback_bytes`]).
     ///
     /// `None` on a quick verify (it reads no content file), and on a full
     /// one that continued an interrupted readback (issue #410): that contact
@@ -17148,12 +17148,70 @@ mod tests {
         // Issue #495: a verify's Layout is rebuilt from the tape's front
         // index, which sizes no seal (`volume-format-v2.md` §3). The
         // read-error denominator counts every sized file, at or before
-        // `ended_after` on a short tape.
+        // `ended_after` on a short tape — the same sum as the progress
+        // total (#496), which leaves the unsized seal out.
         let mut from_tape = layout.clone();
         from_tape.entries[4].size_bytes = None;
-        assert_eq!(verify_read_bytes(&from_tape, None), Some(11 * bs));
-        assert_eq!(verify_read_bytes(&from_tape, Some(1)), Some(3 * bs));
-        assert_eq!(verify_read_bytes(&layout, Some(2)), Some(6 * bs));
+        assert_eq!(readback_bytes(&from_tape, None), Some(11 * bs));
+        assert_eq!(readback_bytes(&from_tape, Some(1)), Some(3 * bs));
+        assert_eq!(readback_bytes(&from_tape, Some(2)), Some(6 * bs));
+    }
+
+    /// Issue #496: `volume verify`'s progress line showed no total, because
+    /// the sum was `None` whenever an entry was unsized, and the Layout a
+    /// verify rebuilds from a tape's front index never sizes the seal
+    /// (`volume-format-v2.md` §3). From real front-index bytes, the total is
+    /// every file the index sizes — File 3 at its own true length — with
+    /// the seal left out; and a Layout with nothing sized has none.
+    #[test]
+    fn a_layout_rebuilt_from_front_index_bytes_has_a_readback_total() {
+        let bs = 4096u64;
+        let file = |position: i32, type_label: &'static str, size: Option<u64>| {
+            layout::FrontIndexFile {
+                position,
+                type_label,
+                size_bytes: size,
+                sha256_encrypted: size.map(|_| "ab".repeat(32)),
+            }
+        };
+        let files = [
+            file(0, "id_thunk", Some(100)),
+            file(1, "system_guide", Some(bs + 1)),
+            file(2, "restore_sh", Some(200)),
+            file(3, "front_index", None),
+            file(4, "data_slice", Some(3 * bs)),
+            file(5, "seal_marker", None),
+        ];
+        let text = layout::generate_front_index("RB496", &files);
+        let rebuilt = layout_from_front_index("RB496", bs, &text).unwrap();
+        assert_eq!(
+            rebuilt.entries[5].size_bytes, None,
+            "the front index sizes no seal"
+        );
+        assert_eq!(
+            rebuilt.entries[3].size_bytes,
+            Some(text.len() as u64),
+            "File 3 at its own true length"
+        );
+        assert!(
+            rebuilt.on_tape_bytes().is_err(),
+            "positive control: the whole-plan sum is unsized here"
+        );
+        let file3 = (text.len() as u64).div_ceil(bs) * bs;
+        // Files 0..4, block-padded: 1 + 2 + 1 + file 3 + 3 blocks.
+        assert_eq!(
+            readback_bytes(&rebuilt, None),
+            Some(7 * bs + file3),
+            "a total, with the unsized seal left out"
+        );
+        // Sealed short after file 2: files 0 to 2.
+        assert_eq!(readback_bytes(&rebuilt, Some(2)), Some(4 * bs));
+
+        let mut unsized_only = rebuilt.clone();
+        for e in &mut unsized_only.entries {
+            e.size_bytes = None;
+        }
+        assert_eq!(readback_bytes(&unsized_only, None), None);
     }
 
     /// Issue #392: `first_write` was stamped when the write session
