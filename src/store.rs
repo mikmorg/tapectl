@@ -2233,6 +2233,10 @@ fn test_lbp_corrupt_block_from_env() -> Option<String> {
     std::env::var_os(TEST_LBP_CORRUPT_BLOCK).map(|raw| raw.to_string_lossy().into_owned())
 }
 
+/// What [`lbp_corrupt_hook`] gives an open the hook applies to: the block
+/// writes to corrupt, and the lines that announce it.
+type CorruptHook = (Vec<u64>, Vec<String>);
+
 /// The hook's decision for one open (#388, F5): `raw` is its value, if set,
 /// and `protection` what the open decided. `Ok(None)` unset; the block
 /// numbers and the lines to announce when it applies; an error when the
@@ -2242,7 +2246,7 @@ fn lbp_corrupt_hook(
     raw: Option<&str>,
     protection: &Protection,
     device: &str,
-) -> std::result::Result<Option<(Vec<u64>, Vec<String>)>, String> {
+) -> std::result::Result<Option<CorruptHook>, String> {
     let Some(raw) = raw else {
         return Ok(None);
     };
