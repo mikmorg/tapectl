@@ -3102,11 +3102,17 @@ fn resend_entries(
 /// it (`mixed`). A change writes a `write_lbp` event. Idempotent: the same
 /// store recorded twice changes nothing. [`Protection::NotApplicable`] — a
 /// test double, variable-block mode — records nothing.
+///
+/// `earlier_run_wrote`: files an earlier run of this session wrote are on
+/// the tape before this run's. With no record on the volume, that run
+/// predates tapectl 1.7.2, which never armed LBP, so a run with LBP now
+/// makes the session `mixed`, never `on` ([`merge_write_lbp`]).
 pub fn record_run_protection(
     conn: &Connection,
     volume_id: i64,
     label: &str,
     protection: &Protection,
+    earlier_run_wrote: bool,
 ) -> Result<()> {
     let (word, reason) = match protection {
         Protection::Lbp { .. } => ("on", None),
@@ -3120,7 +3126,13 @@ pub fn record_run_protection(
             params![volume_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let (now, note) = merge_write_lbp(was.as_deref(), was_note.as_deref(), word, reason);
+        let (now, note) = merge_write_lbp(
+            was.as_deref(),
+            was_note.as_deref(),
+            word,
+            reason,
+            earlier_run_wrote,
+        );
         if was.as_deref() != Some(now) || was_note != note {
             tx.execute(
                 "UPDATE volumes SET write_lbp = ?2, write_lbp_note = ?3 WHERE id = ?1",
@@ -3146,13 +3158,21 @@ pub fn record_run_protection(
 
 /// The merge [`record_run_protection`] makes: `(write_lbp, write_lbp_note)`
 /// from what the volume holds and this run's word and reason.
+///
+/// No record (`was` NULL) while an earlier run of the session wrote
+/// (`earlier_run_wrote`) is a run by a tapectl before 1.7.2: it wrote
+/// without LBP, so this run's `on` merges to `mixed`, and its `off` stays
+/// `off` (no run had it). No record and nothing written before is this
+/// run's word alone.
 fn merge_write_lbp(
     was: Option<&str>,
     was_note: Option<&str>,
     word: &'static str,
     reason: Option<&str>,
+    earlier_run_wrote: bool,
 ) -> (&'static str, Option<String>) {
     match (was, word) {
+        (None, "on") if earlier_run_wrote => ("mixed", Some(EARLIER_RUN_UNRECORDED.to_string())),
         (None, _) => (word, reason.map(str::to_string)),
         (Some("on"), "on") => ("on", None),
         (Some("off"), "off") => ("off", reason.or(was_note).map(str::to_string)),
@@ -3173,6 +3193,11 @@ fn merge_write_lbp(
         (_, _) => ("mixed", was_note.map(str::to_string)),
     }
 }
+
+/// [`merge_write_lbp`]'s note for a session an earlier run of which wrote
+/// with no record of the check: a tapectl before 1.7.2.
+const EARLIER_RUN_UNRECORDED: &str =
+    "an earlier run of this session wrote without it: it ran before tapectl 1.7.2";
 
 /// Item 175's fallback read policy, before a write session's confirm: arm
 /// LBP_R for it when every run of the session wrote with LBP
@@ -4013,8 +4038,16 @@ fn run_entries(
         // blocks went to the store, what its open decided about Logical
         // Block Protection, merged into the volume's record. A run that
         // wrote nothing records nothing.
+        // The files before `start_index` are an earlier run's (a resume
+        // that found no slice written starts again from BOT, index 0).
         if !protection_recorded && waits.is_some() {
-            record_run_protection(conn, volume_id, &built.layout.label, &store.protection())?;
+            record_run_protection(
+                conn,
+                volume_id,
+                &built.layout.label,
+                &store.protection(),
+                start_index > 0,
+            )?;
             protection_recorded = true;
         }
 
@@ -13164,6 +13197,68 @@ mod tests {
             );
         }
 
+        /// The coordinator's 388b addition 1, through a session: a first run
+        /// that recorded nothing (a store that was never asked, as a tapectl
+        /// before 1.7.2 never asked) wrote slice 1, and a resume on a store
+        /// with LBP armed records `mixed`, never `on`. Its control is
+        /// `a_run_records_whether_lbp_ran_on_the_volume`: nothing written
+        /// before, and LBP's run records `on`.
+        #[test]
+        fn a_resume_of_a_run_that_recorded_nothing_records_mixed() {
+            let f = make_fixture();
+            let mut store = MemStore::new(BS as usize);
+            let Fixture {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                ..
+            } = f;
+            let planned = built
+                .into_validated(&keys, SliceCheck::Size, &mut store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap();
+            let calls = AtomicU32::new(0);
+            let interrupted = match planned
+                .execute_checking(&conn, &mut store, move || {
+                    calls.fetch_add(1, Ordering::SeqCst) >= 9
+                })
+                .unwrap()
+            {
+                ExecuteOutcome::Interrupted(i) => i,
+                _ => panic!("expected Interrupted"),
+            };
+            assert_eq!(write_lbp(&conn, volume_id), (None, None));
+            let written: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(written, 1, "positive control: the first run wrote slice 1");
+
+            let mut on = lbp_store();
+            on.files = store.files.clone();
+            on.syncs = store.syncs.clone();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&conn, &keys, SliceCheck::Size, &mut on, || false)
+                .unwrap()
+            else {
+                panic!("expected Ready");
+            };
+            ready.seal_with_retry(&conn, &mut on).unwrap();
+            assert_eq!(
+                write_lbp(&conn, volume_id),
+                (
+                    Some("mixed".into()),
+                    Some(EARLIER_RUN_UNRECORDED.to_string())
+                )
+            );
+        }
+
         /// A run that wrote nothing records nothing.
         #[test]
         fn a_run_interrupted_before_its_first_entry_records_nothing() {
@@ -13191,34 +13286,60 @@ mod tests {
 
         #[test]
         fn the_merge_of_a_sessions_runs() {
-            assert_eq!(merge_write_lbp(None, None, "on", None), ("on", None));
+            assert_eq!(merge_write_lbp(None, None, "on", None, false), ("on", None));
             assert_eq!(
-                merge_write_lbp(None, None, "off", Some("why")),
+                merge_write_lbp(None, None, "off", Some("why"), false),
                 ("off", Some("why".into()))
             );
-            assert_eq!(merge_write_lbp(Some("on"), None, "on", None), ("on", None));
             assert_eq!(
-                merge_write_lbp(Some("off"), Some("old"), "off", Some("new")),
+                merge_write_lbp(Some("on"), None, "on", None, false),
+                ("on", None)
+            );
+            assert_eq!(
+                merge_write_lbp(Some("off"), Some("old"), "off", Some("new"), false),
                 ("off", Some("new".into()))
             );
             assert_eq!(
-                merge_write_lbp(Some("on"), None, "off", Some("why")),
+                merge_write_lbp(Some("on"), None, "off", Some("why"), false),
                 (
                     "mixed",
                     Some("a run of this session wrote without it: why".into())
                 )
             );
             assert_eq!(
-                merge_write_lbp(Some("off"), Some("why"), "on", None),
+                merge_write_lbp(Some("off"), Some("why"), "on", None, false),
                 (
                     "mixed",
                     Some("an earlier run of this session wrote without it: why".into())
                 )
             );
             assert_eq!(
-                merge_write_lbp(Some("mixed"), Some("kept"), "on", None),
+                merge_write_lbp(Some("mixed"), Some("kept"), "on", None, false),
                 ("mixed", Some("kept".into()))
             );
+        }
+
+        /// The coordinator's 388b addition 1: no record while an earlier run
+        /// of the session wrote is a run by a tapectl before 1.7.2, which
+        /// never armed LBP: this run's `on` is `mixed`, its `off` stays
+        /// `off`, and a recorded word is merged as before. Nothing written
+        /// before (the control) is this run's word alone.
+        #[test]
+        fn an_unrecorded_earlier_run_is_one_without_lbp() {
+            assert_eq!(
+                merge_write_lbp(None, None, "on", None, true),
+                ("mixed", Some(EARLIER_RUN_UNRECORDED.to_string()))
+            );
+            assert_eq!(
+                merge_write_lbp(None, None, "off", Some("why"), true),
+                ("off", Some("why".into()))
+            );
+            assert_eq!(
+                merge_write_lbp(Some("on"), None, "on", None, true),
+                ("on", None),
+                "a recorded earlier run is merged by its word"
+            );
+            assert_eq!(merge_write_lbp(None, None, "on", None, false), ("on", None));
         }
 
         /// Item 175's switch, both settings: under `AllReads` every open armed
