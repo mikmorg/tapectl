@@ -1922,6 +1922,13 @@ fn record_dar(config: &Config, trace: &mut RestoreTrace, report: Option<DarRepor
 /// dar extracts AS the slices arrive, so a failure partway — a slice that
 /// fails its checksum, a tape read error — leaves what dar had extracted
 /// by then in the destination. The error says so.
+///
+/// Given the catalogue, dar stops reading where the file data ends and exits
+/// 0, leaving the archive's own trailing catalogue unread (#497,
+/// [`dar::restore::SequentialExtract`]). Every slice is read and
+/// authenticated to its end all the same, what dar does not take is
+/// dropped, and dar's exit status, not the pipe it closed, says whether
+/// the restore failed.
 #[allow(clippy::too_many_arguments)]
 fn stream_into_dar(
     config: &Config,
@@ -1974,6 +1981,12 @@ fn stream_into_dar(
     let phase = progress::phase("read", Some(ciphertext_bytes(positions)));
     let mut failure = None;
     let damage_before = supply.damage.len();
+    // The first slice dar stopped reading before its end (or had ended
+    // before it opened), with no hole to blame. Given the catalogue, dar
+    // stops where the file data ends and exits 0 (#497): that is dar done,
+    // and every slice is still read and checked. Any other exit is dar
+    // failed, named at this slice as ever.
+    let mut cut_at: Option<i64> = None;
     for (i, (wp, pipe)) in positions.iter().zip(&pipes).enumerate() {
         note_slice(&phase, unit_name, i, positions.len(), wp);
         // Issue #404: between slices. dar has been extracting as the slices
@@ -1996,22 +2009,36 @@ fn stream_into_dar(
                 trace.slices_read += 1;
                 trace.bytes_decrypted += read.authentic_bytes as i64;
                 if read.dar_gone {
-                    // dar gave up reading. If a hole is why (a slice nobody
+                    // dar stopped reading. If a hole is why (a slice nobody
                     // could give whole, written as zeros over something dar
                     // needs), the later slices are of no use to it, and the
-                    // restore is judged by what it left. Otherwise dar died
-                    // of its own accord, and that is the failure.
-                    if supply.damage.len() == damage_before {
-                        failure = Some(TapectlError::Dar(format!(
-                            "dar stopped reading slice {}",
-                            wp.slice_number
-                        )));
+                    // restore is judged by what it left.
+                    if supply.damage.len() > damage_before {
+                        break;
                     }
-                    break;
+                    // Otherwise dar's exit status says why: 0 is dar done,
+                    // and the slices left are read and checked, into
+                    // nothing; any other is dar dying of its own accord, and
+                    // that is the failure. Still running, the next slice's
+                    // pipe or the end of the stream will tell.
+                    let cut = *cut_at.get_or_insert(wp.slice_number);
+                    if darx.status().is_some_and(|s| !s.success()) {
+                        failure = Some(TapectlError::Dar(format!(
+                            "dar stopped reading slice {cut}"
+                        )));
+                        break;
+                    }
                 }
             }
             Err(e) => {
-                failure = Some(e);
+                // A dar that stopped reading a slice and then failed is
+                // named at that slice.
+                failure = Some(match (cut_at, e) {
+                    (Some(cut), TapectlError::Dar(_)) => {
+                        TapectlError::Dar(format!("dar stopped reading slice {cut}"))
+                    }
+                    (_, e) => e,
+                });
                 break;
             }
         }
@@ -2023,10 +2050,24 @@ fn stream_into_dar(
     } else {
         phase.done();
         if supply.damage.len() > damage_before {
-            settle_dar(&darx, &pipes);
+            settle_dar(&darx, &pipes, Some(SETTLE_PATIENCE));
+        } else if cut_at.is_some() {
+            // dar stopped reading before the end and may still be running:
+            // it is let end, for as long as that takes (a pipe it waits on
+            // is closed under it), and its exit status decides.
+            settle_dar(&darx, &pipes, None);
         }
     }
     let (report, verdict) = darx.finish();
+    if let (None, Some(cut)) = (&failure, cut_at) {
+        if supply.damage.len() == damage_before
+            && report.as_ref().is_some_and(|r| r.exit_code != Some(0))
+        {
+            failure = Some(TapectlError::Dar(format!(
+                "dar stopped reading slice {cut}"
+            )));
+        }
+    }
     record_dar(config, trace, report);
     if let Some(e) = failure {
         let partial = |what: String| {
@@ -2054,13 +2095,19 @@ const SETTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// over something dar needs (a slice's header) can leave it waiting to
 /// re-open a slice's pipe that nobody is feeding; a pipe held open for it
 /// and closed at once gives it the end of file it needs to fail and exit.
-/// A dar that is still there after [`SETTLE_PATIENCE`] is stopped: what it
-/// left is judged as ever, by the files.
-fn settle_dar(darx: &dar::restore::SequentialExtract, pipes: &[PathBuf]) {
+/// A dar that is still there after `patience` ([`SETTLE_PATIENCE`]) is
+/// stopped: what it left is judged as ever, by the files. With no patience
+/// it is waited for as long as it runs: a dar that stopped reading a slice
+/// early with no hole to blame (#497) is judged by its own exit status.
+fn settle_dar(
+    darx: &dar::restore::SequentialExtract,
+    pipes: &[PathBuf],
+    patience: Option<std::time::Duration>,
+) {
     use std::os::unix::fs::OpenOptionsExt;
     let started = std::time::Instant::now();
     while !darx.exited() {
-        if started.elapsed() > SETTLE_PATIENCE {
+        if patience.is_some_and(|p| started.elapsed() > p) {
             warn!("dar did not end after the holes; stopping it");
             darx.kill();
             return;

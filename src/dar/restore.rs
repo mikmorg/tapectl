@@ -192,8 +192,21 @@ pub fn supports_streaming(version: &super::version::DarVersion) -> bool {
 /// ("arch.4.dar is required for further operation"). The SAME archives,
 /// read the same way with the isolated catalogue given as `-A`, came back
 /// identical on every layout tried (slice sizes from 20 KiB to 3 MiB, all
-/// seven compressors, over regular files and over FIFOs), and dar read
-/// every byte of every slice. A catalogue from a DIFFERENT dar run of the
+/// seven compressors, over regular files and over FIFOs).
+///
+/// **With `-A`, dar does not read every byte (#497).** The catalogue tells
+/// dar where the file data ends, and it stops reading there: the archive's
+/// own trailing catalogue is left unread (the tail of the last slice, and,
+/// when that catalogue is bigger than a slice, the last slices whole, which
+/// dar never opens), and dar exits 0. Measured on 2.7.13: 10,000 files in
+/// 20 MiB slices left 979,621 of the last slice's 6,419,109 bytes unread,
+/// and the restored tree was identical. A tail that fits in a pipe's buffer
+/// (64 KiB, a catalogue of a few hundred files) is taken by the pipe whether
+/// or not dar reads it, which is why smaller measurements saw every byte go.
+/// The restore accepts it: what dar leaves of a slice, and any slice after
+/// it, is still read, hashed and authenticated, its plaintext dropped, and
+/// dar's exit status ([`Self::status`], then [`Self::finish`]) says whether
+/// the stop was a failure. A catalogue from a DIFFERENT dar run of the
 /// same content is refused by dar itself, FATAL, before any file is
 /// written ("The archive and the isolated catalogue do not correspond to
 /// the same data") — so a wrong catalogue cannot produce a wrong restore.
@@ -208,8 +221,9 @@ pub struct SequentialExtract {
 impl SequentialExtract {
     /// Start `dar -x <archive_base> --sequential-read -A <catalogue> -R
     /// <dest> -O -Q [-w]`. dar opens `<archive_base>.1.dar` first and each
-    /// next slice when it has read the one before to its end, so every slice
-    /// must already exist (as a named pipe) when this is called.
+    /// next slice when it has read the one before to its end, until the file
+    /// data ends (see above), so every slice must already exist (as a named
+    /// pipe) when this is called.
     pub fn spawn(
         dar_binary: &str,
         archive_base: &Path,
@@ -284,6 +298,14 @@ impl SequentialExtract {
     pub fn exited(&self) -> bool {
         let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
         !matches!(child.try_wait(), Ok(None))
+    }
+
+    /// dar's exit status once it has ended, `None` while it runs. A dar that
+    /// stopped reading a slice part way is judged by this, never by the pipe
+    /// it closed (#497).
+    pub fn status(&self) -> Option<std::process::ExitStatus> {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        child.try_wait().ok().flatten()
     }
 
     /// Stop dar — a restore that cannot deliver the next slice. dar may be

@@ -378,10 +378,15 @@ pub(super) struct SliceOut<'a> {
     /// The spans of `delivered` that are holes. A hole is entered before it is
     /// written, so one dar interrupted is still on the books.
     holes: Vec<Range<u64>>,
-    /// Zero bytes of holes actually written.
+    /// Zero bytes of holes delivered (written, or dropped once `dropping`).
     hole_bytes: u64,
     /// The named pipe's reader is gone: dar stopped reading.
     gone: bool,
+    /// dar wants no more of this slice (#497): it closed the pipe before the
+    /// slice's end, or had ended with exit 0 before it opened it. The rest is
+    /// still authenticated, and its plaintext dropped; whether dar's stop is
+    /// a failure is its exit status's to say, not the pipe's.
+    dropping: bool,
     /// Reads begun on this slice, from any cartridge. The first hashes no
     /// plaintext: when its ciphertext hash matches, the bytes are proven
     /// identical to what was written and nothing more can be asked of them.
@@ -411,6 +416,7 @@ impl<'a> SliceOut<'a> {
             holes: Vec::new(),
             hole_bytes: 0,
             gone: false,
+            dropping: false,
             attempts: 0,
             plain: None,
             unhashed: false,
@@ -481,7 +487,7 @@ impl<'a> SliceOut<'a> {
     }
 
     fn open(&mut self) -> Result<()> {
-        if self.file.is_some() {
+        if self.file.is_some() || self.dropping {
             return Ok(());
         }
         let opened = match &self.sink {
@@ -494,8 +500,17 @@ impl<'a> SliceOut<'a> {
                 Ok(())
             }
             Err(e) => {
-                // dar exited before it opened the pipe.
+                // dar exited before it opened the pipe. With exit 0 it is
+                // done (#497: given the catalogue it never reads the
+                // archive's own, which can fill the last slices): the slice
+                // is read and authenticated all the same, into nothing.
                 self.gone = matches!(e, TapectlError::Dar(_));
+                if let (true, SliceSink::Pipe { dar, .. }) = (self.gone, &self.sink) {
+                    if dar.status().is_some_and(|s| s.success()) {
+                        self.dropping = true;
+                        return Ok(());
+                    }
+                }
                 Err(e)
             }
         }
@@ -503,19 +518,27 @@ impl<'a> SliceOut<'a> {
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.open()?;
-        let file = self.file.as_mut().expect("opened");
-        let slice_number = self.slice_number;
-        let gone = &mut self.gone;
-        file.write_all(bytes).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                *gone = true;
-                TapectlError::Dar(format!(
-                    "dar stopped reading slice {slice_number} (it gave up on the archive)"
-                ))
-            } else {
-                TapectlError::Other(format!("slice {slice_number}: {e}"))
+        if let Some(file) = self.file.as_mut() {
+            match file.write_all(bytes) {
+                Ok(()) => {}
+                // dar closed the pipe before the slice's end (#497: given the
+                // catalogue, dar stops where the file data ends, before the
+                // archive's own catalogue). The rest of the slice is still
+                // authenticated, its plaintext dropped, and dar's exit status
+                // says whether the stop was a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    self.gone = true;
+                    self.dropping = true;
+                    self.file = None;
+                }
+                Err(e) => {
+                    return Err(TapectlError::Other(format!(
+                        "slice {}: {e}",
+                        self.slice_number
+                    )))
+                }
             }
-        })?;
+        }
         if let Some(plain) = self.plain.as_mut() {
             plain.update(bytes);
         }
@@ -550,7 +573,9 @@ impl<'a> SliceOut<'a> {
 
     fn finish(&mut self) -> Result<()> {
         self.open()?;
-        self.file.as_mut().expect("opened").flush()?;
+        if let Some(file) = self.file.as_mut() {
+            file.flush()?;
+        }
         Ok(())
     }
 
@@ -569,9 +594,12 @@ impl<'a> SliceOut<'a> {
 pub(super) struct SliceRead {
     /// Plaintext bytes written that authenticated.
     pub authentic_bytes: u64,
-    /// dar stopped reading before the slice was all delivered (a streamed
-    /// restore whose archive a hole made unreadable): no later slice can
-    /// be of use.
+    /// dar stopped reading before the slice was all delivered, or had ended
+    /// before it opened the slice: a streamed restore whose archive a hole
+    /// made unreadable, so that no later slice can be of use; a dar that
+    /// failed; or a dar done, which given the catalogue stops where the file
+    /// data ends and exits 0 (#497). The rest of the slice was read and
+    /// authenticated all the same.
     pub dar_gone: bool,
 }
 
@@ -815,6 +843,9 @@ fn prove_plaintext(wp: &WritePositionInfo, out: &SliceOut<'_>) -> Result<Proof> 
 struct Ended {
     /// The sink's reader is gone (dar exited): nothing more can be written.
     sink_gone: bool,
+    /// After the sink's reader was gone, a chunk of the rest of the slice
+    /// did not authenticate: the slice is damaged where dar did not read.
+    tail_damaged: bool,
     /// Strict mode stopped at a chunk that did not authenticate.
     stopped: bool,
     /// The file is a different age file from the one that delivered this
@@ -1235,13 +1266,14 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         let new_holes: Vec<Range<u64>> = out.holes[before_holes..].to_vec();
         if ended.sink_gone && new_holes.is_empty() {
             // dar stopped reading mid-slice. Over a slice that hashes as
-            // written that is dar's own doing (`read_slice` says dar is gone,
-            // and the restore says why). Over one that does not, the slice is
-            // why, and it goes on the books, as a hole would.
-            if !hash_ok {
+            // written, and whose every chunk authenticated, that is dar's own
+            // doing (`read_slice` says dar is gone, and the restore says
+            // why). Over one that does not, the slice is why, and it goes on
+            // the books, as a hole would.
+            if !hash_ok || ended.tail_damaged {
                 let reason = format!(
                     "{}; dar stopped reading it",
-                    described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
+                    described(&cause).unwrap_or_else(|| Defect::Chunk.describe(wp)),
                 );
                 self.record_damage(wp, label, reason, Vec::new());
             }
@@ -1599,15 +1631,15 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         }
         if ended.sink_gone {
             // dar stopped reading, so nothing more can be delivered, from this
-            // copy or any other. Over a slice that hashes as written that is
-            // dar's own doing; over one that does not, the slice is why, and
-            // it goes on the books as unproven.
-            if !hash_ok {
+            // copy or any other. Over a slice that hashes as written, and whose
+            // every chunk authenticated, that is dar's own doing; over one that
+            // does not, the slice is why, and it goes on the books as unproven.
+            if !hash_ok || ended.tail_damaged {
                 let on = self.here_label().unwrap_or_default();
                 let reason = format!(
                     "{on}: {}; dar stopped reading it, so no other copy could be tried (a \
                      spooled restore, --spool, can)",
-                    defect.map_or_else(|| format!("slice {}", wp.slice_number), |d| d.describe(wp)),
+                    defect.map_or_else(|| Defect::Chunk.describe(wp), |d| d.describe(wp)),
                 );
                 self.record_damage(wp, on, reason, Vec::new());
             }
@@ -1979,6 +2011,7 @@ fn decrypt_chunks(
         Err(e) => {
             return Ok(Ended {
                 sink_gone: false,
+                tail_damaged: false,
                 stopped: false,
                 other_file: false,
                 open_error: Some(e),
@@ -1992,12 +2025,14 @@ fn decrypt_chunks(
     if out.bound.as_deref().is_some_and(|bound| bound != header) {
         return Ok(Ended {
             sink_gone: false,
+            tail_damaged: false,
             stopped: false,
             other_file: true,
             open_error: None,
         });
     }
     let mut stopped = false;
+    let mut tail_damaged = false;
     let delivered = (|| -> Result<()> {
         out.open()?;
         let skip = out.delivered;
@@ -2021,6 +2056,14 @@ fn decrypt_chunks(
                 Next::Damaged { plain_len } => {
                     let end = pos + plain_len as u64;
                     if end > skip {
+                        if out.gone {
+                            // dar reads no more of this slice: nothing is
+                            // written for the chunk, and no other copy is
+                            // wanted for it. The slice is damaged all the
+                            // same, and said to be.
+                            tail_damaged = true;
+                            return Ok(());
+                        }
                         if mode == Mode::Strict {
                             stopped = true;
                             return Ok(());
@@ -2034,8 +2077,11 @@ fn decrypt_chunks(
         }
     })();
     match delivered {
+        // dar may have stopped reading part way (`out.gone`): the rest was
+        // read and authenticated all the same.
         Ok(()) => Ok(Ended {
-            sink_gone: false,
+            sink_gone: out.gone,
+            tail_damaged,
             stopped,
             other_file: false,
             open_error: None,
@@ -2043,6 +2089,7 @@ fn decrypt_chunks(
         // dar stopped reading: not a failure of the medium or the slice.
         Err(_) if out.gone => Ok(Ended {
             sink_gone: true,
+            tail_damaged: false,
             stopped: false,
             other_file: false,
             open_error: None,
