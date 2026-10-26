@@ -4082,9 +4082,17 @@ fn finish_session(
             // #388 (migration 041): the seal is a write of this run, so what
             // its store decided about Logical Block Protection is recorded —
             // a resume whose only write is the seal has no other place;
-            // idempotent for a run whose entries already recorded it.
-            super::session::record_run_protection(conn, volume_id, label, &store.protection())
-                .map_err(|e| e.in_write_session(label))?;
+            // idempotent for a run whose entries already recorded it. Every
+            // content file is on the tape before the seal, so with no record
+            // yet they are an earlier run's, by a tapectl before 1.7.2.
+            super::session::record_run_protection(
+                conn,
+                volume_id,
+                label,
+                &store.protection(),
+                true,
+            )
+            .map_err(|e| e.in_write_session(label))?;
             phase.done();
 
             // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
