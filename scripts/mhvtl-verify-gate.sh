@@ -26,8 +26,15 @@
 #      prompts and tapectl's (on a pseudo-terminal) answered by
 #      scripts/mhvtl-prompt-driver.py. TAPECTL_GATE_SWAP_WAIT (seconds,
 #      default 300) is how long the drive stays empty at --stream-tapes' swap.
+#   LBP legs (1.7.2, #388; ADR-0012 items 162-166, 174): the gate's TD8 drive speaks CRC32C
+#      and mhvtl cannot carry tapectl's 524,292-byte wire block, so every open falls back
+#      (item 165): lbp_fallback_recorded proves the write records it, warned once, and
+#      lbp_page_clear_after_every_command proves the page reads method 0 after every step.
+#      rust_lbp runs tests/mhvtl_lbp.rs on a TD6 drive (Reed-Solomon), named by
+#      TAPECTL_GATE_TAPE_TD6, at a 262,144-byte payload mhvtl can carry.
 #
-# The `check` lines below are the list (62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
+# The `check` lines below are the list (65 since #388's lbp_fallback_recorded, rust_lbp and
+# lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
 # span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
 # span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
 # heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
@@ -58,7 +65,7 @@ die() { echo "GATE PRECONDITION FAILED: $*" >&2; exit 2; }
 grep -q '^mhvtl ' /proc/modules \
     || die "mhvtl module not loaded for $(uname -r) — dkms status; see docs/operator-guide.md"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV missing — systemctl start mhvtl.target"
-for bin in lsscsi mtx mt dar age sha256sum python3 cargo; do
+for bin in lsscsi mtx mt dar age sha256sum python3 cargo sg_modes; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 
@@ -77,6 +84,34 @@ DISCOVERY="$("$(dirname "$0")/mhvtl-device.sh" --tape "$TAPE_DEV" --ensure-media
 eval "$DISCOVERY"
 
 echo "gate: drive=$TAPE_DEV ($DRIVE_MODEL, sg=$DRIVE_SG) changer=$CHG_SG dte=$DTE tape=$LOADED_TAG"
+
+# ---------- the TD6 drive for rust_lbp (#388) ----------
+# Logical Block Protection is proven on an LTO-6 emulation (ULT3580-TD6): mhvtl's TD5 and TD6
+# personalities speak Reed-Solomon, the method tapectl arms (ADR-0012 item 162), where the
+# gate's TD8 drive speaks CRC32C and falls back on every open. Named like TAPECTL_GATE_TAPE,
+# never defaulted; discovery refuses a device that is not mhvtl's, and this a model that is
+# not a TD6. TAPECTL_GATE_SPAN_ONLY runs no rust_lbp, so it needs none.
+TAPE_TD6="${TAPECTL_GATE_TAPE_TD6:-}"
+if [ -z "${TAPECTL_GATE_SPAN_ONLY:-}" ]; then
+    [ -n "$TAPE_TD6" ] || die "TAPECTL_GATE_TAPE_TD6 not set — name an mhvtl TD6 drive for rust_lbp: TAPECTL_GATE_TAPE_TD6=\"\$(readlink -f /dev/tape/by-id/scsi-XYZZY_A3-nst)\""
+    [ -e "$TAPE_TD6" ] || die "$TAPE_TD6 missing — systemctl start mhvtl.target"
+    [ "$(readlink -f "$TAPE_TD6")" != "$(readlink -f "$TAPE_DEV")" ] \
+        || die "TAPECTL_GATE_TAPE_TD6 and TAPECTL_GATE_TAPE name the same drive"
+    TD6_DISCOVERY="$("$(dirname "$0")/mhvtl-device.sh" --tape "$TAPE_TD6")" \
+        || die "TD6 device discovery failed (see the message above)"
+    TD6_MODEL="$(sed -n "s/^DRIVE_MODEL='\(.*\)'\$/\1/p" <<<"$TD6_DISCOVERY")"
+    TD6_SG="$(sed -n "s/^DRIVE_SG='\(.*\)'\$/\1/p" <<<"$TD6_DISCOVERY")"
+    case "$TD6_MODEL" in
+        *TD6*) ;;
+        *) die "TAPECTL_GATE_TAPE_TD6=$TAPE_TD6 is a ${TD6_MODEL:-drive of unknown model}, not a TD6 emulation: rust_lbp needs Reed-Solomon LBP" ;;
+    esac
+    # The rehearsals take a drive's own lock (/tmp/tapectl-tape.lock.<node>), not the global one
+    # this gate holds: take the TD6 drive's too, so rust_lbp never meets a rehearsal on it.
+    exec 8>"/tmp/tapectl-tape.lock.$(basename "$(readlink -f "$TAPE_TD6")")"
+    flock -n 8 || die "another process holds $TAPE_TD6's tape lock (/tmp/tapectl-tape.lock.$(basename "$(readlink -f "$TAPE_TD6")"))"
+    export TAPECTL_GATE_TAPE_TD6="$TAPE_TD6"
+    echo "gate: LBP drive=$TAPE_TD6 ($TD6_MODEL, sg=$TD6_SG)"
+fi
 
 # ---------- workspace + build ----------
 RUN="$SCRATCH/run-$(date +%Y%m%d-%H%M%S)"
@@ -131,7 +166,48 @@ check() { # check <name> <fn>
     if [ -n "$GATE_SPAN_ONLY" ] && [[ "$name" != span_* ]]; then return 0; fi
     CHECKS+=("$name")
     if "$@" >"$RUN/log-$name.txt" 2>&1; then RESULT[$name]=PASS; else RESULT[$name]=FAIL; fi
+    lbp_note_page "$name"
     echo "  [$name] ${RESULT[$name]}"
+}
+
+# ---------- the drive's Logical Block Protection page (#388) ----------
+# tapectl arms the Control Data Protection page (0Ah/F0h) for its own open of the drive and
+# clears it before it closes the drive (ADR-0012 items 163-164); on this gate's TD8 drive every
+# open falls back (item 165) and puts the page back as found. After EVERY step the gate reads
+# the page and appends it to $LBP_PAGES; lbp_page_clear_after_every_command judges the rows.
+# A MODE SENSE through sg3-utils: read-only, never a motion, never the st node.
+#
+# lbp_page_parse: the page's method, information length and flags (LBP_W 0x80, LBP_R 0x40)
+# from a MODE SENSE(10) answer on stdin, "method=01 info_len=04 flags=c0", found past the header
+# and the block descriptors it declares, as tape::lbp parses it. An answer holding no Control
+# Data Protection page is an error, never method 0. tests/mhvtl_lbp.rs runs this function
+# ungated on recorded answers, against the library's parser.
+LBP_PAGES="$RUN/lbp-page-after-step.tsv"
+lbp_page_parse() {
+    python3 -c '
+import sys
+r = sys.stdin.buffer.read()
+if len(r) < 8:
+    sys.exit("a MODE SENSE(10) answer of %d bytes" % len(r))
+p = r[8 + int.from_bytes(r[6:8], "big"):]
+if len(p) < 8 or p[0] & 0x3F != 0x0A or p[1] != 0xF0:
+    sys.exit("no Control Data Protection page (0Ah/F0h) in %s" % r.hex())
+print("method=%02x info_len=%02x flags=%02x" % (p[4], p[5], p[6] & 0xC0))
+'
+}
+lbp_page_state() { # lbp_page_state <sg>: the page now, through lbp_page_parse
+    local raw
+    raw="$(mktemp)" || return 1
+    sg_modes --page=0x0a,0xf0 --control=0 --raw "$1" >"$raw" || { rm -f "$raw"; return 1; }
+    lbp_page_parse <"$raw"
+    local rc=$?
+    rm -f "$raw"
+    return $rc
+}
+lbp_note_page() { # lbp_note_page <step>: one row, "<step>\t<state>", or why it could not be read
+    local state
+    state="$(lbp_page_state "$DRIVE_SG" 2>&1)" || state="unreadable: ${state//$'\n'/ }"
+    printf '%s\t%s\n' "$1" "$state" >>"$LBP_PAGES"
 }
 # EMPTY as of 2026-07-29 — every check below must now PASS. Do not add an
 # entry here to make a red gate green; a new failure is a regression to fix,
@@ -315,6 +391,54 @@ assert row[0] is not None, (
 print(f"{label}: sealed_at = {row[0]}")
 PY
 }
+# #388, ADR-0012 item 165: a drive that cannot take Logical Block Protection is warned about
+# once and written without it, and the catalog says so (migration 041: volumes.write_lbp,
+# write_lbp_note; a write_lbp event). On this gate's TD8 drive every write falls back: mhvtl
+# cannot carry the 524,292-byte wire block in one command (cause 8: st answers the open's probe
+# read EBUSY), or its CRC32C personality refuses Reed-Solomon at the select (cause 5) or does
+# not take it (cause 6). Read from the catalog, not `volume info --json`, so the leg judges
+# what the session recorded. The warning is counted in the write's own log as its plain
+# stderr line: once per process per drive (lbp::note_unavailable). R12: no other leg asserts
+# an empty stderr, and step_feed_ratio_recorded's needle ("warning: volume") does not match it.
+LBP_WARNING="warning: Logical Block Protection is not available on "
+step_lbp_fallback_recorded() {
+    LABEL="$LABEL" python3 - "$HOME_DIR/tapectl.db" <<'PY' || return 1
+import os, sqlite3, sys
+label = os.environ["LABEL"]
+c = sqlite3.connect(sys.argv[1])
+row = c.execute("SELECT write_lbp, write_lbp_note FROM volumes WHERE label = ?", (label,)).fetchone()
+assert row is not None, f"no volumes row for {label} -- the check cannot see what it is asserting about"
+lbp, note = row
+assert lbp == "off", (
+    f"volumes.write_lbp is {lbp!r} for {label}: on the gate's TD8 drive every open falls back, "
+    "so the write must record 'off' (NULL: the session recorded nothing)")
+causes = {
+    "8 (st cannot carry the wire block)": "st cannot carry a 524292-byte block",
+    "5 (Reed-Solomon refused)": "the drive refused Reed-Solomon LBP (method 01h)",
+    "6 (the page did not take)": "the drive's page did not take",
+}
+named = [k for k, text in causes.items() if note and text in note]
+assert named, f"write_lbp_note {note!r} names none of the fallback causes the gate's drive can meet"
+events = c.execute(
+    """SELECT e.new_value, e.details FROM events e JOIN volumes v ON v.id = e.entity_id
+       WHERE e.entity_type = 'volume' AND e.action = 'write_lbp' AND v.label = ?""",
+    (label,)).fetchall()
+assert events == [("off", note)], (
+    f"write_lbp events for {label}: {events}; want exactly one, 'off' with the note "
+    "(record_run_protection writes one per change)")
+print(f"{label}: write_lbp = 'off', cause {named[0]}: {note}")
+print(f"{label}: one write_lbp event, 'off'")
+PY
+    local log="$RUN/log-volume_write.txt" n
+    [ -s "$log" ] || { echo "positive control: $log is missing or empty"; return 1; }
+    n="$(grep -c "^$LBP_WARNING" "$log")"
+    [ "$n" = 1 ] || {
+        echo "the write's log holds $n plain '$LBP_WARNING…' line(s), want exactly 1 (item 165: warn once per drive)"
+        grep -n "Logical Block Protection" "$log"
+        return 1
+    }
+    grep "^$LBP_WARNING" "$log"
+}
 step_evidence() {
     python3 - "$HOME_DIR/tapectl.db" <<'PY'
 import sqlite3, sys
@@ -485,6 +609,7 @@ check erase_scratch   step_erase_scratch_tape
 check volume_init     step_vol_init
 check volume_write    step_vol_write
 check sealed_at_recorded step_sealed_at
+check lbp_fallback_recorded step_lbp_fallback_recorded
 check volume_verify   step_vol_verify
 
 # ---------- #355: an empty drive is refused at once ----------
@@ -3142,6 +3267,17 @@ step_rust_motions() {
 }
 check rust_motions      step_rust_motions
 
+# #388: Logical Block Protection through the library on the TD6 drive (tests/mhvtl_lbp.rs says
+# what each test proves), at a 262,144-byte payload: mhvtl cannot carry tapectl's 524,292-byte
+# wire block in one command. It writes the TD6 drive's cartridge, never this gate drive's, and
+# leaves that drive at 524,288 bytes with its page at method 0, which
+# lbp_page_clear_after_every_command reads again at the end.
+step_rust_lbp() {
+    TAPECTL_GATE_TAPE_TD6="$TAPE_TD6" \
+        cargo_leg "$RUN/rust-lbp.out" 5 tests/mhvtl_lbp.rs --test mhvtl_lbp -- --ignored --nocapture
+}
+check rust_lbp          step_rust_lbp
+
 # Issue #416 item 9: a 2 GiB write and full confirm through the real write
 # session into a MemStore, timed against this machine's own sha256 (so a loaded
 # box does not fail it; an order-of-magnitude slowdown does). It holds in a
@@ -3160,6 +3296,69 @@ step_perf_write_2g() {
     ran_ok "$log" perf_a_2gib_write_and_full_confirm_through_a_store
 }
 check perf_write_2g     step_perf_write_2g
+
+# #388, ADR-0012 item 164: tapectl clears the page on every exit, and RESTORE.sh, which never
+# touches it, needs it clear. Judged LAST, over the row check() wrote after every step before
+# this one:
+#   - every row parsed, and reads method 0 with neither check on;
+#   - rows exist for the steps that write, verify, resume, restore and run RESTORE.sh (a
+#     positive control: the rows are the gate's own steps, not an empty file);
+#   - no output in the run holds tapectl's leftover note (an open that found the page armed
+#     prints it, so a command that left it armed shows up in the next command's output, even
+#     though that open cleared it). rust_lbp's output is left out: its leftover test arms the
+#     TD6 drive's page by hand on purpose. Positive control first: the same search finds the
+#     fallback warning in the write's log;
+#   - both drives' pages, read now: the gate drive's and rust_lbp's TD6.
+LBP_LEFTOVER_NOTE="had its Logical Block Protection page armed when tapectl opened it"
+step_lbp_page_clear_after_every_command() {
+    [ -s "$LBP_PAGES" ] || { echo "positive control: $LBP_PAGES is missing or empty"; return 1; }
+    python3 - "$LBP_PAGES" <<'PY' || return 1
+import sys
+rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if l.strip()]
+steps = {r[0] for r in rows}
+need = ["volume_write", "volume_verify", "restore_diff", "heir_restore", "resume_midwrite",
+        "resume_after_crash", "rust_e2e", "rust_motions"]
+missing = [s for s in need if s not in steps]
+assert not missing, f"positive control: no page row after {missing} -- check() did not record them"
+bad = [r for r in rows if len(r) != 2 or not r[1].startswith("method=00 ") or not r[1].endswith(" flags=00")]
+assert not bad, "the page did not read method 0 with neither check on after:\n  " + "\n  ".join("\t".join(r) for r in bad)
+print(f"{len(rows)} page readings, one after every step; every one method 0, neither check on")
+PY
+    local hits rc
+    hits="$(grep -rlF --exclude='rust-lbp.out' --exclude='log-rust_lbp.txt' \
+        --exclude='log-lbp_page_clear_after_every_command.txt' -- "$LBP_WARNING" "$RUN")"
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -xF -- "$RUN/log-volume_write.txt" >/dev/null <<<"$hits"; then
+        echo "positive control: grep -rl over $RUN (rc=$rc) did not find the fallback warning in log-volume_write.txt -- the search below could not have found the leftover note either"
+        return 1
+    fi
+    hits="$(grep -rlF --exclude='rust-lbp.out' --exclude='log-rust_lbp.txt' \
+        --exclude='log-lbp_page_clear_after_every_command.txt' -- "$LBP_LEFTOVER_NOTE" "$RUN")"
+    rc=$?
+    case "$rc" in
+        0) echo "a tapectl open found the gate drive's page armed (a command before it left it so), in:"
+           printf '%s\n' "$hits"
+           return 1 ;;
+        1) ;;
+        *) echo "grep failed (rc=$rc) searching $RUN for the leftover note -- inconclusive, not clean"
+           return 1 ;;
+    esac
+    echo "no tapectl open found the page armed; the same search found the fallback warning"
+    local now
+    now="$(lbp_page_state "$DRIVE_SG")" || { echo "the gate drive's page cannot be read now ($DRIVE_SG)"; return 1; }
+    case "$now" in
+        "method=00 "*" flags=00") echo "the gate drive's page now: $now" ;;
+        *) echo "the gate drive's page now: $now -- not method 0 with neither check on"; return 1 ;;
+    esac
+    if [ -n "${TD6_SG:-}" ]; then
+        now="$(lbp_page_state "$TD6_SG")" || { echo "the TD6 drive's page cannot be read now ($TD6_SG)"; return 1; }
+        case "$now" in
+            "method=00 "*" flags=00") echo "the TD6 drive's page now: $now" ;;
+            *) echo "the TD6 drive's page now: $now -- rust_lbp left it armed"; return 1 ;;
+        esac
+    fi
+}
+check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
