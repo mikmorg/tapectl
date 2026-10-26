@@ -725,8 +725,8 @@ IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"
 The RESTORE.sh on a tape written before tapectl 1.7.0 can end a
 unit of many files this way, just after dar's own summary. If
 that summary says 0 inode(s) failed to restore, it is a known
-fault of the script (tapectl issue #497), not damage: the
-unit's files are restored and sound. age checked every byte
+fault of that script, fixed in tapectl 1.7.0, and not damage:
+the unit's files are restored and sound. age checked every byte
 dar read, and dar stopped only before the archive's own index
 at its end, which it does not need. With --all the script
 stops at that unit: restore each unit it did not reach on its
@@ -1508,7 +1508,7 @@ mod tests {
         for required in [
             "IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"",
             "0 inode(s) failed to restore",
-            "tapectl issue #497",
+            "a known fault of that script, fixed in tapectl 1.7.0, and not damage",
             "the unit's files are restored and sound",
             "With --all the script stops at that unit",
             "If `./RESTORE.sh --help` lists --slices-from",
