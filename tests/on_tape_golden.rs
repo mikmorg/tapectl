@@ -315,6 +315,18 @@
 //! nothing inside such a folder. Every first line of a prompt, refusal and verdict
 //! is unchanged, every other substring keeps its count, and no `TOOLS_*` line moved.
 //!
+//! **Moved a sixth time, 2026-10-26, under ADR-0012 item 176** (#497; the CTO's
+//! own ruling, before the `v1.7.0` tag): `stream_unit` (`1cd5a405…` to
+//! `25505925…`). Given the isolated catalogue (`-A`), dar stops reading where
+//! the file data ends and exits 0, leaving the archive's own trailing catalogue
+//! unread; a tail larger than a pipe's buffer used to end a whole restore
+//! `FATAL: dar extraction failed (exit 0)`. What dar leaves of a slice, and any
+//! slice after it, is now read to its end, hashed and authenticated by age into
+//! nothing (`{ cat >"$sink"; cat >/dev/null; }` after age), dar's exit status is
+//! taken once (`dar_reap`, `DAR_RC`) and decides, and a dar that failed is still
+//! named by `die_dar`. Every first line of a prompt, refusal and verdict is
+//! unchanged, every other substring keeps its count, and no `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -341,7 +353,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "1cd5a405dbbb996a1b0d151c79091a661ef3123ceab718a525b0b7e8aa261f7a";
+const RESTORE_SH_SHA256: &str = "25505925af884bb6898f3702ce72be35ae236fd07cf686cd23cf4fbda83eddce";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
