@@ -17174,14 +17174,13 @@ mod tests {
     #[test]
     fn a_layout_rebuilt_from_front_index_bytes_has_a_readback_total() {
         let bs = 4096u64;
-        let file = |position: i32, type_label: &'static str, size: Option<u64>| {
-            layout::FrontIndexFile {
+        let file =
+            |position: i32, type_label: &'static str, size: Option<u64>| layout::FrontIndexFile {
                 position,
                 type_label,
                 size_bytes: size,
                 sha256_encrypted: size.map(|_| "ab".repeat(32)),
-            }
-        };
+            };
         let files = [
             file(0, "id_thunk", Some(100)),
             file(1, "system_guide", Some(bs + 1)),

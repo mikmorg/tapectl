@@ -8717,7 +8717,10 @@ mod tests {
                 "  Write check: not recorded (written before tapectl 1.7.2, or rebuilt from \
                  tape, which does not say)"
             );
-            assert!(!old.contains("none") && !old.contains("did not run"), "{old}");
+            assert!(
+                !old.contains("none") && !old.contains("did not run"),
+                "{old}"
+            );
             assert!(json["write_lbp"].is_null(), "{json}");
             assert!(json["write_lbp_note"].is_null(), "{json}");
 

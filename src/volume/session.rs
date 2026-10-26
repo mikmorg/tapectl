@@ -13032,7 +13032,11 @@ mod tests {
                 reason.contains("second write the drive refused"),
                 "{reason}"
             );
-            assert_eq!(retries(&f.conn), ["9"], "the first was retried, the second not");
+            assert_eq!(
+                retries(&f.conn),
+                ["9"],
+                "the first was retried, the second not"
+            );
             assert_eq!(statuses_on(&f.conn, f.volume_id), ["interrupted"]);
         }
 
@@ -13281,7 +13285,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(written >= 1, "positive control: the first run wrote a slice");
+            assert!(
+                written >= 1,
+                "positive control: the first run wrote a slice"
+            );
 
             let mut on = lbp_store();
             on.files = store.files.clone();
