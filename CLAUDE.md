@@ -360,6 +360,29 @@ Item 26's shared-place warning judges where a moved tape goes (`--for-location X
 `volume::write::WriteScope` carries the destination beside the `StagedScope`, and
 `coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
 
+**1.7.2: Logical Block Protection** (`docs/releases/1.7.2.md`; ADR-0012 items 161-166, 174, 175;
+#388). A patch: no byte on tape changes, and the CRC never reaches the medium. tapectl arms the
+drive's Control Data Protection page (0Ah/F0h, Reed-Solomon) for every `TapeStore` open and clears
+it in `TapeDevice`'s `Drop`, after any filemark st owes; an open clears a page a crash left armed.
+All of it is in the tape layer: `src/tape/lbp.rs` (the RS-CRC, slicing-by-16; the page through
+`sg_modes`/`sg_wr_mode` on the sg node sysfs binds to the st node, never config's `device_sg`;
+`arm`, `disarm`, `clear_leftover`) and `tape::ioctl::TapeDevice` (the 524,292-byte wire block, the
+probe read at open, the read check). Above the device every count stays in payload bytes. A
+drive or path that cannot take it is `Protection::Unavailable`, warned once per process per node
+on a write open (item 165) and recorded in `volumes.write_lbp`/`write_lbp_note` (migration 041,
+`session::record_run_protection`). A write `EIO` while armed is `TapectlError::LbpRefusal`: the
+session writes on once from the planned start of the file holding the drive's position
+(`Store::logical_position`, `session::retry_from_refusal`, item 174), and a second leaves it
+`interrupted`. Item 175's switch is `tape::lbp::LBP_R_POLICY` (`AllReads`; `OnlyConfirmOfLbpWrite`
+arms LBP_R only for a confirm, `session::arm_read_check_for_confirm`), decided by R1 on home2.
+Output: `volume info`'s Write check line, `report verify-status`, `drive status`'s LBP page; the
+Heir Kit's sheet says a power cycle clears a page left armed. The test hook
+`TAPECTL_TEST_LBP_CORRUPT_BLOCK` (F5) corrupts one block per open and refuses an unarmed one.
+mhvtl cannot carry 524,292 bytes in one command, so the gate's TD8 drive always falls back
+(`lbp_fallback_recorded`, `lbp_page_clear_after_every_command`) and `tests/mhvtl_lbp.rs`
+(`rust_lbp`) proves the path on a TD6 at a 262,144-byte payload, named by `TAPECTL_GATE_TAPE_TD6`.
+The real-drive proof is `scripts/lbp-acceptance.sh`, R1 first (`--r1-only`).
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
