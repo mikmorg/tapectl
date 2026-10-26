@@ -31,7 +31,7 @@ by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
 | the tape drive attached, visible under `/dev/tape/by-id/` | step 6 finds it **by serial**; `/dev/nstN` numbers move across reboots on any host with more than one SCSI device (`docs/lto6-drive-passthrough.md`) | `ls -l /dev/tape/by-id/` |
 | a clone of this repository, on a filesystem the build can use | tapectl is built from source; the toolchain is pinned in `rust-toolchain.toml` (1.94.1) | step 1 |
 | `rustup` (installed by step 1 if absent) | the distro `cargo` cannot build this crate | step 1 |
-| `dar` >= 2.6 (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | archives, drive control, MAM and health pages, ACL grants, the scripts' JSON parsing, device discovery | step 2 offers `sudo apt install dar mt-st sg3-utils acl python3 lsscsi` |
+| `dar` >= 2.6 (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | archives, drive control, MAM and health pages, the drive's Logical Block Protection page, ACL grants, the scripts' JSON parsing, device discovery. Of sg3-utils, tapectl runs `sg_read_attr` (the cartridge's MAM), `sg_logs` (health pages), `sg_inq` (the drive's identity) and, from 1.7.2, `sg_modes` and `sg_wr_mode` (it reads and sets the Logical Block Protection page; without them it writes without LBP and says so) | step 2 checks for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` and `dar`, and offers `sudo apt install dar mt-st sg3-utils acl python3 lsscsi` |
 | `age` (the CLI) — optional | not used by the binary (it uses the `rage` crate); needed by the on-tape `RESTORE.sh` and so by the step-12 rehearsal | step 2 offers the upstream v1.3.2 release into `/usr/local/bin` |
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
 | on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and mints a new identity when neither is set (§6) |
@@ -157,7 +157,7 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | step | creates | owner, mode | check |
 |---|---|---|---|
 | 1 Rust toolchain | `~/.cargo/` for **you** (rustup, default profile, `--no-modify-path`), the pinned toolchain on first `cargo` run | you | `rustup show active-toolchain` |
-| 2 runtime tools | apt packages `dar mt-st sg3-utils acl python3 lsscsi`; optionally `/usr/local/bin/age` and `age-keygen` | root, 0755 | `dar --version`, `age --version` |
+| 2 runtime tools | apt packages `dar mt-st sg3-utils acl python3 lsscsi`; optionally `/usr/local/bin/age` and `age-keygen` | root, 0755 | `dar --version`, `age --version`; `command -v` for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` |
 | 3 build | `target/release/tapectl` in the repo, then **`/usr/local/bin/tapectl`** — the binary's home; the service user cannot execute anything under your home | root, 0755 | `tapectl --version` |
 | 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only `dar`) | — | the script stops if red |
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |

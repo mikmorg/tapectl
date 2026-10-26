@@ -559,10 +559,10 @@ ok "rustc $(rustc --version | awk '{print $2}'), cargo $(cargo --version | awk '
 hdr 2 "Runtime tools"
 skip_if || {
 explain <<'EOF'
-tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages and the cartridge's MAM. `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 11. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
+tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages, the cartridge's MAM and, from 1.7.2, the drive's Logical Block Protection page (`sg_modes`, `sg_wr_mode`). `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 11. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
 EOF
 MISSING=()
-for t in mt sg_read_attr sg_logs setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
+for t in mt sg_read_attr sg_logs sg_modes sg_wr_mode setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
 if [ -n "$DAR_BIN" ]; then [ -x "$DAR_BIN" ] || die "--dar $DAR_BIN is not executable (on home2, contrib/hosts/home2-prep.sh builds it)"
 else command -v dar >/dev/null 2>&1 || MISSING+=(dar); fi
 if [ "${#MISSING[@]}" -gt 0 ]; then
