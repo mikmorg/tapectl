@@ -720,6 +720,33 @@ carries an older script that decrypts every slice first and
 needs about twice that. Do not restore into /tmp, which is RAM
 on many systems.
 
+IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"
+-----------------------------------------------------
+The RESTORE.sh on a tape written before tapectl 1.7.0 can end a
+unit of many files this way, just after dar's own summary. If
+that summary says 0 inode(s) failed to restore, it is a known
+fault of the script (tapectl issue #497), not damage: the
+unit's files are restored and sound. age checked every byte
+dar read, and dar stopped only before the archive's own index
+at its end, which it does not need. With --all the script
+stops at that unit: restore each unit it did not reach on its
+own, with --unit NAME and a new, empty --to folder (--list
+names the units).
+
+If `./RESTORE.sh --help` lists --slices-from, adding
+--slices-from DIR with an empty folder DIR restores the unit
+with every slice and file checked (it needs room for the
+unit's slices too). If not, tapectl reads the whole tape
+without this fault, every slice checked. In a new, empty
+folder for its home (export TAPECTL_HOME=/recovery/home):
+
+    tapectl init --operator ANY_NAME --escrow-public-key \\
+        {key}
+    tapectl catalog rebuild --from-volume --device /dev/nst0 \\
+        --key escrow.key
+    tapectl restore volume --device /dev/nst0 --to ./out \\
+        --key escrow.key
+
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
   catalog.db.age   An encrypted index of what is on the tapes:
@@ -1466,6 +1493,39 @@ mod tests {
         ] {
             assert!(prose.contains(required), "missing {required:?}");
         }
+    }
+
+    /// #497, ADR-0012 item 178: tapes written before 1.7.0 keep a RESTORE.sh
+    /// that ends a big unit `dar extraction failed (exit 0)` after a whole
+    /// restore. The sheet names it, says the files are sound, and gives a
+    /// checked way that works on every such tape: `--slices-from` only where
+    /// the script offers it (1.3.0 on; keepsake's tapes are 1.1.0), else
+    /// tapectl, whose commands are real ones.
+    #[test]
+    fn the_cover_sheet_says_what_dar_extraction_failed_exit_0_means() {
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        let prose = flat(&txt);
+        for required in [
+            "IF RESTORE.sh STOPS: \"dar extraction failed (exit 0)\"",
+            "0 inode(s) failed to restore",
+            "tapectl issue #497",
+            "the unit's files are restored and sound",
+            "With --all the script stops at that unit",
+            "If `./RESTORE.sh --help` lists --slices-from",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+        for command in [
+            "tapectl init --operator ANY_NAME --escrow-public-key \\",
+            "tapectl catalog rebuild --from-volume --device /dev/nst0 \\",
+            "tapectl restore volume --device /dev/nst0 --to ./out \\",
+        ] {
+            assert!(txt.contains(command), "missing {command:?}");
+        }
+        assert!(
+            txt.contains(&format!("--escrow-public-key \\\n        {ESCROW}\n")),
+            "init is given this archive's escrow identity"
+        );
     }
 
     /// Issue #448 item 3: the 1.1.0 restore streams (RESTORE.sh checks for
