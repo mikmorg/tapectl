@@ -668,6 +668,18 @@ reinit() { # <label>
         || fail "volume init $1 does not say the volume it displaced is now marked erased (binding)"
 }
 
+# mhvtl_rewind_first <what>: on mhvtl only, a rewind before a tapectl open that follows a read
+# which failed or ran off the data (the heir's reads with the page armed, RESTORE.sh on an
+# unsealed tape). From there st answers the open's probe read without sending it, so the probe
+# cannot see that mhvtl cannot carry the 524,292-byte wire block: the open arms, and its first
+# transfer fails EBUSY (measured 2026-10-26 on A3, reported to #388). A rewind first puts st
+# where the probe is sent. The real drive carries the wire block, so it needs none.
+mhvtl_rewind_first() {
+    [ "$MHVTL" = 1 ] || return 0
+    mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
+    log "  rehearsal: rewound before $1 (mhvtl: the open's probe after a failed read)"
+}
+
 # The LBP expectations of a tapectl write, by mode: on the real drive the page armed and
 # write_lbp 'on'; on mhvtl the fallback (cause 8), warned once, write_lbp 'off'.
 expect_write_lbp() { # <name> <label>
@@ -1050,25 +1062,34 @@ fi
 # step 2 read off $LABEL2; a tape's own RESTORE.sh cannot be read now).
 mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
 mt -f "$TAPE_DEV" setblk "$FORMAT_BLOCK" || fail "mt setblk failed"
+# Each read under a time limit: item 164 says a refusal (EIO), and a read that hangs instead is
+# a finding to record, not a wait without end. (mhvtl hangs a read at BOT with LBP_R armed --
+# measured 2026-10-26 on A3 -- and answers EIO past it, so the rehearsal reads file 2 with dd and
+# does not run RESTORE.sh, which starts at file 0, against the leftover.)
 set +e
 mt -f "$TAPE_DEV" fsf 2 2>"$STEP_DIR/heir-fsf.err"
-dd if="$TAPE_DEV" of="$STEP_DIR/heir-file2.bin" bs=512k 2>"$STEP_DIR/heir-dd.err"
+timeout 300 dd if="$TAPE_DEV" of="$STEP_DIR/heir-file2.bin" bs=512k 2>"$STEP_DIR/heir-dd.err"
 HEIR_DD_RC=$?
 set -e
 HEIR_DD_BYTES="$(stat -c %s "$STEP_DIR/heir-file2.bin" 2>/dev/null || echo 0)"
 log "  the heir's dd with the page left armed: rc $HEIR_DD_RC, $HEIR_DD_BYTES bytes ($(tr '\n' ' ' < "$STEP_DIR/heir-dd.err"))"
-heir "$HEIR2" info-leftover any --info
-INFO_RC="$RC"
-log "  RESTORE.sh --info with the page left armed: exit $INFO_RC"
+[ "$HEIR_DD_RC" != 124 ] || fail "the heir's dd of file 2 hung for 300 s with the page left armed: item 164 expects a refusal (EIO), not a hang"
+[ "$HEIR_DD_RC" != 0 ] && [ "$HEIR_DD_BYTES" = 0 ] \
+    || fail "with the page left armed the heir's dd read $HEIR_DD_BYTES bytes (rc $HEIR_DD_RC): item 164 says a refusal, never data"
 if [ "$MHVTL" = 0 ]; then
-    [ "$HEIR_DD_RC" != 0 ] && [ "$HEIR_DD_BYTES" = 0 ] \
-        || fail "with the page left armed the heir's dd read $HEIR_DD_BYTES bytes (rc $HEIR_DD_RC): item 164 says a refusal, never data"
+    run info-leftover any timeout 600 env TAPE_DEVICE="$TAPE_DEV" TMPDIR="$RUN/tmp" "$HEIR2/RESTORE.sh" --info
+    INFO_RC="$RC"
+    log "  RESTORE.sh --info with the page left armed: exit $INFO_RC"
+    [ "$INFO_RC" != 124 ] || fail "RESTORE.sh --info hung for 600 s with the page left armed: item 164 expects a refusal (EIO), not a hang"
     [ "$INFO_RC" != 0 ] || fail "RESTORE.sh --info succeeded with the page left armed"
     ! grep -F "Verdict: SEALED" "$STEP_DIR/info-leftover.out" >/dev/null \
         || fail "RESTORE.sh --info called the tape sealed with the page left armed"
+else
+    log "  rehearsal: RESTORE.sh is not run against the leftover (mhvtl hangs a read at BOT with LBP_R armed)"
 fi
 # The next tapectl open: identify clears it (re-armed and cleared at close under item 162's
 # policy; cleared at once by an open that arms nothing or cannot arm).
+mhvtl_rewind_first identify
 run identify 0 tctl volume identify --device "$TAPE_DEV"
 grep -F "$LEFTOVER_NOTE" "$STEP_DIR/identify.err" >/dev/null || fail "volume identify did not print the leftover note"
 log "  $(grep -F "$LEFTOVER_NOTE" "$STEP_DIR/identify.err" | sed -n 1p | cut -c1-200)"
@@ -1079,6 +1100,7 @@ heir "$HEIR2" info-after any --info
 grep -F "Verdict: " "$STEP_DIR/info-after.out" >/dev/null \
     || fail "RESTORE.sh --info gives no verdict with the page clear (exit $RC): its reads still fail"
 log "  RESTORE.sh --info reads the tape again with the page clear: $(grep -F "Verdict: " "$STEP_DIR/info-after.out" | sed -n 1p)"
+mhvtl_rewind_first "volume resume"
 run resume5 0 tctl --json --yes volume resume "$LABEL5" --device "$TAPE_DEV" --keep-staging
 [ "$(status_of "$LABEL5")" = sealed ] || fail "$LABEL5 is '$(status_of "$LABEL5")' after the resume, not sealed"
 expect_write_lbp resume5 "$LABEL5"
@@ -1108,7 +1130,11 @@ heir "$HEIR5" heir-restore 0 --restore --unit "$UNIT_B" --key "$TENANT_KEY" --to
 assert_identical "$SRC/b" "$WORK/restore-heir-b" heir-restore
 mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
 mt -f "$TAPE_DEV" setblk 0 || fail "mt setblk 0 failed"
-dd if="$TAPE_DEV" of="$STEP_DIR/record0.bin" bs=1M count=1 2>"$STEP_DIR/record0.err" || fail "the variable-mode read of File 0 failed"
+# A buffer larger than the record shows its length; mhvtl carries no read over 512 KiB, so there
+# the buffer is the payload, and a longer record would be an error rather than a short read.
+if [ "$MHVTL" = 1 ]; then VAR_BS="$FORMAT_BLOCK"; else VAR_BS=$((2 * FORMAT_BLOCK)); fi
+dd if="$TAPE_DEV" of="$STEP_DIR/record0.bin" bs="$VAR_BS" count=1 2>"$STEP_DIR/record0.err" \
+    || { mt -f "$TAPE_DEV" setblk "$FORMAT_BLOCK" || true; fail "the variable-mode read of File 0 failed (record0.err)"; }
 mt -f "$TAPE_DEV" setblk "$FORMAT_BLOCK" || fail "mt setblk failed"
 mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
 REC="$(stat -c %s "$STEP_DIR/record0.bin")"
@@ -1190,7 +1216,7 @@ cp -a "$DB" "$RUN/catalog-at-end.db"
     echo "R11: $R11_NOTE"
     echo "the cartridge now holds $LABEL5 and belongs to $TAPECTL_HOME"
 } > "$RUN/RESULT.txt"
-log "RESULT: $(sed -n 1p "$RUN/RESULT.txt"). $RUN"
+log "$(sed -n 1p "$RUN/RESULT.txt"). $RUN"
 log "The cartridge holds $LABEL5, in the throwaway home. Before it is a test cartridge again, with"
 log "THIS tapectl (an older installed one refuses this home's catalog):"
 log "  $TAPECTL_BIN --home $TAPECTL_HOME snapshot mark-reclaimable <unit> --version 1 --force"
