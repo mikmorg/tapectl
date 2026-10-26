@@ -3970,6 +3970,16 @@ struct VolumeInfo {
     /// re-confirmation of an aborted session turns on (ADR-0012
     /// 2026-09-23), and that `scripts/first-run.sh` step 13 reads.
     sealed_at: Option<String>,
+    /// Whether the drive checked the write with Logical Block Protection
+    /// (#388, migration 041, `volumes.write_lbp`; ADR-0012 items 161, 165):
+    /// `"on"` when every run of the write session had it armed, `"off"` when
+    /// none did, `"mixed"` when the runs differed. `None` when not recorded:
+    /// written before tapectl 1.7.2, rebuilt from tape (which does not say),
+    /// or nothing written yet — never "off".
+    write_lbp: Option<String>,
+    /// Why LBP did not run (`"off"`), or which run lacked it (`"mixed"`);
+    /// `None` when `"on"` or not recorded.
+    write_lbp_note: Option<String>,
     /// Where a short tape ended (#420, `volumes.ended_after`): its seal says
     /// the tape ends after this file. `None` on a full seal and on a volume
     /// not sealed.
@@ -4005,6 +4015,18 @@ struct VolumeInfo {
     /// output only: `--json`'s shape is unchanged.
     #[serde(skip)]
     phase_timings: Vec<crate::db::phase_timings::PhaseRow>,
+}
+
+impl VolumeInfo {
+    /// The write-check line ([`render_write_check_line`]); a volume with
+    /// neither a write nor a seal recorded has had nothing written yet.
+    fn write_check_line(&self) -> String {
+        render_write_check_line(
+            self.write_lbp.as_deref(),
+            self.write_lbp_note.as_deref(),
+            self.first_write.is_some() || self.sealed_at.is_some(),
+        )
+    }
 }
 
 /// How many of a volume's largest units are named in the summary before
@@ -4093,10 +4115,17 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    let (sealed_at, ended_after): (Option<String>, Option<i64>) = conn.query_row(
-        "SELECT sealed_at, ended_after FROM volumes WHERE id = ?1",
+    // The write check (#388) rides on this statement, so `volume info` sends
+    // no more statements than it did (`tests/catalog_budget.rs`).
+    let (sealed_at, ended_after, write_lbp, write_lbp_note): (
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = conn.query_row(
+        "SELECT sealed_at, ended_after, write_lbp, write_lbp_note FROM volumes WHERE id = ?1",
         rusqlite::params![vol_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let cut_units: Vec<String> = conn
         .prepare(
@@ -4264,6 +4293,8 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         first_write,
         last_write,
         sealed_at,
+        write_lbp,
+        write_lbp_note,
         ended_after,
         cut_units,
         range_units,
@@ -4353,6 +4384,36 @@ fn render_sealed_line(sealed_at: Option<&str>) -> String {
         sealed_at.unwrap_or("(no seal recorded)")
     )
 }
+
+/// `volume info`'s write-check line (#388; ADR-0012 items 161, 165): whether
+/// the drive checked tapectl's CRC on every block of the write
+/// (`volumes.write_lbp`, merged across the write session's runs), with the
+/// reason when it did not. Not recorded (`None`) is never "off": the volume
+/// was written before tapectl 1.7.2 used Logical Block Protection, or
+/// rebuilt from tape, which does not say — or, with no write recorded
+/// (`written` false), nothing has been written yet.
+fn render_write_check_line(write_lbp: Option<&str>, note: Option<&str>, written: bool) -> String {
+    let why = note.unwrap_or("no reason recorded");
+    let check: String = match write_lbp {
+        Some("on") => {
+            "Logical Block Protection on every block (the drive checked tapectl's CRC)".into()
+        }
+        Some("off") => format!(
+            "none (Logical Block Protection did not run: {why}); as strong as a write by \
+             tapectl 1.7.1"
+        ),
+        Some("mixed") => format!("Logical Block Protection on part of the write ({why})"),
+        Some(other) => format!("{other} ({why})"),
+        None if written => WRITE_CHECK_NOT_RECORDED.into(),
+        None => "none yet (no write recorded)".into(),
+    };
+    format!("  Write check: {check}")
+}
+
+/// [`render_write_check_line`]'s words for a volume written with no record
+/// of the check.
+const WRITE_CHECK_NOT_RECORDED: &str =
+    "not recorded (written before tapectl 1.7.2, or rebuilt from tape, which does not say)";
 
 /// `volume info`'s ending line (#490): on a tape that sealed short, where it
 /// ended and the units it cut. `None` for any other volume.
@@ -4463,6 +4524,7 @@ fn print_volume_info(info: &VolumeInfo) {
         render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
     );
     println!("{}", render_sealed_line(info.sealed_at.as_deref()));
+    println!("{}", info.write_check_line());
     if let Some(ending) = render_ending_line(info.ended_after, &info.cut_units, info.unit_count) {
         println!("{ending}");
     }
@@ -8580,6 +8642,88 @@ mod tests {
                 render_sealed_line(None),
                 "  Sealed:      (no seal recorded)"
             );
+        }
+
+        /// #388 (ADR-0012 items 161, 165): the write check, in text and
+        /// `--json`, for a volume written with LBP, without it (with the
+        /// reason), with it on part of the session, and one with no record
+        /// — which reads as written before tapectl 1.7.2 (or rebuilt), never
+        /// as "off".
+        #[test]
+        fn info_says_whether_the_drive_checked_the_write() {
+            let conn = crate::db::open_memory().unwrap();
+            let off_note = "st cannot carry a 524292-byte block on this host's SCSI path \
+                            (Device or resource busy (os error 16))";
+            let mixed_note = "a run of this session wrote without it: no SCSI generic node";
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, sealed_at, write_lbp,
+                                      write_lbp_note)
+                 VALUES ('L6-ON', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         '2026-10-26 07:00:00', 'on', NULL),
+                        ('L6-OFF', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         '2026-10-26 07:00:00', 'off', ?1),
+                        ('L6-MIX', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         '2026-10-26 07:00:00', 'mixed', ?2),
+                        ('L6-OLD', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         '2026-10-01 07:00:00', NULL, NULL),
+                        ('L6-NEW', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized',
+                         NULL, NULL, NULL)",
+                params![off_note, mixed_note],
+            )
+            .unwrap();
+            let line = |label: &str| {
+                let info = volume_info(&conn, label, false).unwrap();
+                let json = serde_json::to_value(&info).unwrap();
+                (info.write_check_line(), json)
+            };
+
+            let (on, json) = line("L6-ON");
+            assert_eq!(
+                on,
+                "  Write check: Logical Block Protection on every block (the drive checked \
+                 tapectl's CRC)"
+            );
+            assert_eq!(json["write_lbp"], "on");
+            assert!(json["write_lbp_note"].is_null(), "{json}");
+
+            let (off, json) = line("L6-OFF");
+            assert_eq!(
+                off,
+                format!(
+                    "  Write check: none (Logical Block Protection did not run: {off_note}); \
+                     as strong as a write by tapectl 1.7.1"
+                )
+            );
+            assert_eq!(json["write_lbp"], "off");
+            assert_eq!(json["write_lbp_note"], off_note);
+
+            let (mixed, json) = line("L6-MIX");
+            assert_eq!(
+                mixed,
+                format!(
+                    "  Write check: Logical Block Protection on part of the write \
+                     ({mixed_note})"
+                )
+            );
+            assert_eq!(json["write_lbp"], "mixed");
+            assert_eq!(json["write_lbp_note"], mixed_note);
+
+            // Not recorded: never "off", and never "none" as if LBP had
+            // been tried and failed.
+            let (old, json) = line("L6-OLD");
+            assert_eq!(
+                old,
+                "  Write check: not recorded (written before tapectl 1.7.2, or rebuilt from \
+                 tape, which does not say)"
+            );
+            assert!(!old.contains("none") && !old.contains("did not run"), "{old}");
+            assert!(json["write_lbp"].is_null(), "{json}");
+            assert!(json["write_lbp_note"].is_null(), "{json}");
+
+            let (new, json) = line("L6-NEW");
+            assert_eq!(new, "  Write check: none yet (no write recorded)");
+            assert!(json["write_lbp"].is_null(), "{json}");
         }
 
         /// Issue #392: "First write" and "Last write" both showed when the

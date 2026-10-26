@@ -3111,11 +3111,13 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "units_first_seen",
             "units_last_seen",
             "verifications",
+            "write_lbp",
+            "write_lbp_note",
             "writes",
         ],
         "volume info --json is unchanged by issue #386 (sealed_at was added after it, \
          for first-run.sh step 13; feed_ratios by issue #439; ended_after and cut_units by \
-         issue #490; range_units by #478)"
+         issue #490; range_units by #478; write_lbp and write_lbp_note by #388)"
     );
 }
 

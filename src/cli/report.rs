@@ -1809,8 +1809,9 @@ fn pending_text_lines(all: &[StagedSetRow]) -> Vec<String> {
 /// LEFT JOIN finding no session row.
 ///
 /// `(label, verify_type, outcome, completed_at, checked, passed, failed,
-/// started_at)` — `started_at` last (issue #392) so every older index is
-/// unchanged.
+/// started_at, write_lbp, write_lbp_note)` — each later column appended last
+/// (`started_at` by issue #392, the volume's write check by #388) so every
+/// older index is unchanged.
 type VerifyStatusRow = (
     String,
     Option<String>,
@@ -1819,6 +1820,8 @@ type VerifyStatusRow = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -1844,7 +1847,8 @@ fn verify_status_rows(
     // this report is for.
     let mut sql = String::from(
         "SELECT v.label, vs.verify_type, vs.outcome, vs.completed_at,
-                vs.slices_checked, vs.slices_passed, vs.slices_failed, vs.started_at
+                vs.slices_checked, vs.slices_passed, vs.slices_failed, vs.started_at,
+                v.write_lbp, v.write_lbp_note
          FROM volumes v
          LEFT JOIN verification_sessions vs ON vs.volume_id = v.id
          WHERE 1=1",
@@ -1902,6 +1906,8 @@ fn verify_status_rows(
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1923,16 +1929,18 @@ fn verify_status_rows(
 /// repo have already outlived the behaviour they described (#209, #274,
 /// #281), so a string an acceptance criterion names gets a test.
 fn verify_status_row_text(row: &VerifyStatusRow) -> String {
-    let (label, vtype, outcome, completed, checked, passed, failed, started) = row;
+    let (label, vtype, outcome, completed, checked, passed, failed, started, lbp, _) = row;
+    let write_check = write_check_words(lbp.as_deref());
     if outcome.is_none() {
         // The line that tells the operator what to verify next — spelled
         // out, not left as an empty column to interpret.
-        return format!("  {label}: never verified");
+        return format!("  {label}: never verified (write check: {write_check})");
     }
     // Both ends, each named (issue #392): `volume info` printed the start
     // and this the completion, unlabelled, so one verify showed two times.
     format!(
-        "  {label}: {} {}, started {}, completed {} ({}/{}/{} checked/passed/failed)",
+        "  {label}: {} {}, started {}, completed {} ({}/{}/{} checked/passed/failed); write \
+         check: {write_check}",
         vtype.as_deref().unwrap_or("?"),
         outcome.as_deref().unwrap_or("?"),
         started.as_deref().unwrap_or("?"),
@@ -1943,8 +1951,21 @@ fn verify_status_row_text(row: &VerifyStatusRow) -> String {
     )
 }
 
+/// Whether the drive checked the volume's write with Logical Block
+/// Protection (#388, `volumes.write_lbp`; ADR-0012 item 165), in a row's
+/// few words; `volume info` gives the reason. Not recorded (written before
+/// tapectl 1.7.2, or rebuilt from tape) is never "no LBP".
+fn write_check_words(write_lbp: Option<&str>) -> &'static str {
+    match write_lbp {
+        Some("on") => "LBP",
+        Some("off") => "no LBP",
+        Some("mixed") => "LBP on part",
+        _ => "not recorded",
+    }
+}
+
 fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
-    let (label, vtype, outcome, completed, checked, passed, failed, started) = row;
+    let (label, vtype, outcome, completed, checked, passed, failed, started, lbp, note) = row;
     serde_json::json!({
         "volume": label,
         "never_verified": outcome.is_none(),
@@ -1954,7 +1975,9 @@ fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
         "completed": completed,
         "checked": checked,
         "passed": passed,
-        "failed": failed
+        "failed": failed,
+        "write_lbp": lbp,
+        "write_lbp_note": note
     })
 }
 
@@ -4237,6 +4260,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             );
             let done: VerifyStatusRow = (
                 "AAA-VERIFIED".to_string(),
@@ -4247,11 +4272,13 @@ mod tests {
                 Some(3),
                 Some(0),
                 Some("2019-12-31T14:00:00Z".to_string()),
+                None,
+                None,
             );
 
             assert_eq!(
                 verify_status_row_text(&never),
-                "  ZZZ-NEVER: never verified",
+                "  ZZZ-NEVER: never verified (write check: not recorded)",
                 "a volume with no sessions must SAY so, not appear with blank \
                  columns the reader has to interpret"
             );
@@ -4294,6 +4321,57 @@ mod tests {
             let json = verify_status_row_json(&rows[0]);
             assert_eq!(json["started"], "2026-10-01 08:14:57");
             assert_eq!(json["completed"], "2026-10-01 18:06:17");
+        }
+
+        /// #388 (ADR-0012 item 165): every row says whether the drive
+        /// checked the volume's write with LBP, verified or not, and
+        /// `--json` carries `write_lbp` and its note. A volume with no
+        /// record (written before tapectl 1.7.2) reads "not recorded",
+        /// never "no LBP".
+        #[test]
+        fn every_row_carries_the_volumes_write_check() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified(&conn, "V-ON", "2026-10-20 00:00:00");
+            seed_verified(&conn, "V-OLD", "2026-10-21 00:00:00");
+            seed_never_verified(&conn, "N-OFF");
+            seed_never_verified(&conn, "N-MIX");
+            let note = "no SCSI generic node is bound to /dev/nst0 (is the sg module loaded?)";
+            for (label, lbp, why) in [
+                ("V-ON", Some("on"), None),
+                ("N-OFF", Some("off"), Some(note)),
+                ("N-MIX", Some("mixed"), Some(note)),
+            ] {
+                conn.execute(
+                    "UPDATE volumes SET write_lbp = ?2, write_lbp_note = ?3 WHERE label = ?1",
+                    params![label, lbp, why],
+                )
+                .unwrap();
+            }
+            let rows = verify_status_rows(&conn, None).unwrap();
+            let text = |label: &str| {
+                let row = rows.iter().find(|r| r.0 == label).expect(label);
+                (verify_status_row_text(row), verify_status_row_json(row))
+            };
+
+            let (t, j) = text("V-ON");
+            assert!(t.ends_with("checked/passed/failed); write check: LBP"), "{t}");
+            assert_eq!(j["write_lbp"], "on");
+            assert!(j["write_lbp_note"].is_null(), "{j}");
+
+            let (t, j) = text("V-OLD");
+            assert!(t.ends_with("; write check: not recorded"), "{t}");
+            assert!(!t.contains("no LBP"), "not recorded is never off: {t}");
+            assert!(j["write_lbp"].is_null() && j["write_lbp_note"].is_null(), "{j}");
+
+            let (t, j) = text("N-OFF");
+            assert_eq!(t, "  N-OFF: never verified (write check: no LBP)");
+            assert_eq!(j["write_lbp"], "off");
+            assert_eq!(j["write_lbp_note"], note);
+
+            let (t, j) = text("N-MIX");
+            assert_eq!(t, "  N-MIX: never verified (write check: LBP on part)");
+            assert_eq!(j["write_lbp"], "mixed");
+            assert_eq!(j["write_lbp_note"], note);
         }
 
         /// A volume with one completed, passed full verification session,
