@@ -4398,11 +4398,29 @@ decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number> [bytes]
   die "slice $num did not decrypt: a key matched it, so its bytes are damaged."
 }
 
-# Wait for background job $1, polling; if dar ($DAR_PID) exits first, return
-# 3, so the caller can stop feeding a dar that is gone.
+# Whether dar ($DAR_PID) is still running. Once it has ended, its exit status
+# is DAR_RC: wait gives a status once, so it is taken once (dar_reap) and read
+# from there by every later question about dar.
+DAR_RC=""
+dar_reap() {
+  [ -z "$DAR_RC" ] || return 0
+  DAR_RC=0
+  wait "$DAR_PID" 2>/dev/null || DAR_RC=$?
+}
+dar_running() {
+  [ -z "$DAR_RC" ] || return 1
+  if kill -0 "$DAR_PID" 2>/dev/null; then
+    return 0
+  fi
+  dar_reap
+  return 1
+}
+
+# Wait for background job $1, polling; if dar exits first, return 3, so the
+# caller can tell a dar that ended from a slice that did.
 wait_feed() { # <pid>
   while kill -0 "$1" 2>/dev/null; do
-    if ! kill -0 "$DAR_PID" 2>/dev/null; then
+    if ! dar_running; then
       return 3
     fi
     sleep 0.2 2>/dev/null || sleep 1
@@ -4416,8 +4434,9 @@ wait_feed() { # <pid>
 # STREAM_REFUSED and returns, and the caller restores another way.
 STREAM_REFUSED=0
 die_dar() { # <destination>
-  local rc=0
-  wait "$DAR_PID" 2>/dev/null || rc=$?
+  local rc
+  dar_reap
+  rc=$DAR_RC
   DAR_PID=""
   CUR=""
   if grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
@@ -4459,6 +4478,13 @@ slice_bytes() { # <slice number>
 # index, and age authenticates every 64 KiB as it decrypts, so damaged bytes
 # stop the restore rather than reach dar. Whatever fails first is named: dar
 # (its own output), the tape read (dd's), or age (a missing key, or damage).
+#
+# Given the catalogue (-A), dar stops reading where the file data ends and
+# exits 0: it never reads the archive's own catalogue, the tail of the last
+# slice, and with small slices not the last few slices at all (#497). That is
+# dar done, not dar failed. What it leaves of a slice is still read to its end,
+# hashed and decrypted, into nothing, and so is every slice after it; dar's
+# exit status then decides, as for any restore.
 stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalogue]
   local list=$1 destdir=$2 cat=${3:-} fifos="$WORK/stream" i n
   STREAM_REFUSED=0
@@ -4486,18 +4512,23 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
   [ -z "$cat" ] || dar_opts+=(-A "$cat")
   dar -x "$fifos/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null &
   DAR_PID=$!
+  DAR_RC=""
   BG_PIDS+=("$DAR_PID")
 
-  local hpid wpid st got from
+  local hpid wpid st got from sink
   for ((i = 0; i < n; i++)); do
     num=${nums[$i]} tpos=${poss[$i]} size=${sizes[$i]} sha=${shas[$i]}
     if [ "$SPAN_RESTORE" = stream ]; then
       # A unit held across tapes, with --stream-tapes: each slice from the
       # cartridge in the drive while its front index lists it, then the next
       # cartridge, asked for while dar waits on its pipe for as long as that
-      # takes (volume-format-v2.md 4.4, R8).
+      # takes (volume-format-v2.md 4.4, R8). A dar that has ended well needs no
+      # more, and the slice is still asked for, to be checked.
       tpos=$(span_pos "$num")
-      if [ -z "$tpos" ]; then
+      if [ -z "$tpos" ] && ! dar_running && [ "$DAR_RC" = 0 ]; then
+        span_swap "$num"
+        tpos=$(span_pos "$num")
+      elif [ -z "$tpos" ]; then
         # A dar already gone (its catalogue refused, #419, or worse) is said
         # before a cartridge is asked for that it would never read.
         if ! kill -0 "$DAR_PID" 2>/dev/null; then
@@ -4516,9 +4547,16 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       from="tape file $tpos"
       info "Slice $((i + 1))/$n — tape file $tpos"
     fi
-    if ! kill -0 "$DAR_PID" 2>/dev/null; then
-      die_dar "$destdir"
-      return 0
+    # The slice goes to dar's pipe while dar runs. A dar that ended well wants
+    # no more: the slice goes to /dev/null, never to a pipe nobody will open.
+    # One that failed is said now.
+    sink="$fifos/restore.$num.dar"
+    if ! dar_running; then
+      if [ "$DAR_RC" != 0 ]; then
+        die_dar "$destdir"
+        return 0
+      fi
+      sink=/dev/null
     fi
     if [ -z "$STREAM_FROM" ]; then
       seek_to "$tpos" || die "cannot position the tape at file $tpos ($MT failed)"
@@ -4531,33 +4569,45 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     (
       # Not -e here: the pipeline's statuses are the result, written below.
       set +e
+      # What dar does not read of the slice is drained after age: the first
+      # cat alone dies of the pipe dar closed, so age still authenticates
+      # every chunk, the hash is of the whole slice and the tape file is read
+      # to its end.
       slice_bytes "$num" |
         {
           head -c "$size"
           cat >/dev/null
         } | tee "$fifos/cipher" |
-        age -d "${AGE_IDS[@]}" 2>"$WORK/age.err" >"$fifos/restore.$num.dar"
+        age -d "${AGE_IDS[@]}" 2>"$WORK/age.err" |
+        {
+          cat 2>/dev/null >"$sink"
+          cat >/dev/null
+        }
       echo "${PIPESTATUS[*]}" >"$WORK/feed.status"
     ) </dev/null &
     wpid=$!
-    if ! wait_feed "$wpid"; then
-      # dar is gone. A feed that is opening, or about to open, this slice's
-      # FIFO waits for a reader that will never come. Open it from the
-      # other end in the background and close it at once: the feed's open
-      # completes, its next write breaks the pipe, and it ends.
+    if [ "$sink" != /dev/null ] && ! wait_feed "$wpid"; then
+      # dar ended while the slice was fed. A feed that is opening, or about
+      # to open, this slice's FIFO waits for a reader that will never come.
+      # Open it from the other end in the background and close it at once:
+      # the feed's open completes, its next write breaks the pipe, and the
+      # rest of the slice drains.
       (: <"$fifos/restore.$num.dar") 2>/dev/null &
       local opener=$!
       BG_PIDS+=("$opener")
       wait "$wpid" 2>/dev/null || true
       wait "$hpid" 2>/dev/null || true
       kill -KILL "$opener" 2>/dev/null || true
-      die_dar "$destdir"
-      return 0
+      if [ "$DAR_RC" != 0 ]; then
+        die_dar "$destdir"
+        return 0
+      fi
     fi
     wait "$wpid" 2>/dev/null || true
     wait "$hpid" 2>/dev/null || true
     read -r -a st <"$WORK/feed.status" || true
-    # st: dd (or cat, from scratch), the head/drain group, tee, age.
+    # st: dd (or cat, from scratch), the head/drain group, tee, age, and the
+    # group that feeds dar and drains what it leaves.
     if [ "${st[0]:-1}" != 0 ]; then
       if [ "$SPAN_RESTORE" = stream ]; then
         echo "NOTE: without --stream-tapes a slice that will not read is asked for from another cartridge that holds it." >&2
@@ -4569,10 +4619,10 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     if [ "${st[3]:-1}" != 0 ]; then
       # age's own complaint about the slice (a damaged chunk, a header no key
       # opens) is what the heir needs to read, even when dar, seeing the slice
-      # cut short, has already died of it. Only an age that failed to WRITE
-      # (dar gone first) hands the word to dar.
+      # cut short, has already died of it. Only an age that failed some other
+      # way, with dar failed too, hands the word to dar.
       if ! grep -E 'decrypt|authenticat|no identity matched|header|MAC' "$WORK/age.err" >/dev/null 2>&1 &&
-        ! kill -0 "$DAR_PID" 2>/dev/null; then
+        ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
         return 0
       fi
@@ -4584,8 +4634,8 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
        damaged. Files already restored to $destdir from this unit may be incomplete.
 $(replace_hint)"
     fi
-    if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ]; then
-      if ! kill -0 "$DAR_PID" 2>/dev/null; then
+    if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; then
+      if ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
         return 0
       fi
@@ -4602,8 +4652,8 @@ $(replace_hint)"
     info "  checksum verified against front index"
   done
 
-  local rc=0
-  wait "$DAR_PID" 2>/dev/null || rc=$?
+  dar_reap
+  local rc=$DAR_RC
   DAR_PID=""
   if [ "$rc" != 0 ] && grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
     STREAM_REFUSED=1
@@ -12331,8 +12381,9 @@ sha256_encrypted = \"bbb\"
             "every key becomes an -i"
         );
         assert!(
-            s.contains("age -d \"${AGE_IDS[@]}\" 2>\"$WORK/age.err\" >\"$fifos/restore.$num.dar\""),
-            "the streamed slice is decrypted with every key"
+            s.contains("age -d \"${AGE_IDS[@]}\" 2>\"$WORK/age.err\" |\n        {\n          cat 2>/dev/null >\"$sink\""),
+            "the streamed slice is decrypted with every key, into dar's pipe (#497: what dar \
+             leaves is drained after it)"
         );
         assert!(
             s.contains("if age -d \"${AGE_IDS[@]}\" <\"$in\" >\"$out\""),
