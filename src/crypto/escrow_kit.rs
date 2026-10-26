@@ -747,6 +747,17 @@ folder for its home (export TAPECTL_HOME=/recovery/home):
     tapectl restore volume --device /dev/nst0 --to ./out \\
         --key escrow.key
 
+IF dar SAYS \"Bad CRC\" BUT EVERY SLICE SAID \"checksum verified\"
+--------------------------------------------------------------
+The tape is sound. dar misreads some archives when it is fed
+their slices through pipes, as RESTORE.sh's restore does, and
+then reports files it got wrong (\"Bad CRC, data corruption
+occurred\", \"invalid FSA ... flag\"). Restore those files from
+slices on disk instead. If the script wrote a list of damaged
+files and printed a --fill-from command, run that command with
+the SAME tape still loaded: the fill reads the slices to disk
+first. Otherwise use --slices-from or tapectl, as above.
+
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
   catalog.db.age   An encrypted index of what is on the tapes:
@@ -1526,6 +1537,25 @@ mod tests {
             txt.contains(&format!("--escrow-public-key \\\n        {ESCROW}\n")),
             "init is given this archive's escrow identity"
         );
+    }
+
+    /// #498: dar misreads some archives through the pipes a streamed restore
+    /// feeds it, and reports files it got wrong while every slice's checksum
+    /// matched. The sheet says the tape is sound and sends the heir to a read
+    /// from slices on disk: the fill with the same tape, `--slices-from`, or
+    /// tapectl.
+    #[test]
+    fn the_cover_sheet_says_bad_crc_over_verified_slices_is_not_the_tape() {
+        let prose = flat(&render_cover_text(&facts_for(&[], &[])));
+        for required in [
+            "IF dar SAYS \"Bad CRC\" BUT EVERY SLICE SAID \"checksum verified\"",
+            "The tape is sound.",
+            "dar misreads some archives when it is fed their slices through pipes",
+            "run that command with the SAME tape still loaded",
+            "Otherwise use --slices-from or tapectl, as above.",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
     }
 
     /// Issue #448 item 3: the 1.1.0 restore streams (RESTORE.sh checks for
