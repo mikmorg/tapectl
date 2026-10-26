@@ -618,6 +618,96 @@ fn mhvtl_lbp_a_page_left_armed_is_cleared_by_the_next_open() {
     assert_page_clear("after the fallen-back open closed");
 }
 
+/// 388c's finding (#388, F12): after a read that ran off the data, st
+/// answers the next read itself, without sending it, so a probe read where
+/// the head was came back without the EBUSY that says mhvtl cannot carry a
+/// 524,292-byte block: the open armed and its first transfer failed EBUSY
+/// (`volume identify` after a failed `dd` exited 2; after `mt rewind`, 0).
+/// The open now rewinds before it probes. Here a tape at the format's block
+/// (written plain: the open falls back), a plain read run off its end, and
+/// then each open must still fall back by cause 8 and read the tape whole.
+#[test]
+#[ignore]
+fn mhvtl_lbp_an_open_after_a_read_off_the_data_still_probes_the_drive() {
+    let Some((_g, _leave)) = start() else { return };
+    let wire = FORMAT_BLOCK + lbp::CRC_LEN;
+    let cannot_carry = |what: &str, p: Protection| match p {
+        Protection::Unavailable(reason) => assert!(
+            reason.starts_with(&format!("st cannot carry a {wire}-byte block")),
+            "{what}: the fallback's reason is not the probe's: {reason}"
+        ),
+        other => panic!(
+            "{what}: a {wire}-byte wire block on mhvtl must fall back by the probe (cause 8), \
+             got {other:?}"
+        ),
+    };
+    let files: Vec<Vec<u8>> = (0..2u64)
+        .map(|i| pattern(FORMAT_BLOCK + 1000 * (i as usize + 1), 40 + i))
+        .collect();
+    let padded_to_format = |bytes: &[u8]| {
+        let mut v = bytes.to_vec();
+        v.resize(bytes.len().div_ceil(FORMAT_BLOCK) * FORMAT_BLOCK, 0);
+        v
+    };
+
+    let mut store = TapeStore::open(&dev(), FORMAT_BLOCK, u64::MAX).unwrap();
+    cannot_carry("the write open, from BOT", store.protection());
+    for (i, bytes) in files.iter().enumerate() {
+        store
+            .execute(&mut &bytes[..], bytes.len() as u64, i == files.len() - 1)
+            .unwrap_or_else(|e| panic!("write of file {i}: {e}"));
+    }
+    drop(store);
+
+    // Off the data: the head is past the last filemark, at the end of data.
+    // A plain read there, as `dd` past a tape's end or RESTORE.sh on an
+    // unsealed tape makes, leaves st answering reads itself.
+    let run_off = |when: &str| {
+        let mut node = std::fs::File::open(dev()).expect("open the node for a plain read");
+        let mut buf = vec![0u8; FORMAT_BLOCK];
+        let answers: Vec<String> = (0..3)
+            .map(|_| match node.read(&mut buf) {
+                Ok(n) => format!("{n} bytes"),
+                Err(e) => format!("{e}"),
+            })
+            .collect();
+        eprintln!("{when}: plain reads at the end of data: {answers:?}");
+        assert!(
+            answers.iter().all(|a| !a.starts_with(&format!("{FORMAT_BLOCK} "))),
+            "{when}: a plain read at the end of data returned a block: {answers:?}"
+        );
+    };
+
+    run_off("before the read open");
+    let mut store = TapeStore::open_read(&dev(), FORMAT_BLOCK).unwrap();
+    match bits_for(false) {
+        Some(_) => cannot_carry("the read open after a read off the data", store.protection()),
+        None => assert_eq!(store.protection(), Protection::NotApplicable),
+    }
+    assert_page_clear("while the read store that fell back holds the drive");
+    for (i, bytes) in files.iter().enumerate() {
+        let mut out = Vec::new();
+        store
+            .read_file(i as u32, &mut out)
+            .unwrap_or_else(|e| panic!("read of file {i} after the open: {e}"));
+        assert!(
+            out == padded_to_format(bytes),
+            "file {i} read back {} bytes that differ from the {} written (padded)",
+            out.len(),
+            padded_to_format(bytes).len()
+        );
+    }
+    drop(store);
+    assert_page_clear("after the read store closed");
+
+    run_off("before the write open");
+    let store = TapeStore::open(&dev(), FORMAT_BLOCK, u64::MAX).unwrap();
+    cannot_carry("the write open after a read off the data", store.protection());
+    assert_page_clear("while the write store that fell back holds the drive");
+    drop(store);
+    assert_page_clear("after the write store closed");
+}
+
 // ── the gate's page reader, ungated ──────────────────────────────────────────
 
 /// The text of the shell function `name` in the gate script: from `name() {`
