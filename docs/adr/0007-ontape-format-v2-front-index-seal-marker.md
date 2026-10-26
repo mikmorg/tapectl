@@ -79,3 +79,11 @@ Considered and rejected: keeping the trailer index (its one edge — describing 
 LTO partitioning (serves index mutation a sealed tape never needs); making confirm
 depend on LBP (unreachable through the Linux data path); and salvaging partial tapes on
 EOT (untestable on mhvtl, a source of the audit's HIGH defects, and never a copy anyway).
+
+*Correction, 2026-10-25 (the coordinator, applying ADR-0012 items 161-166 and 174):* "unreachable
+through the Linux data path" is no longer true. The st driver carries the 4-byte CRC inside each
+block, and tapectl sets the drive's Control Data Protection page through sg3-utils, as measured on
+home2's HP LTO-6 (`docs/research/2026-10-16-logical-block-protection.md` §8.2). From tapectl 1.7.2,
+LBP is an extra write-time check. The rejection itself stands: confirm still does not depend on LBP,
+the readback is still the only proof that a cartridge reads, and LBP's evidence is recorded as its
+own class (ADR-0012 item 161).
