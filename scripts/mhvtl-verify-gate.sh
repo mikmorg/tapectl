@@ -27,7 +27,7 @@
 #      scripts/mhvtl-prompt-driver.py. TAPECTL_GATE_SWAP_WAIT (seconds,
 #      default 300) is how long the drive stays empty at --stream-tapes' swap.
 #
-# The `check` lines below are the list (61 since #478's span_rows, span_heir_tapes_1_3,
+# The `check` lines below are the list (62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
 # span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
 # span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
 # heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
@@ -2124,6 +2124,99 @@ check heir_short_info      step_heir_short_info
 check heir_short_verify    step_heir_short_verify
 check heir_short_restore   step_heir_short_restore
 check heir_short_cut_refused step_heir_short_cut_refused
+
+# ---------- heir_big_catalogue: a unit whose catalogue dar leaves unread (#497) ----------
+# RESTORE.sh streams a unit into `dar -x --sequential-read -A <catalogue>`. Given the
+# catalogue, dar stops at the end of the file data and exits 0: it never reads the
+# archive's own trailing catalogue. With thousands of files that tail is far more than
+# a pipe holds, and before #497 the restore ended "FATAL: dar extraction failed (exit
+# 0)" over a tree restored whole (home2, 2026-10-25). Every heir leg above restores
+# units of a handful of files, whose tail fits in the pipe, so none could see it.
+# This one: a throwaway home, alice's one unit of 3000 small files with long names in
+# 4 MiB slices (the catalogue near 1 MB, in the last slice after the end of the
+# data: home2's shape), written to the cartridge in the drive, restored by the
+# RESTORE.sh on that tape with the real age, dar, mt and tar. It must exit 0 with
+# RESTORE COMPLETE and no FATAL, check every slice against the front index, run the
+# per-file check over every file, and give back the tree. Runs in well under a minute.
+BC="$RUN/big-catalogue"
+BC_LABEL="BC-0001"
+BCC() { "$BIN" --home "$BC/home" "$@"; }
+# One value from the throwaway home's catalog, read-only; fails on no row or a NULL.
+bc_q() { # bc_q <sql>
+    python3 - "$BC/home/tapectl.db" "$1" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(sys.argv[2]).fetchone()
+assert row is not None and row[0] is not None, f"no value for: {sys.argv[2]}"
+print(row[0])
+PY
+}
+# Judge a RESTORE.sh --restore of one whole unit by its output (stdin): RESTORE COMPLETE,
+# no FATAL line, exactly <slices> slices checked against the front index, and the file
+# check's line for <files> files. Says what is missing; exit 1 if anything is. Pure text:
+# tests/heir_restore_sh.rs extracts it and runs it on RESTORE.sh's real output.
+heir_judge_whole_restore() { # heir_judge_whole_restore <unit> <version> <slices> <files>
+    local out n bad=0
+    out="$(cat)"
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; bad=1; }
+    if grep -F "FATAL" <<<"$out"; then
+        echo "a FATAL line"
+        bad=1
+    fi
+    n="$(grep -cF "  checksum verified against front index" <<<"$out")" || true
+    [ "$n" = "$3" ] || { echo "$n slice(s) checked against the front index, want $3"; bad=1; }
+    grep -F "File check: $4 restored file(s) of '$1' version $2 match the sha256 recorded in the index" >/dev/null <<<"$out" \
+        || { echo "no file check line for $4 file(s) of '$1' version $2"; bad=1; }
+    return "$bad"
+}
+step_heir_big_catalogue() {
+    local out rc n files cat_path cat_len
+    rm -rf "$BC"; mkdir -p "$BC/src/bc-many" "$BC/home/staging" "$BC/heir"
+    # 3000 files of 1600 bytes, names of about 200 characters: the names are what
+    # make dar's catalogue large.
+    python3 - "$BC/src/bc-many" <<'PY' || { echo "cannot make the source tree"; return 1; }
+import os, sys
+for i in range(3000):
+    name = f"{i:04d}-" + "n" * 190 + ".bin"
+    with open(os.path.join(sys.argv[1], name), "wb") as f:
+        f.write(os.urandom(1600))
+PY
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
+    # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
+    # its secret going only to this run's log.
+    BCC init --operator gate-bc \
+        && BCC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && BCC config set staging.directory "$BC/home/staging" \
+        && BCC config set defaults.slice_size 4M \
+        && BCC tenant add alice \
+        && BCC unit init "$BC/src/bc-many" --tenant alice --name bc-many \
+        && BCC snapshot create bc-many \
+        && BCC stage create bc-many \
+        || { echo "home: init/backend add/config set/tenant add/unit init/snapshot/stage failed"; return 1; }
+    # The fixture's own control: the catalogue dar is given is far more than a pipe
+    # holds (64 KiB), and the unit has more than one slice.
+    cat_path="$(bc_q "SELECT catalog_path FROM stage_sets")" || return 1
+    cat_len="$(stat -c %s "$cat_path.1.dar")" || { echo "no isolated catalogue at $cat_path.1.dar"; return 1; }
+    [ "$cat_len" -gt 524288 ] || { echo "the catalogue is $cat_len bytes: this check needs one above 512 KiB"; return 1; }
+    n="$(bc_q "SELECT COUNT(*) FROM stage_slices")" || return 1
+    [ "$n" -ge 2 ] || { echo "the unit has $n slice(s): this check needs several"; return 1; }
+    files="$(find "$BC/src/bc-many" -type f | wc -l)"
+    echo "bc-many: $files files, $n slices, a $cat_len-byte catalogue"
+    BCC volume init "$BC_LABEL" --device "$TAPE_DEV" || return 1
+    BCC volume write "$BC_LABEL" --device "$TAPE_DEV" --yes || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$BC/heir/RESTORE.sh" \
+        && chmod +x "$BC/heir/RESTORE.sh" && bash -n "$BC/heir/RESTORE.sh" \
+        || { echo "cannot read RESTORE.sh off the tape"; return 1; }
+    out="$(cd "$BC/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit bc-many \
+        --key "$BC/home/keys/alice-primary.age.key" --to "$BC/heir/recovered" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 40
+    [ "$rc" -eq 0 ] || { echo "heir_big_catalogue: RESTORE.sh exited $rc, want 0"; return 1; }
+    heir_judge_whole_restore bc-many 1 "$n" "$files" <<<"$out" || return 1
+    diff -r "$BC/src/bc-many" "$BC/heir/recovered" || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+echo "gate: heir_big_catalogue — a unit whose catalogue dar leaves unread (#497)"
+check heir_big_catalogue   step_heir_big_catalogue
 
 # ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478) ----------
 # ADR-0012 item 136: the mhvtl proof of spanning is this one leg, judged by test name, with the

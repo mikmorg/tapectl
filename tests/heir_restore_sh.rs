@@ -13638,3 +13638,68 @@ fn a_restore_across_tapes_checks_every_slice_dar_leaves_unread_in_scratch() {
     assert!(same_tree(src, Path::new(&dest)), "{text}");
     assert!(scratch_slices(&dest).is_none(), "the scratch is gone");
 }
+
+/// The gate's judge for heir_big_catalogue (#497), which runs only on
+/// mhvtl, run here on RESTORE.sh's real output: it passes a whole streamed
+/// restore of `many`, and fails the same output with any one of its claims
+/// taken away, starting with what the restore printed before the fix.
+#[test]
+fn the_gates_whole_restore_judge_passes_a_whole_restore_and_nothing_less() {
+    let t = many_template();
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    let h = Heir::of(t, &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "many",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let judge = |out: &str, slices: usize| {
+        run_gate_snippet(
+            &["heir_judge_whole_restore"],
+            &format!(
+                "heir_judge_whole_restore many 1 {slices} {}",
+                MANY_FILES + 1
+            ),
+            out,
+            &[],
+        )
+    };
+    let (rc, said) = judge(&text, n);
+    assert_eq!(rc, 0, "the judge refused a whole restore: {said}\n{text}");
+
+    let verified_line = "  checksum verified against front index";
+    let last = text.rfind(verified_line).expect("a slice was checked");
+    let before_fix = format!(
+        "{}\nFATAL: dar extraction failed (exit 0) — dar's own message is above.\n",
+        &text[..last]
+    );
+    let doctored = [
+        ("the output before the fix", before_fix),
+        (
+            "a FATAL line",
+            format!("{text}FATAL: something else went wrong\n"),
+        ),
+        ("a slice not checked", text.replacen(verified_line, "", 1)),
+        (
+            "no file check",
+            text.replace("match the sha256 recorded in the index", ""),
+        ),
+        (
+            "no RESTORE COMPLETE",
+            text.replace("RESTORE COMPLETE", "RESTORE INCOMPLETE"),
+        ),
+    ];
+    for (what, out) in &doctored {
+        let (rc, said) = judge(out, n);
+        assert_eq!(rc, 1, "{what}: the judge passed it: {said}");
+    }
+    let (rc, said) = judge(&text, n + 1);
+    assert_eq!(rc, 1, "a slice count the output does not show: {said}");
+}
