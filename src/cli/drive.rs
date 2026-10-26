@@ -681,7 +681,10 @@ pub struct StatusProbe {
 /// moving the medium, and the one a poll sends too. A node that answered is
 /// also asked for its Logical Block Protection page (#388, F8: one MODE
 /// SENSE, which neither moves the medium nor changes the page), so a page a
-/// crashed tapectl left armed is reported, never cleared.
+/// crashed tapectl left armed is reported, never cleared. The drive lock is
+/// tested again after that read: a tapectl command that took the drive
+/// since the first test arms the page itself, so its reading is not
+/// reported, with a note.
 ///
 /// Nothing is written: no contact, no journal row. A contact is "a time a
 /// cartridge was in a drive" and exists to carry readings that must be
@@ -813,10 +816,27 @@ pub fn status(
             .or_else(|| lbp::control_for(device).map(|c| Box::new(c) as Box<dyn lbp::PageControl>));
         if let Some(control) = control {
             if let Ok(page) = control.sense() {
-                report.drive.lbp_page = Some(LbpPageFacts {
-                    node: control.node().to_string(),
-                    armed: page.is_armed(),
-                });
+                // The tape node was closed again before this read, so a
+                // tapectl command could have taken the drive and armed the
+                // page for its own session in between, which would read as
+                // a leftover. Every tapectl command takes the drive lock
+                // before it opens the drive, so the lock is tested again
+                // after the read: held now, the reading is that command's
+                // and is not reported.
+                if lock::drive_lock_state(&paths.db_file, device) == DriveLockState::Held {
+                    report.notes.push(
+                        "a tapectl command took this drive while it was being looked at: its \
+                         Logical Block Protection page is not reported, since that command arms \
+                         the page for its own reads and writes. Run `tapectl drive status` again \
+                         once it has finished."
+                            .into(),
+                    );
+                } else {
+                    report.drive.lbp_page = Some(LbpPageFacts {
+                        node: control.node().to_string(),
+                        armed: page.is_armed(),
+                    });
+                }
             }
         }
     }
@@ -2812,6 +2832,97 @@ mod tests {
         );
         assert_eq!(free.drive.lbp_page.map(|p| p.armed), Some(true));
         assert_eq!(page.ops(), ["sense"]);
+    }
+
+    /// A page control whose MODE SENSE finds the drive just taken by a
+    /// tapectl command: it takes the drive lock in the status's home, as the
+    /// command's contact does before its open, and answers the page that
+    /// command armed for its session.
+    struct TakenWhileLooking {
+        page: FakePage,
+        lockfile: std::path::PathBuf,
+        held: std::sync::Mutex<Option<nix::fcntl::Flock<std::fs::File>>>,
+    }
+
+    impl lbp::PageControl for TakenWhileLooking {
+        fn node(&self) -> &str {
+            lbp::PageControl::node(&self.page)
+        }
+
+        fn sense(&self) -> std::result::Result<lbp::ProtectionPage, lbp::PageError> {
+            let file = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&self.lockfile)
+                .unwrap();
+            let flock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .map_err(|(_, e)| e)
+                .expect("the drive lock is free when the command takes it");
+            *self.held.lock().unwrap() = Some(flock);
+            lbp::PageControl::sense(&self.page)
+        }
+
+        fn select(&self, page: &lbp::ProtectionPage) -> std::result::Result<(), lbp::PageError> {
+            lbp::PageControl::select(&self.page, page)
+        }
+    }
+
+    /// 388b's race: the tape node is closed before the page is read, so a
+    /// write session that takes the drive and arms the page in between would
+    /// read as a leftover. The lock is tested again after the read: held
+    /// now, the page is not reported (no ARMED, `lbp_page` null) and a note
+    /// says why. Positive control: the same armed page in the same home with
+    /// the lock still free after the read is reported ARMED.
+    #[test]
+    fn a_page_read_after_a_tapectl_command_took_the_drive_is_not_a_leftover() {
+        let conn = crate::db::open_memory().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        let lockfile = lock::drive_lock_path(&paths.db_file, DEVICE);
+        std::fs::create_dir_all(lockfile.parent().unwrap()).unwrap();
+        let probe = |page: Box<dyn lbp::PageControl>| StatusProbe {
+            drive_lock: Some(DriveLockState::Free),
+            node: Some(node(GMT_BOT | GMT_ONLINE)),
+            mam: Some(mam_read(None)),
+            identity: Some(hp_drive()),
+            holders: Some(Vec::new()),
+            lbp_page: Some(page),
+        };
+
+        let taken = TakenWhileLooking {
+            page: FakePage::new(&ARMED_PAGE),
+            lockfile: lockfile.clone(),
+            held: Default::default(),
+        };
+        let sent = taken.page.clone();
+        let r = status(
+            &conn,
+            &paths,
+            DEVICE,
+            Some(&lto6_backend()),
+            probe(Box::new(taken)),
+        );
+        assert_eq!(sent.ops(), ["sense"], "the page was read");
+        assert_eq!(r.drive.lbp_page, None);
+        let text = status_text(&r);
+        assert!(!text.contains("ARMED"), "{text}");
+        assert!(
+            text.contains("a tapectl command took this drive while it was being looked at"),
+            "{text}"
+        );
+        assert!(serde_json::to_value(&r).unwrap()["drive"]["lbp_page"].is_null());
+        assert_eq!(status_exit_code(&r), 0, "an answer");
+
+        let r = status(
+            &conn,
+            &paths,
+            DEVICE,
+            Some(&lto6_backend()),
+            probe(Box::new(FakePage::new(&ARMED_PAGE))),
+        );
+        assert_eq!(r.drive.lbp_page.as_ref().map(|p| p.armed), Some(true));
+        assert!(!status_text(&r).contains("took this drive"));
     }
 
     // ── `drive eject` (issue #429) ──────────────────────────────────────────

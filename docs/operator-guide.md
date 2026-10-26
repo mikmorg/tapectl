@@ -2446,7 +2446,10 @@ kernel binds to the tape node, and only when the tape node has just answered. Th
 is `LBP page:  not armed (/dev/sgN)`. A page a crashed tapectl left armed is reported as such:
 readers that are not LBP-aware (RESTORE.sh, `dd`) get I/O errors until the next tapectl command
 that opens a tape in the drive clears it, or a power cycle does; `drive status` and `drive eject`
-do not clear it. When the page cannot be read, `drive status` says nothing about LBP. `--json` gives `drive.lbp_page`: `{"node", "armed"}`, or null.
+do not clear it. When the page cannot be read, `drive status` says nothing about LBP. A tapectl
+command that takes the drive between the node's answer and the page's read arms the page for
+itself, so when the drive lock is held after the read the page is not reported and a note says
+why. `--json` gives `drive.lbp_page`: `{"node", "armed"}`, or null.
 
 #### Ejecting the cartridge
 
