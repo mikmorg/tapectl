@@ -6960,7 +6960,7 @@ mod tests {
         }
 
         mod streaming {
-            use super::multi::{multi, noise, Spot, FIRST};
+            use super::multi::{multi, noise, Multi, Spot, FIRST};
             use super::record::only_row;
             use super::*;
             use crate::tape::fake::Op;
@@ -7038,6 +7038,111 @@ mod tests {
                     "spooled slices are on disk: {:?}",
                     m.fake.watched_bytes()
                 );
+                let argv = only_row(&m.conn).dar_argv.expect("dar ran");
+                assert!(!argv.contains("--sequential-read"), "{argv}");
+            }
+
+            // ── #497: dar, given the catalogue, ends before the archive's own ──
+            //
+            // With `-A` dar knows where the file data ends and stops reading
+            // there, before the archive's trailing catalogue, and exits 0. A
+            // tail bigger than a pipe's buffer used to fail the restore ("dar
+            // stopped reading slice N"), and a slice dar never opened ("dar
+            // stopped before it read slice N"), over a unit restored whole. A
+            // unit needs many files for that: 2000 here, with long names.
+
+            /// 2000 names of about 200 characters: what makes dar's
+            /// catalogue large with few files.
+            fn many_names() -> Vec<String> {
+                (0..2000)
+                    .map(|i| format!("{i:04}-{}.bin", "n".repeat(190)))
+                    .collect()
+            }
+
+            fn many_tree(names: &[String], file_len: usize) -> Vec<(&str, Vec<u8>)> {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.as_str(), noise(file_len, i as u32 + 7)))
+                    .collect()
+            }
+
+            /// The fixture's own control: the isolated catalogue dar gets as
+            /// `-A` is far bigger than a pipe's buffer (64 KiB), so the tail
+            /// dar leaves unread cannot hide in one.
+            fn assert_big_catalogue(m: &Multi) {
+                let base: String = m
+                    .conn
+                    .query_row("SELECT catalog_path FROM stage_sets", [], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .unwrap();
+                let len = fs::metadata(format!("{base}.1.dar")).unwrap().len();
+                assert!(
+                    len > 512 * 1024,
+                    "the catalogue is {len} bytes: the test needs one above 512 KiB"
+                );
+            }
+
+            /// The shape home2 met: 2 MiB slices, the catalogue inside the
+            /// last one after the end of the data. dar stops there and exits
+            /// 0, the restore is whole, and every slice is read once, forward
+            /// (the last to its end).
+            #[test]
+            fn a_unit_whose_catalogue_dar_leaves_unread_streams_whole() {
+                let names = many_names();
+                let m = multi("BC-1", "bc-unit", &many_tree(&names, 1800), "2M", true);
+                assert_big_catalogue(&m);
+                assert!(m.slices() >= 2, "want several slices");
+                let dest = TempDir::new().unwrap();
+                m.unit("BC-1", "bc-unit", dest.path(), &RestoreOptions::default())
+                    .expect("dar exited 0: the unit is whole");
+                m.assert_restored(dest.path());
+                let argv = only_row(&m.conn).dar_argv.expect("dar ran");
+                assert!(argv.contains(r#""--sequential-read""#), "{argv}");
+                assert!(argv.contains(r#""-A""#), "{argv}");
+                let mut expected = vec![Op::Rewind, Op::ReadHead(0), Op::Space(FIRST - 1)];
+                expected.extend((0..m.slices() as u32).map(|i| Op::Read(FIRST + i)));
+                assert_eq!(m.fake.ops(), expected, "one forward pass");
+            }
+
+            /// The other shape: 100 KiB slices, the catalogue filling the
+            /// last few, which dar exits 0 without opening. They are still
+            /// read off the tape and authenticated, into nothing.
+            #[test]
+            fn a_unit_whose_last_slices_dar_never_opens_streams_whole() {
+                let names = many_names();
+                let m = multi("BC-2", "bc-unit", &many_tree(&names, 300), "100k", true);
+                assert_big_catalogue(&m);
+                assert!(m.slices() >= 10, "want many slices");
+                let dest = TempDir::new().unwrap();
+                m.unit("BC-2", "bc-unit", dest.path(), &RestoreOptions::default())
+                    .expect("dar exited 0: the unit is whole");
+                m.assert_restored(dest.path());
+                let argv = only_row(&m.conn).dar_argv.expect("dar ran");
+                assert!(argv.contains(r#""--sequential-read""#), "{argv}");
+                let mut expected = vec![Op::Rewind, Op::ReadHead(0), Op::Space(FIRST - 1)];
+                expected.extend((0..m.slices() as u32).map(|i| Op::Read(FIRST + i)));
+                assert_eq!(m.fake.ops(), expected, "every slice read, forward");
+            }
+
+            /// The way round #497 on a tapectl without the fix (ADR-0012 item
+            /// 178): `--spool` decrypts every slice to scratch and dar reads
+            /// them directly, the trailing catalogue too. It held before the
+            /// fix and must go on holding.
+            #[test]
+            fn spool_restores_a_unit_whose_catalogue_dar_would_leave_unread() {
+                let names = many_names();
+                let m = multi("BC-3", "bc-unit", &many_tree(&names, 1800), "2M", true);
+                assert_big_catalogue(&m);
+                let dest = TempDir::new().unwrap();
+                let spool = RestoreOptions {
+                    spool: true,
+                    ..RestoreOptions::default()
+                };
+                m.unit("BC-3", "bc-unit", dest.path(), &spool)
+                    .expect("a spooled restore");
+                m.assert_restored(dest.path());
                 let argv = only_row(&m.conn).dar_argv.expect("dar ran");
                 assert!(!argv.contains("--sequential-read"), "{argv}");
             }

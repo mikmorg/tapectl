@@ -309,6 +309,9 @@ struct UnitSpec {
     /// passes, and only the recorded sha256 sees them. This is the damage
     /// dar's short checksum misses (ADR-0012 item 103).
     tamper: &'static [usize],
+    /// dar's slice size (`-s`): "100k" for every unit but the ones whose
+    /// shape needs another (#497's, whose catalogue sits in the last slice).
+    slice: &'static str,
 }
 
 struct TenantSpec {
@@ -598,6 +601,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         names: &[],
                         corrupt: &[],
                         tamper: &[],
+                        slice: "100k",
                     },
                     UnitSpec {
                         name: "docs",
@@ -610,6 +614,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         names: &[],
                         corrupt: &[],
                         tamper: &[],
+                        slice: "100k",
                     },
                 ],
             },
@@ -626,6 +631,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                     names: &[],
                     corrupt: &[],
                     tamper: &[],
+                    slice: "100k",
                 }],
             },
             TenantSpec {
@@ -642,6 +648,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         names: &[],
                         corrupt: &[],
                         tamper: &[],
+                        slice: "100k",
                     },
                     UnitSpec {
                         name: "nocat",
@@ -654,6 +661,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         names: &[],
                         corrupt: &[],
                         tamper: &[],
+                        slice: "100k",
                     },
                 ],
             },
@@ -680,6 +688,7 @@ fn lone_template() -> &'static Template {
             names: &[],
             corrupt: &[],
             tamper: &[],
+            slice: "100k",
         };
         let tenants = vec![
             TenantSpec {
@@ -721,6 +730,7 @@ fn solo_template() -> &'static Template {
                 names: &[],
                 corrupt: &[],
                 tamper: &[],
+                slice: "100k",
             }],
         }];
         build_template("solo", &tenants, false)
@@ -748,6 +758,7 @@ fn box_template() -> &'static Template {
             names: &[],
             corrupt: &[],
             tamper: &[],
+            slice: "100k",
         };
         let tenants = vec![
             TenantSpec {
@@ -1348,9 +1359,10 @@ fn stage_units(dir: &Path, tenants: &[TenantSpec], spans: &[SpanOnTape]) -> Vec<
                 "-R",
                 src.to_str().unwrap(),
                 "-s",
-                // A size at which dar 2.7.13 cuts short a file that runs into
-                // the last slice when it reads sequentially without -A.
-                "100k",
+                // 100k: a size at which dar 2.7.13 cuts short a file that
+                // runs into the last slice when it reads sequentially
+                // without -A.
+                u.slice,
                 "-Q",
                 "-N",
             ]);
@@ -1364,7 +1376,7 @@ fn stage_units(dir: &Path, tenants: &[TenantSpec], spans: &[SpanOnTape]) -> Vec<
                     "-R",
                     src.to_str().unwrap(),
                     "-s",
-                    "100k",
+                    u.slice,
                     "-Q",
                     "-N",
                 ]);
@@ -6088,6 +6100,7 @@ fn dmg_tenants(
             names: &[],
             corrupt,
             tamper: &[],
+            slice: "100k",
         }],
     }]
 }
@@ -6175,6 +6188,7 @@ fn odd_tenants(corrupt: &'static [(usize, usize)]) -> Vec<TenantSpec> {
             names: ODD_NAMES,
             corrupt,
             tamper: &[],
+            slice: "100k",
         }],
     }]
 }
@@ -7406,6 +7420,7 @@ fn chk_tenants(tamper: &'static [usize]) -> Vec<TenantSpec> {
             names: ODD_NAMES,
             corrupt: &[],
             tamper,
+            slice: "100k",
         }],
     }]
 }
@@ -7445,6 +7460,7 @@ fn chk_two() -> &'static Template {
             names: &[],
             corrupt: &[],
             tamper,
+            slice: "100k",
         };
         let tenants = vec![
             TenantSpec {
@@ -7934,6 +7950,7 @@ fn folder_tenants() -> Vec<TenantSpec> {
             ],
             corrupt: &[],
             tamper: &[],
+            slice: "100k",
         }],
     }]
 }
@@ -8186,6 +8203,7 @@ fn fill_up() -> &'static Template {
                 names: &["big/one.bin", "big/two.bin"],
                 corrupt: &[],
                 tamper: &[],
+                slice: "100k",
             }],
         }];
         build_template("fill-up", &tenants, true)
@@ -9423,6 +9441,7 @@ fn versions_template() -> &'static Template {
             names,
             corrupt: &[],
             tamper: &[],
+            slice: "100k",
         };
         let tenants = vec![TenantSpec {
             name: "alice",
@@ -10517,6 +10536,7 @@ fn big_spec() -> UnitSpec {
         names: &[],
         corrupt: &[],
         tamper: &[],
+        slice: "100k",
     }
 }
 
@@ -10532,6 +10552,7 @@ fn small_spec(name: &'static str, uuid: &'static str, version: i64, seed: u64) -
         names: &[],
         corrupt: &[],
         tamper: &[],
+        slice: "100k",
     }
 }
 
@@ -13183,4 +13204,399 @@ fn a_cartridge_with_no_readable_seal_is_refused_and_one_read_by_rung_2_is_taken(
             by_tape[2]
         );
     }
+}
+
+// ---- #497: dar, given the catalogue, ends before the archive's own ----
+//
+// RESTORE.sh streams a unit into `dar -x --sequential-read -A <catalogue>`.
+// With the catalogue dar knows where the file data ends, and it stops reading
+// there: the archive's own trailing catalogue, the tail of the last slice
+// (and, with small slices, the last few slices whole), is never read, and dar
+// exits 0. A tail bigger than a pipe's buffer (64 KiB) is refused by dar's
+// pipe, and that used to end the restore as `FATAL: dar extraction failed
+// (exit 0)` over a tree that was restored whole. A unit needs a catalogue of
+// that size, so more than a few hundred files; every unit above has a handful.
+//
+// The units here are many small files with long names, built so that the
+// catalogue is far bigger than the buffer (their own positive control:
+// `catalogue_len`). `many` is the shape home2 met (2 MiB slices: the
+// catalogue sits inside the last slice, after the last of the data);
+// `spread` is the other (100 KiB slices: the catalogue fills the last few,
+// which dar never opens). dar 2.7.13 restores both from FIFOs with exit 0
+// (measured for #497); the installed dar does the work here.
+
+const MANY_UUID: &str = "a4970001-0000-4000-8000-000000000001";
+const SPREAD_UUID: &str = "a4970002-0000-4000-8000-000000000002";
+const AFTER_UUID: &str = "a4970003-0000-4000-8000-000000000003";
+/// Files in each big-catalogue unit (and one more: `sub/note.txt`).
+const MANY_FILES: usize = 2000;
+
+/// `MANY_FILES` names of about 200 characters, which is what makes the
+/// catalogue large with few files: dar's catalogue holds every name.
+fn many_names() -> &'static [&'static str] {
+    static N: OnceLock<&'static [&'static str]> = OnceLock::new();
+    N.get_or_init(|| {
+        let names: Vec<&'static str> = (0..MANY_FILES)
+            .map(|i| &*Box::leak(format!("{i:04}-{}.bin", "n".repeat(190)).into_boxed_str()))
+            .collect();
+        Box::leak(names.into_boxed_slice())
+    })
+}
+
+/// alice's `many`: 2000 files of 1800 bytes in 2 MiB slices, three slices,
+/// the last holding the end of the data and then the catalogue.
+fn many_spec() -> UnitSpec {
+    UnitSpec {
+        cat: Cat::Matched,
+        name: "many",
+        uuid: MANY_UUID,
+        version: 1,
+        seed: 49,
+        files: MANY_FILES,
+        file_len: 1800,
+        names: many_names(),
+        corrupt: &[],
+        tamper: &[],
+        slice: "2M",
+    }
+}
+
+/// bob's `spread`: 2000 files of 300 bytes in 100 KiB slices; the catalogue
+/// fills the last six or so, which dar never opens.
+fn spread_spec() -> UnitSpec {
+    UnitSpec {
+        cat: Cat::Matched,
+        name: "spread",
+        uuid: SPREAD_UUID,
+        version: 1,
+        seed: 50,
+        files: MANY_FILES,
+        file_len: 300,
+        names: many_names(),
+        corrupt: &[],
+        tamper: &[],
+        slice: "100k",
+    }
+}
+
+/// A tape with alice's `many` and then `after` (a small unit), and bob's
+/// `spread`.
+fn many_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let tenants = vec![
+            TenantSpec {
+                name: "alice",
+                units: vec![many_spec(), small_spec("after", AFTER_UUID, 1, 51)],
+            },
+            TenantSpec {
+                name: "bob",
+                units: vec![spread_spec()],
+            },
+        ];
+        build_template("many", &tenants, true)
+    })
+}
+
+/// The size of the isolated catalogue `stage_units` made in `dir` for
+/// `uuid` version `version`: what the envelope carries and dar gets as -A.
+fn catalogue_len(dir: &Path, uuid: &str, version: i64) -> u64 {
+    let p = dir
+        .join("work")
+        .join(format!("{uuid}-v{version}"))
+        .join(format!("{}_v{version}.1.dar", &uuid[..8]));
+    std::fs::metadata(&p)
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        .len()
+}
+
+/// The fixture's own control: a catalogue far bigger than a pipe's buffer,
+/// so the tail dar leaves unread cannot fit in it. Without this, a fixture
+/// that shrank would pass on the defect too.
+fn assert_big_catalogue(dir: &Path, uuid: &str, version: i64) {
+    let len = catalogue_len(dir, uuid, version);
+    assert!(
+        len > 512 * 1024,
+        "the catalogue of {uuid} is {len} bytes: the test needs one above 512 KiB"
+    );
+}
+
+/// The lines saying a slice matched the front index.
+fn verified(text: &str) -> usize {
+    text.matches("  checksum verified against front index")
+        .count()
+}
+
+/// The file check's line for a whole unit of `MANY_FILES` files.
+fn many_checked(unit: &str) -> String {
+    format!(
+        "File check: {} restored file(s) of '{unit}' version 1 match the sha256 recorded in the index",
+        MANY_FILES + 1
+    )
+}
+
+/// The home2 shape (#497): the unit streams from the tape, dar stops at the
+/// end of the data inside the last slice and exits 0, and the restore is
+/// complete. Every slice, the last included, is still read to its end and
+/// checked against the front index, and the per-file check runs.
+#[test]
+fn a_unit_whose_catalogue_dar_leaves_unread_restores_with_every_slice_checked() {
+    let t = many_template();
+    assert_big_catalogue(&t.dir, MANY_UUID, 1);
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    assert!(n >= 2, "{many:?}: want several slices");
+    assert!(
+        catalogue_len(&t.dir, MANY_UUID, 1) < *many.sizes.last().unwrap() as u64,
+        "the catalogue fits in the last slice, after the end of the data: the shape home2 met"
+    );
+    let h = Heir::of(t, &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "many",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert_eq!(verified(&text), n, "every slice checked:\n{text}");
+    assert!(text.contains(&many_checked("many")), "{text}");
+    assert!(same_tree(&many.src, Path::new(&dest)), "{text}");
+    let slices: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| many.positions.contains(p))
+        .collect();
+    assert_eq!(slices, many.positions, "each slice read once, in order");
+}
+
+/// The other shape: small slices, the catalogue filling the last few, which
+/// dar exits 0 without opening. The restore still reads each of them off the
+/// tape, checks it and decrypts it (into nothing), and never waits on a pipe
+/// dar will not open.
+#[test]
+fn a_unit_whose_last_slices_dar_never_opens_restores_with_every_slice_checked() {
+    let t = many_template();
+    assert_big_catalogue(&t.dir, SPREAD_UUID, 1);
+    let spread = unit_of(t, "spread");
+    let n = spread.positions.len();
+    let cat = catalogue_len(&t.dir, SPREAD_UUID, 1);
+    let tail: usize = spread.sizes.iter().rev().take(3).sum();
+    assert!(
+        (tail as u64) < cat,
+        "the last three slices hold nothing but catalogue ({tail} bytes of a {cat}-byte one)"
+    );
+    let h = Heir::of(t, &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("bob"),
+        "--unit",
+        "spread",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert_eq!(verified(&text), n, "every slice checked:\n{text}");
+    assert!(text.contains(&many_checked("spread")), "{text}");
+    assert!(same_tree(&spread.src, Path::new(&dest)), "{text}");
+    let slices: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| spread.positions.contains(p))
+        .collect();
+    assert_eq!(slices, spread.positions, "each slice read once, in order");
+}
+
+/// --all over a big-catalogue unit and then another: the first unit's last
+/// slice is read to its end, so the head is where the script says, and the
+/// next unit restores from there with no rewind (the drive is asked where it
+/// is before each read, and a head left inside a file is rewound "to be
+/// sure", which would also get the next unit restored: the walk shows which).
+#[test]
+fn all_restores_the_unit_after_a_big_catalogue_from_where_the_head_is() {
+    let t = many_template();
+    assert_big_catalogue(&t.dir, MANY_UUID, 1);
+    let h = Heir::of(t, &[]);
+    let dest = h.dir.join("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--all",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    for u in ["many", "after"] {
+        assert!(same_tree(&unit_of(t, u).src, &dest.join(u)), "{u}:\n{text}");
+    }
+    let n = unit_of(t, "many").positions.len() + unit_of(t, "after").positions.len();
+    assert_eq!(verified(&text), n, "every slice checked:\n{text}");
+    assert!(text.contains(&many_checked("many")), "{text}");
+    assert!(!text.contains("rewinding to be sure"), "{text}");
+    let (walked, rewinds) = walk(&h);
+    assert_eq!(rewinds, 1, "one rewind for the whole run:\n{:#?}", h.ops());
+    let mut sorted = walked.clone();
+    sorted.sort();
+    assert_eq!(walked, sorted, "one ascending pass:\n{:#?}", h.ops());
+}
+
+/// The way round #497 on a tape already written (ADR-0012 item 178): with
+/// `--slices-from` (here an empty directory) the slices are read off the tape
+/// and checked one by one, decrypted to disk, and dar reads them directly,
+/// where it reads the trailing catalogue too. This held before the fix and
+/// must go on holding: it is what the docs tell an heir to run.
+#[test]
+fn slices_from_an_empty_directory_restores_a_big_catalogue_unit_whole() {
+    let t = many_template();
+    assert_big_catalogue(&t.dir, MANY_UUID, 1);
+    let many = unit_of(t, "many");
+    let h = Heir::of(t, &[]);
+    let empty = h.sub("no-copies");
+    std::fs::create_dir_all(&empty).unwrap();
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--unit",
+        "many",
+        "--key",
+        &h.key("alice"),
+        "--to",
+        &dest,
+        "--slices-from",
+        &empty,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert_eq!(
+        verified(&text),
+        many.positions.len(),
+        "every slice checked:\n{text}"
+    );
+    assert!(text.contains(&many_checked("many")), "{text}");
+    assert!(same_tree(&many.src, Path::new(&dest)), "{text}");
+}
+
+/// Two tapes laid out from one staging of `many`, a unit that may span:
+/// BCS01 holds slices 1 and 2 and ends short after them, BCS02 the rest.
+fn many_box() -> &'static BTreeMap<&'static str, Template> {
+    static B: OnceLock<BTreeMap<&'static str, Template>> = OnceLock::new();
+    B.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heir-restore-sh-manybox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["src", "work"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let tenants = vec![TenantSpec {
+            name: "alice",
+            units: vec![many_spec()],
+        }];
+        let all = SpanOnTape {
+            unit: "many",
+            held: 0..usize::MAX,
+        };
+        let staged = stage_units(&dir, &tenants, std::slice::from_ref(&all));
+        assert_big_catalogue(&dir, MANY_UUID, 1);
+        let n = staged[0].slices.len();
+        assert!(n >= 3, "many has {n} slices: want three or more");
+        let one = TapeId {
+            label: "BCS01",
+            uuid: "a4970b01-0000-4000-8000-000000000001",
+            serial: "BCSSER",
+            earlier: Some(vec![]),
+        };
+        let two = TapeId {
+            label: "BCS02",
+            uuid: "a4970b02-0000-4000-8000-000000000002",
+            serial: "BCSSER",
+            earlier: Some(vec![Holder {
+                label: "BCS01",
+                uuid: "a4970b01-0000-4000-8000-000000000001",
+                serial: "BCSSER",
+                first: 1,
+                last: 2,
+            }]),
+        };
+        let mut tapes = BTreeMap::new();
+        for (id, held, cut_in) in [(one, 0..n, Some(1)), (two, 2..n, None)] {
+            let tdir = dir.join(id.label);
+            write_keys(&tdir);
+            let mut fresh = staged.clone();
+            for s in fresh.iter_mut() {
+                s.unit.slices.clear();
+            }
+            let t = lay_out_tape(
+                &tdir,
+                fresh,
+                true,
+                true,
+                &[],
+                Era::V170Span,
+                &[SpanOnTape {
+                    unit: "many",
+                    held: held.clone(),
+                }],
+                &id,
+            );
+            if let Some(i) = cut_in {
+                let u = unit_of(&t, "many");
+                cut_tape_dir(&tdir.join("tape"), id.label, u.positions[i - held.start]);
+            }
+            tapes.insert(id.label, t);
+        }
+        tapes
+    })
+}
+
+/// The restore across tapes from scratch space (volume-format-v2.md §4.4):
+/// every slice is read into the scratch directory, then streamed from there
+/// into dar, which stops inside the last one. Each slice is still read whole
+/// from the scratch copy, checked, and the unit is complete.
+#[test]
+fn a_restore_across_tapes_checks_every_slice_dar_leaves_unread_in_scratch() {
+    let b = many_box();
+    let many = unit_of(&b["BCS02"], "many");
+    let n = many.slices;
+    let h = Heir::of_box(&[&b["BCS01"], &b["BCS02"]], 0);
+    let dest = h.sub("restored");
+    let key = h.key("alice");
+    let (code, text) = h.run_prompted(
+        &["--restore", "--key", &key, "--unit", "many", "--to", &dest],
+        |k, _| {
+            assert_eq!(k, 1, "one cartridge change");
+            h.load("BCS02");
+            Some(String::new())
+        },
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    let from_scratch = text
+        .split("Every slice of 'many' is in the scratch directory")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no streaming from scratch:\n{text}"));
+    assert_eq!(
+        from_scratch.matches("— from the scratch directory").count(),
+        n,
+        "{text}"
+    );
+    assert_eq!(
+        verified(from_scratch),
+        n,
+        "every slice checked as dar was fed:\n{text}"
+    );
+    assert!(text.contains(&many_checked("many")), "{text}");
+    let src = &unit_of(&b["BCS01"], "many").src;
+    assert!(same_tree(src, Path::new(&dest)), "{text}");
+    assert!(scratch_slices(&dest).is_none(), "the scratch is gone");
 }
