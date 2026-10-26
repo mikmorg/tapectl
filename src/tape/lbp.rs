@@ -24,10 +24,10 @@
 //! nothing else does. They work over [`PageControl`] and two closures, so
 //! every refusal and every restore is unit-tested without a drive.
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// The bytes of protection information LBP adds to a block: one RS-CRC.
@@ -724,10 +724,13 @@ pub fn clear_leftover(control: &dyn PageControl) -> Result<bool, String> {
 /// provoke the second refusal. One count for `TapeDevice` and for the test
 /// double that stands in for a drive (`store::MemStore`), so the two cannot
 /// count differently.
-#[derive(Debug, Clone, Default)]
+///
+/// The count is atomic, not a `Cell`, so a store holding it stays `Sync`
+/// (the test double sits in shared `static` harnesses); one thread writes.
+#[derive(Debug, Default)]
 pub struct CorruptBlocks {
     listed: Vec<u64>,
-    sent: Cell<u64>,
+    sent: AtomicU64,
 }
 
 impl CorruptBlocks {
@@ -735,14 +738,13 @@ impl CorruptBlocks {
     pub fn new(listed: &[u64]) -> Self {
         Self {
             listed: listed.to_vec(),
-            sent: Cell::new(0),
+            sent: AtomicU64::new(0),
         }
     }
 
     /// Count one more block sent; whether the hook corrupts it.
     pub fn next_block(&self) -> bool {
-        let sent = self.sent.get() + 1;
-        self.sent.set(sent);
+        let sent = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
         self.listed.contains(&sent)
     }
 }
