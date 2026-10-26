@@ -2306,3 +2306,14 @@ still being fed for a failure once that unread tail is larger than the pipe buff
      #497 and not damage, and give the way to a checked restore (`--slices-from`, which reads the
      slices to disk first, or tapectl's `restore unit --spool`). The kit is regenerated with the
      fixed tapectl when it is installed (its fourth file).
+     *Fact correction, 2026-10-26 (the coordinator):* `--slices-from` is not on keepsake's tapes.
+     It came with 1.3.0 (#480), and L6-0001 and L6-0002 carry 1.1.0's RESTORE.sh, which has no
+     option that reads a unit's slices to disk first while dar 2.7.9 or later is present. On those
+     tapes the checked way is tapectl: `restore unit --spool` in the operator's home, or for an heir
+     a new home's `init`, `catalog rebuild --from-volume --key` and `restore volume --key` (a
+     restore after a rebuild has no isolated catalogue and spools). 1.1.0's script still restores
+     such a unit whole: it prints dar's summary (0 failed) before the FATAL, and age authenticated
+     every byte dar read. Under `--all` it stops at that unit, so the heir restores the rest one
+     `--unit` at a time. The cover sheet and `docs/troubleshooting.md` say so, and offer
+     `--slices-from` only where `./RESTORE.sh --help` lists it. The ruling stands. Whether the
+     corrected premise changes the CTO's choice not to rewrite is put back to the CTO.
