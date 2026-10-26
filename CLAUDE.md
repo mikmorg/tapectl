@@ -136,7 +136,7 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23).
+  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23; 62 since #497 added `heir_big_catalogue`, GREEN 62/62 on 2026-10-26).
 
 Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
 set above, never as instructions.
@@ -328,15 +328,24 @@ the one prompt in `swap_loop` (stdin, no timeout, no device held); the rebuild's
 `rebuild::tape_split` and item 144's promotion in `promote_spanning_version`. `volume rewrite` and
 compaction refuse a range volume (`write::refuse_range_holder`, item 133). `audit` adds
 `span_in_progress` and four range invariants under `short_seal`; `report failed-stages` is #409's
-report (item 91). RESTORE.sh was re-pinned five times (three under item 135, once for the fresh
-read of File 1, once under item 145 for its damage handling; `1cd5a405…`), a pin covers
-the range block, and the 1.6.0 RESTORE.sh is a test fixture. The coordinator amended fork X12: a
+report (item 91). RESTORE.sh was re-pinned six times (three under item 135, once for the fresh
+read of File 1, once under item 145 for its damage handling, once under item 176 for #497;
+`25505925…`), a pin covers the range block, and the 1.6.0 RESTORE.sh is a test fixture. The coordinator amended fork X12: a
 whole unit a queued spannable unit pushes past the fill ceiling waits for the next tape, never
 refused (for the CTO, in the release notes). The gate's span leg (item 136), the chain and a fresh
 read of File 1 are done. Item 145 fixed RESTORE.sh's damage handling, which GitHub's Ubuntu 26 runner
 exposed: a `sha256sum` that quotes names had hidden damaged files from the list. By item 146 the
 real-drive proof (item 137, `scripts/span-acceptance.sh`, with a scratch build on home2) comes
-before the `v1.7.0` tag, and handoff (h) after it. Item 147 (#492) aligns item 94's start with its
+before the `v1.7.0` tag, and handoff (h) after it. Its first run (2026-10-25/26) passed steps 1a-4b
+and failed step 5 on #497: given the isolated catalogue (`-A`), `dar --sequential-read` stops before
+the archive's own trailing catalogue and exits 0, and RESTORE.sh's `stream_unit` (and tapectl's
+`stream_into_dar`) called a whole restore of a unit of many files a failure once that unread tail
+outgrew a pipe. Items 176-178: the fix ships in 1.7.0 (every slice is read to its end, authenticated
+and hashed, its plaintext dropped once dar is done, and dar's exit status decides;
+`SequentialExtract::status`, RESTORE.sh's `dar_reap`/`DAR_RC`), the proof runs again in full on a
+debug build of the fixed commit, and the tapes already written are not rewritten: the troubleshooting
+guide and the Heir Kit's cover sheet give the way (keepsake's tapes carry 1.1.0's RESTORE.sh, which
+has no `--slices-from`; item 178's fact correction). Item 147 (#492) aligns item 94's start with its
 own text in a 1.7.x patch.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP

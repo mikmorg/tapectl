@@ -481,6 +481,12 @@ contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step
 - **After a PASS:** the coordinator tags `v1.7.0` on the commit the build came from, and the
   install below follows. A FAIL leaves the cartridge as the failed step left it; read its run
   directory before anything writes it again.
+- **The first run (2026-10-25/26) failed at step 5** on #497 (steps 1a-4b passed): RESTORE.sh
+  restored the 135 GB unit identical to its source and then said `FATAL: dar extraction failed
+  (exit 0)`. The fix is in 1.7.0 (ADR-0012 items 176-178), and the proof **runs again in full**
+  with a new build of the fixed commit (item 177): the steps that passed are not carried over,
+  since step 4a re-initialised the cartridge and step 5 needs a tape 1 written with the fixed
+  RESTORE.sh. The coordinator copies the new build to home2 and gives the command.
 
 Then, on home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0`
 is tagged:
@@ -503,9 +509,10 @@ is tagged:
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive, as in (f)
    step 7. Stop the drive-poll timer for it.
 8. **Regenerate the Heir Kit** with the installed binary, as in (f) step 8. RESTORE.sh and File
-   1 moved, and once a span tape exists the kit's copy of tapectl must read it. The kit's
-   fourth file becomes `tapectl-1.7.0`; reprint COVER.txt and put the new files on the media in
-   each envelope.
+   1 moved, and once a span tape exists the kit's copy of tapectl must read it. The cover sheet
+   now says what `dar extraction failed (exit 0)` means on L6-0001 and L6-0002, whose RESTORE.sh
+   has #497, and how to restore them checked (ADR-0012 item 178). The kit's fourth file becomes
+   `tapectl-1.7.0`; reprint COVER.txt and put the new files on the media in each envelope.
 
 **Spanning stays off on home2 until its real-drive proof passes.** A config written before 1.7.0
 has no `allow_spanning`, and an absent key reads `false`: nothing to edit. The proof is
@@ -536,7 +543,8 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
     is then a CTO-ruled on-tape change with its own re-pin, and item 99 makes every write fill to
     the early warning with it.
 - **#478, spanning:** built as 1.7.0 (ADR-0012 items 76-77, 82-100 and 121-144; (h) above).
-  Its real-drive proof (item 137, `scripts/span-acceptance.sh`) is still to run, and the
+  Its real-drive proof (item 137, `scripts/span-acceptance.sh`) runs again after #497's fix
+  (item 177; the first run failed at step 5), and the
   residuals it left are listed in `docs/releases/1.7.0.md`, "Known open items".
 - **#479, the profiling toolkit:** built in 1.4.0: `scripts/lto-profile.sh` and
   `docs/lto-profiling.md`; its real-drive run is the same run as #420's (done 2026-10-20; the
