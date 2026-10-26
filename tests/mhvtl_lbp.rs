@@ -673,7 +673,9 @@ fn mhvtl_lbp_an_open_after_a_read_off_the_data_still_probes_the_drive() {
             .collect();
         eprintln!("{when}: plain reads at the end of data: {answers:?}");
         assert!(
-            answers.iter().all(|a| !a.starts_with(&format!("{FORMAT_BLOCK} "))),
+            answers
+                .iter()
+                .all(|a| !a.starts_with(&format!("{FORMAT_BLOCK} "))),
             "{when}: a plain read at the end of data returned a block: {answers:?}"
         );
     };
@@ -681,7 +683,10 @@ fn mhvtl_lbp_an_open_after_a_read_off_the_data_still_probes_the_drive() {
     run_off("before the read open");
     let mut store = TapeStore::open_read(&dev(), FORMAT_BLOCK).unwrap();
     match bits_for(false) {
-        Some(_) => cannot_carry("the read open after a read off the data", store.protection()),
+        Some(_) => cannot_carry(
+            "the read open after a read off the data",
+            store.protection(),
+        ),
         None => assert_eq!(store.protection(), Protection::NotApplicable),
     }
     assert_page_clear("while the read store that fell back holds the drive");
@@ -702,7 +707,10 @@ fn mhvtl_lbp_an_open_after_a_read_off_the_data_still_probes_the_drive() {
 
     run_off("before the write open");
     let store = TapeStore::open(&dev(), FORMAT_BLOCK, u64::MAX).unwrap();
-    cannot_carry("the write open after a read off the data", store.protection());
+    cannot_carry(
+        "the write open after a read off the data",
+        store.protection(),
+    );
     assert_page_clear("while the write store that fell back holds the drive");
     drop(store);
     assert_page_clear("after the write store closed");

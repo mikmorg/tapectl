@@ -4397,7 +4397,9 @@ mod tests {
             let rows = verify_status_rows(&conn, Some("V-ON")).unwrap();
             let t = verify_status_row_text(&rows[0]);
             assert!(
-                t.ends_with(&format!("checked/passed/failed); write check: no LBP ({note})")),
+                t.ends_with(&format!(
+                    "checked/passed/failed); write check: no LBP ({note})"
+                )),
                 "{t}"
             );
             conn.execute(
