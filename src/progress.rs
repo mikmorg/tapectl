@@ -533,6 +533,10 @@ fn stderr_clear() {
 /// Print one whole line on stderr, first clearing a drawn status line (the
 /// next tick redraws it below).
 pub fn stderr_println(line: &str) {
+    #[cfg(test)]
+    if heard::captured_stderr(line) {
+        return;
+    }
     let mut d = drawn();
     let mut err = io::stderr().lock();
     if *d {
@@ -984,6 +988,130 @@ pub fn log(msg: &str) {
     }
 }
 
+/// Tell the operator `line`: once on stderr ([`stderr_println`], whatever
+/// `[logging]` level is set) and once in the session log ([`log`]). Never
+/// also a `tracing` event for the same line: `main`'s subscriber prints
+/// every event at WARN and above on stderr and tees every one at INFO and
+/// above into the session log, so a line said both ways reached each twice
+/// (#388). A line for the session log alone is [`log`] alone.
+pub fn say(line: &str) {
+    stderr_println(line);
+    log(line);
+}
+
+/// What one run tells the operator, counted (#388: one print, one log line).
+/// Test-only: [`stderr_println`] hands its lines here while [`during`] runs.
+#[cfg(test)]
+pub(crate) mod heard {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    thread_local! {
+        static STDERR: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    /// Keep `line` when [`during`] is listening on this thread: `true` when
+    /// it took it, so nothing is printed.
+    pub(super) fn captured_stderr(line: &str) -> bool {
+        STDERR.with(|s| match s.borrow_mut().as_mut() {
+            Some(lines) => {
+                lines.push(line.to_string());
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// A `tracing` writer into memory.
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Buffer {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    /// Every line a run printed on stderr and wrote to its session log.
+    pub(crate) struct Heard {
+        pub(crate) stderr: Vec<String>,
+        pub(crate) log: Vec<String>,
+    }
+
+    impl Heard {
+        /// The lines holding `needle`: (on stderr, in the session log).
+        pub(crate) fn count(&self, needle: &str) -> (usize, usize) {
+            let n = |lines: &[String]| lines.iter().filter(|l| l.contains(needle)).count();
+            (n(&self.stderr), n(&self.log))
+        }
+    }
+
+    /// Run `f` on this thread as `main` runs a command, and return what it
+    /// told the operator: what [`super::stderr_println`] printed, what a
+    /// session opened in a temp home logged, and every `tracing` event
+    /// through a subscriber built as `main`'s is with no `[logging]` set
+    /// (WARN and above on stderr, INFO and above teed into the session log).
+    pub(crate) fn during<T>(f: impl FnOnce() -> T) -> (T, Heard) {
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{fmt, Layer};
+
+        let home = tempfile::TempDir::new().unwrap();
+        let on_stderr = Buffer::default();
+        let teed = Buffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer({
+                        let b = on_stderr.clone();
+                        move || b.clone()
+                    })
+                    .with_filter(LevelFilter::WARN),
+            )
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer({
+                        let b = teed.clone();
+                        move || b.clone()
+                    })
+                    .with_filter(LevelFilter::INFO),
+            );
+        STDERR.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        let session = super::start_session(Some(home.path()), "heard", super::Display::Off, false);
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let log_path = session.log_path().map(Path::to_path_buf);
+        drop(session);
+        let mut stderr = STDERR.with(|s| s.borrow_mut().take()).unwrap_or_default();
+        stderr.extend(on_stderr.lines());
+        let mut log: Vec<String> = log_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        log.extend(teed.lines());
+        (out, Heard { stderr, log })
+    }
+}
+
 /// Log a single blocking call that took at least [`WAIT_LOG_THRESHOLD`] —
 /// for calls too frequent to wrap in a [`wait`] each (one tape block).
 pub fn note_if_slow(what: &str, took: Duration) {
@@ -1211,6 +1339,34 @@ mod tests {
             let _ = t.join();
         }
         (s, out)
+    }
+
+    /// #388: `say` reaches stderr once and the session log once. The
+    /// positive control is the shape it replaced: the same line also traced
+    /// at WARN reaches each twice (main's stderr layer prints it, its file
+    /// layer tees it), and traced at INFO beside a log line reaches the log
+    /// twice; so a count of one is the harness seeing every path, not
+    /// missing one.
+    #[test]
+    fn say_is_one_print_and_one_log_line() {
+        let ((), heard) = heard::during(|| say("note: said once"));
+        assert_eq!(heard.count("note: said once"), (1, 1));
+
+        let ((), heard) = heard::during(|| {
+            let line = "note: said three ways";
+            tracing::warn!("{line}");
+            stderr_println(line);
+            log(line);
+        });
+        assert_eq!(heard.count("note: said three ways"), (2, 2));
+        let ((), heard) = heard::during(|| {
+            let line = "note: traced and logged";
+            tracing::info!("{line}");
+            log(line);
+        });
+        assert_eq!(heard.count("note: traced and logged"), (0, 2));
+        let ((), heard) = heard::during(|| log("note: logged"));
+        assert_eq!(heard.count("note: logged"), (0, 1));
     }
 
     #[test]
