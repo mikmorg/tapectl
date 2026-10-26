@@ -332,8 +332,10 @@ only ciphertext.
       to home2. A debug build stages the 100 GB unit at about 3.9 MiB/s (1.6.0's run), about 7
       hours; a release build is faster.
 - [ ] `--work` on a disk with about 4 x the unit free (the copy, its staging, the restore's
-      scratch and the restored tree): on home2 a new directory on acache. `~/.cache` (/srv/home)
-      has about 80 GB and is refused.
+      scratch and the restored tree): on home2 a new, empty directory on acache. `/srv/acache` is
+      root's, so make it first: `sudo install -d -o mikmorg -g ultimate -m 750
+      /srv/acache/tapectl-span-$(date +%Y%m%d)` (the script refuses a `--work` it cannot create).
+      `~/.cache` (/srv/home) has about 80 GB and is refused.
 - [ ] The dar on `PATH` is 2.7.9 or later (home2's `/usr/local/bin/dar` is 2.7.21); RESTORE.sh
       restores a unit across tapes only with it.
 - [ ] EW7VWMVKF6 loaded; `sudo systemctl stop tapectl-drive-poll.timer`; nothing else uses the
