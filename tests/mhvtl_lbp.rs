@@ -432,13 +432,14 @@ fn mhvtl_lbp_protected_writes_read_back_and_the_heir_reads_them_plain() {
     assert_page_clear("after the heir's reads");
 }
 
-/// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (F5): one block goes to the drive with a
+/// `TAPECTL_TEST_LBP_CORRUPT_BLOCK=n` (F5; the hook takes a list, here of one):
+/// one block goes to the drive with a
 /// CRC bit flipped, the drive refuses it, and the store says so as
 /// [`TapectlError::LbpRefusal`]. Then the steps item 174's retry takes, at
 /// the store: the drive's position (READ POSITION) names the file holding the
 /// first block it did not take, the store returns to that file's planned
 /// start, and the files from there are written again with true CRCs (the
-/// hook fires once per open), which the drive takes. Every file reads back.
+/// one listed block is past), which the drive takes. Every file reads back.
 /// The session's own retry over these steps is unit-tested in
 /// `volume::session`; this proves the drive and st give it what it relies
 /// on.

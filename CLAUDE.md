@@ -377,7 +377,8 @@ session writes on once from the planned start of the file holding the drive's po
 arms LBP_R only for a confirm, `session::arm_read_check_for_confirm`), decided by R1 on home2.
 Output: `volume info`'s Write check line, `report verify-status`, `drive status`'s LBP page; the
 Heir Kit's sheet says a power cycle clears a page left armed. The test hook
-`TAPECTL_TEST_LBP_CORRUPT_BLOCK` (F5) corrupts one block per open and refuses an unarmed one.
+`TAPECTL_TEST_LBP_CORRUPT_BLOCK=n1[,n2…]` (F5, `lbp::CorruptBlocks`) corrupts each listed block
+write since the open, re-sent ones too, and refuses an unarmed open.
 mhvtl cannot carry 524,292 bytes in one command, so the gate's TD8 drive always falls back
 (`lbp_fallback_recorded`, `lbp_page_clear_after_every_command`) and `tests/mhvtl_lbp.rs`
 (`rust_lbp`) proves the path on a TD6 at a 262,144-byte payload, named by `TAPECTL_GATE_TAPE_TD6`.
