@@ -281,11 +281,10 @@ pub struct TapeDevice {
     /// The last st operation was a block write: the close writes the
     /// filemark st's own close would, before it clears the page (§4.3).
     pending_data: Cell<bool>,
-    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5): the block write, counted
-    /// from 1 since the open, whose CRC gets one bit flipped.
-    corrupt_block: Option<u64>,
-    /// Block writes sent since the open, for [`Self::corrupt_block`].
-    blocks_sent: Cell<u64>,
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5): the block writes,
+    /// counted from 1 since the open (re-sent ones too), whose CRC gets one
+    /// bit flipped. Empty unless the hook is set.
+    corrupt: lbp::CorruptBlocks,
     /// A test's record of every `MTIOCTOP` this device issues, in order,
     /// beside the page commands of a recording page control (§4.3's close
     /// order). `None` on every open: only a test over a plain file sets it.
@@ -425,8 +424,7 @@ impl TapeDevice {
             protection: Protection::NotApplicable,
             st_block: block_size,
             pending_data: Cell::new(false),
-            corrupt_block: None,
-            blocks_sent: Cell::new(0),
+            corrupt: lbp::CorruptBlocks::default(),
             op_log: None,
         };
         dev.set_block_size(block_size)?;
@@ -639,11 +637,12 @@ impl TapeDevice {
 
     /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK` (#388, F5; read and announced by
     /// `store::TapeStore::open`, which refuses it on an open that is not
-    /// write-armed): the `n`th block write since this open, counted from 1,
-    /// goes to the drive with one bit of its CRC flipped, so the drive
-    /// refuses it as it refuses a block damaged on the way.
-    pub fn fake_lbp_corrupt_block(&mut self, n: u64) {
-        self.corrupt_block = Some(n);
+    /// write-armed): each listed block write since this open, counted from 1
+    /// with every re-sent block counted too ([`lbp::CorruptBlocks`]), goes
+    /// to the drive with one bit of its CRC flipped, so the drive refuses it
+    /// as it refuses a block damaged on the way.
+    pub fn fake_lbp_corrupt_blocks(&mut self, blocks: &[u64]) {
+        self.corrupt = lbp::CorruptBlocks::new(blocks);
     }
 
     /// The block size reads and writes use (0: variable-block mode).
@@ -896,9 +895,7 @@ impl TapeDevice {
             }
             if protect {
                 lbp::protect(&mut buf);
-                let sent = self.blocks_sent.get() + 1;
-                self.blocks_sent.set(sent);
-                if self.corrupt_block == Some(sent) {
+                if self.corrupt.next_block() {
                     // The test hook: one CRC bit flipped (F5).
                     buf[wire - 1] ^= 0x01;
                 }
@@ -1777,8 +1774,7 @@ mod density_tests {
             protection: Protection::NotApplicable,
             st_block: block_size,
             pending_data: Cell::new(false),
-            corrupt_block: None,
-            blocks_sent: Cell::new(0),
+            corrupt: lbp::CorruptBlocks::default(),
             op_log: None,
         }
     }
@@ -1981,7 +1977,7 @@ mod density_tests {
         let source = vec![7u8; 3 * bs];
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let (mut dev, _page, _log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
-        dev.fake_lbp_corrupt_block(2);
+        dev.fake_lbp_corrupt_blocks(&[2]);
         dev.write_blocks(
             &mut io::Cursor::new(&source),
             source.len() as u64,
@@ -1998,6 +1994,37 @@ mod density_tests {
             .map(|r| lbp::check(r).is_ok())
             .collect();
         assert_eq!(checks, [true, false, true]);
+    }
+
+    /// The coordinator's 388b addition 2: the hook takes a list, and counts
+    /// every block the open sends, re-sent ones too. Blocks 2 and 5 of an
+    /// open that writes three blocks, then sends the last two again (as
+    /// item 174's retry sends its file again on the same open): the second
+    /// number lands on a re-sent block.
+    #[test]
+    fn the_corrupt_block_hook_counts_re_sent_blocks() {
+        let bs = 64usize;
+        let source: Vec<u8> = (0..3 * bs).map(|i| (i / bs) as u8 + 1).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (mut dev, _page, _log) = device_over_armed(tmp.reopen().unwrap(), bs, lbp::LBP_W);
+        dev.fake_lbp_corrupt_blocks(&[2, 5]);
+        for part in [&source[..], &source[bs..]] {
+            dev.write_blocks(
+                &mut io::Cursor::new(part),
+                part.len() as u64,
+                &mut EarlyWarningState::default(),
+                &mut None,
+            )
+            .unwrap();
+        }
+        let on_wire = std::fs::read(tmp.path()).unwrap();
+        let checks: Vec<bool> = on_wire
+            .chunks(bs + 4)
+            .map(|r| lbp::check(r).is_ok())
+            .collect();
+        assert_eq!(checks, [true, false, true, true, false]);
+        let payloads: Vec<u8> = on_wire.chunks(bs + 4).map(|r| r[0]).collect();
+        assert_eq!(payloads, [1, 2, 3, 2, 3], "the data itself is untouched");
     }
 
     /// §4.3: the close of an armed device after a block write: the

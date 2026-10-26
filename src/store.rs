@@ -2203,20 +2203,22 @@ fn test_early_warning_announcement(device: &str, at: u64) -> Vec<String> {
 }
 
 /// The test hook's environment variable (#388, F5): a write store whose
-/// `n`th block write since it opened goes to the drive with one bit of its
-/// Logical Block Protection CRC flipped.
+/// listed block writes since it opened (`n1[,n2…]`) go to the drive with one
+/// bit of their Logical Block Protection CRC flipped.
 pub const TEST_LBP_CORRUPT_BLOCK: &str = "TAPECTL_TEST_LBP_CORRUPT_BLOCK";
 
 /// The ONE place `TAPECTL_TEST_LBP_CORRUPT_BLOCK` is read (#388, F5), by
 /// [`TapeStore::open`], the write store's open. `None` when unset.
 ///
-/// **What it does.** The `n`th block write since the store opened (from 1)
-/// goes to the drive with one bit of its CRC flipped
-/// (`TapeDevice::fake_lbp_corrupt_block`), so the drive refuses it exactly as
-/// it refuses a block damaged between tapectl and the drive, and the write
-/// session meets the refusal as it meets a real one (ADR-0012 item 174: one
-/// retry, then `interrupted`). How the gate and the real-drive acceptance
-/// provoke a refusal.
+/// **What it does.** Each listed block write since the store opened (from
+/// 1, comma-separated: `n` or `n1,n2,…`) goes to the drive with one bit of
+/// its CRC flipped (`TapeDevice::fake_lbp_corrupt_blocks`), so the drive
+/// refuses it exactly as it refuses a block damaged between tapectl and the
+/// drive, and the write session meets the refusal as it meets a real one
+/// (ADR-0012 item 174: one retry, then `interrupted`). Every block sent
+/// counts, re-sent ones too ([`crate::tape::lbp::CorruptBlocks`]), so a
+/// second number can land inside the retry and provoke the second refusal.
+/// How the gate and the real-drive acceptance provoke a refusal.
 ///
 /// **Why it is safe in a production build** (a runtime check, as
 /// [`TEST_EARLY_WARNING_AT`] is):
@@ -2232,29 +2234,41 @@ fn test_lbp_corrupt_block_from_env() -> Option<String> {
 }
 
 /// The hook's decision for one open (#388, F5): `raw` is its value, if set,
-/// and `protection` what the open decided. `Ok(None)` unset; the block number
-/// and the lines to announce when it applies; an error when the value is not
-/// a block count from 1, or the open is not write-armed.
+/// and `protection` what the open decided. `Ok(None)` unset; the block
+/// numbers and the lines to announce when it applies; an error when the
+/// value is not a list of block counts from 1, or the open is not
+/// write-armed.
 fn lbp_corrupt_hook(
     raw: Option<&str>,
     protection: &Protection,
     device: &str,
-) -> std::result::Result<Option<(u64, Vec<String>)>, String> {
+) -> std::result::Result<Option<(Vec<u64>, Vec<String>)>, String> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let digits = raw.trim();
-    let n = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| digits.parse::<u64>().ok())
-        .flatten()
-        .filter(|n| *n >= 1)
+    let blocks = raw
+        .split(',')
+        .map(|part| {
+            let digits = part.trim();
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+                .filter(|n| *n >= 1)
+        })
+        .collect::<Option<Vec<u64>>>()
         .ok_or_else(|| {
             format!(
-                "{TEST_LBP_CORRUPT_BLOCK}={raw:?} is not a block number: give the block write, \
-                 counted from 1 since the drive opened, whose CRC the test hook corrupts, in \
-                 plain decimal digits, or unset it"
+                "{TEST_LBP_CORRUPT_BLOCK}={raw:?} is not a list of block numbers: give the \
+                 block writes, counted from 1 since the drive opened (re-sent blocks too), \
+                 whose CRC the test hook corrupts, in plain decimal digits separated by \
+                 commas, or unset it"
             )
         })?;
+    let n = blocks
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     if !protection.writes_checked() {
         let why = match protection {
             Protection::Unavailable(reason) => reason.clone(),
@@ -2267,12 +2281,12 @@ fn lbp_corrupt_hook(
         ));
     }
     Ok(Some((
-        n,
+        blocks,
         vec![
             format!(
-                "warning: {TEST_LBP_CORRUPT_BLOCK}={n} is set: block write {n} since {device} \
-                 opened goes to the drive with one bit of its Logical Block Protection CRC \
-                 flipped, so the drive refuses it."
+                "warning: {TEST_LBP_CORRUPT_BLOCK}={n} is set: block write(s) {n} since {device} \
+                 opened go to the drive with one bit of their Logical Block Protection CRC \
+                 flipped, so the drive refuses each. Every block sent counts, re-sent ones too."
             ),
             "warning: this is a TEST hook. It changes no byte of the data, but it makes the \
              drive refuse a write, which the session retries once. Never set it for a real \
@@ -2319,13 +2333,13 @@ impl TapeStore {
             device,
         )
         .map_err(TapectlError::Other)?;
-        if let Some((n, lines)) = corrupt {
+        if let Some((blocks, lines)) = corrupt {
             for line in lines {
                 tracing::warn!("{line}");
                 crate::progress::stderr_println(&line);
                 crate::progress::log(&line);
             }
-            dev.fake_lbp_corrupt_block(n);
+            dev.fake_lbp_corrupt_blocks(&blocks);
         }
         if let Some(at) = test_early_warning_at_from_env() {
             let at = at.map_err(TapectlError::Other)?;
@@ -2679,6 +2693,8 @@ pub struct MemStore {
     protection: Protection,
     /// The refusals a test set, each answered once ([`LbpRefusalAt`]).
     lbp_refusals: Vec<LbpRefusalAt>,
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK`'s double ([`Self::with_lbp_corrupt_blocks`]).
+    lbp_corrupt: crate::tape::lbp::CorruptBlocks,
     /// Where the last refusal left the drive, until the next reposition.
     refused_at: Option<u64>,
     /// [`Store::arm_read_check`] was asked (item 175).
@@ -2866,6 +2882,7 @@ impl MemStore {
             warning: EarlyWarningState::default(),
             protection: Protection::NotApplicable,
             lbp_refusals: Vec::new(),
+            lbp_corrupt: crate::tape::lbp::CorruptBlocks::default(),
             refused_at: None,
             read_check_armed: false,
         }
@@ -2882,6 +2899,16 @@ impl MemStore {
     /// can be set; each is answered by the write of its `surfaces_in` file.
     pub fn with_lbp_refusal(mut self, at: LbpRefusalAt) -> Self {
         self.lbp_refusals.push(at);
+        self
+    }
+
+    /// `TAPECTL_TEST_LBP_CORRUPT_BLOCK=n1[,n2…]` as a drive answers it
+    /// (#388, F5): the store counts its block writes from 1 as
+    /// `TapeDevice` does, re-sent blocks too ([`crate::tape::lbp::CorruptBlocks`]),
+    /// and refuses each listed one as mhvtl refuses a bad CRC — at once, in
+    /// the write of its own file, the position at the refused block.
+    pub fn with_lbp_corrupt_blocks(mut self, blocks: &[u64]) -> Self {
+        self.lbp_corrupt = crate::tape::lbp::CorruptBlocks::new(blocks);
         self
     }
 
@@ -3009,6 +3036,14 @@ impl Store for MemStore {
             }
             block[want..].fill(0);
             read += want as u64;
+            if self.lbp_corrupt.next_block() {
+                // The hook's double: the drive refuses this block, and the
+                // file never lands.
+                let at = LbpRefusalAt::deferred(index, file.len() as u64 / bs as u64, index);
+                self.refused_at = Some(at.position(self.objects_before(index as usize)));
+                self.end.moved();
+                return Err(at.error());
+            }
             let (end, hard_end) = (&mut self.end, self.enospc_after_bytes);
             write_block_retrying(
                 |b| {
@@ -3651,7 +3686,7 @@ mod tests {
         let (n, lines) = lbp_corrupt_hook(Some(" 3 "), &armed, "/dev/nstX")
             .unwrap()
             .unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, vec![3u64]);
         let said = lines.join("\n");
         for want in [
             "TAPECTL_TEST_LBP_CORRUPT_BLOCK=3 is set",
@@ -3665,6 +3700,19 @@ mod tests {
             let err = lbp_corrupt_hook(Some(bad), &armed, "/dev/nstX").unwrap_err();
             assert!(err.contains(TEST_LBP_CORRUPT_BLOCK), "{bad:?}: {err}");
         }
+        // The coordinator's 388b addition 2: a list, announced whole.
+        let (n, lines) = lbp_corrupt_hook(Some("3, 7"), &armed, "/dev/nstX")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, vec![3u64, 7]);
+        let said = lines.join("\n");
+        assert!(said.contains("TAPECTL_TEST_LBP_CORRUPT_BLOCK=3,7 is set"), "{said}");
+        assert!(said.contains("re-sent ones too"), "{said}");
+        for bad in ["3,", ",3", "3,,7", "3,0", "3;7", "3 7"] {
+            let err = lbp_corrupt_hook(Some(bad), &armed, "/dev/nstX").unwrap_err();
+            assert!(err.contains("not a list of block numbers"), "{bad:?}: {err}");
+        }
+        assert!(lbp_corrupt_hook(Some("3,7"), &Protection::NotApplicable, "/dev/nstX").is_err());
         let err = lbp_corrupt_hook(
             Some("3"),
             &Protection::Unavailable("st cannot carry it".into()),
