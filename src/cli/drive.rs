@@ -29,6 +29,7 @@ use crate::staging::lock::{self, DriveLockState};
 use crate::tape::contact::{ContactSite, Medium, Operation, OUTCOME_FAILED, OUTCOME_OK};
 use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::ioctl::{self, CartridgeState, TapeNodeStatus};
+use crate::tape::lbp;
 use crate::tape::mam::{self, MamInfo, MamRead};
 use crate::tape::mam_journal::Hook;
 use crate::tape::poll::{self, PollReport, Probe};
@@ -494,6 +495,28 @@ pub struct DriveFacts {
     pub declared_generation: Option<String>,
     /// The SCSI generic node the identity and the chip were read through.
     pub device_sg: Option<String>,
+    /// The drive's Logical Block Protection page (#388, F8), read by one
+    /// MODE SENSE. `None` when it could not be read: the tape node did not
+    /// answer (a held or busy drive is sent nothing), no sg node is bound to
+    /// it, sg3-utils is missing, or the drive has no such page.
+    pub lbp_page: Option<LbpPageFacts>,
+}
+
+/// What `drive status`'s one MODE SENSE of the Control Data Protection page
+/// (0Ah/F0h) found (#388, F8). tapectl arms the page only inside its own
+/// exclusive open of the tape node and clears it before closing (ADR-0012
+/// item 164), and the status reads it only through a node that just
+/// answered — which no other program had open — so a page that reads armed
+/// is a leftover: a tapectl that crashed or was killed, or a hand-run
+/// `sg_wr_mode`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LbpPageFacts {
+    /// The sg node it was read through: the one the kernel binds to the
+    /// tape node (sysfs; F13), which is the node tapectl's next open of the
+    /// drive clears it on.
+    pub node: String,
+    /// Either check (LBP_W, LBP_R) is on.
+    pub armed: bool,
 }
 
 /// The st driver's answer for the tape node.
@@ -639,6 +662,9 @@ pub struct StatusProbe {
     pub mam: Option<MamRead>,
     pub identity: Option<DriveIdentity>,
     pub holders: Option<Vec<Holder>>,
+    /// The Logical Block Protection page's control; `None` asks the sg node
+    /// the kernel binds to the tape node ([`lbp::control_for`]).
+    pub lbp_page: Option<Box<dyn lbp::PageControl>>,
 }
 
 /// Look at the drive `device` names. Never fails: what could not be learned
@@ -652,7 +678,10 @@ pub struct StatusProbe {
 /// that answered `MTIOCGET` with a ready cartridge is asked for the chip
 /// (READ ATTRIBUTE) and the drive for its identity (sysfs, and INQUIRY only
 /// if sysfs has no serial): both are commands the drive answers without
-/// moving the medium, and the one a poll sends too.
+/// moving the medium, and the one a poll sends too. A node that answered is
+/// also asked for its Logical Block Protection page (#388, F8: one MODE
+/// SENSE, which neither moves the medium nor changes the page), so a page a
+/// crashed tapectl left armed is reported, never cleared.
 ///
 /// Nothing is written: no contact, no journal row. A contact is "a time a
 /// cartridge was in a drive" and exists to carry readings that must be
@@ -773,6 +802,23 @@ pub fn status(
         report.drive.vendor = identity.vendor;
         report.drive.model = identity.model;
         report.drive.firmware = identity.firmware_rev;
+        // The Logical Block Protection page (#388, F8): one MODE SENSE,
+        // `tape::lbp`'s pinned `sg_modes` read, on the sg node the kernel
+        // binds to this tape node — the one tapectl's opens arm and clear
+        // (F13), never config's `device_sg`. Nothing is selected: a leftover
+        // is reported, not cleared. A page that cannot be read says nothing,
+        // and is never an error.
+        let control = probe.lbp_page.or_else(|| {
+            lbp::control_for(device).map(|c| Box::new(c) as Box<dyn lbp::PageControl>)
+        });
+        if let Some(control) = control {
+            if let Ok(page) = control.sense() {
+                report.drive.lbp_page = Some(LbpPageFacts {
+                    node: control.node().to_string(),
+                    armed: page.is_armed(),
+                });
+            }
+        }
     }
     if chip_allowed {
         let read = match (probe.mam, &sg) {
@@ -1068,6 +1114,11 @@ fn render_status(report: &StatusReport, json_output: bool) {
     print!("{}", status_text(report));
 }
 
+/// The st block size a tapectl open sets while LBP is armed: the format's
+/// 512 KiB block and the 4-byte CRC (#388). A status that finds it beside a
+/// leftover armed page says what it is (plan R13).
+const LBP_WIRE_BLOCK: i64 = (crate::cli::volume::DEFAULT_BLOCK_SIZE + lbp::CRC_LEN) as i64;
+
 /// The human form of a status.
 pub fn status_text(report: &StatusReport) -> String {
     use std::fmt::Write;
@@ -1211,6 +1262,36 @@ pub fn status_text(report: &StatusReport) -> String {
                 },
                 n.error.as_deref().unwrap_or("not probed")
             );
+        }
+    }
+    // The Logical Block Protection page (#388, F8).
+    if let Some(p) = &report.drive.lbp_page {
+        if p.armed {
+            let _ = writeln!(
+                out,
+                "  LBP page:  ARMED ({}), and no program has the tape node open: a tapectl that \
+                 crashed or was killed, or a hand-run sg_wr_mode, left it so",
+                p.node
+            );
+            let _ = writeln!(
+                out,
+                "             until it is cleared, a reader that is not LBP-aware (RESTORE.sh, \
+                 dd) gets I/O errors (EIO) from this drive, never wrong data"
+            );
+            let _ = writeln!(
+                out,
+                "             the next tapectl command that opens a tape in this drive clears \
+                 it, and so does a power cycle (`drive status` and `drive eject` do not)"
+            );
+            if n.block_size == Some(LBP_WIRE_BLOCK) {
+                let _ = writeln!(
+                    out,
+                    "             st's block size of {LBP_WIRE_BLOCK} bytes is a 512 KiB block \
+                     and LBP's 4-byte CRC; tapectl's next open sets it back"
+                );
+            }
+        } else {
+            let _ = writeln!(out, "  LBP page:  not armed ({})", p.node);
         }
     }
     // The chip and what the catalog makes of it.
@@ -2050,6 +2131,7 @@ mod tests {
     }
     // ── `drive status` (issue #428) ─────────────────────────────────────────
 
+    use crate::tape::lbp::fake::{FakePage, HP_PAGE};
     use crate::tape::mtget_journal::MtStatus;
     use std::os::unix::process::ExitStatusExt;
 
@@ -2139,6 +2221,8 @@ mod tests {
                 mam,
                 identity: Some(hp_drive()),
                 holders: Some(Vec::new()),
+                // A drive whose LBP page is clear, as tapectl leaves it.
+                lbp_page: Some(Box::new(FakePage::new(&HP_PAGE))),
             },
         )
     }
@@ -2349,6 +2433,7 @@ mod tests {
             mam: Some(mam_read(Some(mam::tests_support::LTO6_SAMPLE))),
             identity: Some(hp_drive()),
             holders: Some(vec![holder.clone()]),
+            lbp_page: None, // never asked: the node is not read either way
         };
         let held = status(
             &conn,
@@ -2518,6 +2603,9 @@ mod tests {
                 mam: None,
                 identity: Some(hp_drive()),
                 holders: Some(Vec::new()),
+                // The real lookup: no sg node is bound to a path that is no
+                // tape node, so nothing is sent.
+                lbp_page: None,
             },
         );
         assert_eq!(r.backend, None);
@@ -2528,6 +2616,200 @@ mod tests {
             "{:?}",
             r.notes
         );
+        assert_eq!(r.drive.lbp_page, None, "no sg node, so no LBP page read");
+    }
+
+    // ── `drive status` and the LBP page (#388, F8) ──────────────────────────
+
+    /// The HP page as a crashed tapectl leaves it: Reed-Solomon (01h),
+    /// length 4, LBP_W and LBP_R on.
+    const ARMED_PAGE: [u8; 8] = [0x4a, 0xf0, 0x00, 0x04, 0x01, 0x04, 0xc0, 0x00];
+
+    /// A status like [`look`]'s, with the lock state and the page given; the
+    /// page is shared, so its call log is the test's to read.
+    fn look_at_page(
+        conn: &Connection,
+        lock: DriveLockState,
+        node: std::io::Result<TapeNodeStatus>,
+        page: &FakePage,
+    ) -> StatusReport {
+        let home = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        status(
+            conn,
+            &paths,
+            DEVICE,
+            Some(&lto6_backend()),
+            StatusProbe {
+                drive_lock: Some(lock),
+                node: Some(node),
+                mam: Some(mam_read(None)),
+                identity: Some(hp_drive()),
+                holders: Some(Vec::new()),
+                lbp_page: Some(Box::new(page.clone())),
+            },
+        )
+    }
+
+    /// F8: a page left armed is reported plainly — what it does to a reader
+    /// that is not LBP-aware, and what clears it — by one MODE SENSE and no
+    /// select (a status reports, it never clears). Exit 0: an answer. With
+    /// st left at the wire block size, that is named too (plan R13).
+    #[test]
+    fn a_leftover_armed_page_is_reported_with_what_it_does_and_what_clears_it() {
+        let conn = crate::db::open_memory().unwrap();
+        let page = FakePage::new(&ARMED_PAGE);
+        let r = look_at_page(
+            &conn,
+            DriveLockState::Free,
+            node(GMT_BOT | GMT_ONLINE),
+            &page,
+        );
+        assert_eq!(
+            r.drive.lbp_page,
+            Some(LbpPageFacts {
+                node: "/dev/sg-fake".into(),
+                armed: true,
+            })
+        );
+        assert_eq!(page.ops(), ["sense"], "one MODE SENSE, nothing selected");
+        assert_eq!(page.current(), ARMED_PAGE, "reported, never cleared");
+        assert_eq!(status_exit_code(&r), 0, "a leftover is an answer");
+        let text = status_text(&r);
+        for needle in [
+            "LBP page:  ARMED (/dev/sg-fake), and no program has the tape node open",
+            "a reader that is not LBP-aware (RESTORE.sh, dd) gets I/O errors (EIO)",
+            "never wrong data",
+            "the next tapectl command that opens a tape in this drive clears it",
+            "a power cycle",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("block size of"), "st at 524288: {text}");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["drive"]["lbp_page"],
+            serde_json::json!({"node": "/dev/sg-fake", "armed": true})
+        );
+
+        let wire = Ok(TapeNodeStatus {
+            raw: MtStatus {
+                mt_gstat: GMT_BOT | GMT_ONLINE,
+                mt_dsreg: 0x5a00_0000 | 524_292,
+                ..MtStatus::default()
+            },
+        });
+        let text = status_text(&look_at_page(&conn, DriveLockState::Free, wire, &page));
+        assert!(text.contains("st's block size of 524292 bytes"), "{text}");
+    }
+
+    /// A clear page reads "not armed"; a page that cannot be read (a drive
+    /// without it, sg3-utils missing, no sg node bound) says nothing about
+    /// LBP at all — no line, no note, no JSON value — and is never an
+    /// error.
+    #[test]
+    fn a_clear_page_reads_not_armed_and_one_that_cannot_be_read_says_nothing() {
+        let conn = crate::db::open_memory().unwrap();
+        let clear = FakePage::new(&HP_PAGE);
+        let ok = look_at_page(
+            &conn,
+            DriveLockState::Free,
+            node(GMT_BOT | GMT_ONLINE),
+            &clear,
+        );
+        assert_eq!(
+            ok.drive.lbp_page,
+            Some(LbpPageFacts {
+                node: "/dev/sg-fake".into(),
+                armed: false,
+            })
+        );
+        let text = status_text(&ok);
+        assert!(text.contains("LBP page:  not armed (/dev/sg-fake)"), "{text}");
+        assert!(!text.contains("ARMED"), "{text}");
+
+        for e in [
+            lbp::PageError::IllegalRequest("sg_modes exited 5: ILLEGAL REQUEST".into()),
+            lbp::PageError::Spawn("sg_modes could not be run: No such file or directory".into()),
+        ] {
+            let page = FakePage::new(&ARMED_PAGE);
+            page.fail_sense(e.clone());
+            let r = look_at_page(
+                &conn,
+                DriveLockState::Free,
+                node(GMT_BOT | GMT_ONLINE),
+                &page,
+            );
+            assert_eq!(page.ops(), ["sense"], "{e:?}: it was asked");
+            assert_eq!(r.drive.lbp_page, None, "{e:?}");
+            assert!(!status_text(&r).contains("LBP"), "{e:?}: {}", status_text(&r));
+            assert_eq!(r.notes, ok.notes, "{e:?}: no note");
+            assert_eq!(status_exit_code(&r), 0, "{e:?}");
+            assert!(serde_json::to_value(&r).unwrap()["drive"]["lbp_page"].is_null());
+        }
+
+        // No sg node bound to the tape node: the real lookup, of a path
+        // that is no tape node, finds none and sends nothing.
+        let home = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        let r = status(
+            &conn,
+            &paths,
+            DEVICE,
+            Some(&lto6_backend()),
+            StatusProbe {
+                drive_lock: Some(DriveLockState::Free),
+                node: Some(node(GMT_BOT | GMT_ONLINE)),
+                mam: Some(mam_read(None)),
+                identity: Some(hp_drive()),
+                holders: Some(Vec::new()),
+                lbp_page: None,
+            },
+        );
+        assert_eq!(r.tape_node.probe, NodeProbe::Read, "the node answered");
+        assert_eq!(r.drive.lbp_page, None);
+        assert!(!status_text(&r).contains("LBP"), "{}", status_text(&r));
+    }
+
+    /// The safety order holds for the page as for the chip: a drive a
+    /// tapectl command holds (whose page is armed on purpose), a node open
+    /// in another process and a node that does not answer are sent no MODE
+    /// SENSE. Positive control: the same page through a node that answered
+    /// is read.
+    #[test]
+    fn a_held_busy_or_absent_drive_is_sent_no_mode_sense() {
+        let conn = crate::db::open_memory().unwrap();
+        let page = FakePage::new(&ARMED_PAGE);
+        let held = look_at_page(
+            &conn,
+            DriveLockState::Held,
+            node(GMT_BOT | GMT_ONLINE),
+            &page,
+        );
+        assert_eq!(held.tape_node.probe, NodeProbe::SkippedDriveHeld);
+        let busy = look_at_page(&conn, DriveLockState::Free, errno(nix::libc::EBUSY), &page);
+        assert_eq!(busy.tape_node.probe, NodeProbe::InUse);
+        let absent = look_at_page(
+            &conn,
+            DriveLockState::Free,
+            errno(nix::libc::ENOENT),
+            &page,
+        );
+        assert_eq!(absent.tape_node.probe, NodeProbe::Absent);
+        for r in [&held, &busy, &absent] {
+            assert_eq!(r.drive.lbp_page, None, "{:?}", r.tape_node.probe);
+            assert!(!status_text(r).contains("LBP"), "{}", status_text(r));
+        }
+        assert!(page.ops().is_empty(), "nothing sent: {:?}", page.ops());
+
+        let free = look_at_page(
+            &conn,
+            DriveLockState::Free,
+            node(GMT_BOT | GMT_ONLINE),
+            &page,
+        );
+        assert_eq!(free.drive.lbp_page.map(|p| p.armed), Some(true));
+        assert_eq!(page.ops(), ["sense"]);
     }
 
     // ── `drive eject` (issue #429) ──────────────────────────────────────────
