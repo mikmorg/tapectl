@@ -6783,6 +6783,17 @@ mod tests {
                 volume_of(label, &[(unit, files, slice_size)], catalogue)
             }
 
+            /// [`multi`] with `dar_args` added to its `dar -c`.
+            pub(crate) fn multi_with(
+                label: &str,
+                unit: &str,
+                files: &[(&str, Vec<u8>)],
+                slice_size: &str,
+                dar_args: &[&str],
+            ) -> Multi {
+                volume_with(label, &[(unit, files, slice_size)], true, dar_args)
+            }
+
             /// [`multi`] for several units, one after another on the tape
             /// in the order given (slices of the first from [`FIRST`]),
             /// each its own unit, snapshot v1, stage set and completed
@@ -6790,6 +6801,16 @@ mod tests {
             /// in miniature. [`Multi::files`] / [`Multi::cipher_lens`]
             /// describe the FIRST unit; [`Multi::units`] every unit.
             pub(crate) fn volume_of(label: &str, units: &[UnitSpec<'_>], catalogue: bool) -> Multi {
+                volume_with(label, units, catalogue, &[])
+            }
+
+            /// [`volume_of`], with `dar_args` added to every unit's `dar -c`.
+            fn volume_with(
+                label: &str,
+                units: &[UnitSpec<'_>],
+                catalogue: bool,
+                dar_args: &[&str],
+            ) -> Multi {
                 let conn = crate::db::open_memory().unwrap();
                 let home = TempDir::new().unwrap();
                 let paths = TapectlPaths::new(home.path().join(".tapectl"));
@@ -6878,6 +6899,7 @@ mod tests {
                         .arg("-s")
                         .arg(slice_size)
                         .arg("-Q")
+                        .args(dar_args)
                         .output()
                         .unwrap();
                     assert!(
@@ -6960,7 +6982,7 @@ mod tests {
         }
 
         mod streaming {
-            use super::multi::{multi, noise, Multi, Spot, FIRST};
+            use super::multi::{multi, multi_with, noise, Multi, Spot, FIRST};
             use super::record::only_row;
             use super::*;
             use crate::tape::fake::Op;
@@ -7050,6 +7072,27 @@ mod tests {
             // stopped reading slice N"), and a slice dar never opened ("dar
             // stopped before it read slice N"), over a unit restored whole. A
             // unit needs many files for that: 2000 here, with long names.
+            //
+            // The archives here carry no filesystem-specific attributes
+            // (`--fsa-scope none`): dar 2.7.13 reading some archives through
+            // FIFOs misreads a file's FSA record ("invalid FSA nature flag",
+            // exit 5, every byte restored), an archive the same dar reads
+            // from regular files without a word. That is a defect of its own
+            // (measured for #497), and it is kept out of these tests.
+            const NO_FSA: &[&str] = &["--fsa-scope", "none"];
+
+            /// The restore of `label`, failing with dar's own report.
+            fn restored(m: &Multi, label: &str, dest: &Path, options: &RestoreOptions) {
+                if let Err(e) = m.unit(label, "bc-unit", dest, options) {
+                    let row = only_row(&m.conn);
+                    panic!(
+                        "the unit is whole, yet: {e}\ndar exit {:?}\n{}{}",
+                        row.dar_exit_code,
+                        row.dar_stdout.unwrap_or_default(),
+                        row.dar_stderr.unwrap_or_default()
+                    );
+                }
+            }
 
             /// 2000 names of about 200 characters: what makes dar's
             /// catalogue large with few files.
@@ -7070,7 +7113,7 @@ mod tests {
             /// The fixture's own control: the isolated catalogue dar gets as
             /// `-A` is far bigger than a pipe's buffer (64 KiB), so the tail
             /// dar leaves unread cannot hide in one.
-            fn assert_big_catalogue(m: &Multi) {
+            fn assert_big_catalogue(m: &Multi) -> u64 {
                 let base: String = m
                     .conn
                     .query_row("SELECT catalog_path FROM stage_sets", [], |r| {
@@ -7082,6 +7125,7 @@ mod tests {
                     len > 512 * 1024,
                     "the catalogue is {len} bytes: the test needs one above 512 KiB"
                 );
+                len
             }
 
             /// The shape home2 met: 2 MiB slices, the catalogue inside the
@@ -7091,12 +7135,15 @@ mod tests {
             #[test]
             fn a_unit_whose_catalogue_dar_leaves_unread_streams_whole() {
                 let names = many_names();
-                let m = multi("BC-1", "bc-unit", &many_tree(&names, 1800), "2M", true);
-                assert_big_catalogue(&m);
+                let m = multi_with("BC-1", "bc-unit", &many_tree(&names, 2000), "2M", NO_FSA);
+                let cat = assert_big_catalogue(&m);
                 assert!(m.slices() >= 2, "want several slices");
+                assert!(
+                    cat < *m.cipher_lens.last().unwrap() as u64,
+                    "the catalogue fits in the last slice, after the end of the data"
+                );
                 let dest = TempDir::new().unwrap();
-                m.unit("BC-1", "bc-unit", dest.path(), &RestoreOptions::default())
-                    .expect("dar exited 0: the unit is whole");
+                restored(&m, "BC-1", dest.path(), &RestoreOptions::default());
                 m.assert_restored(dest.path());
                 let argv = only_row(&m.conn).dar_argv.expect("dar ran");
                 assert!(argv.contains(r#""--sequential-read""#), "{argv}");
@@ -7112,12 +7159,11 @@ mod tests {
             #[test]
             fn a_unit_whose_last_slices_dar_never_opens_streams_whole() {
                 let names = many_names();
-                let m = multi("BC-2", "bc-unit", &many_tree(&names, 300), "100k", true);
+                let m = multi_with("BC-2", "bc-unit", &many_tree(&names, 300), "100k", NO_FSA);
                 assert_big_catalogue(&m);
                 assert!(m.slices() >= 10, "want many slices");
                 let dest = TempDir::new().unwrap();
-                m.unit("BC-2", "bc-unit", dest.path(), &RestoreOptions::default())
-                    .expect("dar exited 0: the unit is whole");
+                restored(&m, "BC-2", dest.path(), &RestoreOptions::default());
                 m.assert_restored(dest.path());
                 let argv = only_row(&m.conn).dar_argv.expect("dar ran");
                 assert!(argv.contains(r#""--sequential-read""#), "{argv}");
@@ -7133,15 +7179,14 @@ mod tests {
             #[test]
             fn spool_restores_a_unit_whose_catalogue_dar_would_leave_unread() {
                 let names = many_names();
-                let m = multi("BC-3", "bc-unit", &many_tree(&names, 1800), "2M", true);
+                let m = multi_with("BC-3", "bc-unit", &many_tree(&names, 2000), "2M", NO_FSA);
                 assert_big_catalogue(&m);
                 let dest = TempDir::new().unwrap();
                 let spool = RestoreOptions {
                     spool: true,
                     ..RestoreOptions::default()
                 };
-                m.unit("BC-3", "bc-unit", dest.path(), &spool)
-                    .expect("a spooled restore");
+                restored(&m, "BC-3", dest.path(), &spool);
                 m.assert_restored(dest.path());
                 let argv = only_row(&m.conn).dar_argv.expect("dar ran");
                 assert!(!argv.contains("--sequential-read"), "{argv}");

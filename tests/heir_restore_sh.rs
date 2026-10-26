@@ -312,6 +312,8 @@ struct UnitSpec {
     /// dar's slice size (`-s`): "100k" for every unit but the ones whose
     /// shape needs another (#497's, whose catalogue sits in the last slice).
     slice: &'static str,
+    /// More `dar -c` options (#497's units: `--fsa-scope none`).
+    dar_args: &'static [&'static str],
 }
 
 struct TenantSpec {
@@ -602,6 +604,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         corrupt: &[],
                         tamper: &[],
                         slice: "100k",
+                        dar_args: &[],
                     },
                     UnitSpec {
                         name: "docs",
@@ -615,6 +618,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         corrupt: &[],
                         tamper: &[],
                         slice: "100k",
+                        dar_args: &[],
                     },
                 ],
             },
@@ -632,6 +636,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                     corrupt: &[],
                     tamper: &[],
                     slice: "100k",
+                    dar_args: &[],
                 }],
             },
             TenantSpec {
@@ -649,6 +654,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         corrupt: &[],
                         tamper: &[],
                         slice: "100k",
+                        dar_args: &[],
                     },
                     UnitSpec {
                         name: "nocat",
@@ -662,6 +668,7 @@ fn main_tenants() -> Vec<TenantSpec> {
                         corrupt: &[],
                         tamper: &[],
                         slice: "100k",
+                        dar_args: &[],
                     },
                 ],
             },
@@ -689,6 +696,7 @@ fn lone_template() -> &'static Template {
             corrupt: &[],
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         };
         let tenants = vec![
             TenantSpec {
@@ -731,6 +739,7 @@ fn solo_template() -> &'static Template {
                 corrupt: &[],
                 tamper: &[],
                 slice: "100k",
+                dar_args: &[],
             }],
         }];
         build_template("solo", &tenants, false)
@@ -759,6 +768,7 @@ fn box_template() -> &'static Template {
             corrupt: &[],
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         };
         let tenants = vec![
             TenantSpec {
@@ -1353,33 +1363,43 @@ fn stage_units(dir: &Path, tenants: &[TenantSpec], spans: &[SpanOnTape]) -> Vec<
             let work = dir.join("work").join(format!("{}-v{}", u.uuid, u.version));
             std::fs::create_dir_all(&work).unwrap();
             let base = work.join("arch");
-            run_dar(&[
-                "-c",
-                base.to_str().unwrap(),
-                "-R",
-                src.to_str().unwrap(),
-                "-s",
-                // 100k: a size at which dar 2.7.13 cuts short a file that
-                // runs into the last slice when it reads sequentially
-                // without -A.
-                u.slice,
-                "-Q",
-                "-N",
-            ]);
+            run_dar(
+                &[
+                    "-c",
+                    base.to_str().unwrap(),
+                    "-R",
+                    src.to_str().unwrap(),
+                    "-s",
+                    // 100k: a size at which dar 2.7.13 cuts short a file that
+                    // runs into the last slice when it reads sequentially
+                    // without -A.
+                    u.slice,
+                    "-Q",
+                    "-N",
+                ]
+                .into_iter()
+                .chain(u.dar_args.iter().copied())
+                .collect::<Vec<_>>(),
+            );
             let cat = work.join(format!("{}_v{}", &u.uuid[..8], u.version));
             let cat_of = if u.cat == Cat::FromAnotherRun {
                 // A second dar run of the same content: a new data label.
                 let again = work.join("again");
-                run_dar(&[
-                    "-c",
-                    again.to_str().unwrap(),
-                    "-R",
-                    src.to_str().unwrap(),
-                    "-s",
-                    u.slice,
-                    "-Q",
-                    "-N",
-                ]);
+                run_dar(
+                    &[
+                        "-c",
+                        again.to_str().unwrap(),
+                        "-R",
+                        src.to_str().unwrap(),
+                        "-s",
+                        u.slice,
+                        "-Q",
+                        "-N",
+                    ]
+                    .into_iter()
+                    .chain(u.dar_args.iter().copied())
+                    .collect::<Vec<_>>(),
+                );
                 again
             } else {
                 base.clone()
@@ -6101,6 +6121,7 @@ fn dmg_tenants(
             corrupt,
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         }],
     }]
 }
@@ -6189,6 +6210,7 @@ fn odd_tenants(corrupt: &'static [(usize, usize)]) -> Vec<TenantSpec> {
             corrupt,
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         }],
     }]
 }
@@ -7421,6 +7443,7 @@ fn chk_tenants(tamper: &'static [usize]) -> Vec<TenantSpec> {
             corrupt: &[],
             tamper,
             slice: "100k",
+            dar_args: &[],
         }],
     }]
 }
@@ -7461,6 +7484,7 @@ fn chk_two() -> &'static Template {
             corrupt: &[],
             tamper,
             slice: "100k",
+            dar_args: &[],
         };
         let tenants = vec![
             TenantSpec {
@@ -7951,6 +7975,7 @@ fn folder_tenants() -> Vec<TenantSpec> {
             corrupt: &[],
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         }],
     }]
 }
@@ -8204,6 +8229,7 @@ fn fill_up() -> &'static Template {
                 corrupt: &[],
                 tamper: &[],
                 slice: "100k",
+                dar_args: &[],
             }],
         }];
         build_template("fill-up", &tenants, true)
@@ -9442,6 +9468,7 @@ fn versions_template() -> &'static Template {
             corrupt: &[],
             tamper: &[],
             slice: "100k",
+            dar_args: &[],
         };
         let tenants = vec![TenantSpec {
             name: "alice",
@@ -10537,6 +10564,7 @@ fn big_spec() -> UnitSpec {
         corrupt: &[],
         tamper: &[],
         slice: "100k",
+        dar_args: &[],
     }
 }
 
@@ -10553,6 +10581,7 @@ fn small_spec(name: &'static str, uuid: &'static str, version: i64, seed: u64) -
         corrupt: &[],
         tamper: &[],
         slice: "100k",
+        dar_args: &[],
     }
 }
 
@@ -13225,6 +13254,13 @@ fn a_cartridge_with_no_readable_seal_is_refused_and_one_read_by_rung_2_is_taken(
 // which dar never opens). dar 2.7.13 restores both from FIFOs with exit 0
 // (measured for #497); the installed dar does the work here.
 
+/// The big units carry no filesystem-specific attributes: dar 2.7.13 reading
+/// some archives through FIFOs misreads a file's FSA record ("invalid FSA
+/// nature flag", exit 5, every byte restored), an archive the same dar reads
+/// from regular files without a word. That is a defect of its own (measured
+/// for #497), kept out of these tests.
+const NO_FSA: &[&str] = &["--fsa-scope", "none"];
+
 const MANY_UUID: &str = "a4970001-0000-4000-8000-000000000001";
 const SPREAD_UUID: &str = "a4970002-0000-4000-8000-000000000002";
 const AFTER_UUID: &str = "a4970003-0000-4000-8000-000000000003";
@@ -13243,7 +13279,7 @@ fn many_names() -> &'static [&'static str] {
     })
 }
 
-/// alice's `many`: 2000 files of 1800 bytes in 2 MiB slices, three slices,
+/// alice's `many`: 2000 files of 2000 bytes in 2 MiB slices, three slices,
 /// the last holding the end of the data and then the catalogue.
 fn many_spec() -> UnitSpec {
     UnitSpec {
@@ -13253,11 +13289,12 @@ fn many_spec() -> UnitSpec {
         version: 1,
         seed: 49,
         files: MANY_FILES,
-        file_len: 1800,
+        file_len: 2000,
         names: many_names(),
         corrupt: &[],
         tamper: &[],
         slice: "2M",
+        dar_args: NO_FSA,
     }
 }
 
@@ -13276,6 +13313,7 @@ fn spread_spec() -> UnitSpec {
         corrupt: &[],
         tamper: &[],
         slice: "100k",
+        dar_args: NO_FSA,
     }
 }
 
