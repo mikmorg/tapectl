@@ -1929,8 +1929,8 @@ fn verify_status_rows(
 /// repo have already outlived the behaviour they described (#209, #274,
 /// #281), so a string an acceptance criterion names gets a test.
 fn verify_status_row_text(row: &VerifyStatusRow) -> String {
-    let (label, vtype, outcome, completed, checked, passed, failed, started, lbp, _) = row;
-    let write_check = write_check_words(lbp.as_deref());
+    let (label, vtype, outcome, completed, checked, passed, failed, started, lbp, note) = row;
+    let write_check = write_check_words(lbp.as_deref(), note.as_deref());
     if outcome.is_none() {
         // The line that tells the operator what to verify next — spelled
         // out, not left as an empty column to interpret.
@@ -1953,14 +1953,16 @@ fn verify_status_row_text(row: &VerifyStatusRow) -> String {
 
 /// Whether the drive checked the volume's write with Logical Block
 /// Protection (#388, `volumes.write_lbp`; ADR-0012 item 165), in a row's
-/// few words; `volume info` gives the reason. Not recorded (written before
-/// tapectl 1.7.2, or rebuilt from tape) is never "no LBP".
-fn write_check_words(write_lbp: Option<&str>) -> &'static str {
+/// few words, with the reason (`write_lbp_note`) when it did not check all
+/// of it, as `volume info` gives it. Not recorded (written before tapectl
+/// 1.7.2, or rebuilt from tape) is never "no LBP".
+fn write_check_words(write_lbp: Option<&str>, note: Option<&str>) -> String {
+    let why = note.unwrap_or("no reason recorded");
     match write_lbp {
-        Some("on") => "LBP",
-        Some("off") => "no LBP",
-        Some("mixed") => "LBP on part",
-        _ => "not recorded",
+        Some("on") => "LBP".into(),
+        Some("off") => format!("no LBP ({why})"),
+        Some("mixed") => format!("LBP on part ({why})"),
+        _ => "not recorded".into(),
     }
 }
 
@@ -4370,14 +4372,45 @@ mod tests {
             );
 
             let (t, j) = text("N-OFF");
-            assert_eq!(t, "  N-OFF: never verified (write check: no LBP)");
+            assert_eq!(
+                t,
+                format!("  N-OFF: never verified (write check: no LBP ({note}))")
+            );
             assert_eq!(j["write_lbp"], "off");
             assert_eq!(j["write_lbp_note"], note);
 
             let (t, j) = text("N-MIX");
-            assert_eq!(t, "  N-MIX: never verified (write check: LBP on part)");
+            assert_eq!(
+                t,
+                format!("  N-MIX: never verified (write check: LBP on part ({note}))")
+            );
             assert_eq!(j["write_lbp"], "mixed");
             assert_eq!(j["write_lbp_note"], note);
+
+            // A verified row says why too, after its counts; an off with no
+            // note recorded says so rather than nothing.
+            conn.execute(
+                "UPDATE volumes SET write_lbp = 'off', write_lbp_note = ?1 WHERE label = 'V-ON'",
+                params![note],
+            )
+            .unwrap();
+            let rows = verify_status_rows(&conn, Some("V-ON")).unwrap();
+            let t = verify_status_row_text(&rows[0]);
+            assert!(
+                t.ends_with(&format!("checked/passed/failed); write check: no LBP ({note})")),
+                "{t}"
+            );
+            conn.execute(
+                "UPDATE volumes SET write_lbp_note = NULL WHERE label = 'V-ON'",
+                [],
+            )
+            .unwrap();
+            let rows = verify_status_rows(&conn, Some("V-ON")).unwrap();
+            let t = verify_status_row_text(&rows[0]);
+            assert!(
+                t.ends_with("; write check: no LBP (no reason recorded)"),
+                "{t}"
+            );
         }
 
         /// A volume with one completed, passed full verification session,
