@@ -29,15 +29,26 @@
 #   2 write      the candidate writes LBA-0002 (three units) with --full-confirm: write_lbp
 #                'on', the session log names the page armed, no fallback warning, the full
 #                readback passed, the page method 0 afterwards.
-#   3 refusal    TAPECTL_TEST_LBP_CORRUPT_BLOCK=<n> (F5), n in the middle of LBA-0003's data:
+#   3 refusal    TAPECTL_TEST_LBP_CORRUPT_BLOCK=<n> (F5; the hook takes n1[,n2...], each block
+#                write counted from 1 since the open, re-sent blocks too), n in the middle of
+#                LBA-0003's data:
 #                the drive refuses the block, the session writes on from the start of the file
 #                holding the first block it did not take (item 174: a write_lbp_retry event and
 #                the session log's line), seals, and the full readback passes. dmesg and the log
 #                pages are recorded around it.
-#   4 second     a second refusal in one run leaves the session interrupted (exit 4), and
-#                `volume resume` completes it. NOT RUN unless --second-refusal-blocks A,B: the
-#                1.7.2 hook corrupts one block per open, so a second refusal in one run cannot be
-#                provoked with it (a hook taking two block numbers is a code change; #388).
+#   4 second     the hook given A and then every block from B to C: the drive refuses A, item
+#                174 writes on once from its file's start, and a block of B..C, sent again or
+#                later in the retry, is refused a second time: the session is left interrupted
+#                (exit 4), and `volume resume` completes it. B needs slack past A: every block
+#                sent counts, and the real drive reports a refusal a few blocks after the block
+#                (st and the drive write behind), so a listed block sent before the first
+#                refusal surfaced is spent inside it, not in the retry. Hence a range, B..C,
+#                whose first block past that point is the one refused: the check is the second
+#                refusal, never which listed block it was. The default puts A in the middle of
+#                the data (as step 3) and B..C at A+64..A+320; --second-refusal-blocks
+#                overrides it. mhvtl refuses a bad block at once, so there one B would be exact,
+#                but the rehearsal cannot run the step: every open falls back there, and the
+#                hook refuses an open that is not armed.
 #   5 crash      `volume write LBA-0005` killed with SIGKILL mid-write: the page reads armed (the
 #                leftover item 164 accepts); the heir's first dd and RESTORE.sh --info fail and
 #                print nothing of the tape; `volume identify` prints tapectl's leftover note and
@@ -86,7 +97,7 @@
 #
 # EXIT: 0 every step passed; 1 a step FAILED (the run stopped there; the cartridge is as that
 # step left it); 2 a precondition refused (nothing was touched); 3 every step that ran passed,
-# and step 4 was not run (no --second-refusal-blocks) or --r1-only stopped after step 1.
+# and a step was not run (step 4 in the rehearsal) or --r1-only stopped after step 1.
 set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
@@ -126,9 +137,16 @@ the heir's restore, R11 and the write rate. OVERWRITES THE CARTRIDGE, several ti
   --i-will-lose-the-cartridge S  Required on the real drive: EW7VWMVKF6, checked against MAM.
   --mhvtl                        The rehearsal on an mhvtl TD6 drive (every open falls back).
   --r1-only                      Run steps 0 and 1 and stop: R1's answer, before the long steps.
-  --second-refusal-blocks A,B    Run step 4 with TAPECTL_TEST_LBP_CORRUPT_BLOCK=A,B. The 1.7.2
-                                 hook takes one block number and refuses this value: step 4
-                                 needs a hook that takes two (#388).
+  --second-refusal-blocks A,B[-C]
+                                 Step 4's blocks, counted from 1 since the write opened the
+                                 drive, re-sent ones too: A for the first refusal, then B, or
+                                 every block from B to C, for the second
+                                 (TAPECTL_TEST_LBP_CORRUPT_BLOCK=A,B,B+1,...,C). B must lie past
+                                 A by more than the drive's write-behind: a listed block sent
+                                 before the first refusal surfaced is spent inside it, so a
+                                 range is the safe form. The step judges the second refusal,
+                                 not which listed block caused it. Default: A in the middle of
+                                 the data, B-C = A+64 to A+320.
   --out DIR                      Where the run directory goes. Default /scratch/tapectl-lbp
                                  where /scratch exists, else ~/.cache/tapectl/lbp.
   --print-plan                   Print what the operator must do and the drive time, and exit.
@@ -158,10 +176,26 @@ while [ $# -gt 0 ]; do
         *) echo "lbp-acceptance: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
-[ -z "$SECOND_BLOCKS" ] || case "$SECOND_BLOCKS" in
-    [0-9]*,[0-9]*) ;;
-    *) die "--second-refusal-blocks wants two block numbers, A,B (got '$SECOND_BLOCKS')" ;;
-esac
+# second_list <A> <B> <C>: the hook's value for step 4, A then every block from B to C.
+second_list() {
+    local out="$1" n
+    for n in $(seq "$2" "$3"); do out="$out,$n"; done
+    printf '%s\n' "$out"
+}
+SECOND_A=""; SECOND_B=""; SECOND_C=""
+if [ -n "$SECOND_BLOCKS" ]; then
+    case "$SECOND_BLOCKS" in
+        *[!0-9,-]*|,*|*,|*,*,*|*--*) die "--second-refusal-blocks wants A,B or A,B-C, block numbers from 1 (got '$SECOND_BLOCKS')" ;;
+    esac
+    SECOND_A="${SECOND_BLOCKS%%,*}"; rest="${SECOND_BLOCKS#*,}"
+    SECOND_B="${rest%%-*}"; SECOND_C="${rest#*-}"
+    for n in "$SECOND_A" "$SECOND_B" "$SECOND_C"; do
+        case "$n" in ''|*[!0-9]*|0*) die "--second-refusal-blocks wants A,B or A,B-C, block numbers from 1 (got '$SECOND_BLOCKS')" ;; esac
+    done
+    [ "$SECOND_B" -gt "$SECOND_A" ] || die "--second-refusal-blocks: B ($SECOND_B) must lie past A ($SECOND_A)"
+    [ "$SECOND_C" -ge "$SECOND_B" ] || die "--second-refusal-blocks: C ($SECOND_C) must not come before B ($SECOND_B)"
+    [ $((SECOND_C - SECOND_B)) -le 4096 ] || die "--second-refusal-blocks: B..C spans more than 4096 blocks"
+fi
 
 # ---------- the two shapes of the run ----------
 MiB=$((1024 * 1024)); GiB=$((1024 * MiB))
@@ -208,7 +242,8 @@ a release one; about $(( (SIZE_A + SIZE_B + SIZE_C) / GiB )) GiB a volume):
                 in full; write_lbp 'on'; the page clear after.                         ~45 min
   3 refusal     $LABEL3 with the test hook mid-data: the drive refuses one block, item 174's
                 retry writes on from the file's start, the volume seals and reads back. ~5 min
-  4 second      NOT RUN unless --second-refusal-blocks (the 1.7.2 hook takes one block).
+  4 second      $LABEL4 with the hook at A and A+64..A+320: the drive refuses twice in one
+                run; the session is left interrupted; volume resume seals it.          ~5 min
   5 crash       $LABEL5's write killed mid-way: the page left armed; the heir's reads fail with
                 I/O errors; volume identify clears it; volume resume completes the write. ~5 min
   6 verify      volume verify $LABEL5 --full with LBP_R.                                ~2 min
@@ -508,8 +543,8 @@ tctl() { env -u TAPECTL_TEST_LBP_CORRUPT_BLOCK "$TAPECTL_BIN" --home "$TAPECTL_H
 tctl_hooked() { # step 3's write: the test hook on this one command line
     env TAPECTL_TEST_LBP_CORRUPT_BLOCK="$HOOK_N" "$TAPECTL_BIN" --home "$TAPECTL_HOME" --config "$CFG" "$@" </dev/null
 }
-tctl_second() { # step 4's write: two block numbers on this one command line
-    env TAPECTL_TEST_LBP_CORRUPT_BLOCK="$SECOND_BLOCKS" "$TAPECTL_BIN" --home "$TAPECTL_HOME" --config "$CFG" "$@" </dev/null
+tctl_second() { # step 4's write: the hook's list on this one command line
+    env TAPECTL_TEST_LBP_CORRUPT_BLOCK="$SECOND_LIST" "$TAPECTL_BIN" --home "$TAPECTL_HOME" --config "$CFG" "$@" </dev/null
 }
 old() { env -u TAPECTL_TEST_LBP_CORRUPT_BLOCK "$OLD_BIN" --home "$R1_HOME" --config "$R1_HOME/config.toml" "$@" </dev/null; }
 cand_r1() { env -u TAPECTL_TEST_LBP_CORRUPT_BLOCK "$TAPECTL_BIN" --home "$R1_HOME" --config "$R1_HOME/config.toml" "$@" </dev/null; }
@@ -920,19 +955,28 @@ cp -a "$DB" "$RUN/catalog-after-write3.db"
 end_step
 
 # ------------------------------------------------------------
-if [ -z "$SECOND_BLOCKS" ]; then
-    skip_step 4 second "the 1.7.2 hook corrupts one block per open, so a second refusal in one run cannot be provoked; --second-refusal-blocks A,B runs it once the hook takes two (#388)"
-elif [ "$MHVTL" = 1 ]; then
-    skip_step 4 second "the hook refuses every open on mhvtl (none is armed)"
+if [ "$MHVTL" = 1 ]; then
+    skip_step 4 second "every open falls back on mhvtl, and the hook refuses an open that is not armed"
 else
     begin_step 4 second "two refusals in one run: interrupted, then volume resume completes it"
+    if [ -z "$SECOND_A" ]; then
+        SECOND_A="$HOOK_N"; SECOND_B=$((HOOK_N + 64)); SECOND_C=$((HOOK_N + 320))
+    fi
+    SECOND_LIST="$(second_list "$SECOND_A" "$SECOND_B" "$SECOND_C")"
+    log "  the hook: block write $SECOND_A, then every one from $SECOND_B to $SECOND_C, counted since the write opened the drive (re-sent blocks too)"
     reinit "$LABEL4"
     run write4 any tctl_second --json --yes volume write "$LABEL4" --device "$TAPE_DEV" --keep-staging
-    [ "$RC" = 4 ] || fail "write4 exited $RC: a second refusal in one run leaves the session interrupted, exit 4 (item 174). Exit 2 with 'is not a block number' means this candidate's hook takes one block number"
+    [ "$RC" = 4 ] || fail "write4 exited $RC: a second refusal in one run leaves the session interrupted, exit 4 (item 174). Exit 0 means no listed block of $SECOND_B..$SECOND_C reached the retry (give a later range); exit 2 with 'is not a block number' means this candidate's hook takes one number"
     grep -F "second write the drive refused" "$STEP_DIR/write4.err" >/dev/null || fail "write4: the message does not name the second refusal"
+    session_says write4 "(ADR-0012 item 174)" || fail "write4: no session log names item 174's first retry"
+    dbq "$DB" "SELECT e.new_value, e.details FROM events e JOIN volumes v ON v.id = e.entity_id
+        WHERE e.entity_type = 'volume' AND e.action = 'write_lbp_retry' AND v.label = ?" "$LABEL4" > "$STEP_DIR/retry-events.tsv"
+    [ "$(wc -l < "$STEP_DIR/retry-events.tsv")" = 1 ] || fail "write4: $(wc -l < "$STEP_DIR/retry-events.tsv") write_lbp_retry event(s) for $LABEL4, want exactly one (one retry, then interrupted)"
+    log "  the first refusal's retry: $(tr '\t' ' ' < "$STEP_DIR/retry-events.tsv")"
     run resume4 0 tctl --json --yes volume resume "$LABEL4" --device "$TAPE_DEV" --keep-staging
     [ "$(status_of "$LABEL4")" = sealed ] || fail "$LABEL4 is '$(status_of "$LABEL4")' after the resume, not sealed"
     expect_write_lbp resume4 "$LABEL4"
+    cp -a "$DB" "$RUN/catalog-after-write4.db"
     end_step
 fi
 

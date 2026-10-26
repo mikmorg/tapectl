@@ -479,16 +479,26 @@ filemark at BOT and `volume init --force`, which marks the volume it displaces `
 | 0 preflight | read only: the page (current and changeable), block limits, `sg_inq`; the page reads method 0 | ~1 min |
 | 1 r1 | 1a: 16 blocks written without LBP read back with LBP_R, every CRC valid by `lbp.py`, every payload equal; 1b: `OLD_BIN` seals `LBA-0001`, the candidate's verify passes with LBP_R armed. `R1.txt` says what the answer means for item 175 | ~15 min |
 | 2 write | three units staged; `LBA-0002` written with `--full-confirm`: `write_lbp` `on`, the session log names the page armed, no fallback warning, a passed full readback; `volume info`'s Write check line | ~45 min (debug staging) |
-| 3 refusal | `LBA-0003` with `TAPECTL_TEST_LBP_CORRUPT_BLOCK` in the middle of the data: exit 0, one `write_lbp_retry` event, the session log's item 174 line, sealed, a passed full readback; `dmesg` and the log pages around it | ~5 min |
-| 4 second | not run in 1.7.2: the hook corrupts one block per open, so two refusals in one run need a hook that takes two block numbers (`--second-refusal-blocks A,B`) | — |
+| 3 refusal | `LBA-0003` with `TAPECTL_TEST_LBP_CORRUPT_BLOCK=n` in the middle of the data: exit 0, one `write_lbp_retry` event, the session log's item 174 line, sealed, a passed full readback; `dmesg` and the log pages around it | ~5 min |
+| 4 second | `LBA-0004` with the hook at A and at every block from B to C (default A mid-data, B..C = A+64..A+320; `--second-refusal-blocks A,B[-C]`): exit 4, the session interrupted after one `write_lbp_retry`, the message naming the second refusal; then `volume resume` seals it with `write_lbp` `on` | ~5 min |
 | 5 crash | `LBA-0005`'s write killed with SIGKILL after 2 GiB: the page reads armed; the heir's `dd` and RESTORE.sh `--info` fail with nothing of the tape printed; `volume identify` prints the leftover note and leaves the page method 0; RESTORE.sh reads again; `volume resume` seals it with `write_lbp` `on` | ~5 min |
 | 6 verify | `volume verify LBA-0005` passes, its session log naming LBP_R armed (none under item 175's fallback) | ~2 min |
 | 7 heir | RESTORE.sh off `LBA-0005` with the real tools, the page clear, no manual step: `--verify` passes, one unit restored identical; one record read in variable mode is 524,288 bytes | ~5 min |
 | 8 r11 | the `tapectl` service user can open the sg node read-write (owner, group or ACL) | no tape |
 | 9 rate | step 2's write phase in MB/s beside 1.6.0's 160 MB/s | no tape |
 
-About 1.5-2 hours, most of it staging. Exit 3 means every step that ran passed and step 4 was
-not run (or `--r1-only` stopped after step 1).
+About 1.5-2 hours, most of it staging. Exit 3 means every step that ran passed and a step was
+not run (the rehearsal skips step 4), or `--r1-only` stopped after step 1.
+
+**The test hook and step 4's slack.** `TAPECTL_TEST_LBP_CORRUPT_BLOCK=n1[,n2…]` flips one CRC bit
+of each listed block write, counted from 1 since the write opened the drive, re-sent blocks
+included (item 174's retry sends its files again on the same open). It refuses an open that did
+not arm LBP. On the real drive a second listed block needs slack past the first: st and the drive
+write behind, so the drive reports a refusal a few blocks after the refused block, and a listed
+block sent in between is spent inside the first refusal, never in the retry. Step 4 therefore
+lists a range, B to C, and judges the second refusal itself (exit 4, one retry), not which listed
+block caused it. mhvtl refuses a bad block at once, so one number would be exact there, but the
+rehearsal cannot arm the hook at all.
 
 **What only the real drive proves** (the rehearsal cannot): R1's answer; a write with LBP on
 through home2's SAS path; the drive's own refusal (the real drive refuses before writing the
