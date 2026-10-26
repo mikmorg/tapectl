@@ -1368,8 +1368,9 @@ session that did not see the warning confirms as before.
   seal marker, plus the readback past the early warning above when there was one), and a
   passing one seals. `--full-confirm`, on every command that
   writes a volume, opts in to the integrity tier. What the default gives up is L3 at
-  write time — the one host → HBA → drive → medium check (with LBP unreachable
-  through `st`, the readback hash is the only control spanning that chain) — so
+  write time — the one host → HBA → drive → medium check (LBP, below, checks each
+  block from host to drive as it is written, not the medium; the readback hash is the
+  only control spanning the whole chain) — so
   `audit` (`no_full_verify`) and `report verify-status` name every sealed volume with
   no passed full readback recorded until `volume verify` runs one.
 - **`volume verify` runs the integrity tier by default**; `--quick` opts down to the
@@ -1389,9 +1390,16 @@ a full readback cost ~2.3 h per tape). The tiers map onto the existing
 
 The `verification_sessions` row records **which tier** was achieved, per ADR-0001
 (recorded strength must match what ran). Drive-level Logical Block Protection is
-not part of this chain — the Linux `st` data path does not expose it (ADR-0007); if
-enabled out of band it is recorded only as supplementary evidence, never as the
-basis of the seal.
+not part of this chain. From 1.7.2 (ADR-0012 items 161-166, 174) tapectl arms the
+drive's Control Data Protection page (0Ah/F0h, Reed-Solomon CRC) through sg3-utils for
+its own open of the drive, and clears it on every exit. st carries each block with
+its 4-byte CRC: the drive checks it before writing the block, and on a read sends its
+own, which tapectl checks (item 175 sets which reads), so a mismatch is a read error,
+never a verdict. The CRC is never stored: the medium's blocks, and everything above,
+are the same with or without LBP. A write records whether LBP ran
+(`volumes.write_lbp`) as supplementary evidence, never the basis of the seal; a drive
+that cannot take it is warned about and written without it (item 165); a block the
+drive refuses is written again, once, from its file's planned start (item 174).
 
 ## 6. Heir path — end to end with `mt`, `dd`, `age`, `dar`, `sha256sum` (and `head`, `truncate`, `tar`; RESTORE.sh also uses `mkfifo` and `tee`)
 
