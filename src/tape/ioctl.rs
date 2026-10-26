@@ -406,7 +406,8 @@ impl TapeDevice {
     /// size, then Logical Block Protection (item 164: armed only inside st's
     /// exclusive open, so no other process does data I/O on the drive while
     /// it is), then the open reading — which therefore shows st at the wire
-    /// block size while armed.
+    /// block size while armed. An open that arms rewinds first, for the
+    /// probe ([`Self::arm_protection`]); a rewind that fails fails the open.
     fn open_with(
         file: File,
         device_path: &str,
@@ -430,7 +431,7 @@ impl TapeDevice {
         dev.set_block_size(block_size)?;
         let control =
             lbp::control_for(device_path).map(|c| Box::new(c) as Box<dyn lbp::PageControl + Send>);
-        dev.arm_protection(write_open, lbp::LBP_R_POLICY, control);
+        dev.arm_protection(write_open, lbp::LBP_R_POLICY, control)?;
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
     }
@@ -438,16 +439,19 @@ impl TapeDevice {
     /// Logical Block Protection for this open (items 162-165; F2: every
     /// `TapeStore` open comes here). `policy` says what an open of this kind
     /// arms ([`lbp::LbpReadPolicy::open_bits`]); variable-block mode arms
-    /// nothing. Never fails the open: a drive, an sg node or an st that
+    /// nothing. LBP never fails the open: a drive, an sg node or an st that
     /// cannot take it is [`Protection::Unavailable`], warned once on a write
     /// open (item 165) and logged on a read (F4). An open that arms nothing
-    /// still clears a page a crash left armed (§4.4).
+    /// still clears a page a crash left armed (§4.4). The one error is the
+    /// rewind an arming open makes before anything else, for the probe: it
+    /// fails the open before the page is touched, as the store's own rewind
+    /// after the open would have.
     fn arm_protection(
         &mut self,
         write_open: bool,
         policy: lbp::LbpReadPolicy,
         control: Option<Box<dyn lbp::PageControl + Send>>,
-    ) {
+    ) -> Result<()> {
         let bits = if self.block_size == 0 {
             None
         } else {
@@ -459,22 +463,32 @@ impl TapeDevice {
                 lbp::note_unavailable(&self.path, &reason, write_open);
                 self.protection = Protection::Unavailable(reason);
             }
-            return;
+            return Ok(());
         };
         let Some(bits) = bits else {
             if let Ok(true) = lbp::clear_leftover(&*control) {
                 self.say_leftover(control.node(), true);
             }
-            return;
+            return Ok(());
         };
+        // 388c's finding (#388): after a read that failed or ran off the
+        // data, st answers the next read itself, from its own end-of-data or
+        // error state, without sending it to the drive. The probe below then
+        // sees no EBUSY on a path that cannot carry the wire block, the open
+        // arms, and its first transfer fails EBUSY (`volume identify` after
+        // a failed `dd` on mhvtl; after `mt rewind` it fell back as it
+        // should). A rewind clears that state, so the probe is a READ the
+        // drive answers, at BOT. Every store rewinds after its open anyway,
+        // which also takes the head back over the block the probe read.
+        self.rewind()?;
         let payload = self.block_size;
         let armed = {
             let this = &*self;
             let mut set_block_size =
                 |n: usize| this.mt_ioctl(MTSETBLK, n as i32).map_err(|e| e.to_string());
-            // F12: one read of a wire block where the head is, before the
-            // store's rewind — st answers EBUSY/EOVERFLOW without sending it
-            // when the path cannot carry it.
+            // F12: one read of a wire block at BOT (the rewind above), before
+            // the store's own rewind — st answers EBUSY/EOVERFLOW without
+            // sending it when the path cannot carry it.
             let mut probe = |n: usize| {
                 let mut buf = vec![0u8; n];
                 (&this.file).read(&mut buf)
@@ -514,6 +528,7 @@ impl TapeDevice {
                 self.protection = Protection::Unavailable(not_armed.reason);
             }
         }
+        Ok(())
     }
 
     /// The leftover note (§4.4): on stderr, traced and logged, read or write.
@@ -2183,6 +2198,70 @@ mod density_tests {
         assert!(
             !body.contains("Command::new"),
             "the device starts no program"
+        );
+    }
+
+    /// 388c's finding (#388): after a read that failed or ran off the data,
+    /// st answers the next read without sending it, which would let the
+    /// probe arm a path that cannot carry the wire block. So an open that
+    /// arms rewinds before it touches the page, and the probe (the last step
+    /// of `lbp::arm`) reads at BOT. Over a plain file the rewind is issued
+    /// first and fails, and nothing else is: no page command, no block size,
+    /// the page as found, nothing armed, and the open fails as the store's
+    /// own rewind would have. Positive control: an open that arms nothing
+    /// (the fallback policy's read) sends no rewind and still reads the page
+    /// for a leftover.
+    #[test]
+    fn an_open_that_arms_rewinds_before_the_page_and_the_probe() {
+        use crate::tape::lbp::fake::{FakePage, HP_PAGE};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut page = FakePage::new(&HP_PAGE);
+        page.log = Some(log.clone());
+
+        let mut dev = device_over(tmp.reopen().unwrap(), 4096);
+        dev.op_log = Some(log.clone());
+        let err = dev
+            .arm_protection(
+                true,
+                lbp::LbpReadPolicy::AllReads,
+                Some(Box::new(page.clone())),
+            )
+            .expect_err("a plain file does not rewind");
+        assert!(matches!(err, TapectlError::TapeIo(_)), "{err:?}");
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["ioctl rewind"],
+            "the rewind first, and nothing after it failed"
+        );
+        assert_eq!(page.current(), HP_PAGE, "the page untouched");
+        assert!(dev.lbp.is_none());
+        assert_eq!(dev.protection(), Protection::NotApplicable);
+        drop(dev);
+
+        log.lock().unwrap().clear();
+        let mut dev = device_over(tmp.reopen().unwrap(), 4096);
+        dev.op_log = Some(log.clone());
+        dev.arm_protection(
+            false,
+            lbp::LbpReadPolicy::OnlyConfirmOfLbpWrite,
+            Some(Box::new(page.clone())),
+        )
+        .unwrap();
+        assert_eq!(*log.lock().unwrap(), ["sense"], "no probe, so no rewind");
+        drop(dev);
+
+        // In the source, the one rewind comes before `lbp::arm(`, whose
+        // last step is the probe.
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let start = body.find("    fn arm_protection(").unwrap();
+        let end = start + body[start..].find("\n    }\n").unwrap();
+        let f = &body[start..end];
+        assert_eq!(f.matches("self.rewind()").count(), 1, "{f}");
+        assert!(
+            f.find("self.rewind()?").unwrap() < f.find("lbp::arm(").unwrap(),
+            "the rewind precedes the arming and its probe"
         );
     }
 

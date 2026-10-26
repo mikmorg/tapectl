@@ -573,7 +573,11 @@ fn probe_not_issued(e: &io::Error) -> bool {
 /// 4. `set_block_size(wire)`: st sends a block descriptor and no page.
 /// 5. `probe(wire)`: one read of a wire block where the head is. Only an
 ///    answer that says st never sent it ([`probe_not_issued`]) fails; data,
-///    a filemark, ENOSPC or EIO all mean the path carried the request.
+///    a filemark, ENOSPC or EIO all mean the path carried the request. That
+///    holds only for a read st sends: after a read that failed or ran off
+///    the data, st answers the next one itself, so the caller rewinds first
+///    (`TapeDevice::arm_protection`, 388c's finding) and the probe reads at
+///    BOT.
 ///
 /// Any failure after the select restores the page (as found, or cleared
 /// for a leftover) and the block size `payload`, and is [`NotArmed`]: the
