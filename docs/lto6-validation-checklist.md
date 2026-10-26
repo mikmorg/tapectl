@@ -47,6 +47,10 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
       the HP; the fixtures under `tests/fixtures/sg_logs/hp_lto6_*` are the 2026-09-23
       captures). Read pages with `--maxlen` so each read is ONE LOG SENSE (#328); do not
       read 0x2E by hand at all — tapectl's sweep journals it once per contact.
+- [ ] `sg_modes --page=0x0a,0xf0 <sg>` reads the drive's Control Data Protection page
+      (method 0, neither check on), and `sg_wr_mode` is on the PATH: from 1.7.2 tapectl reads
+      and sets that page with them (sg3-utils). An open without them writes without LBP and
+      warns once (item 165).
 - [ ] `mt -f <by-id> setblk 524288 && mt -f <by-id> status` reports the 512 KiB block
       size. (Record: 512 K vs 1 M is a wash on this drive — 114.0 vs 114.4 MiB/s,
       `docs/lto6-session-journal-2026-09-10.md`.)
