@@ -2588,7 +2588,7 @@ fewer, and its seal marker says where it ended ("Where the tape ended").
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED, AWK_DAR_HEADER,
         AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
         AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
@@ -4416,18 +4416,6 @@ dar_running() {
   return 1
 }
 
-# Wait for background job $1, polling; if dar exits first, return 3, so the
-# caller can tell a dar that ended from a slice that did.
-wait_feed() { # <pid>
-  while kill -0 "$1" 2>/dev/null; do
-    if ! dar_running; then
-      return 3
-    fi
-    sleep 0.2 2>/dev/null || sleep 1
-  done
-  return 0
-}
-
 # dar is gone: say why, with its own words. One exit is not an error: dar
 # refusing the envelope's catalogue as not this archive's (a re-staged
 # snapshot, #419), which it does before writing anything. That sets
@@ -4470,21 +4458,230 @@ slice_bytes() { # <slice number>
   fi
 }
 
-# Stream one unit's slices off the tape, through age, into dar (#412 item 1).
-# dar reads the slices from FIFOs with --sequential-read, so nothing decrypted
-# is written to disk except the restored files: the 1.0.x restore decrypted
-# every slice to disk first and needed about twice the unit's size free. Each
-# slice's ciphertext is hashed as it passes and checked against the front
-# index, and age authenticates every 64 KiB as it decrypts, so damaged bytes
-# stop the restore rather than reach dar. Whatever fails first is named: dar
-# (its own output), the tape read (dd's), or age (a missing key, or damage).
+# ---- the slices joined back into one stream for dar (#498; ADR-0012 item 181) ----
+#
+# dar given a sliced archive one named pipe per slice (as this script did up
+# to 1.7) can take a slice's one-byte trailer for archive data: where one of
+# its reads ends on the last byte of a slice, the trailer comes back as data,
+# and the unit fails "Bad CRC", exit 5, the same way every time (every dar
+# from 2.7.7 to 2.8.6). So a streamed restore gives dar ONE stream on its
+# standard input (dar -x -), which dar reads without that fault: the slices
+# joined back into the dar -c - stream tapectl cut them from. Its header is
+# this host's dar's own (dar -c - over an empty directory) with the two
+# labels of slice 1 put in; then each slice's payload, with its header and its
+# trailer taken off and checked; then the stream's own trailer, T. A slice
+# that is not what tapectl cut is refused, never guessed at.
+
+# The dar header at the start of file $1: prints its length, its flag (T, N
+# or E), the slice size it records (- for none) and where its data name sits;
+# or what is wrong with it, and fails.
+dar_header() { # <file>
+  od -An -v -tu1 "$1" | awk '__AWK_DAR_HEADER__'
+}
+
+# The header this host's dar writes on its standard output, once a run, in
+# $WORK/stream.tmpl: JOIN_H0 bytes long, its data name at JOIN_DN0. Made
+# before any slice of the unit is read.
+JOIN_H0=""
+JOIN_DN0=""
+stream_template() {
+  local out flag size
+  [ -z "$JOIN_H0" ] || return 0
+  mkdir -p "$WORK/empty"
+  if ! dar -N -c - -R "$WORK/empty" -an -D -Q >"$WORK/stream.tmpl" 2>"$WORK/tmpl.err" </dev/null; then
+    cat "$WORK/tmpl.err" >&2 || true
+    die "dar could not write the header this script joins the slices under (dar -c - over an
+       empty directory): dar's own message is above. No slice of the unit has been read."
+  fi
+  if ! out=$(dar_header "$WORK/stream.tmpl"); then
+    die "the header this dar writes on its standard output is not one this script knows ($out).
+       Refusing to join the slices for dar rather than guess. No slice of the unit has been read."
+  fi
+  read -r JOIN_H0 flag size JOIN_DN0 <<<"$out"
+  if [ "$flag" != T ] || [ "$size" != - ]; then
+    JOIN_H0=""
+    die "the header this dar writes on its standard output is not a single-slice archive's (flag T,
+       no slice size). Refusing to join the slices for dar rather than guess. No slice of the unit
+       has been read."
+  fi
+}
+
+# Why the join refuses the slice being fed, for stream_unit to say.
+join_refuse() { # <what>
+  printf '%s\n' "$1" >"$WORK/join.why"
+}
+
+# Whether files $1 and $2 hold the same bytes (a header: a few dozen).
+same_bytes() { # <file> <file>
+  [ "$(od -An -v -tu1 "$1")" = "$(od -An -v -tu1 "$2")" ]
+}
+
+# The rest of slice $4 after its header (standard input): its payload into
+# the stream (fd 3), its trailer taken off and checked, and nothing past the
+# slice size. The last slice may be shorter than the others, so its last
+# byte is held back (head -c -1) and read off a copy (tail -c 1). A write the
+# stream refuses is dar having closed it: join.closed, and nothing more is
+# checked or written.
+join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number>
+  local h=$1 size=$2 last=$3 num=$4 j="$WORK/join" trl extra want=78 wantc=N tpid
+  : >"$j.trl"
+  if [ "$last" = 1 ]; then
+    want=84 wantc=T
+    tail -c 1 <"$WORK/stream/trail" >"$j.trl" 3>&- &
+    tpid=$!
+    head -c $((size - h)) | tee "$WORK/stream/trail" | {
+      head -c -1 2>/dev/null >&3 || : >"$j.closed"
+      cat >/dev/null
+    }
+    wait "$tpid" || true
+  elif ! head -c $((size - h - 1)) 2>/dev/null >&3; then
+    : >"$j.closed"
+  else
+    head -c 1 >"$j.trl"
+  fi
+  [ ! -f "$j.closed" ] || return 0
+  extra=$(wc -c)
+  trl=$(od -An -v -tu1 "$j.trl" | awk '{ printf "%s", $1 }')
+  if [ "$extra" -gt 0 ]; then
+    join_refuse "slice $num is longer than the slice size its header records ($size bytes)"
+  elif [ -z "$trl" ] && [ "$last" = 1 ]; then
+    join_refuse "slice $num ends without a trailer"
+  elif [ -z "$trl" ]; then
+    join_refuse "slice $num is shorter than the slice size its header records ($size bytes), and it is not the last"
+  elif [ "$trl" != "$want" ]; then
+    join_refuse "slice $num ends with the byte $trl, not $wantc"
+  fi
+}
+
+# Slice $1 (standard input: its plaintext, from age) into the stream on fd 3.
+# Runs in the slice's feed, never in this script itself: a write to a stream
+# dar has closed raises SIGPIPE, which must end the feed's writer, never the
+# restore. What it finds is left in $WORK: join.why (a refusal), join.closed
+# (dar closed the stream). Slice 1's header, and its length and slice size,
+# are kept (join.hdr, join.frame) for the slices after it, which must carry
+# that header byte for byte. Slice 1 also writes the stream's header.
+join_slice() { # <slice number> <1 for the first slice> <1 for the last>
+  local num=$1 first=$2 last=$3 j="$WORK/join" out h flag size dn
+  if [ "$first" = 1 ]; then
+    head -c 4096 >"$j.head"
+    if ! out=$(dar_header "$j.head"); then
+      join_refuse "slice $num: $out"
+      return 0
+    fi
+    read -r h flag size dn <<<"$out"
+    if [ "$flag" != E ] || [ "$size" = - ]; then
+      join_refuse "slice $num has the header of an archive that is not sliced (flag $flag, slice size $size)"
+      return 0
+    fi
+    if [ "$size" -le $((h + 1)) ]; then
+      join_refuse "a slice size of $size bytes leaves no room for data after a $h-byte header"
+      return 0
+    fi
+    head -c "$h" "$j.head" >"$j.hdr"
+    printf '%s %s\n' "$h" "$size" >"$j.frame"
+    # The stream's header: this dar's, with slice 1's internal name (bytes 4
+    # to 13 of every dar header) and its data name put in. Bytes A to B of a
+    # file are its first B, less all but the last B - A.
+    {
+      head -c 4 "$WORK/stream.tmpl"
+      head -c 14 "$j.head" | tail -c 10
+      head -c "$JOIN_DN0" "$WORK/stream.tmpl" | tail -c $((JOIN_DN0 - 14))
+      head -c $((dn + 10)) "$j.head" | tail -c 10
+      head -c "$JOIN_H0" "$WORK/stream.tmpl" | tail -c $((JOIN_H0 - JOIN_DN0 - 10))
+    } >"$j.stream" 2>/dev/null
+    if [ "$(dar_header "$j.stream" 2>/dev/null)" != "$JOIN_H0 T - $JOIN_DN0" ] ||
+      [ "$(wc -c <"$j.stream")" != "$JOIN_H0" ]; then
+      join_refuse "the stream header made from slice $num's does not read back as one"
+      return 0
+    fi
+    if ! cat "$j.stream" 2>/dev/null >&3; then
+      : >"$j.closed"
+      return 0
+    fi
+    { tail -c +$((h + 1)) "$j.head"; cat; } | join_rest "$h" "$size" "$last" "$num"
+    return 0
+  fi
+  read -r h size <"$j.frame"
+  head -c "$h" >"$j.this"
+  if ! same_bytes "$j.this" "$j.hdr"; then
+    join_refuse "slice $num's header is not slice 1's"
+    return 0
+  fi
+  join_rest "$h" "$size" "$last" "$num"
+}
+
+# The stream (fd 3) closed, once: dar reads its end.
+STREAM_OPEN=0
+stream_close() {
+  [ "$STREAM_OPEN" = 1 ] || return 0
+  exec 3>&-
+  STREAM_OPEN=0
+}
+
+# ---- damage only in what dar never needed (ADR-0012 item 182) ----
+#
+# Given the catalogue, dar stops reading where the file data ends and exits 0
+# (#497); what it leaves is still read, hashed and authenticated. Damage found
+# there, once dar has ended well, is in bytes dar never read: it is said, once
+# for the slice, the restore goes on, and the restored files are checked
+# against the index as ever. A file that fails the check fails the restore as
+# it always has. Damage found while dar runs, or with dar failed, stops the
+# restore as it always has.
+
+# The tape slice $1 came from, for a message: the cartridge in the drive (tape
+# file $2), or the one it was read from into the scratch directory.
+CART_LABEL=""
+slice_where() { # <slice number> <tape file, or empty>
+  local lab="" pos=""
+  if [ -n "$STREAM_FROM" ]; then
+    IFS='|' read -r _ lab pos < <(awk -F'|' -v n="$1" '$1 == n { print; exit }' "$WORK/span.from" 2>/dev/null) || true
+    printf 'read into the scratch directory from tape file %s of %s' "${pos:-?}" "${lab:-<unreadable>}"
+  else
+    printf 'tape file %s of %s' "$2" "${CART_LABEL:-${TAPE_LABEL:-$LABEL}}"
+  fi
+}
+
+LATE_NOTES=()
+late_damage() { # <slice number> <tape file, or empty> <what was found>
+  local line advice short
+  line="slice $1 of '$(visible_text "$UNIT_NAME")' ($(slice_where "$1" "$2")) is damaged after the point this restore needed"
+  if [ -n "$STREAM_FROM" ]; then
+    advice="It matched the front index of its tape when it was read, so its copy in the scratch
+      directory changed since, or every copy of the slice holds the same damage."
+    short="Every copy of it may hold the same damage: see the note on it above."
+  else
+    advice="Replace this tape: it no longer holds this slice as written, though this restore did
+      not need the damaged part."
+    short="Replace this tape."
+  fi
+  echo "NOTE: $line: $3." >&2
+  echo "      dar had already restored what it needed of the unit, and ended well. The restore goes on:" >&2
+  echo "      the slices after it are still read and checked, and every restored file is checked against" >&2
+  echo "      the sha256 the index records for it. $advice" >&2
+  LATE_NOTES+=("NOTE: $line. $short")
+}
+
+# Stream one unit's slices off the tape, through age, into dar (#412 item 1),
+# as the one stream above (#498): nothing decrypted is written to disk except
+# the restored files (the 1.0.x restore decrypted every slice to disk first
+# and needed about twice the unit's size free). Each slice's ciphertext is
+# hashed as it passes and checked against the front index, and age
+# authenticates every 64 KiB as it decrypts, so damaged bytes stop the restore
+# rather than reach dar. Whatever fails first is named: the tape read (dd's
+# words), age (a missing key, or damage), dar (its own output), or the join (a
+# slice that is not what tapectl cut).
 #
 # Given the catalogue (-A), dar stops reading where the file data ends and
 # exits 0: it never reads the archive's own catalogue, the tail of the last
 # slice, and with small slices not the last few slices at all (#497). That is
 # dar done, not dar failed. What it leaves of a slice is still read to its end,
 # hashed and decrypted, into nothing, and so is every slice after it; dar's
-# exit status then decides, as for any restore.
+# exit status then decides, as for any restore (and damage found there is
+# late_damage's).
+#
+# The stream is one named pipe, opened for writing once, as fd 3, after dar
+# has started (it is not dar's to hold), and kept open across the slices and
+# across a cartridge change. Only a slice's feed, a child, ever writes to it.
 stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalogue]
   local list=$1 destdir=$2 cat=${3:-} fifos="$WORK/stream" i n
   STREAM_REFUSED=0
@@ -4497,11 +4694,15 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     shas+=("$sha")
   done <"$list"
   n=${#nums[@]}
-  rm -rf "$fifos" && mkdir -p "$fifos"
-  for num in "${nums[@]}"; do
-    mkfifo "$fifos/restore.$num.dar"
+  # The join takes slices 1 to N, in order, none skipped.
+  for ((i = 0; i < n; i++)); do
+    [ "${nums[$i]}" = "$((i + 1))" ] ||
+      die "the slices of '$(visible_text "$UNIT_NAME")' are not listed as 1 to $n in order (slice ${nums[$i]} where
+       slice $((i + 1)) was due), so they cannot be joined for dar. No slice of it has been read."
   done
-  mkfifo "$fifos/cipher"
+  stream_template
+  rm -rf "$fifos" && mkdir -p "$fifos"
+  mkfifo "$fifos/stream" "$fifos/cipher" "$fifos/trail"
 
   local -a dar_opts=(-O -Q -N --sequential-read)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
@@ -4510,18 +4711,21 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
   # that runs into the last slice, for most slice sizes; with it the restore
   # is exact (measured with #411; fixed in dar 2.7.21).
   [ -z "$cat" ] || dar_opts+=(-A "$cat")
-  dar -x "$fifos/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null &
+  dar -x - -R "$(abs_dir "$destdir")" "${dar_opts[@]}" <"$fifos/stream" >"$WORK/extract.log" 2>&1 &
   DAR_PID=$!
   DAR_RC=""
   BG_PIDS+=("$DAR_PID")
+  exec 3>"$fifos/stream"
+  STREAM_OPEN=1
 
-  local hpid wpid st got from sink
+  local hpid wpid got from sink late
+  local -a st
   for ((i = 0; i < n; i++)); do
     num=${nums[$i]} tpos=${poss[$i]} size=${sizes[$i]} sha=${shas[$i]}
     if [ "$SPAN_RESTORE" = stream ]; then
       # A unit held across tapes, with --stream-tapes: each slice from the
       # cartridge in the drive while its front index lists it, then the next
-      # cartridge, asked for while dar waits on its pipe for as long as that
+      # cartridge, asked for while dar waits on the stream for as long as that
       # takes (volume-format-v2.md 4.4, R8). A dar that has ended well needs no
       # more, and the slice is still asked for, to be checked.
       tpos=$(span_pos "$num")
@@ -4533,7 +4737,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
         # before a cartridge is asked for that it would never read.
         if ! kill -0 "$DAR_PID" 2>/dev/null; then
           die_dar "$destdir"
-          return 0
+          break
         fi
         span_swap "$num"
         tpos=$(span_pos "$num")
@@ -4547,14 +4751,14 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       from="tape file $tpos"
       info "Slice $((i + 1))/$n — tape file $tpos"
     fi
-    # The slice goes to dar's pipe while dar runs. A dar that ended well wants
-    # no more: the slice goes to /dev/null, never to a pipe nobody will open.
-    # One that failed is said now.
-    sink="$fifos/restore.$num.dar"
+    # The slice is joined into dar's stream while dar runs. A dar that ended
+    # well wants no more: the slice goes to /dev/null, still read, hashed and
+    # decrypted. One that failed is said now.
+    sink=stream
     if ! dar_running; then
       if [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        return 0
+        break
       fi
       sink=/dev/null
     fi
@@ -4562,17 +4766,18 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       seek_to "$tpos" || die "cannot position the tape at file $tpos ($MT failed)"
       CUR=""
     fi
-    sha256sum <"$fifos/cipher" >"$WORK/slice.sha" 2>/dev/null &
+    rm -f "$WORK/join.why" "$WORK/join.closed"
+    sha256sum <"$fifos/cipher" >"$WORK/slice.sha" 2>/dev/null 3>&- &
     hpid=$!
     BG_PIDS+=("$hpid")
     : >"$WORK/feed.status"
     (
       # Not -e here: the pipeline's statuses are the result, written below.
       set +e
-      # What dar does not read of the slice is drained after age: the first
-      # cat alone dies of the pipe dar closed, so age still authenticates
-      # every chunk, the hash is of the whole slice and the tape file is read
-      # to its end.
+      # What dar does not take of the slice is drained after age: the join
+      # stops writing when dar closes the stream, and what is left is read
+      # into nothing, so age still authenticates every chunk, the hash is of
+      # the whole slice and the tape file is read to its end.
       slice_bytes "$num" |
         {
           head -c "$size"
@@ -4580,34 +4785,35 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
         } | tee "$fifos/cipher" |
         age -d "${AGE_IDS[@]}" 2>"$WORK/age.err" |
         {
-          cat 2>/dev/null >"$sink"
+          [ "$sink" = /dev/null ] || join_slice "$num" "$((i == 0))" "$((i + 1 == n))"
           cat >/dev/null
         }
       echo "${PIPESTATUS[*]}" >"$WORK/feed.status"
     ) </dev/null &
     wpid=$!
-    if [ "$sink" != /dev/null ] && ! wait_feed "$wpid"; then
-      # dar ended while the slice was fed. A feed that is opening, or about
-      # to open, this slice's FIFO waits for a reader that will never come.
-      # Open it from the other end in the background and close it at once:
-      # the feed's open completes, its next write breaks the pipe, and the
-      # rest of the slice drains.
-      (: <"$fifos/restore.$num.dar") 2>/dev/null &
-      local opener=$!
-      BG_PIDS+=("$opener")
-      wait "$wpid" 2>/dev/null || true
-      wait "$hpid" 2>/dev/null || true
-      kill -KILL "$opener" 2>/dev/null || true
-      if [ "$DAR_RC" != 0 ]; then
-        die_dar "$destdir"
-        return 0
-      fi
-    fi
     wait "$wpid" 2>/dev/null || true
     wait "$hpid" 2>/dev/null || true
+    if [ -f "$WORK/join.closed" ]; then
+      # dar closed the stream part way through this slice: it has ended, or
+      # is ending, and takes nothing more. Its status is waited for, and a
+      # dar that failed is said now, as it ended while the slice was fed.
+      stream_close
+      dar_reap
+      if [ "$DAR_RC" != 0 ]; then
+        die_dar "$destdir"
+        break
+      fi
+    fi
+    # Damage here cannot have reached dar when dar had already ended well:
+    # the slice went to /dev/null, or dar closed the stream before the end of
+    # what age gave of it (item 182, late_damage).
+    late=0
+    if { [ "$sink" = /dev/null ] || [ -f "$WORK/join.closed" ]; } && [ "$DAR_RC" = 0 ]; then
+      late=1
+    fi
     read -r -a st <"$WORK/feed.status" || true
     # st: dd (or cat, from scratch), the head/drain group, tee, age, and the
-    # group that feeds dar and drains what it leaves.
+    # group that joins the slice into dar's stream and drains what dar leaves.
     if [ "${st[0]:-1}" != 0 ]; then
       if [ "$SPAN_RESTORE" = stream ]; then
         echo "NOTE: without --stream-tapes a slice that will not read is asked for from another cartridge that holds it." >&2
@@ -4618,32 +4824,46 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     fi
     if [ "${st[3]:-1}" != 0 ]; then
       # age's own complaint about the slice (a damaged chunk, a header no key
-      # opens) is what the heir needs to read, even when dar, seeing the slice
-      # cut short, has already died of it. Only an age that failed some other
-      # way, with dar failed too, hands the word to dar.
+      # opens) is what the heir needs to read. Only an age that failed some
+      # other way, with dar failed too, hands the word to dar.
       if ! grep -E 'decrypt|authenticat|no identity matched|header|MAC' "$WORK/age.err" >/dev/null 2>&1 &&
         ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        return 0
+        break
       fi
       cat "$WORK/age.err" >&2 || true
       if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
         die_slice_keys "$num"
       fi
+      if [ "$late" = 1 ]; then
+        late_damage "$num" "$tpos" "age cannot authenticate it there (its own words are above), so its sha256 cannot match the front index either"
+        [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
+        continue
+      fi
       die "slice $num ($from) did not decrypt: a key matched it, so its bytes are
        damaged. Files already restored to $destdir from this unit may be incomplete.
 $(replace_hint)"
     fi
+    if [ -s "$WORK/join.why" ]; then
+      die "slice $num ($from) is not a slice of this unit as tapectl cut it: $(cat "$WORK/join.why").
+       Refusing to join the slices for dar rather than guess (a dar whose slice header this
+       script does not know would land here). Files already restored to $destdir from this
+       unit may be incomplete."
+    fi
     if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; then
       if ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        return 0
+        break
       fi
       die "slice $num ($from) could not be passed to dar (status ${st[*]})"
     fi
     [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
     got=$(awk '{print $1}' "$WORK/slice.sha")
     if [ "$got" != "$sha" ]; then
+      if [ "$late" = 1 ]; then
+        late_damage "$num" "$tpos" "its sha256 does not match the front index (expected ${sha:0:16}…, got ${got:0:16}…)"
+        continue
+      fi
       die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${got:0:16}…)
        The slice does not match the front index. dar has already taken what
        decrypted of it: do not trust the files restored to $destdir.
@@ -4651,6 +4871,13 @@ $(replace_hint)"
     fi
     info "  checksum verified against front index"
   done
+  # The stream's own trailer, written by a child (see above), once every
+  # slice is joined; then the stream is closed, and dar reads its end.
+  if [ "$STREAM_REFUSED" = 0 ] && [ "$STREAM_OPEN" = 1 ] && dar_running; then
+    (printf T >&3) 2>/dev/null || true
+  fi
+  stream_close
+  [ "$STREAM_REFUSED" = 0 ] || return 0
 
   dar_reap
   local rc=$DAR_RC
@@ -5316,6 +5543,7 @@ span_swap() { # <slice number>
   swap_loop
   SPAN_NEED=""
   SPAN_SWAPPED=1
+  CART_LABEL=${OTHER_LABEL:-<unreadable>}
 }
 
 # The default way (item 132), and --path's: every slice $WORK/span.all lists
@@ -5338,6 +5566,7 @@ span_spool() {
       info "Slice $num of $SPAN_N — tape file $pos"
       if read_slice_checked "$pos" "$size" "$sha" "$SCRATCH/slice.$num.enc"; then
         info "  checksum verified against front index; kept, still encrypted, in the scratch directory"
+        echo "$num|${CART_LABEL:-${TAPE_LABEL:-$LABEL}}|$pos" >>"$WORK/span.from"
       else
         info "  slice $num (tape file $pos) $SLICE_WHY: another cartridge that holds it is asked for"
         break
@@ -5457,6 +5686,8 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
   fi
   SPAN_UNIT=$unit
   SPAN_VER=$ver
+  CART_LABEL=${TAPE_LABEL:-$LABEL}
+  : >"$WORK/span.from"
   info "'$unit' (version $ver) is held across tapes: this tape holds slices 1 to $last of $SPAN_N."
   info "  It is restored from this tape, then from each cartridge you are asked for, in slice order."
   if [ "$SPAN_RESTORE" = scratch ]; then
@@ -5475,6 +5706,7 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
   fi
   restore_unit "$WORK/span.all" "$destdir" "$unit" "$ver"
   STREAM_FROM=""
+  CART_LABEL=""
   if [ "$SPAN_RESTORE" = scratch ]; then
     rm -rf "$SCRATCH"
     SCRATCH=""
@@ -6668,13 +6900,15 @@ restore_end() {
     for line in "${INCOMPLETE[@]}"; do
       printf '%s\n' "$line" | sed 's/^/>>> /'
     done
-    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
+    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"} ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
       info "$line"
     done
     exit 1
   fi
   info "RESTORE COMPLETE"
-  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
+  # The damage a restore did not need (item 182), said again: the tape is to
+  # be replaced, though everything restored checked out.
+  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"} ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
     info "$line"
   done
 }
@@ -7641,6 +7875,7 @@ esac
         .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
         .replace("__AWK_INDEX_HOLDERS__", AWK_INDEX_HOLDERS)
         .replace("__AWK_DAR_DAMAGED__", AWK_DAR_DAMAGED)
+        .replace("__AWK_DAR_HEADER__", AWK_DAR_HEADER)
         .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
         .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
         .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
@@ -8509,7 +8744,7 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAMAGED_DIRS, AWK_DAR_DAMAGED, AWK_DAR_HEADER,
         AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
         AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_HOLDERS, AWK_INDEX_WHERE,
         AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
@@ -11031,6 +11266,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
             ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
+            ("AWK_DAR_HEADER", AWK_DAR_HEADER),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
@@ -11857,6 +12093,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
             ("AWK_INDEX_HOLDERS", AWK_INDEX_HOLDERS),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
+            ("AWK_DAR_HEADER", AWK_DAR_HEADER),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
@@ -11865,6 +12102,153 @@ sha256_encrypted = \"bbb\"
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
+    }
+
+    /// `AWK_DAR_HEADER`, under every awk on the host, reads a dar header as
+    /// `dar::slice`'s parser does (#498, ADR-0012 item 181): dar's own
+    /// standard-output header and slice headers at 50 and 54 bytes (the slice
+    /// size two 4-byte groups wide above 4 GiB), each with its length, flag,
+    /// slice size and the offset of its data name; and the same refusals,
+    /// never a guess.
+    #[test]
+    fn the_dar_header_fragment_reads_dar_headers_alike_under_every_awk() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("tapectl-darhdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        // One header in dar's layout: magic, internal name, flag, extension,
+        // a one-group infinint count, then each field (u16 type, a one-group
+        // infinint length, the value).
+        let hdr = |flag: u8, ext: u8, fields: &[(u16, Vec<u8>)]| -> Vec<u8> {
+            let mut h = vec![0, 0, 0, 0x7b];
+            h.extend_from_slice(b"0123456789");
+            h.extend_from_slice(&[flag, ext, 0x80, 0, 0, 0, fields.len() as u8]);
+            for (t, v) in fields {
+                h.extend_from_slice(&t.to_be_bytes());
+                h.extend_from_slice(&[0x80, 0, 0, 0, v.len() as u8]);
+                h.extend_from_slice(v);
+            }
+            h
+        };
+        let name = b"DATANAME!!".to_vec();
+        let one_mib = vec![0x80, 0, 0x10, 0, 0];
+        let ten_gib = vec![0x40, 0, 0, 0, 2, 0x80, 0, 0, 0];
+        let read = |bytes: &[u8]| -> (i32, String) {
+            let text: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+            let input = dir.join("od.txt");
+            std::fs::write(&input, text.join(" ")).unwrap();
+            run_awk(false, AWK_DAR_HEADER, &input, &[])
+        };
+        for (what, bytes, want) in [
+            (
+                "stdout",
+                hdr(b'T', b'T', &[(3, name.clone())]),
+                "38 T - 28\n",
+            ),
+            (
+                "1M slice",
+                hdr(b'E', b'T', &[(1, one_mib.clone()), (3, name.clone())]),
+                "50 E 1048576 40\n",
+            ),
+            (
+                "10G slice",
+                hdr(b'E', b'T', &[(1, ten_gib.clone()), (3, name.clone())]),
+                "54 E 10737418240 44\n",
+            ),
+        ] {
+            // What follows the header is not read as part of it.
+            let mut more = bytes.clone();
+            more.extend_from_slice(&[0, 0, 0, 0x7b, 9, 9, 9]);
+            assert_eq!(read(&more), (0, want.to_string()), "{what}");
+        }
+        let mut bad_magic = hdr(b'T', b'T', &[(3, name.clone())]);
+        bad_magic[3] = 0x7c;
+        let mut wide = hdr(b'T', b'T', &[(3, name.clone())]);
+        wide[16] = 0x03;
+        let short = hdr(b'E', b'T', &[(1, one_mib.clone()), (3, name.clone())]);
+        for (what, bytes, want) in [
+            (
+                "magic",
+                bad_magic,
+                "the data does not start with the magic number of dar",
+            ),
+            (
+                "flag",
+                hdr(b'X', b'T', &[(3, name.clone())]),
+                "an unknown slice flag 88",
+            ),
+            (
+                "extension",
+                hdr(b'T', b'N', &[(3, name.clone())]),
+                "a header extension that is not a list of fields",
+            ),
+            (
+                "width byte",
+                wide,
+                "an integer width byte 3 with more than one bit set",
+            ),
+            (
+                "field type",
+                hdr(b'E', b'T', &[(2, one_mib.clone()), (3, name.clone())]),
+                "an unknown header field type 2",
+            ),
+            (
+                "two sizes",
+                hdr(
+                    b'E',
+                    b'T',
+                    &[
+                        (1, one_mib.clone()),
+                        (1, one_mib.clone()),
+                        (3, name.clone()),
+                    ],
+                ),
+                "two slice-size fields",
+            ),
+            (
+                "no data name",
+                hdr(b'E', b'T', &[(1, one_mib.clone())]),
+                "no data-name field",
+            ),
+            (
+                "short data name",
+                hdr(b'T', b'T', &[(3, b"NINEBYTES".to_vec())]),
+                "a data-name field 9 bytes long",
+            ),
+            ("ends early", short[..45].to_vec(), "the header ends early"),
+        ] {
+            assert_eq!(read(&bytes), (1, format!("{want}\n")), "{what}");
+        }
+
+        // dar's own: its standard-output header, and a slice header above 4 GiB.
+        let tmpl = Command::new("dar")
+            .args(["-N", "-c", "-", "-R"])
+            .arg(dir.join("empty"))
+            .args(["-an", "-D", "-Q"])
+            .env("HOME", "/nonexistent")
+            .output()
+            .expect("dar must be on PATH (issue #43)");
+        assert!(tmpl.status.success());
+        let (code, out) = read(&tmpl.stdout[..tmpl.stdout.len().min(4096)]);
+        assert_eq!((code, out.split(' ').nth(1)), (0, Some("T")), "{out}");
+        assert!(out.ends_with(" - 28\n") && out.starts_with("38 "), "{out}");
+        let base = dir.join("big");
+        let made = Command::new("dar")
+            .args(["-N", "-c"])
+            .arg(&base)
+            .arg("-R")
+            .arg(dir.join("empty"))
+            .args(["-s", "10G", "-Q"])
+            .env("HOME", "/nonexistent")
+            .output()
+            .expect("dar");
+        assert!(made.status.success());
+        let slice = std::fs::read(dir.join("big.1.dar")).unwrap();
+        assert_eq!(
+            read(&slice[..slice.len().min(4096)]),
+            (0, "54 E 10737418240 44\n".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #133 defects 2 and 4, at the process boundary: how the script answers
@@ -12381,9 +12765,11 @@ sha256_encrypted = \"bbb\"
             "every key becomes an -i"
         );
         assert!(
-            s.contains("age -d \"${AGE_IDS[@]}\" 2>\"$WORK/age.err\" |\n        {\n          cat 2>/dev/null >\"$sink\""),
-            "the streamed slice is decrypted with every key, into dar's pipe (#497: what dar \
-             leaves is drained after it)"
+            s.contains(
+                "age -d \"${AGE_IDS[@]}\" 2>\"$WORK/age.err\" |\n        {\n          [ \"$sink\" = /dev/null ] || join_slice"
+            ),
+            "the streamed slice is decrypted with every key, into dar's stream (#498: joined \
+             into the one stream; #497: what dar leaves is drained after it)"
         );
         assert!(
             s.contains("if age -d \"${AGE_IDS[@]}\" <\"$in\" >\"$out\""),
@@ -12803,8 +13189,9 @@ sha256_encrypted = \"bbb\"
     }
 
     /// The check runs after the versions are picked and BEFORE the first slice
-    /// is read; a full restore streams its slices from the tape into dar
-    /// through FIFOs, and no slice lands in WORK (which is /tmp).
+    /// is read; a full restore streams its slices from the tape into dar,
+    /// joined into one stream on dar's standard input through one FIFO (never
+    /// a FIFO per slice, #498), and no slice lands in WORK (which is /tmp).
     #[test]
     fn restore_measures_space_before_the_first_slice_and_streams_into_dar() {
         let s = generate_restore_script_v2("ORDER1", 20);
@@ -12824,7 +13211,12 @@ sha256_encrypted = \"bbb\"
             picked < check && check < first_read,
             "order: version, space, slices"
         );
-        assert!(s.contains("mkfifo \"$fifos/restore.$num.dar\""));
+        assert!(s.contains("mkfifo \"$fifos/stream\" \"$fifos/cipher\" \"$fifos/trail\""));
+        assert!(!s.contains("mkfifo \"$fifos/restore."), "no FIFO per slice");
+        assert!(s.contains(
+            "dar -x - -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\" <\"$fifos/stream\""
+        ));
+        assert!(s.contains("exec 3>\"$fifos/stream\""));
         assert!(s.contains("local -a dar_opts=(-O -Q -N --sequential-read)"));
         assert!(!s.contains("$WORK/slice.enc") && !s.contains("$WORK/dar/"));
         // --verify hashes as it streams; it copies nothing to WORK.

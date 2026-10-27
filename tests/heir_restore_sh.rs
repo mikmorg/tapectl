@@ -2912,12 +2912,16 @@ fn reseal(h: &Heir, pos: i64, to: &str) {
     std::fs::write(&f, bytes).unwrap();
 }
 
-/// A dar that records how it was called and whether every slice it was
-/// handed is a FIFO, then runs the real one.
+/// A dar that records how it was called and what it was handed to extract,
+/// then runs the real one: each slice of a base it reads directly (`file`, or
+/// `fifo`), or, for `dar -x -`, the one stream on its standard input
+/// (`stream-fifo`, or `stream-other`).
 const DAR_SPY: &str = "#!/bin/sh\necho \"$*\" >>\"$FAKE_TAPE/dar.args\"\n\
     for a in \"$@\"; do case \"$a\" in */restore) for f in \"$a\".*.dar; do \
     if [ -p \"$f\" ]; then echo fifo >>\"$FAKE_TAPE/dar.slices\"; \
     else echo file >>\"$FAKE_TAPE/dar.slices\"; fi; done ;; esac; done\n\
+    case \" $* \" in *\" -x - \"*) if [ -p /dev/stdin ]; then echo stream-fifo; \
+    else echo stream-other; fi >>\"$FAKE_TAPE/dar.slices\" ;; esac\n\
     exec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
 
 /// `DAR_SPY`, answering the script's version probe (`dar -V`) as dar
@@ -2960,10 +2964,12 @@ fn host_dar_at_least(want: (u32, u32, u32)) -> bool {
     (have[0], have[1], have[2]) >= want
 }
 
-/// The slices go from the tape through age straight into dar: dar reads
-/// FIFOs with --sequential-read, nothing decrypted is written to disk, and
-/// the space check asks only for the unit's own size (it asked for about
-/// twice that, plus a slice, which refused a 470 GiB unit on a 1 TB disk).
+/// The slices go from the tape through age straight into dar: dar reads them
+/// joined into one stream on its standard input, a FIFO, with
+/// --sequential-read (never one named pipe per slice, #498), nothing
+/// decrypted is written to disk, and the space check asks only for the
+/// unit's own size (it asked for about twice that, plus a slice, which
+/// refused a 470 GiB unit on a 1 TB disk).
 #[test]
 fn a_restore_streams_slices_into_dar_without_decrypting_to_disk() {
     let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
@@ -2987,11 +2993,15 @@ fn a_restore_streams_slices_into_dar_without_decrypting_to_disk() {
         args.contains("-A ") && args.contains("catalogs/11111111_v2"),
         "dar is given the envelope's catalogue: {args}"
     );
+    assert!(
+        args.lines().any(|l| l.starts_with("-x - ")),
+        "dar extracts its standard input: {args}"
+    );
     let kinds = std::fs::read_to_string(h.dir.join("dar.slices")).unwrap();
     assert_eq!(
         kinds.lines().collect::<Vec<_>>(),
-        vec!["fifo"; photos.positions.len()],
-        "every slice handed to dar is a FIFO"
+        vec!["stream-fifo"],
+        "dar is handed one stream, a FIFO, and no slice of its own"
     );
     assert!(
         text.contains("(the files); "),
@@ -13138,14 +13148,17 @@ fn a_refusal_relayed_from_an_offered_cartridge_says_the_restore_goes_on() {
     );
 }
 
-/// dar -x with the envelope's catalogue (-A): it reads slices 1 to 3 off
-/// their pipes and then refuses the catalogue, as dar refuses a re-staged
-/// snapshot's (#419), so the refusal comes after the cartridge change slice 3
-/// needs. Every other run is the host's dar.
+/// dar -x with the envelope's catalogue (-A): it reads into slice 3 of the
+/// one stream it is given and then refuses the catalogue, as dar refuses a
+/// re-staged snapshot's (#419), so the refusal comes after the cartridge
+/// change slice 3 needs. Slices 1 and 2 of `big` give the stream 2 x 102,400
+/// bytes less their headers and trailers (and it has its own, shorter,
+/// header): 204,801 bytes reach into slice 3. Every other run is the host's
+/// dar.
 const DAR_REFUSES_AFTER_SLICE_3: &str = r#"#!/usr/bin/env bash
 case " $* " in
   *" -x "*" -A "*)
-    for n in 1 2 3; do cat "$2.$n.dar" >/dev/null; done
+    head -c 204801 >/dev/null
     echo "Error: the archive and the isolated catalogue do not correspond to the same data"
     exit 1 ;;
 esac
@@ -14098,9 +14111,16 @@ fn damage_in_the_tail_dar_leaves_unread_is_named_and_the_restore_is_whole() {
         2,
         "said at the slice, and again at the end:\n{text}"
     );
+    // The summary is on standard output, after RESTORE COMPLETE (the harness
+    // puts standard error after it, so the note at the slice is there too).
     let end = text.split("RESTORE COMPLETE").nth(1).unwrap();
-    assert_eq!(late_damage_said(end, n, last), 1, "{text}");
-    assert!(end.contains("Replace this tape"), "{text}");
+    assert!(
+        end.contains(&format!(
+            ">>> NOTE: slice {n} of 'many' (tape file {last} of {LABEL}) is damaged after the point \
+             this restore needed. Replace this tape.\n"
+        )),
+        "{text}"
+    );
     assert_eq!(verified(&text), n - 1, "every other slice checked:\n{text}");
     assert!(text.contains(&many_checked("many")), "{text}");
     assert!(same_tree(&many.src, Path::new(&dest)), "{text}");
@@ -14151,4 +14171,161 @@ fn damage_in_bytes_dar_reads_still_fails_the_restore() {
     );
     assert!(!text.contains("RESTORE COMPLETE"), "{text}");
     assert_eq!(late_damage_said(&text, n, last), 0, "{text}");
+}
+
+// ---- the join's own guarantees (#498, ADR-0012 item 181) ----
+
+/// A dar that takes the first 100 bytes of the stream it extracts and ends
+/// well (every other run is the host's dar): the stream is closed early.
+const DAR_TAKES_100_BYTES: &str = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -x - "*)
+    head -c 100 >/dev/null
+    exit 0 ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+
+/// The stream is one named pipe the script holds open across slices, and a
+/// write to it after dar has closed it raises SIGPIPE. Only a slice's feed,
+/// a child, ever writes to it, so a dar that closes it at once ends that
+/// writer, never the restore: every slice is still read once, in order, and
+/// checked against the front index, dar's own status (0) decides, and the
+/// file check finds the files dar never wrote. Without that containment the
+/// script would die of the signal (exit 141) part way.
+#[test]
+fn a_dar_that_closes_the_stream_early_ends_a_writer_never_the_restore() {
+    let h = Heir::with_stubs(&[("dar", DAR_TAKES_100_BYTES)]);
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(
+        text.contains("do NOT match their recorded sha256, or are missing"),
+        "{text}"
+    );
+    assert_eq!(
+        verified(&text),
+        photos.positions.len(),
+        "every slice checked:\n{text}"
+    );
+    let slices: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .collect();
+    assert_eq!(slices, photos.positions, "each slice read once, in order");
+}
+
+/// Flip byte `at` of the tape file at `pos`.
+fn flip_at(h: &Heir, pos: i64, at: usize) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[at] ^= 0x01;
+    std::fs::write(&f, bytes).unwrap();
+}
+
+/// A slice that is not what tapectl cut is refused by the join and named,
+/// never guessed at: a later slice whose header is not slice 1's, and a slice
+/// that ends with a byte other than its trailer. (The stub age does not
+/// authenticate, so the changed bytes reach the join; the real age would
+/// stop either as damage first.)
+#[test]
+fn a_slice_that_is_not_what_tapectl_cut_is_refused_by_the_join() {
+    let photos = unit("photos/2019");
+    // Under the stub age a slice on tape is its 32-byte header, then the
+    // plaintext: the dar header's internal name is plaintext bytes 4 to 13,
+    // and the trailer the plaintext's last byte.
+    for (what, slice, at, said) in [
+        (
+            "a header that is not slice 1's",
+            1usize,
+            32 + 6,
+            "slice 2's header is not slice 1's".to_string(),
+        ),
+        (
+            "a trailer that is not N",
+            0,
+            photos.sizes[0] - 1,
+            format!("slice 1 ends with the byte {}, not N", b'N' ^ 0x01),
+        ),
+    ] {
+        let h = Heir::new();
+        let pos = photos.positions[slice];
+        flip_at(&h, pos, at);
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "photos/2019",
+            "--to",
+            &h.sub("restored"),
+        ]);
+        assert_eq!(code, 1, "{what}:\n{text}");
+        assert!(
+            text.contains(&format!(
+                "FATAL: slice {} (tape file {pos}) is not a slice of this unit as tapectl cut it: {said}.",
+                slice + 1
+            )),
+            "{what}:\n{text}"
+        );
+        assert!(
+            text.contains("Refusing to join the slices for dar rather than guess"),
+            "{what}:\n{text}"
+        );
+        assert!(!text.contains("RESTORE COMPLETE"), "{what}:\n{text}");
+    }
+}
+
+/// The stream's header is the heir's own dar's (`dar -c -` over an empty
+/// directory), parsed before any slice is read: a dar whose header this
+/// script does not know is refused there, by name, and no slice is read.
+#[test]
+fn a_dar_whose_stream_header_is_unknown_is_refused_before_a_slice_is_read() {
+    let dar = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -c - "*)
+    printf 'not a dar archive at all'
+    exit 0 ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+    let h = Heir::with_stubs(&[("dar", dar)]);
+    let photos = unit("photos/2019");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(
+            "FATAL: the header this dar writes on its standard output is not one this script \
+             knows (the data does not start with the magic number of dar)."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("No slice of the unit has been read."),
+        "{text}"
+    );
+    assert!(
+        reads(&h).iter().all(|p| !photos.positions.contains(p)),
+        "no slice is read:\n{:#?}",
+        h.ops()
+    );
 }

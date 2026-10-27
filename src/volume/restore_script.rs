@@ -1133,3 +1133,83 @@ pub(crate) const AWK_DAMAGED_DIRS: &str = r##"
       }
     }
   "##;
+
+/// One dar header (the slice header, or the header dar writes on its standard
+/// output), read from `od -An -v -tu1` of the bytes it starts: prints its
+/// length, its flag (`T`, `N` or `E`), the slice size it records (`-` for
+/// none) and the offset of its data-name label, one line; or, for anything
+/// it does not recognise, what that is, and exits 1. RESTORE.sh joins a
+/// unit's slices back into the one stream dar reads on its standard input
+/// (`stream_unit`, issue #498, ADR-0012 item 181) with what this finds, and
+/// refuses rather than guesses: the same checks, in the same order, as
+/// `dar::slice`'s parser in tapectl (magic, 10-byte internal name, flag,
+/// extension `T`, an infinint count of at most 16 fields, each a u16 type, an
+/// infinint length and the value; type 1 the slice size, type 3 the 10-byte
+/// data name, any other type refused). An infinint is zero or more `00` bytes,
+/// one byte with a single bit set, then the value in 4-byte groups: `80` one
+/// group, `40` two, each leading `00` eight more. A value wider than six
+/// significant bytes is refused: awk counts in doubles, exact to 2^53. No
+/// exponent operator: busybox awk can be built without it.
+pub(crate) const AWK_DAR_HEADER: &str = r##"
+    function bad(why) { print why; exit 1 }
+    function byte() {
+      if (p >= 4096) bad("a header longer than 4096 bytes")
+      if (p >= n) bad("the header ends early")
+      return b[p++]
+    }
+    function inf(   z, pre, lz, bit, w, v, i, c, sig) {
+      z = 0
+      pre = byte()
+      while (pre == 0) { z++; pre = byte() }
+      lz = -1
+      bit = 128
+      for (i = 0; i < 8; i++) {
+        if (pre == bit) lz = i
+        bit = bit / 2
+      }
+      if (lz < 0) bad("an integer width byte " pre " with more than one bit set")
+      w = (z * 8 + lz + 1) * 4
+      v = 0
+      sig = 0
+      for (i = 0; i < w; i++) {
+        c = byte()
+        if (c != 0 || sig > 0) sig++
+        v = v * 256 + c
+      }
+      if (sig > 6) bad("an integer " w " bytes wide")
+      return v
+    }
+    { for (i = 1; i <= NF; i++) b[n++] = $i + 0 }
+    END {
+      p = 0
+      if (byte() != 0 || byte() != 0 || byte() != 0 || byte() != 123) bad("the data does not start with the magic number of dar")
+      for (i = 0; i < 10; i++) byte()
+      flag = byte()
+      if (flag != 84 && flag != 78 && flag != 69) bad("an unknown slice flag " flag)
+      if (byte() != 84) bad("a header extension that is not a list of fields")
+      count = inf()
+      if (count > 16) bad(count " header fields")
+      dn = -1
+      size = -1
+      for (f = 0; f < count; f++) {
+        t = byte() * 256
+        t += byte()
+        len = inf()
+        if (len > 4096) bad("a header field " len " bytes long")
+        at = p
+        if (t == 3) {
+          if (len != 10 || dn >= 0) bad("a data-name field " len " bytes long")
+          for (i = 0; i < 10; i++) byte()
+          dn = at
+        } else if (t == 1) {
+          if (size >= 0) bad("two slice-size fields")
+          size = inf()
+          if (p - at != len) bad("a slice-size field whose length disagrees with it")
+        } else {
+          bad("an unknown header field type " t)
+        }
+      }
+      if (dn < 0) bad("no data-name field")
+      printf "%d %s %s %d\n", p, (flag == 84 ? "T" : (flag == 78 ? "N" : "E")), (size < 0 ? "-" : sprintf("%.0f", size)), dn
+    }
+  "##;
