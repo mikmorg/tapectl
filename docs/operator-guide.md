@@ -1373,7 +1373,8 @@ tape, and refuses with nothing read
 
 - **Space.** A unit whose isolated catalogue from `stage create` is still on
   disk (under `~/.tapectl/catalogs/`) **streams**: each slice is decrypted
-  off the tape straight into dar through a named pipe, so it needs only about
+  off the tape straight into dar, joined back into the one stream dar wrote and
+  fed to its standard input (since 1.7.2, #498), so it needs only about
   the unit's size free in `--to`, and the drive keeps reading while dar
   extracts. Otherwise — a stage set whose catalogue is not on disk (a catalog
   rebuilt from a tape that carried none), or dar older than 2.7.9 —

@@ -2641,8 +2641,9 @@ room:
 
 - **Streamed** (`restore unit` or `restore volume`, with the unit's isolated
   catalogue from `stage create` still under `<home>/catalogs/`, and dar 2.7.9
-  or newer): each slice goes from the tape through a named pipe straight into
-  dar, so only about the unit's size is needed in `--to`.
+  or newer): each slice goes from the tape straight into dar, joined into the
+  one stream dar wrote (on its standard input; through a named pipe per slice
+  before 1.7.2), so only about the unit's size is needed in `--to`.
 - **Spooled** (otherwise, for example after `catalog rebuild`, which has no
   catalogues, or with `--spool`): every slice is decrypted into a
   `.tapectl-restore-tmp` directory inside `--to` (never the system temp
@@ -2966,7 +2967,7 @@ says all of this on its cover sheet (ADR-0012 item 178).
 The tape is sound: every slice matched the front index, and age authenticated
 every byte. dar itself misreads some archives when their slices reach it through
 named pipes, which is how RESTORE.sh's restore (from 1.1.0) and tapectl's
-streamed restore feed it (#498). Where a read request of dar's ends exactly on a
+streamed restore up to 1.7.1 feed it (#498). Where a read request of dar's ends exactly on a
 slice's last byte, dar takes that slice's one-byte trailer for data. It happens
 at a fixed place in a given archive, so the same unit fails the same way every
 time it is streamed, and it never happens when dar reads the slices from regular
@@ -2982,9 +2983,12 @@ Restore the unit, or the files dar named, from slices on disk:
   into an empty directory with `--slices-from DIR` (an empty `DIR`).
 - **RESTORE.sh from 1.1.0 or 1.2.x** (keepsake's tapes): it ends
   `FATAL: dar extraction failed (exit 5)`. Use tapectl, as the entry above says.
-- **tapectl:** `restore unit --spool` (or `restore volume --spool`). After a
-  `catalog rebuild` there is no isolated catalogue on disk and every restore
-  spools already.
+- **tapectl 1.7.2 or later** does not meet it: it joins the slices back into
+  the one stream dar wrote and feeds that to dar's standard input, which dar
+  reads without this fault. Stream the unit again with it.
+- **tapectl 1.7.1 or earlier:** `restore unit --spool` (or `restore volume
+  --spool`). After a `catalog rebuild` there is no isolated catalogue on disk
+  and every restore spools already.
 
 ### RESTORE.sh: `dar refused the envelope's catalogue`
 
