@@ -2365,3 +2365,16 @@ Ruled 2026-10-27 (later), on the coordinator's proposal after 1.7.1's tag:
      of home2's catalog with the candidate, with no drive touched. Handoff (h) then installs
      `v1.8.0` by its steps.
 
+Ruled 2026-10-27 (night), on the coordinator's report of a serious fault in item 181's first build:
+on Ubuntu 26.04 LTS, whose default coreutils are uutils 0.10.0, `tail -c 1` reading a named pipe
+never returns when the pipe carries under 64 KiB, and 1.8.0's RESTORE.sh took a unit's last slice
+apart with it, so a streamed restore whose last slice is that small hung. It was found by master's
+CI after item 181's re-pin (`201a060c`) had landed there; no real tape carries that script, and
+nothing is tagged.
+
+184. **Item 181's re-pin may move again for fixes to items 181 and 182** found before `v1.8.0` is
+     tagged ("Go ahead with any repin fixes"). Each move is its own commit, names the fix, and
+     comes after the chain has proven it, now including RESTORE.sh's tests under Ubuntu 26.04's
+     uutils coreutils. The authorization ends when `v1.8.0` is tagged; `requires`, MANIFEST.toml,
+     File 0, the front index, the seals and the envelopes still do not move.
+
