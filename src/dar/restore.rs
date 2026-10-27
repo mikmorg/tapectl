@@ -180,9 +180,27 @@ pub fn supports_streaming(version: &super::version::DarVersion) -> bool {
     (version.major, version.minor, version.patch) >= STREAMING_MIN_VERSION
 }
 
-/// A `dar -x --sequential-read` reading its slices from named pipes as the
-/// restore decrypts them off the tape (issue #411) — the process, and the
-/// two threads draining its output.
+/// `dar -x - --sequential-read -A <catalogue>`: dar extracting an archive it
+/// reads as one stream on its standard input, which the restore writes as it
+/// decrypts the slices off the tape (issues #411, #498) — the process, the
+/// stream it is fed, and the two threads draining its output.
+///
+/// **One stream, never a named pipe per slice (#498).** Fed one named pipe
+/// per slice (`<base>.N.dar`), dar's slice layer sees a slice's size as 0
+/// and finds the slice's end only on a short read; when one of its reads
+/// asks for exactly the bytes left in a slice, trailer included, the
+/// trailer byte (`N`) comes back as archive data: a one-byte shift, then
+/// "Bad CRC" or "invalid FSA … flag" and exit 5, the same way every time for
+/// one archive (`sar::inherited_read`, every dar from 2.7.7 to 2.8.6). An
+/// archive on standard input is read by dar's single-stream reader, which
+/// looks one byte ahead and never takes the last byte as data. So the
+/// slices are joined back into the `dar -c -` stream tapectl cut them from
+/// ([`super::slice::Join`]: dar's standard-output header with slice 1's
+/// labels, every slice's payload with its own header and trailer taken off
+/// and checked, the stream's `T`), and that stream is what dar reads.
+/// Measured with dar 2.7.13 and 2.7.21, each way round: the join of
+/// tapectl's slices is the stream byte for byte, and dar restores it
+/// identically, with the catalogue and without.
 ///
 /// **Why the isolated catalogue (`-A`) is always passed.** Measured against
 /// dar 2.7.13 (the version this VM and Ubuntu's CI carry): a sliced archive
@@ -192,52 +210,63 @@ pub fn supports_streaming(version: &super::version::DarVersion) -> bool {
 /// ("arch.4.dar is required for further operation"). The SAME archives,
 /// read the same way with the isolated catalogue given as `-A`, came back
 /// identical on every layout tried (slice sizes from 20 KiB to 3 MiB, all
-/// seven compressors, over regular files and over FIFOs).
+/// seven compressors).
 ///
 /// **With `-A`, dar does not read every byte (#497).** The catalogue tells
 /// dar where the file data ends, and it stops reading there: the archive's
 /// own trailing catalogue is left unread (the tail of the last slice, and,
-/// when that catalogue is bigger than a slice, the last slices whole, which
-/// dar never opens), and dar exits 0. Measured on 2.7.13: 10,000 files in
-/// 20 MiB slices left 979,621 of the last slice's 6,419,109 bytes unread,
-/// and the restored tree was identical. A tail that fits in a pipe's buffer
-/// (64 KiB, a catalogue of a few hundred files) is taken by the pipe whether
-/// or not dar reads it, which is why smaller measurements saw every byte go.
-/// The restore accepts it: what dar leaves of a slice, and any slice after
-/// it, is still read, hashed and authenticated, its plaintext dropped, and
-/// dar's exit status ([`Self::status`], then [`Self::finish`]) says whether
-/// the stop was a failure. A catalogue from a DIFFERENT dar run of the
-/// same content is refused by dar itself, FATAL, before any file is
-/// written ("The archive and the isolated catalogue do not correspond to
-/// the same data") — so a wrong catalogue cannot produce a wrong restore.
+/// when that catalogue is bigger than a slice, the last slices whole), dar
+/// closes its input, and exits 0. Measured on 2.7.13: 10,000 files in 20 MiB
+/// slices left 979,621 of the last slice's 6,419,109 bytes unread, and the
+/// restored tree was identical. The restore accepts it: what dar leaves of
+/// the stream is still read off the tape, hashed and authenticated slice by
+/// slice, its plaintext dropped, and dar's exit status ([`Self::status`],
+/// then [`Self::finish`]) says whether the stop was a failure. A catalogue
+/// from a DIFFERENT dar run of the same content is refused by dar itself,
+/// FATAL, before any file is written ("The archive and the isolated
+/// catalogue do not correspond to the same data") — so a wrong catalogue
+/// cannot produce a wrong restore.
 pub struct SequentialExtract {
     child: std::sync::Mutex<std::process::Child>,
+    input: std::sync::Mutex<Input>,
     argv: Vec<String>,
     stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
     stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
     dest: std::path::PathBuf,
 }
 
+/// dar's standard input: the archive's stream, joined from its slices as
+/// they are fed.
+struct Input {
+    /// `None` once the input is closed: by tapectl, by a refusal, or because
+    /// dar closed it.
+    join: Option<super::slice::Join<std::process::ChildStdin>>,
+    /// Why tapectl stopped feeding dar, when it refused a slice.
+    refused: Option<String>,
+}
+
 impl SequentialExtract {
-    /// Start `dar -x <archive_base> --sequential-read -A <catalogue> -R
-    /// <dest> -O -Q [-w]`. dar opens `<archive_base>.1.dar` first and each
-    /// next slice when it has read the one before to its end, until the file
-    /// data ends (see above), so every slice must already exist (as a named
-    /// pipe) when this is called.
+    /// Start `dar -x - --sequential-read -A <catalogue> -R <dest> -O -Q -N
+    /// [-w]`, its standard input the archive's stream, which the caller
+    /// feeds slice by slice in order ([`Self::begin_slice`], [`Self::feed`],
+    /// [`Self::feed_hole`], [`Self::end_slice`]). `stream_template` is the
+    /// installed dar's standard-output header
+    /// ([`super::slice::stream_template`]); it is checked before dar starts.
     pub fn spawn(
         dar_binary: &str,
-        archive_base: &Path,
         catalogue: &Path,
         dest: &Path,
         overwrite: bool,
+        stream_template: &[u8],
     ) -> Result<Self> {
+        let template = super::slice::StreamTemplate::new(stream_template)?;
         if let Err(e) = std::fs::create_dir_all(dest) {
             return Err(e.into());
         }
         warn_if_non_root();
         let mut args: Vec<std::ffi::OsString> = vec![
             "-x".into(),
-            archive_base.into(),
+            "-".into(),
             "--sequential-read".into(),
             "-A".into(),
             catalogue.into(),
@@ -256,11 +285,12 @@ impl SequentialExtract {
         // stops it between slices on a signal ([`Self::kill`]).
         let mut child = super::command(dar_binary)
             .args(&args)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| TapectlError::Dar(format!("cannot start {dar_binary}: {e}")))?;
+        let stdin = child.stdin.take();
         // Drained on threads: dar prints a line per file it declines to
         // overwrite, and a full 64 KiB pipe would stop it mid-extract.
         let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
@@ -286,6 +316,10 @@ impl SequentialExtract {
         );
         Ok(Self {
             child: std::sync::Mutex::new(child),
+            input: std::sync::Mutex::new(Input {
+                join: stdin.map(|stdin| super::slice::Join::new(stdin, template)),
+                refused: None,
+            }),
             argv,
             stdout,
             stderr,
@@ -293,33 +327,103 @@ impl SequentialExtract {
         })
     }
 
-    /// Whether dar has already exited — asked while waiting for it to open
-    /// the next slice's pipe, so a dar that gave up is never waited on.
+    /// Hand `f` the stream, and say what became of it. `Ok` is taken.
+    /// `BrokenPipe` is dar taking no more: dar closed its input (or ended),
+    /// the input was closed, or tapectl refused the slice as not the
+    /// archive's and closed it ([`Self::refused`] says why). Any other error
+    /// is the write failing; the input is closed then too.
+    fn with_stream(
+        &self,
+        f: impl FnOnce(&mut super::slice::Join<std::process::ChildStdin>) -> Result<()>,
+    ) -> std::io::Result<()> {
+        let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(join) = input.join.as_mut() else {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        };
+        match f(join) {
+            Ok(()) => Ok(()),
+            Err(TapectlError::Io(e)) => {
+                input.join = None;
+                Err(e)
+            }
+            Err(refusal) => {
+                let why = refusal.to_string();
+                warn!("{why}; tapectl stopped feeding dar there");
+                input.refused = Some(why.clone());
+                input.join = None;
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, why))
+            }
+        }
+    }
+
+    /// Begin slice `n` of the archive (from 1, none skipped); `last` when it
+    /// is the archive's last.
+    pub fn begin_slice(&self, n: u32, last: bool) -> std::io::Result<()> {
+        self.with_stream(|join| join.begin(n, last))
+    }
+
+    /// The slice's next bytes.
+    pub fn feed(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.with_stream(|join| join.write(bytes))
+    }
+
+    /// The slice's next `len` bytes are a hole: zeros, where nobody could
+    /// give the bytes whole. They keep their place in the stream.
+    pub fn feed_hole(&self, len: u64) -> std::io::Result<()> {
+        self.with_stream(|join| join.hole(len))
+    }
+
+    /// End the slice: its trailer is checked, and after the last slice the
+    /// stream's own is written.
+    pub fn end_slice(&self) -> std::io::Result<()> {
+        self.with_stream(|join| join.end())
+    }
+
+    /// Close dar's input: dar reads the end of the stream and ends.
+    pub fn close_input(&self) {
+        let mut input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        input.join = None;
+    }
+
+    /// Why tapectl stopped feeding dar, when it refused a slice: the bytes
+    /// were not a slice of this archive as tapectl cut it.
+    pub fn refused(&self) -> Option<String> {
+        let input = self.input.lock().unwrap_or_else(|p| p.into_inner());
+        input.refused.clone()
+    }
+
+    /// Whether dar has already exited.
     pub fn exited(&self) -> bool {
         let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
         !matches!(child.try_wait(), Ok(None))
     }
 
     /// dar's exit status once it has ended, `None` while it runs. A dar that
-    /// stopped reading a slice part way is judged by this, never by the pipe
-    /// it closed (#497).
+    /// stopped reading its input part way is judged by this, never by the
+    /// input it closed (#497).
     pub fn status(&self) -> Option<std::process::ExitStatus> {
         let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
         child.try_wait().ok().flatten()
     }
 
-    /// Stop dar — a restore that cannot deliver the next slice. dar may be
-    /// blocked opening that slice's pipe, and would wait for it forever.
+    /// Stop dar — a restore that cannot deliver the next slice — and close
+    /// its input.
     pub fn kill(&self) {
-        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
+        {
+            let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
         }
+        self.close_input();
     }
 
-    /// Wait for dar to end, and hand back its verbatim report and the
-    /// verdict ([`extract_reported`]'s, `fail_on_skipped` included).
+    /// Close dar's input, wait for dar to end, and hand back its verbatim
+    /// report and the verdict ([`extract_reported`]'s, `fail_on_skipped`
+    /// included). The input is closed first: a dar still reading it would
+    /// otherwise wait for it, and be waited for, forever.
     pub fn finish(mut self) -> (Option<DarReport>, Result<()>) {
+        self.close_input();
         let status = {
             let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
             child.wait()
@@ -969,15 +1073,97 @@ All displayed files have their data in slice range [1,4-5]
         let tmp = tempfile::TempDir::new().unwrap();
         let x = SequentialExtract::spawn(
             "true",
-            &tmp.path().join("restore"),
             &tmp.path().join("cat"),
             &tmp.path().join("dest"),
             false,
+            &super::super::slice::hand_made_stream_template(),
         )
         .unwrap();
         let (report, _) = x.finish();
         let argv = report.expect("it ran").argv;
         assert!(argv.iter().any(|a| a == "-N"), "{argv:?}");
+    }
+
+    /// #498: the streamed extract, failing, is reported in dar's own words.
+    /// tapectl's slices of one dar run, fed as one stream with the catalogue
+    /// of ANOTHER run of the same tree: dar refuses ("do not correspond to the
+    /// same data", FATAL), exits non-zero, and both the verdict and the
+    /// verbatim report carry its message. tapectl's join took every slice it
+    /// was given before dar stopped reading: nothing was refused by tapectl.
+    #[test]
+    fn a_streamed_extract_that_dar_fails_is_reported_in_dars_own_words() {
+        use crate::dar::{create, slice};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        let noise: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(src.join("d/noise.bin"), &noise).unwrap();
+        std::fs::write(src.join("small.txt"), b"small").unwrap();
+        // One dar run of the tree: its slices, as `stage create` cuts them,
+        // and its catalogue, as staging keeps it.
+        let run = |name: &str| {
+            let onfly = tmp.path().join(format!("{name}-onfly"));
+            let base = tmp.path().join(name);
+            let slices = create::archive_to_files(
+                &create::DarCreateParams {
+                    dar_binary: "dar",
+                    source_path: &src,
+                    compression: "none",
+                    exclude_patterns: &[],
+                    exclude_paths: &[],
+                    preserve_xattrs: true,
+                    preserve_fsa: true,
+                    on_fly_catalogue: &onfly,
+                },
+                &base,
+                "64k",
+            )
+            .unwrap();
+            let catalogue = tmp.path().join(format!("{name}-catalogue"));
+            create::reisolate_catalogue("dar", &onfly, &catalogue).unwrap();
+            let slices: Vec<Vec<u8>> = (1..=slices)
+                .map(|n| std::fs::read(format!("{}.{n}.dar", base.display())).unwrap())
+                .collect();
+            (slices, catalogue)
+        };
+        let (slices, _) = run("a");
+        let (_, other_catalogue) = run("b");
+        assert!(slices.len() >= 3, "several slices: {}", slices.len());
+        let template = slice::stream_template("dar", &tmp.path().join("stream")).unwrap();
+        let dest = tmp.path().join("dest");
+        let x = SequentialExtract::spawn("dar", &other_catalogue, &dest, false, &template).unwrap();
+        for (i, bytes) in slices.iter().enumerate() {
+            let fed = x
+                .begin_slice(i as u32 + 1, i + 1 == slices.len())
+                .and_then(|()| x.feed(bytes))
+                .and_then(|()| x.end_slice());
+            match fed {
+                Ok(()) => {}
+                // dar refused and closed its input: the rest goes nowhere.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(e) => panic!("feeding dar: {e}"),
+            }
+        }
+        assert_eq!(x.refused(), None, "tapectl took every slice it was fed");
+        let (report, verdict) = x.finish();
+        let report = report.expect("dar ran");
+        assert!(
+            report.exit_code.is_some_and(|c| c != 0),
+            "{:?}",
+            report.exit_code
+        );
+        let said = String::from_utf8_lossy(&report.stderr);
+        assert!(
+            said.contains("do not correspond to the same data"),
+            "dar's own words are in its report: {said}"
+        );
+        let err = verdict.expect_err("dar failed").to_string();
+        assert!(
+            err.contains("do not correspond to the same data"),
+            "and in the verdict: {err}"
+        );
     }
 
     /// The failure path keeps the report too — the whole point (issue #306:

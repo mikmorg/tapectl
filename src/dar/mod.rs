@@ -548,6 +548,7 @@ mod tests {
         let _ = version::check(dar);
         let _ = version::capabilities(dar);
         let _ = slice::template(dar, "1M", &tmp.path().join("work"));
+        let _ = slice::stream_template(dar, &tmp.path().join("stream"));
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         let params = create::DarCreateParams {
@@ -571,18 +572,21 @@ mod tests {
         let _ = restore::extract_reported(dar, &a, &dest, true);
         let _ = restore::extract_file(dar, &a, "x/y", &dest);
         let _ = restore::entry_slices(dar, &a, "x/y");
-        if let Ok(seq) = restore::SequentialExtract::spawn(dar, &a, &b, &dest, true) {
-            let _ = seq.finish();
-        }
+        // A stand-in dar writes no stream template, so the restore's is made
+        // by hand; the spawn is what is under test.
+        let template = slice::hand_made_stream_template();
+        let seq = restore::SequentialExtract::spawn(dar, &b, &dest, true, &template)
+            .expect("the streaming extract starts");
+        let _ = seq.finish();
         let _ = list::regular_files(dar, &a, &mut |_| {});
 
         let log = std::fs::read_to_string(&log).unwrap();
         let runs: Vec<Vec<&str>> = log.lines().map(|l| l.split('\t').collect()).collect();
-        // check, capabilities, template, spawn_archive (version, create),
-        // test_archive, extract_catalog, reisolate_catalogue, extract,
-        // extract_reported, extract_file, entry_slices, SequentialExtract,
-        // regular_files.
-        assert_eq!(runs.len(), 14, "every dar spawn ran once: {log}");
+        // check, capabilities, template, stream_template, spawn_archive
+        // (version, create), test_archive, extract_catalog,
+        // reisolate_catalogue, extract, extract_reported, extract_file,
+        // entry_slices, SequentialExtract, regular_files.
+        assert_eq!(runs.len(), 15, "every dar spawn ran once: {log}");
         for run in &runs {
             assert_eq!(run[0], "LC_ALL=C", "{run:?}");
             assert!(run[1..].contains(&"-N"), "no -N: {run:?}");

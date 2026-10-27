@@ -1338,6 +1338,67 @@ pub(crate) mod tests {
         }
     }
 
+    /// #498: a slice that is not what tapectl cut is refused by tapectl, which
+    /// joins the slices into the one stream dar reads and checks each one's dar
+    /// header against slice 1's. Slice 3's header here differs from slice 1's
+    /// by one byte of its label, and the catalog records exactly that slice
+    /// (its hashes are the altered slice's), so nothing on the books explains
+    /// it: the restore fails naming the refusal and the partial extract, and
+    /// says nothing of dar's own words standing in for it.
+    #[test]
+    fn a_slice_whose_dar_header_is_not_slice_1s_is_refused_by_name_when_streamed() {
+        let mut fx = Fixture::new(&[A], tree());
+        let st = fx.stage(&tree(), "150k", true);
+        fx.write(&st, A);
+        let mut plain = st.plains[2].clone();
+        assert_eq!(
+            plain[..50],
+            st.plains[0][..50],
+            "every slice carries slice 1's header"
+        );
+        plain[6] ^= 0x01;
+        fx.replace_slice(A, &st, 3, &plain);
+        // The catalog records the altered slice: it is what was written.
+        let position = fx.first_position[&(A.to_string(), st.stage_set_id)] + 2;
+        let cipher = fx.mems[A].files[position][..st.ciphers[2].len()].to_vec();
+        fx.conn
+            .execute(
+                "UPDATE stage_slices SET sha256_encrypted = ?1, sha256_plain = ?2
+                 WHERE stage_set_id = ?3 AND slice_number = 3",
+                params![sha_hex(&cipher), sha_hex(&plain), st.stage_set_id],
+            )
+            .unwrap();
+        fx.conn
+            .execute(
+                "UPDATE write_positions SET sha256_on_volume = ?1 WHERE position = ?2",
+                params![sha_hex(&cipher), position.to_string()],
+            )
+            .unwrap();
+        let mut mem = clone_mem(&fx.mems[A]);
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        let err = restore_unit_from_store(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            1,
+            RestoreTarget::Unit {
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            &mut mem,
+            site(),
+        )
+        .expect_err("a slice that is not the archive's is refused")
+        .to_string();
+        assert!(err.contains("slice 3's header is not slice 1's"), "{err}");
+        assert!(err.contains("refusing to join the slices"), "{err}");
+        assert!(err.contains("partial restore"), "{err}");
+        assert!(!err.contains("dar stopped reading"), "{err}");
+    }
+
     /// The other side of the same check, spooled: a different age file whose
     /// PLAINTEXT is the slice (re-encrypted: other key, header, nonce, so the
     /// ciphertext hash is not the recorded one) IS the slice, because the
@@ -2200,13 +2261,11 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>(),
                 "every slice, in slice order, from the cartridge that holds it"
             );
-            let scratch_parent = TempDir::new().unwrap();
             let plan = plan_restore(
                 &fx.conn,
                 &Config::default(),
                 &selection,
                 RestoreTarget::Unit { dest_dir: "/x" },
-                &scratch_parent.path().join(SCRATCH_NAME),
                 false,
             )
             .unwrap();

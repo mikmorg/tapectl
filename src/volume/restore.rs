@@ -81,7 +81,8 @@ impl<'a> RestoreTarget<'a> {
 pub struct RestoreOptions {
     /// Where the restore's `.tapectl-restore-tmp` directory is made.
     /// `None`: inside the destination. A streamed restore (issue #411)
-    /// puts only its named pipes there; a spooled one its decrypted slices.
+    /// puts nothing of the unit there (only the empty directory dar's stream
+    /// template is made of, #498); a spooled one its decrypted slices.
     /// Never `$TMPDIR` — a unit's slices can be hundreds of GiB, and a
     /// system temp directory is often RAM or the small root filesystem.
     pub scratch: Option<PathBuf>,
@@ -342,7 +343,7 @@ fn plan_before_tape(
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
     // Issue #411: stream or spool, and which slices — decided here, so the
     // space check asks for what this restore will actually write.
-    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
+    let plan = plan_restore(conn, config, &selection, target, options.spool)?;
     preflight(
         conn, unit_name, &selection, &plan, target, &scratch, options,
     )?;
@@ -775,7 +776,7 @@ fn placed_path(destination: &Path, file_path: &str) -> PathBuf {
 /// #411):
 ///
 /// - **Streamed** (`restore unit` with its catalogue): nothing in scratch —
-///   each slice goes through a named pipe straight into dar — and about the
+///   each slice goes straight into dar's standard input — and about the
 ///   archive's size in the destination.
 /// - **Spooled**: every slice read, decrypted, in scratch (a decrypted slice
 ///   is no larger than its ciphertext, and since #411 no ciphertext copy
@@ -1306,7 +1307,7 @@ fn restore_unit_contacted(
     // decided it before the drive opened: whether the slices stream into dar
     // or spool to scratch, and which slices a `restore file` reads.
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
-    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
+    let plan = plan_restore(conn, config, &selection, target, options.spool)?;
 
     // #478: a version read across cartridges needs a person to change them.
     // Refused here, before a key is loaded or a slice read, rather than at
@@ -1511,8 +1512,9 @@ fn name_keys_given(e: TapectlError, given: &[keys::KeyFile]) -> TapectlError {
 #[derive(Debug, Clone)]
 pub(crate) struct RestorePlan {
     /// `Some(catalogue)`: stream — each slice is decrypted off the tape into
-    /// a named pipe `dar -x --sequential-read -A <catalogue>` reads, and
-    /// nothing of the unit is ever on disk outside the destination.
+    /// one stream on the standard input of `dar -x - --sequential-read -A
+    /// <catalogue>`, and nothing of the unit is ever on disk outside the
+    /// destination.
     /// `None`: spool — every slice read is decrypted to a file in scratch,
     /// then dar extracts from those files.
     pub(crate) stream: Option<PathBuf>,
@@ -1527,10 +1529,9 @@ pub(crate) struct RestorePlan {
 /// - **`restore unit` streams** when all of these hold, and spools
 ///   otherwise: the stage set's own isolated catalogue is on disk
 ///   ([`own_catalogue`]); the dar is new enough to read a sliced archive
-///   sequentially with it ([`dar::restore::STREAMING_MIN_VERSION`]); the
-///   slices lie on tape in slice order (dar asks for them in that order,
-///   and the tape is read forward); and the scratch directory's filesystem
-///   takes a named pipe.
+///   sequentially with it ([`dar::restore::STREAMING_MIN_VERSION`]); and the
+///   slices lie on tape in slice order (dar reads them in that order, and
+///   the tape is read forward).
 /// - **`restore file` reads only the slices dar needs** for the entry when
 ///   the catalogue is on disk: the entry's own and its directories'
 ///   ([`dar::restore::entry_slices`]), plus the archive's last, where dar
@@ -1545,7 +1546,6 @@ pub(crate) fn plan_restore(
     config: &Config,
     selection: &RestoreSelection,
     target: RestoreTarget<'_>,
-    scratch: &Path,
     spool: bool,
 ) -> Result<RestorePlan> {
     let all = selection.positions.clone();
@@ -1561,7 +1561,7 @@ pub(crate) fn plan_restore(
                 info!("--spool: the slices are spooled, not streamed");
                 None
             } else {
-                streamable(config, &all, scratch).then_some(catalogue)
+                streamable(config, &all).then_some(catalogue)
             };
             Ok(RestorePlan {
                 stream,
@@ -1644,7 +1644,7 @@ fn own_catalogue(conn: &Connection, stage_set_id: i64) -> Result<Option<PathBuf>
 
 /// Whether a `restore unit` with its catalogue can stream (see
 /// [`plan_restore`]), each refusal said once in the log.
-fn streamable(config: &Config, positions: &[WritePositionInfo], scratch: &Path) -> bool {
+fn streamable(config: &Config, positions: &[WritePositionInfo]) -> bool {
     match dar::version::check(&config.dar.binary) {
         Ok(v) if dar::restore::supports_streaming(&v) => {}
         Ok(v) => {
@@ -1667,26 +1667,7 @@ fn streamable(config: &Config, positions: &[WritePositionInfo], scratch: &Path) 
         info!("the slices are not on tape in slice order; they are spooled");
         return false;
     }
-    if !takes_a_named_pipe(scratch) {
-        info!(
-            scratch = %scratch.display(),
-            "the scratch directory's filesystem does not take a named pipe; the slices are spooled"
-        );
-        return false;
-    }
     true
-}
-
-/// Whether the filesystem the scratch directory will be made on takes a
-/// named pipe: one is made beside where it will be, and removed.
-fn takes_a_named_pipe(scratch: &Path) -> bool {
-    let Some(dir) = scratch.parent().and_then(existing) else {
-        return false;
-    };
-    let probe = dir.join(format!(".tapectl-fifo-probe-{}", std::process::id()));
-    let made = nix::unistd::mkfifo(&probe, nix::sys::stat::Mode::S_IRUSR).is_ok();
-    let _ = fs::remove_file(&probe);
-    made
 }
 
 /// Run `plan` against `store`: make the scratch directory (removed on every
@@ -1726,14 +1707,17 @@ fn restore_planned(
 
     let streamed =
         if let (Some(catalogue), RestoreTarget::Unit { dest_dir }) = (&plan.stream, target) {
-            info!(scratch = %scratch.display(), "slices stream to dar through named pipes here");
+            info!(
+                scratch = %scratch.display(),
+                "slices stream to dar's standard input; nothing of them is written here"
+            );
             Some((
                 stream_into_dar(
                     config,
                     unit_name,
                     &plan.positions,
                     catalogue,
-                    &archive_base,
+                    scratch,
                     Path::new(dest_dir),
                     options,
                     identities,
@@ -1912,12 +1896,15 @@ fn record_dar(config: &Config, trace: &mut RestoreTrace, report: Option<DarRepor
     trace.dar = report;
 }
 
-/// The streamed restore (issue #411): a named pipe per slice in scratch,
-/// `dar -x --sequential-read -A <catalogue>` reading them in slice order,
-/// and each slice decrypted off the tape into its pipe as the tape is read
+/// The streamed restore (issues #411, #498): `dar -x - --sequential-read -A
+/// <catalogue>` reading the archive as one stream on its standard input, and
+/// each slice decrypted off the tape into that stream as the tape is read,
+/// its own header and trailer taken off ([`dar::restore::SequentialExtract`])
 /// — no decrypted byte is ever on disk outside the destination, and the
 /// drive streams while dar extracts (the tape read runs ahead of the
-/// decrypt by the read pipeline's queue, issue #390).
+/// decrypt by the read pipeline's queue, issue #390). One stream, never a
+/// named pipe per slice: dar's named-pipe reader can take a slice's trailer
+/// byte as data (#498).
 ///
 /// dar extracts AS the slices arrive, so a failure partway — a slice that
 /// fails its checksum, a tape read error — leaves what dar had extracted
@@ -1927,67 +1914,55 @@ fn record_dar(config: &Config, trace: &mut RestoreTrace, report: Option<DarRepor
 /// 0, leaving the archive's own trailing catalogue unread (#497,
 /// [`dar::restore::SequentialExtract`]). Every slice is read and
 /// authenticated to its end all the same, what dar does not take is
-/// dropped, and dar's exit status, not the pipe it closed, says whether
-/// the restore failed.
+/// dropped, and dar's exit status, not the input it closed, says whether
+/// the restore failed. A slice tapectl refuses to join into the stream (its
+/// header or trailer not what tapectl cut) ends dar's input there; with no
+/// damage on the books to explain it, the refusal is the failure, by name.
 #[allow(clippy::too_many_arguments)]
 fn stream_into_dar(
     config: &Config,
     unit_name: &str,
     positions: &[WritePositionInfo],
     catalogue: &Path,
-    archive_base: &Path,
+    scratch: &Path,
     dest: &Path,
     options: &RestoreOptions,
     identities: &[age::x25519::Identity],
     supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
 ) -> Result<Result<()>> {
-    // Every pipe exists before dar starts: dar opens slice 1, then each
-    // next slice as it finishes the one before.
-    let pipes: Vec<PathBuf> = positions
-        .iter()
-        .map(|wp| {
-            PathBuf::from(format!(
-                "{}.{}.dar",
-                archive_base.display(),
-                wp.slice_number
-            ))
-        })
-        .collect();
-    for pipe in &pipes {
-        nix::unistd::mkfifo(
-            pipe,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .map_err(|e| {
-            TapectlError::Other(format!(
-                "cannot make the named pipe {}: {e}",
-                pipe.display()
-            ))
-        })?;
-    }
+    // dar's standard-output header, from the installed dar, for the stream
+    // the slices are joined back into (`dar::slice::stream_template`).
+    let template = dar::slice::stream_template(&config.dar.binary, &scratch.join("stream"))?;
     info!(
         "extracting dar archive to {} as its slices are read",
         dest.display()
     );
     let darx = dar::restore::SequentialExtract::spawn(
         &config.dar.binary,
-        archive_base,
         catalogue,
         dest,
         options.overwrite,
+        &template,
     )?;
 
     let phase = progress::phase("read", Some(ciphertext_bytes(positions)));
     let mut failure = None;
     let damage_before = supply.damage.len();
     // The first slice dar stopped reading before its end (or had ended
-    // before it opened), with no hole to blame. Given the catalogue, dar
+    // before it began), with no hole to blame. Given the catalogue, dar
     // stops where the file data ends and exits 0 (#497): that is dar done,
     // and every slice is still read and checked. Any other exit is dar
-    // failed, named at this slice as ever.
+    // failed, named at this slice as ever — or, when tapectl refused to feed
+    // it a slice, the refusal is.
     let mut cut_at: Option<i64> = None;
-    for (i, (wp, pipe)) in positions.iter().zip(&pipes).enumerate() {
+    let stopped = |cut: i64| {
+        TapectlError::Dar(
+            darx.refused()
+                .unwrap_or_else(|| format!("dar stopped reading slice {cut}")),
+        )
+    };
+    for (i, wp) in positions.iter().enumerate() {
         note_slice(&phase, unit_name, i, positions.len(), wp);
         // Issue #404: between slices. dar has been extracting as the slices
         // arrived, so a stop here leaves a partial restore — said below.
@@ -2000,9 +1975,9 @@ fn stream_into_dar(
             failure = Some(e);
             break;
         }
-        let sink = SliceSink::Pipe {
-            path: pipe,
+        let sink = SliceSink::Stream {
             dar: &darx,
+            last: i + 1 == positions.len(),
         };
         match supply.read_slice(wp, identities, sink) {
             Ok(read) => {
@@ -2019,13 +1994,11 @@ fn stream_into_dar(
                     // Otherwise dar's exit status says why: 0 is dar done,
                     // and the slices left are read and checked, into
                     // nothing; any other is dar dying of its own accord, and
-                    // that is the failure. Still running, the next slice's
-                    // pipe or the end of the stream will tell.
+                    // that is the failure. Still running, a later slice or
+                    // the end of the stream will tell.
                     let cut = *cut_at.get_or_insert(wp.slice_number);
                     if darx.status().is_some_and(|s| !s.success()) {
-                        failure = Some(TapectlError::Dar(format!(
-                            "dar stopped reading slice {cut}"
-                        )));
+                        failure = Some(stopped(cut));
                         break;
                     }
                 }
@@ -2034,9 +2007,7 @@ fn stream_into_dar(
                 // A dar that stopped reading a slice and then failed is
                 // named at that slice.
                 failure = Some(match (cut_at, e) {
-                    (Some(cut), TapectlError::Dar(_)) => {
-                        TapectlError::Dar(format!("dar stopped reading slice {cut}"))
-                    }
+                    (Some(cut), TapectlError::Dar(_)) => stopped(cut),
                     (_, e) => e,
                 });
                 break;
@@ -2044,19 +2015,23 @@ fn stream_into_dar(
         }
     }
     if failure.is_some() {
-        // dar may be waiting to open the next slice's pipe; it would wait
-        // forever.
+        // dar may be reading its input for more; stop it.
         darx.kill();
     } else {
         phase.done();
         if supply.damage.len() > damage_before {
-            settle_dar(&darx, &pipes, Some(SETTLE_PATIENCE));
+            settle_dar(&darx, Some(SETTLE_PATIENCE));
         } else if cut_at.is_some() {
             // dar stopped reading before the end and may still be running:
-            // it is let end, for as long as that takes (a pipe it waits on
-            // is closed under it), and its exit status decides.
-            settle_dar(&darx, &pipes, None);
+            // it is let end, for as long as that takes, and its exit status
+            // decides.
+            settle_dar(&darx, None);
         }
+    }
+    // A slice tapectl refused, with no damage on the books to explain it:
+    // the archive is not what tapectl cut, whatever dar made of its end.
+    if failure.is_none() && supply.damage.len() == damage_before {
+        failure = darx.refused().map(TapectlError::Dar);
     }
     let (report, verdict) = darx.finish();
     if let (None, Some(cut)) = (&failure, cut_at) {
@@ -2091,20 +2066,14 @@ fn stream_into_dar(
 /// hole was written into one.
 const SETTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Let a dar that is still running after a restore with holes end. A hole
-/// over something dar needs (a slice's header) can leave it waiting to
-/// re-open a slice's pipe that nobody is feeding; a pipe held open for it
-/// and closed at once gives it the end of file it needs to fail and exit.
-/// A dar that is still there after `patience` ([`SETTLE_PATIENCE`]) is
+/// Let a dar that is still running after its last slice end: its input is
+/// closed, so it reads the end of the stream and ends. After a restore with
+/// holes, a dar still there after `patience` ([`SETTLE_PATIENCE`]) is
 /// stopped: what it left is judged as ever, by the files. With no patience
-/// it is waited for as long as it runs: a dar that stopped reading a slice
-/// early with no hole to blame (#497) is judged by its own exit status.
-fn settle_dar(
-    darx: &dar::restore::SequentialExtract,
-    pipes: &[PathBuf],
-    patience: Option<std::time::Duration>,
-) {
-    use std::os::unix::fs::OpenOptionsExt;
+/// it is waited for as long as it runs: a dar that stopped reading early
+/// with no hole to blame (#497) is judged by its own exit status.
+fn settle_dar(darx: &dar::restore::SequentialExtract, patience: Option<std::time::Duration>) {
+    darx.close_input();
     let started = std::time::Instant::now();
     while !darx.exited() {
         if patience.is_some_and(|p| started.elapsed() > p) {
@@ -2112,58 +2081,7 @@ fn settle_dar(
             darx.kill();
             return;
         }
-        for pipe in pipes {
-            // Succeeds only while dar is waiting to open it; dropped at once.
-            let _ = fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::libc::O_NONBLOCK)
-                .open(pipe);
-        }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-/// Open the named pipe dar will read a slice from, for writing — once dar
-/// has opened it for reading. A plain blocking open would wait forever on a
-/// dar that has already given up, so this opens non-blocking (which fails
-/// with ENXIO while no reader is there), asking between tries whether dar
-/// is still running, then makes the descriptor blocking for the copy.
-fn open_pipe_for_dar(
-    path: &Path,
-    darx: &dar::restore::SequentialExtract,
-    slice_number: i64,
-) -> Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(path)
-        {
-            Ok(file) => {
-                nix::fcntl::fcntl(
-                    file.as_raw_fd(),
-                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::empty()),
-                )
-                .map_err(|e| TapectlError::Other(format!("named pipe {}: {e}", path.display())))?;
-                return Ok(file);
-            }
-            Err(e) if e.raw_os_error() == Some(nix::libc::ENXIO) => {
-                if darx.exited() {
-                    return Err(TapectlError::Dar(format!(
-                        "dar stopped before it read slice {slice_number}"
-                    )));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => {
-                return Err(TapectlError::Other(format!(
-                    "cannot open the named pipe {}: {e}",
-                    path.display()
-                )))
-            }
-        }
     }
 }
 
@@ -2589,7 +2507,7 @@ fn plan_units(
             dest_dir: &req.dest_dir,
         };
         let scratch = scratch_dir(Path::new(&req.dest_dir), options.scratch.as_deref());
-        let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
+        let plan = plan_restore(conn, config, &selection, target, options.spool)?;
         preflight_checks(conn, &req.unit, &selection, target, &scratch, options)?;
         if let Some(n) = space_needs(Path::new(&req.dest_dir), &scratch, &plan, None) {
             needs.extend(n);
@@ -7112,9 +7030,10 @@ mod tests {
             /// THE acceptance test for #411's unit half: with the isolated
             /// catalogue `stage create` keeps, a multi-slice unit restores
             /// with free space for the DESTINATION ONLY — each slice is
-            /// decrypted off the tape straight into a named pipe that `dar
-            /// --sequential-read -A <catalogue>` reads, so nothing of it is
-            /// ever on disk in scratch, in one forward pass.
+            /// decrypted off the tape straight into the stream `dar -x -
+            /// --sequential-read -A <catalogue>` reads on its standard input,
+            /// so nothing of it is ever on disk in scratch, in one forward
+            /// pass.
             ///
             /// The tree is the shape that breaks dar 2.7.13's sequential
             /// read WITHOUT the catalogue (a large file running into the

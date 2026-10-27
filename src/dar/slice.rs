@@ -591,6 +591,18 @@ impl StreamTemplate {
     }
 }
 
+/// A standard-output header built by hand in dar's layout, for tests that
+/// need a [`StreamTemplate`] without running dar (a stand-in dar writes none).
+#[cfg(test)]
+pub(crate) fn hand_made_stream_template() -> Vec<u8> {
+    let mut h = MAGIC.to_vec();
+    h.extend_from_slice(b"0123456789");
+    // Flag 'T', a TLV list of one field: the data name (type 3, 10 bytes).
+    h.extend_from_slice(&[LAST, b'T', 0x80, 0, 0, 0, 1, 0, 3, 0x80, 0, 0, 0, 10]);
+    h.extend_from_slice(b"DATANAME!!");
+    h
+}
+
 /// What a [`Join`] has written: slices taken and stream bytes out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinSummary {
