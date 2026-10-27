@@ -14,7 +14,9 @@
 //! - `age`, because the real age CLI is not installed on CI. The stub honours
 //!   a 32-byte clear header naming the recipients, `STUBAGE:alice,op,esc`; an
 //!   identity file holds one recipient's name. A header carrying ` BAD` fails
-//!   the way a damaged payload does, after the key has matched.
+//!   the way a damaged payload does, after the key has matched; ` BAD@N`
+//!   fails the same way after the first N bytes of plaintext, as age does at
+//!   a chunk it cannot authenticate N bytes in.
 //!
 //! Everything between them — awk, sha256sum, tar, mkfifo and the real `dar`,
 //! which builds the slices here and extracts them in the script — is real.
@@ -268,6 +270,12 @@ for i in "${ids[@]}"; do
         echo "age: error: failed to decrypt and authenticate payload chunk" >&2
         exit 1
       fi
+      case "$flag" in
+        BAD@*)
+          head -c "${flag#BAD@}"
+          echo "age: error: failed to decrypt and authenticate payload chunk" >&2
+          exit 1 ;;
+      esac
       exec cat ;;
   esac
 done
@@ -13702,4 +13710,445 @@ fn the_gates_whole_restore_judge_passes_a_whole_restore_and_nothing_less() {
     }
     let (rc, said) = judge(&text, n + 1);
     assert_eq!(rc, 1, "a slice count the output does not show: {said}");
+}
+
+// ---- #498: dar takes a slice's trailer for data through named pipes ----
+//
+// dar reading a sliced archive one named pipe per slice (`dar -x <base>
+// --sequential-read`, RESTORE.sh's stream up to 1.7.x) finds a slice's end
+// only on a short read (`sar::inherited_read`, every dar from 2.7.7 to 2.8.6).
+// When one of its reads asks for exactly the bytes left in a slice, trailer
+// included, the trailer (`N`) comes back as archive data: a one-byte shift,
+// "Bad CRC", exit 5, the same way every time for one archive. The trigger
+// here is the 1.7.2 one (`volume::restore`'s
+// `a_unit_whose_slice_ends_where_a_dar_read_ends_streams_whole`): one
+// 3,000,000-byte file, archived and cut as `stage create` does, at the slice
+// size where slice 1's payload ends on the last byte of dar's tenth read of
+// the file's data. The sizes a byte either side are the shape's control.
+
+/// dar reads a file's data in requests of this many bytes, from the data's
+/// first byte (measured with strace on 2.7.13 and 2.7.21).
+const DAR_READ: usize = 102_400;
+const BSR_UUID: &str = "a4980001-0000-4000-8000-000000000001";
+
+/// The unit's one file, made once: every archive of it below is of the same
+/// tree, so where its data begins is the same in each.
+fn bsr_src() -> &'static PathBuf {
+    static S: OnceLock<PathBuf> = OnceLock::new();
+    S.get_or_init(|| {
+        let src = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heir-restore-sh-bsr-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("one.bin"), bsr_file()).unwrap();
+        src
+    })
+}
+
+/// The unit's file: 3,000,000 bytes of noise, with no run of zeros (`content`
+/// plants one, which dar stores as a hole, and the file's data would no
+/// longer be one run of the archive).
+fn bsr_file() -> Vec<u8> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ 498;
+    (0..3_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// `src` archived as `stage create` archives it (`dar -c -` with tapectl's
+/// flags, cut into slices of `slice` by tapectl's framing), in `work`: the
+/// plaintext slices and the isolated catalogue dar wrote on the fly.
+fn tapectl_cut(src: &Path, work: &Path, slice: &str) -> (Vec<Vec<u8>>, Vec<u8>) {
+    use tapectl::dar::create::{reisolate_catalogue, spawn_archive, DarCreateParams, DarFinish};
+    let _ = std::fs::remove_dir_all(work);
+    std::fs::create_dir_all(work).unwrap();
+    let onfly = work.join("onfly");
+    let template = tapectl::dar::slice::template("dar", slice, &work.join("tmpl")).unwrap();
+    let mut dar = spawn_archive(&DarCreateParams {
+        dar_binary: "dar",
+        source_path: src,
+        compression: "none",
+        exclude_patterns: &[],
+        exclude_paths: &[],
+        preserve_xattrs: true,
+        preserve_fsa: true,
+        on_fly_catalogue: &onfly,
+    })
+    .unwrap();
+    let stdout = dar.take_stdout();
+    let mut slices: Vec<Vec<u8>> = Vec::new();
+    tapectl::dar::slice::cut_stream(
+        stdout,
+        &template,
+        |_| Ok(Vec::new()),
+        |_, s| {
+            slices.push(s);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(dar.finish().unwrap(), DarFinish::Complete);
+    let cat = work.join("cat");
+    reisolate_catalogue("dar", &onfly, &cat).unwrap();
+    let catalogue = std::fs::read(work.join("cat.1.dar")).unwrap();
+    (slices, catalogue)
+}
+
+/// Where the file's data begins in slice 1 of tapectl's cut: its first bytes,
+/// found in a one-slice cut. The slice header is 50 bytes at any size below
+/// 4 GiB, so the data begins there at the trigger size too.
+fn bsr_data_start() -> usize {
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heir-restore-sh-bsr-probe-{}", std::process::id()));
+        let (slices, _) = tapectl_cut(bsr_src(), &work, "1G");
+        assert_eq!(slices.len(), 1);
+        let file = bsr_file();
+        let head = &file[..64];
+        slices[0]
+            .windows(64)
+            .position(|w| w == head)
+            .expect("the file's first bytes are in the archive")
+    })
+}
+
+/// The trigger: the slice size at which slice 1's payload ends on the last
+/// byte of dar's tenth read of the file's data.
+fn bsr_trigger() -> usize {
+    bsr_data_start() + 10 * DAR_READ
+}
+
+/// The unit `bsr` (tenant alice, version 1), cut at `size` bytes, as staged.
+/// The shape's own control: three slices, slice 1 exactly `size` long and
+/// holding the file from its data start, slice 2 beginning with the next byte
+/// of the file.
+fn bsr_staged(work: &Path, size: usize, may_span: bool) -> Staged {
+    let (slices, catalogue) = tapectl_cut(bsr_src(), work, &size.to_string());
+    let file = bsr_file();
+    let start = bsr_data_start();
+    assert_eq!(slices.len(), 3, "-s {size}");
+    assert_eq!(slices[0].len(), size, "-s {size}");
+    let held = size - 1 - start;
+    assert_eq!(&slices[0][start..size - 1], &file[..held], "-s {size}");
+    assert_eq!(&slices[1][50..60], &file[held..held + 10], "-s {size}");
+    if size == bsr_trigger() {
+        assert_eq!(held + 1, 10 * DAR_READ, "the trigger");
+    }
+    let mut hashes = BTreeMap::new();
+    hashes.insert("one.bin".to_string(), sha256_hex(&file));
+    Staged {
+        tenant: "alice",
+        unit: ManifestUnit {
+            name: "bsr".to_string(),
+            uuid: BSR_UUID.to_string(),
+            snapshot_version: 1,
+            stage_set_id: 1,
+            may_span,
+            dar_version: Some("2.7.13".to_string()),
+            dar_command: Some("dar -c - -R /src -N".to_string()),
+            slices: Vec::new(),
+        },
+        slices,
+        catalogue: Some(catalogue),
+        src: bsr_src().clone(),
+        hashes,
+    }
+}
+
+/// A tape holding `bsr` cut at `size`, and nothing else: HEIR01.
+fn bsr_template(size: usize) -> Template {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("heir-restore-sh-bsr-{size}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["tape", "keys", "work"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    write_keys(&dir);
+    let staged = bsr_staged(&dir.join("work"), size, false);
+    lay_out_tape(
+        &dir,
+        vec![staged],
+        true,
+        true,
+        &[],
+        Era::V160,
+        &[],
+        &THIS_TAPE,
+    )
+}
+
+/// The judge of a whole restore of `bsr` with `slices` slices: exit 0, no
+/// FATAL, RESTORE COMPLETE, every slice checked, the one file checked, and
+/// the tree given back.
+fn assert_bsr_whole(code: i32, text: &str, slices: usize, dest: &str, what: &str) {
+    assert_eq!(code, 0, "{what}:\n{text}");
+    assert!(!text.contains("FATAL"), "{what}:\n{text}");
+    assert!(!text.contains("Bad CRC"), "{what}:\n{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{what}:\n{text}");
+    assert_eq!(
+        verified(text),
+        slices,
+        "{what}: every slice checked:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "File check: 1 restored file(s) of 'bsr' version 1 match the sha256 recorded in the index"
+        ),
+        "{what}:\n{text}"
+    );
+    assert!(same_tree(bsr_src(), Path::new(dest)), "{what}:\n{text}");
+}
+
+/// THE positive control for #498 through RESTORE.sh: the unit streamed off
+/// one tape into dar restores whole at the trigger size and a byte either
+/// side. Through named pipes the trigger fails "Bad CRC", exit 5, on dar
+/// 2.7.13 and 2.7.21 alike; fed one stream on dar's standard input, it
+/// cannot.
+#[test]
+fn a_unit_whose_slice_ends_where_a_dar_read_ends_restores_whole_from_one_tape() {
+    let trigger = bsr_trigger();
+    for size in [trigger - 1, trigger + 1, trigger] {
+        let t = bsr_template(size);
+        let bsr = unit_of(&t, "bsr");
+        let h = Heir::of(&t, &[]);
+        let dest = h.sub("restored");
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "bsr",
+            "--to",
+            &dest,
+        ]);
+        let what = format!("-s {size} (the trigger is {trigger})");
+        assert_bsr_whole(code, &text, bsr.positions.len(), &dest, &what);
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+}
+
+/// Two tapes laid out from one staging of `bsr` at the trigger size, a unit
+/// that may span: BSR01 holds slices 1 and 2 and ends short after them,
+/// BSR02 holds slice 3. The slice boundary that trips dar is on BSR01.
+fn bsr_box() -> &'static BTreeMap<&'static str, Template> {
+    static B: OnceLock<BTreeMap<&'static str, Template>> = OnceLock::new();
+    B.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heir-restore-sh-bsrbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let staged = bsr_staged(&dir.join("work"), bsr_trigger(), true);
+        let n = staged.slices.len();
+        let one = TapeId {
+            label: "BSR01",
+            uuid: "a4980b01-0000-4000-8000-000000000001",
+            serial: "BSRSER",
+            earlier: Some(vec![]),
+        };
+        let two = TapeId {
+            label: "BSR02",
+            uuid: "a4980b02-0000-4000-8000-000000000002",
+            serial: "BSRSER",
+            earlier: Some(vec![Holder {
+                label: "BSR01",
+                uuid: "a4980b01-0000-4000-8000-000000000001",
+                serial: "BSRSER",
+                first: 1,
+                last: 2,
+            }]),
+        };
+        let mut tapes = BTreeMap::new();
+        for (id, held, cut_in) in [(one, 0..n, Some(1)), (two, 2..n, None)] {
+            let tdir = dir.join(id.label);
+            write_keys(&tdir);
+            let mut fresh = staged.clone();
+            fresh.unit.slices.clear();
+            let t = lay_out_tape(
+                &tdir,
+                vec![fresh],
+                true,
+                true,
+                &[],
+                Era::V170Span,
+                &[SpanOnTape {
+                    unit: "bsr",
+                    held: held.clone(),
+                }],
+                &id,
+            );
+            if let Some(i) = cut_in {
+                let u = unit_of(&t, "bsr");
+                cut_tape_dir(&tdir.join("tape"), id.label, u.positions[i - held.start]);
+            }
+            tapes.insert(id.label, t);
+        }
+        tapes
+    })
+}
+
+/// The trigger across tapes, both ways a unit held across tapes is fed to
+/// dar as one run: by default from the scratch directory once every slice is
+/// read, and with --stream-tapes off each cartridge in turn.
+#[test]
+fn a_unit_whose_slice_ends_where_a_dar_read_ends_restores_whole_across_tapes() {
+    let b = bsr_box();
+    let n = unit_of(&b["BSR02"], "bsr").slices;
+    for extra in [&[][..], &["--stream-tapes"][..]] {
+        let h = Heir::of_box(&[&b["BSR01"], &b["BSR02"]], 0);
+        let dest = h.sub("restored");
+        let key = h.key("alice");
+        let mut args = vec!["--restore", "--key", &key, "--unit", "bsr", "--to", &dest];
+        args.extend_from_slice(extra);
+        let (code, text) = h.run_prompted(&args, |k, _| {
+            assert_eq!(k, 1, "one cartridge change");
+            h.load("BSR02");
+            Some(String::new())
+        });
+        let what = format!("across tapes {extra:?}");
+        if extra.is_empty() {
+            assert!(
+                text.contains("Every slice of 'bsr' is in the scratch directory"),
+                "{what}:\n{text}"
+            );
+            // Each slice is checked when it is read into the scratch
+            // directory, and again as it is fed to dar from there.
+            assert_bsr_whole(code, &text, 2 * n, &dest, &what);
+            assert!(scratch_slices(&dest).is_none(), "the scratch is gone");
+        } else {
+            assert_bsr_whole(code, &text, n, &dest, &what);
+        }
+    }
+}
+
+// ---- item 182: damage only in what dar never needed stops no restore that checks out ----
+
+/// Make the slice at tape file `pos` (tenant `tenant`'s, under the stub
+/// age) fail as a chunk age cannot authenticate does, `at` bytes into its
+/// plaintext: its ciphertext changes, and the front index keeps the sha256
+/// of the slice as written, so it says the slice is damaged too.
+fn damage_chunk_at(h: &Heir, pos: i64, tenant: &str, at: usize) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    let mut hdr = format!("STUBAGE:{tenant},op,esc BAD@{at}");
+    assert!(hdr.len() <= 32, "stub header too long: {hdr}");
+    while hdr.len() < 32 {
+        hdr.push(' ');
+    }
+    assert!(bytes.starts_with(format!("STUBAGE:{tenant},op,esc").as_bytes()));
+    bytes[..32].copy_from_slice(hdr.as_bytes());
+    std::fs::write(&f, bytes).unwrap();
+}
+
+/// What the restore of `many` says of damage in its last slice after the
+/// point dar needed: the slice, its tape and tape file, and to replace it.
+fn late_damage_said(text: &str, num: usize, pos: i64) -> usize {
+    text.matches(&format!(
+        "slice {num} of 'many' (tape file {pos} of {LABEL}) is damaged after the point this restore needed"
+    ))
+    .count()
+}
+
+/// #497's shape (the catalogue in the last slice after the end of the data,
+/// which dar, given the catalogue, never reads) with one chunk of that unread
+/// tail damaged: age cannot authenticate it, so the slice cannot match its
+/// sha256 either. dar has already ended well when it is found. The restore
+/// says so, naming the slice and the tape, checks every file against the
+/// index, and is a whole restore: RESTORE COMPLETE, exit 0, the note again
+/// at the end.
+#[test]
+fn damage_in_the_tail_dar_leaves_unread_is_named_and_the_restore_is_whole() {
+    let t = many_template();
+    assert_big_catalogue(&t.dir, MANY_UUID, 1);
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    let last = *many.positions.last().unwrap();
+    let plain = many.sizes.last().unwrap() - 32;
+    let cat = catalogue_len(&t.dir, MANY_UUID, 1) as usize;
+    assert!(cat < plain, "the catalogue is in the last slice");
+    let h = Heir::of(t, &[]);
+    // In the catalogue, far past the end of the data: more than any pipe
+    // between the tape and dar holds, so dar has ended before age gets there.
+    damage_chunk_at(&h, last, "alice", plain - 64);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "many",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("failed to decrypt and authenticate payload chunk"),
+        "age's own words:\n{text}"
+    );
+    assert_eq!(
+        late_damage_said(&text, n, last),
+        2,
+        "said at the slice, and again at the end:\n{text}"
+    );
+    let end = text.split("RESTORE COMPLETE").nth(1).unwrap();
+    assert_eq!(late_damage_said(end, n, last), 1, "{text}");
+    assert!(end.contains("Replace this tape"), "{text}");
+    assert_eq!(verified(&text), n - 1, "every other slice checked:\n{text}");
+    assert!(text.contains(&many_checked("many")), "{text}");
+    assert!(same_tree(&many.src, Path::new(&dest)), "{text}");
+    let slices: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| many.positions.contains(p))
+        .collect();
+    assert_eq!(slices, many.positions, "each slice read once, in order");
+}
+
+/// The same damage in bytes dar DID need (the data at the start of the last
+/// slice): found while dar is still reading, it stops the restore as it
+/// always has, naming the slice as damaged.
+#[test]
+fn damage_in_bytes_dar_reads_still_fails_the_restore() {
+    let t = many_template();
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    let last = *many.positions.last().unwrap();
+    let plain = many.sizes.last().unwrap() - 32;
+    let cat = catalogue_len(&t.dir, MANY_UUID, 1) as usize;
+    assert!(
+        plain - cat > 64 * 1024,
+        "the last slice begins with data: {plain} bytes, a {cat}-byte catalogue"
+    );
+    let h = Heir::of(t, &[]);
+    damage_chunk_at(&h, last, "alice", 1000);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "many",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(&format!(
+            "FATAL: slice {n} (tape file {last}) did not decrypt: a key matched it, so its bytes are"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("failed to decrypt and authenticate payload chunk"),
+        "{text}"
+    );
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(late_damage_said(&text, n, last), 0, "{text}");
 }
