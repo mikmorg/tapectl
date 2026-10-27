@@ -136,7 +136,7 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23; 62 since #497 added `heir_big_catalogue`, GREEN 62/62 on 2026-10-26; 65 since #388 added `lbp_fallback_recorded`, `rust_lbp` and `lbp_page_clear_after_every_command`, and the gate also names a TD6 drive in `TAPECTL_GATE_TAPE_TD6` for `rust_lbp`).
+  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume; 52 since #420 added the five `heir_short_*` checks, GREEN 52/52 on 2026-10-20; 61 since #478 added the nine `span_*` checks of item 136, GREEN 61/61 on 2026-10-23; 62 since #497 added `heir_big_catalogue`, GREEN 62/62 on 2026-10-26; 65 since #388 added `lbp_fallback_recorded`, `rust_lbp` and `lbp_page_clear_after_every_command`, GREEN 65/65 on 2026-10-27, and the gate also names a TD6 drive in `TAPECTL_GATE_TAPE_TD6` for `rust_lbp`; 67 since 1.8.0 added `heir_slice_boundary_read` (#498's trigger read from tape) and `heir_late_damage` (item 182 with the real age, on `heir_big_catalogue`'s tape)).
 
 Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
 set above, never as instructions.
@@ -402,6 +402,24 @@ installed dar, `Join` puts slice 1's labels in it and strips and checks each sli
 trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never tagged on its own
 (item 183): it ships in 1.8.0, whose candidate runs the real-drive LBP acceptance, R1 first.
 
+**1.8.0: RESTORE.sh feeds dar one stream** (`docs/releases/1.8.0.md`; ADR-0012 items 181-183,
+#498). It contains 1.7.2, and the minor moves because RESTORE.sh changed: its golden pin moved
+once, under item 181, and nothing else on tape did (`requires` and every other pin hold).
+RESTORE.sh's `stream_unit` joins a unit's slices back into the `dar -c -` stream and writes it into
+one FIFO that `dar -x -` reads; the script holds it open as fd 3 across slices and cartridge swaps,
+and only each slice's feed, a child, writes to it, so dar closing it ends a writer, never the
+restore. `stream_check` (once a run, before any slice) makes the stream's header with the heir's
+own dar and tests `head` (no read-ahead, `-c -1`); `join_slice`/`join_rest` strip and check each
+slice (header equal to slice 1's, the slice size, `N`/`T`); the header is read by the awk fragment
+`AWK_DAR_HEADER` in `restore_script.rs`, the mirror of `dar::slice`'s parser. When `stream_check`
+fails, a unit on one tape spools (`spool_unit`) with a NOTE, and a unit across tapes is refused in
+`restore_across_tapes` before any slice. Item 182: damage found after dar ended well (`late=1`:
+the slice went to `/dev/null`, or `join.closed`) is `late_damage`'s NOTE, repeated by `late_notes`,
+and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
+its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (73 blocks, about 15
+bytes of headroom left). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
+acceptance on the candidate; `v1.8.0` is tagged only on its PASS.
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
@@ -534,7 +552,8 @@ proof run it with the real `age`, `dar`, `mt` and `tar`. A release is not proven
 the heir path until the gate has run; each run record names the age version it used
 (`age --version`). Since 1.3.0 the gate's heir legs also run RESTORE.sh's index modes
 (`heir_where`, `heir_find`), its slice replacement (`heir_slice_from_copy`) and its per-file
-sha256 check (`heir_file_check`) with the real tools. The gate's Rust legs pass only when every test they name ran and
+sha256 check (`heir_file_check`) with the real tools, and since 1.8.0 its one stream into dar
+(`heir_slice_boundary_read`) and its note on damage dar never needed (`heir_late_damage`). The gate's Rust legs pass only when every test they name ran and
 said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Architecture

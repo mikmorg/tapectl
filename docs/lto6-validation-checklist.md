@@ -59,7 +59,7 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
 - [ ] `dar --version` ≥ 2.6; `age` present (RESTORE.sh and the rehearsal need it).
 - [ ] The mhvtl gate is GREEN on this checkout (`TAPECTL_GATE_TAPE=/dev/nst3
       TAPECTL_GATE_TAPE_TD6=/dev/nst4 TAPECTL_MHVTL=1 bash scripts/mhvtl-verify-gate.sh`,
-      65 checks since #388; `TAPECTL_GATE_TAPE_TD6` names a TD6 emulation for the
+      67 checks since 1.8.0 (65 since #388); `TAPECTL_GATE_TAPE_TD6` names a TD6 emulation for the
       `rust_lbp` leg, from `readlink -f /dev/tape/by-id/scsi-XYZZY_A3-nst`). The gate
       always runs `cargo build` and tests the checkout's own debug binary; it has no
       `TAPECTL_BIN`, so a green gate says
