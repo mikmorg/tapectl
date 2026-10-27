@@ -395,7 +395,12 @@ write since the open, re-sent ones too, and refuses an unarmed open.
 mhvtl cannot carry 524,292 bytes in one command, so the gate's TD8 drive always falls back
 (`lbp_fallback_recorded`, `lbp_page_clear_after_every_command`) and `tests/mhvtl_lbp.rs`
 (`rust_lbp`) proves the path on a TD6 at a 262,144-byte payload, named by `TAPECTL_GATE_TAPE_TD6`.
-The real-drive proof is `scripts/lbp-acceptance.sh`, R1 first (`--r1-only`).
+The real-drive proof is `scripts/lbp-acceptance.sh`, R1 first (`--r1-only`). 1.7.2 also carries
+tapectl's half of #498 (item 180): a streamed restore feeds dar one stream on its standard input,
+never a named pipe per slice. `dar::slice::stream_template` takes the stream's header from the
+installed dar, `Join` puts slice 1's labels in it and strips and checks each slice's header and
+trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is on master untagged until
+the real-drive acceptance passes and R1 has set item 175's switch.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
