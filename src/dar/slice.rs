@@ -1335,7 +1335,7 @@ mod tests {
         // 1 and 2 cannot be told by their bytes: every slice carries the same
         // header. Numbering them is the caller's.)
         refused(
-            &[stream.clone()],
+            std::slice::from_ref(&stream),
             "slice 1's header has flag 'T' and no slice size",
         );
         refused(&[], "no slices");
