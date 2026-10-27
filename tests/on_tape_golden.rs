@@ -413,7 +413,9 @@ fn restore_sh_bytes_are_pinned() {
         "if dar_at_least 2.7.21; then",
         "spool_unit \"$list\" \"$destdir\"",
         "grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then",
-        "mkfifo \"$fifos/restore.$num.dar\"",
+        // 1.8.0 (ADR-0012 item 181, #498): one stream on dar's standard
+        // input, never a named pipe per slice
+        "mkfifo \"$fifos/stream\" \"$fifos/cipher\" \"$fifos/trail\"",
         "check_space \"$destdir\" \"$destdir\" \"$total\" 0",
         "--all)\n      RESTORE_ALL=1",
         "walk_envelopes found_envelope",
@@ -475,7 +477,7 @@ fn restore_sh_bytes_are_pinned() {
         "    info \"RESTORE INCOMPLETE\"\n",
         "  info \"RESTORE COMPLETE\"\n  for line in ${DONE_LINES[@]+\"${DONE_LINES[@]}\"}; do",
         "  finish_pending\n  restore_end\n",
-        "dar -x \"$fifos/restore\" -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\"",
+        "dar -x - -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\" <\"$fifos/stream\"",
         "dar -x \"$SCRATCH/job.$j/restore\" -R \"$(abs_dir \"$destdir\")\"",
         "    do_fill \"$dest\" \"$want\" \"$scratch\"\n",
         "  echo \"  $0 --restore --key KEYFILE --to DIR --unit U --fill-from LIST\"",
@@ -584,6 +586,16 @@ fn restore_sh_bytes_are_pinned() {
         "      for (i = 1; i <= nfound; i++) above(found[i])\n",
         "      for (j = 1; j <= m; j++) rt[j] = top(rp[j], isdir)\n",
         "    if [ \"$FILL_DIRS\" -gt 0 ]; then\n      info \"  In the $FILL_DIRS listed folder(s) only what was missing was restored: what was there already\"\n",
+        // 1.8.0 (ADR-0012 items 181 and 182, #498): the slices joined back
+        // into the stream they were cut from, under this dar's own header,
+        // the stream opened once and written only by a child; and damage
+        // dar never needed, said and not fatal
+        "dar -N -c - -R \"$WORK/empty\" -an -D -Q",
+        "join_slice() { # <slice number> <1 for the first slice> <1 for the last>\n",
+        "join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number>\n",
+        "  exec 3>\"$fifos/stream\"\n",
+        "    (printf T >&3) 2>/dev/null || true\n",
+        "late_damage() { # <slice number> <tape file, or empty> <what was found>\n",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
