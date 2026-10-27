@@ -280,7 +280,7 @@ const RESTORE_TOOLS: &[RestoreTool] = &[
     RestoreTool {
         name: "mkfifo",
         modes: MODE_RESTORE,
-        role: "the named pipes a restore streams each slice through into dar (coreutils)",
+        role: "the named pipes of a restore: one carries a unit's slices to dar, joined back into a single stream, and the others check each slice as it passes (coreutils)",
     },
     RestoreTool {
         name: "tee",
@@ -1020,7 +1020,11 @@ box has its own: File 0 of that tape gives it (`total_files`, and
   exception: it is fed to dar only through pipes (only its encrypted slices
   are ever kept on disk), so it needs dar 2.7.9 or later with the unit's
   dar catalogue, or 2.7.21 or later, and with an older dar RESTORE.sh
-  refuses it before it reads a slice ("A unit across tapes").
+  refuses it before it reads a slice ("A unit across tapes"). Before it
+  reads a slice RESTORE.sh also checks that this computer's `head` and
+  `dar` can join a unit's slices into the one stream dar reads; when they
+  cannot, it says why, restores a unit on one tape from slices decrypted
+  to disk instead, and refuses a unit across tapes.
   `dar --version` says which dar you have. A unit's dar catalogue is the
   small file `catalogs/NAME` in
   its envelope ("Words this guide uses"); "without its dar catalogue" means
@@ -1866,7 +1870,9 @@ named `.tapectl-restore.` and some letters and holding encrypted slices
 only: remove it by hand before you run the restore again, which starts
 from the beginning. A dar older than
 2.7.9 (or than 2.7.21, when the envelope holds no dar catalogue of the unit)
-cannot read slices this way, and RESTORE.sh says so before it reads one.
+cannot read slices this way, and RESTORE.sh says so before it reads one. It
+says so too on a computer whose `head` or `dar` cannot join the slices into
+the one stream dar reads, and names which.
 
 `--restore --unit UNIT --path PATH` reads across tapes too, and needs only
 the slices that hold the path and the last one. It can start on any tape of
@@ -4481,31 +4487,65 @@ dar_header() { # <file>
   od -An -v -tu1 "$1" | awk '__AWK_DAR_HEADER__'
 }
 
-# The header this host's dar writes on its standard output, once a run, in
-# $WORK/stream.tmpl: JOIN_H0 bytes long, its data name at JOIN_DN0. Made
-# before any slice of the unit is read.
+# Whether this host can join a unit's slices into the one stream dar reads,
+# checked once a run, before any slice is read. The join takes each slice apart
+# with head in a group, the next command reading on where head stopped, so head
+# must read no further than it is asked (busybox's reads ahead, through stdio);
+# it holds a slice's last byte back with head -c -1; and its header is the one
+# this host's dar writes on its standard output (dar -c - over an empty
+# directory), which this script must know: $WORK/stream.tmpl, JOIN_H0 bytes
+# long, its data name at JOIN_DN0. When it cannot, STREAM_WHY says why (and
+# STREAM_WHY_MORE what was seen), and the caller restores another way: a unit
+# on one tape from slices decrypted to disk, as for a dar too old to stream.
+JOIN_OK=""
 JOIN_H0=""
 JOIN_DN0=""
-stream_template() {
-  local out flag size
-  [ -z "$JOIN_H0" ] || return 0
+STREAM_WHY=""
+STREAM_WHY_MORE=""
+stream_check() {
+  local got out flag size rc=0
+  [ -z "$JOIN_OK" ] || {
+    [ "$JOIN_OK" = 1 ]
+    return
+  }
+  JOIN_OK=0
+  got=$(printf abcdef | { head -c 2 >/dev/null; head -c 1; } 2>/dev/null) || true
+  if [ "$got" != c ]; then
+    STREAM_WHY="this host's head reads past what it is asked for"
+    STREAM_WHY_MORE="(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '$(visible_text "$got")', not 'c')"
+    return 1
+  fi
+  got=$(printf ab | head -c -1 2>/dev/null) || true
+  if [ "$got" != a ]; then
+    STREAM_WHY="this host's head cannot drop a last byte"
+    STREAM_WHY_MORE="(printf ab | head -c -1 printed '$(visible_text "$got")', not 'a')"
+    return 1
+  fi
   mkdir -p "$WORK/empty"
-  if ! dar -N -c - -R "$WORK/empty" -an -D -Q >"$WORK/stream.tmpl" 2>"$WORK/tmpl.err" </dev/null; then
-    cat "$WORK/tmpl.err" >&2 || true
-    die "dar could not write the header this script joins the slices under (dar -c - over an
-       empty directory): dar's own message is above. No slice of the unit has been read."
+  dar -N -c - -R "$WORK/empty" -an -D -Q >"$WORK/stream.tmpl" 2>"$WORK/tmpl.err" </dev/null || rc=$?
+  if [ "$rc" != 0 ]; then
+    STREAM_WHY="dar could not write its standard-output header (dar -c - over an empty directory, exit $rc)"
+    STREAM_WHY_MORE="dar said: $(visible_text "$(head -n 1 "$WORK/tmpl.err" 2>/dev/null)")"
+    return 1
   fi
   if ! out=$(dar_header "$WORK/stream.tmpl"); then
-    die "the header this dar writes on its standard output is not one this script knows ($out).
-       Refusing to join the slices for dar rather than guess. No slice of the unit has been read."
+    STREAM_WHY="this dar's standard-output header is not one this script knows"
+    STREAM_WHY_MORE="($out)"
+    return 1
   fi
   read -r JOIN_H0 flag size JOIN_DN0 <<<"$out"
   if [ "$flag" != T ] || [ "$size" != - ]; then
-    JOIN_H0=""
-    die "the header this dar writes on its standard output is not a single-slice archive's (flag T,
-       no slice size). Refusing to join the slices for dar rather than guess. No slice of the unit
-       has been read."
+    STREAM_WHY="this dar's standard-output header is not a single-slice archive's (flag T, no slice size)"
+    STREAM_WHY_MORE=""
+    return 1
   fi
+  JOIN_OK=1
+}
+
+# Why stream_check failed, indented by $1, one line or two.
+stream_why() { # <indent>
+  printf '%s%s.\n' "$1" "$STREAM_WHY"
+  [ -z "$STREAM_WHY_MORE" ] || printf '%s%s\n' "$1" "$STREAM_WHY_MORE"
 }
 
 # Why the join refuses the slice being fed, for stream_unit to say.
@@ -4643,24 +4683,36 @@ slice_where() { # <slice number> <tape file, or empty>
   fi
 }
 
+# What was found is age (a chunk it cannot authenticate, so the sha256 cannot
+# match either) or sha (the sha256 alone). The note is said here, once for the
+# slice, and again at the end of the run (late_notes), each line of it within
+# about 100 columns but the first, which names the unit and the tape.
 LATE_NOTES=()
-late_damage() { # <slice number> <tape file, or empty> <what was found>
-  local line advice short
+late_damage() { # <slice number> <tape file, or empty> age|sha [<sha256 expected> <sha256 got>]
+  local line short="Replace this tape."
   line="slice $1 of '$(visible_text "$UNIT_NAME")' ($(slice_where "$1" "$2")) is damaged after the point this restore needed"
-  if [ -n "$STREAM_FROM" ]; then
-    advice="It matched the front index of its tape when it was read, so its copy in the scratch
-      directory changed since, or every copy of the slice holds the same damage."
-    short="Every copy of it may hold the same damage: see the note on it above."
-  else
-    advice="Replace this tape: it no longer holds this slice as written, though this restore did
-      not need the damaged part."
-    short="Replace this tape."
-  fi
-  echo "NOTE: $line: $3." >&2
-  echo "      dar had already restored what it needed of the unit, and ended well. The restore goes on:" >&2
-  echo "      the slices after it are still read and checked, and every restored file is checked against" >&2
-  echo "      the sha256 the index records for it. $advice" >&2
-  LATE_NOTES+=("NOTE: $line. $short")
+  {
+    echo "NOTE: $line:"
+    if [ "$3" = age ]; then
+      echo "      age cannot authenticate it there (its own words are above), so its sha256 cannot"
+      echo "      match the front index either."
+    else
+      echo "      its sha256 does not match the front index"
+      echo "      (expected ${4:0:16}…, got ${5:0:16}…)."
+    fi
+    echo "      dar had already restored what it needed of the unit, and ended well. The restore goes"
+    echo "      on: the slices after it are still read and checked, and every restored file is checked"
+    echo "      against the sha256 the index records for it."
+    if [ -n "$STREAM_FROM" ]; then
+      echo "      It matched the front index of its tape when it was read, so its copy in the scratch"
+      echo "      directory changed since, or every copy of the slice holds the same damage."
+    else
+      echo "      Replace this tape: it no longer holds this slice as written, though this restore did"
+      echo "      not need the damaged part."
+    fi
+  } >&2
+  [ -z "$STREAM_FROM" ] || short="Every copy of it may hold the same damage: see the note on it above."
+  LATE_NOTES+=("NOTE: $line." "      $short")
 }
 
 # Stream one unit's slices off the tape, through age, into dar (#412 item 1),
@@ -4702,7 +4754,9 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       die "the slices of '$(visible_text "$UNIT_NAME")' are not listed as 1 to $n in order (slice ${nums[$i]} where
        slice $((i + 1)) was due), so they cannot be joined for dar. No slice of it has been read."
   done
-  stream_template
+  # The caller asked stream_check before any slice was read.
+  stream_check || die "the slices of '$(visible_text "$UNIT_NAME")' cannot be joined into the one stream dar reads, on this host:
+$(stream_why "       ")"
   rm -rf "$fifos" && mkdir -p "$fifos"
   mkfifo "$fifos/stream" "$fifos/cipher" "$fifos/trail"
 
@@ -4838,7 +4892,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
         die_slice_keys "$num"
       fi
       if [ "$late" = 1 ]; then
-        late_damage "$num" "$tpos" "age cannot authenticate it there (its own words are above), so its sha256 cannot match the front index either"
+        late_damage "$num" "$tpos" age
         [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
         continue
       fi
@@ -4863,7 +4917,7 @@ $(replace_hint)"
     got=$(awk '{print $1}' "$WORK/slice.sha")
     if [ "$got" != "$sha" ]; then
       if [ "$late" = 1 ]; then
-        late_damage "$num" "$tpos" "its sha256 does not match the front index (expected ${sha:0:16}…, got ${got:0:16}…)"
+        late_damage "$num" "$tpos" sha "$sha" "$got"
         continue
       fi
       die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${got:0:16}…)
@@ -4964,6 +5018,22 @@ spool_unit() { # <slices file> <destination>
 restore_unit_plain() { # <slices file> <destination> <unit> <version>
   local list=$1 destdir=$2 unit=$3 ver=$4 cat
   cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
+  # A dar that could stream it, on a host that cannot join the slices into the
+  # one stream dar reads (stream_check): the unit is restored from slices
+  # decrypted to disk first, as for a dar too old to stream. A unit held
+  # across tapes never comes here so: restore_across_tapes refused it.
+  if { { [ -n "$cat" ] && dar_at_least 2.7.9; } || dar_at_least 2.7.21; } && ! stream_check; then
+    [ -z "$SPAN_RESTORE" ] || die "the slices of '$unit' cannot be joined into the one stream dar reads, on this host:
+$(stream_why "       ")"
+    {
+      echo "NOTE: the slices of '$(visible_text "$unit")' cannot be joined into the one stream dar reads, on this host:"
+      stream_why "      "
+      echo "      They are decrypted to disk first instead, and dar reads them from there, as for a dar"
+      echo "      too old to stream: that needs room for the slices as well as the files."
+    } >&2
+    spool_unit "$list" "$destdir"
+    return 0
+  fi
   if [ -n "$cat" ] && dar_at_least 2.7.9; then
     stream_unit "$list" "$destdir" "$cat"
     [ "$STREAM_REFUSED" = 1 ] || return 0
@@ -5676,6 +5746,18 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
        dar 2.7.9 or later with the unit's catalogue (the envelope $held), or dar 2.7.21
        or later. Install a newer dar and run the same command again.
        No slice has been read."
+  fi
+  # The same dar, on a host that cannot join the slices into the one stream
+  # dar reads (stream_check): no slice is kept decrypted on disk across tapes,
+  # so there is no other way here.
+  if ! stream_check; then
+    die "'$unit' is held across tapes, and its slices cannot be joined into the one stream
+       dar reads, on this host:
+$(stream_why "       ")
+       A unit held across tapes keeps only encrypted slices on disk, so they are not decrypted
+       to disk for dar instead. Restore it as File 1's \"Manual Recovery Steps\" say for a unit
+       across tapes (each tape's slices read off it and decrypted, then dar over them), or run
+       the same command on a computer where this check passes. No slice has been read."
   fi
   bytes=$(awk -F'|' '{ s += $3 } END { printf "%.0f\n", s }' "$WORK/span.all")
   if [ "$STREAM_TAPES" = 1 ]; then

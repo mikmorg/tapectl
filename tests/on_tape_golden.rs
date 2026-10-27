@@ -411,7 +411,7 @@ fn restore_sh_bytes_are_pinned() {
         "[ -z \"$cat\" ] || dar_opts+=(-A \"$cat\")",
         "if [ -n \"$cat\" ] && dar_at_least 2.7.9; then",
         "if dar_at_least 2.7.21; then",
-        "spool_unit \"$list\" \"$destdir\"",
+        "  info \"  decrypting the slices to disk first (dar 2.7.21 or later would stream it)\"\n  spool_unit \"$list\" \"$destdir\"\n",
         "grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then",
         // 1.8.0 (ADR-0012 item 181, #498): one stream on dar's standard
         // input, never a named pipe per slice
@@ -595,7 +595,15 @@ fn restore_sh_bytes_are_pinned() {
         "join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number>\n",
         "  exec 3>\"$fifos/stream\"\n",
         "    (printf T >&3) 2>/dev/null || true\n",
-        "late_damage() { # <slice number> <tape file, or empty> <what was found>\n",
+        "late_damage() { # <slice number> <tape file, or empty> age|sha [<sha256 expected> <sha256 got>]\n",
+        // A host that cannot join the slices (its head, or its dar's header):
+        // one unit on one tape from slices on disk, one across tapes refused
+        "stream_check() {\n",
+        "  got=$(printf abcdef | { head -c 2 >/dev/null; head -c 1; } 2>/dev/null) || true\n",
+        "  got=$(printf ab | head -c -1 2>/dev/null) || true\n",
+        "      echo \"      They are decrypted to disk first instead, and dar reads them from there, as for a dar\"\n",
+        "    } >&2\n    spool_unit \"$list\" \"$destdir\"\n    return 0\n",
+        "  if ! stream_check; then\n    die \"'$unit' is held across tapes, and its slices cannot be joined into the one stream\n",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }

@@ -14494,9 +14494,19 @@ fn a_unit_across_tapes_is_refused_before_a_slice_where_the_join_cannot_run() {
         ] {
             assert!(fatal.contains(needle), "{extra:?}: {needle:?}:\n{fatal}");
         }
+        // The slices this short tape holds: its planned positions before its
+        // seal marker (the seal, at a planned slice's position, is read).
+        let seal = last_file(&h.dir.join("cart").join("SPAN01"));
+        let here: Vec<i64> = big
+            .positions
+            .iter()
+            .copied()
+            .filter(|p| *p < seal)
+            .collect();
+        assert!(!here.is_empty(), "SPAN01 holds slices of big");
         assert!(
-            reads(&h).iter().all(|p| !big.positions.contains(p)),
-            "{extra:?}: no slice is read:\n{:#?}",
+            reads(&h).iter().all(|p| !here.contains(p)),
+            "{extra:?}: no slice is read (slices at {here:?}):\n{:#?}",
             h.ops()
         );
         assert!(scratch_slices(&dest).is_none(), "{extra:?}: no scratch");
