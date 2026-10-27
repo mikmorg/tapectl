@@ -1269,7 +1269,8 @@ this way: `range` when the tape holds some of the set's slices, `completed` when
     through the script's exit trap, which removes the scratch directory and the slices read: so
     the heir runs it in `screen` or `tmux`. Only a run stopped with no chance to clean up
     (`kill -9`, a crash, a power loss) leaves the directory, to be removed by hand.
-- **`--stream-tapes`** feeds one dar run through pipes across the swaps instead: no slice is
+- **`--stream-tapes`** feeds one dar run through pipes across the swaps instead (from 1.8.0
+  one stream on dar's standard input, held open across the swaps, §6 step 5): no slice is
   kept on disk, and the script pauses at each tape's end for the next cartridge, accepted by R8.
   dar waits on its pipe across a cartridge change: the mhvtl gate's span leg holds the swap
   for `TAPECTL_GATE_SWAP_WAIT` seconds (300 by default) with the same dar process alive at the
@@ -1442,12 +1443,19 @@ any doubt is a rewind). The manual steps below read in that order.
    `head -c size_bytes` to trim padding; `sha256sum` vs the front index's
    `sha256_encrypted` (**keyless** integrity) and/or the envelope's value;
    `age -d -i KEY` → `base.N.dar`. RESTORE.sh streams this: `dd | head | tee
-   (sha256sum) | age -d > FIFO`, with every key given to age at once, so nothing
-   decrypted is written to disk but the restored files.
+   (sha256sum) | age -d`, with every key given to age at once, so nothing
+   decrypted is written to disk but the restored files. From 1.8.0 it joins the
+   slices back into the one `dar -c -` stream tapectl cut them from (the header
+   from the heir's own dar with slice 1's two labels put in, then each slice's
+   payload with its header and trailer taken off and checked, then the final
+   `T`) and writes that stream into one FIFO (#498, ADR-0012 item 181); up to
+   1.7.x it wrote each slice into a FIFO of its own.
 6. `dar -x base -R /dest -O -Q -N` into an empty directory (`-N`: no darrc on
    the heir's machine changes what is restored; dar keeps an existing file and
    reports success, so a re-run over a stopped restore needs `-w`). RESTORE.sh
-   runs dar with `--sequential-read` over the FIFOs, refuses a non-empty `--to`
+   runs `dar -x -` with `--sequential-read` on that stream (up to 1.7.x, dar
+   over the per-slice FIFOs, where dar 2.7.7 to 2.8.6 can take a slice's
+   trailer byte for data, #498), refuses a non-empty `--to`
    unless `--overwrite`, and fails on dar's "not restored (user choice)".
    For one file, `--path` reads only the slices the catalogue names for it and
    the last.
@@ -1569,8 +1577,8 @@ tape, as ranges (§4.4).
 - **RESTORE.sh.** `KNOWN_FEATURES="short-seal spanning"`, and the "this tape needs tapectl" text
   (`die_newer_needed`) moves to "tapectl 1.7.0", because a new required feature arrived. A
   spanning unit restores across tapes from the tape holding its slice 1: by default through
-  scratch space holding only ciphertext, or with `--stream-tapes` through pipes, each further
-  tape accepted by slice hash (§4.4). `--where`, `--find`, `--list` and `--restore --all` name
+  scratch space holding only ciphertext, or with `--stream-tapes` through pipes (one stream
+  from 1.8.0), each further tape accepted by slice hash (§4.4). `--where`, `--find`, `--list` and `--restore --all` name
   ranges. Every short tape gets one `NOT ON TAPE` line for its planned files past the end,
   instead of one per file (item 140, §4.2).
 - **Compatibility.** 1.7.0 reads every tape before it. A tape with no spannable set states what a
@@ -1578,6 +1586,30 @@ tape, as ranges (§4.4).
   refuses a span tape at File 0 and names `spanning` (§1.2), and its RESTORE.sh refuses one given
   to it as a second tape by the same rule. The Heir Kit is regenerated when 1.7.0 is installed
   (item 135).
+
+**Since 1.8.0** (ADR-0012 items 181 and 182, #498; RESTORE.sh's golden pin moves once, and no
+other pin). Only RESTORE.sh and File 1's text change.
+- **RESTORE.sh streams one stream.** A streamed restore joins a unit's slices back into the
+  `dar -c -` stream tapectl cut them from and feeds it to `dar -x -` through one FIFO, opened
+  once and held across slices and cartridge changes (§6 steps 5 and 6). The stream's header is
+  the heir's own dar's (`dar -N -c - -R <empty dir> -an -D -Q`, made once a run) with slice 1's
+  internal name and data name put in; every later slice's header must equal slice 1's, every
+  slice but the last must be the slice size its header records and end in `N`, and the last
+  must end in `T`. A slice that is not what tapectl cut is refused by name. Item 176 holds:
+  every slice is read to its end, hashed and authenticated, and dar's exit status decides.
+- **When the join cannot run on the heir's host** (a dar whose standard-output header the
+  script does not know, or a `head` that reads past what it is asked for), a unit on one tape
+  is restored from slices decrypted to disk first, as for a dar too old to stream; a unit
+  across tapes is refused before any slice is read.
+- **Damage dar never needed** (item 182). When dar has exited 0 and the only damage is in bytes
+  read after it ended, RESTORE.sh names the slice and the tape in a `NOTE`, goes on, checks
+  every restored file against the index, and ends RESTORE COMPLETE (exit 0) with the note
+  repeated if every file matches, telling the heir to replace the tape; any file that fails
+  ends the restore INCOMPLETE as before.
+- **Compatibility.** `requires`, File 0, MANIFEST.toml, the front index, the seals and the
+  envelopes are 1.7.x's, so 1.7.x and 1.8.0 read each other's tapes. Tapes written before 1.8.0
+  keep the RESTORE.sh they carry (item 181); `docs/troubleshooting.md` and the Heir Kit's copy
+  of tapectl are the way round #498 on them.
 
 ## 7. Block mode
 

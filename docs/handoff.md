@@ -450,89 +450,83 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
    becomes `tapectl-1.6.0`; reprint COVER.txt and put the new files on the media in each
    envelope.
 
-## (h) Upgrade home2 to 1.7.0, with spanning off
+## (h) Upgrade home2 to 1.8.0, with spanning off
+
+**home2 goes from 1.5.0 straight to 1.8.0; do not install 1.7.x** (ADR-0012 item 183). 1.8.0
+contains 1.6.0 (the short seal: (g)'s upgrade never ran), 1.7.0 (spanning), 1.7.1 (per-location
+copy targets), 1.7.2 (Logical Block Protection) and RESTORE.sh's one stream for dar (#498):
+`docs/releases/1.6.0.md` to `1.8.0.md`.
 
 1.7.0 is spanning (#478, ADR-0012 items 121-144, `docs/releases/1.7.0.md`): a unit that allows
 it (`allow_spanning`, off by default) may have its slices run across tapes, the drive's early
 warning ending each tape's run. A tape whose plan holds a slice of such a unit states
 `requires = ["short-seal", "spanning"]`, so **a 1.6.0 tapectl or RESTORE.sh refuses it by
-name**. Every other 1.7.0 tape states `requires = ["short-seal"]` as 1.6.0 did, and a 1.6.0
-reader still reads it. With `allow_spanning` unset nothing spans, and a write plans as 1.6.0 did.
-1.7.0 reads L6-0001 and L6-0002 as they are. One catalog migration applies at the first open:
-039 (the write status `range`, `writes.may_span`, `stage_slices.released_at`,
-`archive_sets.allow_spanning`). There is no downgrade past it: the rollback is the 1.6.0 binary
-kept in step 3 plus `db import` of the backup from step 1, losing whatever the catalog recorded
-in between.
+name**. Every other tape states `requires = ["short-seal"]` as 1.6.0 did, and a 1.6.0 reader
+still reads it. With `allow_spanning` unset nothing spans, and a write plans as 1.6.0 did.
+1.8.0 reads L6-0001 and L6-0002 as they are. Four catalog migrations apply at the first open:
+038 (the short seal), 039 (spanning), 040 (copy targets) and 041 (the LBP columns). There is no
+downgrade past them: the rollback is the 1.5.0 binary kept in step 3 plus `db import` of the
+backup from step 1, losing whatever the catalog recorded in between. Run it before any dotfile
+carries `[policy.copies_at]`, which every older tapectl refuses by name.
 
-This assumes (g)'s upgrade is done. If home2 still runs 1.5.0, go straight to 1.7.0, which
-contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step 3, migrations
-038 and 039 both apply at step 4, and step 5 sets `post_warning_bytes` as (g) step 5 would have.
+**First, spanning's real-drive proof: done** (ADR-0012 item 146). Its first run (2026-10-25/26)
+failed at step 5 on #497; the fix is in 1.7.0 (items 176-178), and the proof ran again in full
+with a debug build of `f66d0ff1` (item 177). It **passed every step** on 2026-10-26/27
+(`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and `v1.7.0` is tagged on `f66d0ff1`. Before
+the install: return the test cartridge to the pool, remove the run's work directory and start
+the drive-poll timer again, as that record's "Afterwards" says.
 
-**Do not install 1.7.x: home2 goes from 1.5.0 straight to 1.8.0** (ADR-0012 item 183). 1.8.0
-contains 1.7.0, 1.7.1 (per-location copy targets, migration 040) and 1.7.2 (Logical Block
-Protection, migration 041). First the LBP acceptance runs on the 1.8.0 candidate
-(`docs/lto6-validation-checklist.md`, "LBP on the real drive"), `--r1-only` first. On a PASS the
-coordinator tags `v1.8.0` and tries the migrations on a copy of home2's catalog. Then the steps
-below install it: check out `v1.8.0` in step 2, expect `1.8.0 (v1.8.0, <date>)` in step 3, and
-migrations 038 to 041 apply in step 4. Run it before any dotfile carries `[policy.copies_at]`.
+**Then the LBP acceptance on the 1.8.0 candidate, before the tag** (item 183).
+- **The build:** the coordinator copies a static musl debug build of the candidate to home2
+  (`~/tapectl-1.8.0-<sha>/`), with its sha256 and the acceptance script and `lbp.py` beside it.
+  It is never put on `PATH` or in a production home.
+- **The run:** you run `scripts/lbp-acceptance.sh` with it on test cartridge EW7VWMVKF6, as
+  `docs/lto6-validation-checklist.md`, "LBP on the real drive", says: `--r1-only` first, which
+  decides item 175's switch (if it says the fallback policy, the coordinator rebuilds the
+  candidate with it), then the full run, inside tmux, with the drive-poll timer stopped and
+  vm-desk1 kept quiet. Its heir step restores a unit through 1.8.0's RESTORE.sh on the real
+  drive.
+- **After a PASS:** the coordinator tags `v1.8.0` on the commit the build came from and tries
+  migrations 038 to 041 on a copy of home2's catalog with it, no drive touched. A FAIL leaves the
+  cartridge as the failed step left it; read its run directory before anything writes it again.
 
-**First, spanning's real-drive proof, before the tag** (ADR-0012 item 146, 1.6.0's order).
-- **The build:** the coordinator copies a static musl debug build of the landed commit to home2,
-  with its sha256, beside the acceptance run's other files. It is never put on `PATH` or in a
-  production home.
-- **The run:** you run `scripts/span-acceptance.sh` with it on test cartridge EW7VWMVKF6, as
-  `docs/lto6-validation-checklist.md`, "Spanning on the real drive (1.7.0 acceptance)", says:
-  inside tmux, with the drive-poll timer stopped and vm-desk1 kept quiet.
-- **What it needs:** a real source of about 100 GB for the spannable unit (`--span-source`), and
-  about 7 hours to stage it at debug speed. `--print-plan` prints your part without touching
-  anything.
-- **After a PASS:** the coordinator tags `v1.7.0` on the commit the build came from, and the
-  install below follows. A FAIL leaves the cartridge as the failed step left it; read its run
-  directory before anything writes it again.
-- **Done.** The first run (2026-10-25/26) failed at step 5 on #497; the fix is in 1.7.0
-  (ADR-0012 items 176-178), and the proof ran again in full with a debug build of `f66d0ff1`
-  (item 177). It **passed every step** on 2026-10-26/27
-  (`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and `v1.7.0` is tagged on `f66d0ff1`. Before
-  the install: return the test cartridge to the pool, remove the run's work directory and start
-  the drive-poll timer again, as that record's "Afterwards" says.
-
-Then, on home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0`
+Then, on home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.8.0`
 is tagged:
 
-1. **Back up the catalog with 1.6.0:** `tapectl-op db backup --to
-   /srv/local_backup/tapectl/tapectl-pre-1.7.0.db`.
-2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.7.0`.
+1. **Back up the catalog with 1.5.0:** `tapectl-op db backup --to
+   /srv/local_backup/tapectl/tapectl-pre-1.8.0.db`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.8.0`.
 3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
-   /usr/local/bin/tapectl-1.6.0`, then `scripts/first-run.sh --profile
+   /usr/local/bin/tapectl-1.5.0`, then `scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 3 --to 3`. `tapectl --version` should read
-   `1.7.0 (v1.7.0, <date>)`.
-4. **The first open applies migration 039:** `tapectl-op config check`.
-5. **Confirm `post_warning_bytes`** in the drive's `[[backends.lto]]` table
-   (`tapectl-op config show`): (g) step 5 set it to `99008M`. If it is missing, set it as (g)
-   step 5 says. A span is planned only on a drive that declares it; without it a unit that
-   allows spanning and would pass the fill ceiling is refused, naming the key (item 123).
-6. **Look:** `tapectl status`, `tapectl-op audit` (the new `span_in_progress` check and the four
-   range invariants of `short_seal` are silent: nothing spans yet), and `tapectl-op report
-   failed-stages` (new: every stage attempt that failed, and the hours each lost; item 91).
+   `1.8.0 (v1.8.0, <date>)`. LBP needs `sg_modes` and `sg_wr_mode`, which come with sg3-utils
+   (installed for `sg_logs`): `command -v sg_modes sg_wr_mode` names both.
+4. **The first open applies migrations 038 to 041:** `tapectl-op config check`.
+5. **Let plans reach past the fill ceiling**, as (g) step 5 would have (item 118): `tapectl-op
+   config set 'backends.lto[NAME].post_warning_bytes' 99008M`, `NAME` being the `name` of the
+   drive's `[[backends.lto]]` table, then `tapectl-op config check`. A span is planned only on a
+   drive that declares it; without it a unit that allows spanning and would pass the fill ceiling
+   is refused, naming the key (item 123).
+6. **Look:** `tapectl status`, `tapectl-op audit` (the `short_seal` check, `span_in_progress`
+   and the four range invariants are silent: nothing has ended short or spans yet),
+   `tapectl-op report failed-stages` (every stage attempt that failed, and the hours each lost;
+   item 91) and `tapectl-op report needs` (empty until a unit has copy targets). `tapectl-op
+   volume info L6-0001` reads `not recorded` for its write check.
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive, as in (f)
-   step 7. Stop the drive-poll timer for it.
+   step 7, now with LBP armed: `volume info` of the volume it writes shows the drive checked
+   every block. Stop the drive-poll timer for it.
 8. **Regenerate the Heir Kit** with the installed binary, as in (f) step 8. RESTORE.sh and File
    1 moved, and once a span tape exists the kit's copy of tapectl must read it. The cover sheet
-   now says what `dar extraction failed (exit 0)` means on L6-0001 and L6-0002, whose RESTORE.sh
-   has #497, and how to restore them checked (ADR-0012 item 178). The kit's fourth file becomes
-   `tapectl-1.7.0`; reprint COVER.txt and put the new files on the media in each envelope.
+   says what `dar extraction failed (exit 0)` means on L6-0001 and L6-0002, whose RESTORE.sh
+   has #497, and how to restore them checked (ADR-0012 item 178), and that a power cycle clears
+   a drive whose reads all fail. The kit's fourth file becomes `tapectl-1.8.0`; reprint
+   COVER.txt and put the new files on the media in each envelope.
 
-**Spanning stays off on home2 until a unit allows it; its real-drive proof passed on 2026-10-27.** A config written before 1.7.0
-has no `allow_spanning`, and an absent key reads `false`: nothing to edit. The proof is
-item 137, as item 139 amends it: on test cartridge EW7VWMVKF6 in a throwaway home, tape 1 is
-filler to the fill ceiling and then a real spannable unit the drive's early warning cuts (the
-`range` row, the readback past the warning, RESTORE.sh spooling tape 1's range into scratch, a
-rebuild of tape 1); the cartridge is then erased and written as tape 2, a whole copy, and the
-restore finishes from scratch plus tape 2. That is the first step of (h) above, run before the
-tag, and it passed. Once 1.7.0 is installed, allow spanning per unit (its dotfile's
-`[policy]`), per archive set (`tapectl-op archive-set edit <NAME> --allow-spanning true`) or in
-`[defaults]`, and keep the tapes `volume write` names together ("keep these together"): a
-whole copy across tapes needs every one of them to restore.
+**Spanning stays off on home2 until a unit allows it.** A config written before 1.7.0 has no
+`allow_spanning`, and an absent key reads `false`: nothing to edit. Once 1.8.0 is installed,
+allow spanning per unit (its dotfile's `[policy]`), per archive set (`tapectl-op archive-set
+edit <NAME> --allow-spanning true`) or in `[defaults]`, and keep the tapes `volume write` names
+together ("keep these together"): a whole copy across tapes needs every one of them to restore.
 
 ## (e) After: the backlog
 
