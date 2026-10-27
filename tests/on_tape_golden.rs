@@ -327,6 +327,20 @@
 //! named by `die_dar`. Every first line of a prompt, refusal and verdict is
 //! unchanged, every other substring keeps its count, and no `TOOLS_*` line moved.
 //!
+//! **Moved a seventh time, 2026-10-27, under ADR-0012 item 181** (#498, with
+//! item 182; the CTO's one authorized re-pin for 1.8.0): `stream_unit`
+//! (`25505925…` to `7285a4ff…`). dar 2.7.7 to 2.8.6 can take a slice's
+//! trailer byte for data through a named pipe per slice, so the slices are
+//! joined back into the `dar -c -` stream (`stream_check`, `join_slice`,
+//! `join_rest`, the `AWK_DAR_HEADER` fragment) and fed to `dar -x -` through one
+//! FIFO held open as fd 3; a host whose `head` or dar cannot join them spools a
+//! unit on one tape and refuses one across tapes before any slice. Damage found
+//! after dar ended well is `late_damage`'s note, and the per-file check decides
+//! (item 182). The two needles that named the per-slice FIFOs name the stream's
+//! lines instead, `spool_unit`'s names the old-dar path beside a needle for the
+//! fallback, and every other substring pinned before keeps its count; no
+//! `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -353,7 +367,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "25505925af884bb6898f3702ce72be35ae236fd07cf686cd23cf4fbda83eddce";
+const RESTORE_SH_SHA256: &str = "7285a4ffe87e425ce5400f58f5c58fd8c4b5a5d03686db3c078f2c6ed5838b63";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
