@@ -6673,6 +6673,8 @@ mod tests {
                 pub cipher_lens: Vec<i64>,
                 /// Every unit on the volume, in tape order.
                 pub units: Vec<UnitFixture>,
+                /// The first unit's slices, in plaintext, slice 1 first.
+                pub plains: Vec<Vec<u8>>,
                 pub _home: TempDir,
                 pub _drive: InjectedDrive,
             }
@@ -6838,7 +6840,35 @@ mod tests {
                 slice_size: &str,
                 dar_args: &[&str],
             ) -> Multi {
-                volume_with(label, &[(unit, files, slice_size)], true, dar_args)
+                volume_with(
+                    label,
+                    &[(unit, files, slice_size)],
+                    true,
+                    Framing::Dar(dar_args),
+                )
+            }
+
+            /// [`multi`], its archive made as `stage create` makes one:
+            /// `dar -c -` with tapectl's create flags, cut into slices by
+            /// tapectl ([`crate::dar::slice::cut_stream`]), and the on-the-fly
+            /// catalogue re-isolated uncompressed.
+            pub(crate) fn multi_cut(
+                label: &str,
+                unit: &str,
+                files: &[(&str, Vec<u8>)],
+                slice_size: &str,
+            ) -> Multi {
+                volume_with(label, &[(unit, files, slice_size)], true, Framing::Tapectl)
+            }
+
+            /// Who slices a fixture's archive.
+            #[derive(Clone, Copy)]
+            enum Framing<'a> {
+                /// dar itself, `dar -c <base> -s <size>`, with these
+                /// arguments added.
+                Dar(&'a [&'a str]),
+                /// tapectl, as `stage create` does.
+                Tapectl,
             }
 
             /// [`multi`] for several units, one after another on the tape
@@ -6848,15 +6878,15 @@ mod tests {
             /// in miniature. [`Multi::files`] / [`Multi::cipher_lens`]
             /// describe the FIRST unit; [`Multi::units`] every unit.
             pub(crate) fn volume_of(label: &str, units: &[UnitSpec<'_>], catalogue: bool) -> Multi {
-                volume_with(label, units, catalogue, &[])
+                volume_with(label, units, catalogue, Framing::Dar(&[]))
             }
 
-            /// [`volume_of`], with `dar_args` added to every unit's `dar -c`.
+            /// [`volume_of`], every unit's archive sliced by `framing`.
             fn volume_with(
                 label: &str,
                 units: &[UnitSpec<'_>],
                 catalogue: bool,
-                dar_args: &[&str],
+                framing: Framing<'_>,
             ) -> Multi {
                 let conn = crate::db::open_memory().unwrap();
                 let home = TempDir::new().unwrap();
@@ -6883,6 +6913,7 @@ mod tests {
                         .unwrap();
                 }
                 let mut fixtures = Vec::new();
+                let mut first_plains = Vec::new();
                 for (k, (name, files, slice_size)) in units.iter().enumerate() {
                     conn.execute(
                         "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -6938,28 +6969,59 @@ mod tests {
                         crate::db::files::fixture::insert(&conn, snapshot_id, &dir, 0, "dir", None);
                     }
                     let base = work.path().join("arch");
-                    let created = std::process::Command::new("dar")
-                        .arg("-c")
-                        .arg(&base)
-                        .arg("-R")
-                        .arg(&src)
-                        .arg("-s")
-                        .arg(slice_size)
-                        .arg("-Q")
-                        .args(dar_args)
-                        .output()
-                        .unwrap();
-                    assert!(
-                        created.status.success(),
-                        "dar -c failed in test setup: {}",
-                        String::from_utf8_lossy(&created.stderr)
-                    );
+                    let onfly = work.path().join("onfly");
+                    match framing {
+                        Framing::Dar(dar_args) => {
+                            let created = std::process::Command::new("dar")
+                                .arg("-c")
+                                .arg(&base)
+                                .arg("-R")
+                                .arg(&src)
+                                .arg("-s")
+                                .arg(slice_size)
+                                .arg("-Q")
+                                .args(dar_args)
+                                .output()
+                                .unwrap();
+                            assert!(
+                                created.status.success(),
+                                "dar -c failed in test setup: {}",
+                                String::from_utf8_lossy(&created.stderr)
+                            );
+                        }
+                        Framing::Tapectl => {
+                            crate::dar::create::archive_to_files(
+                                &crate::dar::create::DarCreateParams {
+                                    dar_binary: "dar",
+                                    source_path: &src,
+                                    compression: "none",
+                                    exclude_patterns: &[],
+                                    exclude_paths: &[],
+                                    preserve_xattrs: true,
+                                    preserve_fsa: true,
+                                    on_fly_catalogue: &onfly,
+                                },
+                                &base,
+                                slice_size,
+                            )
+                            .unwrap();
+                        }
+                    }
                     if catalogue {
                         // Where and how `stage create` isolates it.
                         let dir = paths.catalogs_dir.join(format!("unit{k:04}"));
                         fs::create_dir_all(&dir).unwrap();
                         let catalogue = dir.join(format!("unit{k:04}_v1"));
-                        crate::dar::create::extract_catalog("dar", &base, &catalogue).unwrap();
+                        match framing {
+                            Framing::Dar(_) => {
+                                crate::dar::create::extract_catalog("dar", &base, &catalogue)
+                                    .unwrap()
+                            }
+                            Framing::Tapectl => {
+                                crate::dar::create::reisolate_catalogue("dar", &onfly, &catalogue)
+                                    .unwrap()
+                            }
+                        }
                         conn.execute(
                             "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
                             params![catalogue.to_string_lossy(), ss_id],
@@ -7003,6 +7065,9 @@ mod tests {
                         )
                         .unwrap();
                     }
+                    if k == 0 {
+                        first_plains = plains.clone();
+                    }
                     fixtures.push(UnitFixture {
                         name: name.to_string(),
                         files: files
@@ -7022,6 +7087,7 @@ mod tests {
                     files: fixtures[0].files.clone(),
                     cipher_lens: fixtures[0].cipher_lens.clone(),
                     units: fixtures,
+                    plains: first_plains,
                     _home: home,
                     _drive: drive,
                 }
@@ -7029,7 +7095,7 @@ mod tests {
         }
 
         mod streaming {
-            use super::multi::{multi, multi_with, noise, Multi, Spot, FIRST};
+            use super::multi::{multi, multi_cut, multi_with, noise, Multi, Spot, FIRST};
             use super::record::only_row;
             use super::*;
             use crate::tape::fake::Op;
@@ -7237,6 +7303,111 @@ mod tests {
                 m.assert_restored(dest.path());
                 let argv = only_row(&m.conn).dar_argv.expect("dar ran");
                 assert!(!argv.contains("--sequential-read"), "{argv}");
+            }
+
+            // ── #498: dar's named-pipe reader takes a slice's trailer as data ──
+            //
+            // Over a named pipe a slice's size is 0 to dar, so dar sees the
+            // slice end only on a short read (`sar::inherited_read`, every dar
+            // from 2.7.7 to 2.8.6). When one of its reads asks for exactly the
+            // bytes left in a slice, the slice's one-byte trailer (`N`) comes
+            // back as archive data: a one-byte shift, "Bad CRC", exit 5. It
+            // depends only on the archive's bytes, the slice size and dar's
+            // reads, so it happens the same way every time for one unit.
+
+            /// Where `files[0]`'s data begins in slice 1 of tapectl's cut of
+            /// its archive: the first bytes of the file, found in a one-slice
+            /// cut. The slice header is 50 bytes below 4 GiB at any size, so
+            /// the data begins there at the size the test then cuts at too.
+            fn data_start_in_slice_1(files: &[(&str, Vec<u8>)]) -> usize {
+                let work = TempDir::new().unwrap();
+                let src = work.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                for (path, bytes) in files {
+                    fs::write(src.join(path), bytes).unwrap();
+                }
+                let base = work.path().join("probe");
+                let slices = crate::dar::create::archive_to_files(
+                    &crate::dar::create::DarCreateParams {
+                        dar_binary: "dar",
+                        source_path: &src,
+                        compression: "none",
+                        exclude_patterns: &[],
+                        exclude_paths: &[],
+                        preserve_xattrs: true,
+                        preserve_fsa: true,
+                        on_fly_catalogue: &work.path().join("onfly"),
+                    },
+                    &base,
+                    "1G",
+                )
+                .unwrap();
+                assert_eq!(slices, 1);
+                let slice = fs::read(format!("{}.1.dar", base.display())).unwrap();
+                let head = &files[0].1[..64];
+                slice
+                    .windows(64)
+                    .position(|w| w == head)
+                    .expect("the file's first bytes are in the archive")
+            }
+
+            /// dar reads a file's data in requests of this many bytes,
+            /// from the data's first byte (measured with strace on 2.7.13 and
+            /// 2.7.21: the buffer size of its pipe and generic file layers).
+            const DAR_READ: usize = 102_400;
+
+            /// THE positive control for #498, through tapectl's own staging
+            /// and restore: one 3 MB file, its archive made and cut as `stage
+            /// create` makes and cuts it, at the slice size that ends slice
+            /// 1's payload one byte before the end of dar's tenth read of the
+            /// file's data — so that read asks for exactly the rest of slice
+            /// 1, trailer included. dar fed the slices one named pipe each
+            /// fails it, "Bad CRC" and exit 5, on 2.7.13 and 2.7.21 alike; one
+            /// byte either way, it does not. The restore is whole at all
+            /// three sizes, the trigger last.
+            #[test]
+            fn a_unit_whose_slice_ends_where_a_dar_read_ends_streams_whole() {
+                let file = noise(3_000_000, 498);
+                let tree = vec![("one.bin", file.clone())];
+                let start = data_start_in_slice_1(&tree);
+                let trigger = start + 10 * DAR_READ;
+                for size in [trigger - 1, trigger + 1, trigger] {
+                    let m = multi_cut("PC-1", "bc-unit", &tree, &size.to_string());
+                    // The shape's own control: slice 1 is the size asked for
+                    // and holds the file from `start` to its end, so its last
+                    // payload byte is where dar's tenth read stops one byte
+                    // short of (at the trigger size), and slice 2's first is
+                    // the next byte of the file.
+                    assert_eq!(m.slices(), 3, "-s {size}");
+                    let slice1 = &m.plains[0];
+                    assert_eq!(slice1.len(), size);
+                    let held = size - 1 - start;
+                    assert_eq!(&slice1[start..size - 1], &file[..held], "-s {size}");
+                    assert_eq!(m.plains[1][50..60], file[held..held + 10], "-s {size}");
+                    if size == trigger {
+                        assert_eq!(held + 1, 10 * DAR_READ, "the trigger");
+                    }
+
+                    let dest = TempDir::new().unwrap();
+                    if let Err(e) =
+                        m.unit("PC-1", "bc-unit", dest.path(), &RestoreOptions::default())
+                    {
+                        let row = only_row(&m.conn);
+                        panic!(
+                            "-s {size} (the trigger is {trigger}): the unit is whole, yet: {e}\n\
+                             dar exit {:?}\n{}{}",
+                            row.dar_exit_code,
+                            row.dar_stdout.unwrap_or_default(),
+                            row.dar_stderr.unwrap_or_default()
+                        );
+                    }
+                    m.assert_restored(dest.path());
+                    let row = only_row(&m.conn);
+                    assert_eq!(row.dar_exit_code, Some(0), "-s {size}");
+                    let argv = row.dar_argv.expect("dar ran");
+                    assert!(argv.contains(r#""--sequential-read""#), "{argv}");
+                    assert!(argv.contains(r#""-A""#), "{argv}");
+                }
             }
 
             /// A slice whose age header does not open cannot be read around:
