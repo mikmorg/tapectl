@@ -4419,10 +4419,12 @@ dar_running() {
 # dar is gone: say why, with its own words. One exit is not an error: dar
 # refusing the envelope's catalogue as not this archive's (a re-staged
 # snapshot, #419), which it does before writing anything. That sets
-# STREAM_REFUSED and returns, and the caller restores another way.
+# STREAM_REFUSED and returns, and the caller restores another way. Either way
+# the stream dar read (stream_unit) is closed first.
 STREAM_REFUSED=0
 die_dar() { # <destination>
   local rc
+  stream_close
   dar_reap
   rc=$DAR_RC
   DAR_PID=""
@@ -4737,7 +4739,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
         # before a cartridge is asked for that it would never read.
         if ! kill -0 "$DAR_PID" 2>/dev/null; then
           die_dar "$destdir"
-          break
+          return 0
         fi
         span_swap "$num"
         tpos=$(span_pos "$num")
@@ -4758,7 +4760,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     if ! dar_running; then
       if [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        break
+        return 0
       fi
       sink=/dev/null
     fi
@@ -4801,7 +4803,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       dar_reap
       if [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        break
+        return 0
       fi
     fi
     # Damage here cannot have reached dar when dar had already ended well:
@@ -4829,7 +4831,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       if ! grep -E 'decrypt|authenticat|no identity matched|header|MAC' "$WORK/age.err" >/dev/null 2>&1 &&
         ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        break
+        return 0
       fi
       cat "$WORK/age.err" >&2 || true
       if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
@@ -4853,7 +4855,7 @@ $(replace_hint)"
     if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; then
       if ! dar_running && [ "$DAR_RC" != 0 ]; then
         die_dar "$destdir"
-        break
+        return 0
       fi
       die "slice $num ($from) could not be passed to dar (status ${st[*]})"
     fi
@@ -4873,11 +4875,10 @@ $(replace_hint)"
   done
   # The stream's own trailer, written by a child (see above), once every
   # slice is joined; then the stream is closed, and dar reads its end.
-  if [ "$STREAM_REFUSED" = 0 ] && [ "$STREAM_OPEN" = 1 ] && dar_running; then
+  if [ "$STREAM_OPEN" = 1 ] && dar_running; then
     (printf T >&3) 2>/dev/null || true
   fi
   stream_close
-  [ "$STREAM_REFUSED" = 0 ] || return 0
 
   dar_reap
   local rc=$DAR_RC
@@ -5542,8 +5543,8 @@ span_swap() { # <slice number>
   SPAN_NEED=$1
   swap_loop
   SPAN_NEED=""
-  SPAN_SWAPPED=1
   CART_LABEL=${OTHER_LABEL:-<unreadable>}
+  SPAN_SWAPPED=1
 }
 
 # The default way (item 132), and --path's: every slice $WORK/span.all lists
@@ -6900,15 +6901,25 @@ restore_end() {
     for line in "${INCOMPLETE[@]}"; do
       printf '%s\n' "$line" | sed 's/^/>>> /'
     done
-    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"} ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
+    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
       info "$line"
     done
+    late_notes
     exit 1
   fi
   info "RESTORE COMPLETE"
-  # The damage a restore did not need (item 182), said again: the tape is to
-  # be replaced, though everything restored checked out.
-  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"} ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
+  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
+    info "$line"
+  done
+  late_notes
+}
+
+# The damage a restore did not need (ADR-0012 item 182, late_damage), said
+# again at the end: the tape is to be replaced, though what was restored
+# checked out.
+late_notes() {
+  local line
+  for line in ${LATE_NOTES[@]+"${LATE_NOTES[@]}"}; do
     info "$line"
   done
 }
