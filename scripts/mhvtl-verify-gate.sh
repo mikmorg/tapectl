@@ -33,8 +33,8 @@
 #      rust_lbp runs tests/mhvtl_lbp.rs on a TD6 drive (Reed-Solomon), named by
 #      TAPECTL_GATE_TAPE_TD6, at a 262,144-byte payload mhvtl can carry.
 #
-# The `check` lines below are the list (65 since #388's lbp_fallback_recorded, rust_lbp and
-# lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
+# The `check` lines below are the list (66 since #498's heir_slice_boundary_read; 65 since
+# #388's lbp_fallback_recorded, rust_lbp and lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
 # span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
 # span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
 # heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
@@ -2343,6 +2343,131 @@ PY
 }
 echo "gate: heir_big_catalogue — a unit whose catalogue dar leaves unread (#497)"
 check heir_big_catalogue   step_heir_big_catalogue
+
+# ---------- heir_slice_boundary_read: a slice that ends where a dar read ends (#498) ----------
+# dar 2.7.7 to 2.8.6, reading a sliced archive one named pipe per slice, finds a slice's
+# end only on a short read: where one of its reads ends on the last byte of a slice, the
+# slice's one-byte trailer comes back as data, and the unit fails "Bad CRC", exit 5, the
+# same way every time. RESTORE.sh fed dar that way up to 1.7.x; from 1.8.0 it joins the
+# slices back into one stream on dar's standard input (ADR-0012 item 181). This one: a
+# throwaway home, alice's unit bsr-bound of one 3,000,000-byte file of noise, staged by
+# tapectl at the trigger size P + 10 x 102,400, where P is where the file's data begins
+# in slice 1 (measured on bsr-probe, the same file staged in one slice, and checked on
+# bsr-bound itself): slice 1's payload then ends on the last byte of dar's tenth
+# 102,400-byte read of the file's data. Written to the cartridge in the drive, and
+# restored by the RESTORE.sh on that tape, streamed, with the real age, dar, mt and tar.
+# It must exit 0 with RESTORE COMPLETE, no FATAL and no "Bad CRC", check every slice
+# against the front index, run the per-file check, and give back the tree. Runs in well
+# under a minute.
+BSR="$RUN/slice-boundary"
+BSR_LABEL="BSR-0001"
+BSRC() { "$BIN" --home "$BSR/home" "$@"; }
+# One value from the throwaway home's catalog, read-only; fails on no row or a NULL.
+bsr_q() { # bsr_q <sql> [param...]
+    python3 - "$BSR/home/tapectl.db" "$@" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = db.execute(sys.argv[2], sys.argv[3:]).fetchone()
+assert row is not None and row[0] is not None, f"no value for: {sys.argv[2]} {sys.argv[3:]}"
+print(row[0])
+PY
+}
+# Slice 1 of <unit>'s staging, decrypted with alice's key into $BSR/<unit>.1.plain.
+bsr_slice1() { # bsr_slice1 <unit>
+    local slice
+    slice="$(bsr_q "SELECT sl.staging_path FROM stage_slices sl
+                      JOIN stage_sets ss ON ss.id = sl.stage_set_id
+                      JOIN snapshots s ON s.id = ss.snapshot_id
+                      JOIN units u ON u.id = s.unit_id
+                     WHERE u.name = ? AND sl.slice_number = 1" "$1")" || return 1
+    age -d -i "$BSR/home/keys/alice-primary.age.key" "$slice" >"$BSR/$1.1.plain" \
+        || { echo "cannot decrypt slice 1 of $1 ($slice)"; return 1; }
+}
+step_heir_slice_boundary_read() {
+    local out rc n p size files
+    rm -rf "$BSR"; mkdir -p "$BSR/src/bsr-probe" "$BSR/src/bsr-bound" "$BSR/home/staging" "$BSR/heir"
+    # Noise with no zero byte: dar stores a run of zeros as a hole, and the file's data
+    # would no longer be one run of the archive. The same file, times and all, twice.
+    python3 - "$BSR/src/bsr-probe/one.bin" <<'PY' || { echo "cannot make the source file"; return 1; }
+import os, sys
+with open(sys.argv[1], "wb") as f:
+    f.write(os.urandom(3000000).replace(b"\0", b"\1"))
+PY
+    cp -p "$BSR/src/bsr-probe/one.bin" "$BSR/src/bsr-bound/one.bin" || { echo "cannot copy the source file"; return 1; }
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
+    # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
+    # its secret going only to this run's log.
+    BSRC init --operator gate-bsr \
+        && BSRC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && BSRC config set staging.directory "$BSR/home/staging" \
+        && BSRC tenant add alice \
+        && BSRC unit init "$BSR/src/bsr-probe" --tenant alice --name bsr-probe \
+        && BSRC unit init "$BSR/src/bsr-bound" --tenant alice --name bsr-bound \
+        && BSRC snapshot create bsr-probe \
+        && BSRC snapshot create bsr-bound \
+        && BSRC config set defaults.slice_size 16M \
+        && BSRC stage create bsr-probe \
+        || { echo "home: init/backend add/config set/tenant add/unit init/snapshot/probe stage failed"; return 1; }
+    bsr_slice1 bsr-probe || return 1
+    p="$(python3 - "$BSR/bsr-probe.1.plain" "$BSR/src/bsr-probe/one.bin" <<'PY'
+import sys
+s = open(sys.argv[1], "rb").read()
+f = open(sys.argv[2], "rb").read()
+at = s.find(f[:64])
+assert 0 < at and s[at:at + len(f)] == f, "the probe's one slice does not hold the file in one run"
+print(at)
+PY
+)" || { echo "cannot find where the file's data begins in the probe's slice 1"; return 1; }
+    size=$((p + 10 * 102400))
+    echo "the file's data begins at byte $p of slice 1: the trigger slice size is $size"
+    BSRC config set defaults.slice_size "$size" && BSRC stage create bsr-bound \
+        || { echo "cannot stage bsr-bound at $size bytes"; return 1; }
+    # The shape's own control, on bsr-bound itself: three slices, slice 1 exactly $size
+    # bytes, holding the file from byte $p to its last payload byte, which ends dar's
+    # tenth read of the file's data.
+    n="$(bsr_q "SELECT COUNT(*) FROM stage_slices sl
+                  JOIN stage_sets ss ON ss.id = sl.stage_set_id
+                  JOIN snapshots s ON s.id = ss.snapshot_id
+                  JOIN units u ON u.id = s.unit_id
+                 WHERE u.name = ?" bsr-bound)" || return 1
+    [ "$n" -eq 3 ] || { echo "bsr-bound has $n slice(s): the trigger shape has 3"; return 1; }
+    bsr_slice1 bsr-bound || return 1
+    python3 - "$BSR/bsr-bound.1.plain" "$BSR/src/bsr-bound/one.bin" "$p" "$size" <<'PY' \
+        || { echo "bsr-bound is not at the trigger shape"; return 1; }
+import sys
+s = open(sys.argv[1], "rb").read()
+f = open(sys.argv[2], "rb").read()
+p, size = int(sys.argv[3]), int(sys.argv[4])
+held = size - 1 - p
+assert len(s) == size, f"slice 1 is {len(s)} bytes, not {size}"
+assert s[p:size - 1] == f[:held], "slice 1 does not hold the file from byte p to its last payload byte"
+assert held + 1 == 10 * 102400, "the shape is not the trigger"
+PY
+    # Every file of the unit, its own dotfile included, as heir_big_catalogue counts them.
+    files="$(find "$BSR/src/bsr-bound" -type f | wc -l)" || { echo "cannot count the unit's files"; return 1; }
+    BSRC volume init "$BSR_LABEL" --device "$TAPE_DEV" || return 1
+    BSRC volume write "$BSR_LABEL" --device "$TAPE_DEV" --yes || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$BSR/heir/RESTORE.sh" \
+        && chmod +x "$BSR/heir/RESTORE.sh" && bash -n "$BSR/heir/RESTORE.sh" \
+        || { echo "cannot read RESTORE.sh off the tape"; return 1; }
+    out="$(cd "$BSR/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit bsr-bound \
+        --key "$BSR/home/keys/alice-primary.age.key" --to "$BSR/heir/recovered" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 40
+    [ "$rc" -eq 0 ] || { echo "heir_slice_boundary_read: RESTORE.sh exited $rc, want 0"; return 1; }
+    # Streamed into dar (the way #498 broke), not read from slices on disk.
+    grep -F "Slice 1/$n — tape file" >/dev/null <<<"$out" \
+        || { echo "heir_slice_boundary_read: the unit was not streamed into dar"; return 1; }
+    if grep -F "Bad CRC" <<<"$out"; then
+        echo "heir_slice_boundary_read: dar said Bad CRC"
+        return 1
+    fi
+    heir_judge_whole_restore bsr-bound 1 "$n" "$files" <<<"$out" || return 1
+    diff -r "$BSR/src/bsr-bound" "$BSR/heir/recovered" || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+echo "gate: heir_slice_boundary_read — a slice that ends where a dar read ends (#498)"
+check heir_slice_boundary_read step_heir_slice_boundary_read
 
 # ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478) ----------
 # ADR-0012 item 136: the mhvtl proof of spanning is this one leg, judged by test name, with the
