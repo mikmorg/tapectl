@@ -33,8 +33,9 @@
 #      rust_lbp runs tests/mhvtl_lbp.rs on a TD6 drive (Reed-Solomon), named by
 #      TAPECTL_GATE_TAPE_TD6, at a 262,144-byte payload mhvtl can carry.
 #
-# The `check` lines below are the list (66 since #498's heir_slice_boundary_read; 65 since
-# #388's lbp_fallback_recorded, rust_lbp and lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
+# The `check` lines below are the list (67 since item 182's heir_late_damage; 66 since #498's
+# heir_slice_boundary_read; 65 since #388's lbp_fallback_recorded, rust_lbp and
+# lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
 # span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
 # span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
 # heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
@@ -945,7 +946,8 @@ PY
 }
 # The dd stand-in. It reads through the real dd (REAL_DD) and flips one byte of
 # the tape file at FAULT_POS, found by asking the drive (REAL_MT status) which
-# file the head is at when dd starts; every other read is untouched. Each flip is
+# file the head is at when dd starts; every other read is untouched. The byte is at
+# FAULT_AT in the file (100000 when unset, or the file's last). Each flip is
 # logged to FAULT_LOG, so a run can show the fault really happened. It handles dd
 # writing to a file (of=) and to a pipe.
 heir_write_injector() { # heir_write_injector <path of the dd to write>
@@ -962,13 +964,13 @@ if [ "$pos" = "$FAULT_POS" ]; then
         python3 -c 'import sys
 p = sys.argv[1]
 b = bytearray(open(p, "rb").read())
-b[min(len(b) - 1, 100000)] ^= 0xff
-open(p, "wb").write(b)' "$of"
+b[min(len(b) - 1, int(sys.argv[2]))] ^= 0xff
+open(p, "wb").write(b)' "$of" "${FAULT_AT:-100000}"
     else
         "$REAL_DD" "$@" | python3 -c 'import sys
 b = bytearray(sys.stdin.buffer.read())
-b[min(len(b) - 1, 100000)] ^= 0xff
-sys.stdout.buffer.write(b)'
+b[min(len(b) - 1, int(sys.argv[1]))] ^= 0xff
+sys.stdout.buffer.write(b)' "${FAULT_AT:-100000}"
     fi
     echo "flipped one byte of tape file $pos" >>"$FAULT_LOG"
     exit 0
@@ -2258,12 +2260,14 @@ check heir_short_cut_refused step_heir_short_cut_refused
 # a pipe holds, and before #497 the restore ended "FATAL: dar extraction failed (exit
 # 0)" over a tree restored whole (home2, 2026-10-25). Every heir leg above restores
 # units of a handful of files, whose tail fits in the pipe, so none could see it.
-# This one: a throwaway home, alice's one unit of 3000 small files with long names in
-# 4 MiB slices (the catalogue near 1 MB, in the last slice after the end of the
-# data: home2's shape), written to the cartridge in the drive, restored by the
-# RESTORE.sh on that tape with the real age, dar, mt and tar. It must exit 0 with
-# RESTORE COMPLETE and no FATAL, check every slice against the front index, run the
-# per-file check over every file, and give back the tree. Runs in well under a minute.
+# This one: a throwaway home, alice's one unit of 4000 small files with long names in
+# 6 MiB slices (the catalogue near 1.2 MB, in the last slice after the end of the
+# data: home2's shape; sized so heir_late_damage, after it, can damage that tail),
+# written to the cartridge in the drive, restored by the RESTORE.sh on that tape with
+# the real age, dar, mt and tar. It must exit 0 with RESTORE COMPLETE and no FATAL,
+# check every slice against the front index, run the per-file check over every file,
+# and give back the tree. It leaves the tape in the drive for heir_late_damage, which
+# erases it. Runs in well under a minute.
 BC="$RUN/big-catalogue"
 BC_LABEL="BC-0001"
 BCC() { "$BIN" --home "$BC/home" "$@"; }
@@ -2297,11 +2301,11 @@ heir_judge_whole_restore() { # heir_judge_whole_restore <unit> <version> <slices
 step_heir_big_catalogue() {
     local out rc n files cat_path cat_len
     rm -rf "$BC"; mkdir -p "$BC/src/bc-many" "$BC/home/staging" "$BC/heir"
-    # 3000 files of 1600 bytes, names of about 200 characters: the names are what
+    # 4000 files of 1600 bytes, names of about 200 characters: the names are what
     # make dar's catalogue large.
     python3 - "$BC/src/bc-many" <<'PY' || { echo "cannot make the source tree"; return 1; }
 import os, sys
-for i in range(3000):
+for i in range(4000):
     name = f"{i:04d}-" + "n" * 190 + ".bin"
     with open(os.path.join(sys.argv[1], name), "wb") as f:
         f.write(os.urandom(1600))
@@ -2312,7 +2316,7 @@ PY
     BCC init --operator gate-bc \
         && BCC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
         && BCC config set staging.directory "$BC/home/staging" \
-        && BCC config set defaults.slice_size 4M \
+        && BCC config set defaults.slice_size 6M \
         && BCC tenant add alice \
         && BCC unit init "$BC/src/bc-many" --tenant alice --name bc-many \
         && BCC snapshot create bc-many \
@@ -2339,10 +2343,100 @@ PY
     [ "$rc" -eq 0 ] || { echo "heir_big_catalogue: RESTORE.sh exited $rc, want 0"; return 1; }
     heir_judge_whole_restore bc-many 1 "$n" "$files" <<<"$out" || return 1
     diff -r "$BC/src/bc-many" "$BC/heir/recovered" || return 1
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+    # The tape stays in the drive: heir_late_damage reads it next, and erases it.
 }
 echo "gate: heir_big_catalogue — a unit whose catalogue dar leaves unread (#497)"
 check heir_big_catalogue   step_heir_big_catalogue
+
+# ---------- heir_late_damage: damage only in what dar never needed (ADR-0012 item 182) ----------
+# Item 182 changed what RESTORE.sh does with damage found in the tail of a unit that dar,
+# given its catalogue, never reads (#497): it names the slice and the tape, goes on, checks
+# every file against the index, and is a whole restore if every file matches. ADR-0012 item
+# 70: the heir path is proven only with the real tools, so this leg reads
+# heir_big_catalogue's tape, which that leg leaves in the drive for it (this one erases it),
+# through the gate's dd stand-in (heir_write_injector). The stand-in flips one byte of the
+# LAST slice's ciphertext 2048 bytes before its recorded end: inside the slice, never in the
+# block padding, and inside the catalogue at the end of the archive, far past where dar
+# stops. The real age then cannot authenticate that chunk, so the slice's sha256 cannot
+# match the front index either.
+#
+# The caveat, and so the precondition. The note needs dar to have closed its stream BEFORE
+# age reaches the damage (RESTORE.sh's join.closed). Between age and dar lie a few pipes and
+# an age chunk, about 400 KiB with dar's own read-ahead, so damage within that distance of
+# where dar stops can be found while dar still reads, and that restore ends FATAL as it
+# always has: the stricter outcome, never a false pass. The leg therefore checks first,
+# failing closed, that the unit's isolated catalogue (the size of what dar leaves unread at
+# the end of the archive) is at least 1 MiB and lies inside the last slice.
+# heir_big_catalogue's unit is sized for it: 4000 files in 6 MiB slices, measured with dar
+# 2.7.13 at a 1,188,461-byte catalogue in a last slice of 2,817,557 bytes.
+#
+# Judge a RESTORE.sh --restore of one whole unit whose slice <slice> (tape file <file> of
+# <label>) is damaged after the point dar needed, by its output (stdin): RESTORE COMPLETE,
+# no FATAL line, <slices> - 1 slices checked against the front index, the file check's line
+# for <files> files, the note at the slice, and the note again in the closing summary, after
+# RESTORE COMPLETE. Says what is missing; exit 1 if anything is. Pure text:
+# tests/heir_restore_sh.rs extracts it and runs it on RESTORE.sh's real output.
+heir_judge_late_damage() { # heir_judge_late_damage <unit> <version> <slices> <files> <slice> <tape file> <label>
+    local out n note bad=0
+    out="$(cat)"
+    note="slice $5 of '$1' (tape file $6 of $7) is damaged after the point this restore needed"
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; bad=1; }
+    if grep -F "FATAL" <<<"$out"; then
+        echo "a FATAL line"
+        bad=1
+    fi
+    n="$(grep -cF "  checksum verified against front index" <<<"$out")" || true
+    [ "$n" = "$(($3 - 1))" ] || { echo "$n slice(s) checked against the front index, want $(($3 - 1))"; bad=1; }
+    grep -F "File check: $4 restored file(s) of '$1' version $2 match the sha256 recorded in the index" >/dev/null <<<"$out" \
+        || { echo "no file check line for $4 file(s) of '$1' version $2"; bad=1; }
+    grep -Fx -- "NOTE: $note:" >/dev/null <<<"$out" || { echo "no note at the slice: NOTE: $note:"; bad=1; }
+    awk -v c="RESTORE COMPLETE" -v want=">>> NOTE: $note." '
+        index($0, c) && !at { at = NR }
+        at && NR > at && $0 == want { found = 1 }
+        END { exit !found }' <<<"$out" \
+        || { echo "the closing summary does not repeat the note: >>> NOTE: $note."; bad=1; }
+    return "$bad"
+}
+step_heir_late_damage() {
+    local w="$BC/late" out rc n files cat_path cat_len last_plain last_enc pos fault real_dd real_mt
+    [ "${RESULT[heir_big_catalogue]:-}" = PASS ] \
+        || { echo "heir_big_catalogue did not pass, so there is no known-good tape for this leg"; return 1; }
+    [ -x "$BC/heir/RESTORE.sh" ] && [ -f "$BC/home/tapectl.db" ] \
+        || { echo "heir_big_catalogue left no RESTORE.sh or home for this leg"; return 1; }
+    rm -rf "$w"; mkdir -p "$w/inject"
+    n="$(bc_q "SELECT COUNT(*) FROM stage_slices")" || return 1
+    cat_path="$(bc_q "SELECT catalog_path FROM stage_sets")" || return 1
+    cat_len="$(stat -c %s "$cat_path.1.dar")" || { echo "no isolated catalogue at $cat_path.1.dar"; return 1; }
+    last_plain="$(bc_q "SELECT size_bytes FROM stage_slices WHERE slice_number = $n")" || return 1
+    last_enc="$(bc_q "SELECT encrypted_bytes FROM stage_slices WHERE slice_number = $n")" || return 1
+    pos="$(bc_q "SELECT wp.position FROM write_positions wp
+                   JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                  WHERE sl.slice_number = $n AND wp.status = 'written'")" || return 1
+    # The precondition (see above): what dar leaves unread is far more than the pipes hold.
+    [ "$cat_len" -ge 1048576 ] \
+        || { echo "precondition: the catalogue is $cat_len bytes, under 1 MiB: damage at the end could be found while dar reads"; return 1; }
+    [ "$cat_len" -lt "$last_plain" ] \
+        || { echo "precondition: the $cat_len-byte catalogue is not inside the last slice ($last_plain bytes)"; return 1; }
+    fault=$((last_enc - 2048))
+    echo "bc-many: $n slices; slice $n is tape file $pos, $last_enc bytes; the byte at $fault is flipped"
+    files="$(find "$BC/src/bc-many" -type f | wc -l)" || { echo "cannot count the unit's files"; return 1; }
+    real_dd="$(command -v dd)"
+    real_mt="$(command -v mt-st || command -v mt)"
+    heir_write_injector "$w/inject/dd"
+    : >"$w/fault.log"
+    out="$(cd "$BC/heir" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$pos" \
+        "FAULT_AT=$fault" "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit bc-many \
+        --key "$BC/home/keys/alice-primary.age.key" --to "$w/recovered" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 40
+    grep -F "flipped one byte of tape file $pos" >/dev/null "$w/fault.log" \
+        || { echo "the stand-in never flipped a byte of tape file $pos, so the run proves nothing"; return 1; }
+    [ "$rc" -eq 0 ] || { echo "heir_late_damage: RESTORE.sh exited $rc, want 0"; return 1; }
+    heir_judge_late_damage bc-many 1 "$n" "$files" "$n" "$pos" "$BC_LABEL" <<<"$out" || return 1
+    diff -r "$BC/src/bc-many" "$w/recovered" || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+echo "gate: heir_late_damage — damage only in what dar never needed (ADR-0012 item 182)"
+check heir_late_damage     step_heir_late_damage
 
 # ---------- heir_slice_boundary_read: a slice that ends where a dar read ends (#498) ----------
 # dar 2.7.7 to 2.8.6, reading a sliced archive one named pipe per slice, finds a slice's
