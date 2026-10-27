@@ -2351,3 +2351,17 @@ last byte, in every dar from 2.7.7 to 2.8.6, always reported as `Bad CRC`, exit 
 
 Not ruled: reporting #498 to dar's maintainer. It is outward-facing; the CTO asked for it to be kept as
 an issue on this project for now (#499), to consider making it an upstream report.
+
+Ruled 2026-10-27 (later), on the coordinator's proposal after 1.7.1's tag:
+
+183. **home2 goes from 1.5.0 straight to 1.8.0; no 1.7.x is installed there.** 1.7.0 and 1.7.1
+     keep their tags. 1.7.2 is never tagged on its own: its notes stay as the record, and 1.8.0's
+     say they include it. #388's real-drive acceptance (`scripts/lbp-acceptance.sh`) runs on a
+     static debug build of the 1.8.0 candidate, once 1.8.0's chain is green: `--r1-only` first,
+     which sets item 175's switch (a rebuild if it says the fallback policy), then the full run,
+     whose heir step also proves 1.8.0's RESTORE.sh (item 181) on the real drive. `OLD_BIN` is the
+     1.7.0 acceptance build while home2 runs 1.5.0. Only on a PASS is `v1.8.0` tagged, on the commit
+     the build came from. Before the install, the coordinator tries migrations 038 onward on a copy
+     of home2's catalog with the candidate, with no drive touched. Handoff (h) then installs
+     `v1.8.0` by its steps.
+

@@ -453,7 +453,8 @@ the switch can be decided in about 15 minutes, before the long steps.
       past it), so the rehearsal's heir reads only file 2 against the leftover; on the real
       drive every heir read there runs under a time limit, and a hang is a FAIL. Its step 1a runs at a 262,144-byte payload, and mhvtl computes a
       CRC for every block it returns, so its R1 "yes" says nothing of the HP.
-- [ ] Both binaries on home2: the 1.7.2 candidate (`TAPECTL_BIN`) and a tapectl from 1.6.0 to
+- [ ] Both binaries on home2: the candidate (`TAPECTL_BIN`; 1.8.0's, by ADR-0012 item 183,
+      which carries 1.7.2) and a tapectl from 1.6.0 to
       1.7.1 (`OLD_BIN`: the installed production one once it is 1.6.0 or later; while home2
       still runs 1.5.0, the 1.7.0 acceptance build, `~/tapectl-1.7.0-f66d0ff/tapectl`). A debug candidate writes at
       about 117 MB/s with the CRC (build plan F9); the rate step says which it measured.

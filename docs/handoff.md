@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.7.0, spanning, whose real-drive proof passed on 2026-10-27 and which is tagged `v1.7.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.8.0 (ADR-0012 item 183), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance runs on the 1.8.0 candidate first). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -42,7 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
-| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27), then the `v1.7.0` tag (done), then the upgrade of home2 to 1.7.0, spanning off until a unit allows it (ADR-0012 item 146) | **you** (sudo for the install) |
+| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); then the LBP acceptance on the 1.8.0 candidate, the `v1.8.0` tag, and the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183) | **you** (the cartridge and the drive for the LBP run; sudo for the install); the coordinator copies the build to home2 and tags between |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -468,10 +468,13 @@ This assumes (g)'s upgrade is done. If home2 still runs 1.5.0, go straight to 1.
 contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step 3, migrations
 038 and 039 both apply at step 4, and step 5 sets `post_warning_bytes` as (g) step 5 would have.
 
-**1.7.1 is tagged (`v1.7.1`): install it instead of 1.7.0, by the same steps.** It changes no byte
-on tape and adds migration 040, per-location copy targets (`docs/releases/1.7.1.md`, "Upgrading").
-Check out `v1.7.1` in step 2, expect `1.7.1 (v1.7.1, <date>)` in step 3, and migration 040 applies
-with the others in step 4. Run 1.7.1 before any dotfile carries `[policy.copies_at]`.
+**Do not install 1.7.x: home2 goes from 1.5.0 straight to 1.8.0** (ADR-0012 item 183). 1.8.0
+contains 1.7.0, 1.7.1 (per-location copy targets, migration 040) and 1.7.2 (Logical Block
+Protection, migration 041). First the LBP acceptance runs on the 1.8.0 candidate
+(`docs/lto6-validation-checklist.md`, "LBP on the real drive"), `--r1-only` first. On a PASS the
+coordinator tags `v1.8.0` and tries the migrations on a copy of home2's catalog. Then the steps
+below install it: check out `v1.8.0` in step 2, expect `1.8.0 (v1.8.0, <date>)` in step 3, and
+migrations 038 to 041 apply in step 4. Run it before any dotfile carries `[policy.copies_at]`.
 
 **First, spanning's real-drive proof, before the tag** (ADR-0012 item 146, 1.6.0's order).
 - **The build:** the coordinator copies a static musl debug build of the landed commit to home2,

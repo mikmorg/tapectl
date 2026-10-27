@@ -347,7 +347,7 @@ debug build of the fixed commit, and the tapes already written are not rewritten
 guide and the Heir Kit's cover sheet give the way (keepsake's tapes carry 1.1.0's RESTORE.sh, which
 has no `--slices-from`; item 178's fact correction). The re-run passed every step on 2026-10-26/27
 (`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and 1.7.0 is tagged `v1.7.0` on `f66d0ff1`; home2
-still runs 1.5.0 and goes straight to 1.7.0 by handoff (h). Item 147 (#492) aligns item 94's start
+still runs 1.5.0 and goes straight to 1.8.0 (item 183). Item 147 (#492) aligns item 94's start
 with its own text in a 1.7.x patch.
 
 **1.7.1: per-location copy targets and auto-stage** (`docs/releases/1.7.1.md`; ADR-0012 items
@@ -371,7 +371,7 @@ Item 26's shared-place warning judges where a moved tape goes (`--for-location X
 `volume::write::WriteScope` carries the destination beside the `StagedScope`, and
 `coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
 1.7.1 is tagged `v1.7.1` after the whole chain passed on the tree rebased onto `v1.7.0` (2026-10-27);
-home2, still on 1.5.0, installs it by handoff (h).
+home2, still on 1.5.0, skips it for 1.8.0 (item 183).
 
 **1.7.2: Logical Block Protection** (`docs/releases/1.7.2.md`; ADR-0012 items 161-166, 174, 175;
 #388). A patch: no byte on tape changes, and the CRC never reaches the medium. tapectl arms the
@@ -399,8 +399,8 @@ The real-drive proof is `scripts/lbp-acceptance.sh`, R1 first (`--r1-only`). 1.7
 tapectl's half of #498 (item 180): a streamed restore feeds dar one stream on its standard input,
 never a named pipe per slice. `dar::slice::stream_template` takes the stream's header from the
 installed dar, `Join` puts slice 1's labels in it and strips and checks each slice's header and
-trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is on master untagged until
-the real-drive acceptance passes and R1 has set item 175's switch.
+trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never tagged on its own
+(item 183): it ships in 1.8.0, whose candidate runs the real-drive LBP acceptance, R1 first.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
