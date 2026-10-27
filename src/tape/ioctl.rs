@@ -946,8 +946,9 @@ impl TapeDevice {
                                  {accepted_before} bytes written since the drive opened; \
                                  retrying it"
                             );
-                            tracing::warn!("{line}");
-                            crate::progress::log(&line);
+                            // Once on stderr and once in the session log
+                            // (#388), never also a tracing event.
+                            crate::progress::say(&line);
                         }
                     }
                     attempt
@@ -989,7 +990,7 @@ impl TapeDevice {
              the first, which came after {} bytes written since the drive opened",
             w.refusals, w.bytes_at
         );
-        tracing::info!("{line}");
+        // The session log's alone, once (#388): an INFO event is teed there too.
         crate::progress::log(&line);
     }
 

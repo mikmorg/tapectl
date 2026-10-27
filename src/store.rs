@@ -2347,10 +2347,10 @@ impl TapeStore {
         }
         if let Some(at) = test_early_warning_at_from_env() {
             let at = at.map_err(TapectlError::Other)?;
+            // Once on stderr and once in the session log (#388), never also
+            // a tracing event, which main prints and tees a second time.
             for line in test_early_warning_announcement(device, at) {
-                tracing::warn!("{line}");
-                crate::progress::stderr_println(&line);
-                crate::progress::log(&line);
+                crate::progress::say(&line);
             }
             dev.fake_early_warning_at(at);
         }

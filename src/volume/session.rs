@@ -3722,7 +3722,8 @@ impl SealedPending {
                 range_units,
             };
             if let Some(report) = sealed.short_ending_report() {
-                tracing::info!(label = %sealed.label, "{report}");
+                // Once in the session log (#388): an INFO event is teed there
+                // too. `volume write` prints it on stderr.
                 crate::progress::log(&report);
             }
             Ok(ConfirmOutcome::Sealed(sealed))
