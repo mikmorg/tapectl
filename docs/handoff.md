@@ -468,6 +468,11 @@ This assumes (g)'s upgrade is done. If home2 still runs 1.5.0, go straight to 1.
 contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step 3, migrations
 038 and 039 both apply at step 4, and step 5 sets `post_warning_bytes` as (g) step 5 would have.
 
+**1.7.1 is tagged (`v1.7.1`): install it instead of 1.7.0, by the same steps.** It changes no byte
+on tape and adds migration 040, per-location copy targets (`docs/releases/1.7.1.md`, "Upgrading").
+Check out `v1.7.1` in step 2, expect `1.7.1 (v1.7.1, <date>)` in step 3, and migration 040 applies
+with the others in step 4. Run 1.7.1 before any dotfile carries `[policy.copies_at]`.
+
 **First, spanning's real-drive proof, before the tag** (ADR-0012 item 146, 1.6.0's order).
 - **The build:** the coordinator copies a static musl debug build of the landed commit to home2,
   with its sha256, beside the acceptance run's other files. It is never put on `PATH` or in a

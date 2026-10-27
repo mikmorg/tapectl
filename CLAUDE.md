@@ -370,6 +370,8 @@ displaces in the collection batch (`after_tail`). #491's fix is `volume::write::
 Item 26's shared-place warning judges where a moved tape goes (`--for-location X`, `--move-to Y`):
 `volume::write::WriteScope` carries the destination beside the `StagedScope`, and
 `coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
+1.7.1 is tagged `v1.7.1` after the whole chain passed on the tree rebased onto `v1.7.0` (2026-10-27);
+home2, still on 1.5.0, installs it by handoff (h).
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
