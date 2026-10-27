@@ -22,6 +22,21 @@
 //! parse of the operator's string (issue #59), and its width — 50 bytes of
 //! header at `-s 1M`, `4M` and `1G`, 54 at `10G` — is read, not assumed.
 //!
+//! **A restore joins them back (issue #498).** dar reading a sliced archive
+//! one named pipe per slice can take a slice's trailer byte as data, so the
+//! restore feeds dar the stream on its standard input instead, and [`Join`]
+//! is [`cut_stream`] backwards: dar's standard-output header, the payload of
+//! every slice with its header and trailer taken off (and checked), and the
+//! stream's `T`. That header is dar's too — [`stream_template`] runs the
+//! installed dar's `dar -c -` on an empty directory, and the two labels of
+//! slice 1 are swapped into it. Measured: the standard-output header is 38
+//! bytes on dar 2.7.13 and 2.7.21 alike (magic, internal name, flag `T`,
+//! extension `T`, one field: the data name), two runs differ only in the
+//! labels, and the join of tapectl's slices of a real `dar -c -` stream is
+//! that stream byte for byte at 1000 bytes, 64 KiB, 1M (50-byte slice
+//! headers) and 10G (54), the stream made by either dar and the template
+//! by either.
+//!
 //! Wire format, as dar 2.7 writes it (libdar `header.cpp`, measured):
 //!
 //! ```text

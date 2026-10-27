@@ -91,8 +91,8 @@ pub(crate) struct State {
     pub watched: Vec<(u32, bool)>,
     /// `(file read, bytes of regular files directly inside `watch` then)`,
     /// one per read — how a test sees whether a restore SPOOLS decrypted
-    /// slices to disk or streams them through named pipes (issue #411; a
-    /// FIFO is not a regular file and holds nothing on disk).
+    /// slices to disk or streams them to dar (issues #411, #498: a streamed
+    /// slice goes to dar's standard input and holds nothing on disk).
     pub watched_bytes: Vec<(u32, u64)>,
     /// The distance model's length for the file at a position, where it is
     /// not the file's stored bytes (issue #416). Keyed by POSITION, not by
