@@ -2349,4 +2349,5 @@ last byte, in every dar from 2.7.7 to 2.8.6, always reported as `Bad CRC`, exit 
      today. This is what tapectl's restore already does (the slice is recorded unproven and its
      files are checked one by one).
 
-Not ruled: reporting #498 to dar's maintainer is outward-facing and waits on the CTO's explicit word.
+Not ruled: reporting #498 to dar's maintainer. It is outward-facing; the CTO asked for it to be kept as
+an issue on this project for now (#499), to consider making it an upstream report.
