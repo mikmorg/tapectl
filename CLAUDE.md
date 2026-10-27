@@ -560,7 +560,7 @@ said `ok`, and a gate run turns an on-media skip into a failure (#471).
 ## External Dependencies
 
 - `dar` ≥2.6 (recommended 2.7.20+) — archive creation/extraction
-- `sg3-utils` — drive health pages (`sg_logs`), the cartridge's MAM (`sg_read_attr`), drive identity (`sg_inq`)
+- `sg3-utils` — drive health pages (`sg_logs`), the cartridge's MAM (`sg_read_attr`), drive identity (`sg_inq`), and since 1.7.2 the Control Data Protection mode page that arms and clears Logical Block Protection (`sg_modes` reads it, `sg_wr_mode` writes it; `src/tape/lbp.rs`, #388)
 - `mhvtl` — virtual tape library for development/testing
 - `lsscsi`, `mt-st` — the binary never calls them (device discovery and debugging), but
   `scripts/first-run.sh` step 2 requires both, along with `acl` (`setfacl`) and `python3`
