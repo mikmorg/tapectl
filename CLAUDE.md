@@ -345,8 +345,10 @@ and hashed, its plaintext dropped once dar is done, and dar's exit status decide
 `SequentialExtract::status`, RESTORE.sh's `dar_reap`/`DAR_RC`), the proof runs again in full on a
 debug build of the fixed commit, and the tapes already written are not rewritten: the troubleshooting
 guide and the Heir Kit's cover sheet give the way (keepsake's tapes carry 1.1.0's RESTORE.sh, which
-has no `--slices-from`; item 178's fact correction). Item 147 (#492) aligns item 94's start with its
-own text in a 1.7.x patch.
+has no `--slices-from`; item 178's fact correction). The re-run passed every step on 2026-10-26/27
+(`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and 1.7.0 is tagged `v1.7.0` on `f66d0ff1`; home2
+still runs 1.5.0 and goes straight to 1.7.0 by handoff (h). Item 147 (#492) aligns item 94's start
+with its own text in a 1.7.x patch.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

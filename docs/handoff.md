@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20, (g) takes it to 1.6.0 after the acceptance run, and (h) to 1.7.0, spanning, with spanning left off until its real-drive proof passes). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.7.0, spanning, whose real-drive proof passed on 2026-10-27 and which is tagged `v1.7.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -42,7 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
-| (h) | Spanning's real-drive proof with a scratch 1.7.0 build, then the `v1.7.0` tag, then the upgrade of home2 to 1.7.0, spanning off until a unit allows it (ADR-0012 item 146) | **you** (the cartridge and the drive for the proof; sudo for the install); the coordinator copies the build to home2 and tags between |
+| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27), then the `v1.7.0` tag (done), then the upgrade of home2 to 1.7.0, spanning off until a unit allows it (ADR-0012 item 146) | **you** (sudo for the install) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -481,12 +481,12 @@ contains 1.6.0: take step 1's backup with 1.5.0 and keep `tapectl-1.5.0` in step
 - **After a PASS:** the coordinator tags `v1.7.0` on the commit the build came from, and the
   install below follows. A FAIL leaves the cartridge as the failed step left it; read its run
   directory before anything writes it again.
-- **The first run (2026-10-25/26) failed at step 5** on #497 (steps 1a-4b passed): RESTORE.sh
-  restored the 135 GB unit identical to its source and then said `FATAL: dar extraction failed
-  (exit 0)`. The fix is in 1.7.0 (ADR-0012 items 176-178), and the proof **runs again in full**
-  with a new build of the fixed commit (item 177): the steps that passed are not carried over,
-  since step 4a re-initialised the cartridge and step 5 needs a tape 1 written with the fixed
-  RESTORE.sh. The coordinator copies the new build to home2 and gives the command.
+- **Done.** The first run (2026-10-25/26) failed at step 5 on #497; the fix is in 1.7.0
+  (ADR-0012 items 176-178), and the proof ran again in full with a debug build of `f66d0ff1`
+  (item 177). It **passed every step** on 2026-10-26/27
+  (`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and `v1.7.0` is tagged on `f66d0ff1`. Before
+  the install: return the test cartridge to the pool, remove the run's work directory and start
+  the drive-poll timer again, as that record's "Afterwards" says.
 
 Then, on home2, inside tmux, with no tapectl command running (`tapectl-op status`), once `v1.7.0`
 is tagged:
@@ -514,14 +514,14 @@ is tagged:
    has #497, and how to restore them checked (ADR-0012 item 178). The kit's fourth file becomes
    `tapectl-1.7.0`; reprint COVER.txt and put the new files on the media in each envelope.
 
-**Spanning stays off on home2 until its real-drive proof passes.** A config written before 1.7.0
+**Spanning stays off on home2 until a unit allows it; its real-drive proof passed on 2026-10-27.** A config written before 1.7.0
 has no `allow_spanning`, and an absent key reads `false`: nothing to edit. The proof is
 item 137, as item 139 amends it: on test cartridge EW7VWMVKF6 in a throwaway home, tape 1 is
 filler to the fill ceiling and then a real spannable unit the drive's early warning cuts (the
 `range` row, the readback past the warning, RESTORE.sh spooling tape 1's range into scratch, a
 rebuild of tape 1); the cartridge is then erased and written as tape 2, a whole copy, and the
 restore finishes from scratch plus tape 2. That is the first step of (h) above, run before the
-tag. After it passes, allow spanning per unit (its dotfile's
+tag, and it passed. Once 1.7.0 is installed, allow spanning per unit (its dotfile's
 `[policy]`), per archive set (`tapectl-op archive-set edit <NAME> --allow-spanning true`) or in
 `[defaults]`, and keep the tapes `volume write` names together ("keep these together"): a
 whole copy across tapes needs every one of them to restore.
@@ -543,8 +543,8 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
     is then a CTO-ruled on-tape change with its own re-pin, and item 99 makes every write fill to
     the early warning with it.
 - **#478, spanning:** built as 1.7.0 (ADR-0012 items 76-77, 82-100 and 121-144; (h) above).
-  Its real-drive proof (item 137, `scripts/span-acceptance.sh`) runs again after #497's fix
-  (item 177; the first run failed at step 5), and the
+  Its real-drive proof (item 137, `scripts/span-acceptance.sh`) passed on 2026-10-27, after
+  #497's fix (item 177; the first run failed at step 5), and `v1.7.0` is tagged. The
   residuals it left are listed in `docs/releases/1.7.0.md`, "Known open items".
 - **#479, the profiling toolkit:** built in 1.4.0: `scripts/lto-profile.sh` and
   `docs/lto-profiling.md`; its real-drive run is the same run as #420's (done 2026-10-20; the
