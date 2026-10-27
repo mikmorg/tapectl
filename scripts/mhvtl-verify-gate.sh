@@ -3272,10 +3272,11 @@ check rust_motions      step_rust_motions
 # what each test proves), at a 262,144-byte payload: mhvtl cannot carry tapectl's 524,292-byte
 # wire block in one command. It writes the TD6 drive's cartridge, never this gate drive's, and
 # leaves that drive at 524,288 bytes with its page at method 0, which
-# lbp_page_clear_after_every_command reads again at the end.
+# lbp_page_clear_after_every_command reads again at the end. 6 since 388d's probe after a read
+# off the data: ignored_tests names every one, and the floor catches an extraction that found too few.
 step_rust_lbp() {
     TAPECTL_GATE_TAPE_TD6="$TAPE_TD6" \
-        cargo_leg "$RUN/rust-lbp.out" 5 tests/mhvtl_lbp.rs --test mhvtl_lbp -- --ignored --nocapture
+        cargo_leg "$RUN/rust-lbp.out" 6 tests/mhvtl_lbp.rs --test mhvtl_lbp -- --ignored --nocapture
 }
 check rust_lbp          step_rust_lbp
 
