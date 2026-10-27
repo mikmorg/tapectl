@@ -1896,6 +1896,20 @@ fn record_dar(config: &Config, trace: &mut RestoreTrace, report: Option<DarRepor
     trace.dar = report;
 }
 
+/// A dar the slices cannot be joined into one stream for (#498): its
+/// standard-output header could not be made, or is not one tapectl knows. It
+/// still reads slices from files, so the refusal says how to restore with it.
+fn spool_instead(e: TapectlError) -> TapectlError {
+    match e {
+        TapectlError::Dar(what) => TapectlError::Dar(format!(
+            "{what}. This dar cannot take a streamed restore: `tapectl restore unit --spool` \
+             (or `restore volume --spool`) restores with it, the slices decrypted into the \
+             scratch directory first and read by dar as files"
+        )),
+        other => other,
+    }
+}
+
 /// The streamed restore (issues #411, #498): `dar -x - --sequential-read -A
 /// <catalogue>` reading the archive as one stream on its standard input, and
 /// each slice decrypted off the tape into that stream as the tape is read,
@@ -1932,8 +1946,12 @@ fn stream_into_dar(
     trace: &mut RestoreTrace,
 ) -> Result<Result<()>> {
     // dar's standard-output header, from the installed dar, for the stream
-    // the slices are joined back into (`dar::slice::stream_template`).
-    let template = dar::slice::stream_template(&config.dar.binary, &scratch.join("stream"))?;
+    // the slices are joined back into (`dar::slice::stream_template`), read
+    // before dar starts. A dar whose header cannot be made or read here still
+    // reads slices from files: the refusal names `--spool`.
+    let template = dar::slice::stream_template(&config.dar.binary, &scratch.join("stream"))
+        .map_err(spool_instead)?;
+    dar::slice::StreamTemplate::new(&template).map_err(spool_instead)?;
     info!(
         "extracting dar archive to {} as its slices are read",
         dest.display()
