@@ -2317,3 +2317,36 @@ still being fed for a failure once that unread tail is larger than the pipe buff
      `--unit` at a time. The cover sheet and `docs/troubleshooting.md` say so, and offer
      `--slices-from` only where `./RESTORE.sh --help` lists it. The ruling stands. Whether the
      corrected premise changes the CTO's choice not to rewrite is put back to the CTO.
+
+Ruled 2026-10-27, after the 1.7.0 re-run passed (`docs/runs/2026-10-26-1.7.0-span-acceptance.md`)
+and on the coordinator's account of three questions: item 178's corrected premise, #498 (dar takes
+a slice's one-byte trailer for data when one of its reads through a named pipe ends on the slice's
+last byte, in every dar from 2.7.7 to 2.8.6, always reported as `Bad CRC`, exit 5), and the damage
+#497's fix now finds in bytes dar never reads.
+
+179. **`keepsake`'s tapes are not production backups yet** (answers item 178's question).
+     L6-0001 and L6-0002 stay as they are and are not rewritten for #497 or #498. Keeping what they
+     hold is not a constraint on later work: they are rewritten when a validation step needs it,
+     and only then. Any use of home2's drive still waits on the CTO's go-ahead.
+180. **tapectl's own restore stops feeding dar through one named pipe per slice** (#498), in a
+     1.7.x patch; no byte on tape changes. The preferred way is one stream on dar's standard input:
+     the slices joined back into the `dar -c -` stream tapectl cut them from, which dar reads
+     without the per-slice reader that leaks the trailer (measured immune on dar 2.7.13 and 2.7.21,
+     with and without `-A`). It is proven on tapectl's own slice format before it is built on; only
+     if that fails, each slice is handed to dar as a regular file just before dar opens it (dar's
+     `-E`, measured immune too), one slice on disk at a time. Item 176's rule is kept: every slice
+     is read to its end, authenticated and hashed, and dar's exit status decides.
+181. **RESTORE.sh gets the same change in 1.8.0**, under one golden RESTORE.sh re-pin, authorized
+     now and covering this item and item 182 only. The minor moves because the on-tape script
+     changes; `requires`, MANIFEST.toml, File 0, the front index, the seal and the envelopes do not.
+     Tapes written before 1.8.0 keep the script they carry. The kit's tapectl and
+     `docs/troubleshooting.md` remain the way on them.
+182. **Damage only in what dar never needed stops no restore that checks out** (RESTORE.sh, in item
+     181's re-pin). When dar has exited 0 and the only damage is in bytes read after it ended (a
+     chunk that fails authentication, or the slice's sha256 that then cannot match), RESTORE.sh
+     names the slice and the tape, runs the per-file check, and reports the unit restored if every
+     file matches the index, telling the heir to replace the tape. If any file fails, it fails as
+     today. This is what tapectl's restore already does (the slice is recorded unproven and its
+     files are checked one by one).
+
+Not ruled: reporting #498 to dar's maintainer is outward-facing and waits on the CTO's explicit word.
