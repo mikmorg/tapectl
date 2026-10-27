@@ -6681,10 +6681,22 @@ mod tests {
                     dest: &Path,
                     options: &RestoreOptions,
                 ) -> Result<RestoreReport> {
+                    self.unit_with(&Config::default(), label, unit, dest, options)
+                }
+
+                /// [`Self::unit`] under `config` (another dar, say).
+                pub(crate) fn unit_with(
+                    &self,
+                    config: &Config,
+                    label: &str,
+                    unit: &str,
+                    dest: &Path,
+                    options: &RestoreOptions,
+                ) -> Result<RestoreReport> {
                     restore_unit(
                         &self.conn,
                         &self.paths,
-                        &Config::default(),
+                        config,
                         unit,
                         label,
                         &dest.to_string_lossy(),
@@ -7327,6 +7339,56 @@ mod tests {
                     assert!(argv.contains(r#""--sequential-read""#), "{argv}");
                     assert!(argv.contains(r#""-A""#), "{argv}");
                 }
+            }
+
+            /// A dar whose standard-output header tapectl does not know
+            /// cannot be fed the slices joined into one stream (#498), but
+            /// it reads slices from files as any dar does: the refusal names
+            /// `--spool`, and `--spool` restores the unit with that very dar.
+            #[test]
+            fn a_dar_whose_stream_header_is_unknown_is_refused_naming_spool() {
+                use std::os::unix::fs::PermissionsExt;
+                let m = multi("ST-498S", "st-unit", &tree(), "150k", true);
+                let bin = TempDir::new().unwrap();
+                let stub = bin.path().join("dar");
+                fs::write(
+                    &stub,
+                    "#!/bin/sh\ncase \" $* \" in *\" -c - \"*) printf 'not a dar archive'; exit 0 ;; esac\n\
+                     exec dar \"$@\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+                let mut config = Config::default();
+                config.dar.binary = stub.to_string_lossy().into_owned();
+
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit_with(
+                        &config,
+                        "ST-498S",
+                        "st-unit",
+                        dest.path(),
+                        &RestoreOptions::default(),
+                    )
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("refusing to join the slices"), "{err}");
+                assert!(err.contains("restore unit --spool"), "{err}");
+                assert!(err.contains("restore volume --spool"), "{err}");
+
+                let dest = TempDir::new().unwrap();
+                m.unit_with(
+                    &config,
+                    "ST-498S",
+                    "st-unit",
+                    dest.path(),
+                    &RestoreOptions {
+                        spool: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                m.assert_restored(dest.path());
             }
 
             /// A slice whose age header does not open cannot be read around:

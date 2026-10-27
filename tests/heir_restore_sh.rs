@@ -7177,8 +7177,9 @@ fn the_gates_dd_stand_in_flips_one_tape_file_and_no_other() {
     let log = h.dir.join("fault.log");
     let real_dd = h.dir.join("bin/dd");
     let real_mt = h.dir.join("bin/mt-st");
-    // Files 0, 1, ... read in turn through the stand-in, as RESTORE.sh does.
-    let read = |pos: i64, to_file: bool| -> Vec<u8> {
+    // Files 0, 1, ... read in turn through the stand-in, as RESTORE.sh does;
+    // `at` is FAULT_AT, the offset of the byte it flips (100000 when unset).
+    let read = |pos: i64, to_file: bool, at: Option<usize>| -> Vec<u8> {
         let probe = format!(
             "export PATH={}:{}\n\
              {}\n\
@@ -7203,28 +7204,39 @@ fn the_gates_dd_stand_in_flips_one_tape_file_and_no_other() {
             .env("TAPE_DEVICE", "/dev/nst-fake")
             .env("FAULT_POS", bad.to_string())
             .env("FAULT_LOG", &log)
+            .envs(at.map(|a| ("FAULT_AT", a.to_string())))
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         o.stdout
     };
     let pristine = |pos: i64| std::fs::read(h.dir.join("tape").join(pos.to_string())).unwrap();
-    for to_file in [true, false] {
+    for (to_file, at) in [
+        (true, None),
+        (false, None),
+        (true, Some(1234)),
+        (false, Some(1234)),
+    ] {
         let _ = std::fs::remove_file(&log);
         // Another file is read as it is.
         let other = photos.positions[0];
         assert_eq!(
-            read(other, to_file),
+            read(other, to_file, at),
             pristine(other),
             "file {other} untouched"
         );
         assert!(!log.exists(), "nothing was logged for it");
-        // The named one has exactly one byte different.
-        let got = read(bad, to_file);
+        // The named one has exactly one byte different: at FAULT_AT, or at
+        // 100000 when it is unset.
+        let got = read(bad, to_file, at);
         let was = pristine(bad);
         assert_eq!(got.len(), was.len());
         let diff: Vec<usize> = (0..got.len()).filter(|&i| got[i] != was[i]).collect();
-        assert_eq!(diff, vec![100_000.min(got.len() - 1)], "to_file={to_file}");
+        assert_eq!(
+            diff,
+            vec![at.unwrap_or(100_000).min(got.len() - 1)],
+            "to_file={to_file} at={at:?}"
+        );
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(
             logged.contains(&format!("flipped one byte of tape file {bad}")),
@@ -14117,10 +14129,22 @@ fn damage_in_the_tail_dar_leaves_unread_is_named_and_the_restore_is_whole() {
     assert!(
         end.contains(&format!(
             ">>> NOTE: slice {n} of 'many' (tape file {last} of {LABEL}) is damaged after the point \
-             this restore needed. Replace this tape.\n"
+             this restore needed.\n>>>       Replace this tape.\n"
         )),
         "{text}"
     );
+    // No line of the note, at the slice or at the end, is over 100 columns.
+    let at_slice = block_through(&text, "NOTE: slice ", "not need the damaged part.");
+    assert!(at_slice.len() >= 4, "{text}");
+    let summary = block_through(end, ">>> NOTE: slice ", "Replace this tape.");
+    assert_eq!(summary.len(), 2, "{text}");
+    for line in at_slice.iter().chain(summary.iter()) {
+        assert!(
+            line.chars().count() <= 100,
+            "{} columns: {line:?}",
+            line.chars().count()
+        );
+    }
     assert_eq!(verified(&text), n - 1, "every other slice checked:\n{text}");
     assert!(text.contains(&many_checked("many")), "{text}");
     assert!(same_tree(&many.src, Path::new(&dest)), "{text}");
@@ -14287,12 +14311,10 @@ fn a_slice_that_is_not_what_tapectl_cut_is_refused_by_the_join() {
     }
 }
 
-/// The stream's header is the heir's own dar's (`dar -c -` over an empty
-/// directory), parsed before any slice is read: a dar whose header this
-/// script does not know is refused there, by name, and no slice is read.
-#[test]
-fn a_dar_whose_stream_header_is_unknown_is_refused_before_a_slice_is_read() {
-    let dar = r#"#!/usr/bin/env bash
+/// A dar that writes something other than a dar header on its standard
+/// output (every other run is the host's dar), recording how it was called.
+const DAR_UNKNOWN_HEADER: &str = r#"#!/usr/bin/env bash
+echo "$*" >>"$FAKE_TAPE/dar.args"
 case " $* " in
   *" -c - "*)
     printf 'not a dar archive at all'
@@ -14300,8 +14322,80 @@ case " $* " in
 esac
 exec "$FAKE_TAPE/hostbin/dar" "$@"
 "#;
-    let h = Heir::with_stubs(&[("dar", dar)]);
+
+/// A head that reads ahead, as busybox's does through stdio: given a pipe
+/// and no file, it takes all of its input and prints what was asked of it.
+/// With a file it is the host's head.
+const HEAD_READS_AHEAD: &str = r#"#!/usr/bin/env bash
+last=${!#}
+case "$last" in
+  -* | [0-9]*) ;;
+  *) exec "$FAKE_TAPE/hostbin/head" "$@" ;;
+esac
+t=$("$FAKE_TAPE/hostbin/mktemp") || exit 1
+"$FAKE_TAPE/hostbin/cat" >"$t"
+"$FAKE_TAPE/hostbin/head" "$@" "$t"
+rc=$?
+"$FAKE_TAPE/hostbin/rm" -f "$t"
+exit $rc
+"#;
+
+/// A head that takes no negative count (`head -c -1`), as a minimal one does.
+const HEAD_NO_NEGATIVE_COUNT: &str = r#"#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    -[0-9]*) echo "head: invalid number of bytes: '$a'" >&2; exit 1 ;;
+  esac
+done
+exec "$FAKE_TAPE/hostbin/head" "$@"
+"#;
+
+/// What the one-tape fallback says of `photos/2019` before its slices are
+/// read: the unit, why the join cannot run here, and the way taken.
+fn join_fallback_note(why: &str) -> String {
+    format!(
+        "NOTE: the slices of 'photos/2019' cannot be joined into the one stream dar reads, on this host:\n      {why}"
+    )
+}
+
+/// A restore of `photos/2019` that took the fallback: it restored whole from
+/// slices decrypted to disk first (spool_unit), each slice read once, in
+/// order, and the stream was never begun.
+fn assert_restored_from_slices_on_disk(h: &Heir, code: i32, text: &str, dest: &str, what: &str) {
     let photos = unit("photos/2019");
+    assert_eq!(code, 0, "{what}:\n{text}");
+    assert!(!text.contains("FATAL"), "{what}:\n{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{what}:\n{text}");
+    assert!(
+        text.contains("      They are decrypted to disk first instead, and dar reads them from there, as for a dar\n      too old to stream: that needs room for the slices as well as the files."),
+        "{what}:\n{text}"
+    );
+    assert!(
+        text.contains("(slices read, then the files)"),
+        "the space check counts the slices too ({what}):\n{text}"
+    );
+    assert!(text.contains("Slice 1 (1/"), "spooled ({what}):\n{text}");
+    assert!(!text.contains("Slice 1/"), "not streamed ({what}):\n{text}");
+    assert!(same_tree(&photos.src, Path::new(dest)), "{what}:\n{text}");
+    let slices: Vec<i64> = reads(h)
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .collect();
+    assert_eq!(
+        slices, photos.positions,
+        "{what}: each slice read once, in order"
+    );
+}
+
+/// The stream's header is the heir's own dar's (`dar -c -` over an empty
+/// directory), parsed before any slice is read. A dar whose header this
+/// script does not know cannot be fed the joined stream, but it reads slices
+/// from files as any dar does: the unit is restored from slices decrypted to
+/// disk first, as for a dar too old to stream, with one NOTE naming why.
+#[test]
+fn a_dar_whose_stream_header_is_unknown_restores_from_slices_on_disk() {
+    let h = Heir::with_stubs(&[("dar", DAR_UNKNOWN_HEADER)]);
+    let dest = h.sub("restored");
     let (code, text) = h.run(&[
         "--restore",
         "--key",
@@ -14309,23 +14403,198 @@ exec "$FAKE_TAPE/hostbin/dar" "$@"
         "--unit",
         "photos/2019",
         "--to",
-        &h.sub("restored"),
+        &dest,
     ]);
-    assert_eq!(code, 1, "{text}");
+    assert_restored_from_slices_on_disk(&h, code, &text, &dest, "unknown header");
     assert!(
-        text.contains(
-            "FATAL: the header this dar writes on its standard output is not one this script \
-             knows (the data does not start with the magic number of dar)."
+        text.contains(&format!(
+            "{}\n      (the data does not start with the magic number of dar)\n",
+            join_fallback_note("this dar's standard-output header is not one this script knows.")
+        )),
+        "{text}"
+    );
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    assert!(
+        !args.lines().any(|l| l.starts_with("-x - ")),
+        "dar is never handed a stream: {args}"
+    );
+    assert!(
+        args.lines()
+            .any(|l| l.starts_with("-x ") && l.contains("/restore -R ")),
+        "dar reads the slices from files: {args}"
+    );
+}
+
+/// The join needs a head that reads no further than it is asked (each slice
+/// is taken apart with `head -c` in a group, the next command reading on
+/// where it stopped) and drops a last byte (`head -c -1`). A head that does
+/// not (busybox's reads ahead through stdio; a minimal one takes no negative
+/// count) is found by a self-test before any slice is read, and the unit is
+/// restored from slices decrypted to disk first, with one NOTE naming why.
+#[test]
+fn a_head_the_join_cannot_use_restores_from_slices_on_disk() {
+    for (what, head, why, more) in [
+        (
+            "reads ahead",
+            HEAD_READS_AHEAD,
+            "this host's head reads past what it is asked for.",
+            "(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '', not 'c')",
         ),
-        "{text}"
+        (
+            "no negative count",
+            HEAD_NO_NEGATIVE_COUNT,
+            "this host's head cannot drop a last byte.",
+            "(printf ab | head -c -1 printed '', not 'a')",
+        ),
+    ] {
+        let h = Heir::with_stubs(&[("head", head)]);
+        let dest = h.sub("restored");
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "photos/2019",
+            "--to",
+            &dest,
+        ]);
+        assert_restored_from_slices_on_disk(&h, code, &text, &dest, what);
+        assert!(
+            text.contains(&format!("{}\n      {more}\n", join_fallback_note(why))),
+            "{what}:\n{text}"
+        );
+    }
+}
+
+/// A unit held across tapes keeps only encrypted slices on disk, so a host
+/// that cannot join its slices into the one stream dar reads has no
+/// decrypted fallback: the restore is refused, both ways, before a slice is
+/// read, naming why and the way by hand. No prompt is shown.
+#[test]
+fn a_unit_across_tapes_is_refused_before_a_slice_where_the_join_cannot_run() {
+    let b = span_box();
+    // The slices tape 1 holds, where a refused run must read none.
+    let big = unit_of(b.of(&["SPAN01"])[0], "big");
+    for extra in [&[][..], &["--stream-tapes"][..]] {
+        let h = Heir::of_box(&b.of(&["SPAN01", "SPAN03"]), 0);
+        h.stub("dar", DAR_UNKNOWN_HEADER);
+        let dest = h.sub("restored");
+        let args = big_args(&h, &dest, extra);
+        let (code, text) = h.run_prompted(&strs(&args), |k, text| {
+            panic!("prompt {k} before the refusal ({extra:?}):\n{text}")
+        });
+        assert_eq!(code, 1, "{extra:?}:\n{text}");
+        let fatal = flat(text.split("FATAL:").nth(1).expect("a FATAL"));
+        for needle in [
+            "'big' is held across tapes, and its slices cannot be joined into the one stream dar reads, on this host:",
+            "this dar's standard-output header is not one this script knows. (the data does not start with the magic number of dar)",
+            "A unit held across tapes keeps only encrypted slices on disk, so they are not decrypted to disk for dar instead.",
+            "File 1's \"Manual Recovery Steps\"",
+            "No slice has been read.",
+        ] {
+            assert!(fatal.contains(needle), "{extra:?}: {needle:?}:\n{fatal}");
+        }
+        assert!(
+            reads(&h).iter().all(|p| !big.positions.contains(p)),
+            "{extra:?}: no slice is read:\n{:#?}",
+            h.ops()
+        );
+        assert!(scratch_slices(&dest).is_none(), "{extra:?}: no scratch");
+    }
+}
+
+/// The lines of `text` from the first one starting with `from` through the
+/// first one after it containing `to`.
+fn block_through<'a>(text: &'a str, from: &str, to: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(a) = lines.iter().position(|l| l.starts_with(from)) else {
+        return Vec::new();
+    };
+    let Some(b) = lines[a..].iter().position(|l| l.contains(to)) else {
+        return Vec::new();
+    };
+    lines[a..=a + b].to_vec()
+}
+
+/// The gate's judge for heir_late_damage (ADR-0012 items 70 and 182), which
+/// runs only on mhvtl, run here on RESTORE.sh's real output for damage in the
+/// tail dar leaves unread: it passes that restore, and fails the same output
+/// with any one of its claims taken away or any figure it names wrong.
+#[test]
+fn the_gates_late_damage_judge_passes_a_late_damage_restore_and_nothing_less() {
+    let t = many_template();
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    let last = *many.positions.last().unwrap();
+    let plain = many.sizes.last().unwrap() - 32;
+    let h = Heir::of(t, &[]);
+    damage_chunk_at(&h, last, "alice", plain - 64);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "many",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let files = MANY_FILES + 1;
+    let judge = |out: &str, slices: usize, slice: usize, pos: i64, label: &str| {
+        run_gate_snippet(
+            &["heir_judge_late_damage"],
+            &format!("heir_judge_late_damage many 1 {slices} {files} {slice} {pos} {label}"),
+            out,
+            &[],
+        )
+    };
+    let (rc, said) = judge(&text, n, n, last, LABEL);
+    assert_eq!(
+        rc, 0,
+        "the judge refused a late-damage restore: {said}\n{text}"
     );
-    assert!(
-        text.contains("No slice of the unit has been read."),
-        "{text}"
+
+    let note = format!(
+        "slice {n} of 'many' (tape file {last} of {LABEL}) is damaged after the point this restore needed"
     );
-    assert!(
-        reads(&h).iter().all(|p| !photos.positions.contains(p)),
-        "no slice is read:\n{:#?}",
-        h.ops()
-    );
+    let doctored = [
+        (
+            "the output before item 182",
+            format!(
+                "{}\nFATAL: slice {n} (tape file {last}) did not decrypt: a key matched it, so its bytes are\n",
+                text.split("RESTORE COMPLETE").next().unwrap()
+            ),
+        ),
+        ("a FATAL line", format!("{text}FATAL: something else\n")),
+        ("no note at the slice", text.replace(&format!("NOTE: {note}:"), "")),
+        (
+            "no note at the end",
+            text.replace(&format!(">>> NOTE: {note}."), ">>>"),
+        ),
+        (
+            "every slice checked",
+            format!("{text}>>>   checksum verified against front index\n"),
+        ),
+        (
+            "no file check",
+            text.replace("match the sha256 recorded in the index", ""),
+        ),
+        (
+            "no RESTORE COMPLETE",
+            text.replace("RESTORE COMPLETE", "RESTORE INCOMPLETE"),
+        ),
+    ];
+    for (what, out) in &doctored {
+        let (rc, said) = judge(out, n, n, last, LABEL);
+        assert_eq!(rc, 1, "{what}: the judge passed it: {said}");
+    }
+    for (what, slice, pos, label) in [
+        ("another slice", n - 1, last, LABEL),
+        ("another tape file", n, last + 1, LABEL),
+        ("another tape", n, last, "OTHER9"),
+    ] {
+        let (rc, said) = judge(&text, n, slice, pos, label);
+        assert_eq!(rc, 1, "{what}: the judge passed it: {said}");
+    }
 }
