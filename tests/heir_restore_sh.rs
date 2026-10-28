@@ -14425,28 +14425,19 @@ fn a_dar_whose_stream_header_is_unknown_restores_from_slices_on_disk() {
     );
 }
 
-/// The join needs a head that reads no further than it is asked (each slice
-/// is taken apart with `head -c` in a group, the next command reading on
-/// where it stopped) and drops a last byte (`head -c -1`). A head that does
-/// not (busybox's reads ahead through stdio; a minimal one takes no negative
-/// count) is found by a self-test before any slice is read, and the unit is
-/// restored from slices decrypted to disk first, with one NOTE naming why.
+/// The join needs a head that reads no further than it is asked: each slice
+/// is taken apart with `head -c` in a group, the next command reading on where
+/// it stopped. A head that does not (busybox's reads ahead through stdio) is
+/// found by a self-test before any slice is read, and the unit is restored
+/// from slices decrypted to disk first, with one NOTE naming why.
 #[test]
 fn a_head_the_join_cannot_use_restores_from_slices_on_disk() {
-    for (what, head, why, more) in [
-        (
-            "reads ahead",
-            HEAD_READS_AHEAD,
-            "this host's head reads past what it is asked for.",
-            "(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '', not 'c')",
-        ),
-        (
-            "no negative count",
-            HEAD_NO_NEGATIVE_COUNT,
-            "this host's head cannot drop a last byte.",
-            "(printf ab | head -c -1 printed '', not 'a')",
-        ),
-    ] {
+    for (what, head, why, more) in [(
+        "reads ahead",
+        HEAD_READS_AHEAD,
+        "this host's head reads past what it is asked for.",
+        "(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '', not 'c')",
+    )] {
         let h = Heir::with_stubs(&[("head", head)]);
         let dest = h.sub("restored");
         let (code, text) = h.run(&[
@@ -14607,4 +14598,153 @@ fn the_gates_late_damage_judge_passes_a_late_damage_restore_and_nothing_less() {
         let (rc, said) = judge(&text, n, slice, pos, label);
         assert_eq!(rc, 1, "{what}: the judge passed it: {said}");
     }
+}
+
+/// The join cuts every slice at the plaintext size its manifest gives it
+/// (#498 round 3): no byte is held back with `head -c -1` and read off a copy
+/// with `tail -c 1` on a FIFO, which under uutils coreutils 0.10.0 (Ubuntu
+/// 26.04's) never returns when the FIFO carries under 64 KiB. So a head that
+/// takes no negative count, as a minimal one does, streams the unit whole.
+#[test]
+fn a_head_with_no_negative_count_streams_the_unit_whole() {
+    let h = Heir::with_stubs(&[("head", HEAD_NO_NEGATIVE_COUNT)]);
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(text.contains("Slice 1/"), "streamed:\n{text}");
+    assert!(!text.contains("cannot be joined"), "{text}");
+    assert_eq!(verified(&text), photos.positions.len(), "{text}");
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+}
+
+/// A unit whose LAST slice is a few bytes of plaintext, well under a tape
+/// block and under the 64 KiB a pipe holds, cut so by tapectl's framing:
+/// four slices, the last its 50-byte header, a few payload bytes and `T`.
+/// Its envelope holds no dar catalogue of it: given one (-A), dar stops at the
+/// end of the file data, and a last slice this small is all catalogue, which
+/// dar may have ended before; without one dar reads the stream to its end, so
+/// the last slice is always joined into it.
+fn tiny_last_template() -> &'static (Template, usize) {
+    static T: OnceLock<(Template, usize)> = OnceLock::new();
+    T.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heir-restore-sh-tinylast-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["tape", "keys", "work", "src"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        write_keys(&dir);
+        let src = dir.join("src").join("tiny");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = bsr_file()[..200_000].to_vec();
+        std::fs::write(src.join("one.bin"), &file).unwrap();
+        // The stream's payload, from a one-slice cut (header 50, trailer 1),
+        // then three whole slices and r bytes: the last slice is 50 + r + 1.
+        // Each cut is its own dar run; should the stream's length move by a
+        // byte, the next try sizes from the cut it has.
+        let (one, _) = tapectl_cut(&src, &dir.join("work/probe"), "1G");
+        assert_eq!(one.len(), 1);
+        let mut payload = one[0].len() - 51;
+        let mut cut = None;
+        for attempt in 0..3 {
+            let r = (5..8).find(|r| (payload - r) % 3 == 0).unwrap();
+            let size = (payload - r) / 3 + 51;
+            let (slices, catalogue) = tapectl_cut(
+                &src,
+                &dir.join(format!("work/cut{attempt}")),
+                &size.to_string(),
+            );
+            if slices.len() == 4 && slices[3].len() == 51 + r {
+                cut = Some((slices, catalogue));
+                break;
+            }
+            payload = slices.iter().map(|s| s.len() - 51).sum();
+        }
+        let (slices, _catalogue) = cut.expect("a cut whose last slice is a few bytes");
+        let last = slices.last().unwrap().len();
+        let mut hashes = BTreeMap::new();
+        hashes.insert("one.bin".to_string(), sha256_hex(&file));
+        let staged = Staged {
+            tenant: "alice",
+            unit: ManifestUnit {
+                name: "tiny".to_string(),
+                uuid: "a4980003-0000-4000-8000-000000000003".to_string(),
+                snapshot_version: 1,
+                stage_set_id: 1,
+                may_span: false,
+                dar_version: Some("2.7.13".to_string()),
+                dar_command: Some("dar -c - -R /src -N".to_string()),
+                slices: Vec::new(),
+            },
+            slices,
+            catalogue: None,
+            src,
+            hashes,
+        };
+        let t = lay_out_tape(
+            &dir,
+            vec![staged],
+            true,
+            true,
+            &[],
+            Era::V160,
+            &[],
+            &THIS_TAPE,
+        );
+        (t, last)
+    })
+}
+
+/// A streamed restore whose last slice is a few bytes long (under the 64 KiB
+/// a pipe holds, well under a tape block) restores whole: under GNU coreutils
+/// it always did, and under uutils coreutils 0.10.0 (Ubuntu 26.04) its join
+/// hung on `tail -c 1` reading such a slice's last byte off a FIFO. Its point
+/// is a run under uutils; here it holds the shape and the restore. dar
+/// streams a unit with no catalogue from 2.7.21 (`restore_unit_plain`), which
+/// a wrapper claims, so the stream is used on any installed dar; the joined
+/// stream is read whole without one on 2.7.13 too (#498, item 180).
+#[test]
+fn a_unit_whose_last_slice_is_a_few_bytes_streams_whole() {
+    let (t, last) = tiny_last_template();
+    assert!(*last < 100, "the last slice is {last} bytes");
+    let tiny = unit_of(t, "tiny");
+    let h = Heir::of(t, &[("dar", &dar_spy_claiming("2.7.21"))]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "tiny",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("FATAL"), "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(text.contains("Slice 1/4"), "streamed:\n{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    assert!(
+        args.lines()
+            .any(|l| l.starts_with("-x - ") && !l.contains("-A ")),
+        "one stream, no catalogue: dar reads it to its end, the last slice too: {args}"
+    );
+    assert_eq!(verified(&text), 4, "every slice checked:\n{text}");
+    assert!(
+        text.contains(
+            "File check: 1 restored file(s) of 'tiny' version 1 match the sha256 recorded in the index"
+        ),
+        "{text}"
+    );
+    assert!(same_tree(&tiny.src, Path::new(&dest)), "{text}");
 }

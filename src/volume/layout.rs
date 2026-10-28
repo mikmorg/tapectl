@@ -280,7 +280,7 @@ const RESTORE_TOOLS: &[RestoreTool] = &[
     RestoreTool {
         name: "mkfifo",
         modes: MODE_RESTORE,
-        role: "the named pipes of a restore: one carries a unit's slices to dar, joined back into a single stream, and the others check each slice as it passes (coreutils)",
+        role: "the named pipes of a restore: one carries a unit's slices to dar, joined back into a single stream, and the other hashes each slice as it passes (coreutils)",
     },
     RestoreTool {
         name: "tee",
@@ -4491,12 +4491,12 @@ dar_header() { # <file>
 # checked once a run, before any slice is read. The join takes each slice apart
 # with head in a group, the next command reading on where head stopped, so head
 # must read no further than it is asked (busybox's reads ahead, through stdio);
-# it holds a slice's last byte back with head -c -1; and its header is the one
-# this host's dar writes on its standard output (dar -c - over an empty
-# directory), which this script must know: $WORK/stream.tmpl, JOIN_H0 bytes
-# long, its data name at JOIN_DN0. When it cannot, STREAM_WHY says why (and
-# STREAM_WHY_MORE what was seen), and the caller restores another way: a unit
-# on one tape from slices decrypted to disk, as for a dar too old to stream.
+# and its header is the one this host's dar writes on its standard output (dar
+# -c - over an empty directory), which this script must know:
+# $WORK/stream.tmpl, JOIN_H0 bytes long, its data name at JOIN_DN0. When it
+# cannot, STREAM_WHY says why (and STREAM_WHY_MORE what was seen), and the
+# caller restores another way: a unit on one tape from slices decrypted to
+# disk, as for a dar too old to stream.
 JOIN_OK=""
 JOIN_H0=""
 JOIN_DN0=""
@@ -4513,12 +4513,6 @@ stream_check() {
   if [ "$got" != c ]; then
     STREAM_WHY="this host's head reads past what it is asked for"
     STREAM_WHY_MORE="(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '$(visible_text "$got")', not 'c')"
-    return 1
-  fi
-  got=$(printf ab | head -c -1 2>/dev/null) || true
-  if [ "$got" != a ]; then
-    STREAM_WHY="this host's head cannot drop a last byte"
-    STREAM_WHY_MORE="(printf ab | head -c -1 printed '$(visible_text "$got")', not 'a')"
     return 1
   fi
   mkdir -p "$WORK/empty"
@@ -4558,38 +4552,41 @@ same_bytes() { # <file> <file>
   [ "$(od -An -v -tu1 "$1")" = "$(od -An -v -tu1 "$2")" ]
 }
 
-# The rest of slice $4 after its header (standard input): its payload into
-# the stream (fd 3), its trailer taken off and checked, and nothing past the
-# slice size. The last slice may be shorter than the others, so its last
-# byte is held back (head -c -1) and read off a copy (tail -c 1). A write the
-# stream refuses is dar having closed it: join.closed, and nothing more is
-# checked or written.
-join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number>
-  local h=$1 size=$2 last=$3 num=$4 j="$WORK/join" trl extra want=78 wantc=N tpid
-  : >"$j.trl"
-  if [ "$last" = 1 ]; then
-    want=84 wantc=T
-    tail -c 1 <"$WORK/stream/trail" >"$j.trl" 3>&- &
-    tpid=$!
-    head -c $((size - h)) | tee "$WORK/stream/trail" | {
-      head -c -1 2>/dev/null >&3 || : >"$j.closed"
-      cat >/dev/null
-    }
-    wait "$tpid" || true
-  elif ! head -c $((size - h - 1)) 2>/dev/null >&3; then
-    : >"$j.closed"
-  else
-    head -c 1 >"$j.trl"
+# The rest of slice $4 after its header (standard input), cut exactly at the
+# plaintext size the manifest gives it ($5): its payload into the stream (fd
+# 3), its trailer taken off and checked, and nothing may be left. Every slice
+# but the last is the slice size its header records, the last no longer. Each
+# piece is a head -c, which reads no further than it is asked (stream_check):
+# no byte is held back by a tool and read off a copy (#498: uutils tail -c 1 on
+# a FIFO that carries under 64 KiB never returns). A write the stream refuses is
+# dar having closed it: join.closed, and nothing more is checked or written.
+join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number> <plaintext bytes>
+  local h=$1 size=$2 last=$3 num=$4 plain=$5 j="$WORK/join" trl extra want=78 wantc=N
+  [ "$last" != 1 ] || want=84 wantc=T
+  if [ "$last" != 1 ] && [ "$plain" != "$size" ]; then
+    join_refuse "slice $num is $plain bytes by the manifest, where its header's slice size is $size and it is not the last"
+    return 0
   fi
-  [ ! -f "$j.closed" ] || return 0
+  if [ "$plain" -gt "$size" ]; then
+    join_refuse "slice $num is $plain bytes by the manifest, more than its header's slice size ($size)"
+    return 0
+  fi
+  if [ "$plain" -le "$h" ]; then
+    join_refuse "slice $num is $plain bytes by the manifest, which ends it inside its $h-byte header"
+    return 0
+  fi
+  : >"$j.trl"
+  if ! head -c $((plain - h - 1)) 2>/dev/null >&3; then
+    : >"$j.closed"
+    return 0
+  fi
+  head -c 1 >"$j.trl"
   extra=$(wc -c)
   trl=$(od -An -v -tu1 "$j.trl" | awk '{ printf "%s", $1 }')
   if [ "$extra" -gt 0 ]; then
-    join_refuse "slice $num is longer than the slice size its header records ($size bytes)"
-  elif [ -z "$trl" ] && [ "$last" = 1 ]; then
-    join_refuse "slice $num ends without a trailer"
+    join_refuse "slice $num is longer than the manifest says ($plain bytes)"
   elif [ -z "$trl" ]; then
-    join_refuse "slice $num is shorter than the slice size its header records ($size bytes), and it is not the last"
+    join_refuse "slice $num is shorter than the manifest says ($plain bytes)"
   elif [ "$trl" != "$want" ]; then
     join_refuse "slice $num ends with the byte $trl, not $wantc"
   fi
@@ -4602,8 +4599,8 @@ join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number
 # (dar closed the stream). Slice 1's header, and its length and slice size,
 # are kept (join.hdr, join.frame) for the slices after it, which must carry
 # that header byte for byte. Slice 1 also writes the stream's header.
-join_slice() { # <slice number> <1 for the first slice> <1 for the last>
-  local num=$1 first=$2 last=$3 j="$WORK/join" out h flag size dn
+join_slice() { # <slice number> <1 for the first slice> <1 for the last> <plaintext bytes>
+  local num=$1 first=$2 last=$3 plain=$4 j="$WORK/join" out h flag size dn
   if [ "$first" = 1 ]; then
     head -c 4096 >"$j.head"
     if ! out=$(dar_header "$j.head"); then
@@ -4640,7 +4637,7 @@ join_slice() { # <slice number> <1 for the first slice> <1 for the last>
       : >"$j.closed"
       return 0
     fi
-    { tail -c +$((h + 1)) "$j.head"; cat; } | join_rest "$h" "$size" "$last" "$num"
+    { tail -c +$((h + 1)) "$j.head"; cat; } | join_rest "$h" "$size" "$last" "$num" "$plain"
     return 0
   fi
   read -r h size <"$j.frame"
@@ -4649,7 +4646,7 @@ join_slice() { # <slice number> <1 for the first slice> <1 for the last>
     join_refuse "slice $num's header is not slice 1's"
     return 0
   fi
-  join_rest "$h" "$size" "$last" "$num"
+  join_rest "$h" "$size" "$last" "$num" "$plain"
 }
 
 # The stream (fd 3) closed, once: dar reads its end.
@@ -4748,17 +4745,30 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     shas+=("$sha")
   done <"$list"
   n=${#nums[@]}
-  # The join takes slices 1 to N, in order, none skipped.
+  # Each slice's plaintext size, from the manifest (pick_slices), in the same
+  # order: the join cuts each slice there.
+  local -a plains=() pnums=()
+  local pn pv
+  if [ -f "$list.plain" ]; then
+    while IFS='|' read -r pn pv; do
+      pnums+=("$pn")
+      plains+=("$pv")
+    done <"$list.plain"
+  fi
+  # The join takes slices 1 to N, in order, none skipped, each of a known size.
   for ((i = 0; i < n; i++)); do
     [ "${nums[$i]}" = "$((i + 1))" ] ||
       die "the slices of '$(visible_text "$UNIT_NAME")' are not listed as 1 to $n in order (slice ${nums[$i]} where
        slice $((i + 1)) was due), so they cannot be joined for dar. No slice of it has been read."
+    { [ "${pnums[$i]:-}" = "${nums[$i]}" ] && is_uint "${plains[$i]:-}"; } ||
+      die "the envelope's manifest gives no plaintext size (size_bytes) for slice ${nums[$i]} of
+       '$(visible_text "$UNIT_NAME")', so its slices cannot be joined for dar. No slice of it has been read."
   done
   # The caller asked stream_check before any slice was read.
   stream_check || die "the slices of '$(visible_text "$UNIT_NAME")' cannot be joined into the one stream dar reads, on this host:
 $(stream_why "       ")"
   rm -rf "$fifos" && mkdir -p "$fifos"
-  mkfifo "$fifos/stream" "$fifos/cipher" "$fifos/trail"
+  mkfifo "$fifos/stream" "$fifos/cipher"
 
   local -a dar_opts=(-O -Q -N --sequential-read)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
@@ -4841,7 +4851,7 @@ $(stream_why "       ")"
         } | tee "$fifos/cipher" |
         age -d "${AGE_IDS[@]}" 2>"$WORK/age.err" |
         {
-          [ "$sink" = /dev/null ] || join_slice "$num" "$((i == 0))" "$((i + 1 == n))"
+          [ "$sink" = /dev/null ] || join_slice "$num" "$((i == 0))" "$((i + 1 == n))" "${plains[$i]}"
           cat >/dev/null
         }
       echo "${PIPESTATUS[*]}" >"$WORK/feed.status"
@@ -5214,7 +5224,8 @@ pick_slices() { # <manifest> <unit> <out> [version]
   # two stage sets. Collecting every matching [[units]] block concatenated
   # both versions' slices and handed the mix to dar (issue #131). So: buffer
   # per block and emit exactly one version's slices.
-  awk -v unit="$unit" -v want="$want" '__AWK_SELECT_VERSION__' "$manifest" >"$WORK/picked.txt" 2>"$WORK/picked_version.txt"
+  rm -f "$WORK/picked.plain"
+  awk -v unit="$unit" -v want="$want" -v plain_out="$WORK/picked.plain" '__AWK_SELECT_VERSION__' "$manifest" >"$WORK/picked.txt" 2>"$WORK/picked_version.txt"
   PICKED_VERSION=""
   PICKED_SPAN=0
   read -r PICKED_VERSION PICKED_SPAN _ <"$WORK/picked_version.txt" 2>/dev/null || true
@@ -5290,6 +5301,9 @@ pick_slices() { # <manifest> <unit> <out> [version]
     echo "$num|$tpos|$isize|$ihash" >>"$out"
     PICKED_BYTES=$((PICKED_BYTES + isize))
   done <"$WORK/picked.txt"
+  # Each slice's plaintext size, from the manifest, beside the list: the
+  # streamed restore cuts each slice there (stream_unit).
+  cp "$WORK/picked.plain" "$out.plain" 2>/dev/null || : >"$out.plain"
 }
 
 # A unit cut by the early end of the tape: its slices run past the last file
@@ -5733,6 +5747,8 @@ restore_across_tapes() { # <manifest> <unit> <version> <destination>
   fi
   span_list "$unit"
   cp "$WORK/picked.txt" "$WORK/span.all"
+  # Every slice's plaintext size: the first tape's manifest lists them all.
+  cp "$WORK/picked.plain" "$WORK/span.all.plain" 2>/dev/null || : >"$WORK/span.all.plain"
   # The run this tape gives, each slice checked against the file map (R9).
   span_take_here "$unit"
   last=$(tail -n 1 "$WORK/span.take" | cut -d'|' -f1)
@@ -13304,7 +13320,7 @@ sha256_encrypted = \"bbb\"
             picked < check && check < first_read,
             "order: version, space, slices"
         );
-        assert!(s.contains("mkfifo \"$fifos/stream\" \"$fifos/cipher\" \"$fifos/trail\""));
+        assert!(s.contains("mkfifo \"$fifos/stream\" \"$fifos/cipher\"\n"));
         assert!(!s.contains("mkfifo \"$fifos/restore."), "no FIFO per slice");
         assert!(s.contains(
             "dar -x - -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\" <\"$fifos/stream\""

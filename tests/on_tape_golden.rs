@@ -429,7 +429,7 @@ fn restore_sh_bytes_are_pinned() {
         "grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then",
         // 1.8.0 (ADR-0012 item 181, #498): one stream on dar's standard
         // input, never a named pipe per slice
-        "mkfifo \"$fifos/stream\" \"$fifos/cipher\" \"$fifos/trail\"",
+        "mkfifo \"$fifos/stream\" \"$fifos/cipher\"\n",
         "check_space \"$destdir\" \"$destdir\" \"$total\" 0",
         "--all)\n      RESTORE_ALL=1",
         "walk_envelopes found_envelope",
@@ -605,8 +605,12 @@ fn restore_sh_bytes_are_pinned() {
         // the stream opened once and written only by a child; and damage
         // dar never needed, said and not fatal
         "dar -N -c - -R \"$WORK/empty\" -an -D -Q",
-        "join_slice() { # <slice number> <1 for the first slice> <1 for the last>\n",
-        "join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number>\n",
+        "join_slice() { # <slice number> <1 for the first slice> <1 for the last> <plaintext bytes>\n",
+        "join_rest() { # <header bytes> <slice size> <1 for the last slice> <slice number> <plaintext bytes>\n",
+        // Round 3 (uutils coreutils 0.10.0, Ubuntu 26.04): every slice cut
+        // at its manifest size, no tail -c 1 on a FIFO, no head -c -1
+        "  if ! head -c $((plain - h - 1)) 2>/dev/null >&3; then\n",
+        "  awk -v unit=\"$unit\" -v want=\"$want\" -v plain_out=\"$WORK/picked.plain\" '",
         "  exec 3>\"$fifos/stream\"\n",
         "    (printf T >&3) 2>/dev/null || true\n",
         "late_damage() { # <slice number> <tape file, or empty> age|sha [<sha256 expected> <sha256 got>]\n",
@@ -614,7 +618,6 @@ fn restore_sh_bytes_are_pinned() {
         // one unit on one tape from slices on disk, one across tapes refused
         "stream_check() {\n",
         "  got=$(printf abcdef | { head -c 2 >/dev/null; head -c 1; } 2>/dev/null) || true\n",
-        "  got=$(printf ab | head -c -1 2>/dev/null) || true\n",
         "      echo \"      They are decrypted to disk first instead, and dar reads them from there, as for a dar\"\n",
         "    } >&2\n    spool_unit \"$list\" \"$destdir\"\n    return 0\n",
         "  if ! stream_check; then\n    die \"'$unit' is held across tapes, and its slices cannot be joined into the one stream\n",

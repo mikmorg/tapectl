@@ -164,14 +164,18 @@ pub(crate) const AWK_UNIT_LIST: &str = r##"
 /// (`volume-format-v2.md` sec 4.4, rule R6: never file 0). Standard error gets
 /// one line, `VERSION MAY_SPAN`: the chosen block's `snapshot_version`, and 1
 /// when its head states `may_span = true` (a unit that may run across tapes,
-/// tapectl 1.7.0), else 0. `may_span` is read in the head only (#135).
+/// tapectl 1.7.0), else 0. `may_span` is read in the head only (#135). Given
+/// `-v plain_out=FILE`, it also writes `number|size_bytes` there for each of
+/// those slices, in the same order: every slice's plaintext size, which the
+/// streamed restore cuts each slice at when it joins them for dar (#498).
 pub(crate) const AWK_SELECT_VERSION: &str = r##"
     function flush() {
       if (in_s && num != "") {
         n[blk]++
         slice[blk, n[blk]] = num "|" tpos "|" eb "|" sha
+        plain[blk, n[blk]] = num "|" sb
       }
-      in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""
+      in_s = 0; num = ""; tpos = ""; eb = ""; sha = ""; sb = ""
     }
     # in_head tracks POSITION (are we in the key/value region directly under
     # [[units]]?); in_u tracks IDENTITY (is this block the unit we want?).
@@ -195,6 +199,7 @@ pub(crate) const AWK_SELECT_VERSION: &str = r##"
     in_s && /^number = /           { num = $3 }
     in_s && /^tape_position = /    { tpos = $3 }
     in_s && /^encrypted_bytes = /  { eb = $3 }
+    in_s && /^size_bytes = /       { sb = $3 }
     in_s && /^sha256_encrypted = / { gsub(/"/, "", $3); sha = $3 }
     END {
       flush()
@@ -207,6 +212,7 @@ pub(crate) const AWK_SELECT_VERSION: &str = r##"
       if (pick) {
         print best, span[pick] + 0 > "/dev/stderr"
         for (i = 1; i <= n[pick]; i++) print slice[pick, i]
+        if (plain_out != "") for (i = 1; i <= n[pick]; i++) print plain[pick, i] > plain_out
       }
     }
   "##;
