@@ -18,9 +18,10 @@ const MTIOCTOP: nix::libc::Ioctl = 0x40086d01;
 pub(crate) const MTIOCGET: nix::libc::Ioctl = 0x80306d02u32 as nix::libc::Ioctl;
 /// `_IOR('m', 3, struct mtpos)` from `<linux/mtio.h>`: st sends READ
 /// POSITION and answers the drive's logical object position — blocks and
-/// filemarks from the beginning of the tape (#388, ADR-0012 item 174: where
-/// a refused write left the drive). 64-bit `long`, as [`MTIOCGET`]'s layout
-/// assumes.
+/// filemarks from the beginning of the tape. Only an unarmed device asks it
+/// ([`TapeDevice::logical_position`]): st sends the vendor-specific form,
+/// which the HP LTO-6 refuses, so item 174's position while armed is read on
+/// the sg node instead. 64-bit `long`, as [`MTIOCGET`]'s layout assumes.
 const MTIOCPOS: nix::libc::Ioctl = 0x80086d03u32 as nix::libc::Ioctl;
 
 /// `struct mtpos` from `<linux/mtio.h>`.
@@ -626,11 +627,29 @@ impl TapeDevice {
         }
     }
 
-    /// The drive's logical object position: READ POSITION through st
-    /// (`MTIOCPOS`), blocks and filemarks from the beginning of the tape.
-    /// Asked by a write session after a refused write (item 174) to find the
-    /// first block the drive did not accept. Moves no tape.
+    /// The drive's logical object position, blocks and filemarks from the
+    /// beginning of the tape. Asked by a write session after a refused write
+    /// (item 174) to find the first block the drive did not accept. Moves no
+    /// tape.
+    ///
+    /// While the page is armed it is READ POSITION's short form (service
+    /// action 00h) on the page's own sg node ([`lbp::PageControl::read_position`]),
+    /// and st's `MTIOCPOS` is not tried: st sends the vendor-specific form
+    /// (01h) unless its `scsi2logical` option is set, and the HP LTO-6 refuses
+    /// that with Invalid field in CDB at every position (kernel log, home2,
+    /// 2026-10-28). A refusal (`LbpRefusal`) only arises while armed, so item
+    /// 174 always takes the sg route. Unarmed, it is `MTIOCPOS`, as before.
     pub fn logical_position(&self) -> Result<u64> {
+        if let Some(page) = &self.lbp {
+            return page.control.read_position().map_err(|e| {
+                self.note(
+                    crate::tape::mtget_journal::POINT_FAILURE,
+                    Some("read position"),
+                    None,
+                );
+                TapectlError::TapeIo(lbp::reason_position(page.control.node(), &e))
+            });
+        }
         let mut pos = MtPos::default();
         let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCPOS, &mut pos as *mut MtPos) };
         if rc != 0 {
@@ -2129,6 +2148,82 @@ mod density_tests {
             plain.filemark_error(MTWEOFI, &eio),
             TapectlError::TapeIo(_)
         ));
+    }
+
+    /// Item 174 on the HP LTO-6 (kernel log, 2026-10-28): armed, the position
+    /// is READ POSITION's short form on the page's own sg node, and st's
+    /// `MTIOCPOS` is never tried: over a plain file the ioctl fails, so an
+    /// answer at all proves it was not issued first. The one command is the
+    /// control's. Positive control: an unarmed device over the same file
+    /// takes the `MTIOCPOS` route and the file refuses it.
+    #[test]
+    fn armed_the_position_is_the_page_controls_and_mtiocpos_is_never_tried() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (armed, page, log) = device_over_armed(tmp.reopen().unwrap(), 4096, lbp::LBP_W);
+        page.set_position(6680);
+        assert_eq!(armed.logical_position().unwrap(), 6680);
+        assert_eq!(*log.lock().unwrap(), ["read position"]);
+        page.set_position(7437);
+        assert_eq!(armed.logical_position().unwrap(), 7437);
+        assert_eq!(*log.lock().unwrap(), ["read position", "read position"]);
+
+        let plain = device_over(tmp.reopen().unwrap(), 4096);
+        let e = plain.logical_position().unwrap_err();
+        assert!(
+            matches!(&e, TapectlError::TapeIo(m) if m.starts_with("MTIOCPOS: ")),
+            "{e}"
+        );
+    }
+
+    /// Armed, a READ POSITION that fails is a tape error naming the short
+    /// form on the sg node and the reason, never a position and never a
+    /// refusal; item 174's retry then leaves the session `interrupted`.
+    #[test]
+    fn armed_a_position_the_control_cannot_read_is_a_tape_error_naming_read_position() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (armed, page, log) = device_over_armed(tmp.reopen().unwrap(), 4096, lbp::LBP_W);
+        page.fail_position(lbp::PageError::IllegalRequest(
+            "sg_raw exited 5: Illegal request, Invalid field in cdb".to_string(),
+        ));
+        let e = armed.logical_position().unwrap_err();
+        let TapectlError::TapeIo(m) = &e else {
+            panic!("{e:?}");
+        };
+        assert!(
+            m.contains("READ POSITION (short form")
+                && m.contains("/dev/sg-fake")
+                && m.contains("Invalid field in cdb"),
+            "{m}"
+        );
+        assert!(!m.contains("MTIOCPOS"), "{m}");
+        assert_eq!(*log.lock().unwrap(), ["read position"]);
+
+        // An answer that does not parse (BPU set) is the same kind of error.
+        page.fail_position(lbp::PageError::Other(
+            lbp::parse_read_position_short(&[0x34; 20]).unwrap_err(),
+        ));
+        let e = armed.logical_position().unwrap_err().to_string();
+        assert!(e.contains("READ POSITION") && e.contains("BPU"), "{e}");
+    }
+
+    /// The device names no sg tool and starts no program for the position:
+    /// while armed, `logical_position` returns the page control's answer
+    /// before any `MTIOCPOS` (no ioctl first, no fallback to it), which stays
+    /// only on the unarmed path. Over a plain file the behaviour cannot tell
+    /// an ioctl tried and dropped from one never sent, so the source says it.
+    #[test]
+    fn the_position_while_armed_is_asked_of_the_control_before_any_ioctl() {
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let start = body.find("    pub fn logical_position(").unwrap();
+        let end = start + body[start..].find("\n    }\n").unwrap();
+        let f = &body[start..end];
+        let asked = f.find("return page.control.read_position()").expect(f);
+        let armed = f.find("if let Some(page) = &self.lbp").expect(f);
+        assert_eq!(f.matches("MTIOCPOS, &mut pos").count(), 1, "{f}");
+        let ioctl = f.find("MTIOCPOS, &mut pos").unwrap();
+        assert!(armed < asked && asked < ioctl, "{f}");
+        assert!(!body.contains("\"sg_raw\""), "no sg tool named here");
     }
 
     /// Item 175's fallback policy on a write-armed device: reads before the
