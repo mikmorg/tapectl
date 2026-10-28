@@ -390,7 +390,8 @@ pub fn parse_read_position_short(answer: &[u8]) -> Result<u64, String> {
             answer[0]
         ));
     }
-    let at = |i: usize| u32::from_be_bytes([answer[i], answer[i + 1], answer[i + 2], answer[i + 3]]);
+    let at =
+        |i: usize| u32::from_be_bytes([answer[i], answer[i + 1], answer[i + 2], answer[i + 3]]);
     Ok(u64::from(at(4).min(at(8))))
 }
 
@@ -1287,8 +1288,14 @@ mod tests {
     /// bytes, the two location fields, are enough.
     #[test]
     fn when_the_two_locations_differ_the_smaller_is_taken() {
-        assert_eq!(parse_read_position_short(&short_form(0x30, 7437, 6680)), Ok(6680));
-        assert_eq!(parse_read_position_short(&short_form(0x30, 6680, 7437)), Ok(6680));
+        assert_eq!(
+            parse_read_position_short(&short_form(0x30, 7437, 6680)),
+            Ok(6680)
+        );
+        assert_eq!(
+            parse_read_position_short(&short_form(0x30, 6680, 7437)),
+            Ok(6680)
+        );
         assert_eq!(
             parse_read_position_short(&short_form(0x00, u32::MAX, u32::MAX - 1)),
             Ok(u64::from(u32::MAX - 1))
@@ -1311,13 +1318,17 @@ mod tests {
         let perr = parse_read_position_short(&short_form(0x32, 6680, 6680)).unwrap_err();
         assert!(perr.contains("PERR"), "{perr}");
         for len in [0usize, 1, 11] {
-            let short = parse_read_position_short(&short_form(0x30, 6680, 6680)[..len]).unwrap_err();
+            let short =
+                parse_read_position_short(&short_form(0x30, 6680, 6680)[..len]).unwrap_err();
             assert!(
                 short.contains(&format!("{len} bytes")) && short.contains("12"),
                 "{short}"
             );
         }
-        assert_eq!(parse_read_position_short(&short_form(0x30, 6680, 6680)), Ok(6680));
+        assert_eq!(
+            parse_read_position_short(&short_form(0x30, 6680, 6680)),
+            Ok(6680)
+        );
     }
 
     /// A control that does not override `read_position` refuses it, naming
