@@ -386,7 +386,11 @@ on a write open (item 165) and recorded in `volumes.write_lbp`/`write_lbp_note` 
 `session::record_run_protection`). A write `EIO` while armed is `TapectlError::LbpRefusal`: the
 session writes on once from the planned start of the file holding the drive's position
 (`Store::logical_position`, `session::retry_from_refusal`, item 174), and a second leaves it
-`interrupted`. Item 175's switch is `tape::lbp::LBP_R_POLICY` (`AllReads`; `OnlyConfirmOfLbpWrite`
+`interrupted`. From 1.8.0 (item 185) that position is READ POSITION's short form through `sg_raw` on
+the armed page's sg node (`lbp::PageControl::read_position`, `lbp::read_position_argv`), never st's
+`MTIOCPOS`, whose vendor-specific form the HP refuses; it is the one raw CDB tapectl sends
+(`tests/sg_boundary.rs`). A session that saw a refusal confirms in full (item 186; a
+`write_lbp_refusal` event on the volume). Item 175's switch is `tape::lbp::LBP_R_POLICY` (`AllReads`; `OnlyConfirmOfLbpWrite`
 arms LBP_R only for a confirm, `session::arm_read_check_for_confirm`), decided by R1 on home2.
 Output: `volume info`'s Write check line, `report verify-status`, `drive status`'s LBP page; the
 Heir Kit's sheet says a power cycle clears a page left armed. The test hook
@@ -426,7 +430,9 @@ its pipe quota, keeps 8 KiB pipes and hides it); that is `late_damage`'s NOTE, r
 and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
 its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (74 blocks; the
 control has about three blocks of margin). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
-acceptance on the candidate; `v1.8.0` is tagged only on its PASS.
+acceptance on the candidate; `v1.8.0` is tagged only on its PASS. The first full run (2026-10-28,
+`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`) failed step 3 because item 174 could not read the HP's
+position through st; items 185 and 186 are the fix, and the full run goes again on their candidate.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

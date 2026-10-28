@@ -269,7 +269,12 @@ seal's) and RESTORE.sh's
    finds the seal, or any file, by READ POSITION or LOCATE** (`MTIOCPOS`,
    `mt tell`, `mt seek`, and the SCSI commands behind them): READ POSITION
    never answered through st on home2's HP LTO-6
-   (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`).
+   (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`): st sends its vendor-specific
+   form unless `scsi2logical` is set, and the HP refuses that form
+   (`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`). The one READ POSITION
+   tapectl sends, after a block the drive refused with LBP armed (ADR-0012
+   items 174 and 185), goes to the sg node in the short form; no reader uses
+   it to find a file.
 
    Which seal a reader accepts:
    - **At the planned position:** a seal whose `file_count` is the planned

@@ -122,7 +122,11 @@ spacing proves. The checks that compare READ POSITION figures recorded during th
 (`physical-block-count` and the like) run on either route when the figures exist; they read no tape.
 
 Why there are two (#487): on home2's HP LTO-6 on 2026-10-20, READ POSITION failed through st on every
-call, even at BOT, and LOCATE to the slice failed with EIO. The readback had only the LOCATE route and
+call, even at BOT, and LOCATE to the slice failed with EIO. The reason was found on 2026-10-28: st
+sends READ POSITION's vendor-specific form unless its `scsi2logical` option is set, and the HP
+refuses it (`Invalid field in cdb`); the short form answers on the sg node
+(`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`). st's LOCATE is probably the same case, since st sends
+its vendor-specific form too, but that was not measured. The readback had only the LOCATE route and
 ended FAIL, so the post-warning slice was never read back
 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`). A failed READ POSITION is now recorded with its
 errno: `setup.lba0_errno`, and `read_position` in `result.json` counts every call and every failure

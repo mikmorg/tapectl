@@ -2029,6 +2029,7 @@ did not run: <why>)`, and `report verify-status` shows `write check: no LBP
 |---|---|---|
 | `no SCSI generic node is bound to <device>` | the kernel's `sg` module is not loaded | `sudo modprobe sg` (and add it to `/etc/modules`) |
 | `sg_modes could not be run` or `sg_wr_mode could not be run` | sg3-utils is not installed | `sudo apt install sg3-utils` (`scripts/first-run.sh` step 2 checks for both tools) |
+| `READ POSITION (short form, service action 00h) on <sg>: sg_raw could not be run` | sg3-utils is not installed (`sg_raw` is in it); asked only after the drive refused a block | `sudo apt install sg3-utils`, then `tapectl volume resume <label>` |
 | `sg_wr_mode could not open <sg> for writing` | the user tapectl runs as cannot write the drive's sg node | add it to the node's group (usually `tape`, as for the `nst` node) and log in again |
 | `the drive has no Control Data Protection page` or `the drive refused Reed-Solomon LBP (method 01h)` | the drive has no LBP, or not the Reed-Solomon kind tapectl arms (LTO-5 and later do; mhvtl's TD7 and later speak only CRC32C) | none: the write is as strong as one by 1.7.1 |
 | `the drive's page did not take` | the drive accepted the setting and reads back another | none; report it with `sg_modes --page=0x0a,0xf0 <sg>`'s output |
@@ -2044,17 +2045,23 @@ as a refusal. The drive writes nothing for a refused block, and the tape's
 layout fixes where every file starts, so tapectl reads where the drive
 stopped, goes back to the start of the file that holds the first block the
 drive did not take, and writes on from there, from staging, with fresh
-hashes and CRCs (ADR-0012 item 174). It prints, and writes to the session
-log:
+hashes and CRCs (ADR-0012 item 174). It reads the position with READ
+POSITION's short form on the drive's sg node (`sg_raw`, item 185), because the
+HP LTO-6 refuses the form st's `MTIOCPOS` and `mt tell` send. It prints, and
+writes to the session log:
 
 ```text
 the drive refused a write with Logical Block Protection armed in tape file <n>; its position (logical object
 <lba>) is in tape file <m>: writing on again from the start of tape file <m>, once (ADR-0012 item 174)
 ```
 
-The catalog records a `write_lbp_retry` event naming the file. If the rest of
-the write goes through, the session seals and confirms as usual and exits 0:
-every block on the tape was checked by the drive, the re-sent ones too. The
+The catalog records a `write_lbp_refusal` event and a `write_lbp_retry` event
+naming the file. If the rest of the write goes through, the session seals and
+exits 0: every block on the tape was checked by the drive, the re-sent ones
+too. Its confirm is the full readback even without `--full-confirm` (item 186).
+The drive reports a refusal late (on the HP, a few blocks after the bad one),
+so a file before the one being written may be short, and the readback proves
+every file before the tape counts as a copy. The
 kernel log names each refusal `logical block guard check failed` (`sudo
 dmesg`); one is worth a look at the HBA and the cable even when the retry
 worked.
@@ -2101,7 +2108,8 @@ tapectl volume resume <label>
 ```
 
 Resume writes again from the start of the first file the drive's position
-says is not whole, with one retry of its own. If refusals keep coming, write
+says is not whole, with one retry of its own, and its confirm reads every file
+back whatever `--full-confirm` says (item 186). If refusals keep coming, write
 the staged data from another host or through another HBA.
 
 ### `note: the drive behind <device> (<sg>) had its Logical Block Protection page armed when tapectl opened it`

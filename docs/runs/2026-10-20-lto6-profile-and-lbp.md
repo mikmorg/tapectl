@@ -52,6 +52,8 @@ wear allowance is fitted. Nothing was pasted into home2's config: that is the CT
 
 **What the run did NOT prove: the data past the warning reads back.** The readback step failed.
 - `LOCATE to block address 4772446 failed: EIO`.
+- *(Explained 2026-10-28, `docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`: st sends READ
+  POSITION's vendor-specific form, which the HP refuses with `Invalid field in cdb`.)*
 - READ POSITION (`MTIOCPOS`) never answered through st on this host, not even at BOT on the
   device's first open (`setup.lba0` is null), so every position in `result.json` is null.
 - The writer's `mtpos()` drops the errno. Nothing records why.
