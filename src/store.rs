@@ -1886,8 +1886,9 @@ pub(crate) trait TapeOps: Send {
     fn early_warning(&self) -> Option<EarlyWarning>;
     /// [`Store::protection`]'s answer (#388).
     fn protection(&self) -> Protection;
-    /// [`Store::logical_position`]'s answer (#388, item 174): READ POSITION
-    /// through st. Moves no tape.
+    /// [`Store::logical_position`]'s answer (#388, item 174): while the page
+    /// is armed, READ POSITION's short form on the drive's sg node, through
+    /// the page control (st's `MTIOCPOS` only unarmed). Moves no tape.
     fn logical_position(&self) -> Result<Option<u64>>;
     /// [`Store::arm_read_check`]'s answer (#388, item 175).
     fn arm_read_check(&mut self) -> Result<bool>;
@@ -2510,8 +2511,9 @@ impl Store for TapeStore {
         self.dev.protection()
     }
 
-    /// The drive's own (READ POSITION through st). Moves no tape, so the
-    /// cursor stands.
+    /// The drive's own: armed, READ POSITION's short form on its sg node
+    /// (item 174); unarmed, st's `MTIOCPOS`. Moves no tape, so the cursor
+    /// stands.
     fn logical_position(&mut self) -> Result<Option<u64>> {
         self.dev.logical_position()
     }
