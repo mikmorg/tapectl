@@ -341,6 +341,19 @@
 //! fallback, and every other substring pinned before keeps its count; no
 //! `TOOLS_*` line moved.
 //!
+//! **Moved an eighth time, 2026-10-28, under ADR-0012 item 184** (#498; a fix
+//! to item 181 before the `v1.8.0` tag): `join_rest` (`7285a4ff…` to
+//! `dee817ab…`). Ubuntu 26.04's default coreutils, uutils 0.10.0, never returns
+//! from `tail -c 1` on a FIFO that carries under 64 KiB, and the last slice's
+//! trailer was read that way, so a restore hung there. Every slice is now cut
+//! at the plaintext size the envelope's manifest gives it (`size_bytes`, written
+//! beside the slice list by `AWK_SELECT_VERSION`'s `plain_out`), with `head -c`
+//! alone: no `tail` on a FIFO, no `head -c -1`, and `stream_check` no longer
+//! tests it. The `mkfifo` needle loses the `trail` FIFO, the `join_slice` and
+//! `join_rest` needles take the size, the `head -c -1` needle is gone, and two
+//! name the cut and the `awk` call; every other substring keeps its count, and
+//! no `TOOLS_*` line moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -367,7 +380,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "7285a4ffe87e425ce5400f58f5c58fd8c4b5a5d03686db3c078f2c6ed5838b63";
+const RESTORE_SH_SHA256: &str = "dee817ab6593b66169139bc5b934307efc81bf0e52dd2be489a0dd449b78a08a";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
