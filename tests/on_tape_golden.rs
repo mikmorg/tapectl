@@ -354,6 +354,18 @@
 //! name the cut and the `awk` call; every other substring keeps its count, and
 //! no `TOOLS_*` line moved.
 //!
+//! **Moved a ninth time, 2026-10-28, under ADR-0012 item 184** (#498; a fix
+//! to item 182 before the `v1.8.0` tag): `stream_unit` (`dee817ab…` to
+//! `a5dc4063…`). Damage found while dar's stream was open was ruled FATAL
+//! unless dar had already closed it, and uutils coreutils 0.10.0 enlarges the
+//! pipes it writes to 1 MiB, so on Ubuntu 26.04 the join wrote past the damage
+//! before dar closed anything and damage dar never needed ended the restore
+//! (PR #500's CI). Now the stream is closed at the damage and dar is waited
+//! for: dar ending 0 needed nothing past it (item 182's note, the per-file
+//! check decides), any other end is FATAL with the texts it had. Three needles
+//! pin the rule; every other substring keeps its count, and no `TOOLS_*` line
+//! moved.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 //!
@@ -380,7 +392,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "dee817ab6593b66169139bc5b934307efc81bf0e52dd2be489a0dd449b78a08a";
+const RESTORE_SH_SHA256: &str = "a5dc4063cf47eafad4c4111d8a58c610bfc8e130e1468de0dab8d32205ecb39f";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
