@@ -736,10 +736,10 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// 1's warning about three blocks into `S`'s slice 16 at nominal and about
 /// three blocks before slice 15 ends at 1% sooner, so the 1% proof moves a
 /// cut; its positive control says so if the tape's own files ever grow. They
-/// grew by four blocks with 1.8.0's RESTORE.sh (#498, ADR-0012 items 181 and
-/// 182), and the figure by the same 16,384 bytes, which keeps every cut where
-/// it was.
-const CAP94: u64 = 2_745_384;
+/// grew by five blocks with 1.8.0's RESTORE.sh (#498, ADR-0012 items 181, 182
+/// and 184), and the figure by the same 20,480 bytes, which keeps every cut
+/// where it was.
+const CAP94: u64 = 2_749_480;
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may
