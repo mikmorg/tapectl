@@ -14432,29 +14432,21 @@ fn a_dar_whose_stream_header_is_unknown_restores_from_slices_on_disk() {
 /// from slices decrypted to disk first, with one NOTE naming why.
 #[test]
 fn a_head_the_join_cannot_use_restores_from_slices_on_disk() {
-    for (what, head, why, more) in [(
-        "reads ahead",
-        HEAD_READS_AHEAD,
-        "this host's head reads past what it is asked for.",
-        "(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '', not 'c')",
-    )] {
-        let h = Heir::with_stubs(&[("head", head)]);
-        let dest = h.sub("restored");
-        let (code, text) = h.run(&[
-            "--restore",
-            "--key",
-            &h.key("alice"),
-            "--unit",
-            "photos/2019",
-            "--to",
-            &dest,
-        ]);
-        assert_restored_from_slices_on_disk(&h, code, &text, &dest, what);
-        assert!(
-            text.contains(&format!("{}\n      {more}\n", join_fallback_note(why))),
-            "{what}:\n{text}"
-        );
-    }
+    let h = Heir::with_stubs(&[("head", HEAD_READS_AHEAD)]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_restored_from_slices_on_disk(&h, code, &text, &dest, "reads ahead");
+    let why = join_fallback_note("this host's head reads past what it is asked for.");
+    let more = "(printf abcdef | { head -c 2 >/dev/null; head -c 1; } printed '', not 'c')";
+    assert!(text.contains(&format!("{why}\n      {more}\n")), "{text}");
 }
 
 /// A unit held across tapes keeps only encrypted slices on disk, so a host
