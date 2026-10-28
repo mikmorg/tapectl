@@ -404,20 +404,25 @@ trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never 
 
 **1.8.0: RESTORE.sh feeds dar one stream** (`docs/releases/1.8.0.md`; ADR-0012 items 181-183,
 #498). It contains 1.7.2, and the minor moves because RESTORE.sh changed: its golden pin moved
-once, under item 181, and nothing else on tape did (`requires` and every other pin hold).
+under item 181, then again under item 184 (a fix before the tag), and nothing else on tape did
+(`requires` and every other pin hold).
 RESTORE.sh's `stream_unit` joins a unit's slices back into the `dar -c -` stream and writes it into
 one FIFO that `dar -x -` reads; the script holds it open as fd 3 across slices and cartridge swaps,
 and only each slice's feed, a child, writes to it, so dar closing it ends a writer, never the
 restore. `stream_check` (once a run, before any slice) makes the stream's header with the heir's
-own dar and tests `head` (no read-ahead, `-c -1`); `join_slice`/`join_rest` strip and check each
-slice (header equal to slice 1's, the slice size, `N`/`T`); the header is read by the awk fragment
+own dar and tests that `head` does not read ahead; `join_slice`/`join_rest` cut each slice with
+`head -c` at the manifest's `size_bytes` (`AWK_SELECT_VERSION`'s `plain_out`, `<list>.plain`) and
+check it (header equal to slice 1's, the slice size, `N`/`T`). No tool reads a FIFO for a slice's
+end: Ubuntu 26.04's uutils coreutils 0.10.0, CI's image, hangs on `tail -c 1 <fifo` under 64 KiB
+(item 184), so prove a RESTORE.sh change in the `tapectl-u26` container (`/scratch/tapectl-u26`)
+or a PR before master. The header is read by the awk fragment
 `AWK_DAR_HEADER` in `restore_script.rs`, the mirror of `dar::slice`'s parser. When `stream_check`
 fails, a unit on one tape spools (`spool_unit`) with a NOTE, and a unit across tapes is refused in
 `restore_across_tapes` before any slice. Item 182: damage found after dar ended well (`late=1`:
 the slice went to `/dev/null`, or `join.closed`) is `late_damage`'s NOTE, repeated by `late_notes`,
 and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
-its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (73 blocks, about 15
-bytes of headroom left). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
+its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (74 blocks; the
+control has about three blocks of margin). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
 acceptance on the candidate; `v1.8.0` is tagged only on its PASS.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP

@@ -1447,9 +1447,10 @@ any doubt is a rewind). The manual steps below read in that order.
    decrypted is written to disk but the restored files. From 1.8.0 it joins the
    slices back into the one `dar -c -` stream tapectl cut them from (the header
    from the heir's own dar with slice 1's two labels put in, then each slice's
-   payload with its header and trailer taken off and checked, then the final
-   `T`) and writes that stream into one FIFO (#498, ADR-0012 item 181); up to
-   1.7.x it wrote each slice into a FIFO of its own.
+   payload with its header and trailer taken off and checked, each slice cut at
+   the plaintext `size_bytes` the envelope's manifest gives it, then the final
+   `T`) and writes that stream into one FIFO (#498, ADR-0012 items 181 and 184);
+   up to 1.7.x it wrote each slice into a FIFO of its own.
 6. `dar -x base -R /dest -O -Q -N` into an empty directory (`-N`: no darrc on
    the heir's machine changes what is restored; dar keeps an existing file and
    reports success, so a re-run over a stopped restore needs `-w`). RESTORE.sh
@@ -1587,15 +1588,20 @@ tape, as ranges (§4.4).
   to it as a second tape by the same rule. The Heir Kit is regenerated when 1.7.0 is installed
   (item 135).
 
-**Since 1.8.0** (ADR-0012 items 181 and 182, #498; RESTORE.sh's golden pin moves once, and no
-other pin). Only RESTORE.sh and File 1's text change.
+**Since 1.8.0** (ADR-0012 items 181, 182 and 184, #498; RESTORE.sh's golden pin moves, under
+item 181 and again under item 184's fix, and no other pin). Only RESTORE.sh and File 1's text
+change.
 - **RESTORE.sh streams one stream.** A streamed restore joins a unit's slices back into the
   `dar -c -` stream tapectl cut them from and feeds it to `dar -x -` through one FIFO, opened
   once and held across slices and cartridge changes (§6 steps 5 and 6). The stream's header is
   the heir's own dar's (`dar -N -c - -R <empty dir> -an -D -Q`, made once a run) with slice 1's
-  internal name and data name put in; every later slice's header must equal slice 1's, every
-  slice but the last must be the slice size its header records and end in `N`, and the last
-  must end in `T`. A slice that is not what tapectl cut is refused by name. Item 176 holds:
+  internal name and data name put in; every slice is cut with `head -c` at the plaintext
+  `size_bytes` the envelope's manifest gives it, every later slice's header must equal slice
+  1's, every slice but the last must be the slice size its header records and end in `N`, and
+  the last must end in `T`. No tool reads a FIFO to find a slice's end: uutils coreutils 0.10.0,
+  Ubuntu 26.04's default, never returns from `tail -c 1` on a FIFO that carries under 64 KiB
+  (item 184). A slice that is not what tapectl cut, or whose size the manifest does not give,
+  is refused by name. Item 176 holds:
   every slice is read to its end, hashed and authenticated, and dar's exit status decides.
 - **When the join cannot run on the heir's host** (a dar whose standard-output header the
   script does not know, or a `head` that reads past what it is asked for), a unit on one tape
