@@ -623,6 +623,11 @@ fn restore_sh_bytes_are_pinned() {
         // Round 3 (uutils coreutils 0.10.0, Ubuntu 26.04): every slice cut
         // at its manifest size, no tail -c 1 on a FIFO, no head -c -1
         "  if ! head -c $((plain - h - 1)) 2>/dev/null >&3; then\n",
+        // Round 4 (PR #500): late damage decided by how dar ended, after its
+        // stream is closed at the damage, never by whether it runs at an instant
+        "    if [ \"$STREAM_OPEN\" = 1 ] && { [ \"${st[3]:-1}\" != 0 ] || [ \"$got\" != \"$sha\" ] ||\n",
+        "      stream_close\n      dar_reap\n    fi\n    # Damage cannot have reached what dar needed when dar ended well: the slice\n",
+        "    if [ -n \"$DAR_RC\" ] && [ \"$DAR_RC\" = 0 ]; then\n      late=1\n    fi\n",
         "  awk -v unit=\"$unit\" -v want=\"$want\" -v plain_out=\"$WORK/picked.plain\" '",
         "  exec 3>\"$fifos/stream\"\n",
         "    (printf T >&3) 2>/dev/null || true\n",

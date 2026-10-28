@@ -14740,3 +14740,172 @@ fn a_unit_whose_last_slice_is_a_few_bytes_streams_whole() {
     );
     assert!(same_tree(&tiny.src, Path::new(&dest)), "{text}");
 }
+
+// ---- item 182 decided by how dar ended, never by an instant (round 4) ----
+
+/// A dar that reads its stream to the end before it ends, and ends late: the
+/// host's dar extracts, then the rest of the stream is read until it ends, and
+/// this ends 2 s after that with dar's own status. dar never closes the stream
+/// early, so damage after the point it needed is found while it still runs:
+/// the shape a slow runner gave GitHub's CI (PR #500), made certain.
+const DAR_READS_ON_AND_ENDS_LATE: &str = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -x - "*)
+    "$FAKE_TAPE/hostbin/dar" "$@"
+    rc=$?
+    "$FAKE_TAPE/hostbin/cat" >/dev/null
+    "$FAKE_TAPE/hostbin/sleep" 2
+    exit $rc ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+
+/// Flip one byte of the slice at tape file `pos`, `at` bytes into its
+/// plaintext (the stub age's header is 32 bytes): the stub age passes it on,
+/// so only the slice's sha256 says the slice is damaged.
+fn flip_plain_at(h: &Heir, pos: i64, at: usize) {
+    flip_at(h, pos, 32 + at);
+}
+
+/// Item 182 is decided by dar's exit status, not by whether dar is seen
+/// running when the damage is found. With a dar that reads on to the end and
+/// ends late, damage in the catalogue at the end of `many` (which dar, given
+/// the catalogue, never needs) is found while dar runs, both ways it can be:
+/// a chunk age cannot authenticate, and a byte only the sha256 sees. The
+/// script closes dar's stream there, waits for dar, which ends 0, and the
+/// restore is whole with the note. Before, it ended FATAL.
+#[test]
+fn damage_dar_never_needed_is_named_when_dar_ends_after_it_is_found() {
+    let t = many_template();
+    let many = unit_of(t, "many");
+    let n = many.positions.len();
+    let last = *many.positions.last().unwrap();
+    let plain = many.sizes.last().unwrap() - 32;
+    for (what, sha_only) in [
+        ("a chunk age cannot authenticate", false),
+        ("the sha256 alone", true),
+    ] {
+        let h = Heir::of(t, &[("dar", DAR_READS_ON_AND_ENDS_LATE)]);
+        if sha_only {
+            flip_plain_at(&h, last, plain - 64);
+        } else {
+            damage_chunk_at(&h, last, "alice", plain - 64);
+        }
+        let dest = h.sub("restored");
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "many",
+            "--to",
+            &dest,
+        ]);
+        assert_eq!(code, 0, "{what}:\n{text}");
+        assert!(!text.contains("FATAL"), "{what}:\n{text}");
+        assert!(text.contains("RESTORE COMPLETE"), "{what}:\n{text}");
+        assert_eq!(late_damage_said(&text, n, last), 2, "{what}:\n{text}");
+        let found = if sha_only {
+            "      its sha256 does not match the front index\n"
+        } else {
+            "      age cannot authenticate it there (its own words are above), so its sha256 cannot\n"
+        };
+        assert!(text.contains(found), "{what}:\n{text}");
+        assert_eq!(
+            verified(&text),
+            n - 1,
+            "{what}: every other slice checked:\n{text}"
+        );
+        assert!(text.contains(&many_checked("many")), "{what}:\n{text}");
+        assert!(same_tree(&many.src, Path::new(&dest)), "{what}:\n{text}");
+    }
+}
+
+/// A dar that takes its whole stream, restores nothing, and says it ended
+/// well: the worst a dar could do once its stream is closed at the damage.
+const DAR_RESTORES_NOTHING_AND_SAYS_0: &str = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -x - "*)
+    "$FAKE_TAPE/hostbin/cat" >/dev/null
+    exit 0 ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+
+/// The host's dar, which then says it ended well whatever it did.
+const DAR_ALWAYS_SAYS_0: &str = r#"#!/usr/bin/env bash
+case " $* " in
+  *" -x - "*)
+    "$FAKE_TAPE/hostbin/dar" "$@"
+    exit 0 ;;
+esac
+exec "$FAKE_TAPE/hostbin/dar" "$@"
+"#;
+
+/// The safety net under item 182's rule: dar's exit status after its stream
+/// is closed at the damage decides whether the restore goes on, so a dar that
+/// says 0 while it needed what came after (here the damage is in data dar
+/// reads) must never reach RESTORE COMPLETE. The per-file check against the
+/// index catches it: it names files ABSENT from the restore (a dar that
+/// restored nothing) as well as files whose sha256 differs (the host's dar,
+/// cut short in the data, which says 0 here), and the restore is INCOMPLETE.
+#[test]
+fn a_dar_that_ends_0_on_a_stream_cut_at_the_damage_never_completes_a_short_restore() {
+    let t = many_template();
+    let many = unit_of(t, "many");
+    let last = *many.positions.last().unwrap();
+    for (what, dar) in [
+        ("restores nothing", DAR_RESTORES_NOTHING_AND_SAYS_0),
+        ("the host's dar, cut short", DAR_ALWAYS_SAYS_0),
+    ] {
+        let h = Heir::of(t, &[("dar", dar)]);
+        damage_chunk_at(&h, last, "alice", 1000);
+        let dest = h.sub("restored");
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "many",
+            "--to",
+            &dest,
+        ]);
+        assert_eq!(code, 1, "{what}:\n{text}");
+        assert!(!text.contains("RESTORE COMPLETE"), "{what}:\n{text}");
+        assert!(text.contains("RESTORE INCOMPLETE"), "{what}:\n{text}");
+        let (_, listed) = damaged_list(&dest);
+        assert!(!listed.is_empty(), "{what}: files are listed:\n{text}");
+        // Every listed file is really missing or wrong, and every missing or
+        // wrong file is listed.
+        let wrong: Vec<String> = many_names()
+            .iter()
+            .copied()
+            .chain(["sub/note.txt"])
+            .filter(|name| {
+                std::fs::read(many.src.join(name)).ok()
+                    != std::fs::read(Path::new(&dest).join(name)).ok()
+            })
+            .map(str::to_string)
+            .collect();
+        assert!(!wrong.is_empty(), "{what}: the restore is short");
+        let mut listed_sorted = listed.clone();
+        listed_sorted.sort();
+        let mut wrong_sorted = wrong.clone();
+        wrong_sorted.sort();
+        assert_eq!(
+            listed_sorted, wrong_sorted,
+            "{what}: the list is exactly the files missing or wrong"
+        );
+        if what == "restores nothing" {
+            let absent = many_names()[0];
+            assert!(
+                !Path::new(&dest).join(absent).exists(),
+                "{what}: {absent} is absent"
+            );
+            assert!(
+                listed.iter().any(|p| p == absent),
+                "{what}: the absent file is named"
+            );
+        }
+    }
+}

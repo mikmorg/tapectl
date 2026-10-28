@@ -4661,11 +4661,12 @@ stream_close() {
 #
 # Given the catalogue, dar stops reading where the file data ends and exits 0
 # (#497); what it leaves is still read, hashed and authenticated. Damage found
-# there, once dar has ended well, is in bytes dar never read: it is said, once
-# for the slice, the restore goes on, and the restored files are checked
-# against the index as ever. A file that fails the check fails the restore as
-# it always has. Damage found while dar runs, or with dar failed, stops the
-# restore as it always has.
+# there is in bytes dar never needed: it is said, once for the slice, the
+# restore goes on, and the restored files are checked against the index as
+# ever. Which it is, dar's exit status says: damage found while dar may still
+# be reading closes dar's stream at that point and waits for dar (stream_unit),
+# and dar ending well then needed nothing past it. A dar that ends any other
+# way, or a file that fails the check, fails the restore as it always has.
 
 # The tape slice $1 came from, for a message: the cartridge in the drive (tape
 # file $2), or the one it was read from into the scratch directory.
@@ -4870,13 +4871,6 @@ $(stream_why "       ")"
         return 0
       fi
     fi
-    # Damage here cannot have reached dar when dar had already ended well:
-    # the slice went to /dev/null, or dar closed the stream before the end of
-    # what age gave of it (item 182, late_damage).
-    late=0
-    if { [ "$sink" = /dev/null ] || [ -f "$WORK/join.closed" ]; } && [ "$DAR_RC" = 0 ]; then
-      late=1
-    fi
     read -r -a st <"$WORK/feed.status" || true
     # st: dd (or cat, from scratch), the head/drain group, tee, age, and the
     # group that joins the slice into dar's stream and drains what dar leaves.
@@ -4887,6 +4881,26 @@ $(stream_why "       ")"
         echo "NOTE: a slice that will not read can come from another copy of the unit: see --slices-from and --swap-tapes in --help." >&2
       fi
       die_io "reading $from failed" "$WORK/dd.err" "$WORK"
+    fi
+    got=$(awk '{print $1}' "$WORK/slice.sha")
+    # A slice found damaged (a chunk age cannot authenticate, a sha256 that is
+    # not the front index's) or not passed whole, while dar may still be
+    # reading: dar's stream is closed there, with no final T, and dar is waited
+    # for. dar ending well then needed nothing past the damage, and any other
+    # end is the damage stopping the restore as it always has (item 182). A dar
+    # seen running at one instant may be about to end either way, so it is
+    # never asked whether it runs, only how it ended.
+    if [ "$STREAM_OPEN" = 1 ] && { [ "${st[3]:-1}" != 0 ] || [ "$got" != "$sha" ] ||
+      [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ] || [ "${st[4]:-1}" != 0 ]; }; then
+      stream_close
+      dar_reap
+    fi
+    # Damage cannot have reached what dar needed when dar ended well: the slice
+    # went to /dev/null, dar closed the stream while it was fed, or dar ended
+    # well once the stream was closed at the damage (late_damage).
+    late=0
+    if [ -n "$DAR_RC" ] && [ "$DAR_RC" = 0 ]; then
+      late=1
     fi
     if [ "${st[3]:-1}" != 0 ]; then
       # age's own complaint about the slice (a damaged chunk, a header no key
@@ -4924,7 +4938,6 @@ $(replace_hint)"
       die "slice $num ($from) could not be passed to dar (status ${st[*]})"
     fi
     [ -n "$STREAM_FROM" ] || CUR=$((tpos + 1))
-    got=$(awk '{print $1}' "$WORK/slice.sha")
     if [ "$got" != "$sha" ]; then
       if [ "$late" = 1 ]; then
         late_damage "$num" "$tpos" sha "$sha" "$got"
