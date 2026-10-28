@@ -2,6 +2,30 @@ use rusqlite::{params, Connection};
 
 use crate::error::Result;
 
+/// The action of the event a write session logs on its volume each time the
+/// drive refuses a write with Logical Block Protection armed, at the moment
+/// the session meets it: in the execute loop, at the seal or in the re-send
+/// before a retried seal, retried or not (#388, ADR-0012 item 186). Its
+/// details name the tape file whose write was refused and whether item 174's
+/// retry was made for it: `{"refused_in": 9, "retried": true}`.
+pub const WRITE_LBP_REFUSAL: &str = "write_lbp_refusal";
+
+/// Whether the drive refused a write with Logical Block Protection armed in
+/// a write session of volume `volume_id`: any [`WRITE_LBP_REFUSAL`] event on
+/// it (ADR-0012 item 186). Read from the catalog, never from memory, so a
+/// `volume resume` in another process sees a refusal the first run met. The
+/// volume is the scope: `volume init` mints a new row for every cartridge it
+/// initialises (labels are unique), so the only writers of a volume row's
+/// tape are its own sessions.
+pub fn lbp_refusal_seen(conn: &Connection, volume_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events
+                        WHERE entity_type = 'volume' AND entity_id = ?1 AND action = ?2)",
+        params![volume_id, WRITE_LBP_REFUSAL],
+        |r| r.get(0),
+    )?)
+}
+
 /// Log an event to the audit trail.
 #[allow(clippy::too_many_arguments)]
 pub fn log_event(
@@ -82,4 +106,63 @@ pub fn log_field_change(
         None,
         tenant_id,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0012 item 186: a `write_lbp_refusal` event on a volume is a
+    /// refusal seen on that volume, and only on it; another action on it, or
+    /// the same action on another volume, is not.
+    #[test]
+    fn a_refusal_is_seen_only_on_its_own_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        assert!(!lbp_refusal_seen(&conn, 7).unwrap(), "an empty catalog");
+        log_event(
+            &conn,
+            "volume",
+            7,
+            Some("L6-0007"),
+            "write_lbp_retry",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            "unit",
+            7,
+            Some("u"),
+            WRITE_LBP_REFUSAL,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !lbp_refusal_seen(&conn, 7).unwrap(),
+            "another action, or another entity type"
+        );
+        log_event(
+            &conn,
+            "volume",
+            8,
+            Some("L6-0008"),
+            WRITE_LBP_REFUSAL,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!lbp_refusal_seen(&conn, 7).unwrap(), "another volume");
+        assert!(lbp_refusal_seen(&conn, 8).unwrap(), "positive control");
+    }
 }
