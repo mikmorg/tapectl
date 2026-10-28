@@ -19,6 +19,13 @@
 //! the kernel binds to the st node tapectl opened (sysfs), never config's
 //! `device_sg`: a MODE SELECT on the wrong node would arm another drive.
 //!
+//! **The position** (item 174) is read on the same sg node while the page is
+//! armed: READ POSITION (34h), short form, service action 00h, sent by
+//! `sg_raw` ([`read_position_argv`]) because no sg3-utils tool of its own
+//! sends it. It moves no tape and changes no state. st's `MTIOCPOS` is not
+//! used for it, because st sends the vendor-specific form (01h), which the
+//! HP LTO-6 refuses (kernel log, 2026-10-28).
+//!
 //! [`arm`], [`disarm`] and [`clear_leftover`] are the whole life of the page;
 //! `tape::ioctl::TapeDevice` calls them from its open and its `Drop`, and
 //! nothing else does. They work over [`PageControl`] and two closures, so
@@ -325,6 +332,80 @@ pub fn select_argv(sg: &str, page: &ProtectionPage) -> Result<Vec<String>, Strin
     ])
 }
 
+/// The program that reads the drive's position: READ POSITION (34h) sent as
+/// a CDB, since no sg3-utils tool of its own sends it.
+pub const POSITION_TOOL: &str = "sg_raw";
+
+/// The argv of the one READ POSITION tapectl sends (ADR-0012 item 174): the
+/// short form, service action 00h, 20 bytes back in binary on stdout (`-b`;
+/// sg_raw's status text goes to stderr), and a 300-second timeout, since the
+/// drive may still be recovering from the block it refused (one took 19.6 s
+/// on the HP, 2026-10-20; sg_raw's default is 20). The node is opened
+/// read-write, sg_raw's default, because the sg layer refuses the command on
+/// a read-only open (`-R`). Never service action 01h, the vendor-specific
+/// form st's `MTIOCPOS` sends, which the HP LTO-6 refuses.
+pub fn read_position_argv(sg: &str) -> Vec<String> {
+    let mut argv: Vec<String> = [POSITION_TOOL, "-b", "-r", "20", "-t", "300", sg]
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+    argv.extend(
+        [0x34u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            .iter()
+            .map(|b| format!("{b:02x}")),
+    );
+    argv
+}
+
+/// READ POSITION's short-form flags in byte 0 (SSC-4 §7.8): BPU, which
+/// SSC-4 calls LOLU, says the location fields are not valid.
+const POSITION_BPU: u8 = 0x04;
+/// PERR: a location overflowed its four-byte field.
+const POSITION_PERR: u8 = 0x02;
+
+/// The drive's logical object position from READ POSITION's short-form
+/// answer: blocks and filemarks from the beginning of the tape. Bytes 4-7
+/// are the FIRST logical object location (the host side: the next object
+/// the drive would hand back or accept), bytes 8-11 the LAST (the next one
+/// it writes to the medium); when they differ the smaller is returned, the
+/// conservative choice for item 174, since returning to an earlier file's
+/// start only re-sends more. Refused with the reason when the answer is
+/// shorter than the 12 bytes that hold both, or BPU (LOLU) or PERR is set.
+pub fn parse_read_position_short(answer: &[u8]) -> Result<u64, String> {
+    if answer.len() < 12 {
+        return Err(format!(
+            "READ POSITION answered {} bytes, fewer than the 12 that hold its two locations",
+            answer.len()
+        ));
+    }
+    if answer[0] & POSITION_BPU != 0 {
+        return Err(format!(
+            "the drive does not know its position (BPU, SSC-4's LOLU, set in {:02X}h)",
+            answer[0]
+        ));
+    }
+    if answer[0] & POSITION_PERR != 0 {
+        return Err(format!(
+            "the drive's position overflowed READ POSITION's short form (PERR set in {:02X}h)",
+            answer[0]
+        ));
+    }
+    let at = |i: usize| u32::from_be_bytes([answer[i], answer[i + 1], answer[i + 2], answer[i + 3]]);
+    Ok(u64::from(at(4).min(at(8))))
+}
+
+/// The reason for a READ POSITION that failed or did not parse: the
+/// command, its form and the node, then the tool's own words.
+pub fn reason_position(node: &str, e: &PageError) -> String {
+    let m = match e {
+        PageError::Spawn(m)
+        | PageError::IllegalRequest(m)
+        | PageError::Open(m)
+        | PageError::Other(m) => m,
+    };
+    format!("READ POSITION (short form, service action 00h) on {node}: {m}")
+}
+
 /// sg3-utils' exit status for ILLEGAL REQUEST (`SG_LIB_CAT_ILLEGAL_REQ`):
 /// the drive does not support the page, or refused the value.
 const SG_EXIT_ILLEGAL_REQUEST: i32 = 5;
@@ -345,9 +426,11 @@ pub enum PageError {
     Other(String),
 }
 
-/// The page as the drive holds it, read and written: `sg_modes` and
-/// `sg_wr_mode` on one sg node in production ([`SgPageControl`]), a recorded
-/// page in tests.
+/// What tapectl asks of the drive's sg node while the page is armed: the
+/// page, read and written (`sg_modes` and `sg_wr_mode`), and the drive's
+/// position (READ POSITION's short form through `sg_raw`, item 174), on one
+/// sg node in production ([`SgPageControl`]); a recorded page and position
+/// in tests.
 pub trait PageControl {
     /// The sg node, for messages.
     fn node(&self) -> &str;
@@ -355,6 +438,17 @@ pub trait PageControl {
     fn sense(&self) -> Result<ProtectionPage, PageError>;
     /// MODE SELECT of `page` (which [`select_argv`] checks).
     fn select(&self, page: &ProtectionPage) -> Result<(), PageError>;
+    /// READ POSITION, short form ([`read_position_argv`]): the drive's
+    /// logical object position, blocks and filemarks from the beginning of
+    /// the tape ([`parse_read_position_short`]). Moves no tape. A control
+    /// that cannot ask the drive (a test's page that never needs it) refuses,
+    /// never answering a position it did not read.
+    fn read_position(&self) -> Result<u64, PageError> {
+        Err(PageError::Other(format!(
+            "this page control cannot read the drive's position on {}",
+            self.node()
+        )))
+    }
 }
 
 /// The real control: sg3-utils on the sg node the kernel binds to the st
@@ -370,10 +464,11 @@ impl SgPageControl {
     }
 }
 
-/// Run one pinned argv, stdin closed, stdout and stderr captured.
-fn run(argv: &[String]) -> Result<Vec<u8>, PageError> {
+/// Run one pinned argv against the sg node `node`, stdin closed, stdout and
+/// stderr captured.
+fn run(argv: &[String], node: &str) -> Result<Vec<u8>, PageError> {
     let out = crate::progress::waited(
-        || format!("{} on {}", argv[0], argv[argv.len() - 1]),
+        || format!("{} on {node}", argv[0]),
         || {
             Command::new(&argv[0])
                 .args(&argv[1..])
@@ -400,13 +495,18 @@ impl PageControl for SgPageControl {
     }
 
     fn sense(&self) -> Result<ProtectionPage, PageError> {
-        let raw = run(&sense_argv(&self.sg))?;
+        let raw = run(&sense_argv(&self.sg), &self.sg)?;
         ProtectionPage::from_mode_sense10(&raw).map_err(PageError::Other)
     }
 
     fn select(&self, page: &ProtectionPage) -> Result<(), PageError> {
         let argv = select_argv(&self.sg, page).map_err(PageError::Other)?;
-        run(&argv).map(|_| ())
+        run(&argv, &self.sg).map(|_| ())
+    }
+
+    fn read_position(&self) -> Result<u64, PageError> {
+        let raw = run(&read_position_argv(&self.sg), &self.sg)?;
+        parse_read_position_short(&raw).map_err(PageError::Other)
     }
 }
 
@@ -1104,6 +1204,161 @@ mod tests {
         assert!(select_argv("/dev/sg9", &saved).unwrap()[3].starts_with("--contents=4a,"));
     }
 
+    // ── READ POSITION, short form (item 174) ──
+
+    /// The one READ POSITION tapectl sends (ADR-0012 item 174): the short
+    /// form, service action 00h (never st's vendor-specific 01h, which the HP
+    /// refuses), 20 bytes in binary on stdout, a generous timeout for a drive
+    /// still recovering from a refused block, and the node opened read-write
+    /// (`-R` is refused by the kernel's sg layer).
+    #[test]
+    fn the_read_position_argv_is_pinned_to_the_short_form() {
+        let argv = read_position_argv("/dev/sg13");
+        assert_eq!(
+            argv,
+            [
+                "sg_raw",
+                "-b",
+                "-r",
+                "20",
+                "-t",
+                "300",
+                "/dev/sg13",
+                "34",
+                "00",
+                "00",
+                "00",
+                "00",
+                "00",
+                "00",
+                "00",
+                "00",
+                "00"
+            ]
+        );
+        let node = argv.iter().position(|w| w == "/dev/sg13").unwrap();
+        let cdb = &argv[node + 1..];
+        assert_eq!(cdb.len(), 10, "READ POSITION is a 10-byte CDB");
+        assert_eq!(cdb[0], "34", "READ POSITION");
+        assert_eq!(cdb[1], "00", "service action 00h, never 01h");
+        for word in &argv {
+            assert!(
+                !["-R", "--readonly", "-s", "--send", "-i", "--infile"].contains(&word.as_str()),
+                "{argv:?}"
+            );
+            assert!(!word.starts_with("--readonly="), "{argv:?}");
+        }
+    }
+
+    /// The short form's 20-byte answer, as the tests write it: byte 0's
+    /// flags, then the first and last logical object locations big-endian.
+    fn short_form(flags: u8, first: u32, last: u32) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[0] = flags;
+        a[4..8].copy_from_slice(&first.to_be_bytes());
+        a[8..12].copy_from_slice(&last.to_be_bytes());
+        a
+    }
+
+    /// The three answers the HP LTO-6 gave through the sg node (2026-10-28):
+    /// the start of tape file 12 (6668 blocks and 12 filemarks), just after
+    /// file 12's filemark, and BOT (BOP, LOCU and BYCU set; BPU clear).
+    #[test]
+    fn the_hp_drives_recorded_read_position_answers_parse() {
+        let file_12: [u8; 20] = [
+            0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x18, 0x00, 0x00, 0x1a, 0x18, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let after_file_12: [u8; 20] = [
+            0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x0d, 0x00, 0x00, 0x1d, 0x0d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut bot = [0u8; 20];
+        bot[0] = 0xb0;
+        assert_eq!(parse_read_position_short(&file_12), Ok(6680));
+        assert_eq!(parse_read_position_short(&after_file_12), Ok(7437));
+        assert_eq!(parse_read_position_short(&bot), Ok(0));
+        assert_eq!(short_form(0x30, 6680, 6680), file_12, "the helper's layout");
+    }
+
+    /// A drive whose host-side location runs ahead of what reached the
+    /// medium answers two numbers; the smaller is the conservative one
+    /// (returning to an earlier file's start only re-sends more). Twelve
+    /// bytes, the two location fields, are enough.
+    #[test]
+    fn when_the_two_locations_differ_the_smaller_is_taken() {
+        assert_eq!(parse_read_position_short(&short_form(0x30, 7437, 6680)), Ok(6680));
+        assert_eq!(parse_read_position_short(&short_form(0x30, 6680, 7437)), Ok(6680));
+        assert_eq!(
+            parse_read_position_short(&short_form(0x00, u32::MAX, u32::MAX - 1)),
+            Ok(u64::from(u32::MAX - 1))
+        );
+        assert_eq!(
+            parse_read_position_short(&short_form(0x30, 9, 9)[..12]),
+            Ok(9)
+        );
+    }
+
+    /// An answer that does not hold a valid position is refused, each with
+    /// the reason named: BPU (SSC-4's LOLU: the locations are not valid),
+    /// PERR (a location overflowed its field), or fewer than the 12 bytes
+    /// that hold both locations. Positive control: the same answer with the
+    /// flag clear parses.
+    #[test]
+    fn an_unknown_overflowed_or_short_position_is_refused() {
+        let bpu = parse_read_position_short(&short_form(0x34, 6680, 6680)).unwrap_err();
+        assert!(bpu.contains("BPU") && bpu.contains("LOLU"), "{bpu}");
+        let perr = parse_read_position_short(&short_form(0x32, 6680, 6680)).unwrap_err();
+        assert!(perr.contains("PERR"), "{perr}");
+        for len in [0usize, 1, 11] {
+            let short = parse_read_position_short(&short_form(0x30, 6680, 6680)[..len]).unwrap_err();
+            assert!(
+                short.contains(&format!("{len} bytes")) && short.contains("12"),
+                "{short}"
+            );
+        }
+        assert_eq!(parse_read_position_short(&short_form(0x30, 6680, 6680)), Ok(6680));
+    }
+
+    /// A control that does not override `read_position` refuses it, naming
+    /// its node: it never answers a position it did not ask the drive for.
+    #[test]
+    fn a_control_that_cannot_read_the_position_refuses() {
+        struct PageOnly;
+        impl PageControl for PageOnly {
+            fn node(&self) -> &str {
+                "/dev/sg-page-only"
+            }
+            fn sense(&self) -> Result<ProtectionPage, PageError> {
+                ProtectionPage::from_page_bytes(&HP_PAGE).map_err(PageError::Other)
+            }
+            fn select(&self, _: &ProtectionPage) -> Result<(), PageError> {
+                Ok(())
+            }
+        }
+        match PageOnly.read_position() {
+            Err(PageError::Other(m)) => assert!(m.contains("/dev/sg-page-only"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The reason a failed READ POSITION gives names the command, its form
+    /// and the node, then the tool's own words.
+    #[test]
+    fn a_failed_read_position_names_the_short_form_and_the_node() {
+        let line = reason_position(
+            "/dev/sg13",
+            &PageError::IllegalRequest("sg_raw exited 5: Illegal request".to_string()),
+        );
+        assert!(
+            line.contains("READ POSITION")
+                && line.contains("short form")
+                && line.contains("/dev/sg13")
+                && line.contains("sg_raw exited 5: Illegal request"),
+            "{line}"
+        );
+    }
+
     // ── arm, against a recorded page ──
 
     fn ok_block(_: usize) -> Result<(), String> {
@@ -1479,6 +1734,9 @@ pub(crate) mod fake {
         /// HP applies parameters up to the first error.
         ignore_flags: bool,
         selects: usize,
+        /// READ POSITION's answer: `None` until a test sets one, and then a
+        /// refusal, so a position is never invented.
+        position: Option<Result<u64, PageError>>,
     }
 
     #[derive(Clone, Default)]
@@ -1523,6 +1781,16 @@ pub(crate) mod fake {
             self.state.lock().unwrap().ignore_flags = true;
         }
 
+        /// READ POSITION answers `lba` from now on.
+        pub(crate) fn set_position(&self, lba: u64) {
+            self.state.lock().unwrap().position = Some(Ok(lba));
+        }
+
+        /// READ POSITION fails with `e` from now on.
+        pub(crate) fn fail_position(&self, e: PageError) {
+            self.state.lock().unwrap().position = Some(Err(e));
+        }
+
         fn record(&self, s: &mut State, op: String) {
             if let Some(log) = &self.log {
                 log.lock().unwrap().push(op.clone());
@@ -1560,6 +1828,16 @@ pub(crate) mod fake {
                 s.page = page.bytes().to_vec();
             }
             Ok(())
+        }
+
+        fn read_position(&self) -> Result<u64, PageError> {
+            let mut s = self.state.lock().unwrap();
+            self.record(&mut s, "read position".to_string());
+            s.position.clone().unwrap_or_else(|| {
+                Err(PageError::Other(
+                    "the recorded page has no position".to_string(),
+                ))
+            })
         }
     }
 }
