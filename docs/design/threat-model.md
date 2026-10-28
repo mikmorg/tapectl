@@ -143,7 +143,8 @@ dar's `fadvise` and touches no device.
 
 **SCSI generic (`/dev/sgN`) is used to ask the drive and the cartridge
 questions**, through three sg3-utils tools, **and to set one mode page**, through
-two more (1.7.2, #388; ADR-0012 item 163), and no others:
+two more (1.7.2, #388; ADR-0012 item 163), **and to ask the drive's position**,
+through one pinned raw command (1.8.0; ADR-0012 item 185), and no others:
 
 | Tool | SCSI command | Used for |
 |---|---|---|
@@ -152,23 +153,33 @@ two more (1.7.2, #388; ADR-0012 item 163), and no others:
 | `sg_read_attr` | READ ATTRIBUTE | the cartridge's MAM: medium serial, density, load count (`tape::mam`) |
 | `sg_modes` | MODE SENSE of the Control Data Protection page (0Ah/F0h), current values | reading the Logical Block Protection page (`tape::lbp`) |
 | `sg_wr_mode` | MODE SENSE, then MODE SELECT, of page 0Ah/F0h only, no block descriptor, PS clear, never `--save` | arming and clearing Logical Block Protection (`tape::lbp`) |
+| `sg_raw` | READ POSITION (34h), short form (service action 00h) only: `sg_raw -b -r 20 -t 300 <sg> 34 00 00 00 00 00 00 00 00 00`, never `-R` and never another CDB | where the drive stands after it refused a block with LBP armed (item 174's retry; `tape::lbp::read_position_argv`), on the armed page's own sg node |
 
-None of the five moves the medium, so the st driver's position cannot drift
-underneath them. The three asking tools change no state at all; `sg_wr_mode`
+None of the six moves the medium, so the st driver's position cannot drift
+underneath them. The three asking tools and READ POSITION change no state at all; `sg_wr_mode`
 changes exactly one thing, the Control Data Protection page, and never saves
 it, so a power cycle always clears it. tapectl never sends a WRITE ATTRIBUTE,
-a MODE SELECT of any page but 0Ah/F0h, a LOAD/UNLOAD or a raw CDB over SG, and
-never runs `mt` or `sg_raw` itself (the operator's tools; `first-run.sh` and
-the lifecycle suite use `mt`, the binary does not). `tests/sg_boundary.rs` pins
+a MODE SELECT of any page but 0Ah/F0h, a LOAD/UNLOAD, or any raw CDB over SG
+but that one READ POSITION, and never runs `mt` itself (the operator's tool;
+`first-run.sh` and the lifecycle suite use it, the binary does not).
+
+READ POSITION is sent raw because st cannot ask it on the production drive.
+st's `MTIOCPOS` sends the vendor-specific form (service action 01h) unless
+st's `scsi2logical` option is set, which needs CAP_SYS_ADMIN, and home2's HP
+LTO-6 refuses that form at every position (`Invalid field in cdb`, kernel log,
+2026-10-28). No sg3-utils tool of its own sends READ POSITION. The node must
+be opened read-write, because the sg layer refuses the command on a read-only
+open. While the page is armed, `TapeDevice::logical_position` asks this command
+and never `MTIOCPOS`. `tests/sg_boundary.rs` pins
 both sets — the `sg_*` tools the source names and every program the binary
-starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the five above, and
+starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the six above, and
 `sh -c` over the operator's own `snapshot_command` / `release_command` of a
 `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
 line, run as the user tapectl runs as, given the collection's name and root and
-the snapshot's path and no device) — and the exact `sg_logs` argument list and
-the two page argument lists: a new SG tool, a new program, a
-counter-resetting flag on `sg_logs`, or a saving or other-page flag on the page
-tools fails it.
+the snapshot's path and no device) — and the exact `sg_logs` argument list, the
+two page argument lists and the READ POSITION argument list: a new SG tool, a new program, a
+counter-resetting flag on `sg_logs`, a saving or other-page flag on the page
+tools, or any other CDB or flag on `sg_raw` fails it.
 
 **The page's life (item 164).** `TapeDevice::open`/`open_read` arm the page
 right after st's exclusive open succeeds — so another process can never be
@@ -188,7 +199,9 @@ without it, once warned and recorded (item 165).
 **What LBP covers, and what it does not.** On a write, from tapectl's device
 buffer (the CRC is computed on the tape-writer thread, over the block as
 `write(2)` sends it) to the drive, which refuses a block whose CRC does not
-match before writing it (item 174 retries once, in place); on a read with
+match before writing it (item 174 retries once, in place). The refusal is
+reported late, a few blocks after the bad one, so a session that saw one
+confirms in full before its tape counts (item 186). On a read with
 LBP_R, from the drive back to tapectl. Not covered: the one in-process copy
 from the write pipeline's hashed buffer into the device buffer (the readback
 covers it); an all-zero block with an all-zero CRC, which is valid under the

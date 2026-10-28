@@ -2378,3 +2378,34 @@ nothing is tagged.
      uutils coreutils. The authorization ends when `v1.8.0` is tagged; `requires`, MANIFEST.toml,
      File 0, the front index, the seals and the envelopes still do not move.
 
+Ruled 2026-10-28, after the 1.8.0 candidate's real-drive LBP acceptance on home2 failed step 3
+(`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`). The HP drive refused the hooked block, as item
+174 expects, but tapectl could not find out where the drive stood, so the session was left
+`interrupted` and was not retried. st's `MTIOCPOS` sends READ POSITION's vendor-specific form
+(service action 01h) unless st's `scsi2logical` option is set, and setting it needs CAP_SYS_ADMIN.
+The HP refuses that form at every position (`Illegal Request / Invalid field in cdb`, kernel log),
+which is why READ POSITION never answered through st on 2026-10-20 either. Through the sg node,
+the short form (00h) and the long form (06h) answer at exactly the positions the plan predicts.
+The drive reported the refusal deferred: st's counts show it accepted the bad block and four more
+with GOOD and refused the next WRITE. On the medium, the file held every block before the bad one
+and none after it.
+
+185. **Item 174 reads the drive's position with READ POSITION's short form on the sg node.** It
+     uses `sg_raw`, the one raw command tapectl sends:
+     `sg_raw -b -r 20 -t 300 <sg> 34 00 00 00 00 00 00 00 00 00`. The node is the armed page's
+     own, opened read-write; `-R` is never used, and neither is any other CDB. The command asks
+     and moves nothing, as INQUIRY, LOG SENSE and READ ATTRIBUTE do.
+     `docs/design/threat-model.md` §2 lists it, and `tests/sg_boundary.rs` pins its argv. When
+     the two location fields differ, the smaller is taken. st's `MTIOCPOS` is not asked while the
+     page is armed. Item 174's text holds; only the route to the position changes. No byte on
+     tape changes and no pin moves.
+186. **A session that saw an LBP refusal confirms in full before its tape counts** (amends item
+     174). This covers a run in which the drive refused a write with LBP armed, whether the run
+     was retried and sealed or left `interrupted`. That run's confirm is the full one (every file
+     read back against the front index), and so is the confirm of every `volume resume` of that
+     session, whatever `--full-confirm` says. The drive reports a refusal late (about five blocks
+     on the HP), so a file before the one being written can be incomplete, and when the drive's
+     position cannot be read nothing marks that file. The full readback proves the tape before it
+     counts as a copy. Its cost, one full readback, is paid only when a refusal happened.
+     Both items are in 1.8.0, before its tag; item 183's order holds: a new candidate, then the
+     acceptance in full.

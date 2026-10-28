@@ -5,13 +5,15 @@
 //! and READ ATTRIBUTE (`sg_read_attr`) — and, since #388 (ADR-0012 item
 //! 163), to set exactly one page: the Control Data Protection page (0Ah/F0h)
 //! that arms Logical Block Protection, read with `sg_modes` (MODE SENSE) and
-//! written with `sg_wr_mode` (MODE SENSE, then MODE SELECT), never saved. No
-//! SG command moves the medium, so the st driver's own position accounting
-//! can never drift under a command it did not see. This pins the set of
-//! sg3-utils tools the binary's source names, the absence of the `sg_logs`
-//! flags that turn a LOG SENSE into a LOG SELECT (which clears the drive's
-//! counters), the page argv, and that the binary never runs `mt` or
-//! `sg_raw`.
+//! written with `sg_wr_mode` (MODE SENSE, then MODE SELECT), never saved;
+//! and, since 1.8.0 (ADR-0012 item 185), to ask the drive's position with one
+//! raw command, READ POSITION's short form through `sg_raw`, because st's
+//! `MTIOCPOS` sends a form the HP LTO-6 refuses. No SG command moves the
+//! medium, so the st driver's own position accounting can never drift under a
+//! command it did not see. This pins the set of sg3-utils tools the binary's
+//! source names, the absence of the `sg_logs` flags that turn a LOG SENSE into
+//! a LOG SELECT (which clears the drive's counters), the page argv, the one
+//! READ POSITION argv, and that the binary never runs `mt`.
 //!
 //! A source scan, deliberately: the tools are spawned from half a dozen
 //! modules and several only on real hardware, so no ungated run reaches them
@@ -29,6 +31,9 @@ const ALLOWED: &[(&str, &str)] = &[
     ("sg_read_attr", "READ ATTRIBUTE"),
     ("sg_modes", "MODE SENSE"),
     ("sg_wr_mode", "MODE SELECT"),
+    // ADR-0012 item 185: READ POSITION's short form and no other CDB
+    // (`read_position_argv_is_pinned_to_one_command`).
+    ("sg_raw", "READ POSITION"),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -152,6 +157,40 @@ fn sg_logs_only_ever_reads() {
 /// to clear it (item 164). Any other page is refused before a program could
 /// start. A flag added to either argv fails here, as for `sg_logs`.
 #[test]
+fn read_position_argv_is_pinned_to_one_command() {
+    // ADR-0012 item 185: the one raw CDB tapectl sends. READ POSITION (34h),
+    // short form (service action 00h, never st's vendor-specific 01h, which
+    // the HP LTO-6 refuses), 20 bytes back in binary, the node opened
+    // read-write (the sg layer refuses the command on `-R`). Any other CDB
+    // byte, flag or data-out option fails here: `sg_raw` can send anything, so
+    // the boundary is this argv.
+    use tapectl::tape::lbp;
+    let argv = lbp::read_position_argv("/dev/sg9");
+    assert_eq!(
+        argv,
+        [
+            "sg_raw", "-b", "-r", "20", "-t", "300", "/dev/sg9", "34", "00", "00", "00", "00",
+            "00", "00", "00", "00", "00"
+        ]
+    );
+    for word in &argv {
+        for banned in [
+            "-s",
+            "--send",
+            "-i",
+            "--infile",
+            "-c",
+            "--cmdfile",
+            "-R",
+            "--readonly",
+        ] {
+            assert_ne!(word, banned, "{argv:?}");
+            assert!(!word.starts_with(&format!("{banned}=")), "{argv:?}");
+        }
+    }
+}
+
+#[test]
 fn lbp_page_argv_is_pinned_and_never_saves() {
     use tapectl::tape::lbp::{self, ProtectionPage, LBP_R, LBP_W, METHOD_RS, RS_INFO_LEN};
     assert_eq!(
@@ -226,10 +265,11 @@ fn spawned_programs(text: &str) -> Vec<String> {
 }
 
 /// Every program the binary may start, by the file that starts it and the
-/// expression it names. `"mt"`, `"sg_raw"`, `"sg_write_attr"` and the like
-/// are absent on purpose: a movement of the medium belongs to the st driver
-/// through `tape::ioctl`, so st's position accounting sees it, and SCSI
-/// generic only asks.
+/// expression it names. `"mt"`, `"sg_write_attr"` and the like are absent on
+/// purpose: a movement of the medium belongs to the st driver through
+/// `tape::ioctl`, so st's position accounting sees it, and SCSI generic only
+/// asks. `sg_raw` runs through `lbp.rs`'s `&argv[0]` for one pinned READ
+/// POSITION (ADR-0012 item 185).
 const SPAWNS: &[(&str, &str)] = &[
     ("src/main.rs", "dar_path"),                  // the dar version probe
     ("src/dar/mod.rs", "binary"),                 // dar itself (create, restore, isolate)
@@ -241,7 +281,8 @@ const SPAWNS: &[(&str, &str)] = &[
     ("src/tape/log_pages.rs", "&argv[0]"),        // SgLogs::read_argv / decode_argv, pinned above
     ("src/tape/mam.rs", "MAM_TOOL"),              // sg_read_attr: READ ATTRIBUTE
     // sg_modes / sg_wr_mode: the Control Data Protection page (#388, ADR-0012
-    // item 163), lbp::sense_argv / select_argv, pinned below.
+    // item 163), lbp::sense_argv / select_argv, pinned below; sg_raw: READ
+    // POSITION's short form (item 185), lbp::read_position_argv, pinned below.
     ("src/tape/lbp.rs", "&argv[0]"),
     // `sh -c` over the operator's own `snapshot_command` / `release_command` of a
     // `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
