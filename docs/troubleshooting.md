@@ -3008,8 +3008,9 @@ A RESTORE.sh written by 1.8.0 or later (ADR-0012 item 182). Given the unit's
 isolated catalogue, dar stops reading where the file data ends (the entry on
 `dar extraction failed (exit 0)` above), and the script still reads, hashes and
 authenticates what dar left. Here that part failed: age could not authenticate
-it, or the slice's sha256 did not match the front index. dar never read those
-bytes and had already ended well, so the script went on, read and checked the
+it, or the slice's sha256 did not match the front index. dar did not need those
+bytes: the script closed dar's stream at the damage, or dar had already ended,
+and dar ended well. So the script went on, read and checked the
 slices after it, and checked every restored file against the sha256 the index
 records for it.
 

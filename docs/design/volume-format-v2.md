@@ -1607,8 +1607,9 @@ change.
   script does not know, or a `head` that reads past what it is asked for), a unit on one tape
   is restored from slices decrypted to disk first, as for a dar too old to stream; a unit
   across tapes is refused before any slice is read.
-- **Damage dar never needed** (item 182). When dar has exited 0 and the only damage is in bytes
-  read after it ended, RESTORE.sh names the slice and the tape in a `NOTE`, goes on, checks
+- **Damage dar never needed** (item 182). Damage found while dar's stream is open closes the
+  stream at that point and waits for dar (item 184): when dar exits 0, it needed nothing past the
+  damage, and RESTORE.sh names the slice and the tape in a `NOTE`, goes on, checks
   every restored file against the index, and ends RESTORE COMPLETE (exit 0) with the note
   repeated if every file matches, telling the heir to replace the tape; any file that fails
   ends the restore INCOMPLETE as before.

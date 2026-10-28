@@ -418,8 +418,11 @@ end: Ubuntu 26.04's uutils coreutils 0.10.0, CI's image, hangs on `tail -c 1 <fi
 or a PR before master. The header is read by the awk fragment
 `AWK_DAR_HEADER` in `restore_script.rs`, the mirror of `dar::slice`'s parser. When `stream_check`
 fails, a unit on one tape spools (`spool_unit`) with a NOTE, and a unit across tapes is refused in
-`restore_across_tapes` before any slice. Item 182: damage found after dar ended well (`late=1`:
-the slice went to `/dev/null`, or `join.closed`) is `late_damage`'s NOTE, repeated by `late_notes`,
+`restore_across_tapes` before any slice. Item 182: damage found while dar's stream is open closes it
+there (no final `T`) and reaps dar, and `late=1` is dar's final status 0, never `dar_running` at an
+instant (item 184: uutils `cat`/`tee` enlarge their pipes to 1 MiB, so the join can pass the damage
+before dar closes anything; run the container's heir suite as `--user 1000:1000`, since root, over
+its pipe quota, keeps 8 KiB pipes and hides it); that is `late_damage`'s NOTE, repeated by `late_notes`,
 and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
 its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (74 blocks; the
 control has about three blocks of margin). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
