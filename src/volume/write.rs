@@ -23395,6 +23395,150 @@ mod tests {
             }
         }
 
+        // ── ADR-0012 item 186: a session that saw an LBP refusal confirms
+        //    in full before its tape counts, `--full-confirm` or not ──
+
+        /// The line the confirm says when a refusal makes it the full one.
+        const FULL_AFTER_REFUSAL: &str = "the drive refused a write with Logical Block \
+             Protection armed in this session: the confirm reads every file back (ADR-0012 \
+             item 186)";
+
+        /// The tier each of the volume's confirms recorded, in order.
+        fn verify_types_of(conn: &Connection, volume_id: i64) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT verify_type FROM verification_sessions WHERE volume_id = ?1
+                     ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// The volume's `write_lbp_refusal` events' details, in order.
+        fn lbp_refusals_of(conn: &Connection, volume_id: i64) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT details FROM events WHERE action = 'write_lbp_refusal'
+                     AND entity_type = 'volume' AND entity_id = ?1 ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// A `volume write` without `--full-confirm` whose run the drive
+        /// refused once (a block of the front index, reported two files
+        /// later) retries, seals, and confirms in full: the volume records a
+        /// full readback, the refusal is on the volume, and the write says
+        /// why it read every file back.
+        #[test]
+        fn a_write_that_saw_an_lbp_refusal_confirms_in_full_without_the_flag() {
+            use crate::store::LbpRefusalAt;
+            let mut store = lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(3, 0, 5));
+            let ((r, code, conn, volume_id, _tmp), heard) =
+                crate::progress::heard::during(|| lbp_write("LBP-186", &mut store));
+            r.expect("retried and sealed");
+            assert_eq!(code, 0);
+            assert_eq!(lbp_retries(&conn), ["3"], "positive control: one retry");
+            assert_eq!(
+                lbp_refusals_of(&conn, volume_id),
+                [r#"{"refused_in": 5, "retried": true}"#]
+            );
+            assert_eq!(verify_types_of(&conn, volume_id), ["full"]);
+            assert_eq!(
+                heard.count(FULL_AFTER_REFUSAL),
+                (1, 1),
+                "{:?} {:?}",
+                heard.stderr,
+                heard.log
+            );
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
+        }
+
+        /// The control: the same write with no refusal and no flag runs the
+        /// quick confirm, and says nothing of item 186.
+        #[test]
+        fn a_write_with_no_refusal_and_no_flag_confirms_quick() {
+            let mut store = lbp_store();
+            let ((r, code, conn, volume_id, _tmp), heard) =
+                crate::progress::heard::during(|| lbp_write("LBP-Q", &mut store));
+            r.expect("seals");
+            assert_eq!(code, 0);
+            assert!(lbp_refusals_of(&conn, volume_id).is_empty());
+            assert_eq!(verify_types_of(&conn, volume_id), ["quick"]);
+            assert_eq!(heard.count("ADR-0012 item 186"), (0, 0));
+        }
+
+        /// A `volume write` that two refusals left `interrupted` (exit 4)
+        /// carries both on the volume, and the session `volume resume`
+        /// continues — rebuilt from the catalog, finished by the same
+        /// `finish_session` and asking for the quick confirm, as a resume
+        /// without `--full-confirm` does — confirms in full.
+        #[test]
+        fn a_resume_of_a_write_two_refusals_interrupted_confirms_in_full_without_the_flag() {
+            use crate::store::LbpRefusalAt;
+            let at = LbpRefusalAt::deferred(3, 0, 5);
+            let mut store = lbp_store().with_lbp_refusal(at).with_lbp_refusal(at);
+            let (r, code, conn, volume_id, _tmp) = lbp_write("LBP-186R", &mut store);
+            assert!(matches!(r, Err(TapectlError::WriteInterrupted(_))), "{r:?}");
+            assert_eq!(code, 4);
+            assert_eq!(
+                lbp_refusals_of(&conn, volume_id),
+                [
+                    r#"{"refused_in": 5, "retried": true}"#,
+                    r#"{"refused_in": 5, "retried": false}"#
+                ]
+            );
+            assert!(
+                verify_types_of(&conn, volume_id).is_empty(),
+                "no confirm ran"
+            );
+
+            let session = session::InterruptedSession::rehydrate(&conn, volume_id)
+                .unwrap()
+                .expect("an interrupted session to resume");
+            let layout = session.layout().clone();
+            let tenant_ids: Vec<i64> = layout
+                .entries
+                .iter()
+                .filter_map(|e| match e.kind {
+                    ZoneKind::TenantEnvelope { tenant_id } => Some(tenant_id),
+                    _ => None,
+                })
+                .collect();
+            let stage_set_ids = stage_set_ids_for_layout(&conn, &layout).unwrap();
+            let SessionKeys { keys, .. } =
+                assemble_session_keys(&conn, &tenant_ids, &stage_set_ids).unwrap();
+            let outcome = session
+                .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+                .unwrap();
+            finish_session(
+                &conn,
+                &mut store,
+                volume_id,
+                "LBP-186R",
+                &layout,
+                512 * 1024,
+                outcome,
+                Tier::write_confirm(false),
+                None,
+            )
+            .expect("the resume seals and confirms");
+            assert_eq!(verify_types_of(&conn, volume_id), ["full"]);
+        }
+
         /// Item 165: a drive that could not take LBP is written without it,
         /// and the volume says so, with the reason.
         #[test]

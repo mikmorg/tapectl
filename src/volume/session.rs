@@ -2706,12 +2706,20 @@ impl ReadyToSeal {
         let marker = self.seal_marker()?;
         let first = match execute_seal(store, &marker) {
             Ok(()) => return Ok(self.sealed(&*store)),
-            Err(e @ TapectlError::LbpRefusal(_)) if !self.lbp_retried => e,
+            Err(e @ TapectlError::LbpRefusal(_)) => e,
             Err(e) => return Err(e),
         };
         let planned = planned_seal_position(&self.built.layout)?;
         let seal_at = self.ending.seal_position(planned);
-        let from = retry_from_refusal(
+        // ADR-0012 item 186: every refusal the seal meets is recorded on the
+        // volume before the session goes on, retried or not.
+        let label = &self.built.layout.label;
+        if self.lbp_retried {
+            // The run's one retry (item 174) went to an earlier refusal.
+            record_lbp_refusal(conn, self.volume_id, label, seal_at, false)?;
+            return Err(first);
+        }
+        let retried = retry_from_refusal(
             conn,
             store,
             &self.built.layout,
@@ -2719,8 +2727,9 @@ impl ReadyToSeal {
             &self.write_ids,
             self.run_first_position,
             seal_at,
-        )
-        .map_err(|why| {
+        );
+        record_lbp_refusal(conn, self.volume_id, label, seal_at, retried.is_ok())?;
+        let from = retried.map_err(|why| {
             TapectlError::LbpRefusal(format!(
                 "the seal at tape file {seal_at}: {} It was not retried: {why}. \
                  {CHECK_THE_DRIVE_PATH}",
@@ -2731,6 +2740,7 @@ impl ReadyToSeal {
             conn,
             store,
             &self.built.layout,
+            self.volume_id,
             &self.write_ids,
             from,
             seal_at,
@@ -2738,6 +2748,7 @@ impl ReadyToSeal {
         match execute_seal(store, &marker) {
             Ok(()) => Ok(self.sealed(&*store)),
             Err(e @ TapectlError::LbpRefusal(_)) => {
+                record_lbp_refusal(conn, self.volume_id, label, seal_at, false)?;
                 if let Some(again) =
                     locate_refused_file(store, &self.built.layout, self.run_first_position, seal_at)
                 {
@@ -3034,17 +3045,74 @@ fn retry_from_refusal(
     Ok(from)
 }
 
+/// ADR-0012 item 186 (#388): record on the volume that the drive refused the
+/// write of tape file `refused_in` with Logical Block Protection armed, and
+/// whether item 174's retry was made for it, before the session goes on —
+/// retried, left `interrupted` or returned as an error. The event, never
+/// memory, is what makes this session's confirm the full one, and that of
+/// every `volume resume` of it ([`tier_after_lbp_refusals`]). A catalog busy
+/// past its budget is an error here, as every other write of the session is.
+fn record_lbp_refusal(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    refused_in: u32,
+    retried: bool,
+) -> Result<()> {
+    let details = format!("{{\"refused_in\": {refused_in}, \"retried\": {retried}}}");
+    busy::retry(BusyPolicy::DEFAULT, "the LBP refusal's event", || {
+        crate::db::events::log_event(
+            conn,
+            "volume",
+            volume_id,
+            Some(label),
+            crate::db::events::WRITE_LBP_REFUSAL,
+            Some("refused_in"),
+            None,
+            Some(&refused_in.to_string()),
+            Some(&details),
+            None,
+        )
+    })?;
+    Ok(())
+}
+
+/// ADR-0012 item 186 (#388): the tier a write session's confirm runs at. A
+/// session in which the drive refused a write with Logical Block Protection
+/// armed — in this run or an earlier one, retried and sealed or left
+/// `interrupted` — confirms in full, every file read back against the front
+/// index, whatever the caller asked (`--full-confirm` or not): the drive
+/// reports a refusal late, so a file before the one being written can be
+/// incomplete, and when its position could not be read nothing marks that
+/// file. The refusal is read from the volume's events
+/// ([`crate::db::events::lbp_refusal_seen`]), so a `volume resume` in another
+/// process upgrades as the run that saw it does. Says why, once, when it
+/// upgrades; otherwise `asked` stands and nothing is said.
+fn tier_after_lbp_refusals(conn: &Connection, volume_id: i64, asked: Tier) -> Result<Tier> {
+    if asked == Tier::Integrity || !crate::db::events::lbp_refusal_seen(conn, volume_id)? {
+        return Ok(asked);
+    }
+    crate::progress::say(
+        "the drive refused a write with Logical Block Protection armed in this session: the \
+         confirm reads every file back (ADR-0012 item 186)",
+    );
+    Ok(Tier::Integrity)
+}
+
 /// Item 174's re-send before a retried seal: the Layout's content entries
 /// at positions `from` to `until - 1`, each through the verified write
 /// pipeline from its staged file, its slice's catalog position recorded
 /// `written` again with the hash of the bytes the store took. Any failure —
 /// a refusal, a staged file that cannot be read, a hash that no longer
 /// matches — is returned, the session left resumable; the file it stopped
-/// in stays `pending`.
+/// in stays `pending`. A refusal is recorded on `volume_id` first
+/// ([`record_lbp_refusal`], ADR-0012 item 186): it is the run's second, so
+/// it is not retried.
 fn resend_entries(
     conn: &Connection,
     store: &mut dyn Store,
     layout: &Layout,
+    volume_id: i64,
     write_ids: &[(i64, i64)],
     from: u32,
     until: u32,
@@ -3082,6 +3150,10 @@ fn resend_entries(
                     entry.position,
                     expected.unwrap_or("no recorded hash")
                 )))
+            }
+            Verdict::Failed(e @ TapectlError::LbpRefusal(_)) => {
+                record_lbp_refusal(conn, volume_id, &layout.label, entry.position as u32, false)?;
+                return Err(e);
             }
             Verdict::Failed(e) => return Err(e),
         };
@@ -3294,6 +3366,10 @@ impl SealedPending {
     /// re-enter this same method (staging kept in every case — this method
     /// never touches staging).
     ///
+    /// `tier` is the caller's ask, raised to [`Tier::Integrity`] when the
+    /// drive refused a write of this session with Logical Block Protection
+    /// armed, in any run (ADR-0012 item 186, [`tier_after_lbp_refusals`]).
+    ///
     /// This form has no `Config`, so a continued full readback is bounded by
     /// the archive sets' `verify_interval_days` alone. Every production path
     /// (`volume write`, `volume resume`) goes through
@@ -3318,6 +3394,11 @@ impl SealedPending {
         tier: Tier,
         default_verify_interval_days: Option<i64>,
     ) -> Result<ConfirmOutcome> {
+        // ADR-0012 item 186 (#388): a session the drive refused a write in,
+        // with Logical Block Protection armed, confirms in full whatever was
+        // asked. Decided before anything below reads the tier, so a full
+        // readback an interruption stopped is continued (#410) as any other.
+        let tier = tier_after_lbp_refusals(conn, self.volume_id, tier)?;
         let verify_type = tier.verify_type();
         // Issue #410: read before this confirm's own row exists, which
         // would otherwise be "the latest" itself.
@@ -4215,6 +4296,15 @@ fn run_entries(
                         .position(|e| e.position as u32 == from)
                         .ok_or_else(|| format!("tape file {from} is not one this session writes"))
                 });
+                // ADR-0012 item 186: the refusal is on the volume before the
+                // session writes on or stops.
+                record_lbp_refusal(
+                    conn,
+                    volume_id,
+                    &built.layout.label,
+                    entry.position as u32,
+                    retry.is_ok(),
+                )?;
                 match retry {
                     Ok(from_index) => {
                         // The files it sends again count toward the phase
@@ -4255,6 +4345,15 @@ fn run_entries(
                 // drive's position says so, those files are not whole on the
                 // tape either, and resume writes them again.
                 if matches!(verdict, Verdict::Failed(TapectlError::LbpRefusal(_))) {
+                    // ADR-0012 item 186: the run's second refusal, on the
+                    // volume before anything else.
+                    record_lbp_refusal(
+                        conn,
+                        volume_id,
+                        &built.layout.label,
+                        entry.position as u32,
+                        false,
+                    )?;
                     if let Some(from) = locate_refused_file(
                         store,
                         &built.layout,
@@ -13149,6 +13248,481 @@ mod tests {
                 store.syncs.iter().filter(|s| **s).count(),
                 0,
                 "no seal on the tape"
+            );
+        }
+
+        // ── ADR-0012 item 186: a session that saw an LBP refusal confirms
+        //    in full before its tape counts ──
+
+        /// Each `write_lbp_refusal` event's details, in the order logged.
+        fn refusals(conn: &Connection) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT details FROM events WHERE action = 'write_lbp_refusal'
+                     ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// A refusal event's details: the tape file whose write the drive
+        /// refused, and whether item 174's retry was made for it.
+        fn refusal(refused_in: u32, retried: bool) -> String {
+            format!("{{\"refused_in\": {refused_in}, \"retried\": {retried}}}")
+        }
+
+        /// The tier each of the volume's confirms recorded, in order.
+        fn verify_types(conn: &Connection, volume_id: i64) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT verify_type FROM verification_sessions WHERE volume_id = ?1
+                     ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        /// The line the confirm says when it reads every file back because
+        /// of a refusal.
+        const FULL_AFTER_REFUSAL: &str = "the drive refused a write with Logical Block \
+             Protection armed in this session: the confirm reads every file back (ADR-0012 \
+             item 186)";
+
+        /// The confirm `volume write` and `volume resume` ask for without
+        /// `--full-confirm` (`Tier::write_confirm(false)`), and it passes.
+        fn confirm_asking_quick(f: &Fixture2, sealed: SealedPending, store: &mut dyn Store) {
+            match sealed
+                .confirm(&f.conn, store, Tier::write_confirm(false))
+                .unwrap()
+            {
+                ConfirmOutcome::Sealed(_) => {}
+                ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+                ConfirmOutcome::Inconclusive(i) => {
+                    panic!("inconclusive: {:?}", i.evidence.mismatches)
+                }
+            }
+        }
+
+        /// A `MemStore` that cannot tell where the drive stopped:
+        /// `logical_position` is the trait's default, `Ok(None)`.
+        struct PositionUnknown(MemStore);
+
+        impl Store for PositionUnknown {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                self.0.early_warning()
+            }
+            fn protection(&self) -> Protection {
+                self.0.protection()
+            }
+            fn logical_position(&mut self) -> Result<Option<u64>> {
+                Ok(None)
+            }
+            fn arm_read_check(&mut self) -> Result<bool> {
+                self.0.arm_read_check()
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+            fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+                self.0.reposition_at_most(file_index)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.0.blank_at_bot()
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.0.eod_at_or_before(position)
+            }
+            fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                self.0.files_on_medium()
+            }
+        }
+
+        /// Item 186, the run that saw the refusal: item 174 retried it and
+        /// the session sealed, and the confirm asked for is the quick one;
+        /// the confirm reads every file back, records `full`, and says why,
+        /// once on stderr and once in the session log.
+        #[test]
+        fn a_refusal_retried_and_sealed_confirms_in_full_unasked() {
+            let f = make_fixture();
+            let mut store =
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SLICE_2));
+            let (outcome, f) = execute(f, &mut store);
+            let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+            assert_eq!(retries(&f.conn), ["9"], "positive control: retried, sealed");
+            assert_eq!(refusals(&f.conn), [refusal(SLICE_2, true)]);
+            let ((), heard) =
+                crate::progress::heard::during(|| confirm_asking_quick(&f, sealed, &mut store));
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["full"]);
+            assert_eq!(
+                heard.count(FULL_AFTER_REFUSAL),
+                (1, 1),
+                "{:?} {:?}",
+                heard.stderr,
+                heard.log
+            );
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["completed"]);
+        }
+
+        /// The control: the same session with no refusal, asking for the
+        /// quick confirm, gets the quick confirm, and nothing is said.
+        #[test]
+        fn a_session_with_no_refusal_confirms_as_asked() {
+            let f = make_fixture();
+            let mut store = lbp_store();
+            let (outcome, f) = execute(f, &mut store);
+            let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+            assert!(refusals(&f.conn).is_empty());
+            let ((), heard) =
+                crate::progress::heard::during(|| confirm_asking_quick(&f, sealed, &mut store));
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["quick"]);
+            assert_eq!(heard.count("ADR-0012 item 186"), (0, 0));
+        }
+
+        /// Item 186 across a restart: two refusals left the session
+        /// `interrupted`; the session `volume resume` continues is rebuilt
+        /// from the catalog alone (nothing of the first run's memory), and
+        /// its confirm, asked quick, is the full one.
+        #[test]
+        fn a_resume_after_two_refusals_confirms_in_full_unasked() {
+            let f = make_fixture();
+            let mut store = lbp_store()
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1))
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2));
+            let (outcome, f) = execute(f, &mut store);
+            let ExecuteOutcome::Interrupted(interrupted) = outcome else {
+                panic!("expected Interrupted");
+            };
+            drop(interrupted);
+            assert_eq!(
+                refusals(&f.conn),
+                [refusal(SLICE_1, true), refusal(SLICE_2, false)],
+                "the second refusal is recorded too"
+            );
+            let rehydrated = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+                .unwrap()
+                .expect("an interrupted session to resume");
+            let ResumeOutcome::Ready(ready) = rehydrated
+                .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("expected Ready after the resume");
+            };
+            let sealed = ready.seal_with_retry(&f.conn, &mut store).unwrap();
+            confirm_asking_quick(&f, sealed, &mut store);
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["full"]);
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["completed"]);
+        }
+
+        /// Item 186's case: the drive reported a refusal of slice_1's block
+        /// late, in slice_2's write, and the store cannot tell where the
+        /// drive stopped. Nothing is retried and nothing marks slice_1, which
+        /// the catalog still records `written`. The resume of that session,
+        /// rebuilt from the catalog, asks for the quick confirm and gets the
+        /// full one.
+        #[test]
+        fn a_resume_after_a_refusal_the_store_could_not_place_confirms_in_full() {
+            let f = make_fixture();
+            let mut store = PositionUnknown(
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2)),
+            );
+            let Fixture {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                inputs: _,
+                _slices_dir,
+                _session_dir,
+            } = f;
+            let planned = built
+                .into_validated(&keys, SliceCheck::Size, &mut store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap();
+            let outcome = planned
+                .execute_checking(&conn, &mut store, || false)
+                .unwrap();
+            let ExecuteOutcome::Interrupted(interrupted) = outcome else {
+                panic!("expected Interrupted");
+            };
+            let reason = interrupted.reason().unwrap().to_string();
+            assert!(
+                reason.contains("cannot tell where the drive stopped"),
+                "{reason}"
+            );
+            drop(interrupted);
+            assert!(retries(&conn).is_empty(), "nothing was retried");
+            assert_eq!(
+                slice_statuses(&conn),
+                ["written", "pending"],
+                "nothing marks slice_1"
+            );
+            assert_eq!(refusals(&conn), [refusal(SLICE_2, false)]);
+
+            let rehydrated = InterruptedSession::rehydrate(&conn, volume_id)
+                .unwrap()
+                .expect("an interrupted session to resume");
+            let ResumeOutcome::Ready(ready) = rehydrated
+                .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("expected Ready after the resume");
+            };
+            let sealed = ready.seal_with_retry(&conn, &mut store).unwrap();
+            let f = Fixture2 {
+                conn,
+                keys,
+                volume_id,
+                _slices_dir,
+                _session_dir,
+            };
+            confirm_asking_quick(&f, sealed, &mut store);
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["full"]);
+        }
+
+        /// A `MemStore` that notes every file it reads, and has a signal
+        /// arrive right after it reads `stop_after`.
+        struct ReadsNoted {
+            inner: MemStore,
+            stop_after: Option<u32>,
+            reads: Vec<u32>,
+        }
+
+        impl Store for ReadsNoted {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                self.inner.early_warning()
+            }
+            fn protection(&self) -> Protection {
+                self.inner.protection()
+            }
+            fn logical_position(&mut self) -> Result<Option<u64>> {
+                self.inner.logical_position()
+            }
+            fn arm_read_check(&mut self) -> Result<bool> {
+                self.inner.arm_read_check()
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.reads.push(position);
+                let r = self.inner.read_file(position, sink);
+                if self.stop_after == Some(position) {
+                    crate::signal::interrupt_this_thread(true);
+                }
+                r
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+            fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+                self.inner.reposition_at_most(file_index)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.inner.eod_at_or_before(position)
+            }
+            fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                self.inner.files_on_medium()
+            }
+        }
+
+        /// Item 186 with #410: the full readback a refusal made of a confirm
+        /// asked quick, stopped by a signal after file 5, is continued by the
+        /// confirm of the `volume resume` that follows, asked quick too: the
+        /// files it read back clean are not read again, and both record
+        /// `full`.
+        #[test]
+        fn a_full_readback_a_refusal_made_and_a_signal_stopped_is_continued_by_the_resume() {
+            const K: u32 = 5;
+            let f = make_fixture();
+            let mut store =
+                lbp_store().with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SLICE_2));
+            let (outcome, f) = execute(f, &mut store);
+            let sealed = ready(outcome).seal_with_retry(&f.conn, &mut store).unwrap();
+            let mut store = ReadsNoted {
+                inner: store,
+                stop_after: Some(K),
+                reads: Vec::new(),
+            };
+            let r = sealed.confirm(&f.conn, &mut store, Tier::write_confirm(false));
+            crate::signal::interrupt_this_thread(false);
+            assert!(
+                matches!(r, Err(TapectlError::Interrupted(_))),
+                "the first confirm stops on the signal: {:?}",
+                r.err()
+            );
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["full"]);
+            let checkpointed: Vec<u32> = f
+                .conn
+                .prepare("SELECT position FROM readback_checkpoints ORDER BY position")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(checkpointed, [0, 1, 2, 4, 5], "positive control");
+
+            // What the startup sweep does for a process that stopped
+            // mid-confirm.
+            f.conn
+                .execute(
+                    "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                    params![f.volume_id],
+                )
+                .unwrap();
+            store.stop_after = None;
+            let pending = match InterruptedSession::rehydrate(&f.conn, f.volume_id)
+                .unwrap()
+                .expect("resumable")
+                .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            {
+                ResumeOutcome::Confirming(p) => p,
+                _ => panic!("expected Confirming on this session's own sealed tape"),
+            };
+            store.reads.clear();
+            match pending
+                .confirm(&f.conn, &mut store, Tier::write_confirm(false))
+                .unwrap()
+            {
+                ConfirmOutcome::Sealed(_) => {}
+                ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+                ConfirmOutcome::Inconclusive(i) => {
+                    panic!("inconclusive: {:?}", i.evidence.mismatches)
+                }
+            }
+            assert_eq!(verify_types(&f.conn, f.volume_id), ["full", "full"]);
+            for p in checkpointed {
+                assert!(
+                    !store.reads.contains(&p),
+                    "file {p} read back clean before: {:?}",
+                    store.reads
+                );
+            }
+            assert!(
+                (K + 1..SEAL).all(|p| store.reads.contains(&p)),
+                "the files after {K} are read back: {:?}",
+                store.reads
+            );
+            assert_eq!(statuses_on(&f.conn, f.volume_id), ["completed"]);
+        }
+
+        /// Every refusal is recorded where the session meets it, retried or
+        /// not: in the execute loop, at the seal, in the re-send before a
+        /// retried seal, at a seal after the run's one retry, and one whose
+        /// position no file of the run holds.
+        #[test]
+        fn every_refusal_the_session_meets_is_recorded() {
+            for (ats, want) in [
+                (
+                    vec![
+                        LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1),
+                        LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2),
+                    ],
+                    vec![refusal(SLICE_1, true), refusal(SLICE_2, false)],
+                ),
+                (
+                    vec![
+                        LbpRefusalAt::deferred(SLICE_2, 0, SEAL),
+                        LbpRefusalAt::deferred(SEAL, 0, SEAL),
+                    ],
+                    vec![refusal(SEAL, true), refusal(SEAL, false)],
+                ),
+                (
+                    vec![
+                        LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1),
+                        LbpRefusalAt::deferred(SEAL, 0, SEAL),
+                    ],
+                    vec![refusal(SLICE_1, true), refusal(SEAL, false)],
+                ),
+                (
+                    vec![LbpRefusalAt::deferred(SLICE_1, 1_000, SLICE_1)],
+                    vec![refusal(SLICE_1, false)],
+                ),
+            ] {
+                let f = make_fixture();
+                let mut store = lbp_store();
+                for at in &ats {
+                    store = store.with_lbp_refusal(*at);
+                }
+                let (outcome, f) = execute(f, &mut store);
+                if let ExecuteOutcome::Ready(ready) = outcome {
+                    let _ = ready.seal_with_retry(&f.conn, &mut store);
+                }
+                assert_eq!(refusals(&f.conn), want, "{ats:?}");
+                let on_volume: i64 = f
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE action = 'write_lbp_refusal'
+                         AND entity_type = 'volume' AND entity_id = ?1",
+                        params![f.volume_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(on_volume as usize, want.len(), "on the volume: {ats:?}");
+            }
+        }
+
+        /// The re-send before a retried seal: the seal's write surfaced a
+        /// refusal of slice_2's block, the session returned to slice_2, and
+        /// the drive refused slice_2's first block again as it was re-sent
+        /// (counted from the open, re-sent blocks too). Both are recorded.
+        #[test]
+        fn a_refusal_in_the_resend_before_a_retried_seal_is_recorded() {
+            let f = make_fixture();
+            let blocks_through_slice_2: u64 = f.built.layout.entries[..SEAL as usize]
+                .iter()
+                .map(|e| e.on_tape_bytes(BS).unwrap() / BS)
+                .sum();
+            let mut store = lbp_store()
+                .with_lbp_refusal(LbpRefusalAt::deferred(SLICE_2, 0, SEAL))
+                .with_lbp_corrupt_blocks(&[blocks_through_slice_2 + 1]);
+            let (outcome, f) = execute(f, &mut store);
+            assert!(
+                refusals(&f.conn).is_empty(),
+                "positive control: nothing refused before the seal"
+            );
+            let err = match ready(outcome).seal_with_retry(&f.conn, &mut store) {
+                Err(e) => e,
+                Ok(_) => panic!("a refusal in the re-send must not seal"),
+            };
+            assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+            assert_eq!(retries(&f.conn), ["9"], "the seal's refusal was retried");
+            assert_eq!(
+                refusals(&f.conn),
+                [refusal(SEAL, true), refusal(SLICE_2, false)]
             );
         }
 
