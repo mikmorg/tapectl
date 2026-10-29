@@ -42,7 +42,7 @@ See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every stage
 Enable verbose output
 .TP
 \fB\-\-full\-confirm\fR
-See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
+See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR\-0012 item 186)
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/

@@ -177,7 +177,10 @@ pub enum VolumeCommands {
         /// default (ADR-0012, 2026-10-06): the confirm then reads the front
         /// index and the seal marker, and a passing one seals the volume
         /// with no full readback recorded — `audit` and `report
-        /// verify-status` name it until `volume verify` runs one.
+        /// verify-status` name it until `volume verify` runs one. A session
+        /// in which the drive refused a write with Logical Block Protection
+        /// armed confirms in full regardless, with or without this flag
+        /// (ADR-0012 item 186).
         #[arg(long)]
         full_confirm: bool,
         /// Keep the staged slices after the write seals and confirms, even
@@ -280,7 +283,9 @@ pub enum VolumeCommands {
         /// are not read again, as long as the front index on the tape is
         /// the one they were checked against. Without this flag the resume
         /// runs the quick confirm and the readback is left to `volume
-        /// verify`.
+        /// verify`. A session in which the drive refused a write with Logical
+        /// Block Protection armed, in any run, confirms in full regardless
+        /// (ADR-0012 item 186).
         #[arg(long)]
         full_confirm: bool,
         /// See `volume write --keep-staging`: the staged slices stay even

@@ -69,7 +69,7 @@ Full\-hash every staged slice from disk before the tape moves (tri\-layer L1). O
 Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012). The pre\-write check refuses a layout above the ceiling and names by how much
 .TP
 \fB\-\-full\-confirm\fR
-After sealing, read every file back and hash it against the front index (tri\-layer L3, hours on a full cartridge). Off by default (ADR\-0012, 2026\-10\-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify\-status` name it until `volume verify` runs one
+After sealing, read every file back and hash it against the front index (tri\-layer L3, hours on a full cartridge). Off by default (ADR\-0012, 2026\-10\-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify\-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR\-0012 item 186)
 .TP
 \fB\-\-keep\-staging\fR
 Keep the staged slices after the write seals and confirms, even when every unit written has reached its copy floor. Without this flag the staging is released then; release it later with `tapectl staging clean`

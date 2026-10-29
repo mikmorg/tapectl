@@ -61,7 +61,10 @@ impl Tier {
 
     /// The tier a write session's post-seal confirm runs at: navigable
     /// unless `full_confirm` (`--full-confirm`, on every command that
-    /// writes a tape).
+    /// writes a tape). This is the caller's ask: the session's confirm
+    /// raises it to [`Tier::Integrity`] when the drive refused a write of
+    /// that session with Logical Block Protection armed, in any run
+    /// (ADR-0012 item 186, `volume::session`'s `tier_after_lbp_refusals`).
     ///
     /// ADR-0012, 2026-10-06 item 1 (issue #387), reversing the 2026-07-22
     /// seal-time default (`v2-open-questions.md` §1.2/§2.4): the full
