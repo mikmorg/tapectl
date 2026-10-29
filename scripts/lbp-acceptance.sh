@@ -34,12 +34,15 @@
 #                LBA-0003's data:
 #                the drive refuses the block, the session writes on from the start of the file
 #                holding the first block it did not take (item 174: a write_lbp_retry event and
-#                the session log's line), seals, and the full readback passes. dmesg and the log
-#                pages are recorded around it.
+#                the session log's line), seals, and the full readback passes. The position is
+#                READ POSITION's short form on the sg node (item 185), and the refusal is one
+#                write_lbp_refusal event (item 186). dmesg and the log pages are recorded around it.
 #   4 second     the hook given A and then every block from B to C: the drive refuses A, item
 #                174 writes on once from its file's start, and a block of B..C, sent again or
 #                later in the retry, is refused a second time: the session is left interrupted
-#                (exit 4), and `volume resume` completes it. B needs slack past A: every block
+#                (exit 4), and `volume resume` completes it: two write_lbp_refusal events, and the
+#                resume's confirm, run without --full-confirm, is the full readback (item 186).
+#                B needs slack past A: every block
 #                sent counts, and the real drive reports a refusal a few blocks after the block
 #                (st and the drive write behind), so a listed block sent before the first
 #                refusal surfaced is spent inside it, not in the retry. Hence a range, B..C,
@@ -243,7 +246,8 @@ a release one; about $(( (SIZE_A + SIZE_B + SIZE_C) / GiB )) GiB a volume):
   3 refusal     $LABEL3 with the test hook mid-data: the drive refuses one block, item 174's
                 retry writes on from the file's start, the volume seals and reads back. ~5 min
   4 second      $LABEL4 with the hook at A and A+64..A+320: the drive refuses twice in one
-                run; the session is left interrupted; volume resume seals it.          ~5 min
+                run; the session is left interrupted; volume resume seals it and reads
+                every file back without --full-confirm (item 186).                    ~8 min
   5 crash       $LABEL5's write killed mid-way: the page left armed; the heir's reads fail with
                 I/O errors; volume identify clears it; volume resume completes the write. ~5 min
   6 verify      volume verify $LABEL5 --full with LBP_R.                                ~2 min
@@ -957,6 +961,10 @@ else
         WHERE e.entity_type = 'volume' AND e.action = 'write_lbp_retry' AND v.label = ?" "$LABEL3" > "$STEP_DIR/retry-events.tsv"
     [ "$(wc -l < "$STEP_DIR/retry-events.tsv")" = 1 ] || fail "write3: $(wc -l < "$STEP_DIR/retry-events.tsv") write_lbp_retry event(s) for $LABEL3, want exactly one"
     log "  item 174: the retry wrote on from tape file $(cut -f1 "$STEP_DIR/retry-events.tsv"): $(cut -f2 "$STEP_DIR/retry-events.tsv")"
+    dbq "$DB" "SELECT e.new_value, e.details FROM events e JOIN volumes v ON v.id = e.entity_id
+        WHERE e.entity_type = 'volume' AND e.action = 'write_lbp_refusal' AND v.label = ?" "$LABEL3" > "$STEP_DIR/refusal-events.tsv"
+    [ "$(wc -l < "$STEP_DIR/refusal-events.tsv")" = 1 ] || fail "write3: $(wc -l < "$STEP_DIR/refusal-events.tsv") write_lbp_refusal event(s) for $LABEL3, want exactly one (item 186)"
+    log "  item 186: the refusal recorded: $(tr '\t' ' ' < "$STEP_DIR/refusal-events.tsv")"
     expect_write_lbp write3 "$LABEL3"
 fi
 dmesg > "$STEP_DIR/dmesg-after.txt" 2>&1 || echo "dmesg needs privilege here" > "$STEP_DIR/dmesg-after.txt"
@@ -985,8 +993,14 @@ else
         WHERE e.entity_type = 'volume' AND e.action = 'write_lbp_retry' AND v.label = ?" "$LABEL4" > "$STEP_DIR/retry-events.tsv"
     [ "$(wc -l < "$STEP_DIR/retry-events.tsv")" = 1 ] || fail "write4: $(wc -l < "$STEP_DIR/retry-events.tsv") write_lbp_retry event(s) for $LABEL4, want exactly one (one retry, then interrupted)"
     log "  the first refusal's retry: $(tr '\t' ' ' < "$STEP_DIR/retry-events.tsv")"
+    dbq "$DB" "SELECT e.new_value, e.details FROM events e JOIN volumes v ON v.id = e.entity_id
+        WHERE e.entity_type = 'volume' AND e.action = 'write_lbp_refusal' AND v.label = ?" "$LABEL4" > "$STEP_DIR/refusal-events.tsv"
+    [ "$(wc -l < "$STEP_DIR/refusal-events.tsv")" = 2 ] || fail "write4: $(wc -l < "$STEP_DIR/refusal-events.tsv") write_lbp_refusal event(s) for $LABEL4, want exactly two (item 186)"
+    log "  item 186: the refusals recorded: $(tr '\t\n' '  ' < "$STEP_DIR/refusal-events.tsv")"
     run resume4 0 tctl --json --yes volume resume "$LABEL4" --device "$TAPE_DEV" --keep-staging
     [ "$(status_of "$LABEL4")" = sealed ] || fail "$LABEL4 is '$(status_of "$LABEL4")' after the resume, not sealed"
+    [ "$(last_verify_of "$DB" "$LABEL4")" = "full"$'\t'"passed" ] || fail "$LABEL4's resume confirmed '$(last_verify_of "$DB" "$LABEL4")' without --full-confirm: item 186 wants a passed full readback after a refusal"
+    session_says resume4 "(ADR-0012 item 186)" || fail "resume4: the session log does not say why the confirm reads every file back (item 186)"
     expect_write_lbp resume4 "$LABEL4"
     cp -a "$DB" "$RUN/catalog-after-write4.db"
     end_step

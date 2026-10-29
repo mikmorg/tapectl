@@ -371,7 +371,11 @@ Rules that hold in every path:
   diff the front index against the Layout (navigable tier); hash each file
   against the front index's `sha256_encrypted` (integrity tier). A write's
   confirm runs the navigable tier by default and the integrity tier only
-  under `--full-confirm` (ADR-0012, amendment 2026-10-06 item 1, #387); a
+  under `--full-confirm` (ADR-0012, amendment 2026-10-06 item 1, #387), or
+  when the drive refused a write with Logical Block Protection armed in any
+  run of the session: a `write_lbp_refusal` event on the volume makes every
+  confirm of it the integrity tier, because a refusal is reported late and a
+  file before the one being written can be short (ADR-0012 item 186). A
   passing navigable confirm seals, and the volume's full readback is then
   owed to `volume verify` — `audit` and `report verify-status` name every
   sealed volume without one. The exact
