@@ -40,7 +40,9 @@ use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 ///
 /// There is no `Default`: the two callers default differently, and each
 /// says which it means. `volume verify` is full unless `--quick`; a write's
-/// confirm is quick unless `--full-confirm` ([`Tier::write_confirm`]).
+/// confirm is quick unless `--full-confirm` ([`Tier::write_confirm`]), or
+/// unless the drive refused a write with LBP armed in the session (ADR-0012
+/// item 186), which makes it full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Navigable,
