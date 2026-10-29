@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.8.0 (ADR-0012 item 183), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance runs on the 1.8.0 candidate first). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.8.0 (ADR-0012 item 183), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -42,7 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
-| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); then the LBP acceptance on the 1.8.0 candidate, the `v1.8.0` tag, and the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183) | **you** (the cartridge and the drive for the LBP run; sudo for the install); the coordinator copies the build to home2 and tags between |
+| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183) | **you** (sudo for the install, and returning the test cartridge first) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -476,7 +476,14 @@ with a debug build of `f66d0ff1` (item 177). It **passed every step** on 2026-10
 the install: return the test cartridge to the pool, remove the run's work directory and start
 the drive-poll timer again, as that record's "Afterwards" says.
 
-**Then the LBP acceptance on the 1.8.0 candidate, before the tag** (item 183).
+**Then the LBP acceptance on the 1.8.0 candidate, before the tag: done** (item 183). The first
+full run (2026-10-28) failed step 3, because item 174 could not read the HP's position through st
+(items 185 and 186 are the fix). The second, on a debug build of `d3b7068d`, **passed every step**
+on 2026-10-29 (`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`), and `v1.8.0` is tagged on
+`d3b7068d`. The tagged build passed the migration check on a read-only copy of home2's catalog.
+Before the install: return the test cartridge to the pool and start the drive-poll timer again,
+as that record's "Afterwards" says. What follows is how the acceptance was run, kept for the next
+one.
 - **The build:** the coordinator copies a static musl debug build of the candidate to home2
   (`~/tapectl-1.8.0-<sha>/`), with its sha256 and the acceptance script and `lbp.py` beside it.
   It is never put on `PATH` or in a production home.

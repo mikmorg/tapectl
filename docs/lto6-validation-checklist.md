@@ -425,6 +425,10 @@ which tapectl checks. `scripts/lbp-acceptance.sh` proves it on the test cartridg
 throwaway homes. `--print-plan` prints the operator's part and the drive time without touching
 anything.
 
+**Run on home2 for 1.8.0** (`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`): R1 answered YES
+(2026-10-28). The first full run failed step 3 on the HP's READ POSITION (items 185 and 186). The
+second, on `d3b7068d`, passed every step (2026-10-29).
+
 **R1 comes first, because it decides item 175's switch.** Production's tapes were written
 without LBP. If the HP returns no valid CRC for such blocks when LBP_R is armed, 1.7.2 cannot
 verify or restore them with LBP_R, and item 175's fallback applies: LBP_R only for the confirm

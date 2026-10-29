@@ -404,7 +404,7 @@ tapectl's half of #498 (item 180): a streamed restore feeds dar one stream on it
 never a named pipe per slice. `dar::slice::stream_template` takes the stream's header from the
 installed dar, `Join` puts slice 1's labels in it and strips and checks each slice's header and
 trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never tagged on its own
-(item 183): it ships in 1.8.0, whose candidate runs the real-drive LBP acceptance, R1 first.
+(item 183): it ships in 1.8.0, whose real-drive LBP acceptance passed on 2026-10-29.
 
 **1.8.0: RESTORE.sh feeds dar one stream** (`docs/releases/1.8.0.md`; ADR-0012 items 181-183,
 #498). It contains 1.7.2, and the minor moves because RESTORE.sh changed: its golden pin moved
@@ -429,10 +429,12 @@ before dar closes anything; run the container's heir suite as `--user 1000:1000`
 its pipe quota, keeps 8 KiB pipes and hides it); that is `late_damage`'s NOTE, repeated by `late_notes`,
 and the per-file check decides the restore. tapectl's own streamed restore names `--spool` when
 its dar's header is unknown. The span proofs' `CAP94` follows File 2's size (74 blocks; the
-control has about three blocks of margin). home2 installs 1.8.0 straight from 1.5.0 by handoff (h), after the LBP
-acceptance on the candidate; `v1.8.0` is tagged only on its PASS. The first full run (2026-10-28,
-`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`) failed step 3 because item 174 could not read the HP's
-position through st; items 185 and 186 are the fix, and the full run goes again on their candidate.
+control has about three blocks of margin). The LBP acceptance on home2
+(`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`): the first full run (2026-10-28) failed step 3
+because item 174 could not read the HP's position through st; items 185 and 186 are the fix, and the
+second full run, on `d3b7068d`, passed every step on 2026-10-29, the drive refusing and tapectl
+retrying on the HP. 1.8.0 is tagged `v1.8.0` on `d3b7068d`; home2 installs it straight from 1.5.0
+by handoff (h).
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
