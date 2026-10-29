@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) takes it from 1.5.0 straight to 1.8.0 (ADR-0012 item 183), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -42,7 +42,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
-| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183) | **you** (sudo for the install, and returning the test cartridge first) |
+| (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183): **done 2026-10-29** | **you** (sudo for the install, and returning the test cartridge first) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -452,6 +452,13 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
 
 ## (h) Upgrade home2 to 1.8.0, with spanning off
 
+**Done 2026-10-29: home2 runs `tapectl 1.8.0 (v1.8.0, 2026-10-29)`.** The operator ran steps 1 to
+8 below as one script, and step 7's rehearsal was GREEN 53/53 with LBP on every block
+(`docs/runs/2026-10-29-1.8.0-handoff-h.md`). **One thing is left for you (sudo):** since (f)
+the daily catalog backup has gone to `/var/backups/tapectl`, on the catalog's own disk, not the
+profile's `/srv/local_backup/tapectl`. `scripts/first-run.sh --profile
+contrib/hosts/home2.profile --from 14 --to 14` puts it back. The run record has the cause.
+
 **home2 goes from 1.5.0 straight to 1.8.0; do not install 1.7.x** (ADR-0012 item 183). 1.8.0
 contains 1.6.0 (the short seal: (g)'s upgrade never ran), 1.7.0 (spanning), 1.7.1 (per-location
 copy targets), 1.7.2 (Logical Block Protection) and RESTORE.sh's one stream for dar (#498):
@@ -521,7 +528,8 @@ is tagged:
    volume info L6-0001` reads `not recorded` for its write check.
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive, as in (f)
    step 7, now with LBP armed: `volume info` of the volume it writes shows the drive checked
-   every block. Stop the drive-poll timer for it.
+   every block. Stop the drive-poll timer for it. **Done 2026-10-29, GREEN 53/53** on the v1.8.0
+   binary: its volume reads "Write check: Logical Block Protection on every block".
 8. **Regenerate the Heir Kit** with the installed binary, as in (f) step 8. RESTORE.sh and File
    1 moved, and once a span tape exists the kit's copy of tapectl must read it. The cover sheet
    says what `dar extraction failed (exit 0)` means on L6-0001 and L6-0002, whose RESTORE.sh
@@ -648,5 +656,7 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   clean`. On 1.1.1 the write that completes the policy releases staging itself otherwise.
 - **The on-tape authorizations of 1.2.0, 1.3.0, 1.4.0 and 1.5.0 end when v1.5.0 is installed**
   (ADR-0012 items 72, 81, 104, 105 and 109; the 2026-10-07 one ended with the v1.1.0 install, item 40). After it, a failing
-  `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin. 1.6.0's (item 116) ends
-  when v1.6.0 is installed on home2, and 1.7.0's (item 135) when v1.7.0 is.
+  `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin. 1.6.0's (item 116) was to end
+  when v1.6.0 was installed on home2, and 1.7.0's (item 135) when v1.7.0 was. home2 installed
+  neither; both ended with the 1.8.0 install on 2026-10-29, which contains them. 1.8.0's own
+  (items 181 and 184) ended at the `v1.8.0` tag.

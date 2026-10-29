@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.5.0 (handoff (f)).
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -347,7 +347,7 @@ debug build of the fixed commit, and the tapes already written are not rewritten
 guide and the Heir Kit's cover sheet give the way (keepsake's tapes carry 1.1.0's RESTORE.sh, which
 has no `--slices-from`; item 178's fact correction). The re-run passed every step on 2026-10-26/27
 (`docs/runs/2026-10-26-1.7.0-span-acceptance.md`), and 1.7.0 is tagged `v1.7.0` on `f66d0ff1`; home2
-still runs 1.5.0 and goes straight to 1.8.0 (item 183). Item 147 (#492) aligns item 94's start
+went from 1.5.0 straight to 1.8.0 (item 183). Item 147 (#492) aligns item 94's start
 with its own text in a 1.7.x patch.
 
 **1.7.1: per-location copy targets and auto-stage** (`docs/releases/1.7.1.md`; ADR-0012 items
@@ -371,7 +371,7 @@ Item 26's shared-place warning judges where a moved tape goes (`--for-location X
 `volume::write::WriteScope` carries the destination beside the `StagedScope`, and
 `coverage::copy_distinctness_at` takes it; `stage for-location`'s plan runs the same check.
 1.7.1 is tagged `v1.7.1` after the whole chain passed on the tree rebased onto `v1.7.0` (2026-10-27);
-home2, still on 1.5.0, skips it for 1.8.0 (item 183).
+home2 skipped it for 1.8.0 (item 183).
 
 **1.7.2: Logical Block Protection** (`docs/releases/1.7.2.md`; ADR-0012 items 161-166, 174, 175;
 #388). A patch: no byte on tape changes, and the CRC never reaches the medium. tapectl arms the
@@ -433,8 +433,8 @@ control has about three blocks of margin). The LBP acceptance on home2
 (`docs/runs/2026-10-28-1.8.0-lbp-acceptance.md`): the first full run (2026-10-28) failed step 3
 because item 174 could not read the HP's position through st; items 185 and 186 are the fix, and the
 second full run, on `d3b7068d`, passed every step on 2026-10-29, the drive refusing and tapectl
-retrying on the HP. 1.8.0 is tagged `v1.8.0` on `d3b7068d`; home2 installs it straight from 1.5.0
-by handoff (h).
+retrying on the HP. 1.8.0 is tagged `v1.8.0` on `d3b7068d`; home2 has run it since 2026-10-29,
+installed straight from 1.5.0 by handoff (h) (`docs/runs/2026-10-29-1.8.0-handoff-h.md`).
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
