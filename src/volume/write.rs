@@ -23447,7 +23447,7 @@ mod tests {
             assert_eq!(lbp_retries(&conn), ["3"], "positive control: one retry");
             assert_eq!(
                 lbp_refusals_of(&conn, volume_id),
-                [r#"{"refused_in": 5, "retried": true}"#]
+                [r#"{"refused_in": 5, "retry_due": true}"#]
             );
             assert_eq!(verify_types_of(&conn, volume_id), ["full"]);
             assert_eq!(
@@ -23497,8 +23497,8 @@ mod tests {
             assert_eq!(
                 lbp_refusals_of(&conn, volume_id),
                 [
-                    r#"{"refused_in": 5, "retried": true}"#,
-                    r#"{"refused_in": 5, "retried": false}"#
+                    r#"{"refused_in": 5, "retry_due": true}"#,
+                    r#"{"refused_in": 5, "retry_due": false}"#
                 ]
             );
             assert!(

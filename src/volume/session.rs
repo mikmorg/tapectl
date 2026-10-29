@@ -2711,15 +2711,16 @@ impl ReadyToSeal {
         };
         let planned = planned_seal_position(&self.built.layout)?;
         let seal_at = self.ending.seal_position(planned);
-        // ADR-0012 item 186: every refusal the seal meets is recorded on the
-        // volume before the session goes on, retried or not.
+        // ADR-0012 item 186: every refusal the seal meets is on the volume
+        // the moment it is met, before item 174 asks the drive's position,
+        // demotes or repositions.
         let label = &self.built.layout.label;
+        record_lbp_refusal(conn, self.volume_id, label, seal_at, !self.lbp_retried)?;
         if self.lbp_retried {
             // The run's one retry (item 174) went to an earlier refusal.
-            record_lbp_refusal(conn, self.volume_id, label, seal_at, false)?;
             return Err(first);
         }
-        let retried = retry_from_refusal(
+        let from = retry_from_refusal(
             conn,
             store,
             &self.built.layout,
@@ -2727,9 +2728,8 @@ impl ReadyToSeal {
             &self.write_ids,
             self.run_first_position,
             seal_at,
-        );
-        record_lbp_refusal(conn, self.volume_id, label, seal_at, retried.is_ok())?;
-        let from = retried.map_err(|why| {
+        )
+        .map_err(|why| {
             TapectlError::LbpRefusal(format!(
                 "the seal at tape file {seal_at}: {} It was not retried: {why}. \
                  {CHECK_THE_DRIVE_PATH}",
@@ -3046,20 +3046,23 @@ fn retry_from_refusal(
 }
 
 /// ADR-0012 item 186 (#388): record on the volume that the drive refused the
-/// write of tape file `refused_in` with Logical Block Protection armed, and
-/// whether item 174's retry was made for it, before the session goes on —
-/// retried, left `interrupted` or returned as an error. The event, never
-/// memory, is what makes this session's confirm the full one, and that of
-/// every `volume resume` of it ([`tier_after_lbp_refusals`]). A catalog busy
-/// past its budget is an error here, as every other write of the session is.
+/// write of tape file `refused_in` with Logical Block Protection armed, the
+/// moment the session meets the refusal: before item 174 asks the drive's
+/// position (READ POSITION), demotes or repositions, so a process killed in
+/// any of those still leaves the record. `retry_due` is whether this run's
+/// one retry was still unspent then, known exactly here; whether the retry
+/// was made is `write_lbp_retry`'s event. The event, never memory, is what
+/// makes this session's confirm the full one, and that of every `volume
+/// resume` of it ([`tier_after_lbp_refusals`]). A catalog busy past its
+/// budget is an error here, as every other write of the session is.
 fn record_lbp_refusal(
     conn: &Connection,
     volume_id: i64,
     label: &str,
     refused_in: u32,
-    retried: bool,
+    retry_due: bool,
 ) -> Result<()> {
-    let details = format!("{{\"refused_in\": {refused_in}, \"retried\": {retried}}}");
+    let details = format!("{{\"refused_in\": {refused_in}, \"retry_due\": {retry_due}}}");
     busy::retry(BusyPolicy::DEFAULT, "the LBP refusal's event", || {
         crate::db::events::log_event(
             conn,
@@ -3106,8 +3109,8 @@ fn tier_after_lbp_refusals(conn: &Connection, volume_id: i64, asked: Tier) -> Re
 /// a refusal, a staged file that cannot be read, a hash that no longer
 /// matches — is returned, the session left resumable; the file it stopped
 /// in stays `pending`. A refusal is recorded on `volume_id` first
-/// ([`record_lbp_refusal`], ADR-0012 item 186): it is the run's second, so
-/// it is not retried.
+/// ([`record_lbp_refusal`], ADR-0012 item 186), its retry not due: the
+/// re-send is the run's one retry.
 fn resend_entries(
     conn: &Connection,
     store: &mut dyn Store,
@@ -4179,6 +4182,19 @@ fn run_entries(
                 entry.position
             ))),
         };
+        // ADR-0012 item 186: a refusal is on the volume the moment the
+        // session meets it, before item 174 asks the drive's position,
+        // demotes or repositions, so a process killed in any of those still
+        // leaves the record that makes the confirm the full one.
+        if matches!(verdict, Verdict::Failed(TapectlError::LbpRefusal(_))) {
+            record_lbp_refusal(
+                conn,
+                volume_id,
+                &built.layout.label,
+                entry.position as u32,
+                !retried,
+            )?;
+        }
 
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
             let write_id = *slice_write_id
@@ -4296,15 +4312,6 @@ fn run_entries(
                         .position(|e| e.position as u32 == from)
                         .ok_or_else(|| format!("tape file {from} is not one this session writes"))
                 });
-                // ADR-0012 item 186: the refusal is on the volume before the
-                // session writes on or stops.
-                record_lbp_refusal(
-                    conn,
-                    volume_id,
-                    &built.layout.label,
-                    entry.position as u32,
-                    retry.is_ok(),
-                )?;
                 match retry {
                     Ok(from_index) => {
                         // The files it sends again count toward the phase
@@ -4345,15 +4352,6 @@ fn run_entries(
                 // drive's position says so, those files are not whole on the
                 // tape either, and resume writes them again.
                 if matches!(verdict, Verdict::Failed(TapectlError::LbpRefusal(_))) {
-                    // ADR-0012 item 186: the run's second refusal, on the
-                    // volume before anything else.
-                    record_lbp_refusal(
-                        conn,
-                        volume_id,
-                        &built.layout.label,
-                        entry.position as u32,
-                        false,
-                    )?;
                     if let Some(from) = locate_refused_file(
                         store,
                         &built.layout,
@@ -13269,9 +13267,10 @@ mod tests {
         }
 
         /// A refusal event's details: the tape file whose write the drive
-        /// refused, and whether item 174's retry was made for it.
-        fn refusal(refused_in: u32, retried: bool) -> String {
-            format!("{{\"refused_in\": {refused_in}, \"retried\": {retried}}}")
+        /// refused, and whether the run's one retry (item 174) was still
+        /// unspent when the session met it.
+        fn refusal(refused_in: u32, retry_due: bool) -> String {
+            format!("{{\"refused_in\": {refused_in}, \"retry_due\": {retry_due}}}")
         }
 
         /// The tier each of the volume's confirms recorded, in order.
@@ -13478,7 +13477,11 @@ mod tests {
                 ["written", "pending"],
                 "nothing marks slice_1"
             );
-            assert_eq!(refusals(&conn), [refusal(SLICE_2, false)]);
+            assert_eq!(
+                refusals(&conn),
+                [refusal(SLICE_2, true)],
+                "the retry was due; `write_lbp_retry` says it was not made"
+            );
 
             let rehydrated = InterruptedSession::rehydrate(&conn, volume_id)
                 .unwrap()
@@ -13639,10 +13642,11 @@ mod tests {
             assert_eq!(statuses_on(&f.conn, f.volume_id), ["completed"]);
         }
 
-        /// Every refusal is recorded where the session meets it, retried or
-        /// not: in the execute loop, at the seal, in the re-send before a
-        /// retried seal, at a seal after the run's one retry, and one whose
-        /// position no file of the run holds.
+        /// Every refusal is recorded where the session meets it, its retry
+        /// due or not: in the execute loop, at the seal, at a seal after the
+        /// run's one retry, and one whose position no file of the run holds
+        /// (its retry was due and could not be made). The re-send's is
+        /// [`a_refusal_in_the_resend_before_a_retried_seal_is_recorded`].
         #[test]
         fn every_refusal_the_session_meets_is_recorded() {
             for (ats, want) in [
@@ -13669,7 +13673,7 @@ mod tests {
                 ),
                 (
                     vec![LbpRefusalAt::deferred(SLICE_1, 1_000, SLICE_1)],
-                    vec![refusal(SLICE_1, false)],
+                    vec![refusal(SLICE_1, true)],
                 ),
             ] {
                 let f = make_fixture();
@@ -13724,6 +13728,139 @@ mod tests {
                 refusals(&f.conn),
                 [refusal(SEAL, true), refusal(SLICE_2, false)]
             );
+        }
+
+        /// A `MemStore` that answers the drive's position `answers` times,
+        /// then panics when it is asked again.
+        struct PositionPanics {
+            inner: MemStore,
+            answers: u32,
+        }
+
+        const POSITION_ASKED: &str = "the test double: the drive's position was asked";
+
+        impl Store for PositionPanics {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                self.inner.early_warning()
+            }
+            fn protection(&self) -> Protection {
+                self.inner.protection()
+            }
+            fn logical_position(&mut self) -> Result<Option<u64>> {
+                if self.answers == 0 {
+                    panic!("{POSITION_ASKED}");
+                }
+                self.answers -= 1;
+                self.inner.logical_position()
+            }
+            fn arm_read_check(&mut self) -> Result<bool> {
+                self.inner.arm_read_check()
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+            fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+                self.inner.reposition_at_most(file_index)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.inner.eod_at_or_before(position)
+            }
+            fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                self.inner.files_on_medium()
+            }
+        }
+
+        /// Item 186's order: a refusal is on the volume before the session
+        /// asks the drive where it stopped, so a process killed in item
+        /// 174's READ POSITION, demote or reposition still leaves the
+        /// record. The double panics at the position it is not to answer,
+        /// standing in for that kill; the event is already in the catalog.
+        /// In the execute loop's retry and its second refusal, and at the
+        /// seal's first refusal and its second.
+        #[test]
+        fn a_refusal_is_recorded_before_the_drives_position_is_asked() {
+            for (ats, answers, want) in [
+                (
+                    vec![LbpRefusalAt::deferred(SLICE_2, 0, SLICE_2)],
+                    0,
+                    vec![refusal(SLICE_2, true)],
+                ),
+                (
+                    vec![
+                        LbpRefusalAt::deferred(SLICE_1, 0, SLICE_1),
+                        LbpRefusalAt::deferred(SLICE_1, 0, SLICE_2),
+                    ],
+                    1,
+                    vec![refusal(SLICE_1, true), refusal(SLICE_2, false)],
+                ),
+                (
+                    vec![LbpRefusalAt::deferred(SLICE_2, 0, SEAL)],
+                    0,
+                    vec![refusal(SEAL, true)],
+                ),
+                (
+                    vec![
+                        LbpRefusalAt::deferred(SLICE_2, 0, SEAL),
+                        LbpRefusalAt::deferred(SEAL, 0, SEAL),
+                    ],
+                    1,
+                    vec![refusal(SEAL, true), refusal(SEAL, false)],
+                ),
+            ] {
+                let f = make_fixture();
+                let mut inner = lbp_store();
+                for at in &ats {
+                    inner = inner.with_lbp_refusal(*at);
+                }
+                let mut store = PositionPanics { inner, answers };
+                let Fixture {
+                    conn,
+                    built,
+                    keys,
+                    units,
+                    volume_id,
+                    ..
+                } = f;
+                let planned = built
+                    .into_validated(&keys, SliceCheck::Size, &mut store)
+                    .unwrap()
+                    .plan(&conn, volume_id, &units)
+                    .unwrap();
+                let killed =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match planned.execute_checking(&conn, &mut store, || false) {
+                            Ok(ExecuteOutcome::Ready(ready)) => {
+                                let _ = ready.seal_with_retry(&conn, &mut store);
+                            }
+                            Ok(_) => {}
+                            Err(e) => panic!("execute: {e}"),
+                        }
+                    }));
+                let payload = killed.expect_err("positive control: the position was asked");
+                let said = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(said, POSITION_ASKED, "{ats:?}");
+                assert_eq!(refusals(&conn), want, "{ats:?}");
+            }
         }
 
         /// A refusal's text runs into the advice as one sentence each: the

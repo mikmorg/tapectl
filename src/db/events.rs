@@ -4,10 +4,12 @@ use crate::error::Result;
 
 /// The action of the event a write session logs on its volume each time the
 /// drive refuses a write with Logical Block Protection armed, at the moment
-/// the session meets it: in the execute loop, at the seal or in the re-send
-/// before a retried seal, retried or not (#388, ADR-0012 item 186). Its
-/// details name the tape file whose write was refused and whether item 174's
-/// retry was made for it: `{"refused_in": 9, "retried": true}`.
+/// the session meets it, before item 174 asks the drive's position: in the
+/// execute loop, at the seal or in the re-send before a retried seal (#388,
+/// ADR-0012 item 186). Its details name the tape file whose write was refused
+/// and whether the run's one retry was still unspent then:
+/// `{"refused_in": 9, "retry_due": true}`. Whether the retry was made is the
+/// `write_lbp_retry` event's.
 pub const WRITE_LBP_REFUSAL: &str = "write_lbp_refusal";
 
 /// Whether the drive refused a write with Logical Block Protection armed in
