@@ -408,7 +408,7 @@ trailer, and `dar::restore::SequentialExtract` owns dar's stdin. 1.7.2 is never 
 
 **1.8.0: RESTORE.sh feeds dar one stream** (`docs/releases/1.8.0.md`; ADR-0012 items 181-183,
 #498). It contains 1.7.2, and the minor moves because RESTORE.sh changed: its golden pin moved
-under item 181, then again under item 184 (a fix before the tag), and nothing else on tape did
+under item 181, then twice under item 184 (fixes before the tag; `a5dc4063…` ships), and nothing else on tape did
 (`requires` and every other pin hold).
 RESTORE.sh's `stream_unit` joins a unit's slices back into the `dar -c -` stream and writes it into
 one FIFO that `dar -x -` reads; the script holds it open as fd 3 across slices and cartridge swaps,
