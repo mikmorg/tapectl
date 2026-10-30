@@ -231,6 +231,13 @@ fn a_backup_dir_with_an_ampersand_is_refused() {
 /// home's filesystem is on disk `sda` and one under `/proc` is on
 /// `backup_disk`. Issue #502.
 fn install(args: &[&str], installed: Option<&str>, backup_disk: &str) -> (i32, String, TempDir) {
+    let unit = installed.map(|d| format!("[Service]\nEnvironment=TAPECTL_BACKUP_DIR={d}\n"));
+    install_over(args, unit.as_deref(), backup_disk)
+}
+
+/// [`install`] over an installed `tapectl-backup.service` whose whole text is
+/// `unit` (none when `None`).
+fn install_over(args: &[&str], unit: Option<&str>, backup_disk: &str) -> (i32, String, TempDir) {
     let dir = TempDir::new().unwrap();
     let bin = dir.path().join("bin");
     let units = dir.path().join("units");
@@ -261,12 +268,8 @@ case "$s" in
 esac"#
         ),
     );
-    if let Some(installed) = installed {
-        std::fs::write(
-            units.join("tapectl-backup.service"),
-            format!("[Service]\nEnvironment=TAPECTL_BACKUP_DIR={installed}\n"),
-        )
-        .unwrap();
+    if let Some(unit) = unit {
+        std::fs::write(units.join("tapectl-backup.service"), unit).unwrap();
     }
     let me = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
     let path = format!(
@@ -386,4 +389,60 @@ fn the_same_disk_under_two_filesystems_is_warned() {
     assert!(!out.contains("WARNING"), "{out}");
     // The negative's positive control: both paths were resolved to disks.
     assert_eq!(calls(&dir).matches("lsblk ").count(), 2, "{}", calls(&dir));
+}
+
+/// ADR-0012 item 191: a re-run that replaces an installed unit names each
+/// `Environment=` line of it that the render drops (a setting added by hand),
+/// and says to move it to a drop-in. The positive control is the same run over
+/// a unit without such a line: it re-renders that unit too (the `install`
+/// line), and names nothing. A line whose variable the render sets to another
+/// value (the backup directory, moved by `--backup-dir`) is this script's
+/// option changing, not a setting dropped.
+#[test]
+fn a_reinstall_names_the_environment_lines_it_drops() {
+    let hand = "Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/506-test";
+    let unit = format!(
+        "[Service]\nEnvironment=HOME=/elsewhere\nEnvironment=TAPECTL_BACKUP_DIR=/srv/old-backups\n{hand}\n"
+    );
+    let rerender = "install -D -m 0644";
+    let (code, out, _dir) = install_over(
+        &["--dry-run", "--backup-dir", "/srv/old-backups"],
+        Some(&unit),
+        "sdb",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains(&format!("sets {hand}, which this install drops: move it to a drop-in (sudo systemctl edit tapectl-backup.service), which a reinstall leaves alone")),
+        "{out}"
+    );
+    assert_eq!(out.matches("which this install drops").count(), 1, "{out}");
+    assert!(out.contains(rerender), "{out}");
+
+    // Moved by --backup-dir: the old directory's line is not a dropped setting.
+    let (code, out, _dir) = install_over(
+        &["--dry-run", "--backup-dir", "/srv/new-backups"],
+        Some(&unit),
+        "sdb",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !out.contains("TAPECTL_BACKUP_DIR=/srv/old-backups, which"),
+        "{out}"
+    );
+    assert_eq!(out.matches("which this install drops").count(), 1, "{out}");
+
+    let plain =
+        "[Service]\nEnvironment=HOME=/elsewhere\nEnvironment=TAPECTL_BACKUP_DIR=/srv/old-backups\n";
+    let (code, out, _dir) = install_over(
+        &["--dry-run", "--backup-dir", "/srv/old-backups"],
+        Some(plain),
+        "sdb",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.contains(rerender) && l.ends_with("tapectl-backup.service")),
+        "the unit is re-rendered: {out}"
+    );
+    assert!(!out.contains("which this install drops"), "{out}");
 }

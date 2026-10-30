@@ -30,7 +30,11 @@
 # (`tapectl`, home /var/lib/tapectl); this script rewrites User=, HOME=,
 # TAPECTL_BACKUP_DIR=, TAPECTL_BACKUP_KEEP= and ReadWritePaths= for the
 # options given, so the INSTALLED copies are always consistent with each
-# other. Edit them by re-running this script, not by hand.
+# other. Edit them by re-running this script, not by hand. A setting of your
+# own (a healthcheck URL, TAPECTL_BACKUP_INCLUDE_KEYS) belongs in a drop-in,
+# `sudo systemctl edit <unit>`, which a re-run leaves alone; a re-run that would
+# replace an installed unit names each Environment= line it would drop
+# (ADR-0012 item 191).
 #
 # Tape-command priority (issue #432, ADR-0012 2026-10-15 item 58): the drive
 # wants an even feed, and a host that is busy elsewhere starves it. Priority can
@@ -369,9 +373,27 @@ fi
 for s in "${SCRIPTS[@]}"; do
   if same_as "$LIBDIR/$s" "$SRC/$s"; then ok "$LIBDIR/$s unchanged"; else as_root install -D -m 0755 "$SRC/$s" "$LIBDIR/$s"; fi
 done
+# dropped_env INSTALLED RENDERED: one note per Environment= line of the installed
+# unit that the render drops (ADR-0012 item 191): a setting added by hand, such as
+# a healthcheck URL or TAPECTL_BACKUP_INCLUDE_KEYS, which the reinstall replaces.
+# A line whose variable the render sets to another value is this script's own
+# option changing (--backup-dir, --keep, --tapectl), not a setting dropped.
+dropped_env() {
+  local inst="$1" rend="$2" u line name
+  u="$(basename "$inst")"
+  [ -r "$inst" ] || return 0
+  while IFS= read -r line; do
+    grep -qxF -- "$line" "$rend" && continue
+    name="${line#Environment=}"; name="${name#\"}"; name="${name%%=*}"
+    grep -E "^Environment=\"?${name}=" "$rend" >/dev/null && continue
+    note "the installed $inst sets $line, which this install drops: move it to a drop-in (sudo systemctl edit $u), which a reinstall leaves alone"
+  done < <(grep '^Environment=' "$inst" || true)
+  return 0
+}
 CHANGED=0
 for u in "${UNITS[@]}"; do
-  if same_as "$UNITDIR/$u" "$TMP/$u"; then ok "$UNITDIR/$u unchanged"; else as_root install -D -m 0644 "$TMP/$u" "$UNITDIR/$u"; CHANGED=1; fi
+  if same_as "$UNITDIR/$u" "$TMP/$u"; then ok "$UNITDIR/$u unchanged"
+  else dropped_env "$UNITDIR/$u" "$TMP/$u"; as_root install -D -m 0644 "$TMP/$u" "$UNITDIR/$u"; CHANGED=1; fi
 done
 if [ "$WRAPPER" = 1 ] && [ "$SVC_USER" = "$(id -un)" ]; then
   note "the service user is you — no $WRAPPER_PATH (it would sudo to yourself)"; WRAPPER=0
