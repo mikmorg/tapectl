@@ -721,7 +721,7 @@ ok "rustc $(rustc --version | awk '{print $2}'), cargo $(cargo --version | awk '
 hdr 2 "Runtime tools"
 skip_if || {
 explain <<'EOF'
-tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages, the cartridge's MAM and, from 1.7.2, the drive's Logical Block Protection page (`sg_modes`, `sg_wr_mode`). `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 11. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
+tapectl shells out to `dar` for every archive (a hard dependency, >= 2.6, 2.7.20+ recommended) and to `mt` and the sg3-utils for drive control, health pages, the cartridge's MAM and, from 1.7.2, the drive's Logical Block Protection page (`sg_modes`, `sg_wr_mode`). `age` is not used by the binary itself — it uses the rage crate — but the on-tape RESTORE.sh, the heir path, needs it, and so does the rehearsal in step 12. `setfacl` (package acl) grants the service user read on your data in step 11. `lsscsi` and `python3` are for step 6 and the lifecycle suite.
 EOF
 MISSING=()
 for t in mt sg_read_attr sg_logs sg_modes sg_wr_mode setfacl python3 lsscsi; do command -v "$t" >/dev/null 2>&1 || MISSING+=("$t"); done
@@ -741,9 +741,15 @@ EOF
   if confirm "Install age v1.3.2 from the upstream GitHub release into /usr/local/bin now?"; then
     AGE_TAG="v1.3.2"
     AGE_URL="https://github.com/FiloSottile/age/releases/download/${AGE_TAG}/age-${AGE_TAG}-linux-amd64.tar.gz"
+    # sha256 of that tarball (#506), as home2-prep.sh pins its dar: its age and
+    # age-keygen are byte for byte the ones installed on home2. A new AGE_TAG needs a new pin.
+    AGE_SHA256="cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
     TMPD="$(mktemp -d)"
-    run bash -c "curl -fsSL '$AGE_URL' | tar -xz -C '$TMPD'" || die "download failed — check the tag at https://github.com/FiloSottile/age/releases"
-    run sudo install -m 0755 "$TMPD/age/age" "$TMPD/age/age-keygen" /usr/local/bin/
+    run curl -fsSL -o "$TMPD/age.tar.gz" "$AGE_URL" || { rm -rf "$TMPD"; die "download failed — check the tag at https://github.com/FiloSottile/age/releases"; }
+    echo "$AGE_SHA256  $TMPD/age.tar.gz" | sha256sum -c - \
+      || { rm -rf "$TMPD"; die "the downloaded age tarball does not match the pinned sha256 ($AGE_SHA256) — not installing it"; }
+    if ! { mkdir "$TMPD/x" && tar -xzf "$TMPD/age.tar.gz" -C "$TMPD/x"; }; then rm -rf "$TMPD"; die "could not unpack the age tarball"; fi
+    run sudo install -m 0755 "$TMPD/x/age/age" "$TMPD/x/age/age-keygen" /usr/local/bin/
     rm -rf "$TMPD"
     run age --version
   else note "continuing without age — the step-12 rehearsal will be unavailable until it is installed"; fi
@@ -761,7 +767,7 @@ hdr 3 "Build tapectl"
 skip_if || {
 if [ "$SKIP_BUILD" = 1 ]; then note "--skip-build"; else
 explain <<'EOF'
-Production runs the RELEASE binary: the same source with optimisation on, and it matters here — staging hashes and encrypts every byte, and a debug build does that roughly ten times slower than release (a 20 GiB stage took 19 minutes on the release binary on this host, 2026-09-23; the debug attempt was abandoned). A release binary of master a51b744 passed the real-drive rehearsal on 2026-09-23 (lifecycle first-year with TAPECTL_BIN, 47/47 on the HP LTO-6, run-20260923-213608), so the build is a proven artifact — but the one you build now is a new one, which is why step 12 rehearses it on a test cartridge before step 13 trusts it with data. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
+Production runs the RELEASE binary: the same source with optimisation on, and it matters here — staging hashes and encrypts every byte, and a debug build does that roughly ten times slower than release (a 20 GiB stage took 19 minutes on the release binary on this host, 2026-09-23; the debug attempt was abandoned). Whatever an earlier build proved, the binary you build now is a new artifact, which is why step 12 rehearses it on a test cartridge before step 13 trusts it with data. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
 EOF
 if confirm "Build the release binary now (cargo build --release; a few minutes)?"; then
   toolchain_check
@@ -782,7 +788,7 @@ hdr 4 "The ungated test suite"
 skip_if || {
 if [ "$SKIP_TESTS" = 1 ]; then note "--skip-tests"; else
 explain <<'EOF'
-`cargo test` runs about 1,960 tests that need no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
+`cargo test` runs the ungated suite (about 4,600 tests), which needs no tape and no mhvtl — only dar. It proves this machine's dar, filesystem and toolchain behave the way the suite expects. Two to three minutes.
 EOF
 if confirm "Run cargo test now?"; then toolchain_check; ( cd "$REPO" && PATH="$(dar_path_prefix)$PATH" run flock -w 1200 -E 99 "$BUILD_LOCK" cargo test </dev/null ) || die "the suite is red on this machine (exit 99 = timed out waiting for the build lock) — stop here and look"; ok "suite green"; fi
 fi
@@ -847,7 +853,7 @@ fi
 [ -e "$DEVICE" ] || die "$DEVICE does not exist"
 NST="$(readlink -f "$DEVICE")"; NSTN="$(basename "$NST")"
 if [ -z "$SG" ]; then
-  SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1)"
+  SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1 || true)"
   [ -n "$SGN" ] && SG="/dev/$SGN"
   ask SG "matching SCSI-generic node (for health and MAM)" "$SG"
   SG_DEF="${SGN:+/dev/$SGN}"
@@ -1091,6 +1097,11 @@ EOF
     else
       note "could not run \`tapectl status\` as $USER with group $OPS_GROUP from here — after your next login, run it once; a \"permission denied\" names the directory that still blocks the group"
     fi
+    # The check above gives itself the group (setpriv), so it passes in a shell
+    # that does not have it. Say when this one does not (#506, handoff (h)).
+    if svc_in_group "$USER" "$OPS_GROUP" && ! { id -nG 2>/dev/null || true; } | tr ' ' '\n' | grep -x "$OPS_GROUP" >/dev/null; then
+      note "$USER is in $OPS_GROUP, but this shell is not: it started before the membership (tmux keeps its server's groups). Log in again, or restart tmux, for a plain \`tapectl status\`; until then: sg $OPS_GROUP -c 'tapectl status'"
+    fi
   else
     note "no group $OPS_GROUP — the session logs stay readable by $SVC_USER only"
   fi
@@ -1196,6 +1207,15 @@ if [ -f "$KIT_OUT/COVER.txt" ] && ! confirm "A kit already exists in $KIT_OUT �
 fi
 note "Print: $KIT_OUT/COVER.txt   (and/or open $KIT_OUT/escrow-kit.html and print)"
 note "Seal in tamper-evident envelopes; two failure domains; refresh after each write session."
+# Another kit left under your home (2026-10-20: a profile-less run wrote one to
+# ~/heir-kit) carries an older tapectl, which may not read newer tapes. A note only.
+KIT_REAL="$(realpath -m "$KIT_OUT" 2>/dev/null || printf '%s' "$KIT_OUT")"
+while IFS= read -r other; do
+  [ -n "$other" ] || continue
+  od="$(dirname "$other")"
+  [ "$(realpath -m "$od" 2>/dev/null || printf '%s' "$od")" = "$KIT_REAL" ] && continue
+  note "another Heir Kit is in $od ($other): its tapectl may not read newer tapes (1.5.0's refuses every tape written from 1.6.0 on). Once the kit in $KIT_OUT is printed and in the envelopes, remove that one."
+done < <(find "$HOME" -maxdepth 2 -name COVER.txt 2>/dev/null || true)
 }
 
 # ================================================================ step 10
