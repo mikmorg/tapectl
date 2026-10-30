@@ -10,14 +10,14 @@ the repository, grouped by what you are trying to do.
 |---|---|
 | [Walkthrough](walkthrough.md) | One complete session with real output: init, tenants, units, two tapes in two places, audit, restore, the Heir Kit, a disaster-recovery rehearsal. **Start here.** |
 | [Concepts](concepts.md) | The model: tenants, units, collections, snapshots and versions, stage sets, volumes and cartridges, locations, copies and policy, what is on a tape. |
-| [Install](install.md) | The installer (`scripts/first-run.sh`) step by step, host profiles, the service user, timers, reinstalling, moving hosts, uninstalling. |
+| [Install](install.md) | The installer (`scripts/first-run.sh`) step by step, host profiles, the service user, timers, reinstalling, moving hosts, [upgrading in place](install.md#10-upgrading-in-place), uninstalling. |
 | [Operator guide](operator-guide.md) | Day-to-day operation: archiving, second copies, restores, tape-only units, retiring and compacting volumes, cartridge tracking, warehouse copies, the maintenance cadence. |
 | [Configuration](configuration.md) | Every `config.toml` key with its default, the per-unit `.tapectl-unit.toml`, archive sets and policy resolution, environment variables. |
 | [Keys and recovery](keys-and-recovery.md) | Primary, backup and escrow keys; who can decrypt what; the Heir Kit; restoring with tapectl, with only a key and a tape, and rebuilding a lost catalog. |
 | [Troubleshooting](troubleshooting.md) | Exit codes, how confirmation works, and every refusal you are likely to meet — what it means and what to do. |
 | [Command reference](cli/README.md) | Every command, subcommand and flag, generated from the binary's own definitions. |
 | [Man pages](man/README.md) | The same reference as `man` pages (`man -l docs/man/tapectl.1`). |
-| [Release notes](releases/) | What each release changes for an operator: on-tape format, catalog migrations, exit codes, config keys, known open items ([1.1.0](releases/1.1.0.md), [1.1.1](releases/1.1.1.md), [1.1.2](releases/1.1.2.md), [1.2.0](releases/1.2.0.md), [1.3.0](releases/1.3.0.md), [1.4.0](releases/1.4.0.md), [1.5.0](releases/1.5.0.md), [1.6.0](releases/1.6.0.md), [1.7.0](releases/1.7.0.md), [1.7.1](releases/1.7.1.md)). |
+| [Release notes](releases/) | What each release changes for an operator: on-tape format, catalog migrations, exit codes, config keys, known open items ([1.1.0](releases/1.1.0.md), [1.1.1](releases/1.1.1.md), [1.1.2](releases/1.1.2.md), [1.2.0](releases/1.2.0.md), [1.3.0](releases/1.3.0.md), [1.4.0](releases/1.4.0.md), [1.5.0](releases/1.5.0.md), [1.6.0](releases/1.6.0.md), [1.7.0](releases/1.7.0.md), [1.7.1](releases/1.7.1.md), [1.7.2](releases/1.7.2.md), never tagged on its own and contained in [1.8.0](releases/1.8.0.md)). Read them from your version to the target before [an upgrade](install.md#10-upgrading-in-place). |
 
 ## The tape format and the design
 
@@ -37,6 +37,7 @@ the repository, grouped by what you are trying to do.
 
 | Document | What it covers |
 |---|---|
+| [Development](development.md) | Building and testing from a checkout: the checks to run before a commit, the suites that need a virtual tape library and what each needs, the plaintext scan, the installer's re-entry acceptance, a map of the code. |
 | [Lifecycle suite](lifecycle-suite.md) | Simulating years of use in minutes on a virtual library (or, carefully, a real drive). |
 | [LTO-6 validation checklist](lto6-validation-checklist.md) | The procedure for validating a real drive. |
 | [Profiling an LTO drive](lto-profiling.md) | Measuring a drive and a test cartridge with `scripts/lto-profile.sh`, and the `[[backends.lto]]` block it emits. |
