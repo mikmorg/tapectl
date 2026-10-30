@@ -129,8 +129,9 @@ output of every command.
   escrow secret — and by the installer's rehearsal.
 - Staging space for one tape's worth of data (up to 2.5 TB for a full LTO-6).
 - Rust 1.94.1 to build (pinned in `rust-toolchain.toml`).
-- The guided installer expects a **Debian/Ubuntu host with `sudo`**. It checks for the
-  tools above and offers to install them with `apt`.
+- The guided installer expects a **Debian/Ubuntu host with `sudo`**. It checks for
+  `dar`, `mt-st`, `sg3-utils`, `acl`, `python3` and `lsscsi` and offers to install
+  them with `apt`, and offers `age` from its upstream release.
 
 ## Install
 

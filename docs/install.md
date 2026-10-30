@@ -90,7 +90,7 @@ one, add its `--profile`; it usually sets `DEVICE` and `BACKUP_DIR` already):
 scripts/first-run.sh --device /dev/tape/by-id/scsi-<SERIAL>-nst   # skip the interactive pick
 scripts/first-run.sh --backup-dir /mnt/backup/tapectl               # the second disk (step 14)
 scripts/first-run.sh --from 7 --device /dev/tape/by-id/scsi-<SERIAL>-nst          # resume at step 7
-scripts/first-run.sh --from 12 --to 12 --device /dev/tape/by-id/scsi-<SERIAL>-nst  # just the rehearsal
+scripts/first-run.sh --from 12 --to 12 --device /dev/tape/by-id/scsi-<SERIAL>-nst  # just the rehearsal (it pauses the drive-poll timer)
 scripts/first-run.sh --no-service-user                              # run tapectl as yourself (single-user box)
 ```
 
@@ -845,14 +845,16 @@ wrapper (step 14). On a host without a profile, leave `--profile` out. `<old>` a
 6. **Step 14 again.** It re-renders the timers and `tapectl-op` for the new
    checkout, and reports each installed file `unchanged` when nothing moved. Your
    own settings are safe in their drop-ins (§7), and the script names any
-   `Environment=` line of an installed unit that its render would drop.
+   `Environment=` line of an installed unit that its render would drop. A host
+   without a profile whose backups go somewhere other than the default passes
+   `--backup-dir <that directory>` too, or the step refuses (§7, #502).
    ```bash
    scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 14 --to 14
    ```
 7. **Look.** A new `audit` check may report something that was always true; the
    notes say what to expect.
    ```bash
-   tapectl status
+   tapectl-op status
    tapectl-op audit
    ```
 8. **Rehearse before the next write.** Step 12 proves the new binary on the drive,
