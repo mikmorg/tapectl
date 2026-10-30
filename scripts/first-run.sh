@@ -13,7 +13,8 @@
 #    5  the SERVICE USER: a nologin `tapectl` account owns the keys, catalog and staging;
 #       every tapectl command from here on runs as it (sudo -u tapectl -H)
 #    6  find the tape drive BY SERIAL and confirm the service user can open it
-#    7  initialise the tapectl home — mints the escrow identity (paper ready);
+#    7  initialise the tapectl home — mints the escrow identity (paper ready;
+#       under --auto only with --mint-escrow), or adopts ESCROW_PUBLIC_KEY;
 #       with ADOPT_KEYS_FROM, the operator adopts its existing key instead of minting
 #    8  register the drive as a backend, by-id path, generation from the
 #       drive's INQUIRY product id (never from the loaded cartridge)
@@ -24,6 +25,7 @@
 #   12  rehearsal on a TEST cartridge with the INSTALLED binary (erases it —
 #       serial required; runs as YOU). Ruled required before the first write
 #       (ADR-0012, 2026-09-23): a different binary is a different artifact.
+#       It stops tapectl-drive-poll.timer for the rehearsal and starts it again.
 #   13  the first production tape: snapshot → stage → init → write → verify
 #   14  the systemd timers (weekly audit, daily catalog backup to a second
 #       disk) and the /usr/local/bin/tapectl-op wrapper, via
@@ -51,20 +53,20 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- arguments
-HOME_DIR=""            # tapectl home; empty = the real default (~/.tapectl)
-FROM=0
-TO=99
+# The variables below are the PROFILE VARIABLES: a --profile file may set them,
+# and flags given on the command line still win. The state only a flag sets
+# (--auto, --from, --to, --no-service-user, --mint-escrow, and which values came
+# from a flag) is declared AFTER the profile is sourced, so a profile that sets
+# one is refused by name like any other unknown variable (see PROFILE_VARS).
+HOME_DIR=""            # tapectl home; empty = the real default (the service user's ~/.tapectl)
 TAPECTL=""             # binary; resolved in step 0 unless given
-AUTO=0                 # accept defaults for non-destructive prompts
 DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; TEST_BARCODE=""; DGEN=""
-LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
 SKIP_BUILD=0; SKIP_TESTS=0
-SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
+SVC_USER="tapectl"
 # Step 14: where the daily `db backup` copies go. Empty = not chosen: step 14 then
 # passes no --backup-dir, and install-systemd.sh takes its default on a first
 # install but refuses to move a directory an installed unit already names (#502).
 BACKUP_DIR=""
-BACKUP_DIR_DEFAULT="/var/backups/tapectl"   # install-systemd.sh's, for the text below
 # Host-specific defaults. A --profile file (contrib/hosts/*.profile) sets these;
 # flags given on the command line still win. Empty = the built-in behaviour.
 WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
@@ -87,7 +89,7 @@ TAPE_NICE=-10          # step 13: the nice value this run raises ITSELF to, once
 TAPE_IONICE="-c2 -n0"  # the ionice arguments that go with it (best-effort, level 0). Empty = no I/O priority change.
 ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
                        # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
-                       # (or, under --auto, mint).
+                       # (under --auto: refuse, unless --mint-escrow is on the command line; ADR-0012 item 188).
 ERASE_LABEL=""         # step 13: set by --erase-label ONLY, never by a profile (#469): the File 0 label (or, for a
                        # tape tapectl did not write, the chip serial) of a SEALED tape step 13 may `cartridge erase`
                        # under --auto when `volume init` refuses it. Empty = ask interactively, and never erase
@@ -98,16 +100,77 @@ ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identit
 # CONTENDER_UNITS is left UNSET here on purpose: unset means "this VM's homorg
 # timers" (the historical default, step 13); a profile that declares it — even
 # as () — replaces that list.
-PROFILE=""
+# The documented set: every variable a profile may set. The script reads each of
+# them; a profile that sets any other name (a typo such as STAGING_JOB) is refused
+# by name before anything runs (#506). ERASE_LABEL is not in it, and is not
+# refused either: a profile's value is only reported as not used (#469, step 13).
+PROFILE_VARS=(
+  HOME_DIR TAPECTL SKIP_BUILD SKIP_TESTS SVC_USER SVC_HOME_WANT WORK_DIR DAR_BIN
+  DEVICE SG DGEN OPERATOR ESCROW_PUBLIC_KEY ADOPT_KEYS_FROM STAGING_DIR STAGING_JOBS
+  VERIFY_INTERVAL_DAYS CONTENDER_PROCESSES OPS_GROUP KIT_OUT LOCATIONS LOCATION
+  TENANTS TENANT UNIT_PATH COLLECTIONS TEST_BARCODE LABEL CONTENDER_UNITS
+  TAPE_NICE TAPE_IONICE BACKUP_DIR
+)
 # The profile is sourced BEFORE the flags are parsed, so every flag overrides it.
+# --profile none runs with no profile at all (ADR-0012 item 187).
+PROFILE=""; PROFILE_GIVEN=0; _help=0
 for ((i = 1; i <= $#; i++)); do
-  if [ "${!i}" = "--profile" ]; then j=$((i + 1)); PROFILE="${!j:-}"; fi
+  case "${!i}" in
+    --profile) j=$((i + 1)); PROFILE="${!j:-}"; PROFILE_GIVEN=1 ;;
+    -h | --help) _help=1 ;;
+  esac
 done
-if [ -n "$PROFILE" ]; then
+[ "$PROFILE_GIVEN" = 0 ] || [ -n "$PROFILE" ] || { echo "--profile needs a file (or the word none)" >&2; exit 2; }
+if [ "$PROFILE_GIVEN" = 0 ]; then _logged_profile="unset"
+elif [ "$PROFILE" = none ]; then _logged_profile="none"
+elif [ -r "$PROFILE" ]; then PROFILE="$(realpath "$PROFILE")"; _logged_profile="$PROFILE"
+else _logged_profile="$PROFILE"; fi
+# Item 187: every run's first line in first-run.log says how it was invoked (the
+# arguments carry no secret: keys are passed as paths or PUBLIC keys), with
+# which profile, from which commit. Before the profile is read, so a run it
+# refuses is recorded too.
+if [ "$_help" = 0 ]; then
+  _state="${XDG_STATE_HOME:-$HOME/.local/state}/tapectl"
+  mkdir -p "$_state" || { echo "cannot create $_state (first-run.log's directory)" >&2; exit 2; }
+  _args=""; [ "$#" -eq 0 ] || _args="$(printf ' %q' "$@")"
+  printf '%s first-run.sh%s profile=%s git=%s\n' "$(date -u +%FT%TZ)" "$_args" "$_logged_profile" \
+    "$(git -C "$(dirname "$0")/.." describe --always --dirty 2>/dev/null || echo unknown)" >>"$_state/first-run.log"
+fi
+if [ "$PROFILE_GIVEN" = 1 ] && [ "$PROFILE" != none ]; then
   [ -r "$PROFILE" ] || { echo "--profile $PROFILE is not readable" >&2; exit 2; }
+  _pre_vars="$(compgen -v | LC_ALL=C sort)"
   # shellcheck disable=SC1090
   . "$PROFILE"
+  # Every name the profile brought in must be a profile variable. Names that
+  # existed before it (the environment, the defaults above) are not its to
+  # check; a _-prefixed name is a profile's own helper (home2.profile's
+  # _local_profile), and BASH_* are the shell's.
+  _bad=()
+  while IFS= read -r _n; do
+    case "$_n" in _* | BASH_*) continue ;; esac
+    case " ${PROFILE_VARS[*]} " in *" $_n "*) continue ;; esac
+    _bad+=("$_n")
+  done < <(LC_ALL=C comm -13 <(printf '%s\n' "$_pre_vars") <(compgen -v | LC_ALL=C sort))
+  if [ "${#_bad[@]}" -gt 0 ]; then
+    for _n in "${_bad[@]}"; do
+      case "$_n" in
+        MINT_ESCROW) echo "--profile $PROFILE sets MINT_ESCROW: minting an escrow identity is consent, given on the command line only (--mint-escrow), never by a profile (ADR-0012 item 188)" >&2 ;;
+        *) echo "--profile $PROFILE sets $_n, which is not a profile variable: a typo, or a setting this script does not read" >&2 ;;
+      esac
+    done
+    echo "the profile variables are: ${PROFILE_VARS[*]}" >&2
+    exit 2
+  fi
+  unset _pre_vars _bad _n
 fi
+# What only a flag sets, declared after the profile so that a profile cannot.
+FROM=0
+TO=99
+AUTO=0                 # accept defaults for non-destructive prompts
+SVC_MODE=1             # --no-service-user → run tapectl as yourself
+LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
+MINT_ESCROW=0          # --mint-escrow: under --auto, step 7 may mint a new escrow identity (ADR-0012 item 188)
+BACKUP_DIR_DEFAULT="/var/backups/tapectl"   # install-systemd.sh's, for the text below
 # ERASE_LABEL is consent to erase a cartridge holding a SEALED volume, so it is
 # taken from --erase-label only (#469): a word left in a profile is standing
 # consent, and in a run whose catalog is gone (a rebuild, a DR install) it would
@@ -120,14 +183,16 @@ usage() {
   cat <<EOF
 
 Options:
-  --home DIR        tapectl home (default ~/.tapectl). Use a temp dir to rehearse.
-  --from N          start at step N (1-14)
-  --to N            stop after step N (e.g. --to 9: everything up to and including the printed kit)
+  --home DIR        tapectl home (default: the service user's ~/.tapectl, /var/lib/tapectl/.tapectl
+                    for a new account; with --no-service-user, your own ~/.tapectl). Use a temp dir
+                    to rehearse.
+  --from N          start at step N (0-14)
+  --to N            stop after step N (0-14; e.g. --to 9: everything up to and including the printed kit)
   --tapectl PATH    the tapectl binary to use (default: PATH, then target/release, then target/debug)
   --user NAME       the service user that owns and runs tapectl (default: tapectl; created in step 5)
   --no-service-user run tapectl as yourself instead — no account, no ACLs, your ~/.tapectl
   --auto            take defaults for non-destructive prompts (for scripted rehearsal)
-  --device PATH     tape device by-id path (skips the interactive pick in step 5)
+  --device PATH     tape device by-id path (skips the interactive pick in step 6)
   --sg PATH         matching /dev/sgN (derived from sysfs when omitted)
   --generation GEN  the generation this DRIVE natively writes (default asked; e.g. LTO-6)
   --label L         first volume label (default asked; e.g. L6-0001)
@@ -141,8 +206,13 @@ Options:
   --backup-dir DIR  where step 14's daily catalog backup writes (default $BACKUP_DIR_DEFAULT;
                     put it on a SECOND disk). Over installed timers that back up elsewhere,
                     step 14 refuses unless this or the profile names the directory
-  --profile FILE    host defaults (contrib/hosts/<host>.profile): the values below, plus
-                    LOCATIONS, TENANTS, COLLECTIONS and CONTENDER_UNITS lists. Flags override it.
+  --profile FILE    host defaults (contrib/hosts/<host>.profile), shell assignments that flags
+                    override. FILE may set only these variables (any other name is refused):
+$(printf '%s\n' "${PROFILE_VARS[*]}" | fold -s -w 72 | sed 's/ *$//; s/^/                      /')
+                    The host records FILE (\${XDG_STATE_HOME:-~/.local/state}/tapectl/profile), and a
+                    later run without --profile refuses and names it (ADR-0012 item 187)
+  --profile none    run with no profile: the built-in defaults, and the recorded profile is not
+                    used (it stays recorded)
   --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
                     else ~/.cache/tapectl)
   --staging DIR     default for staging.directory in step 7
@@ -158,7 +228,10 @@ Options:
   --escrow-public-key KEY
                     step 7 adopts KEY (age1… or a .pub path) as the escrow identity instead of
                     minting one, so an existing Heir Kit stays valid (ESCROW_PUBLIC_KEY in a profile)
-  --dar PATH        the dar binary: checked in step 2, first on PATH for the step-4 suite,
+  --mint-escrow     step 7 under --auto, on a fresh home with no ESCROW_PUBLIC_KEY: mint a NEW escrow
+                    identity. Without it --auto refuses there: no command replaces an escrow identity
+                    (ADR-0005). A flag only, never a profile: it is consent (ADR-0012 item 188)
+  --dar PATH       the dar binary: checked in step 2, first on PATH for the step-4 suite,
                     written to [dar] binary in step 7 (default: dar on PATH)
   --skip-build      do not build/install (use the resolved binary as-is)
   --skip-tests      skip the ungated test suite
@@ -196,6 +269,7 @@ while [ $# -gt 0 ]; do
     --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
     --escrow-public-key) ESCROW_PUBLIC_KEY="$2"; shift 2 ;;
     --erase-label) ERASE_LABEL="$2"; shift 2 ;;
+    --mint-escrow) MINT_ESCROW=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -208,6 +282,29 @@ esac
 case "$TAPE_IONICE" in
   *[!-0-9\ cn]*) echo "TAPE_IONICE / --tape-ionice takes only ionice's -c CLASS and -n LEVEL (e.g. '-c2 -n0'); got '$TAPE_IONICE'" >&2; exit 2 ;;
 esac
+# The steps are 0-14 (#506). TO's own default, 99, means "to the end".
+for _flag in from to; do
+  if [ "$_flag" = from ]; then _v="$FROM"; else _v="$TO"; fi
+  [ "$_flag" = to ] && [ "$_v" = 99 ] && continue
+  case "$_v" in
+    [0-9] | 1[0-4]) ;;
+    *) echo "--$_flag must be a step number from 0 to 14, got '$_v'" >&2; exit 2 ;;
+  esac
+done
+[ "$FROM" -le "$TO" ] || { echo "--from $FROM comes after --to $TO: no step would run" >&2; exit 2; }
+
+# Item 187: the profile this host was installed with, recorded beside
+# first-run.log. A run that names none while one is recorded would fall back to
+# the built-in defaults without a word (2026-10-20: the Heir Kit went to
+# ~/heir-kit and the catalog backup to the catalog's own disk, #502), so it is
+# refused, naming the record and both ways on. Never loaded silently.
+PROFILE_RECORD="${XDG_STATE_HOME:-$HOME/.local/state}/tapectl/profile"
+RECORDED_PROFILE=""
+[ ! -e "$PROFILE_RECORD" ] || RECORDED_PROFILE="$(head -n 1 "$PROFILE_RECORD" 2>/dev/null || true)"
+if [ "$PROFILE_GIVEN" = 0 ] && [ -n "$RECORDED_PROFILE" ]; then
+  echo "this host was installed with the profile $RECORDED_PROFILE (recorded in $PROFILE_RECORD), and this run names none: without it, the script's built-in defaults would replace the host's (the Heir Kit and backup directories, the ops group, the locations). Re-run with --profile $RECORDED_PROFILE, or with --profile none to run without it" >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------- plumbing
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -249,6 +346,22 @@ note()    { printf '   %s%s%s\n' "$Y" "$*" "$R"; }
 ok()      { printf '   %s✓ %s%s\n' "$G" "$*" "$R"; }
 die()     { printf '   %s✗ %s%s\n' "$RD" "$*" "$R" >&2; exit 1; }
 log()     { mkdir -p "$(dirname "$LOG")"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
+# Item 187: record the profile (its absolute path), or say why none is used.
+if [ "$PROFILE_GIVEN" = 1 ] && [ "$PROFILE" = none ]; then
+  if [ -n "$RECORDED_PROFILE" ]; then
+    note "--profile none: this run uses no profile; the host's recorded profile $RECORDED_PROFILE is not used (it stays recorded)"
+  else
+    note "--profile none: this run uses no profile, only the built-in defaults"
+  fi
+  PROFILE=""
+elif [ "$PROFILE_GIVEN" = 1 ]; then
+  if [ "$RECORDED_PROFILE" != "$PROFILE" ]; then
+    if ! { mkdir -p "$(dirname "$PROFILE_RECORD")" && printf '%s\n' "$PROFILE" >"$PROFILE_RECORD"; }; then
+      die "could not record the profile in $PROFILE_RECORD"
+    fi
+    [ -z "$RECORDED_PROFILE" ] || note "this host's recorded profile was $RECORDED_PROFILE; it is now $PROFILE ($PROFILE_RECORD)"
+  fi
+fi
 # tty_read VAR "prompt": one line from the terminal. -e gives readline, so an
 # arrow key or Home edits the line instead of landing in the answer as an
 # escape sequence; whatever control bytes still arrive (a bracketed paste, a
@@ -385,15 +498,59 @@ derive_nodes() {
   [ -e "$DEVICE" ] || die "$DEVICE does not exist"
   NST="$(readlink -f "$DEVICE")"; NSTN="$(basename "$NST")"
   if [ -z "$SG" ]; then
-    SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1)"
-    [ -n "$SGN" ] && SG="/dev/$SGN"
+    # `|| true` and the `if`: with no sg node bound (the sg module not loaded),
+    # a failed ls under pipefail, or a false `[ ]` as the function's last word,
+    # ended the script under `set -e` without a word (#506).
+    SGN="$(ls "/sys/class/scsi_tape/$NSTN/device/scsi_generic/" 2>/dev/null | head -1 || true)"
+    if [ -n "$SGN" ]; then SG="/dev/$SGN"; fi
   fi
+  return 0
 }
 # tape_lock: the one-tape-user rule every harness honours (the gate, the
 # lifecycle suite, lto6-measure, lto6-fill). Step 13 takes it for its writes;
 # step 12 must NOT (the suite takes it itself, and a parent holding it would
 # deadlock the child -- flock is per open file description).
 tape_lock() { exec 9>/tmp/tapectl-tape.lock; flock -n 9 || die "another process holds the tape lock (/tmp/tapectl-tape.lock) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
+# Item 190: step 12 and the drive poll. A poll during the rehearsal records the
+# test cartridge in the PRODUCTION catalog: the rehearsal's homes are throwaway
+# ones, so the production drive lock never sees it. drive_poll_pause refuses
+# while a poll runs and stops an active timer; drive_poll_resume starts it again,
+# at the end of the step or, through the EXIT trap, on any exit before that. A
+# host without systemd, or without the units (the dev VM), is left alone.
+POLL_TIMER_STOPPED=0
+poll_running() { # the poll service's state when it is running now, else nothing
+  local s; s="$(systemctl is-active tapectl-drive-poll.service 2>/dev/null || true)"
+  # A oneshot unit is "activating" for as long as it runs: is-active --quiet says no then.
+  case "$s" in active | activating | deactivating | reloading) printf '%s' "$s" ;; esac
+}
+drive_poll_pause() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local s; s="$(poll_running)"
+  [ -z "$s" ] || die "tapectl-drive-poll.service is running now ($s: a drive health poll); wait for it to finish (systemctl status tapectl-drive-poll.service), then re-run scripts/first-run.sh --from 12"
+  systemctl is-active --quiet tapectl-drive-poll.timer 2>/dev/null || return 0
+  explain <<'EOF'
+THE DRIVE POLL. tapectl-drive-poll.timer is active on this host: once a day it reads the drive's health pages and chip as the service user and records them in the PRODUCTION catalog. A poll during the rehearsal would record the test cartridge there, so the timer is stopped for the rehearsal and started again when this step ends, whether it succeeds or fails (ADR-0012 item 190).
+EOF
+  confirm "Stop tapectl-drive-poll.timer for the rehearsal (sudo; it is started again when this step ends)?" \
+    || die "the rehearsal needs tapectl-drive-poll.timer stopped (a poll would record the test cartridge in the production catalog); nothing was run. Re-run scripts/first-run.sh --from 12 and answer y"
+  run sudo systemctl stop tapectl-drive-poll.timer || die "could not stop tapectl-drive-poll.timer (above); nothing was run"
+  POLL_TIMER_STOPPED=1
+  trap drive_poll_on_exit EXIT
+  # The timer may have fired between the check above and the stop.
+  s="$(poll_running)"
+  [ -z "$s" ] || die "tapectl-drive-poll.service started just now ($s); wait for it to finish, then re-run scripts/first-run.sh --from 12"
+}
+# drive_poll_resume never fails: it also runs from the EXIT trap, where under
+# `set -e` a failing command would end the trap and replace the exit status.
+drive_poll_resume() {
+  [ "$POLL_TIMER_STOPPED" = 1 ] || return 0
+  POLL_TIMER_STOPPED=0
+  trap - EXIT
+  if run sudo systemctl start tapectl-drive-poll.timer; then ok "tapectl-drive-poll.timer started again"
+  else note "could not start tapectl-drive-poll.timer again: run sudo systemctl start tapectl-drive-poll.timer"; fi
+  return 0
+}
+drive_poll_on_exit() { local rc=$?; drive_poll_resume; return "$rc"; }
 # The DRIVE's own generation, parsed from its INQUIRY product id (issue #178).
 # shellcheck source=lib/drive-generation.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/drive-generation.sh"
@@ -482,7 +639,7 @@ toolchain_check() {
 # ================================================================ step 0
 printf '%stapectl first run%s — repo %s\n' "$B" "$R" "$REPO"
 printf 'home: %s   log: %s\n' "$EFFECTIVE_HOME" "$LOG"
-[ -n "$PROFILE" ] && printf 'profile: %s\n' "$PROFILE"
+if [ -n "$PROFILE" ]; then printf 'profile: %s\n' "$PROFILE"; elif [ "$PROFILE_GIVEN" = 1 ]; then printf 'profile: none\n'; fi
 printf 'work dir: %s   dar: %s\n' "$WORK_DIR" "$DAR"
 printf 'service user: %s\n' "$( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER (every tapectl command runs as it)" || echo "none — running as $USER" )"
 if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
@@ -735,7 +892,9 @@ if as_svc test -e "$EFFECTIVE_HOME/tapectl.db"; then
   # silently stop detecting the day it changes again).
   if ! tc config show >/dev/null 2>&1; then
     note "config.toml exists but this tapectl cannot LOAD it:"
-    tc config check 2>&1 | head -20 | sed 's/^/     /'
+    # `|| true`: config check exits non-zero on this config, and under pipefail
+    # that ended the script here, before the question below (#506).
+    { tc config check 2>&1 || true; } | head -20 | sed 's/^/     /'
     explain <<'EOF'
 The message above names the offending key. If it names a specific table or key
 to delete, that edit is the smallest fix and keeps your backends, collections
@@ -747,6 +906,8 @@ config's [[backends.lto]] and [[collections]] tables are NOT carried over.
 This script re-adds the drive in step 8; any collections must be re-added by
 hand afterwards.
 EOF
+    # Item 189: `confirm` says yes under --auto, and regenerating drops tables.
+    [ "$AUTO" = 1 ] && die "config.toml cannot be loaded (above), and regenerating it drops its [[backends.lto]] and [[collections]] tables, so --auto never does it (ADR-0012 item 189): fix the key named above, or run step 7 interactively (scripts/first-run.sh --from 7, without --auto) to regenerate it"
     if confirm "Back up config.toml and write a fresh default one?"; then
       CFG_BAK="$EFFECTIVE_HOME/config.toml.superseded-$(date +%Y%m%d-%H%M%S)"
       as_svc cp "$EFFECTIVE_HOME/config.toml" "$CFG_BAK" || die "could not back up config.toml"
@@ -778,8 +939,18 @@ This step's output is deliberately NOT written to the log.
 EOF
   ask OPERATOR "operator name" "${OPERATOR:-$USER}"
   ADOPT="$ESCROW_PUBLIC_KEY"
+  # Item 188: an escrow identity can never be replaced (ADR-0005), so --auto
+  # mints one only when the command line says so; a profile cannot (MINT_ESCROW
+  # is not a profile variable).
+  if [ -n "$ADOPT" ] && [ "$MINT_ESCROW" = 1 ]; then
+    die "--mint-escrow and an escrow public key to adopt ($ADOPT, from ESCROW_PUBLIC_KEY or --escrow-public-key) contradict each other: pass one of them. Nothing was created"
+  fi
   if [ -n "$ADOPT" ]; then note "adopting the escrow public key from ESCROW_PUBLIC_KEY: $ADOPT (no new escrow identity is minted)"
-  elif [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""; fi
+  elif [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""
+  elif [ "$MINT_ESCROW" = 1 ]; then note "--mint-escrow: init mints a NEW escrow identity (none is given to adopt)"
+  else
+    die "this home is new and no escrow public key is given, so init would mint a NEW escrow identity, which --auto never does unless told to: no command replaces an escrow identity once it is registered (ADR-0005), so a minted one cannot be taken back. To keep an existing Heir Kit, set ESCROW_PUBLIC_KEY (the profile, or --escrow-public-key), or run step 7 without --auto and answer its question; to mint one, re-run with --mint-escrow (ADR-0012 item 188). Nothing was created"
+  fi
   INIT_ARGS=(init --operator "$OPERATOR")
   [ -n "$ADOPT" ] && INIT_ARGS+=(--escrow-public-key "$ADOPT")
   if [ -n "$ADOPT_KEYS_FROM" ]; then
@@ -1216,6 +1387,7 @@ derive_nodes
 if ! command -v age >/dev/null 2>&1; then note "skipped: the rehearsal runs RESTORE.sh off the tape, which needs the age CLI (step 2 explains how to install it) — step 13 will ask you to confirm writing without it"
 elif [ "$AUTO" = 1 ] && [ -z "$TEST_BARCODE" ]; then note "skipped under --auto: no --barcode given (erasing a cartridge is never a default)"
 elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
+  drive_poll_pause
   DEVGRP="$(stat -c %G "$NST")"; WRAP=()
   if ! { [ -r "$NST" ] && [ -w "$NST" ] && [ -r "$SG" ] && [ -w "$SG" ]; }; then
     note "$USER cannot open $NST and $SG ($(stat -c '%A %U:%G' "$NST"); $(stat -c '%A %U:%G' "$SG")) — the suite needs both (tape I/O, and MAM/health through sg)"
@@ -1244,6 +1416,8 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     note "Eject the test cartridge ($( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )tapectl drive eject --device $DEVICE) and load the production one before step 13."
   fi
 else note "skipped"; fi
+# The step's end, whatever happened in it: the poll timer runs again (item 190).
+drive_poll_resume
 }
 
 # ================================================================ step 13

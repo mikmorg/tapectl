@@ -329,14 +329,16 @@ for u in a b c d; do
 done
 
 # Every first-run.sh invocation: the profile, --auto, the label as a FLAG (the
-# WRITE confirmation counts under --auto only when the word came from one), and
-# a private XDG_STATE_HOME so its log and the rehearsal marker are this run's.
+# WRITE confirmation counts under --auto only when the word came from one),
+# --mint-escrow (step 7 mints the throwaway home's escrow identity, which --auto
+# does only when the command line says so; ADR-0012 item 188), and a private
+# XDG_STATE_HOME so its log, the profile record and the rehearsal marker are this run's.
 export XDG_STATE_HOME="$RUN/state"
 # #437: step 7 writes the home pointer here, never to this VM's /etc/tapectl/home
 # (which would redirect every HOME-isolated test on the box to this run's home).
 export TAPECTL_HOME_POINTER="$RUN/home-pointer"
 FR_LOG="$RUN/state/tapectl/first-run.log"
-first_run() { bash "$REPO/scripts/first-run.sh" --profile "$PROFILE" --auto --label "$LABEL" "$@"; }
+first_run() { bash "$REPO/scripts/first-run.sh" --profile "$PROFILE" --auto --mint-escrow --label "$LABEL" "$@"; }
 DB="$RUN/home/tapectl.db"
 # Catalog reads go through the service user (the home is 0700) and are
 # read-only URIs: this script never writes the catalog.
