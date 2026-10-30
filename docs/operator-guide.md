@@ -2542,8 +2542,8 @@ never take the alerts a write's or a verify's own reading is owed, within one
 tapectl home: the lock is `<home>/locks/drive-<node>.lock`, so a command run
 against another home (a throwaway rehearsal home, `--home` elsewhere) holds a
 different lock, and the poll does not see it. Stop the poll's timer for such
-runs (`sudo systemctl stop tapectl-drive-poll.timer`), as handoff (f) does for
-the step-12 rehearsal. Nor does it
+runs (`sudo systemctl stop tapectl-drive-poll.timer`, and `start` it after).
+`first-run.sh`'s step-12 rehearsal does this itself (ADR-0012 item 190). Nor does it
 read a page the catalog cannot record: it takes the catalog's write lock and
 records its contact before the first page, and reads nothing when it cannot (75
 for a catalog another command is writing, 2 for one that refuses writes); a

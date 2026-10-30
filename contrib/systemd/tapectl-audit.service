@@ -17,6 +17,8 @@ User=tapectl
 Environment=HOME=/var/lib/tapectl
 
 # Optional healthchecks.io-style endpoint. Leave unset for no pinging.
+# Set it in a drop-in (sudo systemctl edit tapectl-audit.service), not here: install-systemd.sh
+# replaces this file on every re-run and leaves drop-ins alone (ADR-0012 item 191).
 #Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID
 
 # Absolute path to the wrapper (adjust to wherever you installed it).

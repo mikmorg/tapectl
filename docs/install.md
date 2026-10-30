@@ -493,8 +493,9 @@ the script leaves drop-ins alone (`--uninstall` removes them with the units).
 `--keep N` also sets the keep count, but `first-run.sh` step 14 passes none, so
 its re-run would render 14 again; the drop-in survives. When an installed unit
 holds an `Environment=` line that the script's render would drop (one set by hand
-in the unit, before drop-ins were the rule), the script names it, so you can
-move it into a drop-in first.
+in the unit, before drop-ins were the rule), the script names it as it replaces
+the unit. `scripts/install-systemd.sh --dry-run` names it without replacing
+anything, so you can move it into a drop-in first.
 
 **The backup directory.** Default `/var/backups/tapectl`; retention
 `TAPECTL_BACKUP_KEEP=14`; private keys **not** included (issue #40 — a key copy

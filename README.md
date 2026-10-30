@@ -41,8 +41,8 @@ You do not need this repository to get the data back.
 
 tapectl 1.8.0 (tagged `v1.8.0`, 2026-10-29) runs on one production host, home2, with an
 HP LTO-6 drive. home2 wrote its first tape on 1.0.0 (2026-10-01) and started fresh on
-1.1.0 (2026-10-14/15): the `keepsake` collection, about 1.2 TiB, on two tapes, one on
-the shelf by the drive and one offsite. It was upgraded in place to 1.5.0 (2026-10-20)
+1.1.0 (2026-10-14/15): the `keepsake` collection, about 1.2 TiB, on two tapes, L6-0001
+and L6-0002. It was upgraded in place to 1.5.0 (2026-10-20)
 and to 1.8.0 (2026-10-29). The maintainer does not yet count those two tapes as
 production backups (ADR-0012 item 179), because they carry 1.1.0's `RESTORE.sh`. The
 next production copies will be written by 1.8.0.
@@ -198,7 +198,7 @@ Every tape uses **Layout Version 2**
 | 1 | Recovery guide (Markdown, written for a human or an AI assistant) | No |
 | 2 | `RESTORE.sh` — scripted recovery | No |
 | 3 | Front index: every file's position, type, size and ciphertext sha256 | No |
-| 4 … | Envelopes: one per tenant (its file lists and restore recipe), then the operator's (the catalog) and its backup copy, then a backup copy of each tenant's. Each carries an index of the archive: for a tenant, which tapes hold each version of its units, and every path; for the operator, every tenant's units, without paths | Yes |
+| 4 … | Envelopes: one per tenant (its file lists and restore recipe), then the operator's (the catalog) and its backup copy, then a backup copy of each tenant's. Each carries an index of the archive: for a tenant, which tapes hold each version of its units, and every path; for the operator, the same map for every tenant's units, without paths | Yes |
 | … | Data slices (`dar` archives) | Yes |
 | last | Seal marker: binds the front index. A write that reached the drive's early warning ends with a short seal, which says where the tape ended | No |
 

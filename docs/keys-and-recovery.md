@@ -255,7 +255,7 @@ So:
 |---|---|---|---|
 | `tapectl db backup --to X.db` | yes | **no** | no |
 | `tapectl db backup --to X.db --include-keys` | yes | yes, as a directory `X.keys/` beside it | no |
-| The daily backup timer (`tapectl-backup.timer`, see [install.md §7](install.md#7-the-timers-and-the-operator-wrapper)) | yes | no, unless you set `TAPECTL_BACKUP_INCLUDE_KEYS=1` in its unit | no |
+| The daily backup timer (`tapectl-backup.timer`, see [install.md §7](install.md#7-the-timers-and-the-operator-wrapper)) | yes | no, unless you set `TAPECTL_BACKUP_INCLUDE_KEYS=1` in a drop-in for its service (`sudo systemctl edit tapectl-backup.service`) | no |
 | The Heir Kit's `catalog.db.age` | yes, encrypted to escrow | **no** | no |
 | A tarball of the whole home ([install.md §9](install.md#9-moving-to-a-new-host)) | yes | yes | yes |
 

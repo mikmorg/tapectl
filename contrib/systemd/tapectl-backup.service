@@ -31,9 +31,13 @@ Environment=TAPECTL_BACKUP_KEEP=14
 # Private keys are NOT copied by default (issue #40): a key copy makes the
 # backup destination a key-escrow point. Set to 1 only for a destination you
 # keep as secret as the home itself.
+# Set it in a drop-in (sudo systemctl edit tapectl-backup.service), not here: install-systemd.sh
+# replaces this file on every re-run and leaves drop-ins alone (ADR-0012 item 191).
 #Environment=TAPECTL_BACKUP_INCLUDE_KEYS=1
 
 # Optional healthchecks.io-style endpoint. Leave unset for no pinging.
+# Set it in a drop-in (sudo systemctl edit tapectl-backup.service), not here: install-systemd.sh
+# replaces this file on every re-run and leaves drop-ins alone (ADR-0012 item 191).
 #Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID
 
 # Absolute path to the wrapper (adjust to wherever you installed it).
