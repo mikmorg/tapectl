@@ -59,6 +59,7 @@ SVC_USER="tapectl"
 SVC_HOME=""            # default: the account's home from getent
 TAPECTL_HOME_DIR=""    # default: $SVC_HOME/.tapectl (tapectl's own default)
 BACKUP_DIR="/var/backups/tapectl"
+BACKUP_DIR_GIVEN=0   # 1 once --backup-dir is on the command line (issue #502)
 KEEP=14
 BIN="/usr/local/bin/tapectl"
 # Tape-command priority (issue #432). The environment may set either knob (an
@@ -71,7 +72,9 @@ DRY=0
 UNINSTALL=0
 RENDER_DIR=""
 
-UNITDIR=/etc/systemd/system
+# Where the units go. TAPECTL_UNIT_DIR aims it elsewhere, as TAPECTL_HOME_POINTER
+# aims the pointer, so a dry run or a test reads a scratch "installed" unit.
+UNITDIR="${TAPECTL_UNIT_DIR:-/etc/systemd/system}"
 LIBDIR=/usr/local/lib/tapectl
 WRAPPER_PATH=/usr/local/bin/tapectl-op
 WRAPPER_TEMPLATE=tapectl-op.in   # under contrib/systemd/
@@ -91,7 +94,9 @@ Usage: scripts/install-systemd.sh [options]
   --home DIR          that account's home (default: from getent passwd); the units set HOME=DIR
   --tapectl-home DIR  a tapectl home that is NOT DIR/.tapectl (sets TAPECTL_HOME= in the units)
   --backup-dir DIR    where the catalog copies go (default: $BACKUP_DIR) — put it on a
-                      SECOND DISK; the script warns when it shares a filesystem with the home
+                      SECOND DISK; the script warns when it shares a filesystem or a disk with
+                      the home. Over an installed backup unit that names another directory, a
+                      run without it refuses: name the directory to keep, or the one to move to
   --keep N            catalog copies to keep (default: $KEEP)
   --tapectl PATH      the binary the units run and the wrapper execs (default: $BIN)
   --tape-nice N       nice value (-20..19) for tape commands, raised as root (default: -10; env
@@ -114,7 +119,7 @@ while [ $# -gt 0 ]; do
     --user) SVC_USER="$2"; shift 2 ;;
     --home) SVC_HOME="$2"; shift 2 ;;
     --tapectl-home) TAPECTL_HOME_DIR="$2"; shift 2 ;;
-    --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
+    --backup-dir) BACKUP_DIR="$2"; BACKUP_DIR_GIVEN=1; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
     --tapectl) BIN="$2"; shift 2 ;;
     --tape-nice) TAPE_NICE="$2"; shift 2 ;;
@@ -151,6 +156,19 @@ as_root() { if [ -n "$SUDO" ]; then run "$SUDO" "$@"; else run "$@"; fi; }
 same_as() { [ -f "$1" ] && cmp -s "$1" "$2"; }
 # fs_id PATH: the device id of PATH's nearest existing ancestor.
 fs_id() { local d="$1"; while [ ! -e "$d" ] && [ "$d" != / ]; do d="$(dirname "$d")"; done; stat -c %d "$d" 2>/dev/null || echo "?"; }
+# disks_of PATH: the whole disks under the filesystem holding PATH's nearest
+# existing ancestor, one per line, through LVM, dm-crypt and md (issue #502:
+# two LVs on one disk are two filesystems, and fs_id cannot see they share it).
+# Prints nothing when the source is not a block device (tmpfs, NFS, overlay)
+# or the tools are missing: the check then says nothing rather than guess.
+disks_of() {
+  local d="$1" src
+  while [ ! -e "$d" ] && [ "$d" != / ]; do d="$(dirname "$d")"; done
+  src="$(findmnt -n -o SOURCE -T "$d" 2>/dev/null)" || return 0
+  src="${src%%\[*}"   # a btrfs subvolume reads /dev/sdX[/subvol]
+  case "$src" in /dev/*) ;; *) return 0 ;; esac
+  lsblk -s -n -r -o NAME,TYPE "$src" 2>/dev/null | awk '$2 == "disk" { print $1 }' | sort -u
+}
 
 for f in "${UNITS[@]}" "${SCRIPTS[@]}" "$WRAPPER_TEMPLATE"; do [ -f "$SRC/$f" ] || die "$SRC/$f is missing — run this from a tapectl checkout"; done
 command -v systemctl >/dev/null 2>&1 || { [ "$DRY" = 1 ] && note "systemctl not found — this host is not running systemd; showing the plan anyway" || die "systemctl not found — this host is not running systemd"; }
@@ -253,9 +271,36 @@ fi
 case "$BACKUP_DIR" in
   "$THOME"|"$THOME"/*) die "--backup-dir $BACKUP_DIR is inside the tapectl home — a backup on the disk that holds the original is not a backup" ;;
 esac
-if [ -z "$RENDER_DIR" ] && [ "$(fs_id "$BACKUP_DIR")" = "$(fs_id "$THOME")" ]; then
-  note "WARNING: $BACKUP_DIR is on the same filesystem as $THOME. The ruling asks for a second"
-  note "disk (ADR-0012, 2026-09-24 amendment, item 5). Re-run with --backup-dir on another disk when you have one."
+# Issue #502: a re-run without --backup-dir rendered the default over the
+# directory the installed unit named, and the daily copies moved without a
+# word. Moving them is a decision: without --backup-dir, refuse; with it, say so.
+INSTALLED_BACKUP_DIR=""
+INSTALLED_UNIT="$UNITDIR/tapectl-backup.service"
+if [ -z "$RENDER_DIR" ] && [ -e "$INSTALLED_UNIT" ]; then
+  [ -r "$INSTALLED_UNIT" ] || die "cannot read $INSTALLED_UNIT, so cannot tell which backup directory it names"
+  INSTALLED_BACKUP_DIR="$(sed -n '/^Environment=TAPECTL_BACKUP_DIR=/{s///p;q;}' "$INSTALLED_UNIT")"
+fi
+if [ -n "$INSTALLED_BACKUP_DIR" ] && [ "$INSTALLED_BACKUP_DIR" != "$BACKUP_DIR" ]; then
+  if [ "$BACKUP_DIR_GIVEN" = 0 ]; then
+    why="the installed $UNITDIR/tapectl-backup.service backs the catalog up to $INSTALLED_BACKUP_DIR, and this run, given no --backup-dir, would move it to the default $BACKUP_DIR. Pass --backup-dir $INSTALLED_BACKUP_DIR to keep it, or --backup-dir $BACKUP_DIR to move it (scripts/first-run.sh: the host's --profile names it)"
+    [ "$DRY" = 1 ] || die "$why"
+    note "the real run refuses: $why"
+  else
+    note "moving the daily catalog backup from $INSTALLED_BACKUP_DIR to $BACKUP_DIR. The copies already in"
+    note "$INSTALLED_BACKUP_DIR are no longer pruned; remove them by hand once $BACKUP_DIR holds copies."
+  fi
+fi
+if [ -z "$RENDER_DIR" ]; then
+  if [ "$(fs_id "$BACKUP_DIR")" = "$(fs_id "$THOME")" ]; then
+    note "WARNING: $BACKUP_DIR is on the same filesystem as $THOME. The ruling asks for a second"
+    note "disk (ADR-0012, 2026-09-24 amendment, item 5). Re-run with --backup-dir on another disk when you have one."
+  else
+    SHARED_DISKS="$(comm -12 <(disks_of "$BACKUP_DIR") <(disks_of "$THOME") | tr '\n' ' ')"
+    if [ -n "$SHARED_DISKS" ]; then
+      note "WARNING: $BACKUP_DIR and $THOME are different filesystems on the same disk (${SHARED_DISKS% })."
+      note "The ruling asks for a second disk (ADR-0012, 2026-09-24 amendment, item 5). Re-run with --backup-dir on another disk when you have one."
+    fi
+  fi
 fi
 if [ -n "$RENDER_DIR" ]; then :   # rendering only: no directory is touched, not even in the plan
 elif [ -d "$BACKUP_DIR" ]; then ok "backup dir $BACKUP_DIR exists"; else as_root install -d -m 0700 -o "$SVC_USER" "$BACKUP_DIR"; fi

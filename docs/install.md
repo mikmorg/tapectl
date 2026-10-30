@@ -35,7 +35,7 @@ by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
 | `age` (the CLI) — optional | not used by the binary (it uses the `rage` crate); needed by the on-tape `RESTORE.sh` and so by the step-12 rehearsal | step 2 offers the upstream v1.3.2 release into `/usr/local/bin` |
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
 | on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and mints a new identity when neither is set (§6) |
-| a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem with the home |
+| a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem or a disk with the home |
 | a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 asks for its medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 asks for the directory, then shows what is free there |
 
@@ -426,7 +426,17 @@ home). The directory must be outside the tapectl home (refused) and should be
 on a **second disk** (warned, never refused — ADR-0012, item 5). The
 default, `/var/backups/tapectl`, is usually on the same filesystem as the home; the
 script says so at install time, and `--backup-dir` is how you move it to a second
-disk.
+disk. It also warns when the two are different filesystems on the same disk, two
+LVM volumes on one disk for example: it follows each filesystem's source through
+LVM, dm-crypt and md to the whole disks (`findmnt`, `lsblk -s`) (#502).
+
+**A re-run never moves the backups by itself** (#502). Over an installed
+`tapectl-backup.service` that names another directory, a run without `--backup-dir`
+refuses and names both: pass `--backup-dir` with the installed directory to keep it,
+or with the new one to move it. A move is announced, and the copies left in the old
+directory are no longer pruned. `first-run.sh` step 14 passes `--backup-dir` only when
+the profile or the flag names one. Without either it refuses on a host whose timers
+back up elsewhere: run it with the host's `--profile`.
 
 **After a session.** A timer cannot know when a write session ended, and the
 ruling asks for a backup "after every session":

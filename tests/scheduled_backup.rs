@@ -222,3 +222,168 @@ fn a_backup_dir_with_an_ampersand_is_refused() {
     assert!(out.contains("contains | & or"), "{out}");
     assert!(!dir.path().join("r").join("tapectl-backup.service").exists());
 }
+
+/// The installer run for real or dry (`--dry-run` in `args`) against a
+/// scratch "installed" unit directory (`TAPECTL_UNIT_DIR`) whose
+/// `tapectl-backup.service` names `installed` (none when `None`), with stubs
+/// first on `PATH`: `sudo` records that it was called and fails, so no run can
+/// change the host; `systemctl` does nothing; `findmnt` and `lsblk` say the
+/// home's filesystem is on disk `sda` and one under `/proc` is on
+/// `backup_disk`. Issue #502.
+fn install(args: &[&str], installed: Option<&str>, backup_disk: &str) -> (i32, String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("units");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&units).unwrap();
+    let log = dir.path().join("calls");
+    let log = log.display();
+    stub(&bin, "sudo", &format!("echo \"sudo $*\" >> {log}; exit 97"));
+    stub(&bin, "systemctl", "exit 0");
+    stub(
+        &bin,
+        "findmnt",
+        &format!(
+            r#"echo "findmnt $*" >> {log}
+for a; do p="$a"; done
+case "$p" in /proc*) echo /dev/mapper/vg-backup ;; *) echo /dev/mapper/vg-home ;; esac"#
+        ),
+    );
+    stub(
+        &bin,
+        "lsblk",
+        &format!(
+            r#"echo "lsblk $*" >> {log}
+for a; do s="$a"; done
+case "$s" in
+  */vg-backup) printf 'vg-backup lvm\nback_crypt crypt\n{backup_disk}1 part\n{backup_disk} disk\n' ;;
+  *) printf 'vg-home lvm\nsda5_crypt crypt\nsda5 part\nsda disk\n' ;;
+esac"#
+        ),
+    );
+    if let Some(installed) = installed {
+        std::fs::write(
+            units.join("tapectl-backup.service"),
+            format!("[Service]\nEnvironment=TAPECTL_BACKUP_DIR={installed}\n"),
+        )
+        .unwrap();
+    }
+    let me = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg("scripts/install-systemd.sh")
+        .args(["--user", me.trim(), "--home"])
+        .arg(dir.path().join("svc"))
+        .args(["--tapectl", "/usr/local/bin/tapectl"])
+        .args(args)
+        .env("PATH", path)
+        .env("TAPECTL_UNIT_DIR", &units)
+        .env("TAPECTL_HOME_POINTER", dir.path().join("home-pointer"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("bash must be available");
+    (
+        out.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        dir,
+    )
+}
+
+fn calls(dir: &TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default()
+}
+
+/// Issue #502: a re-run with no `--backup-dir` over an installed backup unit
+/// that names another directory refuses, naming both, before it changes
+/// anything. 2026-10-20's run moved home2's daily copies to the catalog's own
+/// disk that way, without a word.
+#[test]
+fn a_rerun_without_backup_dir_refuses_to_move_the_installed_one() {
+    // As root the script runs its commands without sudo, so the stub could
+    // not stop a run that failed to refuse. Never risk the host for it.
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    if uid.trim() == "0" {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let (code, out, dir) = install(&[], Some("/srv/old-backups"), "sdb");
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("backs the catalog up to /srv/old-backups")
+            && out.contains("would move it to the default /var/backups/tapectl")
+            && out.contains("Pass --backup-dir /srv/old-backups to keep it"),
+        "{out}"
+    );
+    assert!(!calls(&dir).contains("sudo"), "{}", calls(&dir));
+
+    // The dry run shows the same refusal and goes on with the plan.
+    let (code, out, _dir) = install(&["--dry-run"], Some("/srv/old-backups"), "sdb");
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("the real run refuses: the installed"), "{out}");
+}
+
+/// With `--backup-dir` named, a move is the operator's decision: it goes
+/// ahead and says so, and says the old copies are no longer pruned. The same
+/// directory as the installed one, or no installed unit, says nothing.
+#[test]
+fn a_named_backup_dir_moves_the_installed_one_and_says_so() {
+    let (code, out, _dir) = install(
+        &["--dry-run", "--backup-dir", "/srv/new-backups"],
+        Some("/srv/old-backups"),
+        "sdb",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("moving the daily catalog backup from /srv/old-backups to /srv/new-backups"),
+        "{out}"
+    );
+    assert!(out.contains("are no longer pruned"), "{out}");
+    for installed in [Some("/srv/new-backups"), None] {
+        let (code, out, _dir) = install(
+            &["--dry-run", "--backup-dir", "/srv/new-backups"],
+            installed,
+            "sdb",
+        );
+        assert_eq!(code, 0, "{out}");
+        assert!(!out.contains("moving the daily"), "{installed:?}: {out}");
+        assert!(!out.contains("refuses"), "{installed:?}: {out}");
+    }
+}
+
+/// Issue #502: two filesystems on one disk are one failure domain. The
+/// backup directory under `/proc` is a different filesystem from the home
+/// under the temp dir, so only the disk check can see it; the stubs put both
+/// on `sda`, then the backup on `sdb`.
+#[test]
+fn the_same_disk_under_two_filesystems_is_warned() {
+    let (code, out, dir) = install(
+        &["--dry-run", "--backup-dir", "/proc/tapectl-502-backups"],
+        None,
+        "sda",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("are different filesystems on the same disk (sda)"),
+        "{out}"
+    );
+    assert!(!out.contains("on the same filesystem as"), "{out}");
+    assert_eq!(calls(&dir).matches("lsblk ").count(), 2, "{}", calls(&dir));
+
+    let (code, out, dir) = install(
+        &["--dry-run", "--backup-dir", "/proc/tapectl-502-backups"],
+        None,
+        "sdb",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
+    // The negative's positive control: both paths were resolved to disks.
+    assert_eq!(calls(&dir).matches("lsblk ").count(), 2, "{}", calls(&dir));
+}

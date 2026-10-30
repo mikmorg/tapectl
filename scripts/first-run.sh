@@ -60,7 +60,11 @@ DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; K
 LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
 SKIP_BUILD=0; SKIP_TESTS=0
 SVC_USER="tapectl"; SVC_MODE=1   # --no-service-user → run tapectl as yourself
-BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies go
+# Step 14: where the daily `db backup` copies go. Empty = not chosen: step 14 then
+# passes no --backup-dir, and install-systemd.sh takes its default on a first
+# install but refuses to move a directory an installed unit already names (#502).
+BACKUP_DIR=""
+BACKUP_DIR_DEFAULT="/var/backups/tapectl"   # install-systemd.sh's, for the text below
 # Host-specific defaults. A --profile file (contrib/hosts/*.profile) sets these;
 # flags given on the command line still win. Empty = the built-in behaviour.
 WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
@@ -134,8 +138,9 @@ Options:
   --kit-out DIR     heir kit output dir (default ~/heir-kit)
   --barcode S       the step-12 TEST cartridge's MEDIUM SERIAL (what its chip reports; sg_read_attr
                     prints it) — required for the rehearsal under --auto
-  --backup-dir DIR  where step 14's daily catalog backup writes (default $BACKUP_DIR;
-                    put it on a SECOND disk)
+  --backup-dir DIR  where step 14's daily catalog backup writes (default $BACKUP_DIR_DEFAULT;
+                    put it on a SECOND disk). Over installed timers that back up elsewhere,
+                    step 14 refuses unless this or the profile names the directory
   --profile FILE    host defaults (contrib/hosts/<host>.profile): the values below, plus
                     LOCATIONS, TENANTS, COLLECTIONS and CONTENDER_UNITS lists. Flags override it.
   --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
@@ -1711,9 +1716,12 @@ fi
 # ================================================================ step 14
 hdr 14 "Timers, the operator wrapper, and what comes next"
 explain <<EOF
-Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to $BACKUP_DIR, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it is on the same one. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op runs tapectl as $SVC_USER, so you need not type the prefix; a tape command (write, resume, verify, restore, init, erase, eject) goes through \`sudo nice -n $TAPE_NICE ionice $TAPE_IONICE runuser -u $SVC_USER -- tapectl\` at raised priority (one sudo prompt where root sudo asks for one), and falls back to \`sudo -u $SVC_USER -H tapectl\` at normal priority with a notice if that is refused. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
+Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to ${BACKUP_DIR:-$BACKUP_DIR_DEFAULT}, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it shares a filesystem or a disk with the home, and refuses to move the directory installed timers already use unless --backup-dir (or the profile) names the one to use. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op runs tapectl as $SVC_USER, so you need not type the prefix; a tape command (write, resume, verify, restore, init, erase, eject) goes through \`sudo nice -n $TAPE_NICE ionice $TAPE_IONICE runuser -u $SVC_USER -- tapectl\` at raised priority (one sudo prompt where root sudo asks for one), and falls back to \`sudo -u $SVC_USER -H tapectl\` at normal priority with a notice if that is refused. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
 EOF
-INSTALL_ARGS=(--tapectl "$TAPECTL" --backup-dir "$BACKUP_DIR" --tape-nice "$TAPE_NICE" --tape-ionice "$TAPE_IONICE")
+INSTALL_ARGS=(--tapectl "$TAPECTL" --tape-nice "$TAPE_NICE" --tape-ionice "$TAPE_IONICE")
+# Only a directory a profile or --backup-dir chose: passing the default as if
+# chosen is how 2026-10-20's run moved home2's backups to the catalog's disk (#502).
+if [ -n "$BACKUP_DIR" ]; then INSTALL_ARGS+=(--backup-dir "$BACKUP_DIR"); fi
 if [ "$SVC_MODE" = 1 ]; then INSTALL_ARGS+=(--user "$SVC_USER"); else INSTALL_ARGS+=(--user "$USER"); fi
 WRAPPER_INSTALLED=0
 if [ -n "$HOME_DIR" ]; then
@@ -1738,7 +1746,7 @@ cat <<EOF
      \`${OP_CMD} volume init <label-2>\`, \`${OP_CMD} volume write <label-2> --keep-staging\`, then \`volume move <label-2> --to <other shelf>\`
      (or both in one: \`${OP_CMD} volume write <label-2> --init --full-confirm --move-to <other shelf>\`).
      (Only if staging was cleaned: load tape 1 first and \`volume read-slices --from ${LABEL:-<label>} --unit <unit>\` per unit.)
-   • \`tapectl audit\` runs weekly and the catalog is copied daily to $BACKUP_DIR (systemctl list-timers 'tapectl-*');
+   • \`tapectl audit\` runs weekly and the catalog is copied daily to ${BACKUP_DIR:-$BACKUP_DIR_DEFAULT} (systemctl list-timers 'tapectl-*');
      after each session: sudo systemctl start tapectl-backup.service, and regenerate the heir kit (step 9).
    • \`${OP_CMD} report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
      \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
