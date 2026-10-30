@@ -6,7 +6,7 @@
 #
 # What it proves, each with its own PASS/FAIL line:
 #
-#   raised     every tape command (volume write/resume/verify/..., restore ...,
+#   raised     every tape command (volume write/resume/verify/rewrite/..., restore ...,
 #              cartridge erase, collection run, quick-archive, drive poll) runs
 #              at the knobs' nice value and best-effort/realtime/idle I/O class,
 #              wherever the global options stand (--home X, --home=X, -qy,
@@ -141,7 +141,7 @@ expect() {
 echo "raised: every tape command, with global options anywhere before the subcommand"
 for args in \
   "volume write L1 --device /dev/x --yes" \
-  "volume resume L1" "volume verify L1 --full --json" \
+  "volume resume L1" "volume verify L1 --full --json" "volume rewrite L1 --label L1b" \
   "volume compact-write L2" "volume compact L1 --to L2" \
   "volume read-slices --from L1" "volume compact-read L1" \
   "restore unit u" "restore file u f" "restore volume L1" "restore raw-volume L1 /out" \
@@ -207,7 +207,7 @@ if [ -n "$BIN" ]; then
   [ "$valued" = "config home " ] && pass "names: --config and --home are the only global options that take a value" \
     || fail "names: global options that take a value are '$valued', the wrapper skips only 'config home'"
   printf '%s\n' "$top" | grep -x quick-archive >/dev/null && pass "names: quick-archive is a top-level command" || fail "names: no top-level quick-archive"
-  for pair in "volume write" "volume resume" "volume verify" "volume compact-write" "volume compact" "volume read-slices" "volume compact-read" \
+  for pair in "volume write" "volume resume" "volume verify" "volume rewrite" "volume compact-write" "volume compact" "volume read-slices" "volume compact-read" \
               "restore unit" "restore file" "restore volume" "restore raw-volume" "cartridge erase" "collection run" "drive poll"; do
     set -- $pair
     if "$BIN" "$1" --help 2>&1 | sed -n '/^Commands:/,/^$/p' | awk 'NR>1 && NF {print $1}' | grep -x "$2" >/dev/null; then pass "names: $1 $2 exists"; else fail "names: '$1 $2' is not a subcommand of $BIN"; fi

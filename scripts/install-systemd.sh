@@ -44,7 +44,7 @@
 # sudoers line), and tapectl-drive-poll.service gets Nice= and
 # IOSchedulingClass=/IOSchedulingPriority= from the same two knobs. The tape
 # commands are the ones that stream the drive: volume write, resume, verify,
-# compact-write, compact, read-slices, compact-read; restore unit, file, volume,
+# rewrite, compact-write, compact, read-slices, compact-read; restore unit, file, volume,
 # raw-volume; cartridge erase; collection run; quick-archive; drive poll.
 # Everything else runs exactly as before. --tape-nice '' turns the raise off:
 # tapectl-op then always runs `sudo -u <user> -H <tapectl>`, as it used to, and

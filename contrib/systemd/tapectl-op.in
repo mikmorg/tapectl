@@ -43,7 +43,7 @@ done
 case "$first" in
   volume)
     case "$second" in
-      write | resume | verify | compact-write | compact | read-slices | compact-read) tape=1 ;;
+      write | resume | verify | rewrite | compact-write | compact | read-slices | compact-read) tape=1 ;;
     esac
     ;;
   restore)
