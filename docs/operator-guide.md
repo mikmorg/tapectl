@@ -166,9 +166,12 @@ the drive's own identification:
 
 ```bash
 tapectl backend add --name lto6 \
-    --device-tape /dev/tape/by-id/scsi-<SERIAL>-nst \
-    --device-sg /dev/sgN --generation LTO-6
+    --device-tape /dev/tape/by-id/scsi-<SERIAL>-nst --generation LTO-6
 ```
+
+The drive's SCSI generic node (the cartridge chip, the health pages and Logical
+Block Protection go through it) is derived from the tape node at every use, so it
+is not given; `--device-sg /dev/sgN` overrides the derivation.
 
 A drive declares only **what generation it is** (ADR-0010). It does not
 declare a media type or a capacity: the generation of each cartridge is
@@ -2357,7 +2360,9 @@ scripts/install-systemd.sh --dry-run                        # print the plan, ch
 scripts/install-systemd.sh --backup-dir /mnt/backup/tapectl # install (or re-render) for this host
 ```
 
-Re-run the script rather than editing the installed units by hand;
+Re-run the script rather than editing the installed units by hand, and put a
+setting of your own (a healthcheck URL, a keep count) in a drop-in, which a
+re-run leaves alone;
 [install.md §7](install.md#7-the-timers-and-the-operator-wrapper) lists its
 options (`--user`, `--home` for a run-as-yourself install, and so on), the
 schedules, and the backup retention. To check them:
@@ -2395,7 +2400,9 @@ it covers every unit that has a copy (365 days unless the archive set or `[defau
 says otherwise). The verify-status listing in the journal is the record of what was
 read, and when.
 
-Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
+Set `TAPECTL_HEALTHCHECK_URL` in a drop-in for the service (`sudo systemctl edit
+tapectl-audit.service`, never the installed unit, which a reinstall replaces:
+[Install §7](install.md#7-the-timers-and-the-operator-wrapper)) to ping a healthchecks.io-style
 endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2 and on any code
 but 75, no second ping on 75, catalog busy). It is off unless set, and a missing `curl` or a failed
 ping never changes the run's own result.
@@ -2556,7 +2563,9 @@ debugging with `sg_logs` can erase the evidence you are looking for; run
 Unlike the audit's warnings, a raised TapeAlert *is* a failure here: it is a
 hardware fact, not a policy finding, and this is the check that exists to go
 red. Ping it through its own healthchecks.io-style check, separate from the
-audit's: set `TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`
+audit's: set `TAPECTL_DRIVE_HEALTHCHECK_URL` in a drop-in for
+`tapectl-drive-poll.service` (`sudo systemctl edit tapectl-drive-poll.service`;
+[Install §7](install.md#7-the-timers-and-the-operator-wrapper))
 (`/start` before, bare URL on 0, `/fail` on 1, 2 and anything else but 75; the
 poll's output is the ping's body, so the check's log names the flags; a cleaning
 flag (TapeAlert 20-23) is printed as the action it asks for, and is still exit 1). The
@@ -3793,13 +3802,16 @@ than the generation's real capacity:
 
 ```bash
 tapectl backend add --name lto8 --device-tape /dev/tape/by-id/scsi-XYZZY_A1-nst \
-    --device-sg /dev/sg5 --generation LTO-8 --capacity-override 2G
+    --generation LTO-8 --capacity-override 2G
 ```
 
 ```text
-backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5)
+backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5 (derived from device_tape))
 verify it with: tapectl config check
 ```
+
+The `sg` node is the one the kernel bound to that drive (`lsscsi -g` shows the
+pair), so its number is whatever this host's enumeration gave it.
 
 **Keep the virtual tapes off a small root partition.** mhvtl stores tape
 images under `/opt/mhvtl` by default, and each grows to the library's

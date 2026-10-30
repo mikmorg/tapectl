@@ -128,33 +128,27 @@ staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 ```
 
-Next, tell tapectl about the drive. It needs two device nodes: `TAPE`, and the
-drive's `sg` node, its SCSI-generic twin, used for health pages and the cartridge's
-memory chip. Find the `sg` node that belongs to your drive through sysfs
-(`lsscsi -g` shows the pair too); this session's was `sg5`:
+Next, tell tapectl about the drive. It needs only `TAPE`. The drive also has an `sg`
+node, its SCSI-generic twin, used for health pages and the cartridge's memory chip;
+tapectl derives it from the tape node through sysfs at every use, so a renumbering
+of `/dev/sgN` never matters (this session's was `sg5`). You declare only what the
+**drive** is; each cartridge's own generation is read from the cartridge later.
 
 ```bash
-SG=/dev/$(ls "/sys/class/scsi_tape/$(basename "$(readlink -f "$TAPE")")/device/scsi_generic/")
-echo "$SG"
-```
-
-You declare only what the **drive** is; each cartridge's own generation is read from
-the cartridge later.
-
-```bash
-tapectl backend add --name lto8 --device-tape "$TAPE" --device-sg "$SG" --generation LTO-8
+tapectl backend add --name lto8 --device-tape "$TAPE" --generation LTO-8
 ```
 
 ```text
-backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5)
+backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5 (derived from device_tape))
 verify it with: tapectl config check
 ```
 
 Run `tapectl config check` again as it says. With a drive declared it also reports
-whether both device nodes are present, warns if the `sg` node is not the one the
-kernel pairs with that tape node (`volume write` refuses the drive until that is
-fixed), and warns if staging has less free space than one full cartridge of that
-generation holds.
+whether both device nodes are present and which `sg` node it derived, and warns if
+staging has less free space than one full cartridge of that generation holds. If
+you pass `--device-sg` to override the derivation, it warns when that node is not
+the one the kernel pairs with the tape node, and `volume write` refuses the drive
+until that is fixed.
 
 ## 3. Places for cartridges
 
@@ -621,14 +615,14 @@ from a tape with the escrow secret you wrote down:
 
 ```bash
 tapectl init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
-tapectl backend add --name lto8 --device-tape "$TAPE" --device-sg "$SG" --generation LTO-8
+tapectl backend add --name lto8 --device-tape "$TAPE" --generation LTO-8
 tapectl catalog rebuild --from-volume --key escrow.key
 tapectl unit list
 ```
 
-(Find `TAPE` and `SG` again on the new machine, as at the top of this page and in
-step 2. `escrow.key` is a file containing the one `AGE-SECRET-KEY-1…` line from the
-paper; delete it afterwards.)
+(Find `TAPE` again on the new machine, as at the top of this page. `escrow.key` is a
+file containing the one `AGE-SECRET-KEY-1…` line from the paper; delete it
+afterwards.)
 
 ```text
 tapectl initialized at ~/.tapectl
@@ -638,7 +632,7 @@ tapectl initialized at ~/.tapectl
   escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
   dar:      dar (found at /usr/bin/dar)
 
-backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5)
+backend "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg5 (derived from device_tape))
 verify it with: tapectl config check
 
 rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelope(s) opened
