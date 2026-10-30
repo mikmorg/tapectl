@@ -505,13 +505,24 @@ pub fn volume_retire(
     if !json_output {
         println!("  Volume \"{label}\" retired.");
         if let Some(barcode) = &freed {
-            println!(
-                "  Cartridge {barcode} is now pending_erase — it holds no live volume. \
-                 `tapectl cartridge mark-erased {barcode}` after you erase it."
-            );
+            println!("{}", freed_cartridge_hint(barcode));
         }
     }
     Ok(())
+}
+
+/// What `volume retire` says when it frees a cartridge. `cartridge erase`
+/// comes first: it erases, reads the tape back and records the erase, and
+/// that record is what lets the next `volume init` go ahead without `--force`
+/// (ADR-0012 items 51, 52 and 57). `mark-erased` only records an erase done
+/// some other way (issue #503).
+fn freed_cartridge_hint(barcode: &str) -> String {
+    format!(
+        "  Cartridge {barcode} is now pending_erase — it holds no live volume. Load it and \
+         run `tapectl cartridge erase`, which erases it, reads it back and records the \
+         erase; if you erase it some other way, run `tapectl cartridge mark-erased \
+         {barcode}` afterwards."
+    )
 }
 
 /// Move the cartridge this volume was on to `pending_erase`, if this was the
@@ -4547,6 +4558,37 @@ mod tests {
     //! trap issue #84 hit), then exercise the function end-to-end.
     use super::*;
     use tempfile::TempDir;
+
+    /// Issue #503: the hint `volume retire` prints for a freed cartridge names
+    /// `cartridge erase` first and `mark-erased` as the fallback, and every
+    /// command it names parses as written.
+    #[test]
+    fn the_freed_cartridge_hint_names_cartridge_erase_and_commands_that_parse() {
+        use clap::Parser;
+        let hint = freed_cartridge_hint("EW7VWMVKF6");
+        let named: Vec<&str> = hint
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|quoted| quoted.starts_with("tapectl "))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "tapectl cartridge erase",
+                "tapectl cartridge mark-erased EW7VWMVKF6"
+            ],
+            "{hint}"
+        );
+        assert!(
+            hint.find("cartridge erase") < hint.find("mark-erased"),
+            "{hint}"
+        );
+        for line in named {
+            crate::cli::Cli::try_parse_from(line.split(' '))
+                .unwrap_or_else(|e| panic!("`{line}` does not parse: {e}"));
+        }
+    }
 
     /// The exact pre-#32 buffered hashing `unit_check_integrity` used to do
     /// inline: whole-file `fs::read`, `Sha256::digest`, byte-iteration hex
