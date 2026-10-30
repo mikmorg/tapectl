@@ -39,23 +39,18 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.8.0 (tagged `v1.8.0`, 2026-10-29) runs on one production host, home2, with an
-HP LTO-6 drive. home2 wrote its first tape on 1.0.0 (2026-10-01) and started fresh on
-1.1.0 (2026-10-14/15): the `keepsake` collection, about 1.2 TiB, on two tapes, L6-0001
-and L6-0002. It was upgraded in place to 1.5.0 (2026-10-20)
-and to 1.8.0 (2026-10-29). The maintainer does not yet count those two tapes as
-production backups (ADR-0012 item 179), because they carry 1.1.0's `RESTORE.sh`. The
-next production copies will be written by 1.8.0.
+tapectl 1.8.0 (tagged `v1.8.0`, 2026-10-29) is the current release. It is young: in real
+use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
+have been exercised only in a virtual tape library (mhvtl).
 
-Each of these passed an acceptance run on that drive before its release was tagged:
-the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and Logical Block
-Protection (1.8.0, 2026-10-29). Before them, from the full real-drive validation of
-2026-09-10 on, it was proven end to end on the same drive: writes, verification, every
-restore path including the heir's script off the tape, and catalog rebuild from tape.
-The on-tape format is pinned by byte-level tests,
-and a change to it is a decision recorded in the [ADRs](docs/adr/). The last full test
-run passed about 4,600 tests. What each release changed is in
-[docs/releases/](docs/releases/).
+The newest features each passed an acceptance run on a real HP LTO-6 drive before their
+release was tagged: the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and
+Logical Block Protection (1.8.0, 2026-10-29). Before them, from the full real-drive
+validation of 2026-09-10 on, it was proven end to end on the same drive: writes,
+verification, every restore path including the heir's script off the tape, and catalog
+rebuild from tape. The on-tape format is pinned by byte-level tests, and a change to it
+is a decision recorded in the [ADRs](docs/adr/). The last full test run passed about
+4,600 tests. What each release changed is in [docs/releases/](docs/releases/).
 
 ## Why tapectl
 
@@ -93,7 +88,7 @@ run passed about 4,600 tests. What each release changed is in
 ```bash
 TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial: named once, in backend add
 
-tapectl init --operator mike                             # write the printed escrow secret on paper
+tapectl init --operator alice                            # write the printed escrow secret on paper
 tapectl backend add --name lto6 --device-tape "$TAPE" --generation LTO-6
 tapectl location add home-rack -d "the shelf beside the drive"
 tapectl tenant add family -d "family photos and letters"
@@ -144,12 +139,13 @@ git clone https://github.com/mikmorg/tapectl && cd tapectl
 scripts/first-run.sh            # resumable: --from N / --to N; --help lists every step
 ```
 
-**If your host has a profile** in `contrib/hosts/`, pass it on every run, a one-step
-re-run included. The host remembers the profile it was installed with: a later run
-without `--profile` refuses and names it, and `--profile none` runs without one.
+**If you install from a [host profile](docs/install.md#host-profiles)**, a bash file of
+the installer's answers for one machine (`contrib/hosts/` has examples), pass it on every
+run, a one-step re-run included. The host remembers the profile it was installed with: a
+later run without `--profile` refuses and names it, and `--profile none` runs without one.
 
 ```bash
-scripts/first-run.sh --profile contrib/hosts/<host>.profile
+scripts/first-run.sh --profile ~/myhost.profile
 ```
 
 [docs/install.md](docs/install.md) is the runbook: what each step creates, how to
