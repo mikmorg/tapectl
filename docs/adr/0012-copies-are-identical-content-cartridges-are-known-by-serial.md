@@ -2409,3 +2409,38 @@ and none after it.
      counts as a copy. Its cost, one full readback, is paid only when a refusal happened.
      Both items are in 1.8.0, before its tag; item 183's order holds: a new candidate, then the
      acceptance in full.
+
+Ruled 2026-10-30, on the coordinator's review of the install and upgrade process as home2 used it
+(handoff (c), (f) and (h)) and of the front-door documents (#505, #506, #507). On 2026-10-20 handoff
+(f) ran `first-run.sh` without `--profile`: its step 9 wrote the Heir Kit to the script's default
+directory, and its step 14 moved the daily catalog backup onto the catalog's own disk for ten days
+(#502). Nothing recorded which profile the host was installed with, so the cause was read from the
+commands' outputs.
+
+187. **A host remembers the profile it was installed with.** A `first-run.sh` run with `--profile`
+     records the profile's absolute path in the operator's state directory, beside `first-run.log`.
+     A run without `--profile` on a host that has one recorded refuses and names it; `--profile
+     none` runs without it, and says so. Every run's first log line records its arguments, the
+     profile and the commit.
+188. **`first-run.sh --auto` never mints an escrow identity unless told to.** On a fresh home, step 7
+     under `--auto` with no `ESCROW_PUBLIC_KEY` refuses unless `--mint-escrow` is passed. The flag is
+     consent, so it is read from the command line only, never from a profile (as `--erase-label`,
+     #469). An interactive run keeps its question. No command replaces an escrow identity
+     (ADR-0005), so a minted one cannot be taken back.
+189. **`--auto` never accepts a step that drops configuration.** Regenerating a `config.toml` that
+     cannot be loaded drops its `[[backends.lto]]` and `[[collections]]` tables, so under `--auto`
+     it refuses; an interactive run keeps the question.
+190. **Step 12's rehearsal stops the drive-poll timer and starts it again.** A poll during the
+     rehearsal would record the test cartridge in the production catalog (the rehearsal's home is
+     a throwaway one, so the production drive lock does not see it). The step refuses while a poll
+     runs, stops an active `tapectl-drive-poll.timer`, and starts it again when the step ends,
+     failed or not.
+191. **Settings in an installed unit live in a drop-in** (`systemctl edit <unit>`), which a
+     reinstall leaves alone. `install-systemd.sh` names any `Environment=` line of an installed
+     unit that its render would drop, and `docs/install.md` says to use drop-ins.
+192. **The repo owns the in-place upgrade: `first-run.sh --upgrade`** (#505), built from handoff
+     (h)'s run. It runs the preflight, a catalog backup with the old binary, keeps the old binary,
+     then build and install, the migrations, step 14, the step-12 rehearsal and the kit, and it
+     offers to tidy what earlier runs left behind. Each release's notes keep only its own steps. It
+     exists before the next build is installed on home2. Until then, `docs/install.md`, "Upgrading
+     in place", is the procedure.
