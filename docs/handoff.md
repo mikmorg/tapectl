@@ -454,10 +454,11 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
 
 **Done 2026-10-29: home2 runs `tapectl 1.8.0 (v1.8.0, 2026-10-29)`.** The operator ran steps 1 to
 8 below as one script, and step 7's rehearsal was GREEN 53/53 with LBP on every block
-(`docs/runs/2026-10-29-1.8.0-handoff-h.md`). **One thing is left for you (sudo):** since (f)
-the daily catalog backup has gone to `/var/backups/tapectl`, on the catalog's own disk, not the
-profile's `/srv/local_backup/tapectl`. `scripts/first-run.sh --profile
-contrib/hosts/home2.profile --from 14 --to 14` puts it back. The run record has the cause.
+(`docs/runs/2026-10-29-1.8.0-handoff-h.md`). From (f) until 2026-10-30 the daily catalog
+backup went to `/var/backups/tapectl`, on the catalog's own disk, not the profile's
+`/srv/local_backup/tapectl`. The operator put it back on 2026-10-30 00:24 UTC with
+`scripts/first-run.sh --profile contrib/hosts/home2.profile --from 14 --to 14`. The run record
+has the cause; #502 makes a re-run refuse to move the backups silently.
 
 **home2 goes from 1.5.0 straight to 1.8.0; do not install 1.7.x** (ADR-0012 item 183). 1.8.0
 contains 1.6.0 (the short seal: (g)'s upgrade never ran), 1.7.0 (spanning), 1.7.1 (per-location
