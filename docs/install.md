@@ -4,7 +4,8 @@ Written for a **reinstall from a bare machine** (ADR-0012, 2026-09-24 amendment,
 item 6: "installation is a formal, repeatable procedure, so a reinstall is
 easy"). It says what the one entry point creates on the host, how to resume it,
 how to re-run it over a home that already exists, how to get the catalog back,
-how to move to another host, and how to take it all off again.
+how to move to another host, how to upgrade in place (§10), and how to take it
+all off again.
 
 It does not repeat the operator's manual: `docs/operator-guide.md` is what to
 do *with* an installed tapectl, and [Keys and recovery](keys-and-recovery.md) is
@@ -12,14 +13,24 @@ the authority on catalog and data recovery (the operator guide's "Disaster
 Recovery" section is its short form) — this document points at them rather than
 restating them. `CONTEXT.md` is the vocabulary.
 
-Every `tapectl` flag below was checked against the binary's own `--help` on
-2026-09-29. Every path below is the default; `first-run.sh --home`, `--user`
-and `--backup-dir` move the ones they name, and the script prints the
-effective values at its start.
+Every `tapectl …` line in a shell block below is checked against the binary by
+`scripts/check-docs.py`: its subcommands and long flags must exist. Every path
+below is the default; `first-run.sh --home`, `--user` and `--backup-dir` move the
+ones they name, and the script prints the effective values at its start.
 
 Facts specific to one machine live in its **host profile** (§2, "Host profiles"):
 the production host, home2, is described by `contrib/hosts/home2.profile` and prepared
 by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
+
+> [!IMPORTANT]
+> **A host with a profile passes it on every run** of `scripts/first-run.sh`, a
+> one-step re-run such as `--from 9 --to 9` included. The host remembers its
+> profile and refuses a run without it (§2, "The profile is remembered"; ADR-0012
+> item 187). Before it did, a run without the profile fell back to the script's
+> own defaults: on 2026-10-20 one wrote the Heir Kit to `~/heir-kit` and moved
+> the daily catalog backup onto the catalog's own disk (#502). Where an example
+> below has no `--profile`, it is the form for a host without one; on a host
+> with one, add `--profile contrib/hosts/<host>.profile`.
 
 ---
 
@@ -34,7 +45,7 @@ by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
 | `dar` >= 2.6 (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | archives, drive control, MAM and health pages, the drive's Logical Block Protection page, ACL grants, the scripts' JSON parsing, device discovery. Of sg3-utils, tapectl runs `sg_read_attr` (the cartridge's MAM), `sg_logs` (health pages), `sg_inq` (the drive's identity) and, from 1.7.2, `sg_modes` and `sg_wr_mode` (it reads and sets the Logical Block Protection page; without them it writes without LBP and says so) | step 2 checks for `mt`, `sg_read_attr`, `sg_logs`, `sg_modes`, `sg_wr_mode`, `setfacl`, `python3`, `lsscsi` and `dar`, and offers `sudo apt install dar mt-st sg3-utils acl python3 lsscsi` |
 | `age` (the CLI) — optional | not used by the binary (it uses the `rage` crate); needed by the on-tape `RESTORE.sh` and so by the step-12 rehearsal | step 2 offers the upstream v1.3.2 release into `/usr/local/bin` |
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
-| on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and mints a new identity when neither is set (§6) |
+| on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and when neither is set it refuses unless `--mint-escrow` is passed (§6) |
 | a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem or a disk with the home |
 | a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 asks for its medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 asks for the directory, then shows what is free there |
@@ -53,7 +64,8 @@ a big disk; that wins over both. See §7 for `--backup-dir`.
 
 ```bash
 cd ~/git/tapectl
-scripts/first-run.sh
+scripts/first-run.sh                                           # a host without a profile
+scripts/first-run.sh --profile contrib/hosts/<host>.profile    # a host with one, on every run
 ```
 
 Interactive, in fourteen steps, each explained before it runs. Every step
@@ -61,7 +73,18 @@ detects whether it is already done and says so; every tape-touching command
 is confirmed by name; `--from N` resumes and `--to N` stops. Before step 1,
 on every run, the script prints the effective settings and checks an existing
 home's `config.toml` for the two `[defaults]` keys this version renamed (§6).
-`--help` prints the step list and every option. Flags you will want:
+`--help` prints the step list and every option.
+
+**The profile is remembered.** The first run with `--profile` records the
+profile's absolute path in `~/.local/state/tapectl/profile`, beside
+`first-run.log`. From then on a run
+without `--profile` refuses and names the recorded one: pass it again, or pass
+`--profile none` to run on the script's own defaults, which the run then says
+it is doing. A profile variable the script does not know is refused by name, so
+a typo is not silently ignored (the variables are in "Host profiles", below).
+
+Flags you will want, in the form for a host without a profile (on a host with
+one, add its `--profile`; it usually sets `DEVICE` and `BACKUP_DIR` already):
 
 ```bash
 scripts/first-run.sh --device /dev/tape/by-id/scsi-<SERIAL>-nst   # skip the interactive pick
@@ -76,9 +99,21 @@ A run that starts after step 6 and reaches step 8, 12 or 13 needs `--device`
 
 `--auto` takes the default for every *non-destructive* prompt; a destructive
 prompt under `--auto` counts only when the word it asks for came from a flag
-(`--label`, `--barcode`) — a default is never consent to erase. The script logs
-to `~/.local/state/tapectl/first-run.log` (yours, never inside the service
-user's home); step 7's `init` output is deliberately not logged.
+(`--label`, `--barcode`) — a default is never consent to erase. Two things
+`--auto` never does on its own (ADR-0012 items 188 and 189):
+
+- **mint an escrow identity.** On a fresh home with no `ESCROW_PUBLIC_KEY`
+  (profile) or `--escrow-public-key`, step 7 refuses unless `--mint-escrow` is
+  on the command line. The flag is consent, so a profile cannot set it. A
+  minted identity can never be replaced (ADR-0005), so on a reinstall adopt the
+  original instead (§6).
+- **regenerate a `config.toml` it cannot load.** Regenerating drops the
+  `[[backends.lto]]` and `[[collections]]` tables, so under `--auto` step 7
+  refuses; run it interactively, or fix the key it names (§6).
+
+The script logs to `~/.local/state/tapectl/first-run.log` (yours, never inside
+the service user's home); each run's first line records its arguments, the
+profile and the commit. Step 7's `init` output is deliberately not logged.
 
 ### Host profiles
 
@@ -91,24 +126,31 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile
 ```
 
 The profile is a bash file of variables, sourced before the flags are parsed, so
-any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
-`BACKUP_DIR`, `KIT_OUT`, `LABEL`, `TEST_BARCODE`, …) it can set:
+any flag still wins. Pass it on every run (§2, "The profile is remembered"). It
+can set the flags' own values: `DEVICE` (`--device`), `SG` (`--sg`), `DGEN`
+(`--generation`), `OPERATOR` (`--operator`), `LABEL` (`--label`), `TEST_BARCODE`
+(`--barcode`), `KIT_OUT` (`--kit-out`), `BACKUP_DIR` (`--backup-dir`),
+`LOCATION` (`--location`), `TENANT` (`--tenant`) and `UNIT_PATH`
+(`--unit-path`). Beyond those it can set:
 
 | Variable | Used in | What it does |
 |---|---|---|
 | `WORK_DIR` (`--work-dir`) | 3, 4, 12 | the build lock and the rehearsal's throwaway homes; default `/scratch` if it exists and is writable, else `~/.cache/tapectl` |
 | `STAGING_DIR` (`--staging`) | 7 | the default for `staging.directory` |
 | `STAGING_JOBS` | 7 | `[staging] jobs`, the units staged at once (#368); written with `config set staging.jobs`. Empty leaves the config's value (the code default is 1) |
+| `VERIFY_INTERVAL_DAYS` | 7 | `[defaults] verify_interval_days`, the full-readback clock `audit` keeps per unit and per volume (#453, #454); written with `config set defaults.verify_interval_days`. Empty leaves the config's value (absent, it is 365) |
+| `OPS_GROUP` | 7 | a group whose members run `tapectl status` and read the session logs without sudo (#393): step 7 creates it (`groupadd --system`), adds the service user and you, writes `[ops] group`, grants it traverse on the directories above the home, and writes the home pointer `/etc/tapectl/home` (§3, row 7). Empty: no group |
 | `CONTENDER_PROCESSES` | 7 | an array: `[host_check] contender_processes`, the processes `host check` names before a write. It replaces the built-in list (`cargo rustc docker Runner.Worker`), so repeat that when adding one |
 | `DAR_BIN` (`--dar`) | 2, 4, 7, 12 | the dar that is checked, tested against, and written into `[dar] binary` |
 | `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
 | `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |
 | `TENANTS=("name\|description" …)` | 11 | non-operator tenants, created if missing |
-| `ESCROW_PUBLIC_KEY` (`--escrow-public-key`) | 7 | the original escrow public key (`age1…` or a `.pub` path): `init` adopts it (`--escrow-public-key`) instead of minting a new escrow identity, so an existing Heir Kit stays valid. Empty: step 7 asks, or under `--auto` mints |
+| `ESCROW_PUBLIC_KEY` (`--escrow-public-key`) | 7 | the original escrow public key (`age1…` or a `.pub` path): `init` adopts it (`--escrow-public-key`) instead of minting a new escrow identity, so an existing Heir Kit stays valid. Empty: step 7 asks; under `--auto` it refuses on a fresh home unless `--mint-escrow` is on the command line (§2), which no profile can set |
 | `ADOPT_KEYS_FROM` (`--adopt-keys-from`) | 7, 11 | a directory of `<name>.key` age identity files: `init` adopts `<operator>.key` (`--operator-key`) and each `TENANTS` entry still to be created adopts `<tenant>.key` (`tenant add --adopt-key`) instead of minting keys, each previewed with `--dry-run` first. A missing or unreadable file stops the step before anything is created. The copy-out is in [keys-and-recovery.md](keys-and-recovery.md#f-keeping-existing-keys-on-a-fresh-home) |
 | `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
 | `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
 | `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands run at: default `-10` and `-c2 -n0` (best-effort, level 0) (#432, ADR-0012 2026-10-15 item 58). Step 13 raises `first-run.sh`'s own shell once with `sudo renice` and `sudo ionice`, and the write, resume and verify it starts inherit that; step 14 hands the same values to `install-systemd.sh` for [`tapectl-op` and the drive-poll unit](#7-the-timers-and-the-operator-wrapper). An empty `TAPE_NICE` never raises |
+| `ERASE_LABEL` | — | **never read from a profile**: it is consent to erase a sealed tape, so only `--erase-label` sets it (#469), and a profile's value is reported and ignored. `--mint-escrow` is a flag only for the same reason |
 
 **home2** (the production host, ADR-0012's 2026-09-28 amendment) has a one-time
 preparation first, dry-run by default:
@@ -299,7 +341,10 @@ catalog says the volume is (`tapectl volume info <label>`):
 ## 6. Re-running over a home that already exists
 
 This is the reinstall case: the machine was rebuilt, or the home was restored
-from a copy (§9), and you run `scripts/first-run.sh` again.
+from a copy (§9), and you run `scripts/first-run.sh` again. On a host with a
+profile, run it with that `--profile`, as every run: the state directory that
+remembers the profile is yours, not the home's, so on a rebuilt machine nothing
+is recorded until the first run with `--profile` records it again.
 
 **Before step 1, the renamed `[defaults]` keys.** The copy requirement every
 unit starts from is `[defaults] min_copies` and `min_locations` (ADR-0012,
@@ -324,6 +369,9 @@ database, keys, tenants and tapes are untouched; the `[[backends.lto]]` and
 `[[collections]]` tables are **not** carried over — step 8 re-adds the drive,
 collections are yours to re-add. The smallest fix is usually to edit the
 named key by hand instead (delete it, or rename it as the message says).
+Under `--auto` the step never regenerates: it refuses, naming the key, and
+leaves the file as it is (ADR-0012 item 189). Fix the key, or run step 7
+interactively to be asked.
 
 **A rebuilt home with no database — adopt the original escrow identity.** When
 step 7 does run `init` interactively, it asks for an existing escrow **public**
@@ -331,9 +379,10 @@ key to adopt (`age1…`, or a `.pub` path). Answer with the one on the heir kit'
 cover sheet and `init` registers it instead of minting a new identity. **Under
 `--auto` there is no such prompt**: the key comes from the profile's
 `ESCROW_PUBLIC_KEY` or from `--escrow-public-key` (both since 1.1.0), and when
-neither is set an `--auto` run's `init` mints a new identity. On a reinstall, set
-one of them, run step 7 without `--auto`, or run `init` by hand before step 7
-(which then finds the database and leaves it alone):
+neither is set step 7 refuses rather than mint one, unless `--mint-escrow` is on
+the command line (ADR-0012 item 188; never pass it on a reinstall). On a
+reinstall, set one of them, run step 7 without `--auto`, or run `init` by hand
+before step 7 (which then finds the database and leaves it alone):
 
 ```bash
 sudo -u tapectl -H tapectl init --operator <name> --escrow-public-key age1…
@@ -397,7 +446,10 @@ It renders `contrib/systemd/` for the host — `User=`, `HOME=`, `TAPECTL_BIN=`,
 only the files whose bytes differ, creates the backup directory (0700, owned by
 the service user), `daemon-reload`s, enables and starts the three timers, restarts a
 timer whose unit changed, and prints `systemctl list-timers --all 'tapectl-*'`.
-**Edit the installed units by re-running the script**, not by hand.
+**Never edit an installed unit by hand**: a re-run replaces any unit whose bytes
+differ from its render. Change what the script renders by re-running it with
+other options, and put every other setting in a drop-in ("Your own settings",
+below), which a re-run leaves alone.
 
 | unit | schedule | runs | exit status |
 |---|---|---|---|
@@ -414,15 +466,41 @@ backup directory writable, and `NoNewPrivileges=true`. The home must be
 writable even for a read: the database is in WAL mode. The poll needs the
 service user in the group that owns the sg node — step 6 (§3) already put it
 there. Its healthchecks.io-style ping is its own: set
-`TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`, a second check
-beside the audit's `TAPECTL_HEALTHCHECK_URL`, so a raised TapeAlert can go red
-on its own.
+`TAPECTL_DRIVE_HEALTHCHECK_URL` in a drop-in for `tapectl-drive-poll.service`, a
+second check beside the audit's `TAPECTL_HEALTHCHECK_URL`, so a raised TapeAlert
+can go red on its own.
+
+**Your own settings go in a drop-in** (ADR-0012 item 191). The healthcheck URLs
+(`TAPECTL_HEALTHCHECK_URL` for the audit and the backup,
+`TAPECTL_DRIVE_HEALTHCHECK_URL` for the drive poll), `TAPECTL_BACKUP_INCLUDE_KEYS=1`
+and a keep count other than 14 are settings of yours, not the script's. Put each
+in a drop-in for its service:
+
+```bash
+sudo systemctl edit tapectl-backup.service
+```
+
+```ini
+[Service]
+Environment=TAPECTL_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID
+Environment=TAPECTL_BACKUP_KEEP=30
+```
+
+`systemctl edit` writes `/etc/systemd/system/tapectl-backup.service.d/override.conf`
+and reloads systemd, and the service's next run uses it. A drop-in's
+`Environment=` line wins over the unit's for the same variable, and a re-run of
+the script leaves drop-ins alone (`--uninstall` removes them with the units).
+`--keep N` also sets the keep count, but `first-run.sh` step 14 passes none, so
+its re-run would render 14 again; the drop-in survives. When an installed unit
+holds an `Environment=` line that the script's render would drop (one set by hand
+in the unit, before drop-ins were the rule), the script names it, so you can
+move it into a drop-in first.
 
 **The backup directory.** Default `/var/backups/tapectl`; retention
 `TAPECTL_BACKUP_KEEP=14`; private keys **not** included (issue #40 — a key copy
 makes the destination a key-escrow point; `TAPECTL_BACKUP_INCLUDE_KEYS=1` in
-the installed service turns it on for a destination you keep as secret as the
-home). The directory must be outside the tapectl home (refused) and should be
+a drop-in for `tapectl-backup.service` turns it on for a destination you keep as
+secret as the home). The directory must be outside the tapectl home (refused) and should be
 on a **second disk** (warned, never refused — ADR-0012, item 5). The
 default, `/var/backups/tapectl`, is usually on the same filesystem as the home; the
 script says so at install time, and `--backup-dir` is how you move it to a second
@@ -443,12 +521,15 @@ ruling asks for a backup "after every session":
 
 ```bash
 sudo systemctl start tapectl-backup.service && journalctl -u tapectl-backup.service -n 30
-scripts/first-run.sh --from 9 --to 9      # regenerate the heir kit (answer y); then reprint COVER.txt
+scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 9 --to 9   # regenerate the heir kit (answer y); then reprint COVER.txt
 ```
 
-Step 9 on its own is the kit refresh; it needs no `--device`, and a host
-installed from a profile passes the same `--profile` (home2's puts the kit in
-`~/tapectl-heir-kit`). It does what a bare `sudo -u tapectl -H tapectl key
+Step 9 on its own is the kit refresh; it needs no `--device`. On a host without a
+profile, leave `--profile` out. On a host with one it is required, and a run
+without it refuses (§2): the profile says where the kit goes (home2's puts it in
+`~/tapectl-heir-kit`), and on 2026-10-20, before the script remembered the
+profile, a run without it wrote a second kit to `~/heir-kit`. Step 9 does what a
+bare `sudo -u tapectl -H tapectl key
 escrow-kit --out ~/heir-kit` cannot: the kit directory is **yours**, 0700
 (§3, row 9), so the service user cannot write into it and that command fails
 with `Permission denied`. The step hands the directory to the service user for
@@ -475,8 +556,12 @@ volume's lock, which the kernel releases when a process dies. The backup
 itself is a single-step online copy that never blocks the writer. If another
 command holds the catalog's write lock longer than the backup will wait,
 `tapectl` exits 75 ("catalog busy") and the wrapper logs "catalog busy, no
-backup this run" instead of a failure. To move the time, edit `OnCalendar=`
-in `contrib/systemd/tapectl-backup.timer` and re-run the installer.
+backup this run" instead of a failure. To move the time, use a drop-in for the
+timer, as for the services above: `sudo systemctl edit tapectl-backup.timer`,
+then under `[Timer]` an empty `OnCalendar=` line (it clears the unit's own) and
+your `OnCalendar=` after it, then `sudo systemctl restart tapectl-backup.timer`.
+An edit of `contrib/systemd/tapectl-backup.timer` in the checkout would be lost at
+the next `git checkout` of a release.
 
 **The wrapper.** `/usr/local/bin/tapectl-op` runs tapectl as the service user:
 `sudo -u tapectl -H /usr/local/bin/tapectl "$@"`. It is installed by
@@ -561,8 +646,9 @@ The home is gone. You hold the printed cover sheet (escrow public key, the
 hand-written secret) and the kit's `catalog.db.age`. In this order:
 
 1. Build a home that carries the **original** escrow identity: run
-   `scripts/first-run.sh --to 8`, interactively (under `--auto` there is no
-   adoption prompt and `init` mints a new identity, §6), and answer step 7's
+   `scripts/first-run.sh --to 8` (with the host's `--profile`, if it has one),
+   interactively (under `--auto` there is no adoption prompt, and step 7 refuses
+   without `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, §6), and answer step 7's
    adoption prompt with the sheet's `age1…` — or by hand, `init --operator
    <name> --escrow-public-key age1…` (§6; as the service user `init` refuses
    without `--operator`). Stop after step 8. Step 9 writes a new kit, by
@@ -606,7 +692,9 @@ hand-written secret) and the kit's `catalog.db.age`. In this order:
    <by-id>` prints the label of the cartridge that is loaded, and only the
    cartridges missing from the list need the rebuild.
 5. Regenerate the kit and finish the install: `scripts/first-run.sh --from 9
-   --device /dev/tape/by-id/scsi-<SERIAL>-nst`. Step 9 is the kit refresh of
+   --device /dev/tape/by-id/scsi-<SERIAL>-nst`, or on a host with a profile
+   `scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 9` (the
+   profile names the device). Step 9 is the kit refresh of
    §7, "After a session" (answer y), and §6 says what the later steps do over
    a home that already has rows. Until the kit is regenerated, what `audit` says
    about the kit on this catalog (`escrow_kit_stale`, `escrow_kit_missing`) is
@@ -674,7 +762,9 @@ binary on one host — earn it again), the systemd units (re-render them for the
 new host), the ACLs (per filesystem; step 11 re-grants), the `tape` group
 membership (step 6), and `device_sg` (derived; nothing to copy).
 
-**On the new host**:
+**On the new host** (a profile names one host's drive and paths, so a new host
+needs its own; if it has one, add `--profile contrib/hosts/<new host>.profile` to
+steps 1 and 3 and to every run after them):
 
 1. `scripts/first-run.sh --to 5` — toolchain, tools, binary, tests, the
    service user (its uid may differ; ownership is fixed in the next step).
@@ -697,7 +787,105 @@ the escrow *secret* is on paper only and is not in the tarball.
 
 ---
 
-## 10. Uninstall
+## 10. Upgrading in place
+
+An upgrade keeps the home, the keys, the catalog and the tapes. The binary is
+replaced, and the catalog moves forward at the new binary's first open. This is
+how home2 went from 1.1.0 to 1.5.0 and from 1.5.0 to 1.8.0 (`docs/handoff.md`, (f)
+and (h)). `first-run.sh --upgrade` (#505) will run these steps for you (ADR-0012
+item 192); until it exists, this section is the procedure.
+
+The commands are for a host installed by `first-run.sh` with the `tapectl-op`
+wrapper (step 14). On a host without a profile, leave `--profile` out. `<old>` and
+`<new>` are the two versions, such as `1.5.0` and `1.8.0`.
+
+**Before you start.**
+
+- **Read the release notes** ([docs/releases/](releases/)) of every release after
+  yours, up to the one you are installing, and each one's "Upgrading" section. You
+  can skip releases: a release contains the ones before it, and home2 went from
+  1.5.0 straight to 1.8.0. The notes name each catalog migration and any step the
+  release asks of you.
+- **There is no downgrade past a migration.** An older binary refuses a catalog
+  that is ahead of its migration list. The way back is the binary and the backup
+  you keep below ("Rolling back").
+- **Work inside tmux, with no tapectl command running.** `tapectl-op status` names a
+  running session.
+
+**The steps**, from the repository checkout:
+
+1. **Back up the catalog with the old binary.** `--to` is required; the backup
+   timer prunes only its own `tapectl-<stamp>.db` files, so a copy named like this
+   one is kept:
+   ```bash
+   tapectl-op db backup --to /var/backups/tapectl/tapectl-pre-<new>.db   # your backup directory (§7)
+   ```
+2. **Check out the release:**
+   ```bash
+   git fetch --tags
+   git checkout v<new>
+   ```
+3. **Keep the old binary, then build and install the new one.** Step 3 builds a
+   release binary from the checkout and installs it to `/usr/local/bin`; the timers
+   pick it up at their next run.
+   ```bash
+   sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>
+   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 3 --to 3
+   tapectl --version        # tapectl <new> (v<new>, <date>)
+   ```
+4. **Let the first open apply the migrations.** Run as the service user, this is
+   the new binary's first open of the catalog, and it applies every migration the
+   notes list. A config key the new version refuses is named here (§6).
+   ```bash
+   tapectl-op config check
+   ```
+5. **The release's own steps**, from its notes' "Upgrading" section: a config key
+   to set, or a step of `first-run.sh` to run again. 1.6.0's, for example, adds
+   `post_warning_bytes` to the drive's backend.
+6. **Step 14 again.** It re-renders the timers and `tapectl-op` for the new
+   checkout, and reports each installed file `unchanged` when nothing moved. Your
+   own settings are safe in their drop-ins (§7), and the script names any
+   `Environment=` line of an installed unit that its render would drop.
+   ```bash
+   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 14 --to 14
+   ```
+7. **Look.** A new `audit` check may report something that was always true; the
+   notes say what to expect.
+   ```bash
+   tapectl status
+   tapectl-op audit
+   ```
+8. **Rehearse before the next write.** Step 12 proves the new binary on the drive,
+   on a test cartridge it erases, and step 13 looks for its marker for that exact
+   binary. A `tapectl-op volume write` by hand does not check for it, so run the
+   rehearsal first. The step stops an active drive-poll timer for its duration and
+   starts it again when it ends, and it refuses while a poll is running.
+   ```bash
+   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 12 --to 12
+   ```
+9. **Regenerate the Heir Kit** with the new binary, reprint `COVER.txt`, and put the
+   new files on the media in each envelope
+   ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir-kit)). The kit
+   holds a copy of the binary that made it (`tapectl-<new>`), and an older copy may
+   refuse the tapes the new one writes: 1.5.0's refuses every tape written by 1.6.0
+   or later. A sheet printed before the upgrade does not describe the new kit.
+   ```bash
+   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 9 --to 9
+   ```
+
+**Rolling back.** Put the kept binary back, then import the backup from step 1 and
+check it. Whatever the catalog recorded after step 1 is lost, and the old binary may
+refuse a tape the new one wrote in between.
+
+```bash
+sudo cp -p /usr/local/bin/tapectl-<old> /usr/local/bin/tapectl
+tapectl-op db import /var/backups/tapectl/tapectl-pre-<new>.db
+tapectl-op db fsck
+```
+
+---
+
+## 11. Uninstall
 
 Two layers. `install-systemd.sh --uninstall` removes what step 14 added and
 nothing else; the rest is deliberate, by hand, in this order.
@@ -755,7 +943,7 @@ Tapes are not affected by any of this. A sealed volume is self-describing: with
 
 ---
 
-## 11. After an install — the five-minute check
+## 12. After an install — the five-minute check
 
 ```bash
 tapectl --version                                   # note it; the rehearsal marker is per binary
