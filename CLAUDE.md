@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)).
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start on the installed 1.8.0, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

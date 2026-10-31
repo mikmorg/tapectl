@@ -9,6 +9,8 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
+**Next: (i), home2 starts over on 1.8.0** (ruled 2026-10-31). What follows is the history before it.
+
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
@@ -43,6 +45,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
 | (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183): **done 2026-10-29** | **you** (sudo for the install, and returning the test cartridge first) |
+| (i) | Start home2 over on 1.8.0: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193, 194) | **you** (sudo, the escrow key, the cartridges) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -543,6 +546,122 @@ is tagged:
 allow spanning per unit (its dotfile's `[policy]`), per archive set (`tapectl-op archive-set
 edit <NAME> --allow-spanning true`) or in `[defaults]`, and keep the tapes `volume write` names
 together ("keep these together"): a whole copy across tapes needs every one of them to restore.
+
+## (i) Start home2 over on 1.8.0: a new catalog, new keys, new units
+
+Ruled 2026-10-31 (ADR-0012 items 193, 194). You do this on home2, inside tmux, in this order.
+(c) and (d) are the model. What differs from them:
+- **the units are new**: their dotfiles go first, so `collection sync` mints new identities;
+- **nothing is built**: the 1.8.0 binary installed and rehearsed on 2026-10-29 is used as it is;
+- **the old state is moved aside, not deleted**, until the new L6-0002 reads back in full;
+- **the cartridges are reused one at a time**, so `keepsake` always has a copy on tape.
+
+Never run step 7 under `script` or `tee`. If you mint an escrow identity, its secret prints there
+once, and only `first-run.sh`'s own log leaves step 7's output out.
+
+0. **Look.** The checkout is on the tag, the binary is the rehearsed one, and its marker exists:
+
+   ```bash
+   git describe --tags                      # v1.8.0
+   tapectl --version                        # 1.8.0 (v1.8.0, 2026-10-29)
+   ls ~/.local/state/tapectl/rehearsal-ok-$(sha256sum /usr/local/bin/tapectl | cut -c1-16)   # rehearsal-ok-dce6b2ae45f285b6
+   ```
+
+   If the marker is missing, step 12 runs again before step 13, on the test cartridge.
+1. **Stop the timers:** `scripts/install-systemd.sh --uninstall`, then `pgrep -a -u tapectl`
+   (nothing may be running). Step 14 installs them again.
+2. **Move the old state aside.** The home holds the 1.1.0 catalog, the old keys and the old
+   config. The daily backups went to `/var/backups/tapectl` from 2026-10-20 to 2026-10-30
+   (#502) and to `/srv/local_backup/tapectl` before and after. Both directories stay; only
+   their contents move:
+
+   ```bash
+   sudo mv /srv/archive_meta/tapectl/.tapectl /srv/archive_meta/tapectl/.tapectl-old
+   for d in /srv/local_backup/tapectl /var/backups/tapectl; do
+     sudo mkdir -p "$d-old" && sudo find "$d" -mindepth 1 -maxdepth 1 -exec mv -t "$d-old" {} +
+   done
+   sudo find /srv/acache/tapectl-staging -mindepth 1 -delete
+   ```
+
+   Step 7 runs `init` because `<home>/tapectl.db` no longer exists.
+3. **The escrow identity is kept.** `~/.config/tapectl/home2.local.profile` names it, and step 7
+   adopts it. Check that it names the one the old home registered:
+
+   ```bash
+   grep ESCROW_PUBLIC_KEY ~/.config/tapectl/home2.local.profile
+   sudo cat /srv/archive_meta/tapectl/.tapectl-old/keys/mikmorg-escrow.age.pub
+   ```
+
+   The two keys must be identical. **To mint a new one instead** (item 194), move the local
+   profile aside (`mv ~/.config/tapectl/home2.local.profile ~/.config/tapectl/home2.local.profile.old`)
+   and leave step 7's question empty. Then the new secret is handwritten and sealed in two
+   failure domains, and the old paper and the old kits are kept until the old L6-0002 is
+   erased in step 8.
+4. **Delete the keepsake dotfiles.** A `[policy]` table in one is a setting made by hand
+   (`collection sync` writes none), such as `allow_spanning`; note it before deleting:
+
+   ```bash
+   D=/srv/keepsake/original-data
+   sudo find "$D" -name .tapectl-unit.toml | wc -l
+   sudo find "$D" -name .tapectl-unit.toml -exec grep -l '^\[policy' {} +
+   sudo find "$D" -name .tapectl-unit.toml -delete
+   ```
+
+5. **Steps 5 to 11:** `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 5 --to 11`.
+   Steps 1 to 4 (toolchain, tools, build, tests) stay done. Step 6 needs no cartridge.
+   - **step 7** says it is adopting the escrow key from `ESCROW_PUBLIC_KEY` and mints the new
+     operator key. With `OPS_GROUP` it writes `[ops] group` again;
+   - **step 9** finds the old kit in `~/tapectl-heir-kit`: answer yes to regenerate;
+   - **step 11** mints new keys for `parents` and `family`, and `collection sync` registers each
+     keepsake folder as a new unit and writes its dotfile.
+6. **The settings made by hand.** The new `config.toml` lacks (h) step 5's key; set it again, then
+   compare with the old config for anything else set by hand:
+
+   ```bash
+   sudo -u tapectl -H tapectl config set 'backends.lto[0].post_warning_bytes' 99008M
+   sudo diff /srv/archive_meta/tapectl/.tapectl-old/config.toml /srv/archive_meta/tapectl/.tapectl/config.toml
+   ```
+
+7. **Copy 1.** Tell the coordinator first, so vm-desk1's builds hold while the drive writes.
+   Load L6-0001 and run `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13`.
+   - Step 13's `volume init` refuses the sealed volume on the tape and offers `cartridge erase`,
+     as in (c), "L6-0001 at its volume init". The dry run shows File 0's label `L6-0001`,
+     written by tapectl 1.1.0, and `catalog: knows neither this volume nor this cartridge`.
+     Type `L6-0001`.
+   - Step 13 then writes, runs `volume verify L6-0001 --full`, audits, moves the tape to
+     `home2-rack` and regenerates the kit. Step 14 installs the timers and `tapectl-op`.
+8. **Copy 2,** with the drive-poll timer stopped. Load L6-0002:
+
+   ```bash
+   sudo systemctl stop tapectl-drive-poll.timer
+   tapectl-op cartridge erase --dry-run      # File 0: L6-0002, tapectl 1.1.0; the catalog knows neither
+   tapectl-op cartridge erase                # type L6-0002
+   tapectl-op volume write L6-0002 --init --full-confirm --move-to offsite
+   sudo systemctl start tapectl-drive-poll.timer
+   ```
+
+   This write completes the copy policy, so it releases staging.
+9. **Finish.**
+
+   ```bash
+   tapectl-op audit                          # keepsake: 2 copies, 2 places
+   sudo systemctl start tapectl-backup.service
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 9 --to 9   # yes, regenerate
+   ```
+
+   Reprint `COVER.txt` and replace the one in each envelope. The handwritten secret stays
+   (or, with a new escrow identity, goes in beside the new sheet). A new identity also goes
+   into the local profile for the next rebuild:
+   `echo "ESCROW_PUBLIC_KEY=$(sudo grep -m1 '^age1' /srv/archive_meta/tapectl/.tapectl/keys/mikmorg-escrow.age.pub)" > ~/.config/tapectl/home2.local.profile`.
+   Each erase registered its cartridge with the chip serial as a placeholder barcode;
+   `tapectl-op cartridge relabel <serial> L6-0001` (and `L6-0002`) names the sticker.
+10. **Tidy, once the new L6-0002 has read back in full:**
+    - delete the old state: `sudo rm -rf /srv/archive_meta/tapectl/.tapectl-old /srv/local_backup/tapectl-old /var/backups/tapectl-old`;
+    - delete `~/heir-kit`, the stray kit from (f);
+    - give `parents` and `family` their new key files, since the old ones open only the erased tapes;
+    - with a new escrow identity, destroy the old paper.
+
+    Send the coordinator the session's output (step 7's excepted) for the run record.
 
 ## (e) After: the backlog
 

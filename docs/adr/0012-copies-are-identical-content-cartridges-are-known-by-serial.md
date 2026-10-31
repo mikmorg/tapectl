@@ -2444,3 +2444,26 @@ commands' outputs.
      offers to tidy what earlier runs left behind. Each release's notes keep only its own steps. It
      exists before the next build is installed on home2. Until then, `docs/install.md`, "Upgrading
      in place", is the procedure.
+
+Ruled 2026-10-31: home2 starts over before its first 1.8.0 copies. On 2026-10-30 the CTO decided
+to "reset the DB from scratch, remove the dotfiles, and init new keys", and to run it themselves.
+L6-0001 and L6-0002 were never counted as production backups (item 179), and the catalog, the
+keys and the units they describe go with them. The procedure is handoff (i).
+
+193. **A second fresh start, on the installed 1.8.0.** A new catalog, a new operator key and new
+     tenant keys. The keepsake `.tapectl-unit.toml` dotfiles are deleted first, so `collection
+     sync` registers every unit with a new identity instead of adopting the old one (unlike
+     handoff (c), where it adopted them). Nothing is built: `first-run.sh` runs from step 5 on
+     the `v1.8.0` checkout with the binary installed on 2026-10-29, so item 192 need not come
+     first, and that binary's step-12 rehearsal (GREEN 53/53, 2026-10-29) stands. The copies
+     reuse L6-0001 and then L6-0002, each erased just before it is written, so the old L6-0002
+     is still a copy on tape until the new L6-0001 is written and read back in full: `keepsake`
+     is never without a copy on tape, and no new cartridge is needed. The old home and the
+     old catalog backups are moved aside, not deleted (unlike items 38 and 49), until the new
+     L6-0002 has been read back in full.
+194. **The escrow identity may be kept or replaced.** The CTO, 2026-10-31: "We can keep the
+     same escrow, but don't need to." Handoff (i) keeps it: step 7 adopts the public key from
+     the local profile, the handwritten secret in the sealed kits stays valid, and the old
+     tapes stay readable with it until they are erased. Minting a new one is handoff (i)
+     step 3's alternative. Its cost is a new handwritten secret in two failure domains, and the
+     old paper must be kept until the old L6-0002 is erased.
