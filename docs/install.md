@@ -810,7 +810,10 @@ below are the two versions, such as `1.8.0` and `1.8.1`.
   session stops the upgrade there. Running `--upgrade` again resumes it.
 - **Have a test cartridge at hand** for the rehearsal: one this catalog has never
   seen, which it erases. Step 12 refuses a cartridge whose chip serial, claimed
-  serial or barcode the catalog knows, and names it.
+  serial or barcode the catalog knows, and names it. So never `cartridge erase`,
+  `volume init` or `cartridge register` the test cartridge through the production
+  catalog: once a row records it, no rehearsal takes it again, and no command
+  removes a cartridge's row.
 - **Have the Heir Kit's media at hand** for step 10's new kit.
 - **There is no downgrade past a migration.** An older binary refuses a catalog
   that is ahead of its migration list. The way back is the binary and the backup
