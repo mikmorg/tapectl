@@ -31,6 +31,12 @@
 #       disk) and the /usr/local/bin/tapectl-op wrapper, via
 #       scripts/install-systemd.sh — then what to do next
 #
+#
+# --upgrade upgrades an installed host in place instead (ADR-0012 item 192):
+# preflight, a catalog backup with the old binary, the old binary kept, the new
+# one built and installed, then steps 14, 12 and 9 again and a tidy. Its own
+# steps are listed in the upgrade section below and in --help.
+#
 # Steps 1-4 run as you (they need your toolchain and sudo). Steps 5-11 and 13
 # run tapectl as the service user through one seam, `as_svc`; step 12 runs as
 # you (the lifecycle suite needs your login to open the drive) and runs the
@@ -166,6 +172,7 @@ fi
 # What only a flag sets, declared after the profile so that a profile cannot.
 FROM=0
 TO=99
+UPGRADE=0              # --upgrade: the in-place upgrade (ADR-0012 item 192), its own steps 1-13
 AUTO=0                 # accept defaults for non-destructive prompts
 SVC_MODE=1             # --no-service-user → run tapectl as yourself
 LABEL_FROM_FLAG=0; BARCODE_FROM_FLAG=0
@@ -177,6 +184,20 @@ BACKUP_DIR_DEFAULT="/var/backups/tapectl"   # install-systemd.sh's, for the text
 # erase that cartridge the moment it is loaded. A profile's value is kept only
 # to say why it is not used.
 PROFILE_ERASE_LABEL="${ERASE_LABEL:-}"; ERASE_LABEL=""
+# --upgrade runs three of the steps below as this script (--from N --to N, see
+# upgrade_child). Those runs get every argument this one got except the ones the
+# upgrade sets for them: the profile (passed by its resolved path), the step
+# range, the binary and the kit directory.
+FWD_ARGS=(); _drop=0
+for _a in "$@"; do
+  if [ "$_drop" = 1 ]; then _drop=0; continue; fi
+  case "$_a" in
+    --upgrade | --skip-build | --skip-tests) ;;
+    --profile | --from | --to | --tapectl | --kit-out) _drop=1 ;;
+    *) FWD_ARGS+=("$_a") ;;
+  esac
+done
+unset _a _drop
 usage() {
   # The step list ends at the "then what to do next" line; keep the range on it.
   sed -n '2,/then what to do next/p' "$0" | sed 's/^# \{0,1\}//'
@@ -188,6 +209,25 @@ Options:
                     to rehearse.
   --from N          start at step N (0-14)
   --to N            stop after step N (0-14; e.g. --to 9: everything up to and including the printed kit)
+  --upgrade         upgrade this installed host in place to the checkout's release tag (ADR-0012
+                    item 192; docs/install.md §10), in steps of its own:
+                       1 preflight, always run: no tapectl running, HEAD an annotated vX.Y.Z tag
+                         on a clean tree, newer than the installed tapectl
+                       2 back up the catalog with the OLD binary, and check the copy
+                       3 keep the old binary beside the new one, as tapectl-<old>
+                       4 build the release binary and install it (with --skip-build, install the
+                         --tapectl PATH instead, which must be a build of the tag)
+                       5 config check: the new binary's first open applies the migrations
+                       6 step 14 again (units, wrapper, timers)
+                       7 pause at each newer release's "Upgrading" notes (docs/releases/)
+                       8 look: status, audit, report failed-stages
+                       9 step 12's rehearsal (a cartridge the catalog knows is refused)
+                      10 step 9: the Heir Kit, its copy of tapectl checked against the install
+                      11 start tapectl-backup.service once
+                      12 tidy: list what earlier runs left; remove a group only on a typed word
+                      13 print the rollback
+                    Run it again to resume: a step already done is checked, not done twice.
+                    Under --upgrade, --from N and --to N take these numbers (1-13)
   --tapectl PATH    the tapectl binary to use (default: PATH, then target/release, then target/debug)
   --user NAME       the service user that owns and runs tapectl (default: tapectl; created in step 5)
   --no-service-user run tapectl as yourself instead — no account, no ACLs, your ~/.tapectl
@@ -243,6 +283,7 @@ while [ $# -gt 0 ]; do
     --home) HOME_DIR="$2"; shift 2 ;;
     --from) FROM="$2"; shift 2 ;;
     --to) TO="$2"; shift 2 ;;
+    --upgrade) UPGRADE=1; shift ;;
     --tapectl) TAPECTL="$2"; shift 2 ;;
     --auto) AUTO=1; shift ;;
     --device) DEVICE="$2"; shift 2 ;;
@@ -282,15 +323,25 @@ esac
 case "$TAPE_IONICE" in
   *[!-0-9\ cn]*) echo "TAPE_IONICE / --tape-ionice takes only ionice's -c CLASS and -n LEVEL (e.g. '-c2 -n0'); got '$TAPE_IONICE'" >&2; exit 2 ;;
 esac
-# The steps are 0-14 (#506). TO's own default, 99, means "to the end".
+# The steps are 0-14 (#506), and --upgrade's are 1-13 (its step 1 always runs,
+# so FROM's default, 0, is its 1). TO's own default, 99, means "to the end".
 for _flag in from to; do
   if [ "$_flag" = from ]; then _v="$FROM"; else _v="$TO"; fi
   [ "$_flag" = to ] && [ "$_v" = 99 ] && continue
-  case "$_v" in
-    [0-9] | 1[0-4]) ;;
-    *) echo "--$_flag must be a step number from 0 to 14, got '$_v'" >&2; exit 2 ;;
-  esac
+  [ "$_flag" = from ] && [ "$UPGRADE" = 1 ] && [ "$_v" = 0 ] && continue
+  if [ "$UPGRADE" = 1 ]; then
+    case "$_v" in
+      [1-9] | 1[0-3]) ;;
+      *) echo "under --upgrade, --$_flag takes an upgrade step from 1 to 13 (--help lists them), got '$_v'" >&2; exit 2 ;;
+    esac
+  else
+    case "$_v" in
+      [0-9] | 1[0-4]) ;;
+      *) echo "--$_flag must be a step number from 0 to 14, got '$_v'" >&2; exit 2 ;;
+    esac
+  fi
 done
+[ "$UPGRADE" = 0 ] || [ "$FROM" != 0 ] || FROM=1
 [ "$FROM" -le "$TO" ] || { echo "--from $FROM comes after --to $TO: no step would run" >&2; exit 2; }
 
 # Item 187: the profile this host was installed with, recorded beside
@@ -316,6 +367,11 @@ if [ -z "$WORK_DIR" ]; then
 fi
 mkdir -p "$WORK_DIR" || { echo "cannot create work dir $WORK_DIR" >&2; exit 2; }
 BUILD_LOCK="$WORK_DIR/tapectl-build.lock"
+# Where step 3 (and --upgrade's step 4) installs the binary, and where --upgrade
+# keeps the old one beside it. TAPECTL_INSTALL_BIN is a test seam, as
+# install-systemd.sh's TAPECTL_UNIT_DIR is: the upgrade harness
+# (scripts/upgrade-mhvtl.sh) points it into its workspace.
+INSTALL_BIN="${TAPECTL_INSTALL_BIN:-/usr/local/bin/tapectl}"
 DAR="${DAR_BIN:-dar}"
 if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; RD=$'\e[31m'; else B=""; D=""; R=""; Y=""; G=""; RD=""; fi
 [ "$SVC_MODE" = 1 ] && [ "$SVC_USER" = "$USER" ] && SVC_MODE=0
@@ -635,6 +691,43 @@ toolchain_check() {
   [ "$have" = "$want" ] || die "rustc is ${have:-absent} at $(command -v rustc || echo '<none>'), the repo pins $want — run step 1 (scripts/first-run.sh --from 1 --to 1)"
   case "$(command -v cargo)" in "$HOME"/.cargo/bin/*|"${CARGO_HOME:-/nonexistent}"/bin/*) ;; *) die "cargo at $(command -v cargo) is not rustup's — a distro cargo cannot build this crate; run step 1" ;; esac
 }
+# build_release: step 3's release build, which --upgrade's step 4 runs too. BUILT
+# is the binary it made.
+build_release() {
+  toolchain_check
+  ( cd "$REPO" && run flock -w 1200 -E 99 "$BUILD_LOCK" cargo build --release ) || die "release build failed (exit 99 = timed out waiting for $BUILD_LOCK: another build is linking)"
+  BUILT="$REPO/target/release/tapectl"
+  [ -x "$BUILT" ] || BUILT="${CARGO_TARGET_DIR:-$REPO/target}/release/tapectl"
+}
+# known_cartridge NAME: the barcode of the catalog's cartridge whose barcode,
+# chip serial or claimed serial is NAME, or nothing when none is. It fails when
+# the catalog cannot be read, so the caller refuses rather than guesses
+# (step 12, ADR-0012 item 192). `cartridge list --json` carries no serial, so
+# each row is asked with `cartridge info --json`; a catalog holds a few.
+known_cartridge() {
+  local list barcodes b info rc
+  list="$(tc cartridge list --json 2>/dev/null)" || return 1
+  # Parsed into a variable first: a parse that fails inside `< <(…)` would only
+  # end the loop, and an unread list must not read as an empty one.
+  barcodes="$(printf '%s' "$list" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+for r in (d if isinstance(d, list) else d["cartridges"]):
+    print(r["barcode"])')" || return 1
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    info="$(tc cartridge info "$b" --json 2>/dev/null)" || return 1
+    rc=0
+    printf '%s' "$info" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+sys.exit(3 if sys.argv[1] in (d.get("barcode"), d.get("serial_number"), d.get("operator_serial")) else 0)' "$1" || rc=$?
+    case "$rc" in
+      0) ;;
+      3) printf '%s' "$b"; return 0 ;;
+      *) return 1 ;;
+    esac
+  done <<<"$barcodes"
+  return 0
+}
 
 # ================================================================ step 0
 printf '%stapectl first run%s — repo %s\n' "$B" "$R" "$REPO"
@@ -697,6 +790,423 @@ resolve_tapectl() {
   elif [ -n "${CARGO_TARGET_DIR:-}" ] && [ -x "$CARGO_TARGET_DIR/debug/tapectl" ]; then TAPECTL="$CARGO_TARGET_DIR/debug/tapectl"
   else TAPECTL=""; fi
 }
+
+# ================================================================ --upgrade
+# ADR-0012 item 192 (#505): the in-place upgrade of a host this script
+# installed, built from handoff (h)'s run (home2, 1.5.0 → 1.8.0, 2026-10-29).
+# Its thirteen steps are listed in --help. Three of them are this script's own
+# steps run again as children (`upgrade_child`: 14, 12, 9), so each is the code
+# a first install runs. What a step has done is recorded in <state>/upgrade-<new>
+# and checked when the upgrade runs again, never done twice: a run that stopped
+# is resumed by running --upgrade again. What only one release needs (a config
+# key, a tool, a skip rule) stays in its notes; step 7 stops at them.
+if [ "$UPGRADE" = 1 ]; then
+U_STEP=0
+uhdr() {
+  U_STEP="$1"
+  [ "$1" -gt "$TO" ] && { printf '\n%s== stopping before upgrade step %s (--to %s) ==%s\n' "$B" "$1" "$TO" "$R"; exit 0; }
+  printf '\n%s== Upgrade step %s — %s ==%s\n' "$B" "$1" "$2" "$R"; log "upgrade step $1: $2"
+}
+uskip() { [ "$FROM" -gt "$U_STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
+# The upgrade's record: KEY=VALUE lines, appended; the last one wins.
+ustate() { [ -f "$U_STATE" ] && sed -n "s/^$1=//p" "$U_STATE" | tail -n 1; return 0; }
+ustate_set() { mkdir -p "$(dirname "$U_STATE")" && printf '%s=%s\n' "$1" "$2" >>"$U_STATE"; }
+# db_facts FILE [version]: "<user_version> <ok|damaged>" (or the version alone),
+# FILE opened READ-ONLY by python3's sqlite3 as the user tapectl runs as. Never
+# by tapectl: its first open of a catalog applies the migrations.
+db_facts() {
+  as_svc python3 - "$1" "${2:-integrity}" <<'PY'
+import sqlite3, sys, urllib.parse
+c = sqlite3.connect("file:" + urllib.parse.quote(sys.argv[1]) + "?mode=ro", uri=True, timeout=30)
+v = c.execute("PRAGMA user_version").fetchone()[0]
+if sys.argv[2] == "version":
+    print(v)
+else:
+    rows = [r[0] for r in c.execute("PRAGMA integrity_check")]
+    print(v, "ok" if rows == ["ok"] else "damaged")
+PY
+}
+# installed_is_new: the installed binary is a build of the tag.
+installed_is_new() { case "$("$INSTALL_BIN" --version 2>/dev/null)" in "tapectl $NEW_VER ($TAG, "*) return 0 ;; *) return 1 ;; esac; }
+need_new() { installed_is_new || die "the installed $INSTALL_BIN is not $TAG ($("$INSTALL_BIN" --version 2>/dev/null || echo unreadable)): run --upgrade --from 4"; }
+# upgrade_child N [ARG…]: this script's own step N, with the installed binary and
+# the arguments this run was given (FWD_ARGS). Not through `run`: the child logs
+# its own lines, and its prompts read the terminal.
+upgrade_child() {
+  local n="$1" rc=0 pa=()
+  shift
+  [ "$PROFILE_GIVEN" = 0 ] || pa=(--profile "${PROFILE:-none}")
+  local cmd=(bash "$REPO/scripts/first-run.sh" ${pa[@]+"${pa[@]}"} ${FWD_ARGS[@]+"${FWD_ARGS[@]}"}
+    --tapectl "$INSTALL_BIN" --skip-build --skip-tests --from "$n" --to "$n" "$@")
+  printf '   %s$ %s%s\n' "$B" "${cmd[*]}" "$R"; log "\$ ${cmd[*]}"
+  "${cmd[@]}" || rc=$?
+  [ "$rc" = 0 ] || die "first-run.sh's step $n stopped (exit $rc, above); once that is dealt with, run --upgrade again (it resumes at upgrade step $U_STEP)"
+}
+# look CMD…: a tapectl command whose exit status is shown, never acted on.
+look() { local rc=0; run tc "$@" || rc=$?; note "(exit $rc)"; }
+
+# ---------------------------------------------------------------- upgrade 1
+uhdr 1 "Preflight"
+explain <<'EOF'
+An upgrade replaces the binary and keeps the home, the keys, the catalog and the tapes; the new binary's first open moves the catalog forward, and there is no downgrade past a migration. So before anything changes: nothing of tapectl may be running, the checkout must be exactly a release tag, and the release must be newer than what is installed. This step always runs, whatever --from says.
+EOF
+U_RUN_USER="$( [ "$SVC_MODE" = 1 ] && printf '%s' "$SVC_USER" || printf '%s' "$USER" )"
+U_RUNNING="$(pgrep -a -x -u "$U_RUN_USER" tapectl || true)"
+if [ -n "$U_RUNNING" ]; then
+  printf '%s\n' "$U_RUNNING" | sed 's/^/   /'
+  die "a tapectl command is running as $U_RUN_USER (above); wait for it to finish, then run --upgrade again"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  for _u in tapectl-audit.service tapectl-backup.service tapectl-drive-poll.service; do
+    _s="$(systemctl is-active "$_u" 2>/dev/null || true)"
+    case "$_s" in active | activating | deactivating | reloading) die "$_u is running now ($_s); wait for it to finish (systemctl status $_u), then run --upgrade again" ;; esac
+  done
+fi
+TAG="$(git -C "$REPO" describe --exact-match HEAD 2>/dev/null || true)"
+[ -n "$TAG" ] || die "the checkout $REPO is at $(git -C "$REPO" describe --tags --always 2>/dev/null || echo '?'), not exactly an annotated release tag: check out the release first (git fetch --tags && git checkout vX.Y.Z)"
+[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "HEAD's tag $TAG is not a release tag of the form vX.Y.Z"
+[ "$(git -C "$REPO" cat-file -t "$TAG" 2>/dev/null)" = tag ] || die "$TAG is not an annotated tag (git cat-file -t $TAG)"
+# Untracked files do not count, as they do not for the binary's own version
+# (build.rs: git describe --dirty): nothing untracked reaches the build.
+if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
+  git -C "$REPO" status --short --untracked-files=no | sed 's/^/   /'
+  die "the checkout has changes (above): the binary is built from the tag as it is, so leave the tree clean first"
+fi
+NEW_VER="${TAG#v}"
+_cargo_ver="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$REPO/Cargo.toml" | head -n 1)"
+[ "$_cargo_ver" = "$NEW_VER" ] || die "$TAG's Cargo.toml says version $_cargo_ver, not $NEW_VER"
+U_NOTES="$REPO/docs/releases/$NEW_VER.md"
+[ -f "$U_NOTES" ] || die "$TAG has no release notes ($U_NOTES), and step 7 stops at them"
+[ -x "$INSTALL_BIN" ] || die "nothing is installed at $INSTALL_BIN, so there is nothing to upgrade: a first install is scripts/first-run.sh without --upgrade"
+INST_LINE="$("$INSTALL_BIN" --version 2>/dev/null || true)"
+INST_VER="$(printf '%s' "$INST_LINE" | awk '$1 == "tapectl" { print $2; exit }')"
+[ -n "$INST_VER" ] || die "$INSTALL_BIN --version printed '${INST_LINE}', not a tapectl version"
+U_STATE="$(dirname "$LOG")/upgrade-$NEW_VER"
+OLD_VER="$(ustate old)"
+UNIT_FILE="${TAPECTL_UNIT_DIR:-/etc/systemd/system}/tapectl-backup.service"
+UNIT_BDIR=""
+if [ -r "$UNIT_FILE" ]; then UNIT_BDIR="$(sed -n '/^Environment=TAPECTL_BACKUP_DIR=/{s///p;q;}' "$UNIT_FILE")"; fi
+if [ -z "$OLD_VER" ]; then
+  [ "$INST_VER" != "$NEW_VER" ] || die "the installed tapectl is already $NEW_VER ($INST_LINE), and no upgrade to it is recorded here ($U_STATE): there is nothing to upgrade. Every build installed on a production host has a version of its own (ADR-0012, 2026-09-30)"
+  vercmp_ge "$NEW_VER" "$INST_VER" || die "$TAG is older than the installed $INST_VER: there is no downgrade past a migration (docs/install.md §10, \"Rolling back\")"
+  OLD_VER="$INST_VER"
+  ustate_set old "$OLD_VER"
+  ustate_set started "$(date -u +%FT%TZ)"
+  # Where the daily backup wrote before this upgrade, for step 12's tidy.
+  ustate_set unit_backup_dir "$UNIT_BDIR"
+else
+  case "$INST_VER" in
+    "$OLD_VER" | "$NEW_VER") note "resuming the upgrade from $OLD_VER to $NEW_VER recorded in $U_STATE" ;;
+    *) die "the installed tapectl is $INST_VER, but $U_STATE records an upgrade from $OLD_VER to $NEW_VER: stop and look" ;;
+  esac
+fi
+# The binary step 4 installs: built from the tag, or the --tapectl PATH that
+# --skip-build names. A profile's TAPECTL alone is not a build to install.
+NEW_BIN=""
+if [ "$SKIP_BUILD" = 1 ]; then
+  [ -n "$TAPECTL" ] || die "--skip-build under --upgrade installs the binary --tapectl names, and none is named"
+  [ -x "$TAPECTL" ] || die "--tapectl $TAPECTL is not executable"
+  NEW_BIN="$TAPECTL"
+fi
+# From here on every tapectl command is the installed one: the old binary until
+# step 4 replaces it, then the new.
+TAPECTL="$INSTALL_BIN"
+CATALOG="$EFFECTIVE_HOME/tapectl.db"
+as_svc test -r "$CATALOG" || die "there is no catalog at $CATALOG for $U_RUN_USER to read: is this the host's home (--home, --user)?"
+# The backup goes where the daily backup does (#502: never the default unasked).
+U_BDIR="${BACKUP_DIR:-$UNIT_BDIR}"
+[ -n "$U_BDIR" ] || die "no backup directory: neither --backup-dir nor the profile names one, and no installed tapectl-backup.service does ($UNIT_FILE). Pass --backup-dir DIR, the second disk the daily backup uses (docs/install.md §7)"
+KEEP="$(dirname "$INSTALL_BIN")/tapectl-$OLD_VER"
+MIG_TOP="$(find "$REPO/src/db/migrations" -maxdepth 1 -name '[0-9]*.sql' -printf '%f\n' | sed 's/_.*//' | sort -n | tail -n 1)"
+MIG_TOP=$((10#${MIG_TOP:-0}))
+if [ -x /usr/local/bin/tapectl-op ] && [ -z "$HOME_DIR" ]; then U_OP=tapectl-op; else U_OP="${SUDO_PREFIX}$INSTALL_BIN${HOME_DIR:+ --home $HOME_DIR}"; fi
+ok "installed: $INST_LINE ($INSTALL_BIN)"
+ok "new: $TAG, the checkout $REPO (clean); its migrations end at $MIG_TOP"
+ok "catalog: $CATALOG; backups: $U_BDIR"
+log "upgrade $OLD_VER -> $NEW_VER ($U_STATE)"
+
+# ---------------------------------------------------------------- upgrade 2
+uhdr 2 "Back up the catalog with the old binary ($OLD_VER)"
+uskip || {
+U_BACKUP="$(ustate backup)"
+if [ -n "$U_BACKUP" ]; then
+  _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP that $U_STATE records"
+  [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check"
+  ok "taken already: $U_BACKUP (schema ${_facts%% *}, integrity ok)"
+else
+  [ "$INST_VER" = "$OLD_VER" ] || die "the installed tapectl is $INST_VER, and $U_STATE records no backup taken with $OLD_VER: the catalog may have moved on already. Do not go on without a backup: stop and look"
+  { as_svc test -d "$U_BDIR" && as_svc test -w "$U_BDIR"; } || die "$U_RUN_USER cannot write $U_BDIR, the backup directory"
+  U_BACKUP="$U_BDIR/tapectl-pre-$NEW_VER.db"
+  if as_svc test -e "$U_BACKUP"; then
+    U_BACKUP="$U_BDIR/tapectl-pre-$NEW_VER-$(date -u +%Y%m%dT%H%M%SZ).db"
+    note "tapectl-pre-$NEW_VER.db is there already; this backup goes to $U_BACKUP"
+  fi
+  run tc db backup --to "$U_BACKUP" || die "db backup with $OLD_VER failed (above); nothing has changed"
+  _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP just written"
+  [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check: do not go on"
+  ustate_set backup "$U_BACKUP"
+  ustate_set schema_before "${_facts%% *}"
+  ok "backed up with $OLD_VER: $U_BACKUP (schema ${_facts%% *}, integrity ok)"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 3
+uhdr 3 "Keep the old binary as $KEEP"
+uskip || {
+if [ -e "$KEEP" ]; then
+  _kv="$("$KEEP" --version 2>/dev/null | awk '{ print $2; exit }')"
+  [ "$_kv" = "$OLD_VER" ] || die "$KEEP is tapectl ${_kv:-<unreadable>}, not $OLD_VER: stop and look"
+  ok "kept already: $KEEP ($("$KEEP" --version))"
+else
+  [ "$INST_VER" = "$OLD_VER" ] || die "the installed tapectl is already $INST_VER, and no copy of $OLD_VER is at $KEEP: a rollback would have no binary. Stop and look"
+  run sudo cp -p "$INSTALL_BIN" "$KEEP" || die "could not copy $INSTALL_BIN to $KEEP"
+  ok "kept: $KEEP ($("$KEEP" --version))"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 4
+uhdr 4 "Build and install $TAG"
+uskip || {
+if installed_is_new; then ok "installed already: $("$INSTALL_BIN" --version)"
+else
+  if [ -n "$NEW_BIN" ]; then
+    note "--skip-build: installing $NEW_BIN"
+  else
+    explain <<'EOF'
+The release binary, built from the checkout under the build lock: a few minutes. It is a new artifact whatever an earlier build proved, which is why step 9 rehearses it on a test cartridge.
+EOF
+    confirm "Build the release binary from $TAG now (cargo build --release)?" || die "stopped before the build; nothing has changed since step 3"
+    build_release
+    NEW_BIN="$BUILT"
+  fi
+  _nv="$("$NEW_BIN" --version 2>/dev/null || true)"
+  case "$_nv" in
+    "tapectl $NEW_VER ($TAG, "*) ;;
+    *) die "$NEW_BIN says '${_nv}', not tapectl $NEW_VER built from $TAG: only a build of the tag is installed" ;;
+  esac
+  confirm "Install it to $INSTALL_BIN (sudo)?" || die "stopped before the install; nothing has changed since step 3"
+  run sudo install -m 0755 "$NEW_BIN" "$INSTALL_BIN" || die "could not install $NEW_BIN to $INSTALL_BIN"
+  need_new
+  ok "installed: $("$INSTALL_BIN" --version)"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 5
+uhdr 5 "The new binary's first open: the migrations"
+uskip || {
+need_new
+_before="$(ustate schema_before)"
+[ -n "$_before" ] || { _before="$(db_facts "$CATALOG" version)" || die "cannot read $CATALOG's schema"; }
+run tc config check || die "config check refused (above). A key a release renamed or removed is named there; the release notes say what to do ($U_NOTES, \"Upgrading\"). Fix it, then run --upgrade again"
+_after="$(db_facts "$CATALOG" version)" || die "cannot read $CATALOG's schema"
+ok "the catalog's schema: $_before → $_after"
+[ "$_after" = "$MIG_TOP" ] || die "the catalog is at schema $_after, but $TAG's migrations end at $MIG_TOP"
+[ "$_before" != "$_after" ] || note "no migration applied: $OLD_VER and $NEW_VER have the same schema"
+}
+
+# ---------------------------------------------------------------- upgrade 6
+uhdr 6 "Step 14 again: the units, the wrapper and the timers"
+uskip || { need_new; upgrade_child 14; }
+
+# ---------------------------------------------------------------- upgrade 7
+uhdr 7 "The release's own steps"
+uskip || {
+explain <<'EOF'
+What only one release asks of you is in its notes, under "Upgrading": a config key to set, a tool to install, which audit check to read. The notes of every release after the one you had, up to this one, follow; a release contains the ones before it, so each one's steps apply.
+EOF
+_found=0
+while IFS= read -r _v; do
+  [ -n "$_v" ] || continue
+  _found=1
+  printf '\n   %sdocs/releases/%s.md, "Upgrading":%s\n' "$B" "$_v" "$R"
+  _sec="$(awk '/^## Upgrading/ { f = 1; next } /^## / { f = 0 } f' "$REPO/docs/releases/$_v.md")"
+  if [ -n "$(printf '%s' "$_sec" | tr -d '[:space:]')" ]; then printf '%s\n' "$_sec" | sed 's/^/     /'
+  else note "(no \"Upgrading\" section: read the notes whole)"; fi
+done < <(for _f in "$REPO"/docs/releases/[0-9]*.md; do
+           _v="$(basename "$_f" .md)"
+           if [ "$_v" != "$OLD_VER" ] && vercmp_ge "$_v" "$OLD_VER" && vercmp_ge "$NEW_VER" "$_v"; then printf '%s\n' "$_v"; fi
+         done | sort -V)
+[ "$_found" = 1 ] || die "no release notes between $OLD_VER and $NEW_VER under $REPO/docs/releases"
+if [ "$AUTO" = 1 ]; then
+  note "--auto does not stop here: the steps above are yours to do"
+else
+  _a=""
+  tty_read _a "   Press Enter once they are done (or type q to stop here; --upgrade --from 8 goes on later): "
+  [ "$_a" != q ] || die "stopped at upgrade step 7; once the release's steps are done, run --upgrade --from 8"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 8
+uhdr 8 "Look"
+uskip || {
+need_new
+explain <<'EOF'
+What the catalog says with the new binary. audit is advisory (exit 1 warnings, 2 violations): a check a release added may report something that was always true, and the notes above say what to expect.
+EOF
+look status
+look audit
+look report failed-stages
+}
+
+# ---------------------------------------------------------------- upgrade 9
+uhdr 9 "Step 12 again: rehearse the installed binary on a test cartridge"
+uskip || {
+need_new
+U_MARKER="$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$INSTALL_BIN" | cut -c1-16)"
+if [ -f "$U_MARKER" ]; then
+  ok "a green rehearsal of the installed binary is recorded: $(cat "$U_MARKER")"
+else
+  upgrade_child 12
+  [ -f "$U_MARKER" ] || die "no green rehearsal of the installed binary is recorded ($U_MARKER): step 12 above was skipped or refused it. The upgrade is not done without one: load a test cartridge and run --upgrade again"
+  ok "rehearsal green: $(cat "$U_MARKER")"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 10
+uhdr 10 "Step 9 again: the Heir Kit"
+uskip || {
+need_new
+# Step 9 asks for the directory, with this one as its default: the kit is
+# checked here, so a different answer there is reported, not looked for.
+KIT_OUT="${KIT_OUT:-$HOME/heir-kit}"
+upgrade_child 9 --kit-out "$KIT_OUT"
+_kb="$KIT_OUT/tapectl-$NEW_VER"
+[ -f "$_kb" ] || die "no $_kb: the kit in $KIT_OUT was not made by $NEW_VER (above). If step 9 was given another directory, check the kit there"
+_a="$(sha256sum "$_kb" | cut -d' ' -f1)"; _b="$(sha256sum "$INSTALL_BIN" | cut -d' ' -f1)"
+[ "$_a" = "$_b" ] || die "the kit's tapectl-$NEW_VER ($_a) is not the installed binary ($_b)"
+grep -F "$_a" "$KIT_OUT/COVER.txt" >/dev/null || die "$KIT_OUT/COVER.txt does not name tapectl-$NEW_VER's sha256 $_a"
+ok "the kit's tapectl-$NEW_VER is the installed binary, and COVER.txt names its sha256"
+note "Yours now: print $KIT_OUT/COVER.txt, put the new catalog.db.age and tapectl-$NEW_VER on the media in each envelope, and destroy the sheets they replace."
+}
+
+# ---------------------------------------------------------------- upgrade 11
+uhdr 11 "A catalog backup made by $NEW_VER"
+uskip || {
+if [ -n "$HOME_DIR" ]; then
+  note "--home $HOME_DIR is not the host's installed home: no backup unit is started for it"
+elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl cat tapectl-backup.service >/dev/null 2>&1; then
+  note "tapectl-backup.service is not installed on this host (step 14 installs it): no copy taken"
+elif confirm "Start tapectl-backup.service once now (sudo), so a copy made by $NEW_VER lands in its directory?"; then
+  run sudo systemctl start tapectl-backup.service || die "tapectl-backup.service failed: journalctl -u tapectl-backup.service -n 30"
+  ok "tapectl-backup.service ran"
+else
+  note "skipped: sudo systemctl start tapectl-backup.service takes one later"
+fi
+}
+
+# ---------------------------------------------------------------- upgrade 12
+uhdr 12 "Tidy what earlier runs left"
+uskip || {
+explain <<EOF
+What earlier installs, rehearsals and upgrades leave behind, by group, with its size. Nothing is removed unless you type the word for its group (never under --auto). Never listed: the home ($EFFECTIVE_HOME), the kit directory (${KIT_OUT:-none}), the backup directory ($U_BDIR), the checkout, the installed binary and the newest kept one.
+EOF
+# tidy_kept PATH: PATH is, holds, or (for a directory the upgrade keeps) lies
+# inside something this step never touches.
+tidy_kept() {
+  local p q
+  p="$(realpath -m "$1")"
+  for q in "$EFFECTIVE_HOME" "$KIT_OUT" "$U_BDIR" "$REPO"; do
+    [ -n "$q" ] || continue
+    q="$(realpath -m "$q")"
+    case "$p/" in "$q/"*) return 0 ;; esac
+  done
+  for q in "$INSTALL_BIN" "$KEEP" "$HOME"; do
+    q="$(realpath -m "$q")"
+    case "$q/" in "$p/"*) return 0 ;; esac
+  done
+  return 1
+}
+# tidy_group TITLE OWNER PATH…: list the paths with their sizes; remove them only
+# on the typed word. OWNER says who removes: me, svc (the service user) or root.
+tidy_group() {
+  local title="$1" owner="$2" p sz
+  shift 2
+  [ "$#" -gt 0 ] || return 0
+  printf '\n   %s%s%s\n' "$B" "$title" "$R"
+  for p in "$@"; do
+    case "$owner" in
+      svc) sz="$(as_svc du -sh "$p" 2>/dev/null | cut -f1)" ;;
+      *) sz="$(du -sh "$p" 2>/dev/null | cut -f1)" ;;
+    esac
+    printf '     %6s  %s\n' "${sz:-?}" "$p"
+  done
+  log "tidy candidates ($title): $*"
+  if [ "$AUTO" = 1 ]; then note "--auto lists only: nothing removed"; return 0; fi
+  if confirm_destructive "Remove these $# ($title)" remove; then
+    for p in "$@"; do
+      case "$owner" in
+        svc) run as_svc rm -rf -- "$p" || note "could not remove $p" ;;
+        root) run sudo rm -rf -- "$p" || note "could not remove $p" ;;
+        *) run rm -rf -- "$p" || note "could not remove $p" ;;
+      esac
+    done
+  else note "kept"; fi
+}
+_t=()
+# Candidate build directories copied to the host for an acceptance run
+# (~/tapectl-<version>-<commit>): superseded once this release is installed.
+while IFS= read -r _p; do
+  [ -n "$_p" ] || continue
+  _v="$(basename "$_p" | sed -E 's/^tapectl-([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/')"
+  vercmp_ge "$NEW_VER" "$_v" || continue
+  tidy_kept "$_p" || _t+=("$_p")
+done < <(find "$HOME" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/tapectl-[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{7,40}' 2>/dev/null | sort)
+tidy_group "candidate build directories under $HOME" me ${_t[@]+"${_t[@]}"}
+# Step 12's throwaway homes, all but the newest (this upgrade's rehearsal).
+_t=()
+while IFS= read -r _p; do
+  [ -n "$_p" ] || continue
+  tidy_kept "$_p" || _t+=("$_p")
+done < <(find "$WORK_DIR/tapectl-lifecycle" -mindepth 1 -maxdepth 1 -type d -name 'run-*' 2>/dev/null | sort | head -n -1)
+tidy_group "rehearsal homes under $WORK_DIR/tapectl-lifecycle (the newest is kept)" me ${_t[@]+"${_t[@]}"}
+# Another Heir Kit under your home: its tapectl may not read newer tapes.
+_t=()
+while IFS= read -r _p; do
+  [ -n "$_p" ] || continue
+  _p="$(dirname "$_p")"
+  tidy_kept "$_p" || _t+=("$_p")
+done < <(find "$HOME" -mindepth 2 -maxdepth 2 -name COVER.txt 2>/dev/null | sort)
+tidy_group "other Heir Kit directories (print and seal the one in ${KIT_OUT:-the kit directory} first)" me ${_t[@]+"${_t[@]}"}
+# Catalog copies in a backup directory the daily backup no longer writes to.
+_t=()
+for _d in "$(ustate unit_backup_dir)" "$BACKUP_DIR_DEFAULT"; do
+  [ -n "$_d" ] || continue
+  [ "$(realpath -m "$_d")" != "$(realpath -m "$U_BDIR")" ] || continue
+  as_svc test -d "$_d" 2>/dev/null || continue
+  while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    tidy_kept "$_p" || _t+=("$_p")
+  done < <(as_svc find "$_d" -mindepth 1 -maxdepth 1 -type f -name 'tapectl-*.db' 2>/dev/null | sort)
+done
+tidy_group "catalog copies in a backup directory the daily backup no longer uses" svc ${_t[@]+"${_t[@]}"}
+# Rollback binaries older than the newest one kept.
+_t=()
+_newest="$(find "$(dirname "$INSTALL_BIN")" -maxdepth 1 -type f -regextype posix-extended -regex '.*/tapectl-[0-9]+\.[0-9]+\.[0-9]+' -printf '%f\n' 2>/dev/null | sort -V | tail -n 1)"
+while IFS= read -r _p; do
+  [ -n "$_p" ] || continue
+  [ "$(basename "$_p")" != "$_newest" ] || continue
+  tidy_kept "$_p" || _t+=("$_p")
+done < <(find "$(dirname "$INSTALL_BIN")" -maxdepth 1 -type f -regextype posix-extended -regex '.*/tapectl-[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null | sort -V)
+tidy_group "rollback binaries older than ${_newest:-the newest}" root ${_t[@]+"${_t[@]}"}
+ok "tidy done"
+}
+
+# ---------------------------------------------------------------- upgrade 13
+uhdr 13 "The rollback"
+_rb="$(ustate backup)"
+explain <<EOF
+Should $NEW_VER have to come out: with the timers stopped, import the backup step 2 took with $OLD_VER while $NEW_VER is still installed, then put the kept binary back and check the catalog with it. In that order: every tapectl command opens the catalog first, and $OLD_VER cannot open one $NEW_VER has migrated, so $OLD_VER's own import would be refused. Whatever the catalog recorded after that backup is lost, and $OLD_VER may refuse a tape $NEW_VER wrote in between.
+EOF
+_timers="tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer"
+[ -n "$HOME_DIR" ] || printf '     sudo systemctl stop %s\n' "$_timers"
+printf '     %s db import %s\n' "$U_OP" "${_rb:-<the backup from step 2: none is recorded in $U_STATE>}"
+printf '     sudo cp -p %s %s\n' "$KEEP" "$INSTALL_BIN"
+printf '     %s db fsck\n' "$U_OP"
+[ -n "$HOME_DIR" ] || printf '     sudo systemctl start %s\n' "$_timers"
+ustate_set finished "$(date -u +%FT%TZ)"
+ok "upgraded to $TAG: $("$INSTALL_BIN" --version). Log: $LOG; record: $U_STATE"
+exit 0
+fi
 
 # ================================================================ step 1
 hdr 1 "Rust toolchain"
@@ -770,11 +1280,9 @@ explain <<'EOF'
 Production runs the RELEASE binary: the same source with optimisation on, and it matters here — staging hashes and encrypts every byte, and a debug build does that roughly ten times slower than release (a 20 GiB stage took 19 minutes on the release binary on this host, 2026-09-23; the debug attempt was abandoned). Whatever an earlier build proved, the binary you build now is a new artifact, which is why step 12 rehearses it on a test cartridge before step 13 trusts it with data. Install it to /usr/local/bin: the service user cannot execute a binary under your home.
 EOF
 if confirm "Build the release binary now (cargo build --release; a few minutes)?"; then
-  toolchain_check
-  ( cd "$REPO" && run flock -w 1200 -E 99 "$BUILD_LOCK" cargo build --release ) || die "release build failed (exit 99 = timed out waiting for $BUILD_LOCK: another build is linking)"
-  TAPECTL="$REPO/target/release/tapectl"
-  [ -x "$TAPECTL" ] || TAPECTL="${CARGO_TARGET_DIR:-$REPO/target}/release/tapectl"
-  if confirm "Install it to /usr/local/bin/tapectl (sudo)?"; then run sudo install -m 0755 "$TAPECTL" /usr/local/bin/tapectl; TAPECTL=/usr/local/bin/tapectl; fi
+  build_release
+  TAPECTL="$BUILT"
+  if confirm "Install it to $INSTALL_BIN (sudo)?"; then run sudo install -m 0755 "$TAPECTL" "$INSTALL_BIN"; TAPECTL="$INSTALL_BIN"; fi
 fi
 fi
 }
@@ -1425,6 +1933,18 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
   ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
   if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
+    # ADR-0012 item 192 (#505): never a cartridge this catalog knows. The suite
+    # erases the cartridge it is given, and checks only that the serial typed is
+    # the one loaded; a production copy typed by mistake would pass that. The
+    # check is fail-closed: a catalog that cannot be read refuses the rehearsal.
+    KNOWN_CART=""
+    KNOWN_CART="$(known_cartridge "$TEST_BARCODE")" \
+      || die "cannot read this catalog's cartridges ($OP_CMD cartridge list), so nothing proves $TEST_BARCODE is not one of them; the rehearsal was not run"
+    if [ -n "$KNOWN_CART" ]; then
+      log "step 12 refused $TEST_BARCODE: catalog cartridge $KNOWN_CART"
+      die "$TEST_BARCODE is a cartridge this catalog knows ($OP_CMD cartridge info $KNOWN_CART): the rehearsal erases the cartridge it is given, so it never takes one the catalog has recorded. Nothing was erased. Load a test cartridge this catalog has never seen, then re-run step 12"
+    fi
+    ok "$TEST_BARCODE is not a cartridge this catalog knows"
     # /usr/sbin:/sbin: Debian installs mtx there and leaves both off a normal
     # user's PATH; the suite's precondition check wants mtx even on a real
     # drive (home2, 2026-09-28).

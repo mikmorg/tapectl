@@ -154,12 +154,13 @@ resume, reinstall, upgrade, move to a new host, or uninstall. To build by hand:
 
 ## Upgrading
 
-An upgrade is done in place. Read the release notes from your version to the new one,
-back up the catalog with the old binary, and keep that binary. Then check out the new
-tag and install it; the catalog migrates at its first open, and there is no downgrade
-past a migration. Rehearse on a test cartridge and regenerate the Heir Kit before the
-next write. [docs/install.md, "Upgrading in place"](docs/install.md#10-upgrading-in-place)
-has the steps until `first-run.sh --upgrade` (#505) replaces them.
+An upgrade is done in place, from a checkout of the new release tag:
+`scripts/first-run.sh --upgrade`. It backs the catalog up with the old binary and keeps
+that binary, installs the new one (the catalog migrates at its first open, and there is
+no downgrade past a migration), stops at each newer release's own steps, rehearses on a
+test cartridge, regenerates the Heir Kit and prints the way back.
+[docs/install.md, "Upgrading in place"](docs/install.md#10-upgrading-in-place) has the
+steps.
 
 ## Documentation
 

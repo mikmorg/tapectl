@@ -791,99 +791,79 @@ the escrow *secret* is on paper only and is not in the tarball.
 ## 10. Upgrading in place
 
 An upgrade keeps the home, the keys, the catalog and the tapes. The binary is
-replaced, and the catalog moves forward at the new binary's first open. This is
-how home2 went from 1.1.0 to 1.5.0 and from 1.5.0 to 1.8.0 (`docs/handoff.md`, (f)
-and (h)). `first-run.sh --upgrade` (#505) will run these steps for you (ADR-0012
-item 192); until it exists, this section is the procedure.
+replaced, and the catalog moves forward at the new binary's first open.
+`scripts/first-run.sh --upgrade` runs the whole of it (ADR-0012 item 192), on a
+host `first-run.sh` installed, from a checkout of the release:
 
-The commands are for a host installed by `first-run.sh` with the `tapectl-op`
-wrapper (step 14). On a host without a profile, leave `--profile` out. `<old>` and
-`<new>` are the two versions, such as `1.5.0` and `1.8.0`.
+```bash
+git fetch --tags
+git checkout v<new>
+scripts/first-run.sh --profile contrib/hosts/<host>.profile --upgrade
+```
+
+On a host installed without a profile, leave `--profile` out. `<old>` and `<new>`
+below are the two versions, such as `1.8.0` and `1.8.1`.
 
 **Before you start.**
 
-- **Read the release notes** ([docs/releases/](releases/)) of every release after
-  yours, up to the one you are installing, and each one's "Upgrading" section. You
-  can skip releases: a release contains the ones before it, and home2 went from
-  1.5.0 straight to 1.8.0. The notes name each catalog migration and any step the
-  release asks of you.
+- **Work inside tmux.** The rehearsal (step 9) runs for minutes, and a dropped
+  session stops the upgrade there. Running `--upgrade` again resumes it.
+- **Have a test cartridge at hand** for the rehearsal: one this catalog has never
+  seen, which it erases. Step 12 refuses a cartridge whose chip serial, claimed
+  serial or barcode the catalog knows, and names it.
+- **Have the Heir Kit's media at hand** for step 10's new kit.
 - **There is no downgrade past a migration.** An older binary refuses a catalog
   that is ahead of its migration list. The way back is the binary and the backup
-  you keep below ("Rolling back").
-- **Work inside tmux, with no tapectl command running.** `tapectl-op status` names a
-  running session.
+  the upgrade keeps (step 13).
+- You can skip releases: a release contains the ones before it, and step 7 shows
+  the "Upgrading" notes of every release after yours.
 
-**The steps**, from the repository checkout:
+**The steps.** Each one checks what an earlier run already did and does not do
+it twice, so a run that stopped is resumed by running `--upgrade` again;
+`--from N` and `--to N` take these numbers. A step that fails stops the run.
 
-1. **Back up the catalog with the old binary.** `--to` is required; the backup
-   timer prunes only its own `tapectl-<stamp>.db` files, so a copy named like this
-   one is kept:
-   ```bash
-   tapectl-op db backup --to /var/backups/tapectl/tapectl-pre-<new>.db   # your backup directory (§7)
-   ```
-2. **Check out the release:**
-   ```bash
-   git fetch --tags
-   git checkout v<new>
-   ```
-3. **Keep the old binary, then build and install the new one.** Step 3 builds a
-   release binary from the checkout and installs it to `/usr/local/bin`; the timers
-   pick it up at their next run.
-   ```bash
-   sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>
-   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 3 --to 3
-   tapectl --version        # tapectl <new> (v<new>, <date>)
-   ```
-4. **Let the first open apply the migrations.** Run as the service user, this is
-   the new binary's first open of the catalog, and it applies every migration the
-   notes list. A config key the new version refuses is named here (§6).
-   ```bash
-   tapectl-op config check
-   ```
-5. **The release's own steps**, from its notes' "Upgrading" section: a config key
-   to set, or a step of `first-run.sh` to run again. 1.6.0's, for example, adds
-   `post_warning_bytes` to the drive's backend.
-6. **Step 14 again.** It re-renders the timers and `tapectl-op` for the new
-   checkout, and reports each installed file `unchanged` when nothing moved. Your
-   own settings are safe in their drop-ins (§7), and the script names any
-   `Environment=` line of an installed unit that its render would drop. A host
-   without a profile whose backups go somewhere other than the default passes
-   `--backup-dir <that directory>` too, or the step refuses (§7, #502).
-   ```bash
-   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 14 --to 14
-   ```
-7. **Look.** A new `audit` check may report something that was always true; the
-   notes say what to expect.
-   ```bash
-   tapectl-op status
-   tapectl-op audit
-   ```
-8. **Rehearse before the next write.** Step 12 proves the new binary on the drive,
-   on a test cartridge it erases, and step 13 looks for its marker for that exact
-   binary. A `tapectl-op volume write` by hand does not check for it, so run the
-   rehearsal first. The step stops an active drive-poll timer for its duration and
-   starts it again when it ends, and it refuses while a poll is running.
-   ```bash
-   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 12 --to 12
-   ```
-9. **Regenerate the Heir Kit** with the new binary, reprint `COVER.txt`, and put the
-   new files on the media in each envelope
-   ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir-kit)). The kit
-   holds a copy of the binary that made it (`tapectl-<new>`), and an older copy may
-   refuse the tapes the new one writes: 1.5.0's refuses every tape written by 1.6.0
-   or later. A sheet printed before the upgrade does not describe the new kit.
-   ```bash
-   scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 9 --to 9
-   ```
+| Step | What it does | By hand, for reference |
+|---|---|---|
+| 1 | Preflight, always run: no tapectl command or tapectl unit running; the checkout exactly an annotated `v<new>` tag, with no change to a tracked file; `<new>` newer than the installed tapectl; release notes for `<new>` | `tapectl-op status`, `git describe --exact-match` |
+| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only) | `tapectl-op db backup --to <backup dir>/tapectl-pre-<new>.db` |
+| 3 | Keep the old binary as `/usr/local/bin/tapectl-<old>` | `sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>` |
+| 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag | `scripts/first-run.sh --from 3 --to 3` |
+| 5 | `config check`, the new binary's first open: it applies the migrations, and the schema is printed before and after | `tapectl-op config check` |
+| 6 | Step 14 again: the units, the wrapper and the timers. Each installed file it leaves alone is reported `unchanged` | `scripts/first-run.sh --from 14 --to 14` |
+| 7 | Stop at the "Upgrading" notes of every release after `<old>` up to `<new>`: what only that release asks (a config key, a tool), done by you. Enter goes on | `docs/releases/` |
+| 8 | Look: `status`, `audit`, `report failed-stages` | |
+| 9 | Step 12 again: the rehearsal of the installed binary on the test cartridge, with the drive-poll timer stopped for it and started again | `scripts/first-run.sh --from 12 --to 12` |
+| 10 | Step 9 again: regenerate the Heir Kit, and check that its `tapectl-<new>` is the installed binary and that `COVER.txt` names its sha256 | `scripts/first-run.sh --from 9 --to 9` |
+| 11 | Start `tapectl-backup.service` once, so a copy made by `<new>` lands in the backup directory | `sudo systemctl start tapectl-backup.service` |
+| 12 | Tidy: list what earlier runs left behind, by group with its size (candidate build directories `~/tapectl-<version>-<commit>`, older rehearsal homes under the work directory, another Heir Kit under your home, catalog copies in a backup directory the daily backup no longer uses, rollback binaries older than the newest). A group is removed only when you type `remove`, never under `--auto`. The home, the kit directory, the backup directory, the checkout, the installed binary and the newest kept one are never listed | |
+| 13 | Print the rollback | |
 
-**Rolling back.** Put the kept binary back, then import the backup from step 1 and
-check it. Whatever the catalog recorded after step 1 is lost, and the old binary may
-refuse a tape the new one wrote in between.
+The backup goes where the daily backup goes: the profile's `BACKUP_DIR` or
+`--backup-dir`, else the directory the installed `tapectl-backup.service` names.
+With neither, the upgrade refuses before anything changes.
+
+What the script does not know stays in each release's notes: the migration
+numbers, config keys to set, new tool dependencies, which releases may be
+skipped, and what an older reader of the tapes refuses. After step 10, print the
+new `COVER.txt`, put the new `catalog.db.age` and `tapectl-<new>` on the media in
+each envelope ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir-kit)),
+and destroy the sheets they replace: an older kit's tapectl may refuse the tapes
+the new one writes (1.5.0's refuses every tape written by 1.6.0 or later).
+
+**Rolling back.** Step 13 prints the commands. With the timers stopped, import
+the backup from step 2 while the NEW binary is still installed, then put the
+kept binary back and check the catalog with it. The order matters: every tapectl
+command opens the catalog first, and an older binary refuses a catalog a newer
+one has migrated, so the old binary's own `db import` would be refused. Whatever
+the catalog recorded after step 2 is lost, and the old binary may refuse a tape
+the new one wrote in between.
 
 ```bash
+sudo systemctl stop tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
+tapectl-op db import <backup dir>/tapectl-pre-<new>.db
 sudo cp -p /usr/local/bin/tapectl-<old> /usr/local/bin/tapectl
-tapectl-op db import /var/backups/tapectl/tapectl-pre-<new>.db
 tapectl-op db fsck
+sudo systemctl start tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer
 ```
 
 ---

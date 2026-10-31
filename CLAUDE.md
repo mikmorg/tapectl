@@ -561,6 +561,22 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
     --ignored --nocapture --test-threads=1
 ```
 
+**`first-run.sh --upgrade` (#505, ADR-0012 item 192) has its own mhvtl harness**,
+`scripts/upgrade-mhvtl.sh`: the previous release tag's `first-run.sh` installs into a
+throwaway home, then the candidate's `--upgrade` runs three times (refused at the rehearsal
+on the production cartridge, resumed to a green rehearsal on a second cartridge, the tidy).
+It works in throwaway clones (a candidate not newer than the tag is stamped X.Y.(Z+1) and
+tagged in its clone only), builds both in debug, and stands in for the host's units: a
+transient `tapectl-drive-poll.timer` in `/run/systemd/system`, an installed backup unit under
+`TAPECTL_UNIT_DIR`, the binary at `TAPECTL_INSTALL_BIN`. It needs a committed HEAD and two
+cartridges of the drive's generation. Not covered: tidy's removal (a typed word), step 11's
+real backup service, a release build.
+
+```bash
+TAPECTL_MHVTL=1 bash scripts/upgrade-mhvtl.sh \
+    --device "$(readlink -f /dev/tape/by-id/scsi-XYZZY_A1-nst)"
+```
+
 **The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
 #457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
 has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive

@@ -11,6 +11,8 @@
 //! stubs for `sudo`, `systemctl`, `age` and `sg_read_attr` first on `PATH`: the
 //! `sudo` stub only records what it was asked, so nothing reaches the host,
 //! and no run gets as far as the rehearsal itself (`/dev/null` is the drive).
+//! Step 12 also refuses a test cartridge its catalog knows (ADR-0012 item
+//! 192): those runs are given a home with cartridges registered in it.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -289,9 +291,21 @@ fn stub(dir: &Path, name: &str, body: &str) {
 /// `sg` as its sg node, the poll service and timer in the given states.
 /// Returns the output and the calls the stubs recorded.
 fn step12(service: &str, timer: &str, sg: &str) -> (Output, String) {
-    let rig = Rig::new();
+    step12_with(&Rig::new(), service, timer, sg, &[])
+}
+
+/// `step12` on a given rig, with more arguments after the usual ones.
+fn step12_with(
+    rig: &Rig,
+    service: &str,
+    timer: &str,
+    sg: &str,
+    extra: &[&str],
+) -> (Output, String) {
     let bin = rig.p("bin");
     let calls = rig.p("calls");
+    // One run's calls: a rig may run the step more than once.
+    let _ = std::fs::remove_file(&calls);
     let calls_s = calls.display();
     stub(
         &bin,
@@ -339,6 +353,7 @@ exit 0"#
             "--sg",
             sg,
         ])
+        .args(extra)
         .env("PATH", path)
         .output()
         .expect("spawn first-run.sh");
@@ -420,4 +435,113 @@ fn step_12_waits_for_a_running_poll_and_leaves_an_inactive_timer_alone() {
     );
     assert!(!calls.contains("sudo systemctl"), "{calls}");
     assert!(!out.contains("THE DRIVE POLL"), "{out}");
+}
+
+// ------------------------------------------- step 12: a cartridge the catalog knows
+
+/// A home initialised by the binary itself, holding two cartridges: `B1`, whose
+/// serial is only claimed (`operator_serial` S1, as `cartridge register --serial`
+/// writes it), and `B2`, whose serial S2 the chip reported (`serial_number`, which
+/// only a MAM read writes, so the test writes it into the catalog directly).
+fn home_with_cartridges(rig: &Rig) -> PathBuf {
+    let home = rig.p("tapectl-home");
+    let tc = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .arg("--home")
+            .arg(&home)
+            .args(args)
+            .env("HOME", rig.p("h"))
+            .env("TAPECTL_HOME_POINTER", rig.p("home-pointer"))
+            .env_remove("TAPECTL_HOME")
+            .output()
+            .expect("spawn tapectl");
+        let (out, err) = text(&o);
+        assert!(o.status.success(), "tapectl {args:?}: {out}\n{err}");
+    };
+    tc(&["init", "--operator", "fr-tester", "--no-escrow"]);
+    tc(&[
+        "cartridge",
+        "register",
+        "--barcode",
+        "B1",
+        "--generation",
+        "LTO-6",
+        "--serial",
+        "S1",
+    ]);
+    tc(&[
+        "cartridge",
+        "register",
+        "--barcode",
+        "B2",
+        "--generation",
+        "LTO-6",
+    ]);
+    let conn = rusqlite::Connection::open(home.join("tapectl.db")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE cartridges SET serial_number = 'S2' WHERE barcode = 'B2'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    home
+}
+
+/// Item 192: the rehearsal erases the cartridge it is given, so a serial or
+/// barcode the catalog has recorded is refused by name, after the consent and
+/// before the suite runs, whichever of the three it matches; and the poll timer
+/// the step stopped is started again. The suite is never started: its command
+/// line is not in the output.
+#[test]
+fn step_12_refuses_a_cartridge_its_catalog_knows() {
+    let rig = Rig::new();
+    let home = home_with_cartridges(&rig);
+    let home_s = home.to_str().unwrap();
+    for (given, cartridge) in [("S1", "B1"), ("S2", "B2"), ("B1", "B1")] {
+        let (o, calls) = step12_with(
+            &rig,
+            "inactive",
+            "active",
+            "/dev/null",
+            &["--home", home_s, "--barcode", given],
+        );
+        let (out, err) = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{given}: {out}\n{err}\n{calls}");
+        assert!(
+            err.contains(&format!("{given} is a cartridge this catalog knows"))
+                && err.contains(&format!("cartridge info {cartridge})")),
+            "{given}: {err}"
+        );
+        assert!(err.contains("Nothing was erased"), "{err}");
+        assert!(
+            out.contains("supplied via a flag"),
+            "the refusal came after the consent: {out}"
+        );
+        assert!(!out.contains("lifecycle-suite.sh"), "the suite ran: {out}");
+        stop_then_start(&calls);
+    }
+}
+
+/// Item 192, fail-closed: with no catalog to ask (a home that does not exist),
+/// nothing proves the cartridge is not one the catalog knows, so the rehearsal
+/// is refused too, and the suite never runs.
+#[test]
+fn step_12_refuses_when_the_catalog_cannot_say() {
+    let rig = Rig::new();
+    let missing = rig.p("no-such-home");
+    let (o, calls) = step12_with(
+        &rig,
+        "inactive",
+        "inactive",
+        "/dev/null",
+        &["--home", missing.to_str().unwrap(), "--barcode", "S9"],
+    );
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}\n{calls}");
+    assert!(
+        err.contains("cannot read this catalog's cartridges"),
+        "{err}"
+    );
+    assert!(!out.contains("lifecycle-suite.sh"), "the suite ran: {out}");
 }
