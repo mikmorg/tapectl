@@ -18,17 +18,18 @@ Every `tapectl …` line in a shell block below is checked against the binary by
 below is the default; `first-run.sh --home`, `--user` and `--backup-dir` move the
 ones they name, and the script prints the effective values at its start.
 
-Facts specific to one machine live in its **host profile** (§2, "Host profiles"):
-the production host, home2, is described by `contrib/hosts/home2.profile` and prepared
-by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
+Facts specific to one machine live in its **host profile** (§2, "Host profiles"),
+a file of shell assignments such as `contrib/hosts/<host>.profile`. A host that
+needs preparing first has a prep script beside it. The profiles in
+`contrib/hosts/` are examples of both.
 
 > [!IMPORTANT]
 > **A host with a profile passes it on every run** of `scripts/first-run.sh`, a
 > one-step re-run such as `--from 9 --to 9` included. The host remembers its
 > profile and refuses a run without it (§2, "The profile is remembered"; ADR-0012
-> item 187). Before it did, a run without the profile fell back to the script's
-> own defaults: on 2026-10-20 one wrote the Heir Kit to `~/heir-kit` and moved
-> the daily catalog backup onto the catalog's own disk (#502). Where an example
+> item 187). Without it, a run would fall back to the script's own defaults: a
+> second Heir Kit in `~/heir-kit`, and the daily catalog backup moved to the
+> default directory, which may be the catalog's own disk (#502). Where an example
 > below has no `--profile`, it is the form for a host without one; on a host
 > with one, add `--profile contrib/hosts/<host>.profile`.
 
@@ -152,21 +153,23 @@ can set the flags' own values: `DEVICE` (`--device`), `SG` (`--sg`), `DGEN`
 | `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands run at: default `-10` and `-c2 -n0` (best-effort, level 0) (#432, ADR-0012 2026-10-15 item 58). Step 13 raises `first-run.sh`'s own shell once with `sudo renice` and `sudo ionice`, and the write, resume and verify it starts inherit that; step 14 hands the same values to `install-systemd.sh` for [`tapectl-op` and the drive-poll unit](#7-the-timers-and-the-operator-wrapper). An empty `TAPE_NICE` never raises |
 | `ERASE_LABEL` | — | **never read from a profile**: it is consent to erase a sealed tape, so only `--erase-label` sets it (#469), and a profile's value is reported and ignored. `--mint-escrow` is a flag only for the same reason |
 
-**home2** (the production host, ADR-0012's 2026-09-28 amendment) has a one-time
-preparation first, dry-run by default:
+**A host that needs preparing first** gets a one-time prep script beside its
+profile, dry-run by default: an account's home on another disk, a `dar` built
+from source, a sudoers rule. `contrib/hosts/home2-prep.sh` is an example. A first
+install on such a host:
 
 ```bash
-contrib/hosts/home2-prep.sh            # prints what it would do
-contrib/hosts/home2-prep.sh --apply    # does it, asking before each part
+contrib/hosts/<host>-prep.sh            # prints what it would do
+contrib/hosts/<host>-prep.sh --apply    # does it, asking before each part
 tmux new -s tapectl
-scripts/first-run.sh --profile contrib/hosts/home2.profile --to 6
-scripts/first-run.sh --profile contrib/hosts/home2.profile --from 7 --to 12   # paper ready for the escrow secret
-tmux clear-history                     # the secret is in the scrollback
+scripts/first-run.sh --profile contrib/hosts/<host>.profile --to 6
+scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 7 --to 12   # paper ready for the escrow secret
+tmux clear-history                      # the secret is in the scrollback
 # unload the test cartridge, load a production one
-scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13
+scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 13
 ```
 
-The prep's last part installs `/etc/sudoers.d/tapectl-operator`, which lets the
+The example prep's last part installs `/etc/sudoers.d/tapectl-operator`, which lets the
 operator run commands *as the service user* (and only as it) without a password.
 Every `tapectl` call in `first-run.sh` outside the step-12 rehearsal goes through
 `sudo -u tapectl`, and on a host whose sudo asks for a password the verify that
@@ -209,7 +212,7 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | 9 heir kit | `~/heir-kit/` (**yours**; `--kit-out` moves it): `COVER.txt`, `escrow-kit.html`, `catalog.db.age`, `tapectl-<version>` (a copy of the installed binary; its sha256 is on the sheet) | you, 0700 | print `COVER.txt`, hand-write the secret on it, seal, two failure domains |
 | 10 location | a `locations` row (e.g. `home-rack`) | in the catalog | `tapectl location list` |
 | 11 tenants, units | tenant rows and keys under `keys/`; per unit: a POSIX ACL grant (`setfacl -R -m u:tapectl:rX` on the tree, the same as a default ACL so new files inherit it, `rwX` on the top directory only, `x` on each ancestor) and a **`.tapectl-unit.toml`** dotfile in the unit's top directory | files keep their owner and mode | `getfacl <dir>`, `tapectl unit list` |
-| 12 rehearsal | the lifecycle suite's run directories under `<work dir>/tapectl-lifecycle` (`--work-dir`: `/scratch` when it is writable, else `~/.cache/tapectl`; home2's profile sets the latter); on green, the marker **`~/.local/state/tapectl/rehearsal-ok-<sha256 of the binary, 16 hex>`**, which step 13 requires for that exact binary. May add **you** to the `tape` group (the suite runs as you) | you | the marker exists |
+| 12 rehearsal | the lifecycle suite's run directories under `<work dir>/tapectl-lifecycle` (`--work-dir`: `/scratch` when it is writable, else `~/.cache/tapectl`; a profile's `WORK_DIR` sets another); on green, the marker **`~/.local/state/tapectl/rehearsal-ok-<sha256 of the binary, 16 hex>`**, which step 13 requires for that exact binary. May add **you** to the `tape` group (the suite runs as you) | you | the marker exists |
 | 13 first tape | the volume, its cartridge row (auto-registered from the chip serial), the write and verify records, a refreshed heir kit; per-run capture files under `~/.local/state/tapectl/` | — | `tapectl volume list`, `report verify-status` |
 | 14 timers, wrapper | via `scripts/install-systemd.sh` (§7): `/etc/systemd/system/tapectl-audit.{service,timer}`, `/etc/systemd/system/tapectl-backup.{service,timer}`, `/etc/systemd/system/tapectl-drive-poll.{service,timer}`, `/usr/local/lib/tapectl/tapectl-scheduled-{audit,backup,drive-poll}.sh`, the backup dir (**`/var/backups/tapectl`** by default), **`/usr/local/bin/tapectl-op`**, the home pointer **`/etc/tapectl/home`** | units root 0644, pointer root 0644, scripts root 0755, backup dir `tapectl` 0700, wrapper root 0755 | `systemctl list-timers 'tapectl-*'` |
 
@@ -527,9 +530,8 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 9 --to 9   # 
 
 Step 9 on its own is the kit refresh; it needs no `--device`. On a host without a
 profile, leave `--profile` out. On a host with one it is required, and a run
-without it refuses (§2): the profile says where the kit goes (home2's puts it in
-`~/tapectl-heir-kit`), and on 2026-10-20, before the script remembered the
-profile, a run without it wrote a second kit to `~/heir-kit`. Step 9 does what a
+without it refuses (§2): the profile says where the kit goes (`KIT_OUT`), and a
+run without it would write a second kit to the default, `~/heir-kit`. Step 9 does what a
 bare `sudo -u tapectl -H tapectl key
 escrow-kit --out ~/heir-kit` cannot: the kit directory is **yours**, 0700
 (§3, row 9), so the service user cannot write into it and that command fails
@@ -571,11 +573,12 @@ it, and skipped when the service user is the account running the installer.
 `tapectl-op audit`, `tapectl-op report summary`, and so on.
 
 A **tape command** is the exception: `volume write`, `resume`, `verify`,
-`compact-write`, `compact`, `read-slices` and `compact-read`; `restore unit`,
-`file`, `volume` and `raw-volume`; `cartridge erase`; `collection run`;
-`quick-archive`; and `drive poll`. They stream the drive, which wants an even
-feed, and a busy host starves it (a write once used 1.505 bytes of tape per byte
-of data, #426). A process cannot raise its own priority, so the wrapper raises
+`rewrite`, `compact-write`, `compact`, `read-slices`, `compact-read`, `init` and
+`identify`; `restore unit`, `file`, `volume` and `raw-volume`; `cartridge erase`;
+`collection run`; `quick-archive`; `catalog rebuild`; and `drive poll` and
+`eject` (ADR-0012 items 58 and 196). They move or read the tape. The drive wants
+an even feed, and a busy host starves it (a write once used 1.505 bytes of tape
+per byte of data, #426). A process cannot raise its own priority, so the wrapper raises
 it as root and then drops to the service user:
 
 ```sh
@@ -596,8 +599,9 @@ stream nothing. `tapectl-drive-poll.service` carries the same priority as
 `Nice=`, `IOSchedulingClass=` and `IOSchedulingPriority=`; systemd applies it as
 root before it drops to `User=`. The audit and backup units are unchanged.
 
-The raise needs **root's** sudo, which is not the rule `home2-prep.sh` installs
-(that one lets you run commands *as the service user* without a password). So
+The raise needs **root's** sudo, which is not the rule a prep script such as
+`home2-prep.sh` installs (that one lets you run commands *as the service user*
+without a password). So
 `tapectl-op` raises when `sudo -n` allows it, asks for your password when there
 is a terminal to ask on, and otherwise runs the command at normal priority and
 says so on stderr. A hand-typed `tapectl-op volume verify` therefore prompts for
@@ -908,7 +912,7 @@ sudo rm -rf /scratch/tapectl-staging  # the directory printed above, when it is 
 # 5. the backups — ONLY once you hold a heir kit or another catalog copy you trust
 sudo rm -rf /var/backups/tapectl
 
-# 6. the operator's sudoers rule, on a host prepared by contrib/hosts/home2-prep.sh,
+# 6. the operator's sudoers rule, where a prep script installed one (home2-prep.sh does),
 #    then the service user and its home — the home holds every private key; the
 #    heir kit and the paper are what remain of the archive's identity after this
 sudo rm -f /etc/sudoers.d/tapectl-operator

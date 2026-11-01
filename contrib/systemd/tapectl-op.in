@@ -4,9 +4,9 @@
 # four @...@ values below; re-run that script to change the user, the binary or
 # the tape priority rather than editing the installed copy.
 #
-# A TAPE COMMAND (one that streams the drive) runs at raised CPU and I/O
-# priority (issue #432, ADR-0012 2026-10-15 item 58): the drive wants an even
-# feed, and a busy host starves it. A process cannot raise its own priority, so
+# A TAPE COMMAND (one that moves or reads the tape) runs at raised CPU and I/O
+# priority (issue #432, ADR-0012 2026-10-15 item 58, extended by item 196): the
+# drive wants an even feed, and a busy host starves it. A process cannot raise its own priority, so
 # the raise is made as root and the command then drops to the service user:
 #
 #   sudo nice -n N ionice ARGS runuser -u USER -- tapectl ...
@@ -43,7 +43,7 @@ done
 case "$first" in
   volume)
     case "$second" in
-      write | resume | verify | rewrite | compact-write | compact | read-slices | compact-read) tape=1 ;;
+      write | resume | verify | rewrite | compact-write | compact | read-slices | compact-read | init | identify) tape=1 ;;
     esac
     ;;
   restore)
@@ -53,7 +53,12 @@ case "$first" in
     ;;
   cartridge) [ "$second" = erase ] && tape=1 ;;
   collection) [ "$second" = run ] && tape=1 ;;
-  drive) [ "$second" = poll ] && tape=1 ;;
+  catalog) [ "$second" = rebuild ] && tape=1 ;;
+  drive)
+    case "$second" in
+      poll | eject) tape=1 ;;
+    esac
+    ;;
   quick-archive) tape=1 ;;
 esac
 

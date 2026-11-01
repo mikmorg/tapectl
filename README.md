@@ -39,7 +39,7 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.8.0 (tagged `v1.8.0`, 2026-10-29) is the current release. It is young: in real
+tapectl 1.8.1 (tagged `v1.8.1`, 2026-11-01) is the current release. It is young: in real
 use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
 have been exercised only in a virtual tape library (mhvtl).
 

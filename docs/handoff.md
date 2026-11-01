@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-**Next: (i), home2 starts over on 1.8.0** (ruled 2026-10-31). What follows is the history before it.
+**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
@@ -45,7 +45,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
 | (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183): **done 2026-10-29** | **you** (sudo for the install, and returning the test cartridge first) |
-| (i) | Start home2 over on 1.8.0: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193, 194) | **you** (sudo, the escrow key, the cartridges) |
+| (i) | Install 1.8.1 with `first-run.sh --upgrade`, then start home2 over on it: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193-195) | **you** (sudo, the escrow key, the cartridges) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -547,27 +547,58 @@ allow spanning per unit (its dotfile's `[policy]`), per archive set (`tapectl-op
 edit <NAME> --allow-spanning true`) or in `[defaults]`, and keep the tapes `volume write` names
 together ("keep these together"): a whole copy across tapes needs every one of them to restore.
 
-## (i) Start home2 over on 1.8.0: a new catalog, new keys, new units
+## (i) Start home2 over on 1.8.1: a new catalog, new keys, new units
 
-Ruled 2026-10-31 (ADR-0012 items 193, 194). You do this on home2, inside tmux, in this order.
-(c) and (d) are the model. What differs from them:
+Ruled 2026-10-31 (ADR-0012 items 193, 194), amended 2026-11-01 (item 195). You do this on home2,
+inside tmux, in this order. (c) and (d) are the model. What differs from them:
 - **the units are new**: their dotfiles go first, so `collection sync` mints new identities;
-- **nothing is built**: the 1.8.0 binary installed and rehearsed on 2026-10-29 is used as it is;
+- **1.8.1 goes on first**, by `first-run.sh --upgrade` on the current home (step 0), which builds,
+  installs and rehearses it; the rest runs on it;
 - **the old state is moved aside, not deleted**, until the new L6-0002 reads back in full;
 - **the cartridges are reused one at a time**, so `keepsake` always has a copy on tape.
 
 Never run step 7 under `script` or `tee`. If you mint an escrow identity, its secret prints there
 once, and only `first-run.sh`'s own log leaves step 7's output out.
 
-0. **Look.** The checkout is on the tag, the binary is the rehearsed one, and its marker exists:
+0. **Install 1.8.1 with `first-run.sh --upgrade`, on the current home** (item 195;
+   `docs/install.md` §10). Load the test cartridge EW7VWMVKF6 first: the upgrade rehearses on
+   it. The old catalog must not list it, because the rehearsal refuses a cartridge its catalog
+   knows; `cartridge list` shows only L6-0001's and L6-0002's chip serials.
 
    ```bash
-   git describe --tags                      # v1.8.0
-   tapectl --version                        # 1.8.0 (v1.8.0, 2026-10-29)
-   ls ~/.local/state/tapectl/rehearsal-ok-$(sha256sum /usr/local/bin/tapectl | cut -c1-16)   # rehearsal-ok-dce6b2ae45f285b6
+   cd ~/devel/git/tapectl
+   git fetch --tags
+   git checkout v1.8.1
+   tapectl-op cartridge list
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --upgrade --to 11
    ```
 
-   If the marker is missing, step 12 runs again before step 13, on the test cartridge.
+   In order, it:
+   - backs the old catalog up with 1.8.0 to `/srv/local_backup/tapectl/tapectl-pre-1.8.1.db`
+     (step 2 below moves it aside with the rest);
+   - keeps 1.8.0 as `/usr/local/bin/tapectl-1.8.0`;
+   - builds the release binary and installs it: a few minutes, and sudo asks once;
+   - runs step 14 again, so `tapectl-op` raises the four commands of item 196;
+   - stops at 1.8.1's "Upgrading" notes: press Enter;
+   - shows `status`, `audit` and `report failed-stages`;
+   - rehearses on EW7VWMVKF6: type its serial. The drive-poll timer is stopped for it and
+     started again;
+   - regenerates the kit for the old catalog (answer yes; step 5 makes it again for the new
+     one);
+   - takes one backup with 1.8.1.
+
+   `--to 11` stops before the tidy and the rollback. The tidy would offer the old backups that
+   step 2 moves aside, and the rollback names the old catalog. If the rehearsal is red, stop
+   and send the coordinator its output: 1.8.1 has no migration, so
+   `sudo cp -p /usr/local/bin/tapectl-1.8.0 /usr/local/bin/tapectl` puts 1.8.0 back over an
+   unchanged catalog, and (i) runs on 1.8.0 as first ruled. Then check:
+
+   ```bash
+   git describe --tags                      # v1.8.1
+   tapectl --version                        # tapectl 1.8.1 (v1.8.1, <date>)
+   ls ~/.local/state/tapectl/rehearsal-ok-$(sha256sum /usr/local/bin/tapectl | cut -c1-16)
+   tapectl-op drive eject                   # the test cartridge out
+   ```
 1. **Stop the timers:** `scripts/install-systemd.sh --uninstall`, then `pgrep -a -u tapectl`
    (nothing may be running). Step 14 installs them again.
 2. **Move the old state aside.** The home holds the 1.1.0 catalog, the old keys and the old
@@ -658,6 +689,8 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
 10. **Tidy, once the new L6-0002 has read back in full:**
     - delete the old state: `sudo rm -rf /srv/archive_meta/tapectl/.tapectl-old /srv/local_backup/tapectl-old /var/backups/tapectl-old`;
     - delete `~/heir-kit`, the stray kit from (f);
+    - delete the rollback binaries `/usr/local/bin/tapectl-1.5.0` ((h)'s) and
+      `/usr/local/bin/tapectl-1.8.0` (step 0's): no catalog either of them wrote remains;
     - give `parents` and `family` their new key files, since the old ones open only the erased tapes;
     - with a new escrow identity, destroy the old paper.
 

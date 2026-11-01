@@ -270,9 +270,10 @@ assert_prio() {
 import sys
 tsv, want_nice, want_io, *required = sys.argv[1:]
 TAPE = {
-    "volume": {"write", "resume", "verify", "compact-write", "compact", "read-slices", "compact-read"},
+    "volume": {"write", "resume", "verify", "rewrite", "compact-write", "compact", "read-slices",
+               "compact-read", "init", "identify"},
     "restore": {"unit", "file", "volume", "raw-volume"},
-    "cartridge": {"erase"}, "collection": {"run"}, "drive": {"poll"},
+    "cartridge": {"erase"}, "collection": {"run"}, "catalog": {"rebuild"}, "drive": {"poll", "eject"},
 }
 def is_tape(cmd):
     first, _, second = cmd.partition(" ")

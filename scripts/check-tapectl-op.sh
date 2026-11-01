@@ -144,8 +144,10 @@ for args in \
   "volume resume L1" "volume verify L1 --full --json" "volume rewrite L1 --label L1b" \
   "volume compact-write L2" "volume compact L1 --to L2" \
   "volume read-slices --from L1" "volume compact-read L1" \
+  "volume init L1 --device /dev/x" "volume init write" "volume identify --device /dev/x" \
   "restore unit u" "restore file u f" "restore volume L1" "restore raw-volume L1 /out" \
-  "cartridge erase --device /dev/x" "collection run keepsake" "drive poll" \
+  "cartridge erase --device /dev/x" "collection run keepsake" "drive poll" "drive eject" \
+  "catalog rebuild --from-volume --key /k --device /dev/x" \
   "quick-archive vol /some/path" \
   "--home /x --quiet volume write L1" "--home=/x volume write L1" "-qy volume write L1" \
   "--json --home /x -v volume verify L1" "--config /c/config.toml volume resume L1" \
@@ -157,8 +159,9 @@ done
 echo "plain: everything else, and labels that equal a tape subcommand's name"
 for args in \
   "status" "unit list" "report summary" "audit" "catalog stats" "tenant list" \
-  "volume info write" "volume info resume" "volume list" "volume init write" "volume plan" \
-  "volume abort verify" "volume retire write" "volume move run" "volume identify" \
+  "volume info write" "volume info resume" "volume list" "volume plan" \
+  "volume abort verify" "volume retire write" "volume move run" "drive status" "drive cleaned" \
+  "catalog locate eject" \
   "collection sync" "collection status" "collection plan" "cartridge list" "cartridge info erase" \
   "restore --help" "stage create write" "snapshot create volume" "tenant add run" \
   "catalog search volume write" "location add poll" "key list" "host check" "db backup" \
@@ -208,7 +211,8 @@ if [ -n "$BIN" ]; then
     || fail "names: global options that take a value are '$valued', the wrapper skips only 'config home'"
   printf '%s\n' "$top" | grep -x quick-archive >/dev/null && pass "names: quick-archive is a top-level command" || fail "names: no top-level quick-archive"
   for pair in "volume write" "volume resume" "volume verify" "volume rewrite" "volume compact-write" "volume compact" "volume read-slices" "volume compact-read" \
-              "restore unit" "restore file" "restore volume" "restore raw-volume" "cartridge erase" "collection run" "drive poll"; do
+              "volume init" "volume identify" "restore unit" "restore file" "restore volume" "restore raw-volume" "cartridge erase" "collection run" \
+              "catalog rebuild" "drive poll" "drive eject"; do
     set -- $pair
     if "$BIN" "$1" --help 2>&1 | sed -n '/^Commands:/,/^$/p' | awk 'NR>1 && NF {print $1}' | grep -x "$2" >/dev/null; then pass "names: $1 $2 exists"; else fail "names: '$1 $2' is not a subcommand of $BIN"; fi
   done

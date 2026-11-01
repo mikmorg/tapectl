@@ -2467,3 +2467,23 @@ keys and the units they describe go with them. The procedure is handoff (i).
      tapes stay readable with it until they are erased. Minting a new one is handoff (i)
      step 3's alternative. Its cost is a new handwritten secret in two failure domains, and the
      old paper must be kept until the old L6-0002 is erased.
+
+Ruled 2026-11-01: 1.8.1 is cut, and home2 installs it before the fresh start. The CTO was asked
+whether home2 takes 1.8.1 after handoff (i) or before it, and chose before; (i) had not begun
+(home2's checkout `v1.8.0`, its home still the one from 1.1.0's fresh start).
+
+195. **The fresh start runs on 1.8.1, installed by `first-run.sh --upgrade` (amends item 193).**
+     Handoff (i)'s first step is now `--upgrade --to 11` on the current home: the old catalog is
+     backed up with 1.8.0, 1.8.0 is kept as `tapectl-1.8.0`, the release build of `v1.8.1` is
+     installed, step 14 runs, the rehearsal on the test cartridge makes 1.8.1's marker (1.8.0's no
+     longer counts), and the kit is regenerated. It stops before upgrade step 12: the tidy would
+     offer the old backups that (i) moves aside rather than deletes, and step 13's rollback names
+     the old catalog, which the fresh start retires. The rest of (i) runs on the `v1.8.1` checkout
+     as written. Item 193's "nothing is built" no longer holds, and the rest of item 193 does.
+     home2's first `--upgrade` is therefore made on a catalog the fresh start retires, so a
+     failure in it costs nothing that matters.
+196. **`tapectl-op` raises four more commands to tape priority (extends item 58):** `volume
+     init`, `volume identify`, `catalog rebuild` and `drive eject`. Each moves or reads the tape,
+     and each ran at normal priority. Ships in 1.8.1.
+
+#499 (reporting #498 to dar upstream) stays parked (the CTO, 2026-11-01).

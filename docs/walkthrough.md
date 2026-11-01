@@ -63,7 +63,7 @@ TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst
 tenant, and the permanent **escrow identity**.
 
 ```bash
-tapectl init --operator mike
+tapectl init --operator alice
 ```
 
 ```text
@@ -82,7 +82,7 @@ tapectl init --operator mike
 ================================================================================
 
 tapectl initialized at ~/.tapectl
-  operator: mike
+  operator: alice
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
   escrow:   age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
@@ -95,7 +95,7 @@ tapectl initialized at ~/.tapectl
 > anywhere on the machine and is never shown again. It is the last-resort key to
 > every tape you will ever write — see [Keys and recovery](keys-and-recovery.md).
 
-The operator tenant (`mike` here) is created by `init`; don't `tenant add` it again.
+The operator tenant (`alice` here) is created by `init`; don't `tenant add` it again.
 
 ## 2. Staging and a drive
 
@@ -614,7 +614,7 @@ On a fresh machine, start a new home that **adopts** the original escrow identit
 from a tape with the escrow secret you wrote down:
 
 ```bash
-tapectl init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+tapectl init --operator alice --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
 tapectl backend add --name lto8 --device-tape "$TAPE" --generation LTO-8
 tapectl catalog rebuild --from-volume --key escrow.key
 tapectl unit list
@@ -626,7 +626,7 @@ afterwards.)
 
 ```text
 tapectl initialized at ~/.tapectl
-  operator: mike
+  operator: alice
   database: ~/.tapectl/tapectl.db
   config:   ~/.tapectl/config.toml
   escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)

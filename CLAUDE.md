@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start on the installed 1.8.0, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)).
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -435,6 +435,19 @@ because item 174 could not read the HP's position through st; items 185 and 186 
 second full run, on `d3b7068d`, passed every step on 2026-10-29, the drive refusing and tapectl
 retrying on the HP. 1.8.0 is tagged `v1.8.0` on `d3b7068d`; home2 has run it since 2026-10-29,
 installed straight from 1.5.0 by handoff (h) (`docs/runs/2026-10-29-1.8.0-handoff-h.md`).
+
+**1.8.1: the in-place upgrade and the setup review** (`docs/releases/1.8.1.md`; ADR-0012 items
+187-192, 195, 196; #502, #503, #505, #506, #507). A patch: no byte on tape changes and there is no
+migration; the binary's only change is #503's retire hint. `scripts/first-run.sh --upgrade` is the
+repo's in-place upgrade (thirteen steps of its own, resumable; `docs/install.md` §10), and its
+acceptance is `scripts/upgrade-mhvtl.sh` (below, Testing). Its rollback imports the backup with
+the NEW binary before the old one goes back: every command opens (and migrates) the catalog
+first, so an older binary's `db import` is refused after a migrating upgrade. Step 12 refuses a
+test cartridge the catalog knows. The host remembers its profile (item 187); `--auto` mints no
+escrow without `--mint-escrow` (item 188); step 12 stops the drive-poll timer (item 190);
+`install-systemd.sh` never moves the backup directory silently (#502); `tapectl-op` raises
+`volume rewrite`, `init`, `identify`, `catalog rebuild` and `drive eject` too (item 196).
+home2 installs 1.8.1 by `--upgrade` as handoff (i)'s step 0, before its fresh start (item 195).
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
