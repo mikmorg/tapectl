@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). What follows is the history before it.
+**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). Step 0 is done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53 (`docs/runs/2026-11-02-1.8.1-handoff-i.md`); steps 1 to 10 are next. What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and

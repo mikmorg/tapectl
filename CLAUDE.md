@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195).
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -447,7 +447,7 @@ test cartridge the catalog knows. The host remembers its profile (item 187); `--
 escrow without `--mint-escrow` (item 188); step 12 stops the drive-poll timer (item 190);
 `install-systemd.sh` never moves the backup directory silently (#502); `tapectl-op` raises
 `volume rewrite`, `init`, `identify`, `catalog rebuild` and `drive eject` too (item 196).
-home2 installs 1.8.1 by `--upgrade` as handoff (i)'s step 0, before its fresh start (item 195).
+home2 installed 1.8.1 by `--upgrade` on 2026-11-02, as handoff (i)'s step 0, before its fresh start (item 195; the rehearsal 53/53, `docs/runs/2026-11-02-1.8.1-handoff-i.md`).
 1.8.1 is tagged `v1.8.1` on `ac8bf8aa` (2026-11-01), after the whole chain passed on `5c17b52b`
 (chain57; the notes' Testing) and PR #510's CI.
 
