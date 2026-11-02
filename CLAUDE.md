@@ -448,6 +448,8 @@ escrow without `--mint-escrow` (item 188); step 12 stops the drive-poll timer (i
 `install-systemd.sh` never moves the backup directory silently (#502); `tapectl-op` raises
 `volume rewrite`, `init`, `identify`, `catalog rebuild` and `drive eject` too (item 196).
 home2 installs 1.8.1 by `--upgrade` as handoff (i)'s step 0, before its fresh start (item 195).
+1.8.1 is tagged `v1.8.1` on `ac8bf8aa` (2026-11-01), after the whole chain passed on `5c17b52b`
+(chain57; the notes' Testing) and PR #510's CI.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
