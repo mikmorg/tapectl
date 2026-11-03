@@ -15,8 +15,9 @@ restating them. `CONTEXT.md` is the vocabulary.
 
 Every `tapectl …` line in a shell block below is checked against the binary by
 `scripts/check-docs.py`: its subcommands and long flags must exist. Every path
-below is the default; `first-run.sh --home`, `--user` and `--backup-dir` move the
-ones they name, and the script prints the effective values at its start.
+below is the default; `first-run.sh --tapectl-home`, `--user` and `--backup-dir` move the
+ones they name (`--home` names a throwaway home for a rehearsal), and the script prints the
+effective values at its start.
 
 Facts specific to one machine live in its **host profile** (§2, "Host profiles"),
 a file of shell assignments such as `contrib/hosts/<host>.profile`. A host that
@@ -228,6 +229,17 @@ override it (`src/startup.rs`; the operator guide's "Working on a different
 archive"). For the service user that is **`/var/lib/tapectl/.tapectl`**, mode
 0700, re-tightened on every run (issue #41):
 
+**A home that is not hidden.** A host may put its installed home elsewhere: the profile's
+`TAPECTL_HOME_DIR` (or `first-run.sh --tapectl-home DIR`) names it, such as home2's
+`/srv/archive_meta/tapectl/home` (ADR-0012 item 197). `first-run.sh` then passes it to every
+command as `--home`, step 5 creates it, step 14 installs the units with
+`install-systemd.sh --tapectl-home` (they set `TAPECTL_HOME=`, and `tapectl-op` runs tapectl
+under `env TAPECTL_HOME=...`), and the pointer `/etc/tapectl/home` names it. Unlike `--home`,
+which names a throwaway home and installs no timers, it is the host's own. A `.tapectl` in the
+service user's home is refused beside it: tapectl finds an account's own `~/.tapectl` before
+the pointer, so a plain `sudo -u tapectl -H tapectl` would open that one. The tree below is the
+same wherever the home is.
+
 ```
 /var/lib/tapectl/.tapectl/
 ├── config.toml          dar path, [[backends.lto]], [staging], [defaults], [discovery], [[collections]]
@@ -438,7 +450,7 @@ scripts/install-systemd.sh --uninstall                     # take the units and 
 Options: `--user NAME` (default `tapectl`; must already exist — the script
 refuses to create an account), `--home DIR` (that account's home), `--tapectl-home DIR`
 (a tapectl home that is not `<home>/.tapectl`; sets `TAPECTL_HOME=` in the
-units), `--backup-dir DIR`, `--keep N`, `--tapectl PATH` (default
+units and in `tapectl-op`, and is refused while `<home>/.tapectl` exists; §4), `--backup-dir DIR`, `--keep N`, `--tapectl PATH` (default
 `/usr/local/bin/tapectl`), `--tape-nice N` and `--tape-ionice ARGS` (the tape
 commands' priority; below), `--no-wrapper`, `--no-start`, and `--render-dir DIR`
 (render the units and the wrapper into `DIR` and stop: nothing is installed and

@@ -771,12 +771,13 @@ tapectl unit list
 On a first-run install the catalog belongs to the service user, in a home
 only that user can enter. Give the file's full path, because a `~` would
 expand to your own home, and run each line as that user. That home is not
-always `/var/lib/tapectl`: a host profile's `SVC_HOME_WANT` moves it (home2's
-profile puts it at `/srv/archive_meta/tapectl`), so ask the system where it
-is rather than typing a path:
+always `/var/lib/tapectl/.tapectl`: a host profile's `SVC_HOME_WANT` moves the
+account's home, and its `TAPECTL_HOME_DIR` the tapectl home itself (home2's is
+`/srv/archive_meta/tapectl/home`, ADR-0012 item 197). The pointer
+`/etc/tapectl/home` names it on an installed host, so ask it rather than typing a path:
 
 ```bash
-DB="$(getent passwd tapectl | cut -d: -f6)/.tapectl/tapectl.db"   # or <dir>/tapectl.db if first-run was given --home <dir>
+DB="$(cat /etc/tapectl/home)/tapectl.db"   # no pointer: "$(getent passwd tapectl | cut -d: -f6)/.tapectl/tapectl.db"
 sudo -u tapectl -H test -f "$DB" && echo "catalog: $DB"    # no line printed: wrong path, stop here
 sudo -u tapectl -H cp "$DB" "$DB.before-026"
 sudo -u tapectl -H sqlite3 "$DB" "UPDATE units SET status = 'active' WHERE id = 1"

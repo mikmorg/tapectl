@@ -1,8 +1,8 @@
 #!/bin/sh
 # tapectl-op — run tapectl as the service user that owns the catalog and keys.
 # Installed by scripts/install-systemd.sh (docs/install.md), which fills in the
-# four @...@ values below; re-run that script to change the user, the binary or
-# the tape priority rather than editing the installed copy.
+# five @...@ values below; re-run that script to change the user, the binary, the
+# home or the tape priority rather than editing the installed copy.
 #
 # A TAPE COMMAND (one that moves or reads the tape) runs at raised CPU and I/O
 # priority (issue #432, ADR-0012 2026-10-15 item 58, extended by item 196): the
@@ -19,6 +19,12 @@ SVC_USER='@SVC_USER@'
 TAPECTL='@TAPECTL@'
 TAPE_NICE='@TAPE_NICE@'
 TAPE_IONICE='@TAPE_IONICE@'
+# The tapectl home, when it is not the service user's ~/.tapectl (--tapectl-home;
+# ADR-0012 item 197). tapectl then runs under `env TAPECTL_HOME=...`, so the
+# wrapper never depends on the pointer /etc/tapectl/home, which tapectl ranks
+# below an existing ~/.tapectl. A --home on the command line still wins. Empty =
+# tapectl's own resolution, as before.
+TAPECTL_HOME_DIR='@TAPECTL_HOME@'
 
 # Is this a tape command? Decided by the first two words that are not options.
 # Global options may stand anywhere before them: --config and --home take a
@@ -62,6 +68,14 @@ case "$first" in
   quick-archive) tape=1 ;;
 esac
 
+# The command the service user runs. Set only after the scan above, which reads
+# the operator's own words.
+if [ -n "$TAPECTL_HOME_DIR" ]; then
+  set -- env "TAPECTL_HOME=$TAPECTL_HOME_DIR" "$TAPECTL" "$@"
+else
+  set -- "$TAPECTL" "$@"
+fi
+
 if [ "$tape" = 1 ] && [ -n "$TAPE_NICE" ]; then
   # The raise needs ROOT's sudo, which is not the operator's usual one: home2's
   # sudoers rule lets the operator run commands AS the service user without a
@@ -87,10 +101,10 @@ if [ "$tape" = 1 ] && [ -n "$TAPE_NICE" ]; then
   fi
   if [ "$ready" = 1 ]; then
     if [ -n "$TAPE_IONICE" ]; then
-      exec sudo nice -n "$TAPE_NICE" ionice $TAPE_IONICE runuser -u "$SVC_USER" -- "$TAPECTL" "$@"
+      exec sudo nice -n "$TAPE_NICE" ionice $TAPE_IONICE runuser -u "$SVC_USER" -- "$@"
     fi
-    exec sudo nice -n "$TAPE_NICE" runuser -u "$SVC_USER" -- "$TAPECTL" "$@"
+    exec sudo nice -n "$TAPE_NICE" runuser -u "$SVC_USER" -- "$@"
   fi
   echo "tapectl-op: this tape command runs at NORMAL priority: raising it (sudo nice ionice runuser) did not work here without a password: root's sudo may ask for one, or runuser is not on sudo's PATH (docs/install.md, 'The wrapper')" >&2
 fi
-exec sudo -u "$SVC_USER" -H "$TAPECTL" "$@"
+exec sudo -u "$SVC_USER" -H "$@"

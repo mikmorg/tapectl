@@ -545,3 +545,189 @@ fn step_12_refuses_when_the_catalog_cannot_say() {
     );
     assert!(!out.contains("lifecycle-suite.sh"), "the suite ran: {out}");
 }
+
+// ------------------------------------------- the installed home outside ~/.tapectl
+
+/// `tapectl --home HOME ...` as the test account, asserting success; its stdout.
+fn tapectl_at(rig: &Rig, home: &Path, args: &[&str]) -> String {
+    let o = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .env("HOME", rig.p("h"))
+        .env("TAPECTL_HOME_POINTER", rig.p("home-pointer"))
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .expect("spawn tapectl");
+    let (out, err) = text(&o);
+    assert!(o.status.success(), "tapectl {args:?}: {out}\n{err}");
+    out
+}
+
+/// ADR-0012 item 197: a profile's `TAPECTL_HOME_DIR` is the home every command
+/// opens. Step 10 adds the profile's location to that home's catalog, and no
+/// `~/.tapectl` is made: before the item, `tc` passed no `--home` for it, so the
+/// step reached `$HOME/.tapectl`, which holds no catalog. A `--home` on the
+/// command line still names a throwaway home over it.
+#[test]
+fn tapectl_home_dir_is_the_home_every_command_opens() {
+    let rig = Rig::new();
+    let home = rig.p("srv/tapectl/home");
+    tapectl_at(
+        &rig,
+        &home,
+        &["init", "--operator", "fr-tester", "--no-escrow"],
+    );
+    let profile = rig.profile(
+        "p.profile",
+        &format!(
+            "TAPECTL_HOME_DIR={}\nLOCATIONS=(\n  \"t-rack|the test rack\"\n)\n",
+            home.display()
+        ),
+    );
+    let o = rig.run(&[
+        "--profile",
+        profile.to_str().unwrap(),
+        "--auto",
+        "--from",
+        "10",
+        "--to",
+        "10",
+        "--tapectl",
+        env!("CARGO_BIN_EXE_tapectl"),
+    ]);
+    let out = ok(&o);
+    assert!(out.contains(&format!("home: {}", home.display())), "{out}");
+    let locations = tapectl_at(&rig, &home, &["location", "list"]);
+    assert!(locations.contains("t-rack"), "{locations}");
+    assert!(
+        !rig.p("h/.tapectl").exists(),
+        "a ~/.tapectl was made beside the home"
+    );
+
+    let other = rig.p("rehearsal-home");
+    let o = rig.run(&[
+        "--profile",
+        profile.to_str().unwrap(),
+        "--to",
+        "0",
+        "--home",
+        other.to_str().unwrap(),
+    ]);
+    let out = ok(&o);
+    assert!(out.contains(&format!("home: {}", other.display())), "{out}");
+}
+
+/// Item 197: tapectl ranks an account's own `~/.tapectl` above the pointer, so
+/// one left beside a `TAPECTL_HOME_DIR` would be what a plain
+/// `sudo -u tapectl -H tapectl` opens. The run refuses before step 1, naming
+/// it; with it moved aside, the same run goes ahead. A relative path is refused.
+#[test]
+fn a_dot_tapectl_beside_tapectl_home_dir_is_refused() {
+    let rig = Rig::new();
+    let home = rig.p("srv/tapectl/home");
+    let profile = rig.profile(
+        "p.profile",
+        &format!("TAPECTL_HOME_DIR={}\n", home.display()),
+    );
+    let p = profile.to_str().unwrap();
+    std::fs::create_dir_all(rig.p("h/.tapectl")).unwrap();
+    let o = rig.run(&["--profile", p, "--to", "0"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        err.contains(&format!(
+            "{} exists, and the home is {} (TAPECTL_HOME_DIR)",
+            rig.p("h/.tapectl").display(),
+            home.display()
+        )),
+        "{err}"
+    );
+
+    std::fs::rename(rig.p("h/.tapectl"), rig.p("h/.tapectl-old")).unwrap();
+    ok(&rig.run(&["--profile", p, "--to", "0"]));
+
+    let rel = rig.profile("rel.profile", "TAPECTL_HOME_DIR=srv/home\n");
+    let o = rig.run(&["--profile", rel.to_str().unwrap(), "--to", "0"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{out}\n{err}");
+    assert!(err.contains("must be an absolute path"), "{err}");
+}
+
+/// Item 197: step 14 installs the timers for a `TAPECTL_HOME_DIR` with
+/// `--tapectl-home` (the units, tapectl-op and the pointer name it), and a
+/// `--home` stays a throwaway home whose install is only planned. The stubs
+/// record `sudo` and do nothing, and the installer refuses the test account
+/// (not a user), so nothing reaches the host either way.
+#[test]
+fn step_14_installs_for_tapectl_home_dir_and_only_plans_for_a_home() {
+    let rig = Rig::new();
+    let bin = rig.p("bin");
+    let calls = rig.p("calls");
+    let calls_s = calls.display();
+    stub(
+        &bin,
+        "sudo",
+        &format!("echo \"sudo $*\" >> {calls_s}; exit 97"),
+    );
+    stub(&bin, "systemctl", "exit 0");
+    std::fs::create_dir_all(rig.p("units")).unwrap();
+    let home = rig.p("srv/tapectl/home");
+    let profile = rig.profile(
+        "p.profile",
+        &format!("TAPECTL_HOME_DIR={}\n", home.display()),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let step14 = |extra: &[&str]| {
+        rig.command(&[
+            "--profile",
+            profile.to_str().unwrap(),
+            "--auto",
+            "--from",
+            "14",
+            "--to",
+            "14",
+            "--tapectl",
+            env!("CARGO_BIN_EXE_tapectl"),
+        ])
+        .args(extra)
+        .env("PATH", &path)
+        .env("TAPECTL_UNIT_DIR", rig.p("units"))
+        .output()
+        .expect("spawn first-run.sh")
+    };
+    let installer = |out: &str| -> String {
+        out.lines()
+            .find(|l| l.contains("$ bash ") && l.contains("scripts/install-systemd.sh"))
+            .unwrap_or_else(|| panic!("no installer command line:\n{out}"))
+            .to_string()
+    };
+
+    let o = step14(&[]);
+    let out = ok(&o);
+    let line = installer(&out);
+    assert!(
+        line.contains(&format!("--tapectl-home {}", home.display())) && !line.contains("--dry-run"),
+        "{line}"
+    );
+    assert!(
+        out.contains(&format!("Its home: {}", home.display())),
+        "{out}"
+    );
+
+    let other = rig.p("rehearsal-home");
+    let o = step14(&["--home", other.to_str().unwrap()]);
+    let out = ok(&o);
+    let line = installer(&out);
+    assert!(
+        line.contains("--dry-run") && line.contains(&format!("--tapectl-home {}", other.display())),
+        "{line}"
+    );
+    assert!(!out.contains(&home.display().to_string()), "{out}");
+    let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(!recorded.contains("systemctl enable"), "{recorded}");
+}

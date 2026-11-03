@@ -762,12 +762,12 @@ The home comes from the pointer `/etc/tapectl/home` (written by first-run step 7
 root, and `--home` or `TAPECTL_HOME` override it.
 
 ```text
-session logs: /srv/archive_meta/tapectl/.tapectl/logs
+session logs: /srv/archive_meta/tapectl/home/logs
 running: volume write L6-0002 (pid 81234), started 2026-10-06T03:12:40.118Z
   phase:    write
   progress: write 512.0 GiB of 1.20 TiB (41.7%), 145.2 MiB/s, ETA 1h 21m, elapsed 1h 00m — file 19 of 43 (at 2026-10-06T04:12:41.002Z)
   last log line at 2026-10-06T04:12:58.310Z
-  log:      /srv/archive_meta/tapectl/.tapectl/logs/20261006T031240Z-volume-write-L6-0002-81234.log
+  log:      /srv/archive_meta/tapectl/home/logs/20261006T031240Z-volume-write-L6-0002-81234.log
 recent:
   2026-10-05T19:02:11.904Z  stage create keepsake/1998-wedding  — ok
       check            2.1 s

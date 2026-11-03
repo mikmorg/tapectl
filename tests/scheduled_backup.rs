@@ -446,3 +446,50 @@ fn a_reinstall_names_the_environment_lines_it_drops() {
     );
     assert!(!out.contains("which this install drops"), "{out}");
 }
+
+/// ADR-0012 item 197: with `--tapectl-home`, a `~/.tapectl` left in the
+/// account's home would be what a plain `sudo -u USER -H tapectl` opens
+/// (tapectl ranks it above the pointer), so the install refuses before it
+/// changes anything, and a dry run says the real run would. With it moved
+/// aside, the dry run says nothing of it and names the home as the pointer's.
+#[test]
+fn a_dot_tapectl_beside_the_tapectl_home_is_refused() {
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    if uid.trim() == "0" {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let svc = TempDir::new().unwrap();
+    std::fs::create_dir_all(svc.path().join(".tapectl")).unwrap();
+    let svc_s = svc.path().to_str().unwrap();
+    let home = svc.path().join("home");
+    let home_s = home.to_str().unwrap();
+    let args = ["--home", svc_s, "--tapectl-home", home_s];
+
+    let (code, out, dir) = install(&args, None, "sdb");
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            "{svc_s}/.tapectl exists, and the tapectl home is {home_s} (--tapectl-home)"
+        )),
+        "{out}"
+    );
+    assert!(!calls(&dir).contains("sudo"), "{}", calls(&dir));
+
+    let dry: Vec<&str> = args.iter().copied().chain(["--dry-run"]).collect();
+    let (code, out, _dir) = install(&dry, None, "sdb");
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("the real run refuses: ") && out.contains("/.tapectl exists"),
+        "{out}"
+    );
+
+    std::fs::rename(svc.path().join(".tapectl"), svc.path().join(".tapectl-old")).unwrap();
+    let (code, out, _dir) = install(&dry, None, "sdb");
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains(".tapectl exists"), "{out}");
+    assert!(
+        out.contains("home pointer: ") && out.contains(&format!("-> {home_s}")),
+        "{out}"
+    );
+}

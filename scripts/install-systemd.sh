@@ -36,6 +36,14 @@
 # replace an installed unit names each Environment= line it would drop
 # (ADR-0012 item 191).
 #
+# A tapectl home that is not <user's home>/.tapectl (--tapectl-home; home2's is
+# /srv/archive_meta/tapectl/home, ADR-0012 item 197) is named three times: in
+# the units (TAPECTL_HOME=), in tapectl-op (which runs tapectl under
+# `env TAPECTL_HOME=...`, so it never depends on the pointer) and in the
+# pointer. A ~/.tapectl beside it in the user's home is refused: tapectl finds
+# an account's own ~/.tapectl before the pointer, so a plain
+# `sudo -u <user> -H tapectl` would open that one.
+#
 # Tape-command priority (issue #432, ADR-0012 2026-10-15 item 58): the drive
 # wants an even feed, and a host that is busy elsewhere starves it. Priority can
 # only be RAISED by root, so tapectl-op runs a tape command as
@@ -97,7 +105,8 @@ usage() {
 Usage: scripts/install-systemd.sh [options]
   --user NAME         service user the units run as (default: tapectl; must exist)
   --home DIR          that account's home (default: from getent passwd); the units set HOME=DIR
-  --tapectl-home DIR  a tapectl home that is NOT DIR/.tapectl (sets TAPECTL_HOME= in the units)
+  --tapectl-home DIR  a tapectl home that is NOT DIR/.tapectl (sets TAPECTL_HOME= in the units and
+                      tapectl-op; refused while that account's ~/.tapectl exists beside it)
   --backup-dir DIR    where the catalog copies go (default: $BACKUP_DIR) — put it on a
                       SECOND DISK; the script warns when it shares a filesystem or a disk with
                       the home. Over an installed backup unit that names another directory, a
@@ -262,6 +271,16 @@ for p in "$SVC_HOME" "$THOME" "$BACKUP_DIR" "$BIN"; do case "$p" in *[[:space:]]
 for p in "$SVC_HOME" "$THOME" "$BACKUP_DIR" "$LIBDIR" "${TAPECTL_HOME_DIR:-}"; do
   case "$p" in *\|* | *\&* | *\\*) die "path '$p' contains | & or \\, which the unit rendering cannot carry" ;; esac
 done
+# ADR-0012 item 197: with the home elsewhere, a ~/.tapectl left in the account's
+# home would win over the pointer for every plain `sudo -u USER -H tapectl`.
+# The account's home is often closed to the caller: ask through sudo then,
+# except in a dry run, which needs no privilege (and so may not see one).
+svc_has() { test -e "$1" || { [ "$DRY" = 0 ] && [ -n "$SUDO" ] && $SUDO test -e "$1" 2>/dev/null; }; }
+if [ -n "$TAPECTL_HOME_DIR" ] && [ -z "$RENDER_DIR" ] && [ "$THOME" != "$SVC_HOME/.tapectl" ] && svc_has "$SVC_HOME/.tapectl"; then
+  why="$SVC_HOME/.tapectl exists, and the tapectl home is $THOME (--tapectl-home): tapectl finds an account's own ~/.tapectl before the pointer, so a plain \`sudo -u $SVC_USER -H tapectl\` would open $SVC_HOME/.tapectl. Move it aside (or delete it) first"
+  [ "$DRY" = 1 ] || die "$why"
+  note "the real run refuses: $why"
+fi
 if [ -x "$BIN" ]; then ok "binary: $BIN"; else note "$BIN is not there (or not executable) — the timers will fail until it is (first-run step 3 installs it)"; fi
 printf '   user %s, HOME %s, tapectl home %s\n' "$SVC_USER" "$SVC_HOME" "$THOME"
 printf '   home pointer: %s -> %s\n' "$POINTER_PATH" "$THOME"
@@ -353,9 +372,10 @@ render() { # render <unit>: contrib copy → $TMP/<unit>, substituted
   return 0
 }
 for u in "${UNITS[@]}"; do render "$u"; done
-# tapectl-op from its template: the four values validated above, nothing else.
+# tapectl-op from its template: the five values validated above, nothing else.
 sed -e "s|@SVC_USER@|$SVC_USER|" -e "s|@TAPECTL@|$BIN|" \
     -e "s|@TAPE_NICE@|$TAPE_NICE|" -e "s|@TAPE_IONICE@|$IONICE_ARGS|" \
+    -e "s|@TAPECTL_HOME@|$TAPECTL_HOME_DIR|" \
     "$SRC/$WRAPPER_TEMPLATE" > "$TMP/tapectl-op"
 if [ -n "$RENDER_DIR" ]; then
   mkdir -p "$RENDER_DIR" || die "cannot create $RENDER_DIR"

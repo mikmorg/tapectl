@@ -25,6 +25,10 @@
 #              a tape command still RUNS, at normal priority, and says so on
 #              stderr
 #   off        --tape-nice '' renders a wrapper that never raises
+#   home       --tapectl-home DIR renders a wrapper whose tapectl, raised or plain,
+#              runs with TAPECTL_HOME=DIR and the operator's words unchanged
+#              (ADR-0012 item 197); without it the variable is not set at all,
+#              which is the positive control
 #   names      with --tapectl BIN: every tape subcommand the wrapper names
 #              exists in that binary, and the only global options that take a
 #              value are --config and --home (a new one must be added to the
@@ -78,11 +82,14 @@ trap cleanup EXIT
 # command name (the name may contain spaces, so a plain split would drift).
 cat >"$WORK/probe" <<'EOF'
 #!/bin/sh
+a=$(printf '%s,' "$@")
 set -- $(sed 's/^.*) //' "/proc/$$/stat")
 nice=${17}
 # Values carry no spaces (spaces become _ or ,), so a line splits into fields.
-printf 'nice=%s io=%s uid=%s gid=%s groups=%s home=%s user=%s logname=%s\n' \
-  "$nice" "$(ionice -p $$ | tr -d '\n' | tr ' ' _)" "$(id -u)" "$(id -g)" "$(id -G | tr ' ' ,)" "$HOME" "$USER" "$LOGNAME"
+# thome is TAPECTL_HOME (unset: the word unset); args are the probe's own, joined by ,.
+printf 'nice=%s io=%s uid=%s gid=%s groups=%s home=%s user=%s logname=%s thome=%s args=%s\n' \
+  "$nice" "$(ionice -p $$ | tr -d '\n' | tr ' ' _)" "$(id -u)" "$(id -g)" "$(id -G | tr ' ' ,)" "$HOME" "$USER" "$LOGNAME" \
+  "${TAPECTL_HOME-unset}" "$a"
 EOF
 chmod 0755 "$WORK/probe"
 sudo -u "$SVC_USER" -H test -x "$WORK/probe" || die "$SVC_USER cannot execute $WORK/probe (is TMPDIR traversable?)"
@@ -94,6 +101,7 @@ render() { # render DIR [installer args...]
 }
 render "$WORK/on" --tape-nice "$NICE" --tape-ionice "$IONICE"
 render "$WORK/off" --tape-nice ""
+render "$WORK/home" --tape-nice "$NICE" --tape-ionice "$IONICE" --tapectl-home "$WORK/thome"
 
 # Expected I/O field for the knobs: ionice prints '<class>: prio <n>', which
 # the probe reports with its spaces as underscores.
@@ -176,6 +184,23 @@ echo "off: --tape-nice '' never raises"
 expect plain "$WORK/off" volume write L1
 expect plain "$WORK/off" drive poll
 
+echo "home: --tapectl-home is carried to tapectl, raised or plain; without it nothing is set"
+# home_expect KIND DIR WANT_THOME ARGS...: the verdict of expect, plus the home and the words.
+home_expect() {
+  local kind="$1" dir="$2" want="$3" out th a; shift 3
+  out="$("$dir/tapectl-op" "$@" 2>/dev/null)"
+  th="$(field thome "$out")"; a="$(field args "$out")"
+  if [ "$th" = "$want" ] && [ "$a" = "$(printf '%s,' "$@")" ]; then pass "home ($kind): tapectl-op $* -> TAPECTL_HOME=$th"
+  else fail "home ($kind): tapectl-op $*" "got thome=$th args=$a (want $want, $(printf '%s,' "$@"))" "stdout: $out"; fi
+  expect "$kind" "$dir" "$@"
+}
+home_expect raised "$WORK/home" "$WORK/thome" volume write L1
+home_expect raised "$WORK/home" "$WORK/thome" --home /x volume verify L1 --full
+home_expect plain "$WORK/home" "$WORK/thome" status
+home_expect plain "$WORK/home" "$WORK/thome" --home /x volume info write
+home_expect raised "$WORK/on" unset volume write L1
+home_expect plain "$WORK/on" unset status
+
 echo "parity: a raised command runs as the same user, groups and home as the old sudo -u -H form"
 RAISED="$("$WORK/on/tapectl-op" volume write L1 2>/dev/null)"
 parity_ok=1
@@ -201,6 +226,8 @@ if [ "$n" = "$BASE_NICE" ] && [ "$(field uid "$out")" = "$(id -u "$SVC_USER")" ]
 case "$err" in *"NORMAL priority"*) pass "fallback: said so on stderr" ;; *) fail "fallback: no notice on stderr" "stderr: $err" ;; esac
 out="$(PATH="$WORK/shim:$PATH" "$WORK/on/tapectl-op" status 2>"$WORK/err")"; err="$(cat "$WORK/err")"
 if [ -z "$err" ] && [ "$(field nice "$out")" = "$BASE_NICE" ]; then pass "fallback: a non-tape command says nothing"; else fail "fallback: a non-tape command was noisy or raised" "stdout: $out" "stderr: $err"; fi
+out="$(PATH="$WORK/shim:$PATH" "$WORK/home/tapectl-op" volume write L1 2>/dev/null)"
+if [ "$(field thome "$out")" = "$WORK/thome" ] && [ "$(field uid "$out")" = "$(id -u "$SVC_USER")" ]; then pass "fallback: the home is carried at normal priority too"; else fail "fallback: the home was lost at normal priority" "stdout: $out"; fi
 
 if [ -n "$BIN" ]; then
   echo "names: the wrapper's words against $BIN"

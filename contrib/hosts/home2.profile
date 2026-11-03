@@ -57,6 +57,12 @@ unset _local_profile
 # The service user's home — and so the tapectl home, catalog and keys — lives on
 # /srv/archive_meta (sda, LUKS), not /var (95% full). home2-prep.sh moves it.
 SVC_HOME_WANT=/srv/archive_meta/tapectl
+# The tapectl home is a visible directory in it, not the hidden ~/.tapectl (the
+# CTO, 2026-11-03, ADR-0012 item 197; from handoff (i)'s fresh start). Every
+# command here gets it as --home; step 14 puts it in the units and tapectl-op, and
+# /etc/tapectl/home names it. A ~/.tapectl beside it is refused: tapectl would
+# find that one first.
+TAPECTL_HOME_DIR=/srv/archive_meta/tapectl/home
 
 # Staging holds one tape's encrypted slices: acache (md1, LUKS, ~2.3 TB free).
 STAGING_DIR=/srv/acache/tapectl-staging

@@ -2487,3 +2487,23 @@ whether home2 takes 1.8.1 after handoff (i) or before it, and chose before; (i) 
      and each ran at normal priority. Ships in 1.8.1.
 
 #499 (reporting #498 to dar upstream) stays parked (the CTO, 2026-11-01).
+
+Ruled 2026-11-03: home2's tapectl home leaves its hidden directory. After (i) step 0, reading
+(i) step 2, the CTO said: "I don't like that we have everything in a hidden folder here
+/srv/archive_meta/tapectl/.tapectl". They were asked whether to move it before (i) step 5, which
+makes the new home (a scripts change, proven by the chain first), or to keep it through (i), and
+chose to move it now, to `/srv/archive_meta/tapectl/home`.
+
+197. **An installed tapectl home may live outside the service user's `~/.tapectl`; home2's is
+     `/srv/archive_meta/tapectl/home`, from (i)'s fresh start (amends item 195's "as written").**
+     The binary already allowed it (`--home`, `TAPECTL_HOME`, the pointer `/etc/tapectl/home`), and
+     `install-systemd.sh --tapectl-home` already rendered the units for it; `first-run.sh` did not,
+     and took any home other than `~/.tapectl` for a throwaway one (`--home`: no timers). Its
+     profile variable `TAPECTL_HOME_DIR` (flag `--tapectl-home`) names the installed home: every
+     command gets it as `--home`, step 5 creates it, step 14 installs with `--tapectl-home`, and
+     the pointer names it. A `--home` still wins over it, as a throwaway. `tapectl-op` installed
+     so runs tapectl under `env TAPECTL_HOME=...`, so it never depends on the pointer, which
+     tapectl ranks below an existing `~/.tapectl`; for the same reason both scripts refuse a
+     `~/.tapectl` beside the home, and handoff (i) step 2's move of the old one is required, not
+     tidiness. No binary changes and nothing on tape names the home: home2 keeps 1.8.1, and (i)
+     runs `first-run.sh` from step 5 on from the master commit that carries this, not `v1.8.1`.

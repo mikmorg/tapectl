@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). Step 0 is done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53 (`docs/runs/2026-11-02-1.8.1-handoff-i.md`); steps 1 to 10 are next. What follows is the history before it.
+**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). Step 0 is done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53 (`docs/runs/2026-11-02-1.8.1-handoff-i.md`); steps 1 to 10 are next. On 2026-11-03 the CTO moved the new home out of the hidden `.tapectl`, to `/srv/archive_meta/tapectl/home` (item 197), so steps 5 on run `first-run.sh` from `origin/master`. What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
@@ -555,7 +555,11 @@ inside tmux, in this order. (c) and (d) are the model. What differs from them:
 - **1.8.1 goes on first**, by `first-run.sh --upgrade` on the current home (step 0), which builds,
   installs and rehearses it; the rest runs on it;
 - **the old state is moved aside, not deleted**, until the new L6-0002 reads back in full;
-- **the cartridges are reused one at a time**, so `keepsake` always has a copy on tape.
+- **the cartridges are reused one at a time**, so `keepsake` always has a copy on tape;
+- **the new home is visible**: `/srv/archive_meta/tapectl/home`, not the hidden
+  `/srv/archive_meta/tapectl/.tapectl` (ruled 2026-11-03, item 197). `home2.profile`'s
+  `TAPECTL_HOME_DIR` names it, so from step 5 on `first-run.sh` runs from `origin/master`, which
+  carries it; the installed binary stays 1.8.1.
 
 Never run step 7 under `script` or `tee`. If you mint an escrow identity, its secret prints there
 once, and only `first-run.sh`'s own log leaves step 7's output out.
@@ -614,7 +618,10 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
    sudo find /srv/acache/tapectl-staging -mindepth 1 -delete
    ```
 
-   Step 7 runs `init` because `<home>/tapectl.db` no longer exists.
+   The move is required, not tidiness. tapectl finds a `.tapectl` in the service user's home
+   before the pointer `/etc/tapectl/home`, so with one there a plain `sudo -u tapectl -H tapectl`
+   would open it, not the new home; `first-run.sh` refuses to run while it exists. Step 7 runs
+   `init` because the new home has no catalog yet.
 3. **The escrow identity is kept.** `~/.config/tapectl/home2.local.profile` names it, and step 7
    adopts it. Check that it names the one the old home registered:
 
@@ -638,19 +645,37 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
    sudo find "$D" -name .tapectl-unit.toml -delete
    ```
 
-5. **Steps 5 to 11:** `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 5 --to 11`.
-   Steps 1 to 4 (toolchain, tools, build, tests) stay done. Step 6 needs no cartridge.
+5. **Steps 5 to 11, from `origin/master`** (item 197: its `first-run.sh` and `home2.profile` put
+   the home at `/srv/archive_meta/tapectl/home`). Steps 1 to 4 (toolchain, tools, build, tests)
+   stay done, and nothing is rebuilt. Step 6 needs no cartridge.
+
+   ```bash
+   git fetch origin
+   git checkout origin/master
+   git log -1 --format=%s origin/master -- contrib/hosts/home2.profile   # names item 197
+   tapectl --version                      # still tapectl 1.8.1 (v1.8.1, 2026-11-02)
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 5 --to 11
+   ```
+
+   The first lines it prints say `home: /srv/archive_meta/tapectl/home`. Step 5 creates it.
    - **step 7** says it is adopting the escrow key from `ESCROW_PUBLIC_KEY` and mints the new
      operator key. With `OPS_GROUP` it writes `[ops] group` again;
    - **step 9** finds the old kit in `~/tapectl-heir-kit`: answer yes to regenerate;
    - **step 11** mints new keys for `parents` and `family`, and `collection sync` registers each
      keepsake folder as a new unit and writes its dotfile.
+
+   Then check where it went:
+
+   ```bash
+   cat /etc/tapectl/home                   # /srv/archive_meta/tapectl/home
+   sudo ls -A /srv/archive_meta/tapectl    # home and .tapectl-old, and no .tapectl
+   ```
 6. **The settings made by hand.** The new `config.toml` lacks (h) step 5's key; set it again, then
    compare with the old config for anything else set by hand:
 
    ```bash
-   sudo -u tapectl -H tapectl config set 'backends.lto[0].post_warning_bytes' 99008M
-   sudo diff /srv/archive_meta/tapectl/.tapectl-old/config.toml /srv/archive_meta/tapectl/.tapectl/config.toml
+   sudo -u tapectl -H tapectl --home /srv/archive_meta/tapectl/home config set 'backends.lto[0].post_warning_bytes' 99008M
+   sudo diff /srv/archive_meta/tapectl/.tapectl-old/config.toml /srv/archive_meta/tapectl/home/config.toml
    ```
 
 7. **Copy 1.** Tell the coordinator first, so vm-desk1's builds hold while the drive writes.
@@ -660,7 +685,8 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
      written by tapectl 1.1.0, and `catalog: knows neither this volume nor this cartridge`.
      Type `L6-0001`.
    - Step 13 then writes, runs `volume verify L6-0001 --full`, audits, moves the tape to
-     `home2-rack` and regenerates the kit. Step 14 installs the timers and `tapectl-op`.
+     `home2-rack` and regenerates the kit. Step 14 installs the timers and `tapectl-op`, each
+     naming the new home (`install-systemd.sh --tapectl-home`).
 8. **Copy 2,** with the drive-poll timer stopped. Load L6-0002:
 
    ```bash
@@ -683,7 +709,7 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
    Reprint `COVER.txt` and replace the one in each envelope. The handwritten secret stays
    (or, with a new escrow identity, goes in beside the new sheet). A new identity also goes
    into the local profile for the next rebuild:
-   `echo "ESCROW_PUBLIC_KEY=$(sudo grep -m1 '^age1' /srv/archive_meta/tapectl/.tapectl/keys/mikmorg-escrow.age.pub)" > ~/.config/tapectl/home2.local.profile`.
+   `echo "ESCROW_PUBLIC_KEY=$(sudo grep -m1 '^age1' /srv/archive_meta/tapectl/home/keys/mikmorg-escrow.age.pub)" > ~/.config/tapectl/home2.local.profile`.
    Each erase registered its cartridge with the chip serial as a placeholder barcode;
    `tapectl-op cartridge relabel <serial> L6-0001` (and `L6-0002`) names the sticker.
 10. **Tidy, once the new L6-0002 has read back in full:**

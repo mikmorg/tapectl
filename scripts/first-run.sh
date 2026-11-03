@@ -65,6 +65,10 @@ set -euo pipefail
 # from a flag) is declared AFTER the profile is sourced, so a profile that sets
 # one is refused by name like any other unknown variable (see PROFILE_VARS).
 HOME_DIR=""            # tapectl home; empty = the real default (the service user's ~/.tapectl)
+TAPECTL_HOME_DIR=""    # the host's own tapectl home when it is not the service user's ~/.tapectl, e.g.
+                       # /srv/archive_meta/tapectl/home (ADR-0012 item 197). Unlike --home, which names a
+                       # throwaway home, this is the installed one: every command gets it as --home, step 14
+                       # bakes it into the units and tapectl-op, and the pointer names it. --home overrides it.
 TAPECTL=""             # binary; resolved in step 0 unless given
 DEVICE=""; SG=""; LABEL=""; OPERATOR=""; TENANT=""; UNIT_PATH=""; LOCATION=""; KIT_OUT=""; TEST_BARCODE=""; DGEN=""
 SKIP_BUILD=0; SKIP_TESTS=0
@@ -111,7 +115,7 @@ ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identit
 # by name before anything runs (#506). ERASE_LABEL is not in it, and is not
 # refused either: a profile's value is only reported as not used (#469, step 13).
 PROFILE_VARS=(
-  HOME_DIR TAPECTL SKIP_BUILD SKIP_TESTS SVC_USER SVC_HOME_WANT WORK_DIR DAR_BIN
+  HOME_DIR TAPECTL_HOME_DIR TAPECTL SKIP_BUILD SKIP_TESTS SVC_USER SVC_HOME_WANT WORK_DIR DAR_BIN
   DEVICE SG DGEN OPERATOR ESCROW_PUBLIC_KEY ADOPT_KEYS_FROM STAGING_DIR STAGING_JOBS
   VERIFY_INTERVAL_DAYS CONTENDER_PROCESSES OPS_GROUP KIT_OUT LOCATIONS LOCATION
   TENANTS TENANT UNIT_PATH COLLECTIONS TEST_BARCODE LABEL CONTENDER_UNITS
@@ -206,7 +210,11 @@ usage() {
 Options:
   --home DIR        tapectl home (default: the service user's ~/.tapectl, /var/lib/tapectl/.tapectl
                     for a new account; with --no-service-user, your own ~/.tapectl). Use a temp dir
-                    to rehearse.
+                    to rehearse: step 14 installs no timers for a --home.
+  --tapectl-home DIR
+                    the host's own tapectl home when it is not the service user's ~/.tapectl (the
+                    profile's TAPECTL_HOME_DIR): an installed home, unlike --home. Refused while a
+                    ~/.tapectl exists in the service user's home, which tapectl would find first
   --from N          start at step N (0-14)
   --to N            stop after step N (0-14; e.g. --to 9: everything up to and including the printed kit)
   --upgrade         upgrade this installed host in place to the checkout's release tag (ADR-0012
@@ -281,6 +289,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --home) HOME_DIR="$2"; shift 2 ;;
+    --tapectl-home) TAPECTL_HOME_DIR="$2"; shift 2 ;;
     --from) FROM="$2"; shift 2 ;;
     --to) TO="$2"; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
@@ -342,6 +351,14 @@ for _flag in from to; do
   fi
 done
 [ "$UPGRADE" = 0 ] || [ "$FROM" != 0 ] || FROM=1
+# ADR-0012 item 197: the installed home may live outside ~/.tapectl. A --home
+# names a throwaway home and wins (a rehearsal driven by the host's profile), so
+# from here on TAPECTL_HOME_DIR is set only when it IS the home in play.
+[ -z "$HOME_DIR" ] || TAPECTL_HOME_DIR=""
+case "$TAPECTL_HOME_DIR" in
+  '' | /*) ;;
+  *) echo "TAPECTL_HOME_DIR / --tapectl-home must be an absolute path, got '$TAPECTL_HOME_DIR'" >&2; exit 2 ;;
+esac
 [ "$FROM" -le "$TO" ] || { echo "--from $FROM comes after --to $TO: no step would run" >&2; exit 2; }
 
 # Item 187: the profile this host was installed with, recorded beside
@@ -390,8 +407,12 @@ OP_CMD="${SUDO_PREFIX}tapectl"
 as_svc()   { if [ "$SVC_MODE" = 1 ]; then sudo -u "$SVC_USER" -H "$@"; else "$@"; fi; }
 svc_home() { if [ "$SVC_MODE" = 1 ]; then { getent passwd "$SVC_USER" 2>/dev/null || true; } | cut -d: -f6; else printf '%s' "$HOME"; fi; }
 svc_in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -x "$2" >/dev/null; }
-compute_home() { local h; h="$(svc_home)"; EFFECTIVE_HOME="${HOME_DIR:-${h:-/var/lib/$SVC_USER}/.tapectl}"; }
+compute_home() { local h; h="$(svc_home)"; EFFECTIVE_HOME="${HOME_DIR:-${TAPECTL_HOME_DIR:-${h:-/var/lib/$SVC_USER}/.tapectl}}"; }
 compute_home
+# Item 197: before step 14 installs tapectl-op, which carries it, a printed remedy
+# names the home itself: the pointer may not exist yet (it is step 7's only with
+# an ops group), and without it tapectl would look in ~/.tapectl.
+[ -z "$TAPECTL_HOME_DIR" ] || OP_CMD="$OP_CMD --home $EFFECTIVE_HOME"
 # The log is yours, never inside the service user's home (which you cannot enter).
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/tapectl/first-run.log"
 STEP=0
@@ -501,7 +522,7 @@ run_capture_json_err() {
 }
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
-tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
+tc() { if [ -n "$HOME_DIR$TAPECTL_HOME_DIR" ]; then as_svc "$TAPECTL" --home "$EFFECTIVE_HOME" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
 # tape_raise_setup (step 13): raise THIS shell's CPU and I/O priority, once.
 # The drive wants an even feed and a busy host starves it (#426: a write used
 # 1.505 bytes of tape per data byte), so the tape commands of step 13 (volume
@@ -739,6 +760,15 @@ if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
   if [ -z "$HOME_DIR" ] && as_svc test -e "$EFFECTIVE_HOME/tapectl.db" 2>/dev/null && [ "$FROM" -le 7 ]; then
     note "$EFFECTIVE_HOME is already initialised. This script will detect that in step 7 and not re-init."
   fi
+  # ADR-0012 item 197: a home outside ~/.tapectl is found through --home, the
+  # units' TAPECTL_HOME and the pointer, and tapectl ranks an account's own
+  # ~/.tapectl above the pointer. One left beside it would be what a plain
+  # `sudo -u USER -H tapectl` opens, silently: refuse until it is moved.
+  _own="$(svc_home)/.tapectl"
+  if [ -n "$TAPECTL_HOME_DIR" ] && [ "$_own" != "$EFFECTIVE_HOME" ] && as_svc test -e "$_own" 2>/dev/null; then
+    die "$_own exists, and the home is $EFFECTIVE_HOME (TAPECTL_HOME_DIR). tapectl finds an account's own ~/.tapectl before the pointer /etc/tapectl/home, so a plain \`${SUDO_PREFIX}tapectl <command>\` would open $_own, not $EFFECTIVE_HOME. Move it aside first (handoff (i) step 2 moves it to .tapectl-old), then run this again"
+  fi
+  unset _own
   # Keys renamed since a home may have been initialised (ADR-0012, 2026-09-28
   # amendment; issue #348): [defaults] min_copies_for_tape_only → min_copies and
   # min_locations_for_tape_only → min_locations, same meaning. The new binary
@@ -1307,7 +1337,7 @@ hdr 5 "The service user"
 skip_if || {
 if [ "$SVC_MODE" != 1 ]; then note "--no-service-user: tapectl runs as $USER, home $EFFECTIVE_HOME"; else
 explain <<EOF
-WHY A SERVICE USER. The tapectl home holds the operator private key, every tenant private key and the catalog, and tapectl resolves that home purely from \$HOME. Under a dedicated account those files share a home with nothing else — not your shell history, your ssh agent or the next script you run — and the systemd audit timer in contrib/ gets the fixed User= and HOME= it needs. The account is a nologin system user; you drive it with \`sudo -u $SVC_USER -H tapectl …\`, which is what this script does for every tapectl command from here on.
+WHY A SERVICE USER. The tapectl home holds the operator private key, every tenant private key and the catalog, and tapectl resolves that home from \$HOME (as \$HOME/.tapectl, unless the profile's TAPECTL_HOME_DIR puts it elsewhere). Under a dedicated account those files share a home with nothing else — not your shell history, your ssh agent or the next script you run — and the systemd audit timer in contrib/ gets the fixed User= and HOME= it needs. The account is a nologin system user; you drive it with \`sudo -u $SVC_USER -H tapectl …\`, which is what this script does for every tapectl command from here on.
 
 Its needs are exactly three, and each is granted where it arises: membership of the group that owns the drive nodes (step 6), read on the trees it archives (per unit, by ACL, step 11), and ownership of the staging directory (step 7). Restore needs no root — dar runs with -O — but a restore destination must be writable by $SVC_USER.
 EOF
@@ -1324,7 +1354,9 @@ SVC_HOME="$(svc_home)"; [ -n "$SVC_HOME" ] || die "no home directory for $SVC_US
 [ -d "$SVC_HOME" ] || { run sudo mkdir -p "$SVC_HOME"; run sudo chown "$SVC_USER" "$SVC_HOME"; }
 as_svc id >/dev/null || die "sudo -u $SVC_USER failed — sudo is required for the service-user mode"
 as_svc test -x "$TAPECTL" || die "$TAPECTL is not executable by $SVC_USER — install it system-wide (step 3 → /usr/local/bin) or pass --tapectl"
-if [ -n "$HOME_DIR" ]; then run sudo mkdir -p "$HOME_DIR"; run sudo chown "$SVC_USER" "$HOME_DIR"; fi
+_hd="${HOME_DIR:-$TAPECTL_HOME_DIR}"
+if [ -n "$_hd" ]; then run sudo mkdir -p "$_hd"; run sudo chown "$SVC_USER" "$_hd"; fi
+unset _hd
 compute_home
 run as_svc "$TAPECTL" --version
 ok "$SVC_USER ready — home $SVC_HOME, tapectl home $EFFECTIVE_HOME"
@@ -2433,6 +2465,9 @@ explain <<EOF
 Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to ${BACKUP_DIR:-$BACKUP_DIR_DEFAULT}, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it shares a filesystem or a disk with the home, and refuses to move the directory installed timers already use unless --backup-dir (or the profile) names the one to use. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op runs tapectl as $SVC_USER, so you need not type the prefix; a tape command (volume write, resume, verify, rewrite, compact, read-slices, init and identify; restore; cartridge erase; collection run; quick-archive; catalog rebuild; drive poll and eject) goes through \`sudo nice -n $TAPE_NICE ionice $TAPE_IONICE runuser -u $SVC_USER -- tapectl\` at raised priority (one sudo prompt where root sudo asks for one), and falls back to \`sudo -u $SVC_USER -H tapectl\` at normal priority with a notice if that is refused. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
 EOF
 INSTALL_ARGS=(--tapectl "$TAPECTL" --tape-nice "$TAPE_NICE" --tape-ionice "$TAPE_IONICE")
+# ADR-0012 item 197: an installed home outside ~/.tapectl goes into the units
+# (TAPECTL_HOME=), tapectl-op and the pointer. (A --home cleared it above.)
+if [ -n "$TAPECTL_HOME_DIR" ]; then INSTALL_ARGS+=(--tapectl-home "$TAPECTL_HOME_DIR"); fi
 # Only a directory a profile or --backup-dir chose: passing the default as if
 # chosen is how 2026-10-20's run moved home2's backups to the catalog's disk (#502).
 if [ -n "$BACKUP_DIR" ]; then INSTALL_ARGS+=(--backup-dir "$BACKUP_DIR"); fi
