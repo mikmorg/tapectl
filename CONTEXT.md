@@ -103,6 +103,13 @@ a session that meets it inside a slice aborts.
 _Avoid_: EOT and end of tape (they do not say which of the two is meant), EOM,
 full
 
+**Fill ceiling**:
+The fraction of a cartridge's capacity a write may plan to fill, 97% by default.
+A drive whose room past the Early warning has been measured may plan beyond it,
+up to the cartridge's whole capacity; what the drive does not reach before its
+Early warning is cut off by a Short seal.
+_Avoid_: usable capacity, `usable_capacity_factor` (its name before #391)
+
 **Short seal**:
 A seal marker written early (1.6.0): at the Early warning, the slice in flight
 at position K is finished and the seal goes at K+1 instead of the planned
