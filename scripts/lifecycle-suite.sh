@@ -2460,8 +2460,10 @@ assert full, "no passed full readback recorded for VOL-B, though it was written 
 }
 
 # #440: VOL-B is copy 2 of every unit's v1, so its own `volume write` releases
-# the staged slices (no --keep-staging). The on-media proof of the release:
-# stage sets exist, at least one is `cleaned`, and none is left `staged`.
+# the staged slices (no --keep-staging). Per unit since 1.9.0 (ADR-0012 item
+# 217): each unit is released because it is itself at 2 of 2, and every unit
+# on VOL-B is, so none is left. The on-media proof of the release: stage sets
+# exist, at least one is `cleaned`, and none is left `staged`.
 rr_staging_released_by_second_copy() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
         skip "rr.staging_released_by_second_copy" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
@@ -4337,8 +4339,10 @@ scenario_cartridge_displacement() {
 #
 #   1. `collection run` writes copy 1 and RETAINS staging, because the units
 #      resolve min_copies = 2 (#238: `execute_batch` gates release on each
-#      unit's own resolved min_copies, not on `clean_staging`'s guard, which
-#      passes vacuously once one write row is 'completed').
+#      unit's own copy floor, not on `clean_staging`'s guard, which passes
+#      vacuously once one write row is 'completed'). Per unit since 1.9.0
+#      (ADR-0012 item 217): every unit here is at 1 of 2, so every unit keeps
+#      its staging -- the twins stay twins until copy 2.
 #   2. Swap cartridges, `volume write VOL-CS2` -- and it consumes the SAME
 #      staged bytes rather than re-staging. That is the property the whole
 #      ruling rests on, and it was false when the ruling was written.
@@ -4411,7 +4415,7 @@ assert d["staging_released"] is False, (
     "one copy released staging while min_copies is 2 -- issue #238's gate is not holding", d)
 assert d["under_copied"], d
 for p in d["under_copied"]:
-    assert p["copies"] == 1 and p["min_copies"] == 2, p
+    assert p["copies"] == 1 and p["copy_floor"] == 2, p
 PY2
 }
 
