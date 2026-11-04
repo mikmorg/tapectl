@@ -3552,6 +3552,69 @@ fn snapshot_create_takes_several_units_and_one_failing_stops_none() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("named twice"));
 }
 
+/// ADR-0012 item 210 (OQ21): `key list` without `--tenant` lists every
+/// tenant's keys, with a Tenant column; JSON rows carry `tenant`, with
+/// `--tenant` too (one shape).
+#[test]
+fn key_list_without_a_tenant_lists_every_tenants_keys() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let ok = |args: &[&str]| {
+        let out = run_tapectl(h, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["init", "--operator", "op"]);
+    ok(&["tenant", "add", "acme"]);
+    ok(&["tenant", "add", "bravo"]);
+
+    let text = ok(&["key", "list"]);
+    let header = text.lines().next().unwrap_or_default();
+    assert!(
+        header.trim_start().starts_with("Tenant") && header.contains("Alias"),
+        "{text}"
+    );
+    for (tenant, alias) in [
+        ("acme", "acme-primary"),
+        ("bravo", "bravo-primary"),
+        ("op", "op-primary"),
+    ] {
+        assert!(
+            text.lines().any(|l| l.starts_with(tenant) && l.contains(alias)),
+            "{tenant}'s {alias} on its own row: {text}"
+        );
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&ok(&["--json", "key", "list"])).unwrap();
+    let pairs: Vec<(String, String)> = json
+        .as_array()
+        .expect("an array of keys")
+        .iter()
+        .map(|r| {
+            (
+                r["tenant"].as_str().expect("every row names its tenant").to_owned(),
+                r["alias"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    for (tenant, alias) in [("acme", "acme-primary"), ("bravo", "bravo-primary")] {
+        assert!(
+            pairs.contains(&(tenant.to_owned(), alias.to_owned())),
+            "{pairs:?}"
+        );
+    }
+
+    let one: serde_json::Value =
+        serde_json::from_str(&ok(&["--json", "key", "list", "--tenant", "acme"])).unwrap();
+    let rows = one.as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|r| r["tenant"] == "acme"), "{one}");
+}
+
 /// The stderr twin: an error reported to a closed stderr still exits with
 /// the error's own code (the one it gives with stderr open), not a panic's
 /// 101.

@@ -37,11 +37,13 @@ pub enum KeyCommands {
         escrow: bool,
     },
 
-    /// List keys for a tenant
+    /// List keys: every tenant's, or one tenant's with --tenant
     List {
-        /// Tenant name
+        /// List only this tenant's keys. Without it every tenant's keys
+        /// are listed, with a Tenant column (deleted tenants are left out,
+        /// as `tenant list` leaves them out; name one to see its keys)
         #[arg(long)]
-        tenant: String,
+        tenant: Option<String>,
     },
 
     /// Export a public key to stdout
@@ -207,13 +209,39 @@ pub fn run(
                 }
             }
         }
-        KeyCommands::List { tenant } => {
-            let t = crate::tenant::require_tenant(conn, tenant)?;
-            let key_list = queries::list_keys_for_tenant(conn, t.id)?;
+        KeyCommands::List { tenant: None } => {
+            // ADR-0012 item 210 (OQ21): every tenant's keys, with a Tenant
+            // column; JSON rows carry `tenant`, as they do with --tenant.
+            let mut listed: Vec<(String, EncryptionKey)> = Vec::new();
+            for t in queries::list_tenants(conn, false)? {
+                for k in queries::list_keys_for_tenant(conn, t.id)? {
+                    listed.push((t.name.clone(), k));
+                }
+            }
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&key_list_json(&key_list)).unwrap()
+                    serde_json::to_string_pretty(&key_list_json(&listed)).unwrap()
+                );
+            } else if listed.is_empty() {
+                println!("no keys found");
+            } else {
+                println!("{}", every_tenants_keys_table(&listed));
+            }
+        }
+        KeyCommands::List {
+            tenant: Some(tenant),
+        } => {
+            let t = crate::tenant::require_tenant(conn, tenant)?;
+            let key_list = queries::list_keys_for_tenant(conn, t.id)?;
+            if json_output {
+                let listed: Vec<(String, EncryptionKey)> = key_list
+                    .into_iter()
+                    .map(|k| (t.name.clone(), k))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&key_list_json(&listed)).unwrap()
                 );
             } else if key_list.is_empty() {
                 println!("no keys found for tenant \"{tenant}\"");
@@ -956,15 +984,53 @@ pub(crate) fn displayed_key_type(k: &EncryptionKey) -> &str {
 /// `key list --json`: every `EncryptionKey` field as stored, except
 /// `key_type`, which says `escrow` on the escrow row ([`displayed_key_type`])
 /// — the same label the table shows. `is_escrow` stays alongside it.
-fn key_list_json(keys: &[EncryptionKey]) -> serde_json::Value {
+/// `key list --json`: each key as `EncryptionKey` serializes it, with the
+/// displayed Type and the name of the tenant it belongs to (OQ21; with or
+/// without --tenant, one shape).
+fn key_list_json(keys: &[(String, EncryptionKey)]) -> serde_json::Value {
     serde_json::Value::Array(
         keys.iter()
-            .map(|k| {
+            .map(|(tenant, k)| {
                 let mut v = serde_json::to_value(k).expect("EncryptionKey serializes");
                 v["key_type"] = serde_json::json!(displayed_key_type(k));
+                v["tenant"] = serde_json::json!(tenant);
                 v
             })
             .collect(),
+    )
+}
+
+/// `key list` without --tenant: every tenant's keys, the tenant first.
+fn every_tenants_keys_table(keys: &[(String, EncryptionKey)]) -> String {
+    let rows = keys
+        .iter()
+        .map(|(tenant, k)| {
+            vec![
+                tenant.clone(),
+                k.alias.clone(),
+                displayed_key_type(k).to_string(),
+                if k.is_active { "yes" } else { "no" }.to_string(),
+                if k.is_escrow {
+                    "ESCROW (ADR-0005)".to_string()
+                } else {
+                    String::new()
+                },
+                truncate_fingerprint(&k.fingerprint),
+                crate::render::table_time(&k.created_at),
+            ]
+        })
+        .collect();
+    crate::render::table(
+        &[
+            "tenant",
+            "alias",
+            "type",
+            "active",
+            "escrow",
+            "fingerprint",
+            "created",
+        ],
+        rows,
     )
 }
 
