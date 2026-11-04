@@ -2732,8 +2732,15 @@ fn generate_stage_report(
     Ok(report)
 }
 
-/// Parse an operator-facing size string (e.g. `"10G"`, `"500M"`, or a bare
-/// byte count like `"1024"`) into a byte count.
+/// Parse an operator-facing size string (e.g. `"10G"`, `"500M"`, `"512MiB"`,
+/// or a bare byte count like `"1024"`) into a byte count.
+///
+/// Binary throughout: `K`/`KB`=1024 ... `T`/`TB`=1024^4, as these fields have
+/// always meant, and the IEC spellings `KiB`, `MiB`, `GiB`, `TiB` mean the
+/// same (ADR-0012 item 212: size input accepts KiB to TiB, while a bare or SI
+/// suffix keeps its meaning in each field). The suffix is case-insensitive.
+/// The capacity fields' sibling, [`crate::media::parse_capacity_to_bytes`],
+/// takes the same strings and reads the bare and SI suffixes decimally.
 ///
 /// A bare number with no suffix is valid and means bytes. Anything else that
 /// doesn't parse cleanly — an unparseable number, an unrecognized suffix, a
@@ -2746,7 +2753,8 @@ pub fn parse_size_to_bytes(s: &str) -> Result<i64> {
     let trimmed = s.trim();
     let invalid = || {
         TapectlError::Config(format!(
-            "{trimmed:?} is not a valid size (expected e.g. 2500G, 500M, or a bare byte count)"
+            "{trimmed:?} is not a valid size: a number with an optional unit, such as \
+             2500G, 500M, 512MiB or a bare byte count (K, M, G and T are binary here)"
         ))
     };
 
@@ -2762,10 +2770,10 @@ pub fn parse_size_to_bytes(s: &str) -> Result<i64> {
 
     let multiplier: f64 = match suffix.to_uppercase().as_str() {
         "" => 1.0,
-        "K" | "KB" => 1024.0,
-        "M" | "MB" => 1024.0 * 1024.0,
-        "G" | "GB" => 1024.0 * 1024.0 * 1024.0,
-        "T" | "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
         _ => return Err(invalid()),
     };
 
@@ -2808,6 +2816,35 @@ mod parse_size_to_bytes_tests {
             parse_size_to_bytes("2TB").unwrap(),
             2 * 1024 * 1024 * 1024 * 1024
         );
+    }
+
+    /// ADR-0012 item 212: the IEC spellings are accepted, in any case, and
+    /// mean what the bare and SI suffixes already mean here (binary).
+    #[test]
+    fn iec_suffixes_are_binary_and_case_insensitive() {
+        for (s, bytes) in [
+            ("2KiB", 2i64 << 10),
+            ("2kib", 2 << 10),
+            ("512MiB", 512 << 20),
+            ("512MIB", 512 << 20),
+            ("1GiB", 1 << 30),
+            ("1.5GiB", 3 << 29),
+            ("2TiB", 2 << 40),
+            ("2tib", 2 << 40),
+        ] {
+            assert_eq!(parse_size_to_bytes(s).unwrap(), bytes, "{s}");
+        }
+        // The field's own meaning of the bare and SI suffixes is unchanged.
+        assert_eq!(
+            parse_size_to_bytes("1G").unwrap(),
+            parse_size_to_bytes("1GiB").unwrap()
+        );
+        assert_eq!(
+            parse_size_to_bytes("99008M").unwrap(),
+            99_008 * 1024 * 1024
+        );
+        assert!(parse_size_to_bytes("1GiBB").is_err());
+        assert!(parse_size_to_bytes("1Gi").is_err());
     }
 
     #[test]

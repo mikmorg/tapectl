@@ -3517,12 +3517,56 @@ mod tests {
             ("99G", 99_000_000_000),
             ("99.008GB", 99_008_000_000),
             ("2500000000", 2_500_000_000),
+            // ADR-0012 item 212: the IEC spellings are binary, as they say.
+            ("99008MiB", 99_008 * 1024 * 1024),
+            ("92GiB", 92 * 1024 * 1024 * 1024),
         ] {
             let cfg = load_text(&room_config(Some(text), "1M", "")).unwrap();
             assert_eq!(
                 cfg.backends.lto[0].post_warning_room_bytes().unwrap(),
                 Some(bytes),
                 "{text}"
+            );
+        }
+    }
+
+    /// ADR-0012 item 212 (OQ18): a bare or SI suffix keeps each field's own
+    /// meaning — `G` is 2^30 in the data sizes (`slice_size`, `enospc_buffer`)
+    /// and 10^9 in the amounts of tape (`capacity_override`,
+    /// `post_warning_bytes`) — and `GiB` is 2^30 in all four.
+    #[test]
+    fn g_keeps_each_size_fields_meaning_and_gib_is_binary_everywhere() {
+        const GIB: u64 = 1 << 30;
+        const GB: u64 = 1_000_000_000;
+        for (suffix, data, tape) in [("G", GIB, GB), ("GiB", GIB, GIB)] {
+            let cfg = load_text(&room_config(
+                Some(&format!("40{suffix}")),
+                &format!("1{suffix}"),
+                &format!(
+                    "enospc_buffer = \"2{suffix}\"\ncapacity_override = \"3000{suffix}\"\n"
+                ),
+            ))
+            .unwrap();
+            let b = &cfg.backends.lto[0];
+            assert_eq!(
+                crate::staging::parse_size_to_bytes(&cfg.defaults.slice_size).unwrap() as u64,
+                data,
+                "slice_size 1{suffix}"
+            );
+            assert_eq!(
+                crate::staging::parse_size_to_bytes(&b.enospc_buffer).unwrap() as u64,
+                2 * data,
+                "enospc_buffer 2{suffix}"
+            );
+            assert_eq!(
+                b.post_warning_room_bytes().unwrap(),
+                Some(40 * tape),
+                "post_warning_bytes 40{suffix}"
+            );
+            assert_eq!(
+                b.planning_capacity_bytes(None).unwrap(),
+                3000 * tape,
+                "capacity_override 3000{suffix}"
             );
         }
     }

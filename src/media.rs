@@ -318,6 +318,12 @@ pub fn resolve_capacity(
 /// `"2500G"`, or a bare byte count) into a byte count, in the DECIMAL
 /// (marketed) unit: `K`=10^3, `M`=10^6, `G`=10^9, `T`=10^12.
 ///
+/// The IEC spellings `KiB`, `MiB`, `GiB` and `TiB` are accepted too, and are
+/// binary, as their names say (ADR-0012 item 212: size input accepts KiB to
+/// TiB in every field, while a bare or SI suffix keeps its meaning in each
+/// field, so `99008M` in `post_warning_bytes` is 99,008,000,000 bytes as it
+/// always was).
+///
 /// This is deliberately the sibling of [`crate::staging::parse_size_to_bytes`]
 /// (data sizes: `slice_size`, `large_file_warn_threshold`, `enospc_buffer` —
 /// binary, `K`=1024 etc., because dar and the block layer count bytes that
@@ -342,7 +348,9 @@ pub fn parse_capacity_to_bytes(s: &str) -> Result<i64> {
     let trimmed = s.trim();
     let invalid = || {
         TapectlError::Config(format!(
-            "{trimmed:?} is not a valid capacity (expected e.g. 2.5T, 2500G, or a bare byte count)"
+            "{trimmed:?} is not a valid capacity: a number with an optional unit, such as \
+             2.5T, 99008M, 2500GiB or a bare byte count (K, M, G and T are decimal here, \
+             KiB to TiB binary)"
         ))
     };
 
@@ -362,6 +370,10 @@ pub fn parse_capacity_to_bytes(s: &str) -> Result<i64> {
         "M" | "MB" => 1_000_000.0,
         "G" | "GB" => 1_000_000_000.0,
         "T" | "TB" => 1_000_000_000_000.0,
+        "KIB" => 1024.0,
+        "MIB" => 1024.0 * 1024.0,
+        "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
         _ => return Err(invalid()),
     };
 
@@ -756,6 +768,26 @@ mod tests {
         assert_eq!(parse_capacity_to_bytes("2TB").unwrap(), 2_000_000_000_000);
     }
 
+    /// ADR-0012 item 212: the IEC spellings are accepted here too, and are
+    /// binary; the bare and SI suffixes stay decimal (`99008M`, home2's
+    /// `post_warning_bytes`, is unchanged).
+    #[test]
+    fn capacity_iec_suffixes_are_binary_and_the_si_ones_stay_decimal() {
+        for (s, bytes) in [
+            ("2KiB", 2i64 << 10),
+            ("512mib", 512 << 20),
+            ("99008MiB", 99_008 << 20),
+            ("1GiB", 1 << 30),
+            ("2TiB", 2 << 40),
+            ("2TIB", 2 << 40),
+        ] {
+            assert_eq!(parse_capacity_to_bytes(s).unwrap(), bytes, "{s}");
+        }
+        assert_eq!(parse_capacity_to_bytes("99008M").unwrap(), 99_008_000_000);
+        assert_eq!(parse_capacity_to_bytes("1G").unwrap(), 1_000_000_000);
+        assert!(parse_capacity_to_bytes("1GiBB").is_err());
+    }
+
     #[test]
     fn capacity_rejects_an_unknown_suffix_rather_than_silently_defaulting() {
         assert!(parse_capacity_to_bytes("2500GG").is_err());
@@ -829,6 +861,11 @@ mod tests {
             "2TB",
             "2.5T",
             "40000G",
+            "2KiB",
+            "512MiB",
+            "1.5GiB",
+            "2TiB",
+            "1Gi",
             "  10G  ",
             "",
             "abc",
