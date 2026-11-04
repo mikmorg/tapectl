@@ -5610,9 +5610,8 @@ mod tests {
             assert_eq!(
                 crate::cli::stage::held_but_not_owing_line(&rows).as_deref(),
                 Some(
-                    "1 more stage set(s) have every copy their own version needs and are \
-                     only held in staging (`tapectl stage clean` decides which can be \
-                     released)"
+                    "1 more stage set has every copy its own version needs and is only held \
+                     in staging (`tapectl stage clean` decides whether it can be released)"
                 )
             );
         }

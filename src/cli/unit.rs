@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use rusqlite::Connection;
 use serde::Serialize;
-use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
 use crate::db::queries;
@@ -138,26 +137,83 @@ pub enum UnitCommands {
     },
 }
 
-/// Table-only: `unit list --json` serializes `db::models::Unit` directly
-/// (already `Serialize`), so there is no hand-rolled JSON derived from
-/// `UnitRow` to keep in sync -- and the two aren't even shaped alike:
-/// `UnitRow.tenant` is a resolved tenant NAME and `UnitRow.tags` is a
-/// joined-in, comma-separated string, neither of which `Unit` carries
-/// (it has `tenant_id` and no tags at all). The `Serialize` derive and its
-/// pin below exist for structural parity with the other ten row structs;
-/// nothing in `run()` calls it.
-#[derive(Tabled, Serialize)]
+/// Table-only: `unit list --json` is [`unit_json`] of each unit, so there is
+/// no hand-rolled JSON derived from `UnitRow` to keep in sync. The
+/// `Serialize` derive and its pin below exist for structural parity with the
+/// other row structs; nothing in `run()` calls it.
+#[derive(Serialize)]
 struct UnitRow {
-    #[tabled(rename = "Name")]
     name: String,
-    #[tabled(rename = "Status")]
     status: String,
-    #[tabled(rename = "Tenant")]
     tenant: String,
-    #[tabled(rename = "Path")]
     path: String,
-    #[tabled(rename = "Tags")]
     tags: String,
+}
+
+/// `unit list`'s table (ADR-0012 item 212): borderless, one header case.
+fn unit_table(rows: &[UnitRow], width: Option<usize>) -> String {
+    crate::render::table_with(
+        &["name", "status", "tenant", "path", "tags"],
+        rows.iter()
+            .map(|r| {
+                vec![
+                    r.name.clone(),
+                    r.status.clone(),
+                    r.tenant.clone(),
+                    r.path.clone(),
+                    r.tags.clone(),
+                ]
+            })
+            .collect(),
+        width,
+    )
+}
+
+/// A unit as `unit list`, `unit init` and `unit info` print it under
+/// `--json` (ADR-0012 item 212, OQ5): `db::models::Unit`'s fields with its
+/// tenant and archive set by name (`tenant`, `archive_set`; null when it has
+/// none) in place of their database ids, and its times in RFC 3339 with `Z`.
+fn unit_json(
+    unit: &crate::db::models::Unit,
+    tenant: &str,
+    archive_set: Option<&str>,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(unit).expect("a unit serializes");
+    if let Some(o) = v.as_object_mut() {
+        o.remove("tenant_id");
+        o.remove("archive_set_id");
+        o.insert("tenant".into(), serde_json::json!(tenant));
+        o.insert("archive_set".into(), serde_json::json!(archive_set));
+        for key in ["created_at", "last_scanned"] {
+            let time = o
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(crate::render::json_time);
+            if let Some(time) = time {
+                o.insert(key.into(), serde_json::json!(time));
+            }
+        }
+    }
+    v
+}
+
+/// The names [`unit_json`] prints for a unit's tenant and archive set.
+fn tenant_and_archive_set(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+) -> Result<(String, Option<String>)> {
+    let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
+        .map(|t| t.name)
+        .unwrap_or_else(|| "?".to_string());
+    let archive_set = match unit.archive_set_id {
+        Some(id) => Some(conn.query_row(
+            "SELECT name FROM archive_sets WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?),
+        None => None,
+    };
+    Ok((tenant, archive_set))
 }
 
 /// `units.status`'s CHECK constraint (`src/db/migrations/026_drop_unwritten_states.sql`,
@@ -217,7 +273,8 @@ pub fn run(
             if json_output {
                 let unit =
                     queries::get_unit_by_name(conn, &resolve_unit_name(conn, unit_id)?)?.unwrap();
-                println!("{}", serde_json::to_string_pretty(&unit).unwrap());
+                let (tenant, archive_set) = tenant_and_archive_set(conn, &unit)?;
+                crate::render::print_json(&unit_json(&unit, &tenant, archive_set.as_deref()));
             } else {
                 let unit_name = resolve_unit_name(conn, unit_id)?;
                 match registration {
@@ -263,12 +320,14 @@ pub fn run(
                 }
             }
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"success": success, "failed": failed})
+                crate::render::print_json(
+                    &serde_json::json!({"success": success, "failed": failed}),
                 );
             } else {
-                println!("{success} units created, {failed} skipped");
+                println!(
+                    "{} created, {failed} skipped",
+                    crate::render::plural(success, "unit", "units")
+                );
             }
         }
 
@@ -288,8 +347,11 @@ pub fn run(
             let listed = unit_list(conn, tenant_id, status.as_deref(), tag.as_deref())?;
 
             if json_output {
-                let units: Vec<&crate::db::models::Unit> = listed.iter().map(|l| &l.unit).collect();
-                println!("{}", serde_json::to_string_pretty(&units).unwrap());
+                let units: Vec<serde_json::Value> = listed
+                    .iter()
+                    .map(|l| unit_json(&l.unit, &l.tenant, l.archive_set.as_deref()))
+                    .collect();
+                crate::render::print_json(&serde_json::Value::Array(units));
             } else if listed.is_empty() {
                 println!("no units found");
             } else {
@@ -303,7 +365,7 @@ pub fn run(
                         tags: l.tags.join(", "),
                     })
                     .collect();
-                println!("{}", Table::new(rows));
+                println!("{}", unit_table(&rows, crate::render::terminal_width()));
             }
         }
 
@@ -327,15 +389,24 @@ pub fn run(
             let prior_paths = queries::unit_path_history(conn, unit.id)?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "unit": unit,
-                        "tags": tags,
-                        "tenant": tenant,
-                        "prior_paths": prior_paths,
+                // ADR-0012 item 212 (OQ5): the tenant and the archive set by
+                // name, times in RFC 3339 with `Z`.
+                let (tenant_name, archive_set) = tenant_and_archive_set(conn, &unit)?;
+                let prior: Vec<serde_json::Value> = prior_paths
+                    .iter()
+                    .map(|rec| {
+                        serde_json::json!({
+                            "path": rec.path,
+                            "observed_at": crate::render::json_time(&rec.observed_at),
+                        })
                     })
-                );
+                    .collect();
+                crate::render::print_json(&serde_json::json!({
+                    "unit": unit_json(&unit, &tenant_name, archive_set.as_deref()),
+                    "tags": tags,
+                    "tenant": tenant_name,
+                    "prior_paths": prior,
+                }));
             } else {
                 println!("Unit: {}", unit.name);
                 println!("  UUID:          {}", unit.uuid);
@@ -350,7 +421,10 @@ pub fn run(
                 );
                 println!("  Checksum mode: {}", unit.checksum_mode);
                 println!("  Encrypted:     {}", unit.encrypt);
-                println!("  Created:       {}", unit.created_at);
+                println!(
+                    "  Created:       {}",
+                    crate::render::table_time(&unit.created_at)
+                );
                 if !tags.is_empty() {
                     println!("  Tags:          {}", tags.join(", "));
                 }
@@ -360,7 +434,11 @@ pub fn run(
                     // the table has no departure timestamp.
                     println!("  Prior paths:   (newest first, recorded at)");
                     for rec in &prior_paths {
-                        println!("    {}  {}", rec.observed_at, rec.path);
+                        println!(
+                            "    {}  {}",
+                            crate::render::table_time(&rec.observed_at),
+                            rec.path
+                        );
                     }
                 }
             }
@@ -381,7 +459,7 @@ pub fn run(
                 if json_output {
                     let mut obj = serde_json::json!({"name": unit.name, "tags": tags});
                     obj["dry_run"] = serde_json::json!(true);
-                    println!("{obj}");
+                    crate::render::print_json(&obj);
                 } else {
                     println!(
                         "unit \"{}\": tags would become [{}] (DRY RUN — no changes made)",
@@ -394,7 +472,7 @@ pub fn run(
             // Issue #359: the database AND the unit's dotfile.
             let tags = crate::unit::tag_unit(conn, &unit, add, remove)?;
             if json_output {
-                println!("{}", serde_json::json!({"name": unit.name, "tags": tags}));
+                crate::render::print_json(&serde_json::json!({"name": unit.name, "tags": tags}));
             } else {
                 println!("unit \"{}\": tags = [{}]", unit.name, tags.join(", "));
             }
@@ -412,9 +490,8 @@ pub fn run(
                     return Err(TapectlError::UnitAlreadyExists(new.clone()));
                 }
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"old_name": current, "new_name": new, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"old_name": current, "new_name": new, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -426,10 +503,7 @@ pub fn run(
             }
             crate::unit::rename_unit(conn, current, new)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"old_name": current, "new_name": new})
-                );
+                crate::render::print_json(&serde_json::json!({"old_name": current, "new_name": new}));
             } else {
                 println!("unit \"{current}\" renamed to \"{new}\"");
             }
@@ -449,15 +523,12 @@ pub fn run(
             }
             let report = crate::unit::discovery::discover(conn, config)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "created": report.created,
-                        "updated": report.updated,
-                        "unchanged": report.unchanged,
-                        "errors": report.errors,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "created": report.created,
+                    "updated": report.updated,
+                    "unchanged": report.unchanged,
+                    "errors": report.errors,
+                }));
             } else {
                 println!(
                     "discover: {} created, {} updated, {} unchanged",
@@ -509,16 +580,19 @@ pub fn run(
     Ok(crate::error::EXIT_SUCCESS)
 }
 
-/// One `unit list` row: the unit, its tenant's name and its tags (sorted).
+/// One `unit list` row: the unit, its tenant's and archive set's names and
+/// its tags (sorted).
 struct ListedUnit {
     unit: crate::db::models::Unit,
     tenant: String,
+    archive_set: Option<String>,
     tags: Vec<String>,
 }
 
-/// `unit list`'s rows, filtered by tenant, status and tag. Three queries
+/// `unit list`'s rows, filtered by tenant, status and tag. Four queries
 /// whatever the number of units (issue #417: it was two more per unit) —
-/// the units, every tenant's name, every unit's tags — joined in memory.
+/// the units, every tenant's name, every archive set's name, every unit's
+/// tags — joined in memory.
 fn unit_list(
     conn: &Connection,
     tenant_id: Option<i64>,
@@ -530,6 +604,10 @@ fn unit_list(
     let units = queries::list_units(conn, tenant_id, status)?;
     let tenants: HashMap<i64, String> = conn
         .prepare("SELECT id, name FROM tenants")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let archive_sets: HashMap<i64, String> = conn
+        .prepare("SELECT id, name FROM archive_sets")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     // `ORDER BY t.name` within each unit, as `queries::get_tags_for_unit`
@@ -555,9 +633,11 @@ fn unit_list(
             .get(&u.tenant_id)
             .cloned()
             .unwrap_or_else(|| "?".to_string());
+        let archive_set = u.archive_set_id.and_then(|id| archive_sets.get(&id).cloned());
         out.push(ListedUnit {
             unit: u,
             tenant,
+            archive_set,
             tags: unit_tags,
         });
     }
@@ -635,21 +715,23 @@ fn show_dirty_status(
     let status = dirty_status(conn, &unit, global_excludes)?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "unit": unit.name,
-                "state": status.state,
-                "added": status.changes.added,
-                "removed": status.changes.removed,
-                "modified": status.changes.modified,
-            })
-        );
+        // CONTEXT.md: "Never Archived", never "new", in the JSON too
+        // (ADR-0012 items 208 and 212), as `report dirty --json` says it.
+        let state = match status.state {
+            "new" => "never_archived",
+            other => other,
+        };
+        crate::render::print_json(&serde_json::json!({
+            "unit": unit.name,
+            "state": state,
+            "added": status.changes.added,
+            "removed": status.changes.removed,
+            "modified": status.changes.modified,
+        }));
     } else {
         match status.state {
             "clean" => println!("unit \"{}\": clean", unit.name),
             // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item 208).
-            // The JSON `state` value keeps its spelling.
             "new" => println!("unit \"{}\": never archived", unit.name),
             _ => {
                 println!(
@@ -826,6 +908,48 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"name":"photos","path":"/home/alice/photos","status":"active","tags":"family, vacation","tenant":"alice"},{"name":"scratch","path":"","status":"tape_only","tags":"","tenant":"?"}]"#
         );
+
+        // The table (ADR-0012 item 212): borderless, one header case.
+        let table = unit_table(&rows, None);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["Name", "Status", "Tenant", "Path", "Tags"],
+            "{table}"
+        );
+        // Aligned: each column starts where its header does.
+        assert_eq!(lines[1].find("active"), lines[0].find("Status"), "{table}");
+        assert_eq!(lines[2].find("tape_only"), lines[0].find("Status"), "{table}");
+        assert!(!table.contains('|') && !table.contains('+'), "{table}");
+    }
+
+    /// ADR-0012 item 212 (OQ5): a unit's JSON names its tenant and archive
+    /// set instead of their database ids, and says its times in RFC 3339.
+    #[test]
+    fn unit_json_names_the_tenant_and_archive_set() {
+        let unit = crate::db::models::Unit {
+            id: 3,
+            uuid: "uuid-3".into(),
+            name: "photos".into(),
+            tenant_id: 7,
+            archive_set_id: Some(9),
+            current_path: Some("/d/photos".into()),
+            checksum_mode: "sha256".into(),
+            encrypt: true,
+            status: "active".into(),
+            created_at: "2026-11-04 10:30:59".into(),
+            last_scanned: None,
+            notes: None,
+            copies_at_frozen: None,
+        };
+        let v = unit_json(&unit, "alice", Some("family"));
+        assert_eq!(v["tenant"], "alice", "{v}");
+        assert_eq!(v["archive_set"], "family", "{v}");
+        assert!(v.get("tenant_id").is_none() && v.get("archive_set_id").is_none(), "{v}");
+        assert_eq!(v["created_at"], "2026-11-04T10:30:59Z", "{v}");
+        assert_eq!(v["last_scanned"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["name"], "photos", "{v}");
+        assert_eq!(unit_json(&unit, "alice", None)["archive_set"], serde_json::Value::Null);
     }
 
     fn setup_unit(current_path: &str, checksum_mode: &str) -> (Connection, i64) {

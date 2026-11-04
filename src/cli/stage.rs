@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
@@ -134,54 +133,42 @@ pub enum StageCommands {
 /// coverage stands. The ONE selection behind `stage list`, `stage list
 /// --owing` and the staging line of the catalog's summary, so they never
 /// disagree about what still owes a copy (issue #352).
-#[derive(Tabled, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StageSetRow {
-    #[tabled(rename = "ID")]
     pub id: i64,
-    #[tabled(rename = "Unit")]
     pub unit: String,
-    #[tabled(rename = "Ver")]
     pub version: i64,
-    #[tabled(rename = "Status")]
     pub status: String,
     /// Raw `Option<i64>`, not a pre-rendered string (issue #205's audit).
-    #[tabled(rename = "Slices", display_with = "display_opt_i64")]
     pub slices: Option<i64>,
     /// Raw bytes; `total_encrypted_size` as `stage info --json` names the
     /// same column.
-    #[tabled(rename = "Size", display_with = "display_encrypted_size")]
     #[serde(rename = "total_encrypted_size")]
     pub size: Option<i64>,
     /// Copies of this stage set's VERSION
     /// ([`crate::policy::coverage::copy_count_expr`], snapshot scope: a copy
     /// is identical content, counted per version, ADR-0012).
-    #[tabled(rename = "Copies", display_with("Self::display_copies", self))]
     pub copies: i64,
     /// The unit's copy floor ([`crate::policy::coverage::copy_floor`] of its
     /// resolved policy), or `None` when its policy cannot be resolved:
     /// `audit` reports that as `policy_unresolvable`, and here a staged set
     /// then owes a copy, the conservative reading for outstanding work.
-    #[tabled(skip)]
     pub copy_floor: Option<i64>,
     /// A `staged` set whose version has fewer copies than its copy floor.
-    #[tabled(skip)]
     pub owing: bool,
-    #[tabled(rename = "Staged At", display_with = "display_opt_string")]
+    /// As stored; RFC 3339 with `Z` in the JSON (ADR-0012 item 212).
+    #[serde(serialize_with = "json_time_opt")]
     pub staged_at: Option<String>,
     /// Issue #402: what is wrong with a staged set's files on disk; empty
     /// when it is whole. Printed below the table, not in it.
-    #[tabled(skip)]
     #[serde(rename = "on_disk_problems")]
     pub problems: Vec<String>,
     /// The command that makes the set whole again; `null` when it is.
-    #[tabled(skip)]
     pub remedy: Option<String>,
     /// #478 (ADR-0012 item 129): a set released in part, slice by slice:
     /// the slice numbers released. Empty unless it was.
-    #[tabled(skip)]
     pub released_slices: Vec<i64>,
     /// With `released_slices`, the slice numbers still staged.
-    #[tabled(skip)]
     pub staged_slices: Vec<i64>,
 }
 
@@ -194,16 +181,50 @@ impl StageSetRow {
     }
 }
 
-fn display_encrypted_size(v: &Option<i64>) -> String {
-    v.map(crate::util::format_bytes_binary).unwrap_or_default()
+fn json_time_opt<S: serde::Serializer>(
+    t: &Option<String>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => s.serialize_str(&crate::render::json_time(t)),
+        None => s.serialize_none(),
+    }
 }
 
-fn display_opt_i64(v: &Option<i64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
-}
-
-fn display_opt_string(v: &Option<String>) -> String {
-    v.clone().unwrap_or_default()
+/// `stage list`'s table (ADR-0012 item 212): borderless, one header case,
+/// the size human (binary: a data size), the time in UTC. `-` is a figure
+/// not recorded yet (a set still being made).
+fn stage_table(rows: &[StageSetRow], width: Option<usize>) -> String {
+    crate::render::table_with(
+        &[
+            "stage set",
+            "unit",
+            "version",
+            "status",
+            "slices",
+            "size",
+            "copies",
+            "staged",
+        ],
+        rows.iter()
+            .map(|r| {
+                vec![
+                    r.id.to_string(),
+                    r.unit.clone(),
+                    format!("v{}", r.version),
+                    r.status.clone(),
+                    r.slices.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                    r.size
+                        .map_or_else(|| "-".to_string(), crate::util::format_bytes_binary),
+                    r.display_copies(),
+                    r.staged_at
+                        .as_deref()
+                        .map_or_else(|| "-".to_string(), crate::render::table_time),
+                ]
+            })
+            .collect(),
+        width,
+    )
 }
 
 /// Which stage sets [`stage_set_rows`] selects.
@@ -350,16 +371,26 @@ fn notes_below_the_table(rows: &[StageSetRow]) -> Vec<String> {
     }
     for r in rows.iter().filter(|r| !r.released_slices.is_empty()) {
         lines.push(format!(
-            "stage set {} ({} v{}) spans cartridges and is released slice by slice: slice(s) \
-             {} released, {} still staged",
+            "stage set {} ({} v{}) spans cartridges and is released slice by slice: {} \
+             released, {} still staged",
             r.id,
             r.unit,
             r.version,
-            staging::clean::describe_slice_numbers(&r.released_slices),
+            slices_words(&r.released_slices),
             staging::clean::describe_slice_numbers(&r.staged_slices),
         ));
     }
     lines
+}
+
+/// `slice 3` or `slices 1-3, 5`: [`staging::clean::describe_slice_numbers`]
+/// with a real plural (ADR-0012 item 212).
+pub(crate) fn slices_words(numbers: &[i64]) -> String {
+    format!(
+        "{} {}",
+        if numbers.len() == 1 { "slice" } else { "slices" },
+        staging::clean::describe_slice_numbers(numbers)
+    )
 }
 
 /// `stage list --owing`'s closing line: how many staged sets owe nothing
@@ -372,10 +403,16 @@ pub(crate) fn held_but_not_owing_line(all_held: &[StageSetRow]) -> Option<String
         .filter(|r| r.status == "staged" && !r.owing)
         .count();
     (held > 0).then(|| {
-        format!(
-            "{held} more stage set(s) have every copy their own version needs and are only \
-             held in staging (`tapectl stage clean` decides which can be released)"
-        )
+        if held == 1 {
+            "1 more stage set has every copy its own version needs and is only held in \
+             staging (`tapectl stage clean` decides whether it can be released)"
+                .to_string()
+        } else {
+            format!(
+                "{held} more stage sets have every copy their own version needs and are only \
+                 held in staging (`tapectl stage clean` decides which can be released)"
+            )
+        }
     })
 }
 
@@ -424,10 +461,7 @@ pub fn run(
             add_disk_state(conn, &mut rows)?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&stage_rows_to_json(&rows)).unwrap()
-                );
+                crate::render::print_json(&stage_rows_to_json(&rows));
             } else {
                 if rows.is_empty() {
                     println!(
@@ -440,7 +474,7 @@ pub fn run(
                     );
                 } else {
                     let notes = notes_below_the_table(&rows);
-                    println!("{}", Table::new(rows));
+                    println!("{}", stage_table(&rows, crate::render::terminal_width()));
                     for note in notes {
                         println!("{note}");
                     }
@@ -528,16 +562,13 @@ pub fn run(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "unit": name, "version": version, "stage_set_id": ss_id,
-                        "status": status, "dar_version": dar_ver,
-                        "num_slices": num_slices, "total_dar_size": dar_size,
-                        "total_encrypted_size": enc_size, "slices": slice_json,
-                        "stage_set_count": stage_set_count,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "unit": name, "version": version, "stage_set_id": ss_id,
+                    "status": status, "dar_version": dar_ver,
+                    "num_slices": num_slices, "total_dar_size": dar_size,
+                    "total_encrypted_size": enc_size, "slices": slice_json,
+                    "stage_set_count": stage_set_count,
+                }));
             } else {
                 println!("Stage set for {name} v{version} (id={ss_id})");
                 if stage_set_count > 1 {
@@ -562,7 +593,7 @@ pub fn run(
                     crate::util::format_bytes_binary(enc_size.unwrap_or(0))
                 );
                 if let Some(sa) = &staged_at {
-                    println!("  Staged at: {sa}");
+                    println!("  Staged at: {}", crate::render::table_time(sa));
                 }
                 if !slices.is_empty() {
                     println!("  Slices:");
@@ -600,18 +631,18 @@ pub fn run(
                 None
             } else {
                 crate::progress::stderr_println(&format!(
-                    "stage for-location {} --volume {}: {} unit(s) planned; staging what is \
-                     not staged yet",
+                    "stage for-location {} --volume {}: {} planned; staging what is not \
+                     staged yet",
                     plan.location,
                     plan.volume,
-                    plan.planned.len()
+                    crate::render::plural(plan.planned.len() as i64, "unit", "units")
                 ));
                 Some(crate::for_location::stage(
                     conn, paths, config, &plan, jobs, assume_yes,
                 )?)
             };
             if json_output {
-                println!("{}", crate::for_location::to_json(&plan, staged.as_deref()));
+                crate::render::print_json(&crate::for_location::to_json(&plan, staged.as_deref()));
             } else {
                 let (out, err) = crate::for_location::text_lines(&plan, staged.as_deref());
                 for line in out {
@@ -714,13 +745,10 @@ pub fn run(
                 }
             }
             if json_output {
-                // One unit: the object it always was. Several: an array.
-                let out = if name.len() == 1 && rows.len() == 1 {
-                    rows.remove(0)
-                } else {
-                    serde_json::Value::Array(rows)
-                };
-                println!("{out}");
+                // ADR-0012 item 212, one shape: an array, one object per unit,
+                // one unit named or several (as `snapshot create` prints). A
+                // failure printed nothing above: the error is the document.
+                crate::render::print_json(&serde_json::Value::Array(rows));
             }
         }
     }
@@ -1078,7 +1106,8 @@ mod tests {
                 copies: 1,
                 copy_floor: Some(2),
                 owing: true,
-                staged_at: Some("2026-07-01T00:00:00Z".to_string()),
+                // As datetime('now') stores it; RFC 3339 with `Z` in the JSON.
+                staged_at: Some("2026-07-01 00:00:00".to_string()),
                 problems: vec!["slice 2: no staged file recorded".to_string()],
                 remedy: Some("tapectl volume read-slices backups --from L6-0001".to_string()),
                 released_slices: vec![1],
@@ -1106,6 +1135,23 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"copies":1,"copy_floor":2,"id":1,"on_disk_problems":["slice 2: no staged file recorded"],"owing":true,"released_slices":[1],"remedy":"tapectl volume read-slices backups --from L6-0001","slices":3,"staged_at":"2026-07-01T00:00:00Z","staged_slices":[2,3],"status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"copies":0,"copy_floor":null,"id":2,"on_disk_problems":[],"owing":false,"released_slices":[],"remedy":null,"slices":null,"staged_at":null,"staged_slices":[],"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
         );
+
+        // The table (ADR-0012 item 212): borderless, one header case, the
+        // size human, the copies against the floor, the time in UTC, and
+        // `-` for what a set still being made has not recorded.
+        let table = stage_table(&rows, None);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["Stage", "Set", "Unit", "Version", "Status", "Slices", "Size", "Copies", "Staged"],
+            "{table}"
+        );
+        for want in ["v2", "120.0 MiB", "1 of 2", "2026-07-01 00:00 UTC"] {
+            assert!(lines[1].contains(want), "{want}: {table}");
+        }
+        assert!(lines[2].contains("0 (policy unresolvable)"), "{table}");
+        assert!(lines[2].trim_end().ends_with('-'), "{table}");
+        assert!(!table.contains('|') && !table.contains('+'), "{table}");
     }
 
     /// A set released in part is named below the table with the slices
@@ -1133,7 +1179,7 @@ mod tests {
             notes_below_the_table(std::slice::from_ref(&row)),
             vec![
                 "stage set 7 (photos v2) spans cartridges and is released slice by slice: \
-                 slice(s) 1-3 released, 4-5 still staged"
+                 slices 1-3 released, 4-5 still staged"
                     .to_string()
             ]
         );

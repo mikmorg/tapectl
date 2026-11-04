@@ -2452,14 +2452,15 @@ fn only_session_log(home: &std::path::Path, needle: &str) -> String {
     std::fs::read_to_string(&logs[0]).expect("read session log")
 }
 
-/// Issue #386: `stage create --json` prints exactly the object it printed
-/// before progress existed — one line, the same five keys — while the
-/// session log under `<home>/logs/` records every phase with UTC
-/// timestamps, and progress (plain lines, stderr not being a terminal)
-/// never reaches stdout. A one-second interval makes a line likely; the
-/// assertions do not depend on one being printed.
+/// Issue #386: `stage create --json` prints one document, the same five
+/// keys per unit, while the session log under `<home>/logs/` records every
+/// phase with UTC timestamps, and progress (plain lines, stderr not being a
+/// terminal) never reaches stdout. A one-second interval makes a line
+/// likely; the assertions do not depend on one being printed. ADR-0012 item
+/// 212: one shape, an array of one object per unit (one unit named, too),
+/// pretty-printed.
 #[test]
-fn stage_create_json_is_unchanged_and_its_session_is_logged() {
+fn stage_create_json_is_one_array_and_its_session_is_logged() {
     let home = TempDir::new().expect("home tempdir");
     let staging_dir = TempDir::new().expect("staging tempdir");
     let source_dir = TempDir::new().expect("source tempdir");
@@ -2479,8 +2480,11 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout.lines().count(), 1, "one JSON line: {stdout:?}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is JSON");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is one JSON");
+    let v = match v.as_array().map(Vec::as_slice) {
+        Some([one]) => one.clone(),
+        _ => panic!("one unit named is an array of one: {stdout}"),
+    };
     let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(
@@ -2523,11 +2527,12 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
     }
 }
 
-/// `stage create --json` prints nothing on stdout when its one unit fails:
-/// the refusal goes to stderr and the exit is non-zero, as before #368 —
-/// not an empty `[]` a script would read as "staged nothing, fine". The
-/// failure here is the missing escrow recipient (`init --no-escrow`), which
-/// is refused inside the stage, before dar.
+/// `stage create --json` prints no list when its one unit fails: the exit
+/// is non-zero and the refusal is the one document (on stderr, or the JSON
+/// error on stdout), as before #368 — not an empty `[]` a script would read
+/// as "staged nothing, fine". The failure here is the missing escrow
+/// recipient (`init --no-escrow`), which is refused inside the stage,
+/// before dar.
 #[test]
 fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
     let home = TempDir::new().expect("home tempdir");
@@ -2555,16 +2560,20 @@ fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
         );
     }
     let out = run_tapectl(home.path(), &["--json", "stage", "create", "unit1"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "the stage must fail: {stderr}");
-    assert!(
-        stderr.contains("no escrow recipient"),
-        "positive control: the stage itself refused: {stderr}"
-    );
-    assert_eq!(
+    let said = format!(
+        "{}{}",
         String::from_utf8_lossy(&out.stdout),
-        "",
-        "nothing on stdout for a failed stage"
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "the stage must fail: {said}");
+    assert!(
+        said.contains("no escrow recipient"),
+        "positive control: the stage itself refused: {said}"
+    );
+    assert_one_document_or_none(&out.stdout);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).trim_start().starts_with('['),
+        "no list on stdout for a failed stage"
     );
 }
 
@@ -3202,15 +3211,57 @@ fn snapshot_create_takes_several_units_and_one_failing_stops_none() {
     assert_eq!(units, ["alpha", "gamma"], "{v}");
     assert_eq!(v[0]["minted"], false, "unchanged since v1: {v}");
 
-    // One unit: the object it always was.
+    // One unit: the same shape, an array of one (ADR-0012 item 212: each
+    // command has one shape).
     let out = ok(&["--json", "snapshot", "create", "alpha"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON value");
-    assert_eq!(v["unit"], "alpha", "{v}");
+    assert_eq!(v.as_array().map(Vec::len), Some(1), "{v}");
+    assert_eq!(v[0]["unit"], "alpha", "{v}");
+
+    // A failure under --json is ONE document: no array of the successes
+    // beside the error. The error is it, and it names what was snapshotted.
+    let out = run_tapectl(h, &["--json", "snapshot", "create", "alpha", "nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_one_document_or_none(&out.stdout);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("1 unit of 2 failed")
+            && said.contains("nope")
+            && said.contains("snapshotted:")
+            && said.contains("alpha")
+            && said.contains("is unchanged since v1"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("reported above"),
+        "nothing is above under --json: {said}"
+    );
 
     // A unit named twice is refused before any walk.
     let out = run_tapectl(h, &["snapshot", "create", "alpha", "alpha"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("named twice"));
+}
+
+/// ADR-0012 item 212: a command under `--json` prints at most one document
+/// on stdout. A failure is the error alone: nothing on stdout from the
+/// command itself, and under the JSON-error envelope one `{"error", …}`
+/// object (`from_slice` refuses trailing data, so a second document fails).
+fn assert_one_document_or_none(stdout: &[u8]) {
+    if String::from_utf8_lossy(stdout).trim().is_empty() {
+        return;
+    }
+    let v: serde_json::Value = serde_json::from_slice(stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not one JSON document ({e}): {}",
+            String::from_utf8_lossy(stdout)
+        )
+    });
+    assert!(v.get("error").is_some(), "a failure's one document is the error: {v}");
 }
 
 /// ADR-0012 item 210 (OQ21): `key list` without `--tenant` lists every

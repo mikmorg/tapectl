@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
@@ -85,51 +84,64 @@ pub enum SnapshotCommands {
     },
 }
 
-#[derive(Tabled, Serialize)]
+#[derive(Serialize)]
 struct SnapshotRow {
-    #[tabled(rename = "ID")]
     id: i64,
-    #[tabled(rename = "Unit")]
     unit: String,
-    #[tabled(rename = "Ver")]
     version: i64,
-    #[tabled(rename = "Status")]
     status: String,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). Renamed to `file_count` to match `snapshot create
     /// --json`'s existing key for the same `file_count` column.
-    #[tabled(rename = "Files", display_with = "display_opt_i64")]
     #[serde(rename = "file_count")]
     files: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). Raw bytes; renamed to `total_size` to match
     /// `snapshot create --json`'s existing key for the same `total_size`
     /// column.
-    #[tabled(rename = "Size", display_with = "display_size_mb")]
     #[serde(rename = "total_size")]
     size: Option<i64>,
     /// Table-only until CTO decision 2026-09-11 (architecture review C2
     /// follow-up, C2b). `created_at` is NOT NULL, so this stays a plain
-    /// `String` (not `Option`) -- renamed to match the DB column name and
-    /// the "Created" timestamp convention used elsewhere (e.g. `TenantRow`,
-    /// `StagingRow.staged_at`).
-    #[tabled(rename = "Created")]
-    #[serde(rename = "created_at")]
+    /// `String` (not `Option`) -- renamed to match the DB column name.
+    /// RFC 3339 with `Z` in the JSON (ADR-0012 item 212; the stored value
+    /// is unchanged).
+    #[serde(rename = "created_at", serialize_with = "json_time")]
     created: String,
 }
 
-fn display_opt_i64(v: &Option<i64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_default()
-}
-
-fn display_size_mb(v: &Option<i64>) -> String {
-    v.map(crate::util::format_bytes_binary).unwrap_or_default()
+fn json_time<S: serde::Serializer>(t: &str, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&crate::render::json_time(t))
 }
 
 /// `snapshot list --json` shape. `files`/`size`/`created` were table-only
 /// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
 fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
+}
+
+/// `snapshot list`'s table (ADR-0012 item 212): borderless, sizes human
+/// (binary: a data size), times in UTC.
+fn snapshot_table(rows: &[SnapshotRow], width: Option<usize>) -> String {
+    crate::render::table_with(
+        &["id", "unit", "version", "status", "files", "size", "created"],
+        rows.iter()
+            .map(|r| {
+                vec![
+                    r.id.to_string(),
+                    r.unit.clone(),
+                    format!("v{}", r.version),
+                    r.status.clone(),
+                    r.files.map(|n| n.to_string()).unwrap_or_default(),
+                    r.size
+                        .map(crate::util::format_bytes_binary)
+                        .unwrap_or_default(),
+                    crate::render::table_time(&r.created),
+                ]
+            })
+            .collect(),
+        width,
+    )
 }
 
 /// `snapshots.status`'s CHECK constraint
@@ -195,14 +207,20 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
 
 /// The error a `snapshot create` of `named` units ends with, `None` when
 /// every unit was snapshotted. One unit named: its own error, exactly as
-/// before. Several: one error naming each unit that failed and why, after
-/// the others were reported; and when a signal stopped the run before the
-/// units in `not_started`, a stop (`Interrupted`) that names them and the
-/// command that snapshots them.
+/// before. Several: one error naming each unit that failed and why; and
+/// when a signal stopped the run before the units in `not_started`, a stop
+/// (`Interrupted`) that names them and the command that snapshots them.
+///
+/// `done` is each unit that was snapshotted, by its line. The text output
+/// printed those lines as each unit finished, so the error says they are
+/// above; under `--json` nothing went to stdout (one document, item 212: the
+/// error is it), so the error names them itself.
 fn end_of_run(
     named: usize,
     mut failed: Vec<(&str, TapectlError)>,
     not_started: &[&str],
+    done: &[String],
+    json_output: bool,
 ) -> Option<TapectlError> {
     if failed.is_empty() && not_started.is_empty() {
         return None;
@@ -214,10 +232,17 @@ fn end_of_run(
     for (name, e) in &failed {
         failures.push_str(&format!("\n  {name}: {e}"));
     }
+    let snapshotted = if !json_output {
+        String::new()
+    } else if done.is_empty() {
+        "\nnone was snapshotted".to_string()
+    } else {
+        format!("\nsnapshotted:\n  {}", done.join("\n  "))
+    };
     if !not_started.is_empty() {
         return Some(TapectlError::Interrupted(format!(
             "snapshot create stopped on a signal before {}; run `tapectl snapshot create {}` \
-             to snapshot {}{}{failures}",
+             to snapshot {}{}{failures}{snapshotted}",
             not_started.join(", "),
             not_started.join(" "),
             if not_started.len() == 1 { "it" } else { "them" },
@@ -226,13 +251,18 @@ fn end_of_run(
     }
     let head = if failed.len() == named {
         format!("all {named} units failed:")
+    } else if json_output {
+        format!(
+            "{} of {named} failed:",
+            crate::render::plural(failed.len() as i64, "unit", "units")
+        )
     } else {
         format!(
             "{} of {named} failed (the others are reported above):",
             crate::render::plural(failed.len() as i64, "unit", "units")
         )
     };
-    Some(TapectlError::Other(format!("{head}{failures}")))
+    Some(TapectlError::Other(format!("{head}{failures}{snapshotted}")))
 }
 
 pub fn run(
@@ -268,6 +298,7 @@ pub fn run(
             // its own as it finishes; a unit that fails does not stop the
             // ones after it.
             let mut rows = Vec::with_capacity(names.len());
+            let mut done: Vec<String> = Vec::with_capacity(names.len());
             let mut failed: Vec<(&str, TapectlError)> = Vec::new();
             let mut not_started: Vec<&str> = Vec::new();
             for (i, name) in names.iter().enumerate() {
@@ -283,22 +314,21 @@ pub fn run(
                             println!("{}", created.line);
                         }
                         rows.push(created.json);
+                        done.push(created.line);
                     }
                     Err(e) => failed.push((name, e)),
                 }
             }
-            if json_output && !rows.is_empty() {
-                // One unit: the object it always was. Several: an array of
-                // the units snapshotted (as `stage create` prints).
-                let out = if names.len() == 1 {
-                    rows.remove(0)
-                } else {
-                    serde_json::Value::Array(rows)
-                };
-                println!("{out}");
-            }
-            if let Some(err) = end_of_run(names.len(), failed, &not_started) {
+            // ADR-0012 item 212, one shape and one document: under --json an
+            // array, one object per unit, whether one unit was named or
+            // several (as `stage create` prints); and only when every unit
+            // was snapshotted. On any failure the error is the one document
+            // (JSON on stdout under --json), naming what was snapshotted.
+            if let Some(err) = end_of_run(names.len(), failed, &not_started, &done, json_output) {
                 return Err(err);
+            }
+            if json_output {
+                crate::render::print_json(&serde_json::Value::Array(rows));
             }
         }
 
@@ -345,9 +375,8 @@ pub fn run(
                     )));
                 }
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"unit": name, "version": version, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"unit": name, "version": version, "dry_run": true}),
                     );
                 } else {
                     println!("would delete snapshot {name} v{version} (DRY RUN — no changes made)");
@@ -380,9 +409,8 @@ pub fn run(
                     )));
                 }
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"unit": name, "version": version, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"unit": name, "version": version, "dry_run": true}),
                     );
                 } else {
                     println!("would purge snapshot {name} v{version} (DRY RUN — no changes made)");
@@ -428,6 +456,13 @@ pub fn run(
             if let Some(st) = status {
                 validate_snapshot_status(st)?;
             }
+            // ADR-0012 item 212: an unknown --unit is an error, never an
+            // empty list.
+            if let Some(name) = unit {
+                if crate::db::queries::get_unit_by_name(conn, name)?.is_none() {
+                    return Err(TapectlError::UnitNotFound(name.clone()));
+                }
+            }
             let mut sql = String::from(
                 "SELECT s.id, u.name, s.version, s.status, s.file_count,
                         s.total_size, s.created_at
@@ -464,14 +499,14 @@ pub fn run(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&snapshot_rows_to_json(&rows)).unwrap()
-                );
+                crate::render::print_json(&snapshot_rows_to_json(&rows));
             } else if rows.is_empty() {
                 println!("no snapshots found");
             } else {
-                println!("{}", Table::new(rows));
+                println!(
+                    "{}",
+                    snapshot_table(&rows, crate::render::terminal_width())
+                );
             }
         }
     }
@@ -610,7 +645,9 @@ mod tests {
                 status: "current".to_string(),
                 files: Some(42),
                 size: Some(125_829_121),
-                created: "2026-07-01T00:00:00Z".to_string(),
+                // As SQLite's datetime('now') stores it; the JSON says it in
+                // RFC 3339 with `Z` (ADR-0012 item 212).
+                created: "2026-07-01 00:00:00".to_string(),
             },
             SnapshotRow {
                 id: 11,
@@ -627,5 +664,20 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"created_at":"2026-07-01T00:00:00Z","file_count":42,"id":10,"status":"current","total_size":125829121,"unit":"backups","version":3},{"created_at":"","file_count":null,"id":11,"status":"reclaimable","total_size":null,"unit":"photos","version":1}]"#
         );
+
+        // The table (ADR-0012 item 212): borderless, one header case, the
+        // size human and binary, the time in UTC.
+        let table = snapshot_table(&rows, None);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["Id", "Unit", "Version", "Status", "Files", "Size", "Created"],
+            "one header case: {table}"
+        );
+        assert!(
+            lines[1].contains("120.0 MiB") && lines[1].contains("2026-07-01 00:00 UTC"),
+            "{table}"
+        );
+        assert!(!table.contains('|') && !table.contains('+'), "{table}");
     }
 }
