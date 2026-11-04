@@ -1040,42 +1040,45 @@ fn plain_problems(
     };
     let new = |p: &String| before.valid || !before.problems.contains(p);
     let mut out: Vec<String> = Vec::new();
-    let mut unknown_named = false;
+    // The head, unless the file already failed with the same problem.
+    let mut head_text = String::new();
     if let Some(head) = report.problems.first() {
         let (message, line) = without_excerpt(&strip(head));
-        if message.starts_with("unknown field `") {
-            for p in report.problems[1..].iter().filter(|p| new(p)) {
-                if let Some(key) = p.strip_prefix("unknown key: ") {
-                    out.push(unknown_key_problem(key, edit));
-                    unknown_named = true;
-                }
-            }
-            if !unknown_named {
+        let old_head = before
+            .problems
+            .first()
+            .map(|p| without_excerpt(&strip(p)).0);
+        if old_head.as_deref() != Some(message.as_str()) {
+            if !message.starts_with("unknown field `") {
+                head_text = plain_message(&message, line.as_deref(), edit);
+                out.push(head_text.clone());
+            } else if report.best_effort.is_none() {
+                // No breakdown to name the key by its path: name it by the
+                // edit's, against the keys serde listed.
                 let typed = message
                     .strip_prefix("unknown field `")
                     .and_then(|r| r.split('`').next())
                     .unwrap_or_default();
                 let fields = expected_fields(&message);
                 let near: Vec<String> = nearest(typed, &fields).into_iter().cloned().collect();
-                out.push(format!(
-                    "{} is not a config key{}",
-                    edit.key(),
-                    did_you_mean(&near)
-                ));
-                unknown_named = true;
+                head_text = format!("{} is not a config key{}", edit.key(), did_you_mean(&near));
+                out.push(head_text.clone());
             }
-        } else {
-            out.push(plain_message(&message, line.as_deref(), edit));
+            // Otherwise the breakdown below names each unknown key.
         }
     }
     for p in report.problems.iter().skip(1).filter(|p| new(p)) {
         if let Some(key) = p.strip_prefix("unknown key: ") {
+            // A renamed key's remediation in the head already names it.
             let last = key.rsplit('.').next().unwrap_or(key);
             let last = last.split('[').next().unwrap_or(last);
-            if unknown_named || out.iter().any(|o| o.contains(last)) {
+            if !head_text.is_empty() && head_text.contains(last) {
                 continue;
             }
-            out.push(unknown_key_problem(key, edit));
+            let line = unknown_key_problem(key, edit);
+            if !out.contains(&line) {
+                out.push(line);
+            }
             continue;
         }
         let p = strip(p);
@@ -1086,6 +1089,11 @@ fn plain_problems(
     for p in &report.slice_cap_problems {
         if !before.slice_cap_problems.contains(p) {
             out.push(strip(p));
+        }
+    }
+    if out.is_empty() {
+        if let Some(head) = report.problems.first() {
+            out.push(without_excerpt(&strip(head)).0);
         }
     }
     out
@@ -2741,6 +2749,20 @@ mod tests {
         let err = set_err(ONE_DRIVE, "post_warning_bytes", "plenty");
         assert!(err.contains("post_warning_bytes"), "{err}");
         assert!(err.contains("99008M"), "{err}");
+    }
+
+    /// On a file that already fails, the refusal names what the edit adds,
+    /// and never calls a known key unknown because the file has another.
+    #[test]
+    fn a_refusal_on_a_broken_file_names_only_what_the_edit_adds() {
+        let broken = "[defaults]\nbogus1 = 1\nslice_size = \"1G\"\n";
+        let err = set_err(broken, "defaults.compression", "zipzap");
+        assert!(err.contains("zipzap"), "{err}");
+        assert!(!err.contains("is not a config key"), "{err}");
+        assert!(!err.contains("bogus1"), "{err}");
+        let err = set_err(broken, "defaults.bogus3", "1");
+        assert!(err.contains("defaults.bogus3 is not a config key"), "{err}");
+        assert!(!err.contains("bogus1"), "{err}");
     }
 
     #[test]

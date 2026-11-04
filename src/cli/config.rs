@@ -716,15 +716,15 @@ fn print_human(
     for line in ops_lines {
         println!("{line}");
     }
+    for note in notes {
+        println!("note: {note}");
+    }
     if let Some(days) = verify_interval_days {
         println!(
             "defaults: verify_interval_days = {days} (`audit` warns when a unit has gone \
              longer without a passing full `volume verify`; an archive set that names its \
              own interval overrides this for its units)"
         );
-    }
-    for note in notes {
-        println!("note: {note}");
     }
 }
 
