@@ -41,7 +41,7 @@ A few conventions:
 - [Verifying a volume](#verifying-a-volume)
 - [Restoring](#restoring)
 - [Audit findings](#audit-findings)
-- [`report summary` counts stage sets held in staging](#report-summary-counts-stage-sets-held-in-staging)
+- [`status` counts stage sets held in staging](#status-counts-stage-sets-held-in-staging)
 - [first-run.sh stopped](#first-runsh-stopped)
 - [Related pages](#related-pages)
 
@@ -106,7 +106,7 @@ Exit 75 is not a verdict. The catalog is not damaged, and an `audit` that
 exits 75 found neither violations nor warnings: it did not run. Run the
 command again once the other one has finished (`ps -C tapectl` shows it). A
 `stage create` that stops this way keeps its encrypted slices. The next
-command marks the set `failed`, and `staging clean` reclaims it; stage the
+command marks the set `failed`, and `stage clean` reclaims it; stage the
 unit again. Opening the catalog takes the write lock only to recover a
 crashed session, so read-only commands such as `report`, `catalog` and `db
 backup` run while another command writes.
@@ -157,12 +157,12 @@ that finishes it on its own:
 | Step that did not finish | Finish it with |
 |---|---|
 | `volume compact`'s step 3, retiring the source, refused for consent (no terminal and no `--yes`, or a "no" at the prompt) | `tapectl volume compact-finish <source> --force` |
-| releasing `collection run`'s staging (a catalog error) | `tapectl staging clean`, which retains whatever is still below its policy |
+| releasing `collection run`'s staging (a catalog error) | `tapectl stage clean`, which retains whatever is still below its policy |
 | recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | `tapectl volume verify <label> --full`: once it passes, it records the figures that are missing or wrong, from the front index it read and the catalog's own rows, and logs a `write_figures_recorded` event naming each one. It records nothing when the tape's slices are not the ones the catalog staged for that volume, and says why |
 
 ```text
 warning: volume "L6-0002" is sealed and confirmed and counts as a copy, but releasing the batch's staging did
-not finish: database error: disk I/O error. The tape needs nothing. To finish it: tapectl staging clean
+not finish: database error: disk I/O error. The tape needs nothing. To finish it: tapectl stage clean
 ```
 
 `volume compact --json` says `"source_retired": false` and carries the warning;
@@ -519,7 +519,7 @@ Every write path (`volume init`, `volume write`, `volume resume`,
 `volume plan` and `collection plan`, even with `--generation` (`volume plan`
 prints its plan first and then fails). Uncomment the example
 `init` left in config.toml, or add one with
-[`tapectl backend add`](cli/backend.md#tapectl-backend-add).
+[`tapectl drive add`](cli/drive.md#tapectl-drive-add).
 
 That message appears only when you leave out `--device`. With `--device`,
 tapectl instead reports that no backend has the path you named, and
@@ -719,7 +719,7 @@ A missing directory is usually a backup disk that is not mounted. With
 replaced by `.keys`:
 
 ```bash
-tapectl db backup --to /mnt/usb/tapectl.db --include-keys
+tapectl db backup /mnt/usb/tapectl.db --include-keys
 ```
 
 At the default `[logging] level = "warn"`, a log line on stderr comes first,
@@ -1033,7 +1033,7 @@ So a short staging directory is never refused outright:
 staging directory <directory> may be too small for unit "<unit>": 1.0 MiB free, and staging it needs up to 5.7
 MiB, its encrypted slices at the snapshot's full size (less if dar stores runs of zeros as holes and a
 hard-linked file once); if it runs out, the stage stops there and its partial slices are removed.
-`tapectl staging status` shows what staging holds; a bare `tapectl staging clean` frees what failed
+`tapectl stage list` shows what staging holds; a bare `tapectl stage clean` frees what failed
 stages left and what is already on tape
 ```
 
@@ -1069,8 +1069,8 @@ error: cannot write staged slice <directory>/<slice>.dar.age: No space left on d
 ```
 
 The half-built stage set's files are removed, and the next tapectl command
-marks its stage set `failed`. `tapectl staging status` shows what staging
-holds; a bare `tapectl staging clean` frees what failed stages left and what
+marks its stage set `failed`. `tapectl stage list` shows what staging
+holds; a bare `tapectl stage clean` frees what failed stages left and what
 is already on tape.
 
 #### Why a failed stage starts over
@@ -1674,10 +1674,10 @@ total: 4 slices, 1.7 MiB
 ```
 
 A stage set stays in staging after it has been written, until
-`staging clean` releases it. That is how the same staged data becomes the
+`stage clean` releases it. That is how the same staged data becomes the
 second copy on the next tape. It also means leftovers ride along. No flag
 picks a subset: if the list is wrong, stop, run
-[`staging clean`](cli/staging.md#tapectl-staging-clean) to release what is
+[`stage clean`](cli/stage.md#tapectl-stage-clean) to release what is
 already safely on tape, and start again. See the
 [operator guide](operator-guide.md#archive-to-tape).
 
@@ -1791,10 +1791,10 @@ Size the batch before you write:
 
 ```bash
 tapectl volume plan --copies 2
-tapectl staging status
+tapectl stage list
 ```
 
-Release what is already on enough tapes (`staging clean`), so that less rides
+Release what is already on enough tapes (`stage clean`), so that less rides
 along. Or split the work across cartridges. The
 [Collection](cli/collection.md#tapectl-collection) commands batch
 folder-per-unit archives to fit.
@@ -1839,7 +1839,7 @@ the generation the message names last.
 ### A slice a span owes was released from staging
 
 ```text
-error: refusing to write: "<unit>" v<n> (stage set <id>) may span, and this tape plans its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices --from <holder> --unit <unit> --version <n>
+error: refusing to write: "<unit>" v<n> (stage set <id>) may span, and this tape plans its slice <s>, whose staged file was released from staging. A range is one unbroken run of a unit's slices, so the slice is never skipped. Nothing was written and the drive was not touched. Stage it again, then write: tapectl volume read-slices <unit> --from <holder> --version <n>
 ```
 
 Staging is released slice by slice for a unit that spans cartridges, once
@@ -1854,7 +1854,7 @@ instead.
 ```text
 error: volume "<label>" failed pre-write validation: stage set <id> for unit '<unit>' was encrypted without the
 current escrow recipient (<reason>) — its slices cannot be recovered with the escrow key; re-stage it: tapectl
-staging clean --force (releases the old set), then tapectl stage create <unit> --version <snapshot version>
+stage clean --force (releases the old set), then tapectl stage create <unit> --version <snapshot version>
 (ADR-0005)
 ```
 
@@ -1945,7 +1945,7 @@ resume <label>` to continue from where it stopped.
 ```
 
 Do exactly that. The session carries on from its frozen staging files, so do
-**not** run `staging clean` in between.
+**not** run `stage clean` in between.
 
 Ctrl-C, a SIGTERM (a shutdown) and a SIGHUP (a dropped ssh session) all stop
 any long operation the same way: at the next slice, file or tape entry, with an
@@ -2183,7 +2183,7 @@ recorded hash, and every stage report lists its slices' hashes, so
 Re-stage it, then write the cartridge again from the beginning:
 
 ```bash
-tapectl staging clean --force --unit <unit> --version <n>
+tapectl stage clean --force --unit <unit> --version <n>
 tapectl stage create <unit> --version <n>
 tapectl volume write <label>
 ```
@@ -2223,7 +2223,7 @@ or a registered `--capacity` set too high, or a short or worn tape. A new
 `volume write <label>` starts again from the beginning of the same tape with
 **every** staged set, so it will run out again unless the batch shrinks.
 Before you retry, correct the cause, check the batch with `volume plan`, and
-release what is already safe with `staging clean`. Use another cartridge if
+release what is already safe with `stage clean`. Use another cartridge if
 this one is suspect.
 
 ### Confirm could not complete, or the volume was quarantined at write
@@ -2275,7 +2275,7 @@ seal marker at position <n> (ADR-0003: sealed volumes are immutable)`.
   a larger generation, or raise `--fill-ceiling` only if you know the cartridge takes it.
 - **"The rewrite is NOT finished: its staged slices are held"** (after the erase): load the same
   cartridge (the message names the chip serial if another is in the drive) and run
-  `tapectl volume rewrite --resume NEW`. `staging clean` prints "held by the rewrite of volume ..."
+  `tapectl volume rewrite --resume NEW`. `stage clean` prints "held by the rewrite of volume ..."
   and `--force` does not release them.
 - **`--resume` says the staged slices were released**: every unit has a fully read back copy on
   another volume. The record is closed and the source's cartridge is free: `volume init <LABEL>`
@@ -2283,8 +2283,8 @@ seal marker at position <n> (ADR-0003: sealed volumes are immutable)`.
 - **"sealed but was not fully read back"**: run `tapectl volume verify NEW --full`, then
   `--resume`.
 - **The cartridge is unusable after the erase**: `volume init OTHER` on a blank cartridge, then
-  `volume compact-write --destination OTHER --full-confirm`, which lifts the hold when it passes.
-  Do not run `--resume` (it would use the old cartridge); then `tapectl staging clean`.
+  `volume compact-write --to OTHER --full-confirm`, which lifts the hold when it passes.
+  Do not run `--resume` (it would use the old cartridge); then `tapectl stage clean`.
 
 ### `volume compact` needs a terminal
 
@@ -2302,7 +2302,7 @@ swap cartridges between the two steps, and stdin is not a terminal — there is 
 done. Nothing was read. Run the three steps separately, which works unattended:
     tapectl volume compact-read L6-0001
     (unload "L6-0001", load the destination)
-    tapectl volume compact-write --destination L6-0010
+    tapectl volume compact-write --to L6-0010
     tapectl volume compact-finish L6-0001
 ```
 
@@ -2324,7 +2324,7 @@ to press Enter once the destination is loaded, and Ctrl-D stops:
 
 ```text
 error: volume compact stopped before step 2: no answer at the swap prompt — the live slices of "L6-0001" are
-staged; to finish, load the destination and run `tapectl volume compact-write --destination L6-0010`, then
+staged; to finish, load the destination and run `tapectl volume compact-write --to L6-0010`, then
 `tapectl volume compact-finish L6-0001`
 ```
 
@@ -2333,7 +2333,7 @@ or Enter with no label typed, stops with the destination left as `<DEST>`:
 
 ```text
 error: no destination label provided — the live slices of "L6-0001" are staged; to finish, load the destination
-and run `tapectl volume compact-write --destination <DEST>`, then `tapectl volume compact-finish L6-0001`
+and run `tapectl volume compact-write --to <DEST>`, then `tapectl volume compact-finish L6-0001`
 ```
 
 If you decline step 3's question, the destination is already written and
@@ -2380,7 +2380,7 @@ apart ([Exit codes](#volume-verify-0-2-or-3)).
 volume "<label>" QUARANTINED: <n> of <m> failure(s) prove the medium is bad. Its status is untouched (ADR-0012,
 2026-09-17) — only its condition changed, from "<old>" to "quarantined" — but it no longer counts as a copy, so
 `volume retire` will no longer refuse it as the last one — salvage what still reads off it first (`volume
-read-slices --from <label> --unit <UNIT>`).
+read-slices <UNIT> --from <label>`).
 ```
 
 The volume's **condition** becomes `quarantined` (its **status** stays
@@ -2391,7 +2391,7 @@ missing copies. A volume that was already quarantined and fails again prints
 still reads, write it to a new cartridge, then retire the volume:
 
 ```bash
-tapectl volume read-slices --from L6-0001 --unit family/letters
+tapectl volume read-slices family/letters --from L6-0001
 ```
 
 (`--version N` reads one version; without it, every version on the tape except
@@ -2620,16 +2620,16 @@ remaining one with `restore unit`.
 error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
 not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"
 --all-versions` finds one and names the versions that hold it (without `--all-versions` it searches each unit's newest
-version only), and `tapectl catalog ls <unit>` lists the newest version's files.
+version only), and `tapectl catalog list <unit>` lists the newest version's files.
 ```
 
 `--file` is checked against the version's file list before the drive is
 opened. Give the path relative to the unit's root, with no leading `/` or
-`./`, exactly as `catalog ls` prints it:
+`./`, exactly as `catalog list` prints it:
 
 ```bash
 tapectl catalog search "letter mum"
-tapectl catalog ls family/letters
+tapectl catalog list family/letters
 ```
 
 A directory is refused the same way (`"<path>" is a directory …`):
@@ -3284,7 +3284,7 @@ state of your archive:
     fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
   ...
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit --out <dir>
+    fix: tapectl key escrow-kit <dir>
 ```
 
 After the second tape, only the heir-kit warning was left, and `audit` exited 1:
@@ -3320,8 +3320,8 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 | `tenancy` | warning | `the catalog says tenant "<t>" owns this unit, but <dir>/.tapectl-unit.toml names tenant "<other>"` | The unit's dotfile names another owner than the catalog. The catalog is the authority: set `tenant` under `[unit]` in the dotfile to the catalog's tenant. The dotfile is not content, so the edit creates no new version. |
 | `tenancy` | warning | `volume <label> (stage set <id>, v<n>) is encrypted to none of tenant "<t>"'s keys — …` | The catalog holds keys for that tenant, and none of them is a recipient of that copy. A retired key of the tenant counts as one of its keys. Two causes: the copy was encrypted before the unit moved to its current tenant (`tenant reassign`), or the catalog was rebuilt from tape and the tenant's key that opens the copy was never imported. Either way the operator and escrow keys still open it. Fix: if the tenant has a key the catalog does not list, [`key import`](cli/key.md#tapectl-key-import) its public key and run `audit` again. Otherwise re-stage and write a new copy if the tenant's key holders need it, or accept it. A tenant the catalog holds no key for at all (a rebuilt catalog before any `key import`) is not judged, so this check reports nothing for its copies. |
 | `compaction_candidate` | warning | `live data is <n>% of the archive data on this volume (<live> live, <r> in reclaimable/purged snapshots), below the <t>% compaction threshold` | Part of the volume's data belongs to snapshots marked reclaimable or purged, and the live share has fallen below `[compaction] utilization_threshold`. Only data slices count, never the fixed per-volume metadata, and a volume with nothing reclaimable is never a candidate. Fix: [compaction](operator-guide.md#compaction), starting with `volume compact-read <label>`. |
-| `escrow_kit_missing` | warning | `<n> sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them` | Fix: `tapectl key escrow-kit --out <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |
-| `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog (and the cover sheet's list of places) is behind; its secret opens every tape. Two causes, one finding: a volume sealed after the kit, or a volume moved with `volume move` / `cartridge move` after it; for a move the message adds `<n> volume(s) were moved to another place after the last heir kit` (#448). Fix: `tapectl key escrow-kit --out <dir>`, reprint COVER.txt, correct its "Tapes are at" box, and replace the stored copies. The escrow secret itself does not change. |
+| `escrow_kit_missing` | warning | `<n> sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them` | Fix: `tapectl key escrow-kit <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |
+| `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog (and the cover sheet's list of places) is behind; its secret opens every tape. Two causes, one finding: a volume sealed after the kit, or a volume moved with `volume move` / `cartridge move` after it; for a move the message adds `<n> volume(s) were moved to another place after the last heir kit` (#448). Fix: `tapectl key escrow-kit <dir>`, reprint COVER.txt, correct its "Tapes are at" box, and replace the stored copies. The escrow secret itself does not change. |
 | `escrow_identity_mismatch` | warning | `<n> stage set(s) the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
 | `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`, 365 days when that is absent). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
@@ -3336,9 +3336,9 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 
 ---
 
-## `report summary` counts stage sets held in staging
+## `status` counts stage sets held in staging
 
-In the tour, after both copies were written, `report summary` said:
+In the tour, after both copies were written, `status` said:
 
 ```text
 tapectl summary
@@ -3348,7 +3348,7 @@ tapectl summary
   Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
-  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)
+  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl stage clean` decides which can be released)
 ```
 
 A stage set stays in staging after its writes on purpose, so it can become the
@@ -3356,7 +3356,7 @@ next copy, and every set still held there rides along on the next
 `volume write`. The `Staging` line counts those sets, written or not, and says
 how many still owe a copy: their version has fewer copies than its unit's
 `min_copies`. When some do, the line reads ``<n> stage set(s) held, <m> still
-owe a copy (`tapectl report pending` lists them)``. `report pending` lists only
+owe a copy (`tapectl stage list --owing` lists them)``. `stage list --owing` lists only
 those:
 
 ```text
@@ -3367,19 +3367,19 @@ stage sets that still owe a copy:
 When none owe a copy, it prints `no stage set owes a copy`. A last line counts
 the sets that are only held in staging.
 
-The line goes away once `staging clean` has released every held set. To see
+The line goes away once `stage clean` has released every held set. To see
 how often each set has actually been written, read the `Writes` column:
 
 ```bash
-tapectl staging status
+tapectl stage list
 ```
 
-The tour's two writes were both done, and `staging clean` then released all
+The tour's two writes were both done, and `stage clean` then released all
 four sets.
 
-A script that read `staged_pending` from `report summary --json` finds it gone:
+A script that read `staged_pending` from `status --json` finds it gone:
 `stage_sets_held` and `stage_sets_owing_a_copy` replace it, and
-`report pending --json` now lists only the sets that owe a copy. The operator
+`stage list --owing --json` now lists only the sets that owe a copy. The operator
 guide lists every `--json` field that changed, under
 [Scripting against tapectl](operator-guide.md#scripting-against-tapectl).
 

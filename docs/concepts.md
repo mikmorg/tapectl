@@ -62,7 +62,7 @@ flowchart LR
     S -->|"2 · stage create<br/>dar + encrypt + sha256"| SS["Stage set<br/>slices in the staging directory"]
     SS -->|"3 · volume write<br/>plan, write, seal, confirm"| V["Sealed volume"]
     SS -->|"volume write again<br/>(another tape)"| V2["Second sealed volume"]
-    SS -.->|staging clean| X["staging space released"]
+    SS -.->|stage clean| X["staging space released"]
 ```
 
 | Phase | Command | What it does | Touches tape? |
@@ -127,11 +127,11 @@ because tape punishes surprises.
   is bit-for-bit the same ciphertext as the first. `volume write` picks up
   everything currently staged, so after the first tape is written, the next
   `volume write` to another tape writes the same stage sets again.
-  The `Writes` column of `staging status` shows how many times each stage set
+  The `Writes` column of `stage list` shows how many times each stage set
   has been written.
 
 - **Release deliberately.**
-  [`staging clean`](cli/staging.md#tapectl-staging-clean) deletes the slice files
+  [`stage clean`](cli/stage.md#tapectl-stage-clean) deletes the slice files
   once a stage set has been written and its unit meets its copy requirement. It
   does not touch stage sets whose units are still short of copies unless you
   pass `--force`.
@@ -214,7 +214,7 @@ component is also dropped:
 at its new path and reconnects it to the same unit, so the unit's
 history carries over. The dotfile can also hold per-unit policy overrides (see
 [Policy](#policy-archive-sets-and-audit)). It is archived with the rest of the
-unit (`catalog ls family/letters` lists `.tapectl-unit.toml` next to
+unit (`catalog list family/letters` lists `.tapectl-unit.toml` next to
 `1998-letter-to-mum.txt`), so a restored unit can register itself again. It is
 not counted as content, though: `unit tag`, `unit rename` and an edit to its
 `[policy]` rewrite it without making the unit dirty, and a policy change takes
@@ -554,9 +554,9 @@ defaults, a tape-only unit needs 4 copies in 2 locations, not 4 in 4;
 
 One rule applies it, so the commands cannot disagree: `audit`'s `copy_count`
 and `location_presence`, `unit mark-tape-only` (the unit is about to be
-tape-only), `snapshot mark-reclaimable` and `report supersedable` (for the newer
-version), the retire family's below-policy question, `staging clean`'s
-retention and `report pending`. A message whose floor the multiplier raised
+tape-only), `snapshot mark-reclaimable` and `report reclaimable` (for the newer
+version), the retire family's below-policy question, `stage clean`'s
+retention and `stage list --owing`. A message whose floor the multiplier raised
 says so: `has 2 copies, needs 4 (tape-only 2x)`. A unit that is not tape-only is
 never multiplied. A shortfall stays a question to confirm, not an absolute
 refusal (ADR-0008 Tier 2).
@@ -612,7 +612,7 @@ requirement is the archive set's `min_copies`, or else `[defaults] min_copies`
 `[defaults] min_locations` (default 2) is a floor on the number of distinct
 locations of a tape-only unit. It has no per-set layer. `unit mark-tape-only` reads
 it, and afterwards `audit` (`location_count`), `snapshot mark-reclaimable` and
-`report supersedable` hold the unit to it. A
+`report reclaimable` hold the unit to it. A
 misspelled key at any layer is an error, not a silent fallback to the next
 layer. See [configuration](configuration.md) for every key.
 
@@ -651,7 +651,7 @@ VIOLATIONS (4):
     fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit --out <dir>
+    fix: tapectl key escrow-kit <dir>
 audit: 4 violations, 1 warnings (exit 2)
 ```
 
@@ -721,7 +721,7 @@ retired with the cartridge, each to the status it had before.
 | `sealed` | Written, sealed, confirmed. Immutable. The only status that counts as a copy. |
 | `retired` | You took it out of service (`volume retire` shows the impact first; `compact-finish` and `cartridge retire` also retire volumes). Not a copy. `volume retire` accepts a volume in any status. |
 | `erased` | Its cartridge was erased (`cartridge mark-erased`) or re-initialized with a new volume. The bytes are gone. |
-| `active` | Set only by [`import`](cli/import.md), for a volume written outside this catalog. |
+| `active` | Set only by [`volume import`](cli/volume.md#tapectl-volume-import), for a volume written outside this catalog. |
 
 When you retire the last live volume on a cartridge, the cartridge moves to
 `pending_erase` (see below).
@@ -829,8 +829,8 @@ stateDiagram-v2
     [*] --> cleaned : catalog rebuild from the tape
     staging --> staged : dar, encryption and checksums complete
     staging --> failed : stage create stopped partway
-    staged --> cleaned : staging clean
-    failed --> cleaned : staging clean
+    staged --> cleaned : stage clean
+    failed --> cleaned : stage clean
     cleaned --> staged : volume read-slices or compact-read brings the slices back
 ```
 
@@ -838,7 +838,7 @@ stateDiagram-v2
 |---|---|
 | `staging` | `stage create` is running. |
 | `staged` | Slices are on disk and eligible for the next `volume write`. It stays `staged` after being written, so you can write more copies. |
-| `failed` | `stage create` stopped partway: it crashed, or refused after it had begun (for example, the source changed since the snapshot, or the staging directory proved too small once the unit had been read). The next tapectl command that opens the catalog marks it `failed`; `staging clean` removes the leftovers. |
+| `failed` | `stage create` stopped partway: it crashed, or refused after it had begun (for example, the source changed since the snapshot, or the staging directory proved too small once the unit had been read). The next tapectl command that opens the catalog marks it `failed`; `stage clean` removes the leftovers. |
 | `cleaned` | Slice files deleted from staging. The record and its checksums remain. A stage set rebuilt from tape by `catalog rebuild` also starts here. |
 
 ### Write sessions

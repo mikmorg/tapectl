@@ -250,7 +250,7 @@ same wherever the home is.
 ├── staging/             created 0700 by init as the default [staging] directory; stays empty once step 7 points staging elsewhere
 ├── logs/                created by ensure_dirs; may stay empty
 ├── tmp/                 0700: a stage's dar slice template and a write's catalog.db, each removed once used (never under staging)
-├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`staging clean` reclaims them)
+├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`stage clean` reclaims them)
 ├── config.toml.pre-rename-<stamp>   only after the pre-step-1 check renamed old [defaults] keys (§6)
 └── config.toml.superseded-<stamp>   only after step 7 regenerated a config this version could not load
 ```
@@ -469,7 +469,7 @@ below), which a re-run leaves alone.
 | unit | schedule | runs | exit status |
 |---|---|---|---|
 | `tapectl-audit.timer` → `tapectl-audit.service` | **weekly**, Monday 09:00, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-audit.sh`: `tapectl audit`, then `tapectl report verify-status` | 0 clean, 1 warnings (**success** — ADR-0004, advisory), 2 violations (failure), 70 the audit's own error and any other code but 75 no verdict (failure) |
-| `tapectl-backup.timer` → `tapectl-backup.service` | **daily**, 03:00, `Persistent=true`, up to 15 min random delay | `tapectl-scheduled-backup.sh`: `tapectl db backup --to <dir>/tapectl-<UTC stamp>.db`, SQLite-header check on the copy, `tapectl db fsck` on the live catalog, prune to the newest **14** | nonzero if the copy is not a database or fsck found problems |
+| `tapectl-backup.timer` → `tapectl-backup.service` | **daily**, 03:00, `Persistent=true`, up to 15 min random delay | `tapectl-scheduled-backup.sh`: `tapectl db backup <dir>/tapectl-<UTC stamp>.db`, SQLite-header check on the copy, `tapectl db fsck` on the live catalog, prune to the newest **14** | nonzero if the copy is not a database or fsck found problems |
 | `tapectl-drive-poll.timer` → `tapectl-drive-poll.service` | **daily**, 06:30, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-drive-poll.sh`: `tapectl drive poll` — the drive's log pages and, when a cartridge is loaded, its chip, through `/dev/sg*` only ([operator guide](operator-guide.md#the-daily-drive-poll)) | 0 nothing reported, 1 a raised TapeAlert or an unrecovered error (failure), 75 a tapectl command holds the drive or is writing the catalog (success, nothing read, no ping), any other code no reading, or a reading the catalog could not record (failure) |
 
 The audit and backup services run as the service user with
@@ -545,7 +545,7 @@ profile, leave `--profile` out. On a host with one it is required, and a run
 without it refuses (§2): the profile says where the kit goes (`KIT_OUT`), and a
 run without it would write a second kit to the default, `~/heir-kit`. Step 9 does what a
 bare `sudo -u tapectl -H tapectl key
-escrow-kit --out ~/heir-kit` cannot: the kit directory is **yours**, 0700
+escrow-kit ~/heir-kit` cannot: the kit directory is **yours**, 0700
 (§3, row 9), so the service user cannot write into it and that command fails
 with `Permission denied`. The step hands the directory to the service user for
 the write and takes it back afterwards. By hand, the same thing is:
@@ -553,7 +553,7 @@ the write and takes it back afterwards. By hand, the same thing is:
 ```bash
 mkdir -p ~/heir-kit                                          # as you; the service user cannot create it
 sudo chown -R tapectl ~/heir-kit
-sudo -u tapectl -H tapectl key escrow-kit --out ~/heir-kit
+sudo -u tapectl -H tapectl key escrow-kit ~/heir-kit
 sudo chown -R "$USER" ~/heir-kit
 ```
 
@@ -562,7 +562,7 @@ ancestor of the kit directory the service user could not already enter. A kit
 directory somewhere new is created by the `mkdir` above, and each of its
 ancestors the service user cannot enter needs `sudo setfacl -m u:tapectl:x
 <ancestor>` before the `chown`. Under `--no-service-user` it is plain `tapectl
-key escrow-kit --out ~/heir-kit`.
+key escrow-kit ~/heir-kit`.
 
 **During a write session.** A backup may land in the middle of an overnight
 `volume write`. Opening the database runs the startup sweep, which leaves
@@ -582,7 +582,7 @@ the next `git checkout` of a release.
 `sudo -u tapectl -H /usr/local/bin/tapectl "$@"`. It is installed by
 `install-systemd.sh` (so by step 14), rendered with the user and binary you gave
 it, and skipped when the service user is the account running the installer.
-`tapectl-op audit`, `tapectl-op report summary`, and so on.
+`tapectl-op audit`, `tapectl-op status`, and so on.
 
 A **tape command** is the exception: `volume write`, `resume`, `verify`,
 `rewrite`, `compact-write`, `compact`, `read-slices`, `compact-read`, `init` and
@@ -757,7 +757,7 @@ host.
 ```bash
 # old host
 sudo tar -C /var/lib/tapectl -cpf /media/usb/tapectl-home.tar --exclude='.tapectl/staging/*' .tapectl
-sudo -u tapectl -H tapectl db backup --to /var/lib/tapectl/tapectl-catalog.db   # a second, independent copy of the catalog
+sudo -u tapectl -H tapectl db backup /var/lib/tapectl/tapectl-catalog.db   # a second, independent copy of the catalog
 sudo mv /var/lib/tapectl/tapectl-catalog.db /media/usb/
 # the heir kit directory (~/heir-kit) and the paper stay yours either way
 ```
@@ -844,7 +844,7 @@ it twice, so a run that stopped is resumed by running `--upgrade` again;
 | Step | What it does | By hand, for reference |
 |---|---|---|
 | 1 | Preflight, always run: no tapectl command or tapectl unit running; the checkout exactly an annotated `v<new>` tag, with no change to a tracked file; `<new>` newer than the installed tapectl; release notes for `<new>` | `tapectl-op status`, `git describe --exact-match` |
-| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only) | `tapectl-op db backup --to <backup dir>/tapectl-pre-<new>.db` |
+| 2 | Back up the catalog with the OLD binary to `<backup dir>/tapectl-pre-<new>.db` and check the copy (schema and SQLite's integrity check, read-only) | `tapectl-op db backup <backup dir>/tapectl-pre-<new>.db` |
 | 3 | Keep the old binary as `/usr/local/bin/tapectl-<old>` | `sudo cp -p /usr/local/bin/tapectl /usr/local/bin/tapectl-<old>` |
 | 4 | Build the release binary from the tag and install it; refuse a binary that is not a build of the tag | `scripts/first-run.sh --from 3 --to 3` |
 | 5 | `config check`, the new binary's first open: it applies the migrations, and the schema is printed before and after | `tapectl-op config check` |

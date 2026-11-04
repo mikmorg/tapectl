@@ -86,10 +86,10 @@ is a decision recorded in the [ADRs](docs/adr/). The last full test run passed a
 ## A taste
 
 ```bash
-TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial: named once, in backend add
+TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial: named once, in drive add
 
 tapectl init --operator alice                            # write the printed escrow secret on paper
-tapectl backend add --name lto6 --device-tape "$TAPE" --generation LTO-6
+tapectl drive add --name lto6 --device-tape "$TAPE" --generation LTO-6
 tapectl location add home-rack -d "the shelf beside the drive"
 tapectl tenant add family -d "family photos and letters"
 tapectl unit init-bulk /media/family/photos --tenant family

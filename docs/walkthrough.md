@@ -135,7 +135,7 @@ of `/dev/sgN` never matters (this session's was `sg5`). You declare only what th
 **drive** is; each cartridge's own generation is read from the cartridge later.
 
 ```bash
-tapectl backend add --name lto8 --device-tape "$TAPE" --generation LTO-8
+tapectl drive add --name lto8 --device-tape "$TAPE" --generation LTO-8
 ```
 
 ```text
@@ -417,7 +417,7 @@ VIOLATIONS (4):
     fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit --out <dir>
+    fix: tapectl key escrow-kit <dir>
 audit: 4 violations, 1 warnings (exit 2)
 ```
 
@@ -462,7 +462,7 @@ in step 13.
 ## 10. Find things
 
 ```bash
-tapectl catalog ls family/letters
+tapectl catalog list family/letters
 tapectl catalog search letter
 tapectl catalog search "IMG 101"
 tapectl catalog locate family/letters
@@ -498,7 +498,7 @@ note: "Verified" is this catalog's last-known record of each copy's most recent 
 prefix: `"IMG 101"` finds `IMG_101.jpg`, but `garden` finds nothing
 (`no files matching "garden"`), because no word in any file's path starts with it;
 only the unit is called `2020-garden`. Quote a pattern of several words, since it is
-one argument. It searches each unit's newest version, the one `catalog ls` lists, so a
+one argument. It searches each unit's newest version, the one `catalog list` lists, so a
 file kept through many versions is one line; `--all-versions` lists it once per version
 that holds it. `catalog locate` answers "which tape, and where is it?".
 
@@ -543,7 +543,7 @@ See [Keys and recovery](keys-and-recovery.md).
 With both copies written, the staged slices can go:
 
 ```bash
-tapectl staging clean
+tapectl stage clean
 ```
 
 ```text
@@ -551,7 +551,7 @@ cleaned 4 stage set(s), 4 files removed, 2.1 MiB freed
   sessions: 2 reclaimed, 0 retained, 0 orphaned; 4 lockfiles reclaimed
 ```
 
-`staging clean` releases the stage sets that have been written, and even then keeps
+`stage clean` releases the stage sets that have been written, and even then keeps
 any unit that still has fewer copies than its policy asks for, so it is safe to run
 between copies. It also sweeps every stage set whose staging failed, since those hold
 nothing a copy needs.
@@ -562,7 +562,7 @@ The **Heir Kit** is the printed envelope that lets you — or someone who inheri
 tapes — get everything back without this machine.
 
 ```bash
-tapectl key escrow-kit --out ~/heir-kit
+tapectl key escrow-kit ~/heir-kit
 ```
 
 ```text
@@ -594,7 +594,7 @@ Back up the catalog at the end of every write session too. The backup holds no
 private keys unless you ask:
 
 ```bash
-tapectl db backup --to /mnt/backup/tapectl.db
+tapectl db backup /mnt/backup/tapectl.db
 ```
 
 ```text
@@ -615,7 +615,7 @@ from a tape with the escrow secret you wrote down:
 
 ```bash
 tapectl init --operator alice --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
-tapectl backend add --name lto8 --device-tape "$TAPE" --generation LTO-8
+tapectl drive add --name lto8 --device-tape "$TAPE" --generation LTO-8
 tapectl catalog rebuild --from-volume --key escrow.key
 tapectl unit list
 ```

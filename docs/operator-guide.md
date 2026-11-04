@@ -160,12 +160,12 @@ original with `tapectl init --escrow-public-key age1…` (see
 ### Configure
 
 The config file is `~/.tapectl/config.toml` (under the service user's home on
-a production install). Register the drive with `backend add` rather than by
+a production install). Register the drive with `drive add` rather than by
 editing the file — `first-run.sh` step 8 does this, reading the generation from
 the drive's own identification:
 
 ```bash
-tapectl backend add --name lto6 \
+tapectl drive add --name lto6 \
     --device-tape /dev/tape/by-id/scsi-<SERIAL>-nst --generation LTO-6
 ```
 
@@ -241,7 +241,7 @@ as the by-id path, when:
 - **a read has no backend configured.** `volume identify`, `volume verify`,
   `restore`, `catalog rebuild` and `volume read-slices` take any path you give
   them with no `[[backends.lto]]` at all, so a rebuilt machine holding only keys
-  can read its tapes before `backend add`. That is the heir and disaster-recovery
+  can read its tapes before `drive add`. That is the heir and disaster-recovery
   path ([Disaster Recovery](#disaster-recovery) here, runbooks B to F in
   [keys-and-recovery.md](keys-and-recovery.md#recovery-runbooks), and §8 of
   [install.md](install.md)), and those pages name the drive every time. A write never runs without a backend.
@@ -308,9 +308,9 @@ tapectl volume write L8-0002 --init --full-confirm --move-to offsite
 # 5. Check, release staging, refresh the Heir Kit, back up the catalog
 tapectl audit
 tapectl report copies
-tapectl staging clean
-tapectl key escrow-kit --out ~/heir-kit
-tapectl db backup --to /mnt/backup/tapectl.db   # a timer install: sudo systemctl start tapectl-backup.service
+tapectl stage clean
+tapectl key escrow-kit ~/heir-kit
+tapectl db backup /mnt/backup/tapectl.db   # a timer install: sudo systemctl start tapectl-backup.service
 ```
 
 What success looks like at each step:
@@ -396,11 +396,11 @@ $ tapectl report copies
   family/photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
   work/invoices-2024: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
 
-$ tapectl staging clean
+$ tapectl stage clean
 cleaned 4 stage set(s), 4 files removed, 2.1 MiB freed
   sessions: 2 reclaimed, 0 retained, 0 orphaned; 4 lockfiles reclaimed
 
-$ tapectl key escrow-kit --out ~/heir-kit
+$ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
@@ -450,7 +450,7 @@ gets the quick confirm unless you pass it `--full-confirm`.
 copy they seal brings every unit written to the volume to its `min_copies`, they
 release those units' staged slices, and name any unit still short. Pass
 `--keep-staging` to hold them, for example for a full `volume verify` first, and
-run `staging clean` afterwards.
+run `stage clean` afterwards.
 
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
@@ -941,7 +941,7 @@ total: 4 slices, 50.0 MiB
 ```
 
 That is by design, not a bug: staging happens once and a stage set stays
-`staged` until the write that completes its copies, or `staging clean`, releases it, which is what lets you write the
+`staged` until the write that completes its copies, or `stage clean`, releases it, which is what lets you write the
 same data to a second and third cartridge without re-archiving it (ADR-0006).
 The consequence is that a stage set left over from last week rides along on
 today's tape. **Read the list.** This is write-once media — a tape that
@@ -949,7 +949,7 @@ received four units when you meant one cannot be un-written, and under ADR-0003
 it cannot even be overwritten without a real erase.
 
 The announcement is display only. It does not prompt, and there is no flag to
-select a subset: if the list is not what you want, stop, run `staging clean` to
+select a subset: if the list is not what you want, stop, run `stage clean` to
 release what is already safely on tape, and start again. (`volume write` may
 still ask one question — the quiet-host check below — which `--yes` answers.)
 
@@ -1082,7 +1082,7 @@ clears it and says so in a note. Switching the drive off and on clears it too.
 `tapectl drive status` shows the page
 ([What is in the drive right now](#what-is-in-the-drive-right-now)).
 
-`staging clean` releases every unit that has met its policy's `min_copies` and
+`stage clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
 short of its second copy keeps its staged bytes — the release cannot quietly
 discard the cheap route to a copy your own policy requires — while everything
@@ -1178,7 +1178,7 @@ contender_units = ["nightly-ci.timer", "photo-sync.timer"]
 ```
 
 and pause them for the write with `sudo systemctl stop <unit>…` (`start` them
-again afterwards). `tapectl host check --unit <unit>` checks a unit once
+again afterwards). `tapectl host check --systemd-unit <unit>` checks a unit once
 without editing the config; `first-run.sh` step 13 does exactly that for the
 host profile's `CONTENDER_UNITS` before its WRITE confirmation.
 
@@ -1250,19 +1250,19 @@ named.
 ```bash
 tapectl stage list --status staged
 tapectl volume plan --copies 2
-tapectl report pending
+tapectl stage list --owing
 ```
 
 `stage list --status staged` is everything the next `volume write` would
-carry. `report pending` is narrower: the stage sets whose version still owes a
+carry. `stage list --owing` is narrower: the stage sets whose version still owes a
 copy, fewer copies than its unit's resolved `min_copies`, each with how many it
 has of how many it needs. A stage set that already has all its copies is only
-counted on a last line, as held in staging until `staging clean` releases it:
+counted on a last line, as held in staging until `stage clean` releases it:
 
 ```text
-$ tapectl report pending
+$ tapectl stage list --owing
 no stage set owes a copy
-4 more stage set(s) have every copy their own version needs and are only held in staging (`tapectl staging clean` decides which can be released)
+4 more stage set(s) have every copy their own version needs and are only held in staging (`tapectl stage clean` decides which can be released)
 ```
 
 `volume plan` estimates against the drive's own generation; pass
@@ -1280,7 +1280,7 @@ batches, each group in name order. Batch numbers follow that order, so give
 ```bash
 tapectl volume plan --copies 2 --policy-aware
 tapectl collection plan --policy-aware
-tapectl collection run --collection movies --batch 0 --label L8-0003 --policy-aware
+tapectl collection run movies --batch 0 --label L8-0003 --policy-aware
 ```
 
 ### Restore
@@ -1407,7 +1407,7 @@ tape, and refuses with nothing read
   cannot do. A file that is not an identity is refused by name before the drive is
   opened.
 - **The file.** `restore file --file` must be a path the catalog recorded for
-  that version, relative to the unit's root, as `catalog ls` and
+  that version, relative to the unit's root, as `catalog list` and
   `catalog search` print it. A directory is refused: restore the unit. dar is
   asked for that one entry, and with the unit's isolated catalogue on disk
   only the slices that hold it, its directories and dar's own catalogue (the
@@ -1426,12 +1426,12 @@ tape, and refuses with nothing read
 ```bash
 tapectl catalog search "episode01"
 tapectl catalog search "episode01" --all-versions
-tapectl catalog ls family/letters
+tapectl catalog list family/letters
 tapectl catalog locate family/letters
 tapectl catalog stats
 ```
 
-`catalog search` looks in each unit's newest version, the one `catalog ls`
+`catalog search` looks in each unit's newest version, the one `catalog list`
 lists, and prints its hits in unit and path order; `--all-versions` lists a
 file once for every version that holds it. `catalog stats` adds up each
 version's own totals: `Files` counts the non-directory entries and `Total` the
@@ -1523,7 +1523,7 @@ layout.
 
 ```bash
 # Read slices from tape into staging (source cartridge loaded)
-tapectl volume read-slices --from L6-0001 --unit tv/breaking-bad/s01
+tapectl volume read-slices tv/breaking-bad/s01 --from L6-0001
 # Swap in a blank cartridge, then initialise it and write
 tapectl volume write L6-0002 --init
 ```
@@ -1839,7 +1839,7 @@ VIOLATIONS (4):
   ...
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit --out <dir>
+    fix: tapectl key escrow-kit <dir>
 audit: 4 violations, 1 warnings (exit 2)
 ```
 
@@ -1868,7 +1868,7 @@ fewer places than `[defaults] min_locations` (2 by default, never multiplied) re
 ### Reports
 
 ```bash
-tapectl report summary
+tapectl status
 tapectl report fire-risk
 tapectl report copies --unit family/letters
 tapectl report needs --location offsite
@@ -1880,7 +1880,7 @@ tapectl report failed-stages
 ```
 
 ```text
-$ tapectl report summary
+$ tapectl status
 tapectl summary
   Tenants:    2 (the operator not counted)
   Units:      4 active
@@ -1888,12 +1888,12 @@ tapectl summary
   Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
-  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)
+  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl stage clean` decides which can be released)
 ```
 
 The `Staging` line appears only while something is staged. When a stage set's
 version still has fewer copies than its unit needs, it reads
-`N stage set(s) held, M still owe a copy`, and `report pending` lists them.
+`N stage set(s) held, M still owe a copy`, and `stage list --owing` lists them.
 
 From 1.7.0 a unit that allows spanning may be held across cartridges, as
 ranges (runs of its slices, one per tape). A range is not a copy on its own,
@@ -2342,7 +2342,7 @@ clear when a full `tapectl volume verify` passes, or when the write used
 `--full-confirm`. That is expected, not a fault: a quick-confirmed tape has not yet
 proved its data reads.
 
-`tapectl report dirty` and `tapectl report pending` are the companion glance —
+`tapectl report dirty` and `tapectl stage list --owing` are the companion glance —
 what has drifted since its last snapshot, and which stage sets still owe a
 copy.
 
@@ -2428,7 +2428,7 @@ Two things the timers do **not** change:
   that as "busy, not run" and do not ping `/fail`.
 
 The same lock guards the destructive commands. `volume abort`, `volume
-resume` and `staging clean` (with or without `--force`) refuse a volume or
+resume` and `stage clean` (with or without `--force`) refuse a volume or
 stage set whose session is live, and `--force` does not override that: the
 running command is a fact, not a risk judgement.
 
@@ -2767,7 +2767,7 @@ How to read it:
   the tape: compare across drives before you act (`report health` lists each
   reading's drive).
 - Rising, with the data still verifying: copy its units to a fresh cartridge
-  while it still reads (`volume read-slices --from <LABEL> --unit <UNIT>`, then
+  while it still reads (`volume read-slices <UNIT> --from <LABEL>`, then
   `volume write` to the new one), then retire it. Once the cartridge is
   `retired_permanent` or `pending_erase` (or, for a trend shown as
   `volume:<label>`, the volume is retired or erased) it drops out of the trend
@@ -2796,7 +2796,7 @@ Nothing automated performs a drill; schedule it yourself, on real hardware.
 While you are there, confirm your off-tape recovery inputs are current:
 
 ```bash
-tapectl db backup --to /path/to/backup/tapectl.db   # add --include-keys only if the
+tapectl db backup /path/to/backup/tapectl.db   # add --include-keys only if the
                                                     # destination is treated as secret
 tapectl key list --tenant <name>              # find the aliases, then
 tapectl key export <alias>                    # public half, for the record
@@ -2809,7 +2809,7 @@ how an heir uses it, is in [keys-and-recovery.md](keys-and-recovery.md); this
 is the operator's routine.
 
 ```bash
-tapectl key escrow-kit --out ~/heir-kit
+tapectl key escrow-kit ~/heir-kit
 ```
 
 It writes four files:
@@ -2902,7 +2902,7 @@ tapectl snapshot mark-reclaimable tv/breaking-bad/s01 --version 1
 tapectl volume compact-read L6-0001                           # source loaded
 # (swap in a blank cartridge)
 tapectl volume init L6-0010
-tapectl volume compact-write --destination L6-0010
+tapectl volume compact-write --to L6-0010
 tapectl volume compact-finish L6-0001                         # retires the source
 
 # Or all three in one flow, at a terminal: initialise the destination first
@@ -3031,7 +3031,7 @@ Consent depends on what else holds the data:
 readback, the staging disk holds the only copy of those units. The window is
 named in the `rewrite_window_opened` and `rewrite_window_closed` events and in
 the session log. If the command stops in it, the staged slices stay staged and
-nothing releases them (`staging clean --force`, the release after
+nothing releases them (`stage clean --force`, the release after
 `volume write`/`volume resume`, and `collection run` all refuse). The error
 names `tapectl volume rewrite --resume L6-0011`, which continues from where the
 catalog says it stopped and lifts the hold once the new volume has passed the
@@ -3334,14 +3334,14 @@ tapectl key import --tenant family --reactivate ~/.tapectl/keys/family-primary.a
 ## Database Operations
 
 ```bash
-tapectl db backup --to /backup/tapectl.db
+tapectl db backup /backup/tapectl.db
 tapectl db fsck --repair
 tapectl db stats
 tapectl db export > tapectl-catalog.json   # every table, as JSON
 ```
 
 ```text
-$ tapectl db backup --to /tmp/tour/backup/tapectl.db
+$ tapectl db backup /tmp/tour/backup/tapectl.db
 database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
@@ -3716,7 +3716,7 @@ Two things the rebuild deliberately does not do:
   at all, and the refusal points them at RESTORE.sh above.
 
 A tape written before the on-tape catalog existed carries no `catalog.db`. The
-restore path still comes back whole; what you lose is `catalog ls`/`catalog
+restore path still comes back whole; what you lose is `catalog list`/`catalog
 search` and each snapshot's original source path, and the command says so when
 it happens.
 
@@ -3801,7 +3801,7 @@ a `capacity_override` so tapectl plans against the small virtual tape rather
 than the generation's real capacity:
 
 ```bash
-tapectl backend add --name lto8 --device-tape /dev/tape/by-id/scsi-XYZZY_A1-nst \
+tapectl drive add --name lto8 --device-tape /dev/tape/by-id/scsi-XYZZY_A1-nst \
     --generation LTO-8 --capacity-override 2G
 ```
 

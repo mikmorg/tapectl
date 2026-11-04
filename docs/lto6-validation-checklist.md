@@ -252,7 +252,7 @@ It refuses (exit 2, nothing touched) when any of these fails:
 | 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` "Verdict: SEALED" and "ended early, after file K"; `--verify` "VERIFY: PASS" with the planned files after K marked NOT ON TAPE | ~9-10 h |
 | 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; the cut unit refused by both | ~15 min |
 | 6 rebuild | `catalog rebuild --from-volume` into a second bare home; `short_seal_filler compare` agrees on the volume, its units, every write's status and every slice on the tape | ~15 min |
-| 7 rewrite | the filler released by `staging clean --force`; `SSA-0001` retired; `cartridge erase`; `SSA-0002` initialised without `--force`; the cut unit written whole (full seal), verified and restored | ~20 min |
+| 7 rewrite | the filler released by `stage clean --force`; `SSA-0001` retired; `cartridge erase`; `SSA-0002` initialised without `--force`; the cut unit written whole (full seal), verified and restored | ~20 min |
 
 About 14-16 hours of drive time in all. Step 4's two whole-tape reads are most of it.
 

@@ -52,6 +52,7 @@ pub mod pipeline;
 pub mod pipeline_trace;
 pub mod policy;
 pub mod progress;
+pub mod render;
 pub mod research;
 pub mod store;
 pub mod util;

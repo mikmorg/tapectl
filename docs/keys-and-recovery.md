@@ -253,16 +253,16 @@ So:
 
 | Copy | Catalog | Private keys | `config.toml` |
 |---|---|---|---|
-| `tapectl db backup --to X.db` | yes | **no** | no |
-| `tapectl db backup --to X.db --include-keys` | yes | yes, as a directory `X.keys/` beside it | no |
+| `tapectl db backup X.db` | yes | **no** | no |
+| `tapectl db backup X.db --include-keys` | yes | yes, as a directory `X.keys/` beside it | no |
 | The daily backup timer (`tapectl-backup.timer`, see [install.md §7](install.md#7-the-timers-and-the-operator-wrapper)) | yes | no, unless you set `TAPECTL_BACKUP_INCLUDE_KEYS=1` in a drop-in for its service (`sudo systemctl edit tapectl-backup.service`) | no |
 | The Heir Kit's `catalog.db.age` | yes, encrypted to escrow | **no** | no |
 | A tarball of the whole home ([install.md §9](install.md#9-moving-to-a-new-host)) | yes | yes | yes |
 
 ```text
-$ tapectl db backup --to /tmp/tour/backup/tapectl.db
+$ tapectl db backup /tmp/tour/backup/tapectl.db
 database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
-$ tapectl db backup --to /tmp/tour/backup/tapectl.db --include-keys
+$ tapectl db backup /tmp/tour/backup/tapectl.db --include-keys
 database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
@@ -440,7 +440,7 @@ opens it, and it is as of the day the kit was made. From 1.5.0 its "tapectl itse
 sends the heir to the kit's copy of tapectl first.
 
 ```text
-$ tapectl key escrow-kit --out ~/heir-kit
+$ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
@@ -515,7 +515,7 @@ Once a kit exists and volumes have been sealed after it, the warning is
 (*time*): the kit's escrow secret still opens them (it is a recipient of every
 tape), but the kit's encrypted catalog (catalog.db.age) does not list them —
 regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog
-rebuild --from-volume`". Both suggest `tapectl key escrow-kit --out <dir>`. The same
+rebuild --from-volume`". Both suggest `tapectl key escrow-kit <dir>`. The same
 warning fires when a `volume move` or `cartridge move` happened after the kit: the
 cover sheet's list of places and the locations in `catalog.db.age` are then out of
 date, so reprint COVER.txt and correct its "Tapes are at" box (#448).
@@ -790,7 +790,7 @@ is the same procedure for a service-user host.
    `--device`, but needed before writing again):
    ```bash
    # --device-sg is the drive's SCSI generic node (lsscsi -g); --generation is the DRIVE's
-   tapectl backend add --name lto6 --device-tape "$TAPE" --device-sg /dev/sg3 --generation LTO-6
+   tapectl drive add --name lto6 --device-tape "$TAPE" --device-sg /dev/sg3 --generation LTO-6
    ```
 
 5. **Put private keys back, if any survived.** If a `db backup --include-keys`
@@ -1146,7 +1146,7 @@ go back into `keys/` (runbooks C and D).
    machine (ADR-0005). `key import` still takes public keys only.
 
 5. **Remove the copies** once a key-bearing backup of the new home exists
-   (`tapectl db backup --to /media/usb/tapectl.db --include-keys`, see
+   (`tapectl db backup /media/usb/tapectl.db --include-keys`, see
    [What your backups contain](#what-your-backups-contain)):
 
    ```bash
