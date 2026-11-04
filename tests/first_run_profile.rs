@@ -325,10 +325,7 @@ fn step_7_names_the_staging_parent_the_account_cannot_traverse() {
     let acache = rig.p("srv/acache");
     let staging = acache.join("tapectl-staging");
     std::fs::create_dir_all(&staging).unwrap();
-    let profile = rig.profile(
-        "p.profile",
-        &format!("STAGING_DIR={}\n", staging.display()),
-    );
+    let profile = rig.profile("p.profile", &format!("STAGING_DIR={}\n", staging.display()));
     let path = sudo_stub_path(&rig);
     let step7 = || {
         rig.command(&[
@@ -738,7 +735,10 @@ fn step_12_refuses_a_drive_that_is_not_ready_before_asking_for_the_serial() {
         ) && err.contains("nothing was asked and nothing was erased"),
         "{err}"
     );
-    assert!(!out.contains(SERIAL_QUESTION), "the serial was asked: {out}");
+    assert!(
+        !out.contains(SERIAL_QUESTION),
+        "the serial was asked: {out}"
+    );
     assert!(!out.contains("supplied via a flag"), "{out}");
     assert_eq!(
         calls.matches("sg_read_attr /dev/null").count(),
@@ -787,9 +787,7 @@ fn step_12_reads_the_chip_again_on_a_unit_attention_and_says_what_else_failed() 
     let serial = out
         .find("Medium serial number: TESTSERIAL")
         .unwrap_or_else(|| panic!("the chip's serial was not shown: {out}"));
-    let question = out
-        .find(SERIAL_QUESTION)
-        .unwrap_or_else(|| panic!("{out}"));
+    let question = out.find(SERIAL_QUESTION).unwrap_or_else(|| panic!("{out}"));
     assert!(serial < question, "{out}");
 
     let (o, calls_seen) = step12_sg(
@@ -807,11 +805,11 @@ fn step_12_reads_the_chip_again_on_a_unit_attention_and_says_what_else_failed() 
     let (out, err) = text(&o);
     assert_eq!(o.status.code(), Some(0), "{out}\n{err}\n{calls_seen}");
     let failed = out
-        .find("sg_read_attr /dev/null failed (exit 15): sg_read_attr: open error: Permission denied")
+        .find(
+            "sg_read_attr /dev/null failed (exit 15): sg_read_attr: open error: Permission denied",
+        )
         .unwrap_or_else(|| panic!("{out}"));
-    let question = out
-        .find(SERIAL_QUESTION)
-        .unwrap_or_else(|| panic!("{out}"));
+    let question = out.find(SERIAL_QUESTION).unwrap_or_else(|| panic!("{out}"));
     assert!(failed < question, "{out}");
     assert_eq!(
         calls_seen.matches("sg_read_attr /dev/null").count(),
