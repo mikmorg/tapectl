@@ -57,7 +57,7 @@ pub fn run(
             }
             Ok(EXIT_SUCCESS)
         }
-        ConfigCommands::Check => run_check(conn, paths, json_output),
+        ConfigCommands::Check => run_check(conn, paths, None, json_output),
         ConfigCommands::Get { key } => {
             run_get(paths, key, json_output)?;
             Ok(EXIT_SUCCESS)
@@ -196,6 +196,16 @@ fn apply_planned(
     Ok(())
 }
 
+/// `config check` as `main` runs it: the home it checks is named, with the
+/// rule that chose it (ADR-0012 item 213).
+pub fn check(
+    conn: &Connection,
+    startup: &crate::startup::Startup,
+    json_output: bool,
+) -> Result<i32> {
+    run_check(conn, &startup.paths, Some(startup), json_output)
+}
+
 /// `config check`'s body, split out of [`run`] only for readability —
 /// `Check` is by far the larger of the two arms.
 ///
@@ -208,7 +218,15 @@ fn apply_planned(
 /// BEFORE that strict load (see its own comment; `config show` is left on
 /// the normal path), and this function gets its own view of the config via
 /// [`crate::policy::lenient_config::check`] instead of the strict loader.
-fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Result<i32> {
+///
+/// `home`, when given, is the resolution that chose `paths`; the human form
+/// names it after the verdict (item 213).
+fn run_check(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    home: Option<&crate::startup::Startup>,
+    json_output: bool,
+) -> Result<i32> {
     let toml_str = std::fs::read_to_string(&paths.config_file)?;
     let report = crate::policy::lenient_config::check(&toml_str, &paths.config_file);
     // A best-effort `Config`, present whenever the lenient parse could
@@ -364,6 +382,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &ops_lines,
             defaults_json,
             &notes,
+            home,
         );
     } else {
         print_human(
@@ -384,6 +403,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &ops_lines,
             verify_interval_days,
             &notes,
+            home,
         );
     }
 
@@ -441,6 +461,7 @@ fn print_json(
     ops_lines: &[String],
     defaults_json: Option<serde_json::Value>,
     notes: &[String],
+    home: Option<&crate::startup::Startup>,
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
         .iter()
@@ -587,6 +608,8 @@ fn print_json(
             "ops": ops_lines,
             "defaults": defaults_json,
             "notes": notes,
+            "home": home.map(|h| h.paths.home.display().to_string()),
+            "home_source": home.map(|h| h.source.key()),
         })
     );
 }
@@ -610,6 +633,7 @@ fn print_human(
     ops_lines: &[String],
     verify_interval_days: Option<i64>,
     notes: &[String],
+    home: Option<&crate::startup::Startup>,
 ) {
     if report.valid {
         println!("config: valid");
@@ -618,6 +642,11 @@ fn print_human(
         for problem in &report.problems {
             println!("  - {problem}");
         }
+    }
+    // Item 213: the home this checked, and why that one. After the verdict,
+    // which scripts and tests read as the first line, and its problems.
+    if let Some(home) = home {
+        println!("{}", home.home_line());
     }
     // Issue #479: the file loads, so every other command runs, but a slice
     // size the measured post-warning room cannot hold is an error `config

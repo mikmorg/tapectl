@@ -73,9 +73,18 @@ pub struct Cli {
 
     /// tapectl home directory: database, keys, catalogs, stage-reports, logs.
     ///
-    /// Defaults to ~/.tapectl. The config file is taken from
-    /// <home>/config.toml unless --config overrides it. Also settable as
-    /// TAPECTL_HOME.
+    /// The home is the first of: --home; TAPECTL_HOME; the directory of
+    /// --config; this account's ~/.tapectl, when it exists; the home named by
+    /// the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another
+    /// file), when the account has no ~/.tapectl of its own; else
+    /// ~/.tapectl, where `tapectl init` makes a new one. The config file is
+    /// <home>/config.toml unless --config names another. `tapectl status`
+    /// and `tapectl config check` name the home in use and the rule that
+    /// chose it.
+    ///
+    /// As root the home pointer is never read, and on a host that has one
+    /// tapectl refuses unless --home or TAPECTL_HOME names the home: the
+    /// service user's commands run through `tapectl-op`.
     #[arg(long, global = true)]
     pub home: Option<String>,
 
@@ -298,11 +307,26 @@ pub enum Commands {
         command: host::HostCommands,
     },
 
-    /// What is running and how the last sessions ended, from the session
-    /// logs alone: the live session's phase, progress, rate and ETA, and
-    /// each recent session's outcome and phase timings. Opens no catalog
-    /// and no config, so an account in the home's `[ops] group` can run it
-    /// (`tapectl --home <service home> status`) without sudo
+    /// The home screen: the home and why it was chosen, what is running,
+    /// the units by state, the volumes due a verify, and the next commands
+    ///
+    /// The home is named with the rule that chose it (see --home). What is
+    /// running and how the last sessions ended come from the session logs:
+    /// the live session's phase, progress, rate and ETA, and each recent
+    /// session's outcome and phase timings. Then, from the catalog, the units
+    /// by state (pending: never archived or dirty; staged, awaiting a write;
+    /// under-copied, below their copy floor), the volumes due a verify (no
+    /// full readback, or past the verify_interval_days of a unit on them),
+    /// and at most three next commands: an interrupted write to resume,
+    /// pending units, staged or under-copied units, a volume to verify.
+    ///
+    /// An account in the home's `[ops] group` reads the session logs but not
+    /// the catalog: it is shown the home and the sessions, and is told that
+    /// the overview needs the service user (`tapectl-op status`).
+    ///
+    /// Exit status: 0 = shown (the catalog read, or an `[ops] group` account
+    /// shown its part); 2 = the catalog could not be read (not initialized,
+    /// damaged or busy), said on stderr after the home and the sessions.
     Status {
         /// How many finished sessions to show, newest first (running ones
         /// are always shown)

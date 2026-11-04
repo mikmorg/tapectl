@@ -1,5 +1,7 @@
-//! `tapectl status`: what is running and how the last sessions ended, read
-//! from the session logs alone (issue #393).
+//! `tapectl status`: the home screen (ADR-0012 item 213). The home and why
+//! it was chosen; what is running and how the last sessions ended, from the
+//! session logs (issue #393); the units by state, the volumes due a verify
+//! and at most three next commands, from the catalog.
 //!
 //! On a production host the catalog, the keys and the session logs live
 //! under the service user's home, and live progress prints only on the
@@ -9,19 +11,27 @@
 //! confirmed write was invisible until the CTO ran a sudo script, and an
 //! agent misread it as having ended early.
 //!
-//! This command opens **no catalog and no config**: everything it shows is
-//! in `<home>/logs/`, which `[ops] group` makes readable to one group
-//! (`config::OpsConfig`), so a member of that group sees a live session's
-//! phase and progress and the last sessions' outcomes, and nothing else.
-//! Every session writes its progress line to its log once per interval
-//! (`progress::DEFAULT_INTERVAL`), whatever its display, so the newest
-//! `progress:` line is never more than that old.
+//! The sessions come from `<home>/logs/` alone, which `[ops] group` makes
+//! readable to one group (`config::OpsConfig`), so a member of that group
+//! sees a live session's phase and progress and the last sessions'
+//! outcomes. The catalog stays closed to that group: for an account that
+//! may not open it, `status` shows the home and the sessions and says the
+//! overview needs the service user, and exits 0, because that is all such
+//! an account is meant to see (the 1.9.0 coordinator's OQ9). It exits 2 only
+//! when the catalog cannot be read for a reason nobody designed: missing
+//! (not initialized), corrupt, or busy (OQ6). Every session writes its
+//! progress line to its log once per interval (`progress::DEFAULT_INTERVAL`),
+//! whatever its display, so the newest `progress:` line is never more than
+//! that old.
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use crate::error::{Result, TapectlError};
+use crate::config::Config;
+use crate::error::{Result, TapectlError, EXIT_ERROR, EXIT_SUCCESS};
+use crate::startup::Startup;
 
 /// One session, as its log tells it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -414,22 +424,519 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
     out
 }
 
-/// `tapectl status`.
-pub fn run(logs_dir: &Path, last: usize, json_output: bool) -> Result<()> {
-    let sessions = read_sessions(logs_dir, last)?;
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "logs_dir": logs_dir.display().to_string(),
-                "sessions": sessions,
-            }))
-            .unwrap()
-        );
-    } else {
-        print!("{}", render(logs_dir, &sessions));
+/// The line an account that may not open the catalog is shown in place of
+/// the overview (OQ9).
+pub const NEEDS_SERVICE_USER: &str = "the overview needs the service user: tapectl-op status";
+
+/// What `status` could make of the catalog.
+#[derive(Debug)]
+pub enum Overview {
+    /// It read the catalog: the overview.
+    Read(Box<HomeScreen>),
+    /// This account may not open the catalog (an `[ops] group` member): the
+    /// designed view, exit 0.
+    NeedsServiceUser,
+    /// The catalog could not be read (missing, corrupt, busy, a config that
+    /// does not load): why, exit 2.
+    Unreadable(String),
+}
+
+impl Overview {
+    /// OQ6: 0 when `status` read the catalog, or showed the view an account
+    /// without it is meant to have; 2 when it could not read it.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Overview::Read(_) | Overview::NeedsServiceUser => EXIT_SUCCESS,
+            Overview::Unreadable(_) => EXIT_ERROR,
+        }
     }
-    Ok(())
+}
+
+/// A volume due a verify (`report verify-status`'s and `audit`'s rules): one
+/// that counts as a copy with no passed full readback, or whose newest one
+/// is older than the shortest `verify_interval_days` of the units on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueVerify {
+    pub label: String,
+    /// The newest passed full readback, dated by its start; `None` when
+    /// there is none.
+    pub last_full: Option<String>,
+    /// The interval it is past; `None` when it was never read back in full.
+    pub interval_days: Option<i64>,
+}
+
+/// The catalog's half of the home screen: the units by state, the volumes
+/// due a verify and the interrupted write sessions, with what the next
+/// commands are built from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HomeScreen {
+    /// Active units.
+    pub active: usize,
+    /// Pending, Never Archived: no snapshot at all.
+    pub never_archived: Vec<String>,
+    /// Pending, Dirty: the source no longer matches the snapshot.
+    pub dirty: Vec<String>,
+    /// Units whose source the dirty scan could not read.
+    pub not_scanned: Vec<String>,
+    /// Units with a stage set held in staging that still owes a copy.
+    pub staged: Vec<String>,
+    /// Units below their copy floor (Never Archived ones are pending, not
+    /// counted here).
+    pub under_copied: Vec<String>,
+    /// Units whose policy does not resolve, so their copies cannot be judged.
+    pub policy_unresolvable: Vec<String>,
+    pub due_verify: Vec<DueVerify>,
+    /// Write targets with an interrupted write session.
+    pub interrupted: Vec<String>,
+    /// The collection each pending unit belongs to, in pending order (name,
+    /// collection); a unit in none is absent.
+    pub pending_collections: Vec<(String, String)>,
+}
+
+impl HomeScreen {
+    /// Pending: Never Archived and Dirty (CONTEXT.md).
+    pub fn pending(&self) -> usize {
+        self.never_archived.len() + self.dirty.len()
+    }
+
+    /// At most three next commands, in OQ9's order: an interrupted session,
+    /// pending units, staged or under-copied units, volumes due a verify.
+    pub fn next_commands(&self) -> Vec<String> {
+        let mut next = Vec::new();
+        if let Some((first, rest)) = self.interrupted.split_first() {
+            let more = if rest.is_empty() {
+                String::new()
+            } else {
+                format!("  ({} more interrupted: {})", rest.len(), rest.join(", "))
+            };
+            next.push(format!("tapectl volume resume {first}{more}"));
+        }
+        let pending: Vec<&String> = self.never_archived.iter().chain(&self.dirty).collect();
+        if !pending.is_empty() {
+            next.push(match self.pending_collections.first() {
+                Some((_, collection)) => {
+                    format!("tapectl collection run {collection} --label <LABEL>")
+                }
+                None => format!("tapectl snapshot create {}", some_names(&pending)),
+            });
+        }
+        if !self.staged.is_empty() {
+            next.push(
+                "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>"
+                    .to_string(),
+            );
+        } else if !self.under_copied.is_empty() {
+            // Nothing staged to write: the copy floor is met by staging the
+            // units again first (a write takes only what is staged).
+            let units: Vec<&String> = self.under_copied.iter().collect();
+            next.push(format!("tapectl stage create {}", some_names(&units)));
+        }
+        if let Some(due) = self.due_verify.first() {
+            next.push(format!("tapectl volume verify {}", due.label));
+        }
+        next.truncate(3);
+        next
+    }
+}
+
+/// Up to three names for a command line, and how many more there are.
+fn some_names(names: &[&String]) -> String {
+    const SHOWN: usize = 3;
+    let shown: Vec<&str> = names.iter().take(SHOWN).map(|n| n.as_str()).collect();
+    if names.len() <= SHOWN {
+        shown.join(" ")
+    } else {
+        format!("{}  ({} more)", shown.join(" "), names.len() - SHOWN)
+    }
+}
+
+/// Read the catalog's half of the home screen. `config` is the home's
+/// config, loaded as `report` loads it.
+pub fn gather(conn: &Connection, config: &Config) -> Result<HomeScreen> {
+    let mut screen = HomeScreen::default();
+    for row in crate::cli::report::dirty_rows(conn, None, &config.defaults.global_excludes)? {
+        screen.active += 1;
+        match row.state {
+            "new" => screen.never_archived.push(row.name),
+            "dirty" => screen.dirty.push(row.name),
+            "unreadable" => screen.not_scanned.push(row.name),
+            _ => {}
+        }
+    }
+    screen.pending_collections = pending_collections(
+        conn,
+        config,
+        screen.never_archived.iter().chain(&screen.dirty),
+    )?;
+
+    let mut staged: Vec<String> = crate::cli::stage::stage_set_rows(
+        conn,
+        config,
+        crate::cli::stage::Shown::Status("staged"),
+    )?
+    .into_iter()
+    .filter(|r| r.owing)
+    .map(|r| r.unit)
+    .collect();
+    staged.dedup();
+    screen.staged = staged;
+
+    for row in crate::cli::report::fire_risk_rows(conn, config)? {
+        match row.risk {
+            crate::cli::report::FireRisk::PolicyUnresolvable(_) => {
+                screen.policy_unresolvable.push(row.unit)
+            }
+            _ if screen.never_archived.contains(&row.unit) => {}
+            _ => screen.under_copied.push(row.unit),
+        }
+    }
+
+    screen.due_verify = due_verify(conn, config.defaults.verify_interval_days)?;
+    screen.interrupted = interrupted_write_targets(conn)?;
+    Ok(screen)
+}
+
+/// The configured collection each of `pending` lies under (by path, as
+/// `collection status` finds its units), in `pending`'s order.
+fn pending_collections<'a>(
+    conn: &Connection,
+    config: &Config,
+    pending: impl Iterator<Item = &'a String>,
+) -> Result<Vec<(String, String)>> {
+    let roots: Vec<(String, String)> = config
+        .collections
+        .iter()
+        .filter_map(|c| {
+            crate::collection::canonical_root(c)
+                .ok()
+                .map(|root| (c.name.clone(), root))
+        })
+        .collect();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for name in pending {
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, name)? else {
+            continue;
+        };
+        let Some(path) = unit.current_path.as_deref() else {
+            continue;
+        };
+        if let Some((collection, _)) = roots
+            .iter()
+            .find(|(_, root)| crate::collection::is_under_root(path, root))
+        {
+            out.push((name.clone(), collection.clone()));
+        }
+    }
+    Ok(out)
+}
+
+/// The volumes due a verify, the never-read-back first (in label order),
+/// then those past their interval, oldest readback first.
+///
+/// The first half is `report verify-status`'s and `audit`'s `no_full_verify`
+/// query ([`crate::policy::evidence::sealed_without_full_verify`]). The
+/// second is `audit`'s per-volume clock (`volume_verify_age`): each volume
+/// that counts as a copy and holds a completed write or a range, its newest
+/// passed full readback dated by its start, against the shortest
+/// `verify_interval_days` of the units on it (an archive set's, else
+/// `defaults_interval`); past it by whole days, or with a date that does not
+/// parse, it is due.
+fn due_verify(conn: &Connection, defaults_interval: i64) -> Result<Vec<DueVerify>> {
+    let mut due: Vec<DueVerify> = crate::policy::evidence::sealed_without_full_verify(conn, None)?
+        .into_iter()
+        .map(|label| DueVerify {
+            label,
+            last_full: None,
+            interval_days: None,
+        })
+        .collect();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT v.label, MAX({dated}) AS last_full,
+                (SELECT MIN(COALESCE(a.verify_interval_days, ?1))
+                   FROM writes w2
+                   JOIN snapshots s2 ON s2.id = w2.snapshot_id
+                   JOIN units u2 ON u2.id = s2.unit_id
+                   LEFT JOIN archive_sets a ON a.id = u2.archive_set_id
+                  WHERE w2.volume_id = v.id
+                    AND w2.status IN ('completed', 'range')) AS interval_days
+           FROM volumes v
+           JOIN verification_sessions vs
+             ON vs.volume_id = v.id AND vs.outcome = 'passed' AND vs.verify_type = 'full'
+          WHERE {eligible}
+            AND EXISTS (SELECT 1 FROM writes w
+                         WHERE w.volume_id = v.id AND w.status IN ('completed', 'range'))
+          GROUP BY v.id
+          ORDER BY last_full, v.label",
+        dated = crate::policy::evidence::full_readback_date("vs"),
+        eligible = crate::policy::coverage::eligible("v"),
+    ))?;
+    let rows = stmt
+        .query_map(params![defaults_interval], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now = chrono::Utc::now().naive_utc();
+    for (label, last_full, interval) in rows {
+        let Some(days) = interval else {
+            continue;
+        };
+        let age = chrono::NaiveDateTime::parse_from_str(&last_full, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| (now - dt).num_days());
+        if age.is_some_and(|a| a <= days) {
+            continue;
+        }
+        due.push(DueVerify {
+            label,
+            last_full: Some(last_full),
+            interval_days: Some(days),
+        });
+    }
+    Ok(due)
+}
+
+/// Write targets with an interrupted write session (`volume resume`
+/// continues it). A crashed session's rows were turned `interrupted` by the
+/// catalog's open; a live one's stay `in_progress` and show as running.
+fn interrupted_write_targets(conn: &Connection) -> Result<Vec<String>> {
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT DISTINCT v.label, v.status, v.observed_condition
+               FROM volumes v JOIN writes w ON w.volume_id = v.id
+              WHERE w.status = 'interrupted'
+              ORDER BY v.label",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, status, condition)| {
+            crate::policy::coverage::is_write_target(status, condition)
+        })
+        .map(|(label, _, _)| label)
+        .collect())
+}
+
+/// Open the home's catalog for the overview, deciding before SQLite sees the
+/// file (which reports a missing file and a forbidden one alike): missing is
+/// "not initialized", forbidden is the `[ops] group` view, and anything else
+/// that stops the read is an error.
+pub fn overview(startup: &Startup) -> Overview {
+    let paths = &startup.paths;
+    match std::fs::File::open(&paths.db_file) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Overview::Unreadable(crate::startup::not_initialized_message(startup));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Overview::NeedsServiceUser;
+        }
+        Err(e) => {
+            return Overview::Unreadable(format!(
+                "cannot open the catalog {}: {e}",
+                paths.db_file.display()
+            ));
+        }
+    }
+    // `status` never reaches a drive, so a backend collision does not stop
+    // it (the #261 reasoning `report` follows).
+    let config = match Config::load_tolerating_backend_ambiguity(&paths.config_file) {
+        Ok(c) => c,
+        Err(e) => return Overview::Unreadable(format!("failed to load config: {e}")),
+    };
+    let conn = match crate::db::open(&paths.db_file) {
+        Ok(c) => c,
+        Err(e) => return Overview::Unreadable(format!("failed to open the catalog: {e}")),
+    };
+    match gather(&conn, &config) {
+        Ok(screen) => Overview::Read(Box::new(screen)),
+        Err(e) => Overview::Unreadable(format!("cannot read the catalog: {e}")),
+    }
+}
+
+/// The catalog half of the human screen.
+pub fn render_overview(overview: &Overview) -> String {
+    let screen = match overview {
+        Overview::Read(screen) => screen,
+        Overview::NeedsServiceUser => return format!("{NEEDS_SERVICE_USER}\n"),
+        // Said on stderr, as an error.
+        Overview::Unreadable(_) => return String::new(),
+    };
+    use crate::render::plural;
+    let mut out = format!("units: {} active\n", screen.active);
+    let pending = if screen.pending() == 0 {
+        "0".to_string()
+    } else {
+        format!(
+            "{} ({} never archived, {} dirty)",
+            screen.pending(),
+            screen.never_archived.len(),
+            screen.dirty.len()
+        )
+    };
+    let mut rows = vec![
+        vec!["pending".to_string(), pending],
+        vec![
+            "staged".to_string(),
+            format!("{}, awaiting a write", screen.staged.len()),
+        ],
+        vec![
+            "under-copied".to_string(),
+            format!("{}, below their copy floor", screen.under_copied.len()),
+        ],
+    ];
+    if !screen.not_scanned.is_empty() {
+        rows.push(vec![
+            "not scanned".to_string(),
+            format!(
+                "{} (the source could not be read: tapectl report dirty says why)",
+                screen.not_scanned.len()
+            ),
+        ]);
+    }
+    if !screen.policy_unresolvable.is_empty() {
+        rows.push(vec![
+            "unjudged".to_string(),
+            format!(
+                "{} (the policy does not resolve: tapectl audit says why)",
+                screen.policy_unresolvable.len()
+            ),
+        ]);
+    }
+    out.push_str(&indent(&crate::render::table_with(
+        &["state", "units"],
+        rows,
+        None,
+    )));
+    if screen.due_verify.is_empty() {
+        out.push_str("volumes due a verify: none\n");
+    } else {
+        out.push_str(&format!(
+            "volumes due a verify: {}\n",
+            plural(screen.due_verify.len() as i64, "volume", "volumes")
+        ));
+        let rows = screen
+            .due_verify
+            .iter()
+            .map(|d| {
+                let why = match (&d.last_full, d.interval_days) {
+                    (Some(at), Some(days)) => format!(
+                        "last read back in full {}, past its {days}-day interval",
+                        crate::render::table_time(at)
+                    ),
+                    _ => "never read back in full".to_string(),
+                };
+                vec![d.label.clone(), why]
+            })
+            .collect();
+        out.push_str(&indent(&crate::render::table(&["volume", "why"], rows)));
+    }
+    let next = screen.next_commands();
+    if next.is_empty() {
+        out.push_str("next: nothing to do\n");
+    } else {
+        out.push_str("next:\n");
+        for n in next {
+            out.push_str(&format!("  {n}\n"));
+        }
+    }
+    out
+}
+
+/// `text`'s lines, each indented two spaces.
+fn indent(text: &str) -> String {
+    text.lines().map(|l| format!("  {l}\n")).collect()
+}
+
+/// The `--json` document: `logs_dir` and `sessions` as before 1.9.0, and the
+/// home, the units by state, the volumes due a verify and the next commands
+/// (`null` where the catalog was not read, with `note` or `error` saying
+/// why).
+pub fn overview_json(
+    startup: &Startup,
+    sessions: &[SessionStatus],
+    overview: &Overview,
+) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "home": startup.paths.home.display().to_string(),
+        "home_source": startup.source.key(),
+        "home_pointer": match &startup.source {
+            crate::startup::HomeSource::Pointer(p) => Some(p.display().to_string()),
+            _ => None,
+        },
+        "logs_dir": startup.paths.logs_dir.display().to_string(),
+        "sessions": sessions,
+        "units": null,
+        "due_verify": null,
+        "interrupted": null,
+        "next": null,
+    });
+    match overview {
+        Overview::Read(s) => {
+            doc["units"] = serde_json::json!({
+                "active": s.active,
+                "pending": s.pending(),
+                "never_archived": s.never_archived,
+                "dirty": s.dirty,
+                "not_scanned": s.not_scanned,
+                "staged": s.staged,
+                "under_copied": s.under_copied,
+                "policy_unresolvable": s.policy_unresolvable,
+            });
+            doc["due_verify"] = s
+                .due_verify
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "volume": d.label,
+                        "last_full": d.last_full.as_deref().map(crate::render::json_time),
+                        "interval_days": d.interval_days,
+                    })
+                })
+                .collect();
+            doc["interrupted"] = serde_json::json!(s.interrupted);
+            doc["next"] = serde_json::json!(s.next_commands());
+        }
+        Overview::NeedsServiceUser => doc["note"] = serde_json::json!(NEEDS_SERVICE_USER),
+        Overview::Unreadable(why) => {
+            doc["error"] = serde_json::json!(why);
+            doc["exit_code"] = serde_json::json!(EXIT_ERROR);
+        }
+    }
+    doc
+}
+
+/// `tapectl status`: its exit code (OQ6).
+pub fn run(startup: &Startup, last: usize, json_output: bool) -> Result<i32> {
+    let logs_dir = &startup.paths.logs_dir;
+    // A home with no logs directory yet has run no session; any other
+    // failure to read it is said as before.
+    let sessions = match std::fs::symlink_metadata(logs_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        _ => read_sessions(logs_dir, last)?,
+    };
+    let overview = overview(startup);
+    if json_output {
+        crate::render::print_json(&overview_json(startup, &sessions, &overview));
+    } else {
+        print!(
+            "{}\n{}{}",
+            startup.home_line(),
+            render(logs_dir, &sessions),
+            render_overview(&overview)
+        );
+        if let Overview::Unreadable(why) = &overview {
+            eprintln!("error: {why}");
+        }
+    }
+    Ok(overview.exit_code())
 }
 
 #[cfg(test)]
@@ -748,6 +1255,308 @@ mod tests {
         assert!(!has_end_line(
             "2026-10-01T05:40:01.101Z  INFO x: session end after 3 s\nsession end after 3 s\n"
         ));
+    }
+
+    // ---- the home screen (ADR-0012 item 213) ----
+
+    /// A catalog in memory and source folders on disk.
+    struct Catalog {
+        conn: Connection,
+        tenant: i64,
+        dir: tempfile::TempDir,
+    }
+
+    impl Catalog {
+        fn new() -> Self {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tenant = conn.last_insert_rowid();
+            Catalog {
+                conn,
+                tenant,
+                dir: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        /// An active unit; `with_source` gives it a folder holding one file.
+        fn unit(&self, name: &str, with_source: bool) -> i64 {
+            let path = with_source.then(|| {
+                let p = self.dir.path().join(name);
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::write(p.join("f.txt"), "x").unwrap();
+                p.display().to_string()
+            });
+            self.conn
+                .execute(
+                    "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode,
+                                        encrypt, status)
+                     VALUES (?1, ?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                    params![name, self.tenant, path],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// Version 1 of `unit`, current; its snapshot id.
+        fn snapshot(&self, unit: i64) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, 1, 'full', 'current', '/src')",
+                    params![unit],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// A staged stage set of `snapshot`; its id.
+        fn staged(&self, snapshot: i64) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
+                     VALUES (?1, 'staged', 1048576, 1)",
+                    params![snapshot],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// A volume `label` in `status`, condition ok.
+        fn volume(&self, label: &str, status: &str) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status, sealed_at)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2,
+                             CASE WHEN ?2 = 'sealed' THEN '2026-10-21 10:00:00' END)",
+                    params![label, status],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// A write of `set` to `volume` in `status`.
+        fn write(&self, set: i64, volume: i64, status: &str) {
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![set, volume, status],
+                )
+                .unwrap();
+        }
+
+        /// A passed full readback of `volume`, started `days` ago.
+        fn read_back(&self, volume: i64, days: i64) {
+            let at = (chrono::Utc::now().naive_utc() - chrono::Duration::days(days))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, 'full', 'passed', ?2, ?2)",
+                    params![volume, at],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Every state the screen counts, from one catalog: a never-archived
+    /// unit, a staged one owing its copy (so under-copied too), an
+    /// interrupted write, a sealed copy never read back in full and one read
+    /// back past its interval.
+    #[test]
+    fn the_home_screen_counts_units_by_state_and_names_what_is_due() {
+        let c = Catalog::new();
+        c.unit("fresh", true);
+        let held = c.unit("held", false);
+        let set = c.staged(c.snapshot(held));
+        let copied = c.unit("copied", false);
+        let copied_set = c.staged(c.snapshot(copied));
+        c.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                params![copied_set],
+            )
+            .unwrap();
+        let never = c.volume("L-NEVER", "sealed");
+        c.write(copied_set, never, "completed");
+        let stale = c.volume("L-STALE", "sealed");
+        c.write(copied_set, stale, "completed");
+        c.read_back(stale, 400);
+        let fresh_read = c.volume("L-FRESH", "sealed");
+        c.write(copied_set, fresh_read, "completed");
+        c.read_back(fresh_read, 10);
+        let open = c.volume("L-INT", "initialized");
+        c.write(set, open, "interrupted");
+
+        let screen = gather(&c.conn, &Config::default()).unwrap();
+        assert_eq!(screen.active, 3);
+        assert_eq!(screen.never_archived, ["fresh"]);
+        assert!(screen.dirty.is_empty(), "{screen:?}");
+        assert_eq!(screen.pending(), 1);
+        assert_eq!(screen.staged, ["held"]);
+        assert_eq!(
+            screen.under_copied,
+            ["held"],
+            "the never-archived unit is pending, not counted twice"
+        );
+        assert_eq!(screen.interrupted, ["L-INT"]);
+        let due: Vec<(&str, Option<i64>)> = screen
+            .due_verify
+            .iter()
+            .map(|d| (d.label.as_str(), d.interval_days))
+            .collect();
+        assert_eq!(
+            due,
+            [("L-NEVER", None), ("L-STALE", Some(365))],
+            "never read back first, then past the default interval; L-FRESH is not due"
+        );
+
+        assert_eq!(
+            screen.next_commands(),
+            [
+                "tapectl volume resume L-INT",
+                "tapectl snapshot create fresh",
+                "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>",
+            ],
+            "OQ9's order, at most three"
+        );
+
+        let text = render_overview(&Overview::Read(Box::new(screen)));
+        assert!(text.starts_with("units: 3 active\n"), "{text}");
+        assert!(
+            text.contains("next:\n  tapectl volume resume L-INT\n"),
+            "{text}"
+        );
+        // Column widths are the render kit's; the words are this screen's.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            "pending 1 (1 never archived, 0 dirty)",
+            "staged 1, awaiting a write",
+            "under-copied 1, below their copy floor",
+            "volumes due a verify: 2 volumes",
+            "L-NEVER never read back in full",
+            "past its 365-day interval",
+        ] {
+            assert!(flat.contains(want), "{want:?} in:\n{text}");
+        }
+    }
+
+    /// OQ9's order holds whichever categories are present, and a volume to
+    /// verify comes last.
+    #[test]
+    fn the_next_commands_follow_oq9_order() {
+        let screen = |f: &dyn Fn(&mut HomeScreen)| {
+            let mut s = HomeScreen::default();
+            f(&mut s);
+            s.next_commands()
+        };
+        let due = DueVerify {
+            label: "L1".into(),
+            last_full: None,
+            interval_days: None,
+        };
+        assert!(screen(&|_| {}).is_empty());
+        assert_eq!(
+            screen(&|s| {
+                s.dirty = vec!["d".into()];
+                s.due_verify = vec![due.clone()];
+            }),
+            ["tapectl snapshot create d", "tapectl volume verify L1"]
+        );
+        // Under-copied with nothing staged: stage first, a write takes only
+        // what is staged.
+        assert_eq!(
+            screen(&|s| s.under_copied = vec!["a".into(), "b".into()]),
+            ["tapectl stage create a b"]
+        );
+        // A pending unit in a collection: the collection run.
+        assert_eq!(
+            screen(&|s| {
+                s.never_archived = vec!["movies/x".into()];
+                s.pending_collections = vec![("movies/x".into(), "movies".into())];
+            }),
+            ["tapectl collection run movies --label <LABEL>"]
+        );
+        // Several interrupted sessions: the first, and the others named.
+        assert_eq!(
+            screen(&|s| s.interrupted = vec!["A".into(), "B".into()]),
+            ["tapectl volume resume A  (1 more interrupted: B)"]
+        );
+        // Every category: the first three, the verify dropped.
+        let all = screen(&|s| {
+            s.interrupted = vec!["A".into()];
+            s.never_archived = vec!["n1".into(), "n2".into(), "n3".into(), "n4".into()];
+            s.staged = vec!["st".into()];
+            s.due_verify = vec![due.clone()];
+        });
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert_eq!(all[1], "tapectl snapshot create n1 n2 n3  (1 more)");
+        assert!(all[2].starts_with("tapectl volume write"), "{all:?}");
+    }
+
+    fn startup_at(home: &Path) -> Startup {
+        crate::startup::resolve_from(Some(home.to_str().unwrap()), None, None, None, None).unwrap()
+    }
+
+    /// OQ6: no catalog is "not initialized", exit 2, naming the path; JSON
+    /// keeps `logs_dir` and `sessions` and says why in `error`.
+    #[test]
+    fn a_missing_catalog_is_not_initialized_and_exits_2() {
+        let home = tempfile::tempdir().unwrap();
+        let startup = startup_at(home.path());
+        let o = overview(&startup);
+        assert_eq!(o.exit_code(), EXIT_ERROR);
+        match &o {
+            Overview::Unreadable(why) => {
+                assert!(why.contains("not initialized"), "{why}");
+                assert!(why.contains(&home.path().display().to_string()), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !home.path().join("tapectl.db").exists(),
+            "status made no catalog"
+        );
+        let json = overview_json(&startup, &[], &o);
+        assert_eq!(
+            json["logs_dir"],
+            home.path().join("logs").display().to_string()
+        );
+        assert_eq!(json["sessions"], serde_json::json!([]));
+        assert_eq!(json["home_source"], "home_flag");
+        assert_eq!(json["exit_code"], EXIT_ERROR);
+        assert!(json["units"].is_null() && json["next"].is_null(), "{json}");
+    }
+
+    /// OQ9: an account that may not open the catalog is shown its part and
+    /// told who sees the rest; that is the designed view, exit 0.
+    #[test]
+    fn a_catalog_this_account_may_not_open_is_the_ops_view_and_exits_0() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: root opens a mode-0 file");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("tapectl.db");
+        std::fs::write(&db, "").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let startup = startup_at(home.path());
+        let o = overview(&startup);
+        assert!(matches!(o, Overview::NeedsServiceUser), "{o:?}");
+        assert_eq!(o.exit_code(), EXIT_SUCCESS);
+        assert_eq!(render_overview(&o), format!("{NEEDS_SERVICE_USER}\n"));
+        assert!(NEEDS_SERVICE_USER.contains("tapectl-op status"));
+        let json = overview_json(&startup, &[], &o);
+        assert_eq!(json["note"], NEEDS_SERVICE_USER);
+        assert!(json.get("error").is_none(), "{json}");
     }
 
     #[test]

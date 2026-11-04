@@ -299,6 +299,17 @@ fn run(
         return Ok(());
     }
 
+    // ADR-0012 item 213 (OQ10): root on a host with a home pointer is
+    // refused unless --home or TAPECTL_HOME names the home, naming
+    // `tapectl-op`; as root the pointer is never read, so the command would
+    // open /root/.tapectl. `host check` reads no home and stays open to
+    // root; `--help`, `--version` and `completions` never get here.
+    if !matches!(cli.command, Commands::Host { .. }) {
+        if let Some(refusal) = startup::root_refusal_now(cli.home.as_deref()) {
+            bail!("{refusal}");
+        }
+    }
+
     // Resolve paths (issue #109) — `--home`, `TAPECTL_HOME`, the legacy
     // "`--config` relocates everything" behaviour, then `$HOME/.tapectl`.
     //
@@ -307,8 +318,10 @@ fn run(
     // archive all live in `tapectl::startup` (issue #228), together with
     // the input table as tests. `main()` above ran this same call before
     // the subscriber existed, to peek `[logging]`, and emitted the
-    // ambiguous-`--config` notice from there.
-    let paths = startup::resolve(cli.home.as_deref(), cli.config.as_deref())?.paths;
+    // ambiguous-`--config` notice from there. The rule that chose the home
+    // (`Startup::source`) is kept for the messages that name it (item 213).
+    let home = startup::resolve(cli.home.as_deref(), cli.config.as_deref())?;
+    let paths = home.paths.clone();
 
     // Init is special — it creates everything from scratch
     if let Commands::Init {
@@ -352,19 +365,23 @@ fn run(
         return Ok(());
     }
 
-    // Issue #393: `status` reads the session logs and nothing else — no
-    // catalog, no config, no chmod — so it runs for an account that can
-    // only read `<home>/logs/` (a member of the `[ops] group`), before the
-    // initialization gate and `ensure_dirs` below, neither of which such an
-    // account could pass.
+    // Issue #393: `status` runs for an account that can only read
+    // `<home>/logs/` (a member of the `[ops] group`), so it is dispatched
+    // before the initialization gate and `ensure_dirs` below, neither of
+    // which such an account could pass. It opens the catalog itself when it
+    // may (ADR-0012 item 213) and decides its own exit code: 0 when it read
+    // the catalog or showed such an account its view, 2 when it could not
+    // read it (OQ6).
     if let Commands::Status { last } = cli.command {
-        cli::status::run(&paths.logs_dir, last, cli.json)?;
+        let exit_code = cli::status::run(&home, last, cli.json)?;
+        exit_if_nonzero(exit_code);
         return Ok(());
     }
 
-    // Everything else requires initialization
+    // Everything else requires initialization. The error names the path,
+    // the rule that chose it, and `init` only for a new archive (item 213).
     if !paths.is_initialized() {
-        bail!("tapectl is not initialized — run `tapectl init` first");
+        bail!("{}", startup::not_initialized_message(&home));
     }
 
     // Issue #41: `ensure_dirs` tightens `~/.tapectl`'s directory tree to
@@ -437,8 +454,8 @@ fn run(
         }
     ) {
         let conn = db::open(&paths.db_file).context("failed to open database")?;
-        let exit_code =
-            cli::config::run(&conn, &paths, &ConfigCommands::Check, cli.json, cli.dry_run)?;
+        // Item 213: it names the home it checked, and why that one.
+        let exit_code = cli::config::check(&conn, &home, cli.json)?;
         exit_if_nonzero(exit_code);
         return Ok(());
     }
@@ -905,6 +922,7 @@ fn cmd_init(
                 "operator_key_adopted": adopted_operator_key.as_ref().map(|i| &i.public_key),
                 "dar_available": dar_ok,
                 "escrow_public_key": escrow_public_key,
+                "next": INIT_NEXT_STEPS.iter().map(|(_, cmd)| cmd).collect::<Vec<_>>(),
             })
         );
     } else {
@@ -957,9 +975,52 @@ fn cmd_init(
         } else {
             println!("  dar:      {dar_path} (NOT FOUND on PATH — install before staging)");
         }
+        print!("{}", init_next_steps());
     }
 
     Ok(())
+}
+
+/// What a new archive needs next, in order (ADR-0012 item 213): a tenant,
+/// the drive, what to archive, where its copies go, then a copy. `--move-to`
+/// takes a registered location, so `location add` comes before the copy.
+const INIT_NEXT_STEPS: &[(&str, &str)] = &[
+    (
+        "a tenant, whose data is archived",
+        "tapectl tenant add <TENANT>",
+    ),
+    (
+        "the tape drive",
+        "tapectl drive add --name <NAME> --device-tape /dev/tape/by-id/<DRIVE>-nst",
+    ),
+    (
+        "what to archive, a folder of units",
+        "tapectl collection add <NAME> <ROOT> --tenant <TENANT>",
+    ),
+    (
+        "or one folder as a unit",
+        "tapectl unit init <PATH> --tenant <TENANT>",
+    ),
+    ("where copies are kept", "tapectl location add <PLACE>"),
+    (
+        "a copy, once units are staged",
+        "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <PLACE>",
+    ),
+];
+
+/// `init`'s ending: [`INIT_NEXT_STEPS`], aligned, and where to look next.
+fn init_next_steps() -> String {
+    let width = INIT_NEXT_STEPS
+        .iter()
+        .map(|(what, _)| what.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from("\nnext steps:\n");
+    for (what, cmd) in INIT_NEXT_STEPS {
+        out.push_str(&format!("  {what:<width$}  {cmd}\n"));
+    }
+    out.push_str("`tapectl status` shows where things stand and the next command at every step.\n");
+    out
 }
 
 /// Check if dar is available at the configured path.

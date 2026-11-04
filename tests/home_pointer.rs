@@ -186,22 +186,268 @@ fn a_wrong_pointer_is_a_named_error_not_a_fresh_home() {
     }
 }
 
-/// ADR-0012 2026-10-15 item 62, through the real euid: as root the pointer
-/// is not read, so root gets its own `~/.tapectl` and the service home is
-/// left alone. Only meaningful as root, so it skips otherwise (CI and the
-/// dev VM run unprivileged; the injected-euid unit test covers every run).
+/// ADR-0012 item 213 (OQ10), through the real euid: as root, on a host with a
+/// home pointer, a command that does not name its home is refused and names
+/// `tapectl-op`, rather than opening /root/.tapectl; `--home` and
+/// `TAPECTL_HOME` still work, and `host check`, `completions`, `--version`
+/// and `--help` are exempt. Only meaningful as root, so it skips otherwise
+/// (CI and the dev VM run unprivileged; `startup`'s unit test
+/// `root_is_refused_beside_a_pointer_unless_the_home_is_named` covers the
+/// rule).
 #[test]
-fn as_root_the_pointer_is_ignored() {
+fn as_root_beside_a_pointer_only_a_named_home_runs() {
     if !is_root() {
         eprintln!(
-            "skipped: needs euid 0 (unit test `root_ignores_the_pointer_entirely` covers the rule)"
+            "skipped: needs euid 0 (unit test `root_is_refused_beside_a_pointer_unless_the_home_is_named` covers the rule)"
         );
         return;
     }
     let host = Host::new();
-    let out = host.run(&host.pointer, &["init", "--operator", "x"]);
+    for args in [
+        &["status"][..],
+        &["init", "--operator", "x"],
+        &["unit", "list"],
+    ] {
+        let out = host.run(&host.pointer, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("tapectl-op"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert!(!host.own_home().exists(), "{args:?}: made /root's home");
+    }
+    let named = host.run(
+        &host.pointer,
+        &["--home", host.svc.to_str().unwrap(), "unit", "list"],
+    );
+    assert!(named.status.success(), "{}", stderr(&named));
+    let env = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["unit", "list"])
+        .env("HOME", &host.op_home)
+        .env("TAPECTL_HOME", &host.svc)
+        .env("TAPECTL_HOME_POINTER", &host.pointer)
+        .output()
+        .unwrap();
+    assert!(env.status.success(), "{}", stderr(&env));
+    for args in [
+        &["host", "check"][..],
+        &["completions", "bash"],
+        &["--version"],
+        &["--help"],
+    ] {
+        let out = host.run(&host.pointer, args);
+        assert!(
+            !stderr(&out).contains("refusing to run as root"),
+            "{args:?} is exempt: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// ADR-0012 item 213: `status` and `config check` name the home and the rule
+/// that chose it, for every rule an operator meets.
+#[test]
+fn status_and_config_check_name_the_home_and_why() {
+    if is_root() {
+        eprintln!("skipped: as root beside a pointer tapectl refuses (see the root test)");
+        return;
+    }
+    let host = Host::new();
+    let first_line = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // The pointer.
+    let out = host.run(&host.pointer, &["status"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(host.own_home().join("tapectl.db").exists());
+    assert_eq!(
+        first_line(&out),
+        format!(
+            "home: {} (named by the home pointer {})",
+            host.svc.display(),
+            host.pointer.display()
+        )
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&host.run(&host.pointer, &["status", "--json"]).stdout).unwrap();
+    assert_eq!(json["home_source"], "pointer");
+    assert_eq!(json["home_pointer"], host.pointer.display().to_string());
+    assert_eq!(json["home"], host.svc.display().to_string());
+    assert!(json["units"]["active"].is_number(), "{json}");
+    assert!(json["next"].is_array(), "{json}");
+
+    // `config check`: second, after the verdict scripts read first.
+    let check = host.run(&host.pointer, &["config", "check"]);
+    let text = String::from_utf8_lossy(&check.stdout);
+    let lines: Vec<&str> = text.lines().take(2).collect();
+    assert_eq!(lines[0], "config: valid", "{text}");
+    assert_eq!(
+        lines[1],
+        format!(
+            "home: {} (named by the home pointer {})",
+            host.svc.display(),
+            host.pointer.display()
+        )
+    );
+
+    // --home.
+    let out = host.run(
+        &host.pointer,
+        &["--home", host.svc.to_str().unwrap(), "status"],
+    );
+    assert_eq!(
+        first_line(&out),
+        format!("home: {} (named by --home)", host.svc.display())
+    );
+
+    // TAPECTL_HOME.
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("status")
+        .env("HOME", &host.op_home)
+        .env("TAPECTL_HOME", &host.svc)
+        .env("TAPECTL_HOME_POINTER", &host.pointer)
+        .output()
+        .unwrap();
+    assert_eq!(
+        first_line(&out),
+        format!("home: {} (named by TAPECTL_HOME)", host.svc.display())
+    );
+
+    // --config alone.
+    let cfg = host.svc.join("config.toml");
+    let out = host.run(
+        &host.pointer,
+        &["--config", cfg.to_str().unwrap(), "status"],
+    );
+    assert_eq!(
+        first_line(&out),
+        format!("home: {} (the directory of --config)", host.svc.display())
+    );
+
+    // No pointer and no ~/.tapectl: the default, not initialized, exit 2.
+    let absent = host.pointer.with_file_name("no-such-pointer");
+    let out = host.run(&absent, &["status"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(
+        first_line(&out),
+        format!(
+            "home: {} (~/.tapectl, the default: nothing named another home)",
+            host.own_home().display()
+        )
+    );
+    assert!(!host.own_home().exists(), "status made no home");
+
+    // This account's own ~/.tapectl.
+    let made = host.run(&absent, &["init", "--operator", "x"]);
+    assert!(made.status.success(), "{}", stderr(&made));
+    let out = host.run(&host.pointer, &["status"]);
+    assert_eq!(
+        first_line(&out),
+        format!(
+            "home: {} (this account's ~/.tapectl)",
+            host.own_home().display()
+        )
+    );
+}
+
+/// ADR-0012 item 213: "not initialized" names the path and the rule, and
+/// offers `tapectl init` only for a new archive, never on a host with a
+/// home pointer.
+#[test]
+fn not_initialized_names_the_path_and_offers_init_only_without_a_pointer() {
+    if is_root() {
+        eprintln!("skipped: as root beside a pointer tapectl refuses (see the root test)");
+        return;
+    }
+    let host = Host::new();
+    let absent = host.pointer.with_file_name("no-such-pointer");
+    let out = host.run(&absent, &["unit", "list"]);
+    assert_eq!(out.status.code(), Some(2));
+    let said = stderr(&out);
+    assert!(
+        said.contains(&format!(
+            "tapectl is not initialized at {}",
+            host.own_home().display()
+        )),
+        "{said}"
+    );
+    assert!(said.contains("nothing named a home"), "{said}");
+    assert!(said.contains("`tapectl init`"), "{said}");
+
+    // A pointer naming a directory with no catalog: no init offered.
+    let empty = host.svc.with_file_name("empty-home");
+    std::fs::create_dir_all(&empty).unwrap();
+    let to_empty = host.pointer.with_file_name("pointer-to-empty");
+    std::fs::write(&to_empty, format!("{}\n", empty.display())).unwrap();
+    let out = host.run(&to_empty, &["unit", "list"]);
+    assert_eq!(out.status.code(), Some(2));
+    let said = stderr(&out);
+    assert!(
+        said.contains(&format!(
+            "tapectl is not initialized at {}",
+            empty.display()
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("the home pointer {} named it", to_empty.display())),
+        "{said}"
+    );
+    assert!(said.contains("tapectl-op"), "{said}");
+    assert!(!said.contains("init`"), "{said}");
+    assert!(!empty.join("tapectl.db").exists(), "nothing was made");
+}
+
+/// ADR-0012 item 213: `init` ends with the next steps, in order, and names
+/// `tapectl status` for every step after.
+#[test]
+fn init_ends_with_the_next_steps() {
+    let tmp = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(tmp.path().join("h"))
+        .args(["init", "--operator", "op", "--no-escrow"])
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let steps = text
+        .split("next steps:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no next steps: {text}"));
+    let order = [
+        "tapectl tenant add",
+        "tapectl drive add",
+        "tapectl collection add",
+        "tapectl unit init",
+        "tapectl location add",
+        "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <PLACE>",
+        "`tapectl status`",
+    ];
+    let mut at = 0;
+    for want in order {
+        let found = steps[at..]
+            .find(want)
+            .unwrap_or_else(|| panic!("{want:?} after byte {at} in:\n{steps}"));
+        at += found + want.len();
+    }
+    assert!(!steps.contains("/dev/nst"), "{steps}");
+
+    let json = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(tmp.path().join("j"))
+        .args(["--json", "init", "--operator", "op", "--no-escrow"])
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["next"][0], "tapectl tenant add <TENANT>", "{v}");
 }
 
 /// `.cargo/config.toml` switches the system home pointer off for every test binary,

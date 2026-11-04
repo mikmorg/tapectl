@@ -3364,11 +3364,19 @@ fn tenant_info_names_the_escrow_key_as_escrow() {
     );
 }
 
-/// Issue #393: `tapectl status` reads the session logs and nothing else, so
-/// it runs against a home whose catalog and config it cannot open — here a
-/// home that has nothing BUT `logs/`, as an `[ops] group` member sees it.
+/// Issue #393 and ADR-0012 item 213: `tapectl status` reads the session logs
+/// for an account that may not open the catalog — here a home holding only
+/// `logs/` and a catalog this account may not read, as an `[ops] group`
+/// member sees it. It shows the home and the sessions, says the overview
+/// needs the service user, and exits 0: that is the view such an account is
+/// meant to have (the 1.9.0 coordinator's OQ9).
 #[test]
-fn status_reads_the_logs_without_a_catalog_or_config() {
+fn status_reads_the_logs_for_an_account_that_may_not_open_the_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: root opens a mode-0 catalog");
+        return;
+    }
     let home = TempDir::new().unwrap();
     let logs = home.path().join("logs");
     std::fs::create_dir(&logs).unwrap();
@@ -3381,14 +3389,20 @@ fn status_reads_the_logs_without_a_catalog_or_config() {
          2026-10-01T05:40:01.100Z session end after 2h 27m\n",
     )
     .unwrap();
+    // The service user's catalog, closed to this account.
+    let db = home.path().join("tapectl.db");
+    std::fs::write(&db, "").unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+
     let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .arg("--home")
         .arg(home.path())
         .args(["status", "--json"])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -3397,9 +3411,16 @@ fn status_reads_the_logs_without_a_catalog_or_config() {
     assert_eq!(s["command"], "volume write L6-0001");
     assert_eq!(s["state"], "ended");
     assert_eq!(s["outcome"], "ok");
-    assert!(
-        !home.path().join("tapectl.db").exists(),
-        "status created no catalog"
+    assert_eq!(v["logs_dir"], logs.display().to_string());
+    assert_eq!(
+        v["note"],
+        "the overview needs the service user: tapectl-op status"
+    );
+    assert!(v["units"].is_null(), "{v}");
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().len(),
+        0,
+        "status wrote nothing into the catalog"
     );
 
     let human = Command::new(env!("CARGO_BIN_EXE_tapectl"))
@@ -3408,9 +3429,65 @@ fn status_reads_the_logs_without_a_catalog_or_config() {
         .arg("status")
         .output()
         .unwrap();
+    assert_eq!(human.status.code(), Some(0));
     let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.starts_with(&format!(
+            "home: {} (named by --home)\n",
+            home.path().display()
+        )),
+        "{text}"
+    );
     assert!(text.contains("running: nothing"), "{text}");
     assert!(text.contains("volume write L6-0001  — ok"), "{text}");
+    assert!(
+        text.contains("the overview needs the service user: tapectl-op status"),
+        "{text}"
+    );
+}
+
+/// OQ6: a home with session logs and no catalog is not initialized: `status`
+/// shows what it can, names the path on stderr, exits 2, and makes nothing.
+#[test]
+fn status_of_a_home_with_no_catalog_exits_2_naming_it() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir(home.path().join("logs")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("running: nothing"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "tapectl is not initialized at {}",
+            home.path().display()
+        )),
+        "{err}"
+    );
+    assert!(
+        !home.path().join("tapectl.db").exists(),
+        "status created no catalog"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["exit_code"], 2);
+    assert!(
+        v["error"].as_str().unwrap().contains("not initialized"),
+        "{v}"
+    );
+    assert_eq!(v["sessions"], serde_json::json!([]));
 }
 
 /// A pipe whose reading end is already closed: every write to the returned
