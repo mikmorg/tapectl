@@ -384,6 +384,11 @@ fn step_7_names_the_staging_parent_the_account_cannot_traverse() {
 /// device it cannot find a sg node for (a warning, never a refusal), and the
 /// drive's facts (sysfs, `mt status`) are unreadable, which the step says.
 fn step8(rig: &Rig, profile: &Path, home: &Path) -> Output {
+    step8_with(rig, profile, home, Path::new(env!("CARGO_BIN_EXE_tapectl")))
+}
+
+/// `step8` with `tapectl` as the binary the script runs.
+fn step8_with(rig: &Rig, profile: &Path, home: &Path, tapectl: &Path) -> Output {
     let path = sudo_stub_path(rig);
     rig.command(&[
         "--profile",
@@ -394,7 +399,7 @@ fn step8(rig: &Rig, profile: &Path, home: &Path) -> Output {
         "--to",
         "8",
         "--tapectl",
-        env!("CARGO_BIN_EXE_tapectl"),
+        tapectl.to_str().unwrap(),
         "--home",
         home.to_str().unwrap(),
         "--device",
@@ -1124,4 +1129,213 @@ fn step_14_installs_for_tapectl_home_dir_and_only_plans_for_a_home() {
     assert!(!out.contains(&home.display().to_string()), "{out}");
     let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
     assert!(!recorded.contains("systemctl enable"), "{recorded}");
+}
+
+// ---------------------------------------------------------------- 1.9.0's consumers
+
+/// W2-A's residual: step 7 made a missing staging directory with `install
+/// -d`, which makes missing parents too, so an unmounted `/srv/acache` put
+/// staging on the filesystem below it. Now a missing parent is refused by
+/// name ("mounted?") and nothing is made; with the parent there, the staging
+/// directory alone is made (`mkdir` without `-p`). The `sudo` stub runs the
+/// `mkdir` for real (the test's own account can, in its temp dir).
+#[test]
+fn step_7_never_makes_a_staging_directory_under_a_missing_parent() {
+    let rig = Rig::new();
+    let home = initialised_home(&rig);
+    std::fs::create_dir_all(rig.p("srv")).unwrap();
+    let acache = rig.p("srv/acache");
+    let staging = acache.join("tapectl-staging");
+    let profile = rig.profile("p.profile", &format!("STAGING_DIR={}\n", staging.display()));
+    let calls = rig.p("calls");
+    stub(
+        &rig.p("bin"),
+        "sudo",
+        &format!(
+            "echo \"sudo $*\" >> {}\ncase \"$1\" in mkdir) \"$@\" ;; esac\nexit 0",
+            calls.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        rig.p("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let step7 = || {
+        rig.command(&[
+            "--profile",
+            profile.to_str().unwrap(),
+            "--auto",
+            "--from",
+            "7",
+            "--to",
+            "7",
+            "--tapectl",
+            env!("CARGO_BIN_EXE_tapectl"),
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("spawn first-run.sh")
+    };
+    let (a, s) = (acache.display(), staging.display());
+
+    let o = step7();
+    let (out, err) = text(&o);
+    let made = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}\n{made}");
+    assert!(
+        err.contains(&format!(
+            "the staging directory {s} cannot be made: {a} does not exist. Is its filesystem mounted?"
+        )),
+        "{err}"
+    );
+    assert!(!acache.exists(), "the missing parent was made");
+    assert!(
+        !made.contains("mkdir") && !made.contains("install"),
+        "something was made: {made}"
+    );
+
+    // The parent there: the staging directory alone is made.
+    std::fs::create_dir(&acache).unwrap();
+    let out = ok(&step7());
+    let made = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(out.contains(&format!("staging at {s}")), "{out}");
+    assert!(staging.is_dir(), "{out}");
+    assert!(
+        made.contains(&format!("sudo mkdir -m 0700 -- {s}")) && !made.contains("install -d"),
+        "{made}"
+    );
+}
+
+/// ADR-0012 item 214 (W4-B): step 8 reads the drive's `post_warning_bytes`
+/// with `config get` (`{key, value, source}`), and `config show --json` only
+/// to find the drive's name. A wrapper `tapectl` records every call.
+#[test]
+fn step_8_reads_the_drives_post_warning_bytes_with_config_get() {
+    let rig = Rig::new();
+    let home = initialised_home(&rig);
+    let calls = rig.p("tc-calls");
+    stub(
+        &rig.p("bin"),
+        "tapectl-rec",
+        &format!(
+            "echo \"$*\" >> {}\nexec {} \"$@\"",
+            calls.display(),
+            env!("CARGO_BIN_EXE_tapectl")
+        ),
+    );
+    let tc = rig.p("bin/tapectl-rec");
+    let profile = rig.profile("p.profile", "POST_WARNING_BYTES=99008M\n");
+    let get = "config get backends.lto[lto6].post_warning_bytes --json";
+
+    // The first run: the drive is added, its value read (none) and set.
+    let out = ok(&step8_with(&rig, &profile, &home, &tc));
+    let seen = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(seen.matches(get).count(), 1, "{seen}");
+    assert!(
+        out.contains("drive lto6: post_warning_bytes = 99008M (the profile's POST_WARNING_BYTES)"),
+        "{out}"
+    );
+
+    // The re-run, by device: the name from `config show --json`, the value
+    // from `config get`, which now says the profile's.
+    std::fs::remove_file(&calls).unwrap();
+    let out = ok(&step8_with(&rig, &profile, &home, &tc));
+    let seen = std::fs::read_to_string(&calls).unwrap();
+    assert!(seen.contains("config show --json"), "{seen}");
+    assert_eq!(seen.matches(get).count(), 1, "{seen}");
+    assert!(
+        out.contains("drive lto6: post_warning_bytes = 99008M already, as the profile says"),
+        "{out}"
+    );
+}
+
+/// ADR-0012 item 206 (W2-B): step 11 configures the profile's COLLECTIONS
+/// with `collection add`, which takes an older init's `collections = []` line
+/// itself, and `collection sync`'s exit 1 (warnings: here a file outside every
+/// unit) is a note, not a stop (OQ6). A re-run finds the collection configured
+/// and adds nothing.
+#[test]
+fn step_11_adds_collections_with_collection_add_and_a_sync_warning_is_a_note() {
+    let rig = Rig::new();
+    let home = initialised_home(&rig);
+    let cfg = home.join("config.toml");
+    let old = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("collections = []\n{old}")).unwrap();
+    let root = rig.p("src/keepsake");
+    for u in ["a", "b"] {
+        std::fs::create_dir_all(root.join(u)).unwrap();
+        std::fs::write(root.join(u).join("f"), u).unwrap();
+    }
+    std::fs::write(root.join("loose.txt"), "outside every unit").unwrap();
+    let profile = rig.profile(
+        "p.profile",
+        &format!(
+            "TENANTS=(\"family|the family\")\nCOLLECTIONS=(\"keepsake|{}|family|1\")\n",
+            root.display()
+        ),
+    );
+    let path = sudo_stub_path(&rig);
+    let step11 = || {
+        rig.command(&[
+            "--profile",
+            profile.to_str().unwrap(),
+            "--auto",
+            "--from",
+            "11",
+            "--to",
+            "11",
+            "--tapectl",
+            env!("CARGO_BIN_EXE_tapectl"),
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("spawn first-run.sh")
+    };
+
+    let out = ok(&step11());
+    assert!(
+        out.contains(&format!(
+            "$ tc collection add keepsake {} --tenant family --unit-depth 1",
+            root.display()
+        )),
+        "{out}"
+    );
+    for what in ["collection sync --dry-run", "collection sync"] {
+        assert!(
+            out.contains(&format!("{what} reported warnings (exit 1, above)")),
+            "{what}: {out}"
+        );
+    }
+    let written = std::fs::read_to_string(&cfg).unwrap();
+    assert!(
+        !written.lines().any(|l| l.trim() == "collections = []"),
+        "{written}"
+    );
+    let show: serde_json::Value =
+        serde_json::from_str(&tapectl_at(&rig, &home, &["config", "show", "--json"])).unwrap();
+    let names: Vec<&str> = show["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["keepsake"]);
+    let units = tapectl_at(&rig, &home, &["unit", "list", "--json"]);
+    assert!(
+        units.contains("keepsake/a") && units.contains("keepsake/b"),
+        "the sync registered the units: {units}"
+    );
+
+    // The re-run: configured already, nothing added.
+    let out = ok(&step11());
+    assert!(
+        out.contains("collection keepsake is already in config.toml"),
+        "{out}"
+    );
+    assert!(!out.contains("$ tc collection add"), "{out}");
 }

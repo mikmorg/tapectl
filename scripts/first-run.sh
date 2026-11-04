@@ -794,14 +794,25 @@ staging_why() {
 # offer a chown that could not help. Nothing is given away by chown: a DIR that
 # does not exist is created for the account (as home2-prep.sh part 4 creates
 # it), and a DIR that exists is left as it is.
+#
+# Only DIR itself is ever created, never a missing parent: a parent that is not
+# there is most likely a filesystem that is not mounted (/srv/acache after a
+# reboot), and making the whole path would put staging on the filesystem below
+# it, the root one on home2. That is refused, naming the parent.
 staging_ready() {
-  local dir="$1" who reach p
+  local dir="$1" who reach p miss
   who="$(svc_name)"
   reach="$(svc_reach "$dir")"
   case "$reach" in
     missing\ *)
-      note "$dir does not exist (${reach#missing } is missing): creating it for $who, mode 0700"
-      run sudo install -d -o "$who" -m 0700 "$dir" || die "could not create the staging directory $dir (above)"
+      miss="${reach#missing }"
+      [ "$miss" = "$dir" ] \
+        || die "the staging directory $dir cannot be made: $miss does not exist. Is its filesystem mounted? Nothing was created: making the whole path would put staging on the filesystem below it. Mount it (or, if staging belongs there, create $miss yourself), then re-run with --from 7"
+      note "$dir does not exist: creating it for $who, mode 0700 (its parent $(dirname "$dir") is there)"
+      # mkdir without -p: it makes the last component only, so a parent that
+      # went away since the check above fails it instead of being made.
+      run sudo mkdir -m 0700 -- "$dir" || die "could not create the staging directory $dir (above)"
+      run sudo chown -- "$who" "$dir" || die "could not give the staging directory $dir to $who (above)"
       reach="$(svc_reach "$dir")" ;;
   esac
   case "$reach" in
@@ -816,12 +827,11 @@ staging_ready() {
     die "$who cannot write the staging directory $dir ($(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo 'mode unreadable')); every directory above it lets $who through. Grant $who write on it, then re-run with --from 7:  sudo setfacl -m u:$who:rwx $dir"
   fi
 }
-# drive_setting BY VALUE: the configured drive whose name (BY=name) or tape
-# node (BY=device; VALUE is the node its device_tape resolves to) is VALUE, as
-# "NAME<US>PWB", PWB being its post_warning_bytes or empty when it has none;
-# nothing when no drive is. Read from `config show --json`, the file as tapectl
-# loads it. Fails when that cannot be read.
-drive_setting() {
+# drive_name BY VALUE: the name of the configured drive whose name (BY=name)
+# or tape node (BY=device; VALUE is the node its device_tape resolves to) is
+# VALUE; nothing when no drive is. Read from `config show --json`, the file as
+# tapectl loads it. Fails when that cannot be read.
+drive_name() {
   local j
   j="$(tc config show --json 2>/dev/null)" || return 1
   printf '%s' "$j" | python3 -c 'import json, os, sys
@@ -830,9 +840,20 @@ d = json.load(sys.stdin)
 for b in (d.get("backends") or {}).get("lto") or []:
     name = b.get("name", "")
     if (name == want) if by == "name" else (os.path.realpath(b.get("device_tape", "")) == want):
-        v = b.get("post_warning_bytes")
-        print("%s\x1f%s" % (name, "" if v is None else v))
+        print(name)
         break' "$1" "$2"
+}
+# drive_post_warning_value NAME: drive NAME's post_warning_bytes as tapectl
+# reads it, from `config get` (ADR-0012 item 214: `{key, value, source}`, the
+# value null when nothing sets it); empty when it has none. Fails when that
+# cannot be read.
+drive_post_warning_value() {
+  local j
+  log "\$ tc config get backends.lto[$1].post_warning_bytes --json"
+  j="$(tc config get "backends.lto[$1].post_warning_bytes" --json 2>/dev/null)" || return 1
+  printf '%s' "$j" | python3 -c 'import json, sys
+v = json.load(sys.stdin)["value"]
+print("" if v is None else v)'
 }
 # drive_post_warning BY VALUE (ADR-0012 item 200): the profile's
 # POST_WARNING_BYTES onto that drive's post_warning_bytes, the same on a first
@@ -841,15 +862,16 @@ for b in (d.get("backends") or {}).get("lto") or []:
 # naming both values and both ways on. Without POST_WARNING_BYTES, a drive that
 # has no value gets one line here; what that loses is config check's note, once.
 drive_post_warning() {
-  local hit name cur
-  hit="$(drive_setting "$1" "$2")" \
+  local name cur
+  name="$(drive_name "$1" "$2")" \
     || die "could not read the configured drives ($OP_CMD config show --json failed; $OP_CMD config check says why)"
-  if [ -z "$hit" ]; then
+  if [ -z "$name" ]; then
     [ "$1" = device ] || die "config.toml has no drive named $2 ($OP_CMD config show)"
     note "no configured drive's device_tape is $2, so its post_warning_bytes is left alone"
     return 0
   fi
-  name="${hit%%$'\x1f'*}"; cur="${hit#*$'\x1f'}"
+  cur="$(drive_post_warning_value "$name")" \
+    || die "could not read drive $name's post_warning_bytes ($OP_CMD config get 'backends.lto[$name].post_warning_bytes' failed; $OP_CMD config check says why)"
   if [ -z "$POST_WARNING_BYTES" ]; then
     if [ -n "$cur" ]; then
       ok "drive $name: post_warning_bytes = $cur (already set; the profile sets no POST_WARNING_BYTES)"
@@ -1144,7 +1166,10 @@ else
     U_BACKUP="$U_BDIR/tapectl-pre-$NEW_VER-$(date -u +%Y%m%dT%H%M%SZ).db"
     note "tapectl-pre-$NEW_VER.db is there already; this backup goes to $U_BACKUP"
   fi
-  run tc db backup --to "$U_BACKUP" || die "db backup with $OLD_VER failed (above); nothing has changed"
+  # The OLD binary's own spelling (ADR-0012 OQ1): `db backup FILE` from 1.9.0,
+  # `db backup --to FILE` before it (1.9.0 refuses --to by name).
+  if vercmp_ge "$OLD_VER" 1.9.0; then U_BACKUP_ARGS=("$U_BACKUP"); else U_BACKUP_ARGS=(--to "$U_BACKUP"); fi
+  run tc db backup "${U_BACKUP_ARGS[@]}" || die "db backup with $OLD_VER failed (above); nothing has changed"
   _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP just written"
   [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check: do not go on"
   ustate_set backup "$U_BACKUP"
@@ -1622,8 +1647,10 @@ and staging path intact.
 Regenerating starts from tapectl's own defaults instead. Your database, keys,
 tenants and every tape are untouched — only config.toml is replaced — but the
 config's [[backends.lto]] and [[collections]] tables are NOT carried over.
-This script re-adds the drive in step 8; any collections must be re-added by
-hand afterwards.
+This script re-adds the drive in step 8, and step 11 the profile's
+COLLECTIONS; any other collection is re-added with `tapectl collection add
+NAME ROOT --tenant TENANT` (the old file, kept beside the new one, has its
+table).
 EOF
     # Item 189: `confirm` says yes under --auto, and regenerating drops tables.
     [ "$AUTO" = 1 ] && die "config.toml cannot be loaded (above), and regenerating it drops its [[backends.lto]] and [[collections]] tables, so --auto never does it (ADR-0012 item 189): fix the key named above, or run step 7 interactively (scripts/first-run.sh --from 7, without --auto) to regenerate it"
@@ -1643,7 +1670,7 @@ EOF
       tc config show >/dev/null 2>&1 \
         || die "the freshly generated config still does not load — that is a bug in tapectl, not in your configuration; your original is at $CFG_BAK"
       ok "fresh config.toml written; previous kept at $CFG_BAK"
-      note "staging.directory and the drive are re-asked below; re-add any [[collections]] by hand."
+      note "staging.directory and the drive are re-asked below; re-add each collection the profile does not name with $OP_CMD collection add NAME ROOT --tenant TENANT (the old tables are in $CFG_BAK)."
     else
       die "cannot continue with a config tapectl will not load — fix the key named above, then re-run with --from 7"
     fi
@@ -1971,7 +1998,7 @@ A TENANT is a person or trust domain with their own age keys. Everything staged 
 
 A UNIT is one directory archived as one entity: a photo year, a project, a show season. It gets a .tapectl-unit.toml (a uuid, so renames are survivable) and is what you snapshot, stage and restore. Keep units at the size you would want to restore in one go.
 
-A COLLECTION is a folder-per-unit source root bound to ONE tenant: `collection sync` registers every child folder at a fixed depth as a unit — the right tool when a tenant's data is already "one folder per thing". Configure it as a [[collections]] table in config.toml.
+A COLLECTION is a folder-per-unit source root bound to ONE tenant: `collection sync` registers every child folder at a fixed depth as a unit — the right tool when a tenant's data is already "one folder per thing". Add one with `tapectl collection add NAME ROOT --tenant TENANT`, which checks the root, the tenant and the service user's access before it writes the [[collections]] table into config.toml.
 
 Layout that works: one top directory per tenant (/data/alice, /data/bob), units or a collection root beneath. A path belongs to exactly one tenant.
 
@@ -2019,23 +2046,42 @@ except Exception: pass' 2>/dev/null || true) "
     { [ -n "$CNAME" ] && [ -n "$CROOT" ] && [ -n "$CTEN" ]; } || die "COLLECTIONS entry '$spec' is not name|root|tenant|unit_depth"
     [ -d "$CROOT" ] || sudo test -d "$CROOT" || die "collection $CNAME: $CROOT is not a directory"
     grant_collection "$CROOT" "$CDEPTH" || die "$SVC_USER cannot read $CROOT — not configuring collection $CNAME"
-    if as_svc grep -qE "^name *= *\"$CNAME\"" "$CFG"; then
+    # The collections config.toml already has, by name, as tapectl loads it.
+    CNAMES="$(tc config show --json 2>/dev/null | python3 -c 'import json, sys
+for c in json.load(sys.stdin).get("collections") or []:
+    print(c.get("name", ""))')" \
+      || die "could not read the configured collections ($OP_CMD config show --json failed; $OP_CMD config check says why)"
+    if printf '%s\n' "$CNAMES" | grep -Fx -- "$CNAME" >/dev/null; then
       ok "collection $CNAME is already in config.toml"
     else
-      # init no longer writes `collections = []` (issue #345), but a config
-      # written by an older init still carries it, and a [[collections]] table
-      # beside it is a duplicate key — so an empty one goes first if present.
-      as_svc sed -i '/^collections *= *\[\] *$/d' "$CFG"
-      printf '\n[[collections]]\nname       = "%s"\nroot       = "%s"\ntenant     = "%s"\nunit_depth = %s\n' \
-        "$CNAME" "$CROOT" "$CTEN" "$CDEPTH" | as_svc tee -a "$CFG" >/dev/null
-      tc config show >/dev/null 2>&1 || die "config.toml does not load after adding collection $CNAME — read: tapectl config check"
+      # ADR-0012 item 206: `collection add` refuses a root that is missing,
+      # relative or overlapping another, a tenant that does not exist, and
+      # access the service user lacks (printing the setfacl lines that grant
+      # it); then it writes the [[collections]] table, an old init's
+      # `collections = []` line included (issue #345), and shows the sync's
+      # dry run. A refusal stops the step: nothing was written.
+      run tc collection add "$CNAME" "$CROOT" --tenant "$CTEN" --unit-depth "$CDEPTH" \
+        || die "collection add refused collection $CNAME (above): nothing was written. Act on what it names, then re-run with --from 11"
       ok "collection $CNAME: $CROOT (tenant $CTEN, a unit per folder at depth $CDEPTH)"
     fi
   done
+  # sync_outcome RC WHAT: `collection sync`'s exit status (ADR-0012 OQ6): 0
+  # clean; 1 warnings (a folder refused for its name, an entry outside every
+  # unit, a unit marked missing), each said above and a note here; 2 or more
+  # errors, which stop the step.
+  sync_outcome() {
+    case "$1" in
+      0) ;;
+      1) note "$2 reported warnings (exit 1, above): they stop nothing; read them, and move or exclude what they name when you can" ;;
+      *) die "$2 failed (exit $1, above): fix what it names, then re-run with --from 11" ;;
+    esac
+  }
   if [ "${#COLLECTIONS[@]}" -gt 0 ]; then
-    run tc collection sync --dry-run || die "collection sync --dry-run failed"
+    src=0; run tc collection sync --dry-run || src=$?
+    sync_outcome "$src" "collection sync --dry-run"
     if confirm "Register those units now (collection sync writes a .tapectl-unit.toml into each folder)?"; then
-      run tc collection sync --yes || die "collection sync failed"
+      src=0; run tc collection sync --yes || src=$?
+      sync_outcome "$src" "collection sync"
     fi
   fi
   NT=$((NT + ${#TENANTS[@]}))
@@ -2053,7 +2099,7 @@ while [ "$ADD_MORE" = 1 ]; do
     run tc tenant add "$TENANT" -d "$TDESC" || note "(already exists?)"
   fi
   explain <<'EOF'
-Register this tenant's data as units. Give a directory and it becomes one unit; repeat for each. (For a folder-per-unit tree, add a [[collections]] stanza instead — shown at the end of this step.)
+Register this tenant's data as units. Give a directory and it becomes one unit; repeat for each. (For a folder-per-unit tree, use `tapectl collection add` instead — shown at the end of this step.)
 EOF
   UP="$UNIT_PATH"
   while :; do
@@ -2091,19 +2137,14 @@ done
 run tc tenant list || true
 run tc unit list || true
 explain <<'EOF'
-Folder-per-unit alternative. Add a `[[collections]]` table to config.toml (a config written by an older init may carry `collections = []` near the top — delete that line first, or the file stops loading with a duplicate key; `config check` says so), then run `tapectl collection sync`:
+Folder-per-unit alternative: `tapectl collection add`. It checks that the root exists and overlaps no other collection's, that the tenant exists, and that the service user can read the tree and write each unit folder; when it cannot, it prints the setfacl lines that grant it and adds nothing. Then it writes the [[collections]] table into config.toml and shows the sync's dry run, and `tapectl collection sync` registers the units. Grant the service user the root first, the same way as above:
 
-  [[collections]]
-  name       = "alice-photos"       # unit names become "alice-photos/<folder>"
-  root       = "/data/alice/photos"
-  tenant     = "alice"
-  unit_depth = 1                    # 1 = each immediate child folder is a unit
-  # exclude    = ["*.partial"]
-  # archive_set = "critical"
-
-`collection status` shows what is pending; `collection plan` fills tape-sized batches; `collection run` stages and writes them. Grant the service user the root the same way first:
   sudo setfacl -R -m u:tapectl:rX /data/alice/photos && sudo setfacl -R -d -m u:tapectl:rX /data/alice/photos
   sudo setfacl -m u:tapectl:rwX /data/alice/photos/*      # each unit folder gets the dotfile
+  tapectl collection add alice-photos /data/alice/photos --tenant alice   # units: alice-photos/<folder>
+  tapectl collection sync
+
+`--unit-depth 2` makes each folder two levels down a unit (show/season); `--exclude '*.partial'` and `--archive-set NAME` are there too. `collection status` shows what is pending; `collection plan` fills tape-sized batches; `collection run` stages and writes them; `collection remove NAME` takes a collection out of config.toml and leaves its units.
 EOF
 }
 
@@ -2748,19 +2789,34 @@ elif confirm "Install the audit and backup timers and /usr/local/bin/tapectl-op 
   else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 else note "skipped — later: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
+# What the CTO does next (ADR-0012 items 213, 218, 219): copy 2 is step 13
+# again with the next label and the profile's second place.
+# next_label L: L with its trailing number one higher, its width kept
+# (L6-0001 -> L6-0002); <next-label> when L ends in no number.
+next_label() {
+  if [[ "$1" =~ ^(.*[^0-9])?([0-9]+)$ ]]; then
+    printf '%s%0*d' "${BASH_REMATCH[1]}" "${#BASH_REMATCH[2]}" "$((10#${BASH_REMATCH[2]} + 1))"
+  else printf '<next-label>'; fi
+}
+NEXT_LABEL="$(next_label "${LABEL:-}")"
+NEXT_PLACE="${LOCATIONS[1]:-}"; NEXT_PLACE="${NEXT_PLACE%%|*}"; NEXT_PLACE="${NEXT_PLACE:-<another place>}"
 cat <<EOF
+   • Where things stand, any time: ${OP_CMD} status (what is running, the units by state, what to do next).
    • Every tapectl command from now on: ${OP_CMD} <command>$( [ "$WRAPPER_INSTALLED" = 1 ] || printf '   (alias it)' ). Its home: $EFFECTIVE_HOME
    • A restore destination must be writable by ${SVC_USER}; new unit trees need the same ACL grant as step 11.
-   • Eject with: ${OP_CMD} drive eject (it tells the catalog; a write or verify in progress refuses it). Write the label on the cartridge.
-     Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
-     ${OP_CMD} cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
-   • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,
-     \`${OP_CMD} volume init <label-2>\`, \`${OP_CMD} volume write <label-2> --keep-staging\`, then \`volume move <label-2> --to <other shelf>\`
-     (or both in one: \`${OP_CMD} volume write <label-2> --init --full-confirm --move-to <other shelf>\`).
-     (Only if staging was cleaned: load tape 1 first and \`volume read-slices <unit> --from ${LABEL:-<label>}\` per unit.)
+   • Eject with: ${OP_CMD} drive eject (it names the volume and where it belongs; a write or verify in progress refuses it).
+     Write the volume's label on the cartridge's sticker: volume init gave the cartridge that label as its
+     barcode (ADR-0012 item 219; the chip serial stays its identity).
+   • The next copy: load a blank cartridge and run step 13 again, with the next label and the place the tape goes:
+       scripts/first-run.sh${PROFILE:+ --profile $PROFILE} --from 13 --label ${NEXT_LABEL} --location ${NEXT_PLACE}
+     It is the same loop: the write takes the units still owed a copy from staging, reads every file back,
+     records the tape at that place, and releases each unit's staging once it has its copy floor.
+     By hand, the same in one command: ${OP_CMD} volume write ${NEXT_LABEL} --init --full-confirm --move-to ${NEXT_PLACE}
+     (Only if a unit's staging was released before its copies were all made: load tape 1 first and
+     \`${OP_CMD} volume read-slices <unit> --from ${LABEL:-<label>}\` per unit.)
    • \`tapectl audit\` runs weekly and the catalog is copied daily to ${BACKUP_DIR:-$BACKUP_DIR_DEFAULT} (systemctl list-timers 'tapectl-*');
      after each session: sudo systemctl start tapectl-backup.service, and regenerate the heir kit (step 9).
-   • \`${OP_CMD} status\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
+   • \`${OP_CMD} report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
      \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
    • Disaster recovery, the whole procedure: docs/operator-guide.md, "Disaster Recovery".
    • Reinstall, move to another host, uninstall: docs/install.md.
