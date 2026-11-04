@@ -670,7 +670,7 @@ fn run(
         }
         Commands::Config { ref command } => {
             // `Check`, `Set`, `Add` and `Remove` are intercepted above, before
-            // the strict `Config::load` (#173, #143); only `Show` reaches here.
+            // the strict `Config::load` (#173, #143); only `Show` and `Get` reach here.
             let exit_code = cli::config::run(&conn, &paths, command, cli.json, cli.dry_run)?;
             exit_if_nonzero(exit_code);
         }
