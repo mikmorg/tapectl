@@ -22845,9 +22845,10 @@ mod tests {
         }
 
         /// Issue #410: a full confirm stopped by a signal keeps what it read
-        /// back clean, and its error tells the operator to resume WITH
-        /// `--full-confirm` — without it the resume runs the quick confirm
-        /// and the readback is not continued.
+        /// back clean, and its error names the resume that continues the full
+        /// readback. Since ADR-0012 item 215 the write records its
+        /// `--full-confirm` with the session, so that resume is the bare
+        /// command, and the error says it continues the full readback.
         #[test]
         fn an_interrupted_full_confirm_says_how_to_continue_it() {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -22880,8 +22881,11 @@ mod tests {
             let msg = err.to_string();
             assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{msg}");
             assert!(
-                msg.contains("volume resume SW-STOP --full-confirm"),
-                "names the flag that continues the readback: {msg}"
+                msg.contains(
+                    "run `tapectl volume resume SW-STOP` to continue the full readback (files it \
+                     already read back clean are not read again), as the write asked"
+                ),
+                "names the resume that continues the readback: {msg}"
             );
             let checkpoints: Vec<u32> = conn
                 .prepare(
@@ -24972,7 +24976,7 @@ mod tests {
                         Some(no_slice_on_disk),
                         StoppedWrite::NothingOpen,
                         "tapectl volume write L",
-                        "failed pre-write validation",
+                        "Nothing was written and the drive was not touched",
                     ),
                 ];
                 for (fault, prepare, state, command, phrase) in cases {
