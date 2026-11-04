@@ -639,7 +639,9 @@ fn show_dirty_status(
     } else {
         match status.state {
             "clean" => println!("unit \"{}\": clean", unit.name),
-            "new" => println!("unit \"{}\": new — never archived", unit.name),
+            // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item 208).
+            // The JSON `state` value keeps its spelling.
+            "new" => println!("unit \"{}\": never archived", unit.name),
             _ => {
                 println!(
                     "unit \"{}\": dirty ({} added, {} removed, {} modified)",

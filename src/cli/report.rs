@@ -11,7 +11,13 @@ pub enum ReportCommands {
     /// Removed in 1.9.0: `status` (ADR-0012 item 209)
     #[command(hide = true, disable_help_flag = true)]
     Summary(crate::cli::renamed::Removed),
-    /// Units at risk: below min copies/locations
+    /// Units below their copy floor, judged by copies only
+    ///
+    /// A unit is listed when it has fewer copies than its copy floor (the
+    /// larger of `min_copies` and its `copies_at` sum, raised by the tape-only
+    /// multiplier for a tape-only unit), or when its policy will not resolve.
+    /// The places its copies are in are counted and shown, not judged:
+    /// `report needs` judges each location, and `audit` judges everything.
     FireRisk,
     /// Each unit's copy target, copies and shortfall at every location
     ///
@@ -167,6 +173,20 @@ pub fn run(
     }
 }
 
+/// A `--unit` that names no unit is an error, never an empty report
+/// (ADR-0012 items 212 and 220): `report copies --unit nope` used to print
+/// nothing and exit 0, so a typo read as "no data". Checked by the report
+/// commands themselves, not in their `*_rows` scans, which `audit` and the
+/// gates share with their own unit handling.
+fn require_known_unit(conn: &Connection, unit_filter: Option<&str>) -> Result<()> {
+    if let Some(name) = unit_filter {
+        if queries::get_unit_by_name(conn, name)?.is_none() {
+            return Err(crate::error::TapectlError::UnitNotFound(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Issue #90 (as re-scoped): superseded versions accumulate silently
 /// because `snapshot mark-reclaimable` is a manual step nothing prompts.
 /// This is the prompt.
@@ -187,14 +207,17 @@ fn report_reclaimable(conn: &Connection, config: &Config, json_output: bool) -> 
     use crate::policy::reclaimable::ReclaimVerdict;
 
     let found = crate::policy::reclaimable::candidates(conn, config)?;
-    let summary = supersedable_summary(&found);
+    let summary = reclaimable_summary(&found);
 
     if json_output {
         println!("{summary}");
     } else if found.is_empty() {
-        println!("supersedable: nothing to release (no unit has more than one current snapshot)");
+        println!("reclaimable: nothing to release (no unit has more than one current snapshot)");
     } else {
-        println!("supersedable snapshots ({} candidate(s)):", found.len());
+        println!(
+            "snapshots that could be marked reclaimable ({}):",
+            crate::render::plural(found.len() as i64, "candidate", "candidates")
+        );
         for c in &found {
             match &c.verdict {
                 ReclaimVerdict::Releasable {
@@ -240,7 +263,7 @@ fn report_reclaimable(conn: &Connection, config: &Config, json_output: bool) -> 
 /// The total sums the RELEASABLE candidates only — a blocked one's bytes
 /// are shown per-row (they are what clearing the blocker would buy) but
 /// must never be advertised as available.
-fn supersedable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serde_json::Value {
+fn reclaimable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serde_json::Value {
     use crate::policy::reclaimable::ReclaimVerdict;
 
     let mut total_freeable: i64 = 0;
@@ -610,7 +633,7 @@ pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
 pub(crate) enum FireRisk {
     /// No copies at all.
     NoCopies,
-    /// Fewer copies than this unit's own resolved `min_copies`.
+    /// Fewer copies than this unit's own copy floor.
     BelowMinimum,
     /// The unit's policy could not be resolved, so its threshold is unknown
     /// (issue #106). It is LISTED rather than skipped: a unit whose policy
@@ -629,9 +652,9 @@ pub(crate) struct FireRiskRow {
     pub copies: i64,
     pub locations: i64,
     pub deposits: i64,
-    /// This unit's own resolved `min_copies`, not the global default
-    /// (issue #106). `None` when the policy would not resolve.
-    pub min_copies: Option<i64>,
+    /// This unit's own copy floor (`coverage::copy_floor`), not the global
+    /// default (issue #106). `None` when the policy would not resolve.
+    pub copy_floor: Option<i64>,
     pub risk: FireRisk,
 }
 
@@ -714,7 +737,7 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
         else {
             continue;
         };
-        let (min_copies, risk) = match crate::policy::resolve(conn, config, &unit) {
+        let (copy_floor, risk) = match crate::policy::resolve(conn, config, &unit) {
             Ok(p) => {
                 // The one copy floor (#493, ADR-0012 item 149: the larger of
                 // `min_copies` and the `copies_at` sum), as `audit` judges.
@@ -736,16 +759,16 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
             copies,
             locations,
             deposits,
-            min_copies,
+            copy_floor,
             risk,
         });
     }
     Ok(at_risk)
 }
 
-fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let at_risk = fire_risk_rows(conn, config)?;
-
+/// `report fire-risk --json`, built apart from the printing so its keys are
+/// assertable.
+fn fire_risk_json(at_risk: &[FireRiskRow]) -> serde_json::Value {
     let risks: Vec<serde_json::Value> = at_risk
         .iter()
         .map(|r| {
@@ -754,8 +777,10 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                 "locations": r.locations, "warehouse_deposits": r.deposits,
                 // The threshold this unit was actually judged against, so a
                 // scripted consumer can tell a 2-copy unit failing a
-                // min_copies=3 archive set from one failing the default.
-                "min_copies": r.min_copies,
+                // min_copies=3 archive set from one failing the default. It
+                // is the copy floor, not the `min_copies` setting (ADR-0012
+                // item 208), so it carries the floor's name.
+                "copy_floor": r.copy_floor,
                 "risk": match &r.risk {
                     FireRisk::NoCopies => "no_copies",
                     FireRisk::BelowMinimum => "below_minimum",
@@ -768,14 +793,16 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
             })
         })
         .collect();
+    serde_json::json!({"at_risk": risks.len(), "units": risks})
+}
+
+fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let at_risk = fire_risk_rows(conn, config)?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"at_risk": risks.len(), "units": risks})
-        );
+        println!("{}", fire_risk_json(&at_risk));
     } else if at_risk.is_empty() {
-        println!("fire-risk: all units meet their resolved minimum copy requirements");
+        println!("fire-risk: every unit has the copies its copy floor asks for");
     } else {
         println!("FIRE RISK: {} unit(s) at risk", at_risk.len());
         for r in &at_risk {
@@ -796,7 +823,7 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                     let severity = if *other == FireRisk::NoCopies {
                         "ZERO COPIES"
                     } else {
-                        "below minimum"
+                        "below its copy floor"
                     };
                     println!(
                         "  {}: {} copies{}, {} locations — {severity} (needs {})",
@@ -804,7 +831,7 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                         r.copies,
                         warehouse_note(r.deposits),
                         r.locations,
-                        r.min_copies
+                        r.copy_floor
                             .map(|m| m.to_string())
                             .unwrap_or_else(|| "?".into()),
                     );
@@ -1308,6 +1335,7 @@ fn mark_ineligible_volumes(vols: &str, not_eligible: &str) -> String {
 }
 
 fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    require_known_unit(conn, unit_filter)?;
     let rows = copies_rows(conn, unit_filter)?;
     let gaps = escrow_gaps_by_unit(conn, unit_filter)?;
     let ranges = range_holdings_by_unit(conn, unit_filter)?;
@@ -1491,6 +1519,7 @@ pub(crate) fn tape_only_rows(
 }
 
 fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    require_known_unit(conn, unit_filter)?;
     let rows = tape_only_rows(conn, unit_filter)?;
 
     if json_output {
@@ -1599,6 +1628,7 @@ fn report_dirty(
     json_output: bool,
     global_excludes: &[String],
 ) -> Result<()> {
+    require_known_unit(conn, unit_filter)?;
     let rows = dirty_rows(conn, unit_filter, global_excludes)?;
 
     if json_output {
@@ -1624,7 +1654,9 @@ fn report_dirty(
         for r in &rows {
             match r.state {
                 "clean" => println!("  {}: clean", r.name),
-                "new" => println!("  {}: new — never archived", r.name),
+                // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item
+                // 208). The JSON `state` value keeps its spelling.
+                "new" => println!("  {}: never archived", r.name),
                 "unreadable" => println!(
                     "  {}: UNREADABLE — dirty scan could not run ({})",
                     r.name,
@@ -3256,6 +3288,7 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
 }
 
 fn report_age(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
+    require_known_unit(conn, unit_filter)?;
     let mut sql = String::from(
         "SELECT u.name, s.version, s.status, s.created_at
          FROM snapshots s
@@ -3714,7 +3747,8 @@ pub(crate) fn plan_compaction(
 }
 
 /// The destination tape the planner packs against: `generation` (or the
-/// drive's own) at the drive's fill ceiling, less its end-of-tape reserve —
+/// drive's own) at the drive's fill ceiling, less its reserve before the
+/// early warning (`enospc_buffer`) —
 /// `collection plan`'s budget. With no drive configured the generation is
 /// required and the defaults apply.
 fn planner_budget(config: &Config, generation: Option<&str>) -> Result<crate::config::TapeBudget> {
@@ -4640,11 +4674,23 @@ mod tests {
                 .find(|r| r.unit == "photos")
                 .expect("the archive set demands 3 copies and the unit has 2 — it is at risk");
             assert_eq!(
-                row.min_copies,
+                row.copy_floor,
                 Some(3),
                 "the reported threshold must be the RESOLVED one, not the global default"
             );
             assert_eq!(row.risk, FireRisk::BelowMinimum);
+
+            // ADR-0012 item 208, OQ5: the JSON key carrying that threshold
+            // is the copy floor's name, not the `min_copies` setting's.
+            let json = fire_risk_json(&rows);
+            let unit = json["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["unit"] == "photos")
+                .expect("photos in the JSON");
+            assert_eq!(unit["copy_floor"], 3, "{json}");
+            assert!(unit.get("min_copies").is_none(), "{json}");
         }
 
         /// The other direction, so the test above cannot pass by simply
@@ -4701,7 +4747,7 @@ mod tests {
                 .expect("an unresolvable unit must not vanish from the risk report");
             assert!(matches!(row.risk, FireRisk::PolicyUnresolvable(_)));
             assert_eq!(
-                row.min_copies, None,
+                row.copy_floor, None,
                 "no threshold is known, and reporting one would be a guess"
             );
         }
@@ -4806,6 +4852,51 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "clean_unit");
         assert_eq!(rows[0].state, "clean");
+    }
+
+    /// ADR-0012 items 212 and 220: a `--unit` naming no unit is an error in
+    /// every report that takes one, never an empty report (`report copies
+    /// --unit nope` printed nothing and exited 0). A unit that exists but
+    /// matches nothing (here: not tape-only) is still an empty report.
+    #[test]
+    fn every_report_refuses_a_unit_that_does_not_exist() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+        let config = Config::default();
+        let unit = Some("nope".to_string());
+        for command in [
+            ReportCommands::Copies { unit: unit.clone() },
+            ReportCommands::TapeOnly { unit: unit.clone() },
+            ReportCommands::Dirty { unit: unit.clone() },
+            ReportCommands::Age { unit: unit.clone() },
+        ] {
+            for json in [false, true] {
+                let err = run(&conn, &config, &command, json)
+                    .expect_err(&format!("{command:?} --json={json} must refuse"));
+                assert!(
+                    matches!(err, crate::error::TapectlError::UnitNotFound(ref n) if n == "nope"),
+                    "{command:?}: {err}"
+                );
+            }
+        }
+        // Positive control: a unit that exists runs, even where nothing matches.
+        let known = Some("clean_unit".to_string());
+        for command in [
+            ReportCommands::Copies {
+                unit: known.clone(),
+            },
+            ReportCommands::TapeOnly {
+                unit: known.clone(),
+            },
+            ReportCommands::Dirty {
+                unit: known.clone(),
+            },
+            ReportCommands::Age {
+                unit: known.clone(),
+            },
+        ] {
+            run(&conn, &config, &command, true).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+        }
     }
 
     #[test]
@@ -5051,7 +5142,7 @@ mod tests {
 
         fn summary_for(conn: &Connection) -> serde_json::Value {
             let found = crate::policy::reclaimable::candidates(conn, &Config::default()).unwrap();
-            supersedable_summary(&found)
+            reclaimable_summary(&found)
         }
 
         #[test]

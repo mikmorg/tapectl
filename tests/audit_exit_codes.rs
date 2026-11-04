@@ -65,6 +65,40 @@ fn an_audit_that_errors_exits_70_not_2() {
     );
 }
 
+/// ADR-0012 items 212 and 220: an unknown `--unit` is an error in `report`
+/// too, with the ordinary error code (2) — `report copies --unit nope` used
+/// to print nothing and exit 0, so a typo read as "no data". `audit` keeps
+/// 70 for the same mistake (above; OQ6).
+#[test]
+fn a_report_of_a_unit_that_does_not_exist_exits_2() {
+    let home = initialised_home();
+    for args in [
+        &["report", "copies", "--unit", "nope"][..],
+        &["report", "tape-only", "--unit", "nope"],
+        &["report", "dirty", "--unit", "nope"],
+        &["report", "age", "--unit", "nope"],
+        &["--json", "report", "copies", "--unit", "nope"],
+    ] {
+        let out = tapectl(home.path(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            format!("{stdout}{stderr}").contains("unit not found: nope"),
+            "{args:?}: the error names the unit: stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+    }
+
+    // Positive control: the same report with no `--unit` runs and exits 0.
+    let out = tapectl(home.path(), &["report", "copies"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// An error raised before the audit itself runs — here, a home that was
 /// never initialised — is still an error of the `audit` invocation.
 #[test]
