@@ -75,14 +75,17 @@ pub enum VolumeCommands {
     /// sealed, retired, erased or quarantined volume is not a write target
     /// (ADR-0012); no flag overrides it.
     ///
-    /// Once the volume is sealed and confirmed, staging is released if every
-    /// unit written has reached its copy floor (the larger of its policy's
-    /// `min_copies` and the sum of its `copies_at` targets, times the
-    /// tape-only multiplier for a tape-only unit; ADR-0012, 2026-10-07 item
-    /// 2: after a quick confirm too); otherwise it is kept
-    /// and the output names each unit that is still short. A release that
-    /// fails is a warning and the exit status stays 0. `--keep-staging`
-    /// never releases; `stage clean` does it later.
+    /// Once the volume is sealed and confirmed (after a quick confirm too,
+    /// ADR-0012 2026-10-07 item 2), and moved if `--move-to` asked, each unit
+    /// written is released from staging once it has reached its copy floor
+    /// (the larger of its policy's `min_copies` and the sum of its
+    /// `copies_at` targets, times the tape-only multiplier for a tape-only
+    /// unit) and every `copies_at` target; a unit still short keeps its
+    /// staging, and the output names it and what it lacks (ADR-0012 item
+    /// 217). A release that fails is a warning and the exit status stays 0.
+    /// `--keep-staging` never releases; `stage clean` does it later. The
+    /// write ends with what the volume holds and the next copy's command, or
+    /// that there is nothing to do.
     ///
     /// A further copy in one command (ADR-0012 2026-10-15 item 59):
     /// `tapectl volume write L6-0003 --init --full-confirm --move-to
@@ -184,9 +187,9 @@ pub enum VolumeCommands {
         #[arg(long)]
         full_confirm: bool,
         /// Keep the staged slices after the write seals and confirms, even
-        /// when every unit written has reached its copy floor.
-        /// Without this flag the staging is released then; release it later
-        /// with `tapectl stage clean`.
+        /// of the units that have their copies. Without this flag each such
+        /// unit's staging is released then; release it later with `tapectl
+        /// stage clean`.
         #[arg(long)]
         keep_staging: bool,
         /// Write only the staged sets that still have need at this location
@@ -199,11 +202,12 @@ pub enum VolumeCommands {
         /// the write takes every staged set.
         #[arg(long, value_name = "LOCATION")]
         for_location: Option<String>,
-        /// Release the staging only once every per-location copy target of
-        /// each unit written is met, not at its copy floor (ADR-0012 item
-        /// 154), so the next location's copy reuses these staged slices
-        /// instead of staging again. Use it when staging has room; the
-        /// output names the locations that still need each unit.
+        /// Also keep every slice of a unit that spans cartridges until each
+        /// of its per-location copy targets is met (ADR-0012 item 154);
+        /// without this flag those slices are released one by one at the
+        /// copy floor. A unit written whole waits for its targets either
+        /// way (item 217). The output names the locations that still need
+        /// each unit.
         #[arg(long, conflicts_with = "keep_staging")]
         keep_staging_for_locations: bool,
     },
@@ -1092,9 +1096,7 @@ pub(crate) fn staging_release_json(
         _ => (false, 0, 0),
     };
     let units_released: Vec<&str> = match release {
-        StagingRelease::Retained { released, .. } => {
-            released.iter().map(String::as_str).collect()
-        }
+        StagingRelease::Retained { released, .. } => released.iter().map(String::as_str).collect(),
         _ => Vec::new(),
     };
     let under: Vec<serde_json::Value> = match release {
