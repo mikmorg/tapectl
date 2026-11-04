@@ -108,21 +108,37 @@ fn main() {
     // records how the command ended (`session result:`) before its end line.
     let mut session = None;
     let result = run(cli, &mut session);
+    let text = result
+        .as_ref()
+        .err()
+        .map(|e| render_error(e, resolved.as_ref()));
     if let Some(s) = &session {
-        let text = result.as_ref().err().map(|e| format!("{e:#}"));
         s.note_result(match &text {
             None => Ok(()),
             Some(t) => Err(t.as_str()),
         });
     }
     drop(session);
-    if let Err(err) = result {
+    if let (Err(err), Some(text)) = (result, text) {
         // Issue #377: a busy catalog is "retry later", not a failure of what
         // the command checks, so it exits 75 — except where a command's own
         // contract already has a code for "no verdict, try again" (`volume
         // verify`'s 3), which it keeps. `ErrorContract::exit_code` decides.
-        error::exit_with_error_code(&err, contract.exit_code(&err));
+        error::exit_with_rendered(&text, contract.exit_code(&err));
     }
+}
+
+/// The error as the operator reads it: its own text, completed from the
+/// catalog where that names the next step better (ADR-0012 items 216 and
+/// 220, [`error::render`]) — the nearest label for a `volume not found`,
+/// the command that proceeds after a write session only planned. The
+/// catalog is opened read-only, and only for those errors; the exit code
+/// is decided from the error itself, never from this text.
+fn render_error(err: &anyhow::Error, resolved: Option<&startup::Startup>) -> String {
+    let catalog = resolved
+        .filter(|_| error::render_reads_catalog(err))
+        .and_then(|r| error::open_catalog_for_render(&r.paths.db_file));
+    error::render(err, catalog.as_ref())
 }
 
 /// The exit code for a command line that did not parse (issues #356, #408).
@@ -373,12 +389,6 @@ fn run(
     *progress_slot = match cli::progress_session_name(&cli.command) {
         Some(name) if !cli.dry_run => {
             use std::io::IsTerminal;
-            // Issue #404: a long run over bare ssh dies with the connection;
-            // say so before it starts. A warning, never a refusal.
-            if let Some(warning) = signal::unprotected_ssh_warning(&name, |k| std::env::var(k).ok())
-            {
-                eprintln!("{warning}");
-            }
             let display = tapectl::progress::Display::choose(
                 cli.quiet,
                 std::io::stderr().is_terminal(),
@@ -388,6 +398,14 @@ fn run(
                 tapectl::progress::start_session(Some(&paths.logs_dir), &name, display, true);
             if let Some(log) = session.log_path() {
                 tracing::debug!(log = %log.display(), "session log");
+            }
+            // Issue #404: a long run over bare ssh dies with the connection;
+            // say so before it starts. A warning, never a refusal. Said at
+            // the first phase or tape wait (ADR-0012 item 220), so a command
+            // that fails on its arguments (a mistyped label) never says it.
+            if let Some(warning) = signal::unprotected_ssh_warning(&name, |k| std::env::var(k).ok())
+            {
+                tapectl::progress::say_before_work(&warning);
             }
             Some(session)
         }

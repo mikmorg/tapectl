@@ -592,16 +592,247 @@ impl TapectlError {
     /// `interrupted` on the next open. So it is [`Self::WriteInterrupted`],
     /// with its text kept and the resume named; an error already classified
     /// is returned unchanged.
+    ///
+    /// The `volume resume` it names is right while the session's rows say
+    /// something reached the tape. When they do not (the rows are still
+    /// `planned`), `main` names the command that proceeds instead, from the
+    /// catalog ([`render`]).
     pub fn in_write_session(self, label: &str) -> TapectlError {
         if self.write_outcome().is_some() {
             return self;
         }
-        TapectlError::WriteInterrupted(format!(
-            "{self} — volume \"{label}\"'s write session stopped part-way and is left \
-             resumable: fix the cause, reload the same cartridge and run `tapectl volume \
-             resume {label}`"
-        ))
+        TapectlError::WriteInterrupted(format!("{self}{}", resumable_tail(label)))
     }
+}
+
+/// The tail [`TapectlError::in_write_session`] gives its text: the `volume
+/// resume` that continues the session.
+fn resumable_tail(label: &str) -> String {
+    format!(
+        " — volume \"{label}\"'s write session stopped part-way and is left resumable: fix \
+         the cause, reload the same cartridge and run `tapectl volume resume {label}`"
+    )
+}
+
+/// [`resumable_tail`] found at the end of `text`: the text before it and
+/// the label it names. `None` for any other text, among them the other
+/// interrupted-write texts that name `volume resume` in words of their own.
+fn split_resumable_tail(text: &str) -> Option<(&str, &str)> {
+    let head = text.strip_suffix('`')?;
+    let (_, label) = head.rsplit_once("`tapectl volume resume ")?;
+    let cause = text.strip_suffix(resumable_tail(label).as_str())?;
+    Some((cause, label))
+}
+
+/// What comes after a write session that stopped, when `volume resume`
+/// would refuse it ([`crate::volume::write::StoppedWrite`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterStop {
+    /// The session was planned and never started, so nothing reached the
+    /// tape: `volume abort` clears it, then the volume is written again,
+    /// with the flags the write recorded with its session.
+    AbortThenWrite { flags: Vec<String> },
+    /// No session is left open: the volume is written again.
+    Write,
+}
+
+/// The hint that replaces [`resumable_tail`] for `after`, after `cause`.
+fn after_stop_text(cause: &str, label: &str, after: &AfterStop) -> String {
+    let write = |flags: &[String]| {
+        let mut cmd = format!("tapectl volume write {label}");
+        for f in flags {
+            cmd.push(' ');
+            cmd.push_str(f);
+        }
+        cmd
+    };
+    match after {
+        AfterStop::AbortThenWrite { flags } => format!(
+            "{cause} — volume \"{label}\"'s write session was planned and never started, so \
+             nothing reached the tape and there is nothing to resume. Clear it with `tapectl \
+             volume abort {label}`, then run `{}` again",
+            write(flags)
+        ),
+        AfterStop::Write => format!(
+            "{cause} — volume \"{label}\" has no write session left open, so there is nothing \
+             to resume: run `{}` again",
+            write(&[])
+        ),
+    }
+}
+
+/// The volume labels this catalog holds within reach of `typed`, for a
+/// `volume not found` (ADR-0012 item 216): the label that differs from it
+/// in case alone, else those at the smallest edit distance, ignoring case,
+/// when it is small for the label's length (at most 2, and at most a third
+/// of it). None when nothing is near, or when more than three are equally
+/// near: a guess among many helps nobody.
+fn nearest_labels<'l>(typed: &str, labels: &'l [String]) -> Vec<&'l str> {
+    let typed_lower = typed.to_lowercase();
+    let typed_len = typed_lower.chars().count();
+    let limit = (typed_len / 3).min(2);
+    let mut best: Option<usize> = None;
+    let mut near: Vec<&str> = Vec::new();
+    for label in labels {
+        if label == typed {
+            continue;
+        }
+        let d = edit_distance(&typed_lower, &label.to_lowercase());
+        if d > limit {
+            continue;
+        }
+        match best {
+            Some(b) if d > b => {}
+            Some(b) if d == b => near.push(label.as_str()),
+            _ => {
+                best = Some(d);
+                near = vec![label.as_str()];
+            }
+        }
+    }
+    if near.len() > 3 {
+        return Vec::new();
+    }
+    near.sort_unstable();
+    near
+}
+
+/// Levenshtein distance, by characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = Vec::with_capacity(b.len() + 1);
+        cur.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != *cb);
+            cur.push(substitute.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// ` — did you mean "L6-0001"?` (or `"A" or "B"`) for `typed`, or nothing.
+fn did_you_mean(typed: &str, labels: &[String]) -> String {
+    let near = nearest_labels(typed, labels);
+    if near.is_empty() {
+        return String::new();
+    }
+    let quoted: Vec<String> = near.iter().map(|l| format!("\"{l}\"")).collect();
+    format!(" — did you mean {}?", quoted.join(" or "))
+}
+
+/// Whether [`render`] reads the catalog for `err`: a `volume not found`, or
+/// an interrupted write session's hint. `main` opens the catalog only then.
+pub fn render_reads_catalog(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+        .any(|e| {
+            matches!(
+                e,
+                TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
+            )
+        })
+}
+
+/// The catalog at `db_file`, opened read-only for [`render`]: never created,
+/// never migrated, and `None` when it cannot be opened or is busy for long.
+pub fn open_catalog_for_render(db_file: &std::path::Path) -> Option<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(500))
+        .ok()?;
+    Some(conn)
+}
+
+/// How the operator reads `err` (`{err:#}`), completed from the catalog
+/// when one is given, by one query each (ADR-0012 items 216 and 220):
+///
+/// - a `volume not found` gains the nearest label this catalog holds,
+///   ignoring case (` — did you mean "L6-0001"?`), and nothing when none
+///   is near;
+/// - an interrupted write's `volume resume` hint
+///   ([`TapectlError::in_write_session`]) is replaced by the command that
+///   proceeds when the session's rows say nothing reached the tape
+///   ([`crate::volume::write::stopped_write`]): `volume abort` then `volume
+///   write` for a session only planned, `volume write` when none is open.
+///
+/// Every lookup that fails keeps the text as it is. The error itself, and
+/// so the exit code, is unchanged.
+pub fn render(err: &anyhow::Error, catalog: Option<&rusqlite::Connection>) -> String {
+    let text = format!("{err:#}");
+    let Some(conn) = catalog else {
+        return text;
+    };
+    let found = err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+        .find(|e| {
+            matches!(
+                e,
+                TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
+            )
+        });
+    match found {
+        Some(TapectlError::VolumeNotFound(label)) => match volume_labels(conn) {
+            Ok(labels) => format!("{text}{}", did_you_mean(label, &labels)),
+            Err(_) => text,
+        },
+        Some(TapectlError::WriteInterrupted(_)) => match after_stop(conn, &text) {
+            Some(replaced) => replaced,
+            None => text,
+        },
+        _ => text,
+    }
+}
+
+/// Every volume label in the catalog: a small table, read whole.
+fn volume_labels(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT label FROM volumes")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// [`render`]'s second half: `text` with its [`resumable_tail`] replaced,
+/// when the catalog says `volume resume` would refuse the session.
+fn after_stop(conn: &rusqlite::Connection, text: &str) -> Option<String> {
+    use crate::volume::write::{stopped_write, StoppedWrite};
+    let (cause, label) = split_resumable_tail(text)?;
+    let after = match stopped_write(conn, label).ok()? {
+        StoppedWrite::Planned => AfterStop::AbortThenWrite {
+            flags: planned_session_flags(conn, label),
+        },
+        StoppedWrite::NothingOpen => AfterStop::Write,
+        StoppedWrite::Open { .. } | StoppedWrite::Other => return None,
+    };
+    Some(after_stop_text(cause, label, &after))
+}
+
+/// The flags the write of `label`'s planned session recorded with it
+/// (`session::WriteIntent`), as `volume write` takes them; none when there
+/// is no record or it cannot be read.
+fn planned_session_flags(conn: &rusqlite::Connection, label: &str) -> Vec<String> {
+    let dir: Option<String> = conn
+        .query_row(
+            "SELECT w.session_dir FROM writes w JOIN volumes v ON v.id = w.volume_id
+             WHERE v.label = ?1 AND w.status = 'planned' AND w.session_dir IS NOT NULL
+             ORDER BY w.id LIMIT 1",
+            [label],
+            |r| r.get(0),
+        )
+        .ok();
+    dir.and_then(|d| {
+        crate::volume::session::WriteIntent::read(std::path::Path::new(&d))
+            .ok()
+            .flatten()
+    })
+    .map(|intent| intent.flags())
+    .unwrap_or_default()
 }
 
 impl From<rusqlite::Error> for TapectlError {
@@ -667,7 +898,12 @@ pub fn exit_with_error(err: &anyhow::Error) -> ! {
 /// contract 2 means "the medium is proven bad" (issue #356). The message is
 /// printed exactly as [`exit_with_error`] prints it.
 pub fn exit_with_error_code(err: &anyhow::Error, code: i32) -> ! {
-    eprintln!("error: {err:#}");
+    exit_with_rendered(&format!("{err:#}"), code)
+}
+
+/// [`exit_with_error_code`] for an error already rendered ([`render`]).
+pub fn exit_with_rendered(text: &str, code: i32) -> ! {
+    eprintln!("error: {text}");
     process::exit(code);
 }
 
@@ -913,6 +1149,173 @@ mod tests {
             assert_eq!(after.write_outcome(), before);
             assert_eq!(after.to_string().len(), 1, "text unchanged");
         }
+    }
+
+    /// A catalog of `labels`, every volume `initialized`.
+    fn catalog_of(labels: &[&str]) -> rusqlite::Connection {
+        let conn = crate::db::open_memory().unwrap();
+        for label in labels {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'p', 10485760, 'initialized')",
+                [label],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// ADR-0012 item 216: `volume not found` stays (scripts route on it) and
+    /// gains the nearest label the catalog holds, ignoring case — also
+    /// through a context — and nothing when no label is near, or with no
+    /// catalog to ask.
+    #[test]
+    fn a_volume_not_found_names_the_nearest_label_ignoring_case() {
+        let conn = catalog_of(&["L8-0001", "L6-0100"]);
+        let shown = |typed: &str| {
+            render(
+                &anyhow::Error::from(TapectlError::VolumeNotFound(typed.into())),
+                Some(&conn),
+            )
+        };
+        assert_eq!(
+            shown("l8-0001"),
+            "volume not found: l8-0001 — did you mean \"L8-0001\"?"
+        );
+        assert_eq!(
+            shown("L8-0009"),
+            "volume not found: L8-0009 — did you mean \"L8-0001\"?"
+        );
+        assert_eq!(shown("photos"), "volume not found: photos", "nothing near");
+        let wrapped = anyhow::Error::from(TapectlError::VolumeNotFound("l6-0100".into()))
+            .context("cannot move it");
+        assert_eq!(
+            render(&wrapped, Some(&conn)),
+            "cannot move it: volume not found: l6-0100 — did you mean \"L6-0100\"?"
+        );
+        let bare = anyhow::Error::from(TapectlError::VolumeNotFound("l8-0001".into()));
+        assert_eq!(render(&bare, None), "volume not found: l8-0001");
+        assert!(render_reads_catalog(&bare));
+        assert!(!render_reads_catalog(&anyhow::Error::from(
+            TapectlError::UnitNotFound("u".into())
+        )));
+    }
+
+    /// The nearest label: a case-only difference wins over any edit; ties
+    /// are named together up to three; more is no suggestion; the label
+    /// typed exactly is never suggested.
+    #[test]
+    fn the_nearest_label_is_close_and_few() {
+        let labels: Vec<String> = ["L6-0001", "L6-0010", "l6-0011", "L6-0012", "L6-0014"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(nearest_labels("L6-0011", &labels), vec!["l6-0011"]);
+        assert_eq!(
+            nearest_labels("L6-0002", &labels),
+            vec!["L6-0001", "L6-0012"]
+        );
+        assert_eq!(
+            did_you_mean("L6-0002", &labels),
+            " — did you mean \"L6-0001\" or \"L6-0012\"?"
+        );
+        assert_eq!(did_you_mean("L6-0013", &labels), "", "four at one edit");
+        assert_eq!(
+            nearest_labels("L6-0001", &labels),
+            vec!["l6-0011"],
+            "never itself"
+        );
+        assert_eq!(did_you_mean("L6", &labels), "", "too short to guess from");
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    /// ADR-0012 item 220: an error in a write session whose rows are still
+    /// `planned` (nothing reached the tape; a busy catalog at the session's
+    /// start, past the retry budget) named `volume resume`, which then
+    /// refuses. Rendered with the catalog it names `volume abort` and the
+    /// `volume write` that proceeds, with the flags the write recorded; a
+    /// session that reached the tape keeps its resume; so does any text
+    /// that is not this hint, and any render without a catalog.
+    #[test]
+    fn an_interrupted_write_with_nothing_written_names_abort_then_write() {
+        let conn = catalog_of(&["L6-1"]);
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-1', 'u', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'staged', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);",
+        )
+        .unwrap();
+        let session = tempfile::TempDir::new().unwrap();
+        crate::volume::session::WriteIntent {
+            full_confirm: true,
+            move_to: Some("offsite".into()),
+            ..Default::default()
+        }
+        .record(session.path())
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (1, 1, 1, 'planned', ?1)",
+            [session.path().to_str().unwrap()],
+        )
+        .unwrap();
+        let err = anyhow::Error::from(
+            TapectlError::CatalogBusy("marking the session in progress".into())
+                .in_write_session("L6-1"),
+        );
+        assert!(render_reads_catalog(&err));
+        let shown = render(&err, Some(&conn));
+        assert!(
+            shown.starts_with("catalog busy: marking the session in progress"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with(
+                "volume \"L6-1\"'s write session was planned and never started, so nothing \
+                 reached the tape and there is nothing to resume. Clear it with `tapectl volume \
+                 abort L6-1`, then run `tapectl volume write L6-1 --full-confirm --move-to \
+                 offsite` again"
+            ),
+            "{shown}"
+        );
+        assert!(!shown.contains("volume resume"), "{shown}");
+        assert_eq!(
+            render(&err, None),
+            format!("{err:#}"),
+            "no catalog: as it was"
+        );
+
+        // No session left open: `volume write`, bare.
+        conn.execute("UPDATE writes SET status = 'aborted'", [])
+            .unwrap();
+        let shown = render(&err, Some(&conn));
+        assert!(
+            shown.ends_with(
+                "volume \"L6-1\" has no write session left open, so there is nothing to \
+                 resume: run `tapectl volume write L6-1` again"
+            ),
+            "{shown}"
+        );
+
+        // Something reached the tape: the resume stands.
+        conn.execute("UPDATE writes SET status = 'interrupted'", [])
+            .unwrap();
+        assert_eq!(render(&err, Some(&conn)), format!("{err:#}"));
+
+        // Another interrupted-write text naming `volume resume` in its own
+        // words is not this hint, and is left alone.
+        conn.execute("UPDATE writes SET status = 'planned'", [])
+            .unwrap();
+        let other = anyhow::Error::from(TapectlError::WriteInterrupted(
+            "stopped: run `tapectl volume resume L6-1`".into(),
+        ));
+        assert_eq!(
+            render(&other, Some(&conn)),
+            "stopped: run `tapectl volume resume L6-1`"
+        );
     }
 
     /// A command line that does not parse: the two verdict commands take

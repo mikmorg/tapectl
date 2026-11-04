@@ -116,6 +116,66 @@ fn a_verify_whose_drive_cannot_be_opened_exits_3_and_touches_nothing() {
     );
 }
 
+/// ADR-0012 items 216 and 220, through the binary. A label typed in the
+/// wrong case is named back with the catalog's own, and the exit stays 3;
+/// the ssh warning, held until the first tape contact, is never printed for
+/// it. The positive control: a verify of the label the catalog holds
+/// reaches for the drive, and the warning comes before that open fails — so
+/// its absence above is the label failing first, not a warning gone.
+#[test]
+fn a_mistyped_label_is_named_back_and_never_warned_about_ssh() {
+    let home = initialised_home();
+    let db = home.path().join(".tapectl").join("tapectl.db");
+    {
+        let conn = tapectl::db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status)
+             VALUES ('L6-EXIT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+    }
+    let over_ssh = |label: &str| {
+        Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args(["volume", "verify", label, "--device", NO_DRIVE])
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("TAPECTL_HOME")
+            .env("SSH_CONNECTION", "192.0.2.1 50000 192.0.2.2 22")
+            .env_remove("TMUX")
+            .env_remove("STY")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to spawn tapectl binary")
+    };
+    const WARNING: &str = "is running over ssh outside tmux or screen";
+
+    let out = over_ssh("l6-exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: volume not found: l6-exit — did you mean \"L6-EXIT\"?"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    assert!(!stderr.contains(WARNING), "stderr: {stderr}");
+
+    let out = over_ssh("L6-EXIT");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    let warned = stderr
+        .find(WARNING)
+        .unwrap_or_else(|| panic!("stderr: {stderr}"));
+    let failed = stderr
+        .find("error: ")
+        .unwrap_or_else(|| panic!("stderr: {stderr}"));
+    assert!(
+        warned < failed,
+        "the warning precedes the tape work: {stderr}"
+    );
+    assert_eq!(stderr.matches(WARNING).count(), 1, "once: {stderr}");
+}
+
 /// Issue #435: a verify with no label reaches for the drive like any other
 /// and, when it cannot, exits 3 and leaves the catalog as it was — the same
 /// "no verdict" a named volume's verify gives.

@@ -172,6 +172,9 @@ struct State {
     finished: Vec<PhaseTiming>,
     waits: Vec<ActiveWait>,
     next_id: u64,
+    /// A warning held until the work begins ([`say_before_work`]): said at
+    /// the session's first phase or wait, then cleared.
+    before_work: Option<String>,
 }
 
 /// One session's shared state. See the module documentation.
@@ -222,6 +225,7 @@ impl Recorder {
     }
 
     fn start_phase(&self, name: &str, total: Option<u64>) -> u64 {
+        self.work_begins();
         let now = Instant::now();
         let mut st = self.lock();
         let id = Self::next_id(&mut st);
@@ -320,7 +324,24 @@ impl Recorder {
         });
     }
 
+    /// The work begins: a warning held for it is said now, once, on stderr
+    /// and in the session log.
+    fn work_begins(&self) {
+        let line = {
+            let mut st = self.lock();
+            let line = st.before_work.take();
+            if let Some(line) = &line {
+                log_line(&mut st, line);
+            }
+            line
+        };
+        if let Some(line) = line {
+            self.println(&line);
+        }
+    }
+
     fn start_wait(&self, what: String) -> u64 {
+        self.work_begins();
         let mut st = self.lock();
         let id = Self::next_id(&mut st);
         st.waits.push(ActiveWait {
@@ -788,6 +809,7 @@ fn start_session_diverted(
             finished: Vec::new(),
             waits: Vec::new(),
             next_id: 0,
+            before_work: None,
         }),
         session_id,
         log_path,
@@ -985,6 +1007,18 @@ pub fn log(msg: &str) {
     if let Some(r) = current() {
         let mut st = r.lock();
         log_line(&mut st, msg);
+    }
+}
+
+/// Hold `line`, a warning about the work this session is about to do, and
+/// say it ([`say`]'s way: stderr and the session log) once, when the work
+/// begins: at the session's first phase or wait — a tape open, a MAM read,
+/// any named step (ADR-0012 item 220). A command that stops before any of
+/// that (a mistyped label, a refusal from the catalog) never says it. A
+/// later call replaces a line not yet said. A no-op with no session.
+pub fn say_before_work(line: &str) {
+    if let Some(r) = current() {
+        r.lock().before_work = Some(line.to_string());
     }
 }
 
@@ -1367,6 +1401,32 @@ mod tests {
         assert_eq!(heard.count("note: traced and logged"), (0, 2));
         let ((), heard) = heard::during(|| log("note: logged"));
         assert_eq!(heard.count("note: logged"), (0, 1));
+    }
+
+    /// ADR-0012 item 220: the ssh warning is held until the work begins. A
+    /// command that stops before any phase or wait (a mistyped label) never
+    /// says it; the first phase, or the first wait (a tape open, a MAM read),
+    /// says it once — on stderr and in the session log — and never again.
+    #[test]
+    fn a_warning_held_for_the_work_is_said_at_its_first_phase_or_wait_once() {
+        let line = "warning: `volume verify L8-0009` is running over ssh";
+        let ((), heard) = heard::during(|| say_before_work(line));
+        assert_eq!(heard.count(line), (0, 0), "no work began: never said");
+
+        let ((), heard) = heard::during(|| {
+            say_before_work(line);
+            phase("verify", None).done();
+            phase("confirm", None).done();
+            waited(|| "a rewind".into(), || ());
+        });
+        assert_eq!(heard.count(line), (1, 1), "said once, at the first phase");
+
+        let ((), heard) = heard::during(|| {
+            say_before_work(line);
+            waited(|| "opening /dev/nst0".into(), || ());
+            phase("verify", None).done();
+        });
+        assert_eq!(heard.count(line), (1, 1), "said once, at the first wait");
     }
 
     #[test]
