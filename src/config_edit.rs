@@ -2489,6 +2489,416 @@ mod tests {
         );
     }
 
+    // ---- ADR-0012 item 214: the schema, key resolution, plain errors ----
+
+    fn doc(text: &str) -> DocumentMut {
+        text.parse().unwrap()
+    }
+
+    const ONE_DRIVE: &str = "[[backends.lto]]\nname = \"lto6\"\n\
+                             device_tape = \"/dev/tapectl-config-edit-nonexistent\"\n\
+                             generation = \"LTO-6\"\n";
+
+    fn two_drives() -> String {
+        format!(
+            "{ONE_DRIVE}\n[[backends.lto]]\nname = \"spare\"\n\
+             device_tape = \"/dev/tapectl-config-edit-nonexistent-2\"\ngeneration = \"LTO-6\"\n"
+        )
+    }
+
+    fn resolved(text: &str, key: &str) -> Result<String> {
+        resolve_key(doc(text).as_table(), key).map(|segs| dotted(&segs))
+    }
+
+    /// The tables [`TABLES`] lists are [`crate::config::Config`]'s own, each
+    /// written as listed: every key of every listed table that is itself a
+    /// table (one, a list, or a map, told apart by what serde says of a
+    /// probe) is listed with that shape, and every listed table is a key of
+    /// its parent. A table added to `Config` and not here fails this.
+    #[test]
+    fn the_schema_s_tables_are_config_s_tables() {
+        fn probe(text: &str) -> std::result::Result<(), String> {
+            toml::from_str::<crate::config::Config>(text)
+                .map(|_| ())
+                .map_err(|e| e.message().to_string())
+        }
+        let unknown = format!("unknown field `{PROBE_KEY}`");
+        for (table, shape) in TABLES {
+            if *shape == Shape::Map {
+                continue;
+            }
+            let fields = table_fields(table, *shape);
+            assert!(!fields.is_empty(), "{table:?} names no keys");
+            // The header that opens an entry of the parent, for a key under
+            // a list of tables.
+            let opener = match shape {
+                Shape::List => format!("[[{table}]]\n"),
+                _ => String::new(),
+            };
+            for field in fields {
+                let full = if table.is_empty() {
+                    field.clone()
+                } else {
+                    format!("{table}.{field}")
+                };
+                let as_table = probe(&format!("{opener}[{full}]\n{PROBE_KEY} = 0\n"));
+                let found = match &as_table {
+                    Err(m) if m.starts_with(&unknown) => Some(Shape::Table),
+                    Err(m) if m.starts_with("invalid type: map") => {
+                        match probe(&format!("{opener}[[{full}]]\n{PROBE_KEY} = 0\n")) {
+                            Err(m) if m.starts_with(&unknown) => Some(Shape::List),
+                            _ => None,
+                        }
+                    }
+                    // A map takes the probe's key as one of its own.
+                    _ => Some(Shape::Map),
+                };
+                assert_eq!(
+                    shape_of(&full),
+                    found,
+                    "{full}: serde says {as_table:?}; TABLES must list it as {found:?}"
+                );
+            }
+        }
+        for (table, _) in TABLES.iter().filter(|(t, _)| !t.is_empty()) {
+            let (parent, name) = table.rsplit_once('.').unwrap_or(("", table));
+            let shape = shape_of(parent).expect("a listed table's parent is listed");
+            assert!(
+                table_fields(parent, shape).iter().any(|f| f == name),
+                "{table} is not a key of {parent:?}"
+            );
+        }
+        // The keys the ruling names are among the schema's.
+        let keys: Vec<String> = value_keys().iter().map(|k| k.join(".")).collect();
+        for k in [
+            "backends.lto.post_warning_bytes",
+            "backends.lto.device_sg",
+            "defaults.slice_size",
+            "defaults.copies_at",
+            "archive_sets.copies_at",
+            "collections.exclude",
+            "host_check.max_load_per_cpu",
+            "ops.group",
+        ] {
+            assert!(keys.iter().any(|x| x == k), "{k} missing from {keys:?}");
+        }
+        assert!(!keys.iter().any(|x| x == "backends.lto"), "a table is not a value");
+    }
+
+    #[test]
+    fn a_bare_key_resolves_to_the_one_key_of_that_name() {
+        assert_eq!(
+            resolved(ONE_DRIVE, "post_warning_bytes").unwrap(),
+            "backends.lto[lto6].post_warning_bytes"
+        );
+        assert_eq!(
+            resolved(ONE_DRIVE, "verify_interval_days").unwrap(),
+            "defaults.verify_interval_days"
+        );
+        assert_eq!(
+            resolved("", "max_load_per_cpu").unwrap(),
+            "host_check.max_load_per_cpu"
+        );
+        // A key of several tables is one only while the file has one of
+        // them: with an archive set, slice_size could be either.
+        assert_eq!(resolved("", "slice_size").unwrap(), "defaults.slice_size");
+        let with_set = "[[archive_sets]]\nname = \"cold\"\n";
+        let err = resolved(with_set, "slice_size").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("defaults.slice_size"), "{err}");
+        assert!(err.contains("archive_sets[cold].slice_size"), "{err}");
+
+        // Two drives: both named, nothing picked.
+        let err = resolved(&two_drives(), "post_warning_bytes")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backends.lto[lto6].post_warning_bytes"), "{err}");
+        assert!(err.contains("backends.lto[spare].post_warning_bytes"), "{err}");
+        // None: the drive is what is missing.
+        let err = resolved("", "post_warning_bytes").unwrap_err().to_string();
+        assert!(err.contains("no drive is configured"), "{err}");
+        assert!(err.contains("`tapectl drive add"), "{err}");
+        // A typo of a bare key.
+        let err = resolved(ONE_DRIVE, "post_warning_byte")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did you mean post_warning_bytes?"), "{err}");
+    }
+
+    #[test]
+    fn a_list_of_tables_with_one_entry_needs_no_selector() {
+        assert_eq!(
+            resolved(ONE_DRIVE, "backends.lto.post_warning_bytes").unwrap(),
+            "backends.lto[lto6].post_warning_bytes"
+        );
+        let err = resolved(&two_drives(), "backends.lto.enospc_buffer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backends.lto[lto6].enospc_buffer"), "{err}");
+        assert!(err.contains("backends.lto[spare].enospc_buffer"), "{err}");
+        let err = resolved("", "backends.lto.enospc_buffer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drive add"), "{err}");
+        let one_set = "[[collections]]\nname = \"movies\"\nroot = \"/m\"\ntenant = \"t\"\n";
+        assert_eq!(
+            resolved(one_set, "collections.exclude").unwrap(),
+            "collections[movies].exclude"
+        );
+    }
+
+    /// The forms that worked before 1.9.0 resolve to themselves: first-run.sh
+    /// sets `backends.lto[NAME].post_warning_bytes`, the collection refusals
+    /// point at `collections[NAME].exclude`, and a whole table or list is
+    /// still named by its own name.
+    #[test]
+    fn the_existing_key_forms_resolve_to_themselves() {
+        let text = format!(
+            "{}\n[[collections]]\nname = \"movies\"\nroot = \"/m\"\ntenant = \"t\"\n\n\
+             [typo]\na = 1\n",
+            two_drives()
+        );
+        for key in [
+            "backends.lto[lto6].post_warning_bytes",
+            "backends.lto[spare].enospc_buffer",
+            "backends.lto[0].enospc_buffer",
+            "collections[movies].exclude",
+            "collections[0].unit_depth",
+            "archive_sets[1]",
+            "defaults.slice_size",
+            "host_check",
+            "backends.lto",
+            "collections",
+            "typo",
+        ] {
+            assert_eq!(resolved(&text, key).unwrap(), key, "{key}");
+        }
+        assert_eq!(
+            resolved(&text, "backends.lto[hp.lto6].enospc_buffer").unwrap(),
+            "backends.lto[hp.lto6].enospc_buffer"
+        );
+    }
+
+    fn set_err(original: &str, key: &str, value: &str) -> String {
+        plan(
+            original,
+            &p(),
+            &Edit::Set {
+                key: key.into(),
+                value: value.into(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// A refused set is one line naming the key and what was wrong: no
+    /// excerpt of the file, no serde words for a type, and a typo names the
+    /// key meant.
+    #[test]
+    fn a_refused_set_is_one_line_naming_the_key_and_what_was_wrong() {
+        for (key, value, want) in [
+            (
+                "defaults.slice_sizee",
+                "2G",
+                "defaults.slice_sizee is not a config key — did you mean defaults.slice_size?",
+            ),
+            (
+                "defaults.min_copies",
+                "lots",
+                "defaults.min_copies takes a whole number, not \"lots\"",
+            ),
+            (
+                "defaults.encrypt",
+                "maybe",
+                "defaults.encrypt takes true or false, not \"maybe\"",
+            ),
+            (
+                "compaction.utilization_threshold",
+                "half",
+                "compaction.utilization_threshold takes a number, not \"half\"",
+            ),
+            (
+                "defalts.slice_size",
+                "1G",
+                "defalts.slice_size is not a config key — did you mean defaults.slice_size?",
+            ),
+        ] {
+            let err = set_err("[defaults]\nslice_size = \"1G\"\n", key, value);
+            assert!(err.contains(want), "{key}: {err}");
+            assert!(!err.contains('\n'), "{key}: one line: {err}");
+            assert!(!err.contains("TOML parse error"), "{key}: {err}");
+            assert!(!err.contains(" | "), "{key}: no excerpt: {err}");
+            assert!(!err.contains("expected one of"), "{key}: {err}");
+            assert!(err.contains("unchanged"), "{key}: {err}");
+        }
+        // The text reading of a number explains a closed set better than
+        // "takes text".
+        let err = set_err("", "defaults.compression", "5");
+        assert!(err.contains("defaults.compression"), "{err}");
+        assert!(!err.contains("takes text"), "{err}");
+        // A size names the forms it takes.
+        let err = set_err(ONE_DRIVE, "post_warning_bytes", "plenty");
+        assert!(err.contains("post_warning_bytes"), "{err}");
+        assert!(err.contains("99008M"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_key_and_the_one_drive_shorthand_are_set_in_the_drive_s_table() {
+        for key in ["post_warning_bytes", "backends.lto.post_warning_bytes"] {
+            let planned = plan(
+                ONE_DRIVE,
+                &p(),
+                &Edit::Set {
+                    key: key.into(),
+                    value: "99008M".into(),
+                },
+            )
+            .unwrap();
+            assert!(
+                planned
+                    .new_text
+                    .ends_with("generation = \"LTO-6\"\npost_warning_bytes = \"99008M\"\n"),
+                "{key}: {}",
+                planned.new_text
+            );
+            assert_eq!(
+                planned.summary,
+                "set backends.lto[lto6].post_warning_bytes = \"99008M\" (was unset)"
+            );
+            assert_eq!(planned.json["key"], "backends.lto[lto6].post_warning_bytes");
+        }
+    }
+
+    #[test]
+    fn a_misspelt_key_gets_a_did_you_mean_from_add_and_remove() {
+        let original = "[defaults]\nslice_size = \"1G\"\nglobal_excludes = []\n";
+        let err = plan(
+            original,
+            &p(),
+            &Edit::Add {
+                key: "defaults.global_exclude".into(),
+                values: vec!["*.bak".into()],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did you mean defaults.global_excludes?"), "{err}");
+        let err = plan(
+            original,
+            &p(),
+            &Edit::Remove {
+                key: "defaults.slice_sizee".into(),
+                values: Vec::new(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nothing to remove"), "{err}");
+        assert!(err.contains("did you mean defaults.slice_size?"), "{err}");
+    }
+
+    fn effective(text: &str) -> crate::config::Config {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        crate::config::Config::load(&path).unwrap()
+    }
+
+    /// `config get`'s source: the file, a default, unset, or derived — the
+    /// last through the sysfs derivation, faked under a temp dir.
+    #[test]
+    fn get_names_where_each_value_comes_from() {
+        let text = format!("[defaults]\nmin_copies = 3\n\n{ONE_DRIVE}post_warning_bytes = \"99008M\"\n");
+        let cfg = effective(&text);
+
+        let got = get(&text, &cfg, "defaults.min_copies").unwrap();
+        assert_eq!(got.value, Some(serde_json::json!(3)));
+        assert_eq!(got.source, Source::File);
+
+        let got = get(&text, &cfg, "slice_size").unwrap();
+        assert_eq!(got.key, "defaults.slice_size");
+        assert_eq!(got.value, Some(serde_json::json!("1G")));
+        assert_eq!(got.source, Source::Default);
+
+        let got = get(&text, &cfg, "post_warning_bytes").unwrap();
+        assert_eq!(got.key, "backends.lto[lto6].post_warning_bytes");
+        assert_eq!(got.value, Some(serde_json::json!("99008M")));
+        assert_eq!(got.source, Source::File);
+
+        let got = get(&text, &cfg, "backends.lto.capacity_override").unwrap();
+        assert_eq!(got.value, None, "an optional key nothing sets");
+        assert_eq!(got.source, Source::Default);
+
+        // [host_check] is absent: its defaults are in force.
+        let got = get(&text, &cfg, "host_check.min_available_mb").unwrap();
+        assert_eq!(got.value, Some(serde_json::json!(2048)));
+        assert_eq!(got.source, Source::Default);
+
+        // device_sg, derived from device_tape.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tape = tmp.path().join("nst-fake-3");
+        std::fs::File::create(&tape).unwrap();
+        let sysfs = tmp.path().join("sys");
+        std::fs::create_dir_all(sysfs.join("nst-fake-3/device/scsi_generic/sg7")).unwrap();
+        let text = format!(
+            "[[backends.lto]]\nname = \"d\"\ndevice_tape = \"{}\"\ngeneration = \"LTO-6\"\n",
+            tape.display()
+        );
+        let mut cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        cfg.fill_derived_sg_nodes_under(&sysfs);
+        let got = get(&text, &cfg, "device_sg").unwrap();
+        assert_eq!(got.key, "backends.lto[d].device_sg");
+        assert_eq!(got.value, Some(serde_json::json!("/dev/sg7")));
+        assert!(matches!(got.source, Source::Derived(_)), "{:?}", got.source);
+        assert_eq!(got.source.word(), "derived");
+        // Written in the file, the same key is the file's.
+        let written = format!("{text}device_sg = \"/dev/sg7\"\n");
+        let got = get(&written, &cfg, "device_sg").unwrap();
+        assert_eq!(got.source, Source::File);
+    }
+
+    #[test]
+    fn get_refuses_a_table_and_a_typo_naming_the_keys() {
+        let cfg = effective(ONE_DRIVE);
+        let err = get(ONE_DRIVE, &cfg, "defaults").unwrap_err().to_string();
+        assert!(err.contains("is a table"), "{err}");
+        assert!(err.contains("defaults.slice_size"), "{err}");
+        let err = get(ONE_DRIVE, &cfg, "backends.lto").unwrap_err().to_string();
+        assert!(err.contains("list of tables"), "{err}");
+        let err = get(ONE_DRIVE, &cfg, "defaults.slice_sizee")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("defaults.slice_sizee is not a config key — did you mean defaults.slice_size?"),
+            "{err}"
+        );
+        let err = get(ONE_DRIVE, &cfg, "backends.lto[lto6].post_warning_byte")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("did you mean backends.lto[lto6].post_warning_bytes?"),
+            "{err}"
+        );
+        let err = get(ONE_DRIVE, &cfg, "backends.lto[nope].name")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no entry named \"nope\""), "{err}");
+    }
+
+    #[test]
+    fn values_print_as_config_toml_writes_them() {
+        for (v, want) in [
+            (serde_json::json!("1G"), "\"1G\""),
+            (serde_json::json!(0.97), "0.97"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!(["*.tmp", "*.bak"]), "[\"*.tmp\", \"*.bak\"]"),
+            (serde_json::json!({"offsite": 2}), "{ offsite = 2 }"),
+        ] {
+            assert_eq!(toml_text_of(&v), want);
+        }
+    }
+
     #[test]
     fn the_combination_search_prefers_literals() {
         let slots = vec![
