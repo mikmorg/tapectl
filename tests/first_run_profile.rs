@@ -279,6 +279,108 @@ fn the_steps_are_numbered_0_to_14() {
     ok(&rig.run(&["--from", "0", "--to", "0"]));
 }
 
+// ---------------------------------------------------------------- step 7
+
+fn is_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
+/// `PATH` with the rig's stubs first: a `sudo` that records what it was asked
+/// in `calls` and does nothing, so no run reaches the host.
+fn sudo_stub_path(rig: &Rig) -> String {
+    let calls = rig.p("calls");
+    stub(
+        &rig.p("bin"),
+        "sudo",
+        &format!("echo \"sudo $*\" >> {}; exit 0", calls.display()),
+    );
+    format!(
+        "{}:{}",
+        rig.p("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// #511's third defect (ADR-0012 item 199): on 2026-11-03 home2's
+/// `/srv/acache`, rebuilt root:root 0710 without `u:tapectl:x`, kept the service
+/// user out of the staging directory below it, and step 7 blamed the staging
+/// directory and offered a `chown`. Now the parent the account cannot traverse
+/// is named, with the traverse-only `setfacl` that fixes it, nothing is created
+/// or given away, and no `chown` is offered. Here the account is the test's
+/// own (`--no-service-user`) and the parent is its own directory at mode 0600.
+/// The positive control is the same step with traverse given back.
+#[test]
+fn step_7_names_the_staging_parent_the_account_cannot_traverse() {
+    if is_root() {
+        eprintln!("skipped: running as root, whom no mode keeps out");
+        return;
+    }
+    let rig = Rig::new();
+    let home = rig.p("tapectl-home");
+    tapectl_at(
+        &rig,
+        &home,
+        &["init", "--operator", "fr-tester", "--no-escrow"],
+    );
+    let acache = rig.p("srv/acache");
+    let staging = acache.join("tapectl-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let profile = rig.profile(
+        "p.profile",
+        &format!("STAGING_DIR={}\n", staging.display()),
+    );
+    let path = sudo_stub_path(&rig);
+    let step7 = || {
+        rig.command(&[
+            "--profile",
+            profile.to_str().unwrap(),
+            "--auto",
+            "--from",
+            "7",
+            "--to",
+            "7",
+            "--tapectl",
+            env!("CARGO_BIN_EXE_tapectl"),
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("spawn first-run.sh")
+    };
+
+    std::fs::set_permissions(&acache, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let o = step7();
+    // Given back before asserting, so the temp dir can be removed either way.
+    std::fs::set_permissions(&acache, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, err) = text(&o);
+    let calls = std::fs::read_to_string(rig.p("calls")).unwrap_or_default();
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}\n{calls}");
+    let (a, s) = (acache.display(), staging.display());
+    assert!(
+        err.contains(&format!(
+            "fr-tester cannot reach the staging directory {s}: {a} ("
+        )) && err.contains(&format!("sudo setfacl -m u:fr-tester:x {a}")),
+        "{err}"
+    );
+    assert!(
+        !out.contains("chown") && !err.contains("chown") && !calls.contains("chown"),
+        "a chown was offered:\n{out}\n{err}\n{calls}"
+    );
+    assert!(
+        !err.contains("cannot write the staging directory") && !err.contains("is not writable"),
+        "the staging directory was blamed: {err}"
+    );
+    assert!(
+        !calls.contains("mkdir") && !calls.contains("install"),
+        "something was created: {calls}"
+    );
+
+    let o = step7();
+    let out = ok(&o);
+    assert!(out.contains(&format!("staging at {s}")), "{out}");
+}
+
 // ---------------------------------------------------------------- step 12
 
 fn stub(dir: &Path, name: &str, body: &str) {

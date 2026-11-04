@@ -695,6 +695,70 @@ EOF
   run sudo find "$root" -mindepth "$depth" -maxdepth "$depth" -type d -exec setfacl -m "u:$SVC_USER:rwX" {} + || return 1
   as_svc test -r "$root" && as_svc test -x "$root"
 }
+# svc_name: the account tapectl runs as (the service user; you, with --no-service-user).
+svc_name() { if [ "$SVC_MODE" = 1 ]; then printf '%s' "$SVC_USER"; else printf '%s' "$USER"; fi; }
+# svc_reach PATH (#511, ADR-0012 item 199): walk PATH from / down AS the account
+# tapectl runs as, and print what stops it there: "untraversable DIR" for the
+# first directory above PATH that exists but does not let that account through,
+# "missing DIR" for the first component that does not exist, or nothing when
+# PATH exists and every directory above it lets the account through. A test run
+# as you answers for the wrong account: a root:root 0710 directory keeps you out
+# too, so "is it there?" said no, and PATH was blamed for its parent.
+svc_reach() {
+  local p="$1" chain=() c
+  while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+    chain=("$p" ${chain[@]+"${chain[@]}"}); p="$(dirname "$p")"
+  done
+  for c in ${chain[@]+"${chain[@]}"}; do
+    # Every directory above c has let the account through, so a c it cannot
+    # see is one that does not exist.
+    as_svc test -e "$c" || { printf 'missing %s' "$c"; return 0; }
+    [ "$c" = "$1" ] || as_svc test -x "$c" || { printf 'untraversable %s' "$c"; return 0; }
+  done
+  return 0
+}
+# staging_why DIR: why DIR cannot be the staging directory as it stands, in words.
+staging_why() {
+  local r
+  [ -n "$1" ] || { printf 'unset'; return 0; }
+  r="$(svc_reach "$1")"
+  case "$r" in
+    untraversable\ *) printf '%s cannot reach it: %s does not let it through' "$(svc_name)" "${r#untraversable }" ;;
+    missing\ *) printf 'it does not exist' ;;
+    *) printf 'not writable by %s' "$(svc_name)" ;;
+  esac
+}
+# staging_ready DIR (#511, ADR-0012 item 199): the staging directory exists and
+# the account tapectl runs as can write it, or the step stops naming what is in
+# the way and the remedy. A directory above DIR that the account cannot traverse
+# is named itself, with the traverse-only ACL that fixes it, and DIR is not
+# blamed: on 2026-11-03 home2's /srv/acache, rebuilt root:root 0710 without
+# u:tapectl:x, made this check say the staging directory was not writable and
+# offer a chown that could not help. Nothing is given away by chown: a DIR that
+# does not exist is created for the account (as home2-prep.sh part 4 creates
+# it), and a DIR that exists is left as it is.
+staging_ready() {
+  local dir="$1" who reach p
+  who="$(svc_name)"
+  reach="$(svc_reach "$dir")"
+  case "$reach" in
+    missing\ *)
+      note "$dir does not exist (${reach#missing } is missing): creating it for $who, mode 0700"
+      run sudo install -d -o "$who" -m 0700 "$dir" || die "could not create the staging directory $dir (above)"
+      reach="$(svc_reach "$dir")" ;;
+  esac
+  case "$reach" in
+    untraversable\ *)
+      p="${reach#untraversable }"
+      die "$who cannot reach the staging directory $dir: $p ($(stat -c '%A %U:%G' "$p" 2>/dev/null || echo 'mode unreadable')) does not let $who through, so nothing below it can be checked. Grant traverse only (x) on $p, which changes nothing else about it, then re-run with --from 7:  sudo setfacl -m u:$who:x $p" ;;
+    missing\ *)
+      die "the staging directory $dir does not exist for $who after creating it (${reach#missing } is missing)" ;;
+  esac
+  as_svc test -d "$dir" || die "the staging directory $dir is not a directory"
+  if ! { as_svc test -w "$dir" && as_svc test -x "$dir"; }; then
+    die "$who cannot write the staging directory $dir ($(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo 'mode unreadable')); every directory above it lets $who through. Grant $who write on it, then re-run with --from 7:  sudo setfacl -m u:$who:rwx $dir"
+  fi
+}
 skip_if() { [ "$FROM" -gt "$STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
 vercmp_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 # dar_path_prefix: "DIR:" when --dar names a dar outside PATH's first hit, so the
@@ -1534,7 +1598,7 @@ SD_DEF="$SD"
 # one works: the profile is the decision about this host.
 [ -n "$STAGING_DIR" ] && [ "$SD" != "$STAGING_DIR" ] && SD_DEF="$STAGING_DIR" && note "profile staging directory: $STAGING_DIR (config has '${SD:-<unset>}')"
 if [ -z "$SD" ] || ! as_svc test -d "$SD" || ! as_svc test -w "$SD"; then
-  note "staging.directory is '${SD:-<unset>}' — $( [ -z "$SD" ] && echo unset || { [ -d "$SD" ] && echo "not writable by $SVC_USER" || echo "does not exist"; } )"
+  note "staging.directory is '${SD:-<unset>}' — $(staging_why "$SD")"
   # The home is usually on the root filesystem (small on this VM: / is
   # 22 GB); a big writable filesystem is the right default when one exists.
   if [ -n "$STAGING_DIR" ]; then SD_DEF="$STAGING_DIR"
@@ -1546,12 +1610,7 @@ if [ "$SD_NEW" != "$SD" ]; then
   as_svc sed -i "/^\[staging\]/,/^\[/{s|^directory *= *\".*\"|directory = \"$SD_NEW\"|}" "$CFG"
   as_svc grep -q "^directory = \"$SD_NEW\"" "$CFG" || die "could not rewrite staging.directory in $CFG — edit it by hand"
 fi
-[ -d "$SD_NEW" ] || run sudo mkdir -p "$SD_NEW"
-if ! as_svc test -w "$SD_NEW"; then
-  OWN_USER="$( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" )"
-  note "$SD_NEW is not writable by $OWN_USER"; confirm "sudo chown $OWN_USER $SD_NEW ?" && run sudo chown "$OWN_USER" "$SD_NEW"
-fi
-as_svc test -w "$SD_NEW" || die "staging directory $SD_NEW is not writable by $( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" )"
+staging_ready "$SD_NEW"
 run as_svc df -h "$SD_NEW"
 ok "staging at $SD_NEW"
 if [ -n "$STAGING_JOBS" ]; then
