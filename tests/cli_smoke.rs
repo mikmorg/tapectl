@@ -2068,6 +2068,12 @@ fn ambiguous_backends_do_not_surface_as_a_config_load_failure_for_the_rest_of_th
         vec!["audit".to_string()],
         vec!["catalog".to_string(), "stats".to_string()],
         vec!["report".to_string(), "fire-risk".to_string()],
+        // `report pending` until 1.9.0, which had this door (item 207).
+        vec![
+            "stage".to_string(),
+            "list".to_string(),
+            "--owing".to_string(),
+        ],
         vec!["db".to_string(), "backup".to_string(), backup_arg],
         vec!["db".to_string(), "fsck".to_string(), "--repair".to_string()],
     ] {

@@ -27,24 +27,32 @@ fn tapectl(home: &Path, args: &[&str]) -> Output {
         .expect("failed to spawn tapectl")
 }
 
-/// The refusal `r` must give for `args`, or what was wrong.
+/// The refusal `r` must give for `args`, or what was wrong: exit 2 and
+/// "`tapectl <old>` was renamed in 1.9.0: use `tapectl <new>`". On stderr,
+/// with nothing on stdout, except under `--json`, whose refusal is to be
+/// the JSON error (ADR-0012 item 212, OQ4): there the words may be on
+/// either stream, so this pin holds when that error moves to stdout.
 fn refused_by_name(home: &Path, r: &Renamed, args: &[&str]) -> Option<String> {
     let out = tapectl(home, args);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let want = format!(
-        "`tapectl {}` was renamed in 1.9.0: use `tapectl {}`",
-        r.old(),
-        r.new
-    );
-    if out.status.code() == Some(2) && stderr.contains(&want) && out.stdout.is_empty() {
+    let json = args.contains(&"--json");
+    let old = format!("`tapectl {}`", r.old());
+    let new = format!("`tapectl {}`", r.new);
+    let named = if json {
+        let both = format!("{stdout}{stderr}");
+        both.contains(&old) && both.contains(&new) && both.contains("1.9.0")
+    } else {
+        stderr.contains(&format!("{old} was renamed in 1.9.0: use {new}")) && stdout.is_empty()
+    };
+    if out.status.code() == Some(2) && named {
         None
     } else {
         Some(format!(
-            "`tapectl {}` exited {:?}; want exit 2 and {want:?} on stderr, nothing on stdout\n\
-             stdout={}\nstderr={stderr}",
+            "`tapectl {}` exited {:?}; want exit 2 naming {old}, {new} and 1.9.0\n\
+             stdout={stdout}\nstderr={stderr}",
             args.join(" "),
             out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
         ))
     }
 }

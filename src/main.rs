@@ -468,10 +468,16 @@ fn run(
     //     only, mirroring #233's own specificity: a plain `fsck` (no
     //     `--repair`) never mutates and was never the blocked command in
     //     the first place.
+    //   - `Stage { List }`: `report pending` and `staging status` until 1.9.0
+    //     (ADR-0012 items 207, 209), so it keeps the door `report pending`
+    //     had. It reads `config.defaults`/`config.compaction` for the copy
+    //     floor (`cli::stage::stage_set_rows`) and the staged files on disk,
+    //     and never calls a device resolver. `src/cli/stage.rs`.
     //
-    // Every other command (`Volume`, `Collection`, `Snapshot`, `Stage`,
-    // `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`, `QuickArchive`,
-    // `Drive`, `Db::{Export,Import,Stats}`, `Config::Show`) keeps the strict loader below unconditionally —
+    // Every other command (`Volume`, `Collection`, `Snapshot`, the rest of
+    // `Stage`, `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`,
+    // `QuickArchive`, `Drive`, `Db::{Export,Import,Stats}`, `Config::Show`)
+    // keeps the strict loader below unconditionally —
     // several of them (`Volume`, `Collection`, `QuickArchive`) reach
     // `resolve_lto_backend` directly and must never see this door.
     let lenient_backend_ok = matches!(
@@ -485,6 +491,9 @@ fn run(
             }
             | Commands::Db {
                 command: cli::DbCommands::Fsck { repair: true }
+            }
+            | Commands::Stage {
+                command: cli::stage::StageCommands::List { .. }
             }
     );
     let cfg = match Config::load(&paths.config_file) {
