@@ -2003,3 +2003,52 @@ fn quick_archive_dry_run_refuses_before_resolving_a_backend() {
         "--dry-run staged anything"
     );
 }
+
+/// ADR-0012 item 220: a move to where the tape already is changes nothing and
+/// says so, for `volume move` and `cartridge move` alike (W3-B's mover, the
+/// commands' text): no "moved", no movement row, no event, and `--json`
+/// carries `already_there`.
+#[test]
+fn a_move_to_where_the_tape_already_is_says_so_and_writes_nothing() {
+    let home = home_with_a_bound_cartridge();
+    ok(home.path(), &["volume", "move", "L6-0001", "--to", "bank"]);
+    let conn = db(home.path());
+    let moves = count(&conn, "SELECT COUNT(*) FROM volume_movements");
+    let events = count(&conn, "SELECT COUNT(*) FROM events WHERE action = 'moved'");
+    assert!(moves > 0 && events > 0, "the first move moved nothing");
+
+    let again = ok(home.path(), &["volume", "move", "L6-0001", "--to", "bank"]);
+    let text = String::from_utf8_lossy(&again.stdout);
+    assert!(
+        text.contains("volume \"L6-0001\" is already at \"bank\": nothing changed"),
+        "a no-op volume move must say so: {text}"
+    );
+    assert!(
+        !text.contains("moved to"),
+        "a no-op move said it moved: {text}"
+    );
+
+    let cart = ok(
+        home.path(),
+        &["cartridge", "move", "A001L6", "--to", "bank"],
+    );
+    let text = String::from_utf8_lossy(&cart.stdout);
+    assert!(
+        text.contains("cartridge \"A001L6\" is already at \"bank\": nothing changed"),
+        "a no-op cartridge move must say so: {text}"
+    );
+
+    let json = ok(
+        home.path(),
+        &["--json", "volume", "move", "L6-0002", "--to", "bank"],
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(parsed["already_there"], serde_json::json!(true), "{parsed}");
+
+    let conn = db(home.path());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM volume_movements"), moves);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM events WHERE action = 'moved'"),
+        events
+    );
+}

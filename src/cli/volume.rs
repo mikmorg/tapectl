@@ -1604,6 +1604,12 @@ fn check_move_destination(conn: &Connection, location: &str) -> Result<()> {
 fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
     match moved {
         MoveAfterWrite::NotAsked => {}
+        MoveAfterWrite::Moved { to, outcome } if outcome.already_there => {
+            println!(
+                "volume \"{label}\" is already at \"{}\": nothing changed",
+                to.trim()
+            );
+        }
         MoveAfterWrite::Moved { to, outcome } => {
             println!("volume \"{label}\" moved to \"{to}\"");
             if let Some(barcode) = &outcome.cartridge {
@@ -2792,11 +2798,17 @@ pub fn run(
                     "location": to,
                     "cartridge": outcome.cartridge,
                     "volumes_moved": outcome.volumes,
+                    "already_there": outcome.already_there,
                 });
                 if dry_run {
                     obj["dry_run"] = serde_json::json!(true);
                 }
                 println!("{obj}");
+            } else if outcome.already_there {
+                println!(
+                    "volume \"{label}\" is already at \"{}\": nothing changed",
+                    to.trim()
+                );
             } else if dry_run {
                 println!(
                     "volume \"{label}\" would be moved to \"{to}\" (DRY RUN — no changes made)"

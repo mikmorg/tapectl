@@ -749,11 +749,17 @@ pub fn run(
                     "barcode": barcode,
                     "location": to,
                     "volumes_moved": outcome.volumes,
+                    "already_there": outcome.already_there,
                 });
                 if dry_run {
                     obj["dry_run"] = serde_json::json!(true);
                 }
                 println!("{obj}");
+            } else if outcome.already_there {
+                println!(
+                    "cartridge \"{barcode}\" is already at \"{}\": nothing changed",
+                    to.trim()
+                );
             } else if dry_run {
                 println!(
                     "cartridge \"{barcode}\" would be moved to \"{to}\" \
