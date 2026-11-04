@@ -91,7 +91,7 @@ pub enum UnitCommands {
     /// Add or remove a unit's tags
     ///
     /// The tags are written to the catalog and to the unit's
-    /// .tapectl-unit.toml; neither mints a new version.
+    /// .tapectl-unit.toml. A tag is not content: it mints no new version.
     Tag {
         /// The unit
         name: String,
