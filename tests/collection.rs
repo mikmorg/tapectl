@@ -116,3 +116,512 @@ fn collection_sync_dry_run_parses_through_the_real_cli() {
         other => panic!("expected Commands::Collection, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0012 items 206, 207, 212 and 220, through the real binary.
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+fn tapectl(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TAPECTL_HOME")
+        .env_remove("TAPECTL_CONFIG")
+        .output()
+        .expect("failed to spawn tapectl binary")
+}
+
+fn shown(out: &Output) -> String {
+    format!(
+        "exit={:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Runs `args` and asserts the exit code.
+fn exits(home: &Path, args: &[&str], code: i32) -> Output {
+    let out = tapectl(home, args);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "`tapectl {}`\n{}",
+        args.join(" "),
+        shown(&out)
+    );
+    out
+}
+
+fn json(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("not one JSON document ({e}):\n{}", shown(out)))
+}
+
+fn config_text(home: &Path) -> String {
+    std::fs::read_to_string(home.join(".tapectl/config.toml")).unwrap()
+}
+
+/// A home with tenant `media` and a root of `folders` (each holding one
+/// file), the root canonical.
+fn home_and_root(folders: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, String) {
+    let home = tempfile::tempdir().unwrap();
+    exits(home.path(), &["init", "--no-escrow"], 0);
+    exits(home.path(), &["tenant", "add", "media"], 0);
+    let root = tempfile::tempdir().unwrap();
+    for f in folders {
+        std::fs::create_dir_all(root.path().join(f)).unwrap();
+        std::fs::write(root.path().join(f).join("a.txt"), b"x").unwrap();
+    }
+    let canonical = root.path().canonicalize().unwrap().display().to_string();
+    (home, root, canonical)
+}
+
+/// A collection table written by hand, as an older `config add` could:
+/// `collection add` refuses each of the broken ones the tests need.
+fn append_collection(home: &Path, name: &str, root: &str, tenant: &str) {
+    let cfg = home.join(".tapectl/config.toml");
+    let text = config_text(home);
+    std::fs::write(
+        cfg,
+        format!("{text}\n[[collections]]\nname = \"{name}\"\nroot = \"{root}\"\ntenant = \"{tenant}\"\n"),
+    )
+    .unwrap();
+}
+
+/// `collection add` refuses, exit 2 and the file untouched, each thing
+/// that makes a collection unusable (ADR-0012 item 206).
+#[test]
+fn collection_add_refuses_each_unusable_collection() {
+    let (home, root, canonical) = home_and_root(&["alpha"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    let before = config_text(h);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = elsewhere
+        .path()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let inside = format!("{canonical}/alpha");
+    let missing = format!("{elsewhere}/nope");
+    let parent = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    for (args, says) in [
+        (
+            vec!["my photos", &elsewhere, "--tenant", "media"],
+            "invalid collection name \"my photos\"",
+        ),
+        (
+            vec!["photos", &elsewhere, "--tenant", "media"],
+            "already configured",
+        ),
+        (
+            vec!["more", "relative/root", "--tenant", "media"],
+            "is not an absolute path",
+        ),
+        (
+            vec!["more", &missing, "--tenant", "media"],
+            "does not exist",
+        ),
+        (
+            vec!["more", &elsewhere, "--tenant", "medai"],
+            "tenant \"medai\" does not exist",
+        ),
+        (
+            vec![
+                "more",
+                &elsewhere,
+                "--tenant",
+                "media",
+                "--archive-set",
+                "cold",
+            ],
+            "unknown archive set \"cold\"",
+        ),
+        (
+            vec!["more", &inside, "--tenant", "media"],
+            "overlaps collection \"photos\"",
+        ),
+        (
+            vec!["more", &parent, "--tenant", "media"],
+            "overlaps collection \"photos\"",
+        ),
+    ] {
+        let mut argv = vec!["collection", "add"];
+        argv.extend(args.iter().copied());
+        let out = exits(h, &argv, 2);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(says),
+            "`{}` should say {says:?}\n{}",
+            argv.join(" "),
+            shown(&out)
+        );
+        assert_eq!(before, config_text(h), "`{}` wrote", argv.join(" "));
+    }
+}
+
+/// `collection add` checks, as the user it runs as, that it can write each
+/// unit folder, prints the `setfacl` line that grants it when it cannot,
+/// and adds nothing; `--no-dotfiles` needs no write.
+#[test]
+fn collection_add_prints_the_setfacl_lines_it_cannot_run_itself() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, root, canonical) = home_and_root(&["alpha", "bravo"]);
+    let h = home.path();
+    let alpha = root.path().join("alpha");
+    std::fs::set_permissions(&alpha, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(alpha.join("probe"), b"x").is_ok() {
+        eprintln!("SKIPPED: a read-only directory does not stop this user (root?)");
+        return;
+    }
+    let before = config_text(h);
+    let out = exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        2,
+    );
+    let user = tapectl::unit::effective_user_name();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "sudo find {canonical} -mindepth 1 -maxdepth 1 -type d -exec setfacl -m u:{user}:rwX {{}} +"
+        )),
+        "{}",
+        shown(&out)
+    );
+    assert!(
+        stderr.contains(&format!("cannot write {canonical}/alpha")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-dotfiles"), "{stderr}");
+    assert_eq!(before, config_text(h));
+
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+            "--no-dotfiles",
+        ],
+        0,
+    );
+    assert!(config_text(h).contains("dotfiles = false"));
+    std::fs::set_permissions(&alpha, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `collection add` writes the table and shows the sync it would get; the
+/// dry run it shows and the real `collection sync` agree on a folder whose
+/// name is not a unit name (ADR-0012 item 220), which is a warning: exit 1.
+#[test]
+fn collection_add_previews_the_sync_the_real_one_agrees_with() {
+    let (home, _root, canonical) = home_and_root(&["alpha", "bravo", "2022 trip"]);
+    let h = home.path();
+    let out = exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    let text = stdout(&out);
+    assert!(text.contains("added collection \"photos\""), "{text}");
+    assert!(
+        text.contains("collection \"photos\" (dry run): would create 2; 1 refused"),
+        "{text}"
+    );
+    assert!(text.contains("2 pending (2 never archived)"), "{text}");
+    assert!(
+        text.contains("tapectl config add 'collections[photos].exclude' '2022 trip'"),
+        "{text}"
+    );
+
+    let dry = exits(h, &["collection", "sync", "--dry-run"], 1);
+    assert!(
+        stdout(&dry).contains("would create 2; 1 refused"),
+        "{}",
+        shown(&dry)
+    );
+    let real = exits(h, &["collection", "sync"], 1);
+    assert!(
+        stdout(&real).contains("collection \"photos\": 2 created; 1 refused"),
+        "{}",
+        shown(&real)
+    );
+    // Positive control for the exit: with the folder excluded, clean.
+    exits(
+        h,
+        &["config", "add", "collections[photos].exclude", "2022 trip"],
+        0,
+    );
+    let clean = exits(h, &["collection", "sync"], 0);
+    assert!(
+        stdout(&clean).contains("0 created; 0 refused"),
+        "{}",
+        shown(&clean)
+    );
+}
+
+/// `collection remove` takes the table out and leaves the units: a later
+/// sync of the collections still configured marks none of them missing,
+/// though one of its folders is gone (the coordinator's OQ23).
+#[test]
+fn collection_remove_leaves_the_units_and_no_sync_marks_them_missing() {
+    let (home, root, canonical) = home_and_root(&["alpha", "bravo"]);
+    let h = home.path();
+    let (_other, other_canonical) = {
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join("x")).unwrap();
+        let c = other.path().canonicalize().unwrap().display().to_string();
+        (other, c)
+    };
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "other",
+            &other_canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(h, &["collection", "sync"], 0);
+
+    let out = exits(h, &["collection", "remove", "photos"], 0);
+    assert!(
+        stdout(&out).contains("its 2 units stay registered and untouched"),
+        "{}",
+        shown(&out)
+    );
+    assert!(!config_text(h).contains("name = \"photos\""));
+    std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
+    exits(h, &["collection", "sync"], 0);
+
+    let units = json(&exits(h, &["--json", "unit", "list"], 0));
+    let status_of = |name: &str| {
+        units
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is still registered: {units}"))["status"]
+            .clone()
+    };
+    assert_eq!(status_of("photos/alpha"), "active", "never marked missing");
+    assert_eq!(status_of("photos/bravo"), "active");
+    // Positive control: a folder gone from a collection still configured is.
+    std::fs::remove_dir_all(Path::new(&other_canonical).join("x")).unwrap();
+    exits(h, &["collection", "sync"], 1);
+}
+
+/// One collection with a missing root and one with a misspelled tenant are
+/// each that collection's error (exit 2); the good one is still shown and
+/// synced, and neither broken one reads as clean (ADR-0012 item 220).
+#[test]
+fn status_survives_a_missing_root_and_flags_a_misspelled_tenant() {
+    let (home, _root, canonical) = home_and_root(&["alpha"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    append_collection(h, "movies", "/nonexistent/tapectl-test/movies", "media");
+    let typo_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(typo_root.path().join("x")).unwrap();
+    let typo = typo_root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    append_collection(h, "tv", &typo, "medai");
+
+    let out = exits(h, &["collection", "status"], 2);
+    let text = stdout(&out);
+    assert!(text.contains("collection \"photos\": 0 pending"), "{text}");
+    assert!(
+        text.contains("collection \"movies\": error: root \"/nonexistent/tapectl-test/movies\" does not exist"),
+        "{text}"
+    );
+    assert!(
+        text.contains("collection \"tv\": error: tenant \"medai\" does not exist"),
+        "{text}"
+    );
+
+    let rows = json(&exits(h, &["--json", "collection", "status"], 2));
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0]["pending"], 0);
+    assert!(
+        rows[1]["pending"].is_null() && rows[2]["pending"].is_null(),
+        "{rows:?}"
+    );
+    assert_eq!(rows[2]["errors"].as_array().unwrap().len(), 1, "{rows:?}");
+
+    // Sync goes on to the good collection, and registers nothing for tv.
+    let out = exits(h, &["collection", "sync"], 2);
+    assert!(
+        stdout(&out).contains("collection \"photos\": 1 created"),
+        "{}",
+        shown(&out)
+    );
+    let units = json(&exits(h, &["--json", "unit", "list"], 0));
+    assert_eq!(units.as_array().unwrap().len(), 1, "{units}");
+}
+
+/// The JSON keys of ADR-0012 item 207, and the exit codes of item 212: a
+/// pending unit is never archived or dirty, a staged one awaits a write,
+/// and only a warning (here an entry outside every unit) makes it exit 1.
+#[test]
+fn status_reports_pending_as_the_glossary_says_and_staged_beside_it() {
+    let (home, root, canonical) = home_and_root(&["alpha", "bravo", "charlie"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(h, &["collection", "sync"], 0);
+    // charlie: a version staged and owed its copies, as `stage create`
+    // leaves it; its folder changed since, so it is dirty too.
+    let conn = tapectl::db::open(&h.join(".tapectl/tapectl.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             SELECT id, 1, 'current', current_path, 0, 0 FROM units WHERE name = 'photos/charlie';
+         INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             SELECT id, 'staged', 1 FROM snapshots;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = exits(h, &["collection", "status"], 0);
+    assert!(
+        stdout(&out).contains(
+            "collection \"photos\": 3 pending (2 never archived, 1 dirty) · 1 staged, awaiting \
+             a write · 3 under-copied"
+        ),
+        "{}",
+        shown(&out)
+    );
+    let rows = json(&exits(h, &["--json", "collection", "status"], 0));
+    let photos = &rows[0];
+    for (key, n) in [
+        ("pending", 3),
+        ("never_archived", 2),
+        ("dirty", 1),
+        ("staged", 1),
+        ("under_copied", 3),
+        ("missing", 0),
+    ] {
+        assert_eq!(photos[key], n, "{key}: {photos}");
+    }
+
+    let rows = json(&exits(h, &["--json", "collection", "sync", "--dry-run"], 0));
+    for (key, n) in [
+        ("pending", 3),
+        ("never_archived", 2),
+        ("dirty", 1),
+        ("staged", 1),
+    ] {
+        assert_eq!(rows[0][key], n, "sync's {key}: {}", rows[0]);
+    }
+
+    std::fs::write(root.path().join("loose.txt"), b"x").unwrap();
+    let out = exits(h, &["collection", "status"], 1);
+    assert!(
+        stdout(&out).contains("tapectl config add 'collections[photos].exclude' PATTERN"),
+        "{}",
+        shown(&out)
+    );
+}
+
+/// With no collection configured, `sync`, `status` and `plan` print the
+/// one shape they print for several, an empty list, under --json, and
+/// otherwise name the command that adds one (ADR-0012 items 206, 220).
+#[test]
+fn with_no_collection_each_command_prints_an_empty_list() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    exits(h, &["init", "--no-escrow"], 0);
+    for command in ["sync", "status", "plan"] {
+        let out = exits(h, &["--json", "collection", command], 0);
+        assert_eq!(json(&out), serde_json::json!([]), "{command}");
+        let out = exits(h, &["collection", command], 0);
+        assert!(
+            stdout(&out).contains("tapectl collection add NAME ROOT --tenant TENANT"),
+            "{command}: {}",
+            shown(&out)
+        );
+    }
+}

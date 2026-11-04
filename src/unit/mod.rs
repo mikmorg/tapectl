@@ -1153,4 +1153,113 @@ mod tests {
             "copies_at must survive rename, got: {after}"
         );
     }
+
+    // ── ADR-0012 item 220: the half-registered unit ──
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The row commits only once the dotfile is written: a folder the user
+    /// cannot write leaves no row, and the error names the grant.
+    #[test]
+    fn a_dotfile_that_cannot_be_written_leaves_no_row() {
+        let (conn, tmp, paths) = harness();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        chmod(&src, 0o555);
+        if std::fs::write(src.join(".probe"), b"x").is_ok() {
+            chmod(&src, 0o755);
+            eprintln!("SKIPPED: a read-only directory does not stop this user (root?)");
+            return;
+        }
+        let err = init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &["t".to_string()],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        chmod(&src, 0o755);
+        let user = effective_user_name();
+        assert!(
+            err.contains(&format!(
+                "cannot write .tapectl-unit.toml in {}",
+                src.canonicalize().unwrap().display()
+            )) && err.contains(&format!("as user {user}"))
+                && err.contains(&format!("sudo setfacl -m u:{user}:rwX")),
+            "{err}"
+        );
+        for table in ["units", "unit_tags", "unit_path_history"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table}: the transaction rolled back");
+        }
+
+        // Writable again: `unit init` registers it.
+        init_unit(
+            &conn,
+            &paths,
+            src.to_str().unwrap(),
+            "alice",
+            Some("unit1"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(src.join(dotfile::UNIT_DOTFILE).exists());
+    }
+
+    /// `unit init` at a folder registered before 1.9.0 without its dotfile
+    /// completes it with the row's identity, rather than calling it nested
+    /// in itself; for another tenant it refuses, naming the owner.
+    #[test]
+    fn unit_init_completes_a_unit_stuck_without_its_dotfile() {
+        let (conn, tmp, paths) = harness();
+        crate::tenant::add_tenant(&conn, &paths, "bob", None, false).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let abs = src.canonicalize().unwrap().to_string_lossy().to_string();
+        let alice = crate::tenant::require_tenant(&conn, "alice").unwrap();
+        let id = queries::insert_unit(
+            &conn,
+            "u-1",
+            "photos",
+            alice.id,
+            None,
+            &abs,
+            "mtime_size",
+            true,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let err = register_unit(&conn, &config, &abs, "bob", None, &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--tenant alice"), "{err}");
+        assert!(!src.join(dotfile::UNIT_DOTFILE).exists());
+
+        let done = register_unit(&conn, &config, &abs, "alice", None, &[], None).unwrap();
+        assert_eq!(done, Registration::Completed(id));
+        let df = dotfile::read_dotfile(&src.join(dotfile::UNIT_DOTFILE)).unwrap();
+        assert_eq!((df.uuid.as_str(), df.name.as_str()), ("u-1", "photos"));
+        let units: i64 = conn
+            .query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(units, 1);
+    }
+
+    #[test]
+    fn a_shell_word_is_quoted_only_when_it_must_be() {
+        assert_eq!(shell_word("/srv/media/photos"), "/srv/media/photos");
+        assert_eq!(shell_word("2022 trip"), "'2022 trip'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+    }
 }

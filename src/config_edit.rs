@@ -127,7 +127,12 @@ pub fn plan_collection_remove(original: &str, path: &Path, name: &str) -> Result
         key: format!("{COLLECTIONS}[{name}]"),
         values: Vec::new(),
     };
-    let segs = parse_key(edit.key())?;
+    // Selected by name, never parsed: `collections[2024]` would read as the
+    // position 2024, and a collection may be named 2024.
+    let segs = vec![Seg {
+        key: COLLECTIONS.to_string(),
+        select: Some(Selector::Name(name.to_string())),
+    }];
     plan_parsed(original, path, &edit, segs)
 }
 

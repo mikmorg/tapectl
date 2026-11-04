@@ -1519,4 +1519,206 @@ mod tests {
             "the source is gone: the frozen dotfile layer, not the set's home = 3"
         );
     }
+
+    // ── ADR-0012 item 220 ──
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Whether a read-only directory stops this user writing in it: mode
+    /// bits do not bind root, nor some filesystems. Probed, not guessed.
+    fn modes_bind(dir: &Path) -> bool {
+        let probe = dir.join(".probe");
+        std::fs::create_dir(&probe).unwrap();
+        chmod(&probe, 0o500);
+        let binds = std::fs::write(probe.join("x"), b"x").is_err();
+        chmod(&probe, 0o700);
+        std::fs::remove_dir_all(&probe).unwrap();
+        binds
+    }
+
+    fn unit_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The half-registered unit: a folder this user cannot write gets no
+    /// row (the dry run predicts the same refusal), the error names the
+    /// grant and `dotfiles = false`, and once the folder is writable the
+    /// next sync registers it.
+    #[test]
+    fn a_dotfile_that_cannot_be_written_leaves_no_row_and_a_later_sync_registers_it() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        if !modes_bind(root.path()) {
+            eprintln!("SKIPPED: a read-only directory does not stop this user (root?)");
+            return;
+        }
+        let alpha = root.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        chmod(&alpha, 0o555);
+        let lib = test_lib(root.path(), "media");
+
+        for dry_run in [true, false] {
+            let (report, errors) =
+                sync_collection(&conn, &paths_in(home.path()), &lib, dry_run, &[]).unwrap();
+            assert_eq!(report.created, 0, "dry_run={dry_run}");
+            assert_eq!(report.refused_folders(), 1, "dry_run={dry_run}");
+            assert_eq!(report.problems[0].severity, Severity::Error);
+            let user = crate::unit::effective_user_name();
+            assert!(
+                errors[0].contains(&format!("setfacl -m u:{user}:rwX"))
+                    && errors[0].contains("dotfiles = false")
+                    && errors[0]
+                        .contains("tapectl config set 'collections[testlib].dotfiles' false"),
+                "dry_run={dry_run}: {}",
+                errors[0]
+            );
+            assert_eq!(unit_count(&conn), 0, "dry_run={dry_run}: no row is left");
+        }
+        assert!(!alpha.join(dotfile::UNIT_DOTFILE).exists());
+
+        chmod(&alpha, 0o755);
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((report.created, report.completed), (1, 0));
+        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .unwrap();
+        let df = dotfile::read_dotfile(&alpha.join(dotfile::UNIT_DOTFILE)).unwrap();
+        assert_eq!(df.uuid, unit.uuid);
+    }
+
+    /// A row stuck at its exact folder with no dotfile (what a failed write
+    /// left before 1.9.0) is completed with its own uuid, not reported as
+    /// nested in itself; the dry run says so and writes nothing.
+    #[test]
+    fn a_row_stuck_without_its_dotfile_is_completed_with_its_own_uuid() {
+        let conn = db::open_memory().unwrap();
+        let tenant_id = seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let alpha = root.path().canonicalize().unwrap().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let id = queries::insert_unit(
+            &conn,
+            "u-stuck",
+            "testlib/alpha",
+            tenant_id,
+            None,
+            &alpha.to_string_lossy(),
+            "mtime_size",
+            true,
+        )
+        .unwrap();
+        queries::add_tag_to_unit(&conn, id, "kept").unwrap();
+        let lib = test_lib(root.path(), "media");
+
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, true, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((report.created, report.completed), (0, 1));
+        assert!(!alpha.join(dotfile::UNIT_DOTFILE).exists(), "a dry run");
+
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "never called nested: {errors:?}");
+        assert_eq!((report.created, report.completed), (0, 1));
+        let df = dotfile::read_dotfile(&alpha.join(dotfile::UNIT_DOTFILE)).unwrap();
+        assert_eq!(
+            (df.uuid.as_str(), df.name.as_str(), df.tenant.as_str()),
+            ("u-stuck", "testlib/alpha", "media")
+        );
+        assert_eq!(df.tags, vec!["kept".to_string()]);
+        assert_eq!(unit_count(&conn), 1, "the row is the unit; none is added");
+
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((report.created, report.completed), (0, 0));
+    }
+
+    /// Sync's dry run validates names as the real run does (ADR-0012 item
+    /// 220): both refuse the folder with a space in it, with its two ways
+    /// out, and agree on every count.
+    #[test]
+    fn the_dry_run_and_the_real_run_agree_on_an_invalid_name() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for d in ["alpha", "2022 trip"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        let lib = test_lib(root.path(), "media");
+        let counts = |r: &SyncReport| (r.created, r.refused_folders(), r.never_archived);
+
+        let (dry, dry_errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, true, &[]).unwrap();
+        assert_eq!(counts(&dry), (1, 1, 1));
+        assert_eq!(dry.problems[0].severity, Severity::Warning);
+        assert!(
+            dry_errors[0].contains("invalid unit name \"testlib/2022 trip\"")
+                && dry_errors[0].contains("rename the folder")
+                && dry_errors[0]
+                    .contains("tapectl config add 'collections[testlib].exclude' '2022 trip'"),
+            "{}",
+            dry_errors[0]
+        );
+        assert_eq!(unit_count(&conn), 0);
+
+        let (real, real_errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert_eq!(counts(&real), counts(&dry));
+        assert_eq!(real_errors, dry_errors);
+        assert_eq!(unit_count(&conn), 1);
+    }
+
+    /// A dry run reads its own moves and reactivations: a renamed unit is
+    /// moved, not also missing, and is pending at its new folder, as the
+    /// real run reports it.
+    #[test]
+    fn a_dry_run_counts_a_move_as_the_real_run_does() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        let lib = test_lib(root.path(), "media");
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        std::fs::rename(root.path().join("alpha"), root.path().join("alpha2")).unwrap();
+
+        let counts = |r: &SyncReport| (r.moved, r.missing, r.never_archived, r.created);
+        let (dry, _) = sync_collection(&conn, &paths_in(home.path()), &lib, true, &[]).unwrap();
+        assert_eq!(counts(&dry), (1, 0, 1, 0));
+        let (real, _) = sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert_eq!(counts(&real), counts(&dry));
+    }
+
+    /// A collection whose tenant does not exist is that collection's error:
+    /// nothing is walked or registered, and the problem names the fix.
+    #[test]
+    fn an_unknown_tenant_stops_the_collection_before_any_folder() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        let lib = test_lib(root.path(), "medai");
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert_eq!(errors.len(), 1, "one line, not one a folder: {errors:?}");
+        assert!(
+            errors[0].contains("tenant \"medai\" does not exist"),
+            "{errors:?}"
+        );
+        assert_eq!(report.problems[0].folder, None);
+        assert_eq!(report.severities(), vec![Severity::Error]);
+        assert_eq!(unit_count(&conn), 0);
+    }
 }
