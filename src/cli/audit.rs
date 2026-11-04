@@ -26,7 +26,14 @@ pub fn run(
 
     print!(
         "{}",
-        render(&violations, &warnings, exit_code, action_plan, json_output)
+        render(
+            &violations,
+            &warnings,
+            exit_code,
+            action_plan,
+            json_output,
+            unit_filter
+        )
     );
 
     Ok(exit_code)
@@ -42,12 +49,18 @@ pub fn run(
 /// `run` (issue #56) hoisted the trailing summary line out of the non-JSON
 /// branch and silently broke exactly this. `json_output_is_a_single_parseable_object`
 /// pins it.
+///
+/// The human form lists the findings, then, with `--action-plan`, one `fix:`
+/// line per distinct remedy, naming the units it is for: five staged units
+/// owe one `volume write`, not five copies of it (ADR-0012 item 220). Without
+/// `--action-plan`, an audit that found anything ends by naming it.
 fn render(
     violations: &[AuditFinding],
     warnings: &[AuditFinding],
     exit_code: i32,
     action_plan: bool,
     json_output: bool,
+    unit_filter: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -71,25 +84,31 @@ fn render(
         return out;
     }
 
-    if violations.is_empty() && warnings.is_empty() {
+    let found = !(violations.is_empty() && warnings.is_empty());
+    if !found {
         let _ = writeln!(out, "audit: clean");
     } else {
         if !violations.is_empty() {
             let _ = writeln!(out, "VIOLATIONS ({}):", violations.len());
             for f in violations {
                 let _ = writeln!(out, "  [{}] {}: {}", f.check, f.unit, f.message);
-                if action_plan {
-                    let _ = writeln!(out, "    fix: {}", f.action);
-                }
             }
         }
         if !warnings.is_empty() {
             let _ = writeln!(out, "WARNINGS ({}):", warnings.len());
             for f in warnings {
                 let _ = writeln!(out, "  [{}] {}: {}", f.check, f.unit, f.message);
-                if action_plan {
-                    let _ = writeln!(out, "    fix: {}", f.action);
-                }
+            }
+        }
+        if action_plan {
+            let fixes = distinct_fixes(violations.iter().chain(warnings));
+            let _ = writeln!(
+                out,
+                "ACTION PLAN ({}):",
+                crate::render::plural(fixes.len() as i64, "fix", "fixes")
+            );
+            for (action, subjects) in &fixes {
+                let _ = writeln!(out, "  fix: {action} — for {}", subjects_phrase(subjects));
             }
         }
     }
@@ -100,7 +119,53 @@ fn render(
         warnings.len(),
         exit_code,
     );
+    if found && !action_plan {
+        let _ = writeln!(
+            out,
+            "for the fixes: tapectl audit --action-plan{}",
+            unit_filter
+                .map(|u| format!(" --unit {u}"))
+                .unwrap_or_default()
+        );
+    }
     out
+}
+
+/// Each distinct remedy once, in the order first found, with the subjects
+/// (units, `volume:L`, `archive`) whose findings it fixes, each named once.
+fn distinct_fixes<'a>(
+    findings: impl Iterator<Item = &'a AuditFinding>,
+) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut fixes: Vec<(&str, Vec<&str>)> = Vec::new();
+    for f in findings {
+        let (action, unit) = (f.action.as_str(), f.unit.as_str());
+        match fixes.iter_mut().find(|fix| fix.0 == action) {
+            Some(fix) => {
+                if !fix.1.contains(&unit) {
+                    fix.1.push(unit);
+                }
+            }
+            None => fixes.push((action, vec![unit])),
+        }
+    }
+    fixes
+}
+
+/// `photos`, `3 units: a, b, c`, or the subjects as the findings name them
+/// when they are not all units (`volume:L6-0001, archive`).
+fn subjects_phrase(subjects: &[&str]) -> String {
+    let all_units = subjects
+        .iter()
+        .all(|s| *s != "archive" && !s.starts_with("volume:") && !s.starts_with("cartridge:"));
+    if subjects.len() > 1 && all_units {
+        format!(
+            "{}: {}",
+            crate::render::plural(subjects.len() as i64, "unit", "units"),
+            subjects.join(", ")
+        )
+    } else {
+        subjects.join(", ")
+    }
 }
 
 /// Every per-unit check's `statuses` except `dirty` (issue #138): `active`,
@@ -600,27 +665,72 @@ fn current_versions_live(conn: &Connection, unit_id: i64) -> Result<Vec<(i64, bo
     Ok(live_by_version.into_iter().collect())
 }
 
+/// Where a copy recipe's new copy goes, its last step, and a note after the
+/// whole recipe.
+#[derive(Clone, Copy)]
+struct Dest<'a> {
+    /// The location the new volume is moved to: a location's name, a
+    /// placeholder (`<OTHER-LOCATION>`), or `None` when any place will do.
+    location: Option<&'a str>,
+    /// Appended verbatim after the recipe (`location_presence`'s "then the
+    /// same again" for a second missing location).
+    note: &'a str,
+}
+
+impl Dest<'static> {
+    /// No place named: `copy_count`'s remedy.
+    const ANYWHERE: Self = Dest {
+        location: None,
+        note: "",
+    };
+}
+
+impl<'a> Dest<'a> {
+    fn at(location: &'a str) -> Self {
+        Dest {
+            location: Some(location),
+            note: "",
+        }
+    }
+
+    /// The end of a recipe that initialises `label` and writes it: the move
+    /// to the named place, if any, then the note.
+    fn move_step(&self, label: &str) -> String {
+        match self.location {
+            Some(location) => format!(
+                " && tapectl volume move {label} --to {location}{}",
+                self.note
+            ),
+            None => self.note.to_string(),
+        }
+    }
+
+    /// The one-command copy of everything staged onto a new cartridge
+    /// (`volume write --init --full-confirm --move-to`, the form `collection
+    /// status` and `volume write`'s help give), then the note. It names no
+    /// unit, so the same remedy for several units collapses into one line.
+    fn write_new(&self) -> String {
+        format!(
+            "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to {}{}",
+            self.location.unwrap_or("<location>"),
+            self.note
+        )
+    }
+}
+
 /// The remedy for "this unit needs another copy of its CURRENT-snapshot
-/// content" — `copy_count` and `location_presence`. The content itself is
-/// not in question, so a live stage set can be written as-is and a
-/// released one can be pulled back byte-for-byte with `read-slices`.
-/// `extra` is appended verbatim to the final write command (e.g.
-/// `location_presence`'s `volume move ... --to <missing location>` step).
-fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result<String> {
+/// content" — `copy_count`, `location_presence` and `location_count`. The
+/// content itself is not in question, so a live stage set can be written
+/// as-is and a released one can be pulled back byte-for-byte with
+/// `read-slices`. `dest` says where the new copy goes.
+fn additional_copy_action(conn: &Connection, unit: &Unit, dest: &Dest<'_>) -> Result<String> {
     let versions = current_versions_live(conn, unit.id)?;
     if versions.is_empty() {
-        // No current snapshot at all: this is `no_archive`'s territory
-        // (which may also be firing alongside this one), but a defensive
-        // fallback still needs a command that works. Nothing to
-        // distinguish from "the first copy" here, hence `<LABEL>` rather
-        // than `<OTHER-LABEL>` — in `extra` too (`location_presence`'s
-        // `volume move` step names the volume this recipe writes).
-        return Ok(format!(
-            "tapectl snapshot create {0} && tapectl stage create {0} && \
-             tapectl volume init <LABEL> && tapectl volume write <LABEL>{1}",
-            unit.name,
-            extra.replace("<OTHER-LABEL>", "<LABEL>")
-        ));
+        // No current snapshot: no tape holds the unit yet, so this is its
+        // first copy, and the remedy is the one `no_archive` gives — for a
+        // staged unit the write alone, never a `stage create` that finds
+        // nothing to stage (ADR-0012 item 220).
+        return first_copy_action(conn, unit, dest);
     }
 
     let mut steps: Vec<String> = Vec::new();
@@ -665,7 +775,10 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
     }
 
     steps.push("tapectl volume init <OTHER-LABEL>".to_string());
-    steps.push(format!("tapectl volume write <OTHER-LABEL>{extra}"));
+    steps.push(format!(
+        "tapectl volume write <OTHER-LABEL>{}",
+        dest.move_step("<OTHER-LABEL>")
+    ));
     let mut action = steps.join(" && ");
 
     if !stuck.is_empty() {
@@ -796,14 +909,24 @@ fn check_copy_count(
     let needed = policy::coverage::copy_floor(ctx.config, resolved.copy_floor_base(), &unit.status);
 
     if copy_count < needed {
+        let mut message = format!(
+            "has {copy_count} copies, needs {needed}{}",
+            policy::coverage::tape_only_note(ctx.config, &unit.status)
+        );
+        // ADR-0012 item 220: a unit no tape holds a current version of is
+        // reported here once, saying why, rather than here and again as
+        // `no_archive`. Asked only at zero copies, so a covered unit pays
+        // nothing for it. The `has N copies` start stays: scripts read it.
+        if copy_count == 0 {
+            if let Some(unwritten) = Unwritten::of(ctx.conn, unit)? {
+                message.push_str(&format!(": {}", unwritten.describe()));
+            }
+        }
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "copy_count".into(),
-            message: format!(
-                "has {copy_count} copies, needs {needed}{}",
-                policy::coverage::tape_only_note(ctx.config, &unit.status)
-            ),
-            action: additional_copy_action(ctx.conn, unit, "")?,
+            message,
+            action: additional_copy_action(ctx.conn, unit, &Dest::ANYWHERE)?,
         });
     }
     Ok(f)
@@ -879,10 +1002,7 @@ fn check_location_presence(
         .map(|s| s.location.as_str())
         .collect();
     if missing.is_empty() && !short.is_empty() {
-        let extra = format!(
-            " && tapectl volume move <OTHER-LABEL> --to {}",
-            short[0].location
-        );
+        let dest = Dest::at(&short[0].location);
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "location_presence".into(),
@@ -891,7 +1011,7 @@ fn check_location_presence(
                 policy::coverage::describe_short_locations(&short),
                 policy::coverage::tape_only_note(ctx.config, &unit.status),
             ),
-            action: additional_copy_action(ctx.conn, unit, &extra)?,
+            action: additional_copy_action(ctx.conn, unit, &dest)?,
         });
     }
     if !missing.is_empty() {
@@ -899,13 +1019,18 @@ fn check_location_presence(
         // The remedy's last step says where the new copy goes. One copy can
         // only be shelved at one place, so with several names missing the
         // recipe is repeated per location, which the note says.
-        let mut extra = format!(" && tapectl volume move <OTHER-LABEL> --to {}", missing[0]);
-        if missing.len() > 1 {
-            extra.push_str(&format!(
+        let note = if missing.len() > 1 {
+            format!(
                 " (then the same again, one new copy each, for: {})",
                 missing[1..].join(", ")
-            ));
-        }
+            )
+        } else {
+            String::new()
+        };
+        let dest = Dest {
+            location: Some(missing[0]),
+            note: &note,
+        };
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "location_presence".into(),
@@ -914,7 +1039,7 @@ fn check_location_presence(
                  {location_count} location(s))",
                 missing.join(", "),
             ),
-            action: additional_copy_action(ctx.conn, unit, &extra)?,
+            action: additional_copy_action(ctx.conn, unit, &dest)?,
         });
     }
     Ok(f)
@@ -943,12 +1068,11 @@ fn check_location_count(
     )? {
         // A new copy, shelved elsewhere: always available, and the remedy
         // every other coverage shortfall names.
-        let extra = " && tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>";
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "location_count".into(),
             message: format!("has {}", short.describe()),
-            action: additional_copy_action(ctx.conn, unit, extra)?,
+            action: additional_copy_action(ctx.conn, unit, &Dest::at("<OTHER-LOCATION>"))?,
         });
     }
     Ok(f)
@@ -1223,105 +1347,165 @@ fn check_tenancy(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -
     Ok(f)
 }
 
-// Check if current snapshot exists.
+// Check if current snapshot exists. Since ADR-0012 item 220 this fires only
+// where `copy_count` cannot: a unit whose copy floor is 0. Under any floor
+// above 0 a unit with no copy is a `copy_count` violation, which now says it
+// was never written (`Unwritten`), so the unit is reported once, not twice.
 fn check_no_archive(
     ctx: &Ctx<'_>,
     unit: &Unit,
     _policy: Option<&ResolvedPolicy>,
 ) -> Result<Findings> {
     let mut f = Findings::default();
+    // `Ctx::resolved` is set for every per-unit check. Read before any
+    // statement, so the common case (a floor above 0) costs none.
+    if let Some(resolved) = ctx.resolved {
+        let floor =
+            policy::coverage::copy_floor(ctx.config, resolved.copy_floor_base(), &unit.status);
+        if floor > 0 {
+            return Ok(f);
+        }
+    }
     let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
-    let has_current: bool = ctx
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM snapshots WHERE unit_id = ?1 AND status = 'current'",
-            params![unit.id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)?;
-
-    if !has_current && copy_count == 0 {
+    if copy_count > 0 {
+        return Ok(f);
+    }
+    if let Some(unwritten) = Unwritten::of(ctx.conn, unit)? {
         f.warnings.push(AuditFinding {
             unit: unit.name.clone(),
             check: "no_archive".into(),
-            message: "no current snapshot or tape copies".into(),
-            action: no_archive_action(ctx.conn, unit)?,
+            message: unwritten.describe(),
+            action: first_copy_action(ctx.conn, unit, &Dest::ANYWHERE)?,
         });
     }
     Ok(f)
 }
 
-/// The remedy for `no_archive` (issue #209). `!has_current` (this check's
-/// own gate) rules out `'current'` as the unit's latest snapshot status —
-/// `session.rs` only sets it at seal, i.e. once a completed write exists,
-/// which would make `copy_count` at least 1 — so the only statuses left
-/// to branch on are `'created'`, a dead status (`'reclaimable'`,
-/// `'purged'`), no snapshot at all, or
-/// `'staged'`:
-///   - no snapshot / `'created'` / dead: the pre-existing chain already
-///     works. `snapshot create` either mints the unit's first version or
-///     (ADR-0012's dead-row arm) mints fresh despite unchanged content, so
-///     a `'created'` row always exists afterward for the bare `stage
-///     create` to find.
-///   - `'staged'`: this is the one `#209` names — `snapshot create` is a
-///     guaranteed no-op (ADR-0012's `"staged"` short-circuit arm reuses
-///     this row rather than minting) and a bare `stage create` finds no
-///     `'created'` row to select. If the stage set is still live, nothing
-///     needs staging at all — just write it. If it was force-cleaned
-///     before ever being written (the only way a `'staged'` snapshot can
-///     have no live stage set, since reaching `'current'` requires a
-///     completed write), a genuine re-stage is needed, gated on `active`
-///     for the same reason [`restage_action`] gates on it.
-fn no_archive_action(conn: &Connection, unit: &Unit) -> Result<String> {
-    let default_chain = || {
-        format!(
-            "tapectl snapshot create {0} && tapectl stage create {0} && \
-             tapectl volume init <LABEL> && tapectl volume write <LABEL>",
-            unit.name
-        )
-    };
+/// What a unit with no current snapshot has instead: the facts behind
+/// `copy_count`'s and `no_archive`'s wording for a unit no tape holds
+/// (ADR-0012 item 220), and behind [`first_copy_action`]'s remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unwritten {
+    /// No snapshot at all: CONTEXT.md's Never Archived.
+    NeverArchived,
+    /// The latest snapshot is `created`: walked, not yet staged.
+    Snapshotted { version: i64 },
+    /// The latest snapshot is `staged` and its stage set holds live slices:
+    /// a write is all it waits for.
+    Staged { version: i64 },
+    /// The latest snapshot is `staged` but its staging was released (`stage
+    /// clean --force`) before any write.
+    StagingReleased { version: i64 },
+    /// The latest snapshot is dead (`reclaimable`, `purged`).
+    NotCurrent { version: i64, status: String },
+}
 
-    let Some((snapshot_id, version, status)) =
-        crate::unit::content_match::latest_snapshot(conn, unit.id)?
-    else {
-        return Ok(default_chain());
-    };
-
-    if status != "staged" {
-        return Ok(default_chain());
+impl Unwritten {
+    /// `None` when the unit has a `current` snapshot: some tape holds (or
+    /// held) it, and a shortfall is a copy count, not a first copy.
+    fn of(conn: &Connection, unit: &Unit) -> Result<Option<Unwritten>> {
+        let has_current: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM snapshots WHERE unit_id = ?1 AND status = 'current')",
+            params![unit.id],
+            |row| row.get(0),
+        )?;
+        if has_current {
+            return Ok(None);
+        }
+        let Some((snapshot_id, version, status)) =
+            crate::unit::content_match::latest_snapshot(conn, unit.id)?
+        else {
+            return Ok(Some(Unwritten::NeverArchived));
+        };
+        Ok(Some(match status.as_str() {
+            "created" => Unwritten::Snapshotted { version },
+            "staged" => {
+                let statuses: Vec<String> = conn
+                    .prepare("SELECT status FROM stage_sets WHERE snapshot_id = ?1")?
+                    .query_map(params![snapshot_id], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if statuses
+                    .iter()
+                    .any(|s| crate::staging::stage_set_has_live_slices(s))
+                {
+                    Unwritten::Staged { version }
+                } else {
+                    Unwritten::StagingReleased { version }
+                }
+            }
+            _ => Unwritten::NotCurrent { version, status },
+        }))
     }
 
-    let live: bool = {
-        let statuses: Vec<String> = conn
-            .prepare("SELECT status FROM stage_sets WHERE snapshot_id = ?1")?
-            .query_map(params![snapshot_id], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        statuses
-            .iter()
-            .any(|s| crate::staging::stage_set_has_live_slices(s))
-    };
-
-    if live {
-        return Ok("tapectl volume init <LABEL> && tapectl volume write <LABEL>".to_string());
-    }
-
-    if unit.status == "active" {
-        Ok(format!(
-            "tapectl stage create {} --version {version} && tapectl volume init <LABEL> && \
-             tapectl volume write <LABEL>",
-            unit.name
-        ))
-    } else {
-        Ok(format!(
-            "unit \"{}\" is not active, so v{version} cannot be re-staged from source — \
-             investigate with `tapectl catalog locate {}`",
-            unit.name, unit.name
-        ))
+    /// The finding's words: `never archived`, or `never written to tape`
+    /// with what there is instead.
+    fn describe(&self) -> String {
+        match self {
+            Unwritten::NeverArchived => "never archived".to_string(),
+            Unwritten::Snapshotted { version } => {
+                format!("never written to tape (v{version} snapshotted, not yet staged)")
+            }
+            Unwritten::Staged { version } => {
+                format!("never written to tape (v{version} staged, awaiting a write)")
+            }
+            Unwritten::StagingReleased { version } => format!(
+                "never written to tape (v{version} was staged, and its staging released \
+                 unwritten)"
+            ),
+            Unwritten::NotCurrent { version, status } => {
+                format!("no current version on tape (v{version} is {status})")
+            }
+        }
     }
 }
 
+/// The remedy for a unit no tape holds a current version of: its first copy
+/// (`no_archive`, and `copy_count` / `location_presence` / `location_count`
+/// through [`additional_copy_action`]'s fallback). Issue #209 and ADR-0012
+/// item 220: the recipe must work from the state the unit is in.
+///   - Never archived, snapshotted, or a dead latest snapshot: the chain
+///     from the start. `snapshot create` mints the first version (or,
+///     ADR-0012's dead-row arm, a fresh one despite unchanged content), or
+///     finds the `created` row, which the bare `stage create` then stages.
+///   - Staged, with live slices: the write alone. `snapshot create` is a
+///     guaranteed no-op here (ADR-0012's `"staged"` short-circuit) and a bare
+///     `stage create` finds no `created` row, so the old chain failed at its
+///     second command.
+///   - Staged, its staging released before any write (the only way a
+///     `staged` snapshot loses its live set, since `current` needs a
+///     completed write): a re-stage of that version, gated on `active` for
+///     the same reason [`restage_action`] gates on it.
+///
+/// The write is [`Dest::write_new`]'s one-command copy.
+fn first_copy_action(conn: &Connection, unit: &Unit, dest: &Dest<'_>) -> Result<String> {
+    let write = dest.write_new();
+    let from_the_start = || {
+        format!(
+            "tapectl snapshot create {0} && tapectl stage create {0} && {write}",
+            unit.name
+        )
+    };
+    Ok(match Unwritten::of(conn, unit)? {
+        Some(Unwritten::Staged { .. }) => write,
+        Some(Unwritten::StagingReleased { version }) if unit.status == "active" => format!(
+            "tapectl stage create {} --version {version} && {write}",
+            unit.name
+        ),
+        Some(Unwritten::StagingReleased { version }) => format!(
+            "unit \"{}\" is not active, so v{version} cannot be re-staged from source — \
+             investigate with `tapectl catalog locate {}`",
+            unit.name, unit.name
+        ),
+        Some(
+            Unwritten::NeverArchived | Unwritten::Snapshotted { .. } | Unwritten::NotCurrent { .. },
+        )
+        | None => from_the_start(),
+    })
+}
+
 // Check dirty status (design §2.20). MUST NOT fire for `PendingReason::New`
-// — a never-archived unit is already reported by `no_archive` above, and
+// — a never-archived unit is already reported by `copy_count` (or, at a copy
+// floor of 0, `no_archive`) above, and
 // firing both would double-report the same condition (`dirty_rows`'s "new"
 // state, distinct from "dirty", exists for exactly this reason).
 //
@@ -3856,10 +4040,10 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_name(&conn, "gallery")
             .unwrap()
             .unwrap();
-        let action = no_archive_action(&conn, &unit).unwrap();
+        let action = first_copy_action(&conn, &unit, &Dest::ANYWHERE).unwrap();
         assert_eq!(
             action,
-            "tapectl volume init <LABEL> && tapectl volume write <LABEL>"
+            "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>"
         );
     }
 
@@ -3902,12 +4086,170 @@ mod tests {
         let unit = crate::db::queries::get_unit_by_name(&conn, "gallery2")
             .unwrap()
             .unwrap();
-        let action = no_archive_action(&conn, &unit).unwrap();
+        let action = first_copy_action(&conn, &unit, &Dest::ANYWHERE).unwrap();
         assert_eq!(
             action,
-            "tapectl stage create gallery2 --version 1 && tapectl volume init <LABEL> && \
-             tapectl volume write <LABEL>"
+            "tapectl stage create gallery2 --version 1 && tapectl volume write <NEW-LABEL> \
+             --init --full-confirm --move-to <location>"
         );
+        assert_eq!(
+            Unwritten::of(&conn, &unit).unwrap(),
+            Some(Unwritten::StagingReleased { version: 1 })
+        );
+    }
+
+    /// One `active` unit per name under one tenant, each with v1 `staged`
+    /// and a live stage set, never written: what `stage create` leaves
+    /// before the first `volume write` (the cli review's F4).
+    fn staged_never_written(names: &[&str]) -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for name in names {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                params![name, tid],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'staged', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// ADR-0012 item 220 (the cli review's F4): a staged, never-written
+    /// unit is reported ONCE, by `copy_count`, saying why — not again as
+    /// `no_archive` — and its fix is the write, not the `snapshot create &&
+    /// stage create` chain that failed at its second command. The message
+    /// keeps its `has N copies` start, which the lifecycle suite's permute
+    /// check reads.
+    #[test]
+    fn a_staged_never_written_unit_is_one_copy_count_whose_fix_is_the_write() {
+        let conn = staged_never_written(&["photos/2020"]);
+        let (violations, warnings) =
+            collect_findings(&conn, &Config::default(), Some("photos/2020")).unwrap();
+        assert!(
+            warnings.iter().all(|w| w.check != "no_archive"),
+            "never-written is reported once, by copy_count: {warnings:?}"
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        let v = &violations[0];
+        assert_eq!(v.check, "copy_count");
+        assert_eq!(
+            v.message,
+            "has 0 copies, needs 2: never written to tape (v1 staged, awaiting a write)"
+        );
+        assert_eq!(
+            v.action,
+            "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>"
+        );
+        assert!(!v.action.contains("stage create"), "{}", v.action);
+    }
+
+    /// The other half of the fold: a unit with no snapshot at all is
+    /// `never archived`, and its fix starts from `snapshot create`.
+    #[test]
+    fn a_unit_with_no_snapshot_is_a_copy_count_worded_never_archived() {
+        let conn = staged_never_written(&[]);
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u-n', 'fresh', 1, 'mtime_size', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let (violations, warnings) =
+            collect_findings(&conn, &Config::default(), Some("fresh")).unwrap();
+        assert!(
+            warnings.iter().all(|w| w.check != "no_archive"),
+            "{warnings:?}"
+        );
+        let v = &violations[0];
+        assert_eq!(
+            (v.check.as_str(), v.message.as_str()),
+            ("copy_count", "has 0 copies, needs 2: never archived")
+        );
+        assert_eq!(
+            v.action,
+            "tapectl snapshot create fresh && tapectl stage create fresh && tapectl volume \
+             write <NEW-LABEL> --init --full-confirm --move-to <location>"
+        );
+    }
+
+    /// A unit that WAS written, whose copies are all gone (its volume
+    /// erased or retired), still has a `current` snapshot: a plain copy
+    /// shortfall, never worded as never written.
+    #[test]
+    fn a_unit_with_a_current_snapshot_and_no_copy_is_not_called_never_written() {
+        let (conn, _unit_id) = setup_unit_with_one_stage_set("reels", "reels", "staged");
+        conn.execute("UPDATE volumes SET status = 'erased'", [])
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_name(&conn, "reels")
+            .unwrap()
+            .unwrap();
+        assert_eq!(Unwritten::of(&conn, &unit).unwrap(), None);
+        let (violations, _) = collect_findings(&conn, &Config::default(), Some("reels")).unwrap();
+        let v = violations
+            .iter()
+            .find(|v| v.check == "copy_count")
+            .expect("copy_count");
+        assert_eq!(v.message, "has 0 copies, needs 2");
+    }
+
+    /// ADR-0012 item 220: identical fixes collapse into one line naming
+    /// the units, and plain `audit` ends by pointing at `--action-plan`.
+    #[test]
+    fn identical_fixes_collapse_into_one_line_for_the_units() {
+        let conn = staged_never_written(&["a", "b", "c"]);
+        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        assert_eq!(violations.len(), 3, "{violations:?}");
+
+        let out = render(&violations, &warnings, 2, true, false, None);
+        let fixes: Vec<&str> = out.lines().filter(|l| l.contains("fix: ")).collect();
+        assert_eq!(
+            fixes,
+            vec![
+                "  fix: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to \
+                 <location> — for 3 units: a, b, c"
+            ],
+            "{out}"
+        );
+        assert!(!out.contains("--action-plan"), "{out}");
+
+        // Plain `audit` lists the findings, no fixes, and says where they are.
+        let plain = render(&violations, &warnings, 2, false, false, None);
+        assert!(!plain.contains("fix: "), "{plain}");
+        assert!(
+            plain
+                .trim_end()
+                .ends_with("the fixes: tapectl audit --action-plan"),
+            "{plain}"
+        );
+        let one = render(&violations, &warnings, 2, false, false, Some("a"));
+        assert!(
+            one.trim_end()
+                .ends_with("the fixes: tapectl audit --action-plan --unit a"),
+            "{one}"
+        );
+        // Nothing found, nothing to point at.
+        let clean = render(&[], &[], 0, false, false, None);
+        assert!(!clean.contains("--action-plan"), "{clean}");
     }
 
     /// Seeds the exact "reels" fixture both `restage_action` tests below
@@ -4169,7 +4511,7 @@ mod tests {
     #[test]
     fn json_output_is_a_single_parseable_object() {
         let (violations, warnings) = sample_findings();
-        let out = render(&violations, &warnings, 2, true, true);
+        let out = render(&violations, &warnings, 2, true, true, None);
 
         let parsed: serde_json::Value = serde_json::from_str(&out)
             .expect("the whole of --json stdout must parse as one JSON object");
@@ -4189,7 +4531,7 @@ mod tests {
     #[test]
     fn human_output_keeps_the_summary_line_and_action_plan() {
         let (violations, warnings) = sample_findings();
-        let out = render(&violations, &warnings, 2, true, false);
+        let out = render(&violations, &warnings, 2, true, false, None);
         assert!(out.contains("VIOLATIONS (1):"), "got: {out}");
         assert!(out.contains("[encryption] photos:"), "got: {out}");
         assert!(out.contains("WARNINGS (1):"), "got: {out}");
@@ -4206,7 +4548,7 @@ mod tests {
 
     #[test]
     fn human_output_says_clean_when_there_are_no_findings() {
-        let out = render(&[], &[], 0, false, false);
+        let out = render(&[], &[], 0, false, false, None);
         assert!(out.contains("audit: clean"), "got: {out}");
     }
 
@@ -5703,7 +6045,7 @@ mod tests {
             } else {
                 0
             };
-            let out = render(&violations, &warnings, exit, false, true);
+            let out = render(&violations, &warnings, exit, false, true, None);
             let json: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
             let finding = json["findings"]
                 .as_array()
