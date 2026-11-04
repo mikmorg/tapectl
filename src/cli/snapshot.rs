@@ -194,17 +194,37 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
 }
 
 /// The error a `snapshot create` of `named` units ends with, `None` when
-/// none failed. One unit named: its own error, exactly as before. Several:
-/// one error naming each unit that failed and why, after the others were
-/// reported.
-fn several_failed(named: usize, mut failed: Vec<(&str, TapectlError)>) -> Option<TapectlError> {
-    if failed.is_empty() {
+/// every unit was snapshotted. One unit named: its own error, exactly as
+/// before. Several: one error naming each unit that failed and why, after
+/// the others were reported; and when a signal stopped the run before the
+/// units in `not_started`, a stop (`Interrupted`) that names them and the
+/// command that snapshots them.
+fn end_of_run(
+    named: usize,
+    mut failed: Vec<(&str, TapectlError)>,
+    not_started: &[&str],
+) -> Option<TapectlError> {
+    if failed.is_empty() && not_started.is_empty() {
         return None;
     }
-    if named == 1 {
+    if named == 1 && not_started.is_empty() {
         return Some(failed.remove(0).1);
     }
-    let mut text = if failed.len() == named {
+    let mut failures = String::new();
+    for (name, e) in &failed {
+        failures.push_str(&format!("\n  {name}: {e}"));
+    }
+    if !not_started.is_empty() {
+        return Some(TapectlError::Interrupted(format!(
+            "snapshot create stopped on a signal before {}; run `tapectl snapshot create {}` \
+             to snapshot {}{}{failures}",
+            not_started.join(", "),
+            not_started.join(" "),
+            if not_started.len() == 1 { "it" } else { "them" },
+            if failed.is_empty() { "" } else { ". Failed:" },
+        )));
+    }
+    let head = if failed.len() == named {
         format!("all {named} units failed:")
     } else {
         format!(
@@ -212,10 +232,7 @@ fn several_failed(named: usize, mut failed: Vec<(&str, TapectlError)>) -> Option
             crate::render::plural(failed.len() as i64, "unit", "units")
         )
     };
-    for (name, e) in &failed {
-        text.push_str(&format!("\n  {name}: {e}"));
-    }
-    Some(TapectlError::Other(text))
+    Some(TapectlError::Other(format!("{head}{failures}")))
 }
 
 pub fn run(
@@ -252,7 +269,14 @@ pub fn run(
             // ones after it.
             let mut rows = Vec::with_capacity(names.len());
             let mut failed: Vec<(&str, TapectlError)> = Vec::new();
-            for name in names {
+            let mut not_started: Vec<&str> = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                // Issue #404: a signal stops the run between units, the
+                // next unit's walk not started.
+                if i > 0 && crate::signal::is_interrupted() {
+                    not_started = names[i..].iter().map(String::as_str).collect();
+                    break;
+                }
                 match create_one(conn, config, name) {
                     Ok(created) => {
                         if !json_output {
@@ -273,7 +297,7 @@ pub fn run(
                 };
                 println!("{out}");
             }
-            if let Some(err) = several_failed(names.len(), failed) {
+            if let Some(err) = end_of_run(names.len(), failed, &not_started) {
                 return Err(err);
             }
         }
@@ -457,6 +481,69 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A catalog with units `unit1` and `unit2`, each a directory of one
+    /// file under `root`.
+    fn two_units(root: &std::path::Path) -> Connection {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        for u in ["unit1", "unit2"] {
+            let dir = root.join(u);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), u).unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt,
+                                    status)
+                 VALUES (?1, ?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                params![u, tid, dir.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn versions(conn: &Connection, unit: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM snapshots s JOIN units u ON u.id = s.unit_id
+             WHERE u.name = ?1",
+            params![unit],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #404 with ADR-0012 item 210: a signal stops a `snapshot create`
+    /// of several units between units. The unit being walked finishes, the
+    /// next is not started, and the stop names it and the command to run.
+    #[test]
+    fn a_signal_stops_several_units_between_units() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = two_units(tmp.path());
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let create = SnapshotCommands::Create {
+            name: vec!["unit1".into(), "unit2".into()],
+        };
+        crate::signal::interrupt_this_thread(true);
+        let err = run(&conn, &paths, &Config::default(), &create, true, false, false);
+        crate::signal::interrupt_this_thread(false);
+        let err = err.unwrap_err();
+        assert!(matches!(err, TapectlError::Interrupted(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("before unit2") && text.contains("`tapectl snapshot create unit2`"),
+            "{text}"
+        );
+        assert_eq!((versions(&conn, "unit1"), versions(&conn, "unit2")), (1, 0));
+
+        // Positive control: with no signal both are snapshotted.
+        run(&conn, &paths, &Config::default(), &create, true, false, false).unwrap();
+        assert_eq!(versions(&conn, "unit2"), 1);
+    }
 
     /// Issue #171 / ADR-0012: `snapshot list --status` must be a usage
     /// error naming the accepted set for anything outside
