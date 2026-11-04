@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # first-run-reentry-mhvtl.sh — issue #414's acceptance, on mhvtl: a
 # `scripts/first-run.sh` run whose step-13 write is KILLED mid-tape, then
-# re-entered with `--from 13`, finishes the post-write block (verify --full,
-# audit, the shelf move, the Heir Kit).
+# re-entered with `--from 13`, finishes the copy (`volume resume` with its full
+# readback, the tape's first verify: ADR-0012 item 218) and the steps after it
+# (the shelf move, the audit, the Heir Kit).
 #
 # What it does, in order (every first-run.sh invocation is the real script
 # driven by a profile, --auto, against an mhvtl drive; nothing is stubbed):
@@ -29,12 +30,15 @@
 #          without it a write that finished before the signal would take the
 #          `sealed` branch below and prove nothing about resume.
 #   C      first-run.sh --from 13 again, the re-entry: it must find the
-#          interrupted session, `volume resume` it, and run the post-write
-#          block — the volume sealed with every write completed, a full verify
-#          recorded after the resume, the volume at the profile's first
+#          interrupted session, `volume resume` it with --full-confirm, and run
+#          the post-write block — the volume sealed with every write completed,
+#          a full readback recorded by the resume's own confirm (and no second
+#          read: no `volume verify`), the volume at the profile's first
 #          location, the Heir Kit regenerated — and exit 0.
-#   D      first-run.sh --from 13 a third time: the `sealed` path goes straight
-#          to the post-write block, writes nothing, and exits 0.
+#   D      first-run.sh --from 13 a third time: the `sealed` path finds the full
+#          readback recorded (`report verify-status`) and reads nothing (OQ15):
+#          no tape command at all, no new verification session; it goes
+#          straight to the shelf, the audit and the kit, and exits 0.
 #
 # Issue #432 rides on the same run: tape commands run at raised CPU and I/O
 # priority from every launcher. Before phase A a `tapectl_op_priority` check runs
@@ -43,9 +47,9 @@
 # command it starts inherits that, so in each phase a sampler running as the
 # service user records the nice value and I/O class of each tapectl process the
 # run starts (RUN/prio-<phase>.tsv), and a check per phase asserts: `volume write`
-# (B), `volume resume` and `volume verify` (C), `volume verify` (D) are at the
-# profile's TAPE_NICE/TAPE_IONICE, and the step's own notice says its shell went
-# from the harness's priority to the profile's. Phase B also reads the write's
+# (B) and `volume resume` (C) are at the profile's TAPE_NICE/TAPE_IONICE, phase D
+# (which reads nothing, OQ15) starts no tape command at all, and the step's own
+# notice says its shell went from the harness's priority to the profile's. Phase B also reads the write's
 # priority from /proc/PID/stat and `ionice -p` just before it signals. The
 # negative side is phase A, steps 1-12: every tapectl process the sampler sees is
 # at the harness's own priority (non-tape commands INSIDE step 13 inherit the
@@ -259,16 +263,22 @@ sampler_start() { # sampler_start <name>: record each tapectl process's priority
     SAMPLER_PID=$!
 }
 sampler_stop() { touch "$RUN/prio-$1.stop"; chmod 0644 "$RUN/prio-$1.stop"; wait "$SAMPLER_PID" 2>/dev/null; }
+assert_no_tape() { assert_prio "$1" --none; }
 # assert_prio <name> <tape commands that must have been seen>...: the sampler's
 # record against the profile. Every tape command (the list `tapectl-op` raises)
 # is at TAPE_NICE/TAPE_IONICE, and each named one was seen. Other tapectl
 # commands in step 13 inherit the raise from the shell and are not judged.
+# `assert_prio <name> --none`: no tape command was started at all (the record
+# is not empty: the phase's other tapectl commands are in it).
 assert_prio() {
     local name="$1"; shift
     [ -s "$RUN/prio-$name.tsv" ] || { echo "the sampler recorded nothing (prio-$name.err: $(cat "$RUN/prio-$name.err" 2>/dev/null))"; return 1; }
     python3 - "$RUN/prio-$name.tsv" "$TAPE_NICE_RUN" "$WANT_IO" "$@" <<'PY'
 import sys
 tsv, want_nice, want_io, *required = sys.argv[1:]
+none = required == ["--none"]
+if none:
+    required = []
 TAPE = {
     "volume": {"write", "resume", "verify", "rewrite", "compact-write", "compact", "read-slices",
                "compact-read", "init", "identify"},
@@ -290,6 +300,8 @@ for pid, cmd, nice, io in rows:
 for cmd in required:
     if cmd not in tape:
         bad.append(f"never saw '{cmd}' (saw tape commands: {sorted(tape) or 'none'})")
+if none and tape:
+    bad.append(f"a tape command ran where none may: {sorted(tape)}")
 print("tape commands raised: " + (", ".join(f"{c} x{len(v)}" for c, v in sorted(tape.items())) or "none") + f"  (other tapectl commands seen, not judged: {other})")
 print("\n".join(bad))
 sys.exit(1 if bad else 0)
@@ -591,32 +603,50 @@ max_verify_id() { sql "SELECT COALESCE(MAX(s.id), 0) FROM verification_sessions 
 writes_count() { sql "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id = w.volume_id WHERE v.label = ?" "$LABEL"; }
 # The post-write block, as the catalog and the kit record it, after a phase
 # that began when the newest verification session was $1 and $2 is a file
-# created when the phase began.
-assert_post_write_block() { # assert_post_write_block <verify-id-before> <phase-start-file> <phase-out>
-    local before="$1" since="$2" out="$3" bad sess loc
+# created when the phase began. $4 says where the full readback comes from
+# (ADR-0012 item 218, OQ15): `new`, recorded by this phase (the resume's own
+# --full-confirm: there is no separate verify any more), or `recorded`, by an
+# earlier phase, which this one must have read and not repeated.
+assert_post_write_block() { # assert_post_write_block <verify-id-before> <phase-start-file> <phase-out> <new|recorded>
+    local before="$1" since="$2" out="$3" readback="$4" bad sess loc
     bad="$(sql "SELECT w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
                 WHERE v.label = ? AND w.status <> 'completed'" "$LABEL" | tr '\n' ' ')"
     [ "$(sql "SELECT status FROM volumes WHERE label = ?" "$LABEL")" = sealed ] \
         || { echo "volume $LABEL is not sealed"; return 1; }
     [ -z "${bad// /}" ] || { echo "writes not all completed: $bad"; return 1; }
-    # The post-write `volume verify --full` is the phase's last tape contact,
-    # so the newest session is it: full, passed, and newer than the phase's
-    # start. (A full confirm records a full session too, which is why "a full
-    # session exists" would prove nothing.)
+    # The newest verification session. In a `new` phase the confirm of the
+    # copy is the phase's last tape contact, so it is that confirm: full,
+    # passed, and newer than the phase's start. In a `recorded` phase nothing
+    # read the tape, so it is the one the phase began with, full and passed.
     sess="$(sql "SELECT s.id || ' ' || s.verify_type || ' ' || s.outcome FROM verification_sessions s
                  JOIN volumes v ON v.id = s.volume_id WHERE v.label = ? ORDER BY s.id DESC LIMIT 1" "$LABEL")"
     echo "newest verification session: $sess (newest before this phase: $before)"
     local sid stype soutcome
     read -r sid stype soutcome <<<"$sess"
-    [ "${sid:-0}" -gt "$before" ] && [ "${stype:-}" = full ] && [ "${soutcome:-}" = passed ] \
-        || { echo "no full, passed verification recorded by this phase"; return 1; }
-    grep "$LABEL sealed and verified" "$out" >/dev/null || { echo "$out does not say '$LABEL sealed and verified'"; return 1; }
+    [ "${stype:-}" = full ] && [ "${soutcome:-}" = passed ] \
+        || { echo "the newest verification session of $LABEL is not a full, passed readback"; return 1; }
+    case "$readback" in
+        new)
+            [ "${sid:-0}" -gt "$before" ] || { echo "no full, passed readback recorded by this phase"; return 1; }
+            grep "$LABEL sealed and read back in full: the resume's confirm read every file back" "$out" >/dev/null \
+                || { echo "$out does not say the resume's confirm read $LABEL back in full"; return 1; } ;;
+        recorded)
+            [ "${sid:-0}" -eq "$before" ] || { echo "this phase recorded a verification session ($sid, newest before: $before): it read the tape again"; return 1; }
+            grep -E "^ +\\\$ .* report verify-status --volume $LABEL --json" "$out" >/dev/null \
+                || { echo "$out shows no 'report verify-status --volume $LABEL --json': the recorded readback was not asked for"; return 1; }
+            grep "$LABEL sealed and read back in full: a full readback passed on " "$out" >/dev/null \
+                || { echo "$out does not say a full readback of $LABEL is recorded"; return 1; } ;;
+        *) echo "assert_post_write_block: new or recorded, not '$readback'"; return 1 ;;
+    esac
+    if grep -E "^ +\\\$ .* volume verify " "$out" >/dev/null; then
+        echo "$out runs a volume verify: the copy's full readback was read a second time (ADR-0012 item 218)"; return 1
+    fi
     grep -E '^ +\$ .* audit$' "$out" >/dev/null || { echo "$out shows no audit run"; return 1; }
     loc="$(sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" volume info "$LABEL" --json \
            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("location") or "")')"
     [ "$loc" = "$SHELF" ] || { echo "volume $LABEL is at '$loc', expected $SHELF"; return 1; }
     [ "$RUN/kit/COVER.txt" -nt "$since" ] || { echo "the Heir Kit was not regenerated ($RUN/kit/COVER.txt not newer than the phase)"; return 1; }
-    echo "post-write block complete: sealed, verified in full, audited, at $loc, kit regenerated"
+    echo "post-write block complete: sealed, read back in full once ($readback), audited, at $loc, kit regenerated"
 }
 
 echo "fr414: phase C — the re-entry, first-run.sh --from 13; output $RUN/phase-C.out"
@@ -629,16 +659,18 @@ step_phase_c() {
     [ "$rc" -eq 0 ] || { echo "the re-entry exited non-zero"; tail -40 "$RUN/phase-C.out"; return 1; }
     grep "step 13: volume $LABEL is resume" "$FR_LOG" >/dev/null \
         || { echo "step 13 did not classify $LABEL as an interrupted write (first-run log)"; return 1; }
-    grep -E "^ +\\\$ .* volume resume $LABEL " "$RUN/phase-C.out" >/dev/null \
-        || { echo "phase-C.out shows no 'volume resume $LABEL'"; return 1; }
+    grep -E "^ +\\\$ .* volume resume $LABEL .*--full-confirm" "$RUN/phase-C.out" >/dev/null \
+        || { echo "phase-C.out shows no 'volume resume $LABEL ... --full-confirm'"; return 1; }
+    grep -F "volume \"$LABEL\" write resumed and completed" "$RUN/phase-C.out" >/dev/null \
+        || { echo "phase-C.out does not show the resume completing"; return 1; }
     if grep -E "^ +\\\$ .* (volume write|stage create|snapshot create) " "$RUN/phase-C.out" >/dev/null; then
         echo "the re-entry staged or wrote again instead of resuming"; return 1
     fi
-    assert_post_write_block "$before" "$RUN/phase-C.start" "$RUN/phase-C.out"
+    assert_post_write_block "$before" "$RUN/phase-C.start" "$RUN/phase-C.out" new
 }
 check reentry_resumes_and_finishes step_phase_c
 must reentry_resumes_and_finishes
-check priority_phase_c assert_prio C "volume resume" "volume verify"
+check priority_phase_c assert_prio C "volume resume"
 check raise_notice_phase_c assert_raised_notice "$RUN/phase-C.out"
 
 # ---------- phase D: the sealed path ----------
@@ -652,14 +684,16 @@ step_phase_d() {
     [ "$rc" -eq 0 ] || { echo "the sealed re-entry exited non-zero"; tail -40 "$RUN/phase-D.out"; return 1; }
     grep "step 13: volume $LABEL is sealed" "$FR_LOG" >/dev/null \
         || { echo "step 13 did not classify $LABEL as sealed (first-run log)"; return 1; }
-    if grep -E "^ +\\\$ .* (volume write|volume resume|volume init|stage create) " "$RUN/phase-D.out" >/dev/null; then
-        echo "the sealed re-entry touched the write path"; return 1
+    if grep -E "^ +\\\$ .* (volume write|volume resume|volume init|volume verify|stage create) " "$RUN/phase-D.out" >/dev/null; then
+        echo "the sealed re-entry touched the write path, or read the tape"; return 1
     fi
     [ "$(writes_count)" = "$nwrites" ] || { echo "the sealed re-entry added write rows"; return 1; }
-    assert_post_write_block "$before" "$RUN/phase-D.start" "$RUN/phase-D.out"
+    assert_post_write_block "$before" "$RUN/phase-D.start" "$RUN/phase-D.out" recorded
 }
 check sealed_reentry_runs_only_the_post_write_block step_phase_d
-check priority_phase_d assert_prio D "volume verify"
+# OQ15: with the full readback recorded, phase D starts no tape command at all
+# (phase C's record, which saw `volume resume`, is the positive control).
+check no_tape_command_phase_d assert_no_tape D
 check raise_notice_phase_d assert_raised_notice "$RUN/phase-D.out"
 
 finish
