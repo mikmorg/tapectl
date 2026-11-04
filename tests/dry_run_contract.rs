@@ -149,6 +149,8 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // `tests/config_edit.rs` (`dry_run_writes_nothing`).
     (&["config", "add"], Verdict::Honours),
     (&["config", "check"], Verdict::ReadOnly),
+    // config get (ADR-0012 item 214): prints one key's value; reads only.
+    (&["config", "get"], Verdict::ReadOnly),
     (&["config", "remove"], Verdict::Honours),
     (&["config", "set"], Verdict::Honours),
     (&["config", "show"], Verdict::ReadOnly),

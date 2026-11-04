@@ -877,3 +877,268 @@ fn set_of_a_copy_floor_below_one_or_a_place_floor_below_zero_is_refused() {
     assert!(after.contains("min_locations = 0\n"), "{after}");
     config_check_passes(home.path());
 }
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn get_json(home: &Path, key: &str) -> serde_json::Value {
+    let out = ok(home, &["--json", "config", "get", key]);
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("config get --json is not one document: {e}\n{}", text(&out)))
+}
+
+fn add_drive(home: &Path, name: &str, node: &str) {
+    ok(
+        home,
+        &[
+            "drive",
+            "add",
+            "--name",
+            name,
+            "--device-tape",
+            &format!("/dev/tapectl-config-edit-nonexistent-{node}"),
+            "--generation",
+            "LTO-6",
+        ],
+    );
+}
+
+/// ADR-0012 item 214: `config get KEY` gives the value in force and where it
+/// comes from — the file, or a default (a key the file does not set, an
+/// optional one nothing sets) — and `--json` is `{key, value, source}`. A
+/// bare key resolves to its full key, and the line names that key.
+#[test]
+fn config_get_names_the_value_in_force_and_where_it_comes_from() {
+    let home = home();
+    let h = home.path();
+    let cfg = config_path(h);
+
+    // init writes slice_size into the file.
+    let line = stdout(&ok(h, &["config", "get", "defaults.slice_size"]));
+    assert_eq!(
+        line.trim_end(),
+        format!("defaults.slice_size = \"1G\"  # set in {}", cfg.display())
+    );
+    let v = get_json(h, "defaults.slice_size");
+    assert_eq!(
+        v,
+        serde_json::json!({"key": "defaults.slice_size", "value": "1G", "source": "config.toml"})
+    );
+
+    // Not in the file: its default, by its full key or its bare one.
+    for key in ["host_check.max_load_per_cpu", "max_load_per_cpu"] {
+        let v = get_json(h, key);
+        assert_eq!(v["key"], "host_check.max_load_per_cpu", "{key}: {v}");
+        assert_eq!(v["value"], serde_json::json!(1.0), "{key}: {v}");
+        assert_eq!(v["source"], "default", "{key}: {v}");
+    }
+    ok(h, &["config", "remove", "defaults.slice_size"]);
+    let line = stdout(&ok(h, &["config", "get", "slice_size"]));
+    assert_eq!(line.trim_end(), "defaults.slice_size = \"1G\"  # default");
+
+    // A drive's optional key nothing sets, then set by its bare name.
+    add_drive(h, "drive-a", "a");
+    let line = stdout(&ok(h, &["config", "get", "post_warning_bytes"]));
+    assert_eq!(
+        line.trim_end(),
+        "backends.lto[drive-a].post_warning_bytes is not set  # default"
+    );
+    let v = get_json(h, "post_warning_bytes");
+    assert_eq!(v["value"], serde_json::Value::Null, "{v}");
+    assert_eq!(v["source"], "default", "{v}");
+
+    let out = ok(h, &["config", "set", "post_warning_bytes", "99008M"]);
+    assert!(
+        stdout(&out).contains("set backends.lto[drive-a].post_warning_bytes = \"99008M\""),
+        "{}",
+        text(&out)
+    );
+    assert!(read(h).contains("post_warning_bytes = \"99008M\"\n"));
+    let v = get_json(h, "backends.lto.post_warning_bytes");
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "key": "backends.lto[drive-a].post_warning_bytes",
+            "value": "99008M",
+            "source": "config.toml",
+        })
+    );
+    config_check_passes(h);
+}
+
+/// The key forms scripts already use keep working exactly (first-run.sh
+/// step 8 sets `backends.lto[NAME].post_warning_bytes` and reads it back
+/// from `config show --json`'s `backends.lto[]`), beside the new bare and
+/// one-drive forms, which refuse naming each drive once there are two.
+#[test]
+fn the_existing_key_forms_work_beside_the_new_ones() {
+    let home = home();
+    let h = home.path();
+    add_drive(h, "drive-a", "a");
+    ok(
+        h,
+        &[
+            "config",
+            "set",
+            "backends.lto[drive-a].post_warning_bytes",
+            "99008M",
+        ],
+    );
+    ok(h, &["config", "set", "backends.lto[0].enospc_buffer", "64M"]);
+    let shown: serde_json::Value =
+        serde_json::from_slice(&ok(h, &["--json", "config", "show"]).stdout).unwrap();
+    let drive = &shown["backends"]["lto"][0];
+    assert_eq!(drive["name"], "drive-a", "{shown}");
+    assert_eq!(
+        drive["device_tape"], "/dev/tapectl-config-edit-nonexistent-a",
+        "{shown}"
+    );
+    assert_eq!(drive["post_warning_bytes"], "99008M", "{shown}");
+    assert_eq!(drive["enospc_buffer"], "64M", "{shown}");
+
+    // A second drive: the bare and one-drive forms name both and change
+    // nothing; the selected form still works.
+    add_drive(h, "drive-b", "b");
+    let out = refused(h, &["config", "set", "backends.lto.enospc_buffer", "32M"]);
+    assert!(out.contains("backends.lto[drive-a].enospc_buffer"), "{out}");
+    assert!(out.contains("backends.lto[drive-b].enospc_buffer"), "{out}");
+    let out = run(h, &["config", "get", "post_warning_bytes"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let said = text(&out);
+    assert!(said.contains("backends.lto[drive-a].post_warning_bytes"), "{said}");
+    assert!(said.contains("backends.lto[drive-b].post_warning_bytes"), "{said}");
+    ok(
+        h,
+        &["config", "set", "backends.lto[drive-b].post_warning_bytes", "40G"],
+    );
+    assert_eq!(
+        get_json(h, "backends.lto[drive-b].post_warning_bytes")["value"],
+        "40G"
+    );
+    config_check_passes(h);
+}
+
+/// Item 214: a misspelt key names the key meant, on get, set, add and
+/// remove; a refused edit is one line naming the key and what was wrong,
+/// with no excerpt of the file and with types named plainly.
+#[test]
+fn a_misspelt_key_is_named_and_a_refusal_is_one_line() {
+    let home = home();
+    let h = home.path();
+    let out = run(h, &["config", "get", "defaults.slice_sizee"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("did you mean defaults.slice_size?"),
+        "{}",
+        text(&out)
+    );
+    for args in [
+        &["config", "set", "defaults.slice_sizee", "2G"][..],
+        &["config", "add", "defaults.global_exclude", "*.bak"][..],
+        &["config", "remove", "defaults.slice_sizee"][..],
+    ] {
+        let out = refused(h, args);
+        assert!(out.contains("did you mean defaults."), "{args:?}: {out}");
+    }
+
+    let cfg = config_path(h);
+    for (key, value, want) in [
+        (
+            "defaults.min_copies",
+            "lots",
+            "defaults.min_copies takes a whole number, not \"lots\"",
+        ),
+        (
+            "defaults.encrypt",
+            "maybe",
+            "defaults.encrypt takes true or false, not \"maybe\"",
+        ),
+        (
+            "defaults.slice_sizee",
+            "2G",
+            "defaults.slice_sizee is not a config key — did you mean defaults.slice_size?",
+        ),
+    ] {
+        let out = run(h, &["config", "set", key, value]);
+        assert!(!out.status.success(), "{}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{key}: one line: {err}");
+        assert!(lines[0].contains(want), "{key}: {err}");
+        assert!(
+            lines[0].contains(&format!("{} is unchanged", cfg.display())),
+            "{key}: {err}"
+        );
+        assert!(!err.contains("TOML parse error"), "{key}: {err}");
+        assert!(!err.contains(" | "), "{key}: no excerpt: {err}");
+    }
+}
+
+fn notes(out: &Output) -> Vec<String> {
+    stdout(out)
+        .lines()
+        .filter_map(|l| l.strip_prefix("note: "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Item 214: `config check` still prints `config: valid` and exits 0 for a
+/// config that loads, and notes what it lacks: no drive, a drive without
+/// its measured post_warning_bytes, a collection whose root or tenant is
+/// not there. `--json` keeps its keys and adds `notes`.
+#[test]
+fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
+    let home = home();
+    let h = home.path();
+    let out = ok(h, &["config", "check"]);
+    assert!(stdout(&out).starts_with("config: valid\n"), "{}", text(&out));
+    let n = notes(&out);
+    assert!(
+        n.iter()
+            .any(|l| l.contains("no drive is configured") && l.contains("`tapectl drive add")),
+        "{n:?}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&ok(h, &["--json", "config", "check"]).stdout).unwrap();
+    assert_eq!(json["valid"], true, "{json}");
+    for key in ["problems", "tape_devices", "staging", "dar", "defaults", "ops"] {
+        assert!(json.get(key).is_some(), "{key} is kept: {json}");
+    }
+    assert!(
+        json["notes"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|l| l.as_str().unwrap().contains("no drive"))),
+        "{json}"
+    );
+
+    add_drive(h, "drive-a", "a");
+    let n = notes(&ok(h, &["config", "check"]));
+    assert!(!n.iter().any(|l| l.contains("no drive")), "{n:?}");
+    let room = n
+        .iter()
+        .find(|l| l.contains("drive \"drive-a\" has no post_warning_bytes"))
+        .unwrap_or_else(|| panic!("{n:?}"));
+    for want in ["fill ceiling", "slice cap", "scripts/lto-profile.sh"] {
+        assert!(room.contains(want), "{want}: {room}");
+    }
+    ok(h, &["config", "set", "post_warning_bytes", "99008M"]);
+    let n = notes(&ok(h, &["config", "check"]));
+    assert!(!n.iter().any(|l| l.contains("post_warning_bytes")), "{n:?}");
+
+    // A collection whose root does not exist, for a tenant that does not.
+    with_collection(h, "movies", "/nonexistent/tapectl-config-edit/movies");
+    let out = ok(h, &["config", "check"]);
+    assert!(stdout(&out).starts_with("config: valid\n"), "{}", text(&out));
+    let n = notes(&out);
+    assert!(
+        n.iter()
+            .any(|l| l.starts_with("collection \"movies\" cannot run: root")),
+        "{n:?}"
+    );
+    assert!(
+        n.iter()
+            .any(|l| l.starts_with("collection \"movies\" cannot run: tenant \"family\"")),
+        "{n:?}"
+    );
+}
