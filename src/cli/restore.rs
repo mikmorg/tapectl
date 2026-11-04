@@ -156,6 +156,11 @@ pub enum RestoreCommands {
     },
 
     /// Restore a single file from a unit
+    // The derived usage would show `[UNIT] [PATH]`, both optional, since the
+    // two slots are filled by order (`UnitAndFile`); this says what is asked.
+    #[command(
+        override_usage = "tapectl restore file [OPTIONS] --to <TO> <UNIT|--unit <UNIT>> <PATH|--file <PATH>>"
+    )]
     File {
         // The unit and the file: `UNIT PATH`, or either as a flag (`--unit
         // UNIT PATH`, `UNIT --file PATH`, `--unit UNIT --file PATH`). The
