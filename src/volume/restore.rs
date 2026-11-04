@@ -2885,6 +2885,73 @@ pub fn select_write_positions(
     select(conn, unit_name, volume_label, want, Across::Plan)
 }
 
+/// The volume `restore unit --dry-run` previews when no `--from` names one
+/// (ADR-0012 item 220). The real restore reads the loaded tape's File 0 to
+/// learn its volume; a dry run opens no drive, so it asks the catalog, and
+/// the one in-service volume (`coverage::in_service`, where audit's
+/// `read-slices --from` also looks) that holds the unit is the answer: one
+/// holding a version whole, or slice 1 of a version held across cartridges
+/// (where a restore of it starts). `version` narrows it to that version.
+///
+/// Several holders are refused, each named with its versions, for `--from`
+/// to pick one; none is refused too. One statement after the unit's own
+/// lookup, and it is not on any real restore's path.
+pub fn sole_holder(conn: &Connection, unit_name: &str, version: Option<i64>) -> Result<String> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT v.label, s.version FROM writes w
+           JOIN stage_sets ss ON ss.id = w.stage_set_id
+           JOIN snapshots s ON s.id = ss.snapshot_id
+           JOIN volumes v ON v.id = w.volume_id
+          WHERE s.unit_id = ?1 AND (?2 IS NULL OR s.version = ?2) AND {}
+            AND w.status IN ('completed', 'range')
+            AND EXISTS (SELECT 1 FROM write_positions wp
+                          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                         WHERE wp.write_id = w.id AND wp.status = 'written'
+                           AND (w.status = 'completed' OR sl.slice_number = 1))
+          ORDER BY v.label, s.version",
+        crate::policy::coverage::in_service("v")
+    ))?;
+    let rows = stmt
+        .query_map(params![unit.id, version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut holders: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
+    for (label, v) in rows {
+        let versions = holders.entry(label).or_default();
+        if !versions.contains(&v) {
+            versions.push(v);
+        }
+    }
+    let which = match version {
+        Some(v) => format!("\"{unit_name}\" v{v}"),
+        None => format!("\"{unit_name}\""),
+    };
+    match holders.len() {
+        1 => Ok(holders.into_keys().next().expect("one holder")),
+        0 => Err(TapectlError::Other(format!(
+            "no volume in service holds {which}, so there is nothing to preview; `tapectl \
+             catalog locate {unit_name}` lists every copy"
+        ))),
+        n => {
+            let listed: Vec<String> = holders
+                .iter()
+                .map(|(label, versions)| {
+                    let vs: Vec<String> = versions.iter().map(|v| format!("v{v}")).collect();
+                    format!("{label} ({})", vs.join(", "))
+                })
+                .collect();
+            Err(TapectlError::Other(format!(
+                "{n} volumes hold {which}: {}. A dry run opens no drive, so it cannot read \
+                 which one is loaded: name one with --from to preview the restore from it",
+                listed.join(", ")
+            )))
+        }
+    }
+}
+
 /// [`select_write_positions`], with what to do about a range ([`Across`]).
 fn select(
     conn: &Connection,
@@ -4110,6 +4177,103 @@ mod tests {
             assert_eq!(sel.stage_set_id, f.v2_set);
             assert!(sel.positions.iter().all(|p| p.stage_set_id == f.v2_set));
             assert_eq!(sel.positions.len(), 1);
+        }
+
+        /// ADR-0012 item 220: a dry run with no `--from` previews from the
+        /// catalog's only holder of the unit, and with several lists them,
+        /// each with its versions; `--version` narrows the holders to those
+        /// of that version.
+        #[test]
+        fn a_dry_run_with_no_volume_named_uses_the_only_holder() {
+            let f = two_versions_on_one_volume();
+            assert_eq!(sole_holder(&f.conn, "big", None).unwrap(), "VOL-PM4");
+            assert_eq!(sole_holder(&f.conn, "big", Some(1)).unwrap(), "VOL-PM4");
+            let err = sole_holder(&f.conn, "big", Some(3))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("no volume in service holds \"big\" v3"),
+                "{err}"
+            );
+            let err = sole_holder(&f.conn, "nope", None).unwrap_err();
+            assert!(matches!(err, TapectlError::UnitNotFound(_)), "{err}");
+
+            // A second volume holding v1: two holders without --version,
+            // still one for v2.
+            f.conn
+                .execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES ('VOL-PM5', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    [],
+                )
+                .unwrap();
+            let other = f.conn.last_insert_rowid();
+            let snap: i64 = f
+                .conn
+                .query_row(
+                    "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                    params![f.v1_set],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            f.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![f.v1_set, snap, other],
+                )
+                .unwrap();
+            let write = f.conn.last_insert_rowid();
+            f.conn
+                .execute(
+                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                     SELECT ?1, id, 7 + slice_number, 'written' FROM stage_slices
+                      WHERE stage_set_id = ?2",
+                    params![write, f.v1_set],
+                )
+                .unwrap();
+            let err = sole_holder(&f.conn, "big", None).unwrap_err().to_string();
+            assert!(
+                err.contains("2 volumes hold \"big\": VOL-PM4 (v1, v2), VOL-PM5 (v1)"),
+                "{err}"
+            );
+            assert!(err.contains("--from"), "{err}");
+            assert_eq!(sole_holder(&f.conn, "big", Some(2)).unwrap(), "VOL-PM4");
+
+            // A retired holder is not one.
+            f.conn
+                .execute(
+                    "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+                    params![other],
+                )
+                .unwrap();
+            assert_eq!(sole_holder(&f.conn, "big", None).unwrap(), "VOL-PM4");
+        }
+
+        /// The CLI's dry run with no `--from` reaches the preview: it used
+        /// to refuse, though the real restore finds the tape.
+        #[test]
+        fn restore_unit_dry_run_without_from_previews_through_the_cli() {
+            use crate::cli::restore::{run, RestoreCommands};
+            let f = two_versions_on_one_volume();
+            let home = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(home.path().join(".tapectl"));
+            let command = RestoreCommands::Unit {
+                unit: "big".into(),
+                from: None,
+                to: "/nonexistent/tapectl-dry-run-dest".into(),
+                device: Some("/nonexistent/tapectl-dry-run-nst".into()),
+                version: None,
+                scratch: None,
+                overwrite: false,
+                no_space_check: false,
+                spool: false,
+                key: Vec::new(),
+                dry_run: true,
+            };
+            run(&f.conn, &paths, &Config::default(), &command, true, true)
+                .expect("the dry run previews from VOL-PM4, the only holder");
         }
 
         /// The wiring: `restore_unit --dry-run` counts the SELECTED version's

@@ -18,8 +18,10 @@ pub enum RestoreCommands {
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
-        /// refused, naming what File 0 says. Not with --dry-run, which
-        /// opens no drive. For a version held across cartridges (a range
+        /// refused, naming what File 0 says. Without it, --dry-run (which
+        /// opens no drive) previews from the one volume this catalog has
+        /// holding the unit, and names it; when several hold it they are
+        /// listed, to name one here. For a version held across cartridges (a range
         /// on this tape), this tape (or the loaded one) must hold its slice
         /// 1: the others are asked for in slice order, by label, sticker
         /// and chip serial, and a tape that does not hold slice 1 is
@@ -155,10 +157,11 @@ pub enum RestoreCommands {
 
     /// Restore a single file from a unit
     File {
+        // The unit and the file: `UNIT PATH`, or either as a flag (`--unit
+        // UNIT PATH`, `UNIT --file PATH`, `--unit UNIT --file PATH`). The
+        // field keeps the name `unit`, as `restore unit`'s does.
         #[command(flatten)]
-        unit: UnitArg,
-        #[command(flatten)]
-        file: FileArg,
+        unit: UnitAndFile,
         /// Volume label. Without it the loaded tape names itself: File 0 is
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
@@ -211,9 +214,9 @@ pub enum RestoreCommands {
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
-    /// itself (no database needed) — the emergency/heir path. --positions
-    /// and --only narrow it to the files named (a full cartridge is a
-    /// terabyte; RESTORE.sh alone is `--only restore_sh`)
+    /// itself (no database needed): the files the heir path reads, without
+    /// RESTORE.sh. --positions and --only narrow it to the files named (a
+    /// full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
     RawVolume {
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
@@ -274,28 +277,76 @@ impl From<&str> for UnitArg {
     }
 }
 
-/// `restore file`'s file: the positional PATH after the unit, or `--file
-/// PATH` (OQ2). Exactly one of the two.
+/// `restore file`'s unit and file (OQ2): `UNIT PATH`, or either one as a
+/// flag — `--unit UNIT PATH`, `UNIT --file PATH`, `--unit UNIT --file PATH`.
+/// The mixed `--unit UNIT PATH` is the spelling an heir who learned `--unit`
+/// from File 1's `restore unit --unit` types here (ADR-0012 item 210 (a)).
+///
+/// Clap fills positionals in order, so after `--unit` the one positional
+/// given lands in the first slot, UNIT's: [`Self::resolve`] reads it there as
+/// the file. Two unit/file groups (each "exactly one of the two") cannot say
+/// that: they refused `restore file --unit U PATH` as UNIT given twice.
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
-#[group(required = true, multiple = false)]
-pub struct FileArg {
+pub struct UnitAndFile {
+    /// Unit name. After --unit, the file's PATH instead
+    #[arg(value_name = "UNIT", required_unless_present = "unit")]
+    first: Option<String>,
     /// File path within the unit, relative to its root, as `catalog list`
     /// prints it. Checked against the catalog's file list for the version
     /// before the tape is touched; a directory is refused
-    #[arg(value_name = "PATH")]
-    path: Option<String>,
+    #[arg(
+        value_name = "PATH",
+        required_unless_present_any = ["unit", "file"],
+        conflicts_with_all = ["unit", "file"]
+    )]
+    second: Option<String>,
+    /// The unit, as a flag: the same as UNIT
+    #[arg(long = "unit", value_name = "UNIT")]
+    unit: Option<String>,
     /// The file, as a flag: the same as PATH
     #[arg(long = "file", value_name = "PATH")]
     file: Option<String>,
 }
 
-impl FileArg {
-    /// The file named, however it was given.
-    pub fn path(&self) -> &str {
-        self.path
+impl UnitAndFile {
+    /// The unit named, however it was given.
+    pub fn name(&self) -> &str {
+        self.unit
             .as_deref()
-            .or(self.file.as_deref())
-            .expect("clap requires PATH or --file")
+            .or(self.first.as_deref())
+            .expect("clap requires UNIT or --unit")
+    }
+
+    /// The unit and the file, however they were given. The two shapes clap
+    /// cannot refuse on its own are refused here: `--unit` with no file, and
+    /// `--unit UNIT --file PATH` with a positional besides.
+    pub fn resolve(&self) -> Result<(&str, &str)> {
+        let file = match (&self.unit, &self.first, &self.second, &self.file) {
+            (None, Some(_), Some(path), None) => path,
+            (None, Some(_), None, Some(path)) => path,
+            (Some(_), Some(path), None, None) => path,
+            (Some(_), None, None, Some(path)) => path,
+            (Some(unit), None, None, None) => {
+                return Err(TapectlError::Other(format!(
+                    "restore file: no file named for unit \"{unit}\"; give it after the \
+                     unit, as `tapectl restore file --unit {unit} PATH --to DIR`"
+                )))
+            }
+            (Some(_), Some(extra), None, Some(path)) => {
+                return Err(TapectlError::Other(format!(
+                    "restore file: \"{extra}\" is one argument too many: --unit names the \
+                     unit and --file names \"{path}\""
+                )))
+            }
+            _ => {
+                return Err(TapectlError::Other(
+                    "restore file: name the unit and the file, as `tapectl restore file UNIT \
+                     PATH --to DIR`"
+                        .into(),
+                ))
+            }
+        };
+        Ok((self.name(), file.as_str()))
     }
 }
 
@@ -332,10 +383,21 @@ pub fn run(
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             let unit = unit.name();
             // Issue #435: no `--from` restores from the loaded tape, which
-            // File 0 names. A dry run opens no drive, so it cannot.
-            if from.is_none() && *dry_run {
-                return Err(no_volume_dry_run("restore unit"));
-            }
+            // File 0 names. A dry run opens no drive, so it asks the catalog
+            // instead, and previews from the one volume holding the unit,
+            // naming it; several are listed for --from (ADR-0012 item 220).
+            let only_holder = match (from, *dry_run) {
+                (None, true) => {
+                    let label = volume::restore::sole_holder(conn, unit, *version)?;
+                    eprintln!(
+                        "no --from given: previewing from {label}, the one volume this \
+                         catalog has holding \"{unit}\""
+                    );
+                    Some(label)
+                }
+                _ => None,
+            };
+            let from = only_holder.as_ref().or(from.as_ref());
             let device = crate::cli::read_device(config, device.as_deref())?;
             let options = volume::restore::RestoreOptions {
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
@@ -410,7 +472,6 @@ pub fn run(
         }
 
         RestoreCommands::File {
-            file,
             unit,
             from,
             to,
@@ -424,8 +485,7 @@ pub fn run(
             // Item 107: refused by name before anything else, as `restore
             // unit` does.
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
-            let unit = unit.name();
-            let file = file.path();
+            let (unit, file) = unit.resolve()?;
             // Issue #241: unlike `restore unit`, this has no preview. The
             // catalog check of `--file` runs before any tape contact (issue
             // #406), but proving the entry is really in the archive still
@@ -613,7 +673,8 @@ pub fn run(
             };
             // A misspelt type is refused before the drive is opened.
             selection.check_types()?;
-            // Issue #241: the emergency/heir path — there is no catalog
+            // Issue #241: the tape's own files, as the heir path reads
+            // them — there is no catalog
             // to consult, so knowing what would be dumped means opening
             // the drive and reading the tape's own front index, which is
             // most of this command's own work.
@@ -791,15 +852,15 @@ fn filled_json(filled: &[(String, String)]) -> serde_json::Value {
         .collect()
 }
 
-/// The refusal for `--dry-run` with no volume named (issue #435): a dry run
-/// opens no drive, and without a label the volume is whatever File 0 on the
-/// loaded tape says.
+/// The refusal for `restore volume --dry-run` with no label (issue #435): a
+/// dry run opens no drive, and without a label the volume is whatever File 0
+/// on the loaded tape says. (`restore unit` asks the catalog for the unit's
+/// one holder instead, [`volume::restore::sole_holder`].)
 fn no_volume_dry_run(command: &str) -> TapectlError {
     crate::cli::refuse_dry_run(
         command,
         "with no volume named the tape that is loaded names it, which means reading its \
-         File 0, and a dry run opens no drive. Name the volume (--from for restore unit, the \
-         label for restore volume) to preview.",
+         File 0, and a dry run opens no drive. Name the volume (the label) to preview.",
     )
 }
 
@@ -949,4 +1010,64 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
         "failed": if report.dry_run { 0 } else { report.failed() },
         "units": units,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> std::result::Result<UnitAndFile, clap::Error> {
+        let argv = ["tapectl", "restore", "file"]
+            .iter()
+            .chain(args)
+            .chain(&["--to", "/d"]);
+        match crate::cli::Cli::try_parse_from(argv)?.command {
+            crate::cli::Commands::Restore {
+                command: RestoreCommands::File { unit, .. },
+            } => Ok(unit),
+            other => panic!("not restore file: {other:?}"),
+        }
+    }
+
+    /// OQ2 and ADR-0012 item 210 (a): every spelling of the unit and the
+    /// file parses to the same two names, the mixed `--unit U PATH` an heir
+    /// types after File 1's `restore unit --unit` included.
+    #[test]
+    fn restore_file_takes_the_unit_and_the_file_in_every_spelling() {
+        for args in [
+            &["photos", "a/b.txt"][..],
+            &["--unit", "photos", "a/b.txt"],
+            &["a/b.txt", "--unit", "photos"],
+            &["photos", "--file", "a/b.txt"],
+            &["--unit", "photos", "--file", "a/b.txt"],
+            &["--file", "a/b.txt", "--unit", "photos"],
+        ] {
+            let target = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(target.resolve().unwrap(), ("photos", "a/b.txt"), "{args:?}");
+            assert_eq!(target.name(), "photos", "{args:?}");
+        }
+    }
+
+    /// The shapes that name too little or too much are refused: by clap
+    /// where it can say so, by [`UnitAndFile::resolve`] where it cannot.
+    #[test]
+    fn restore_file_refuses_a_missing_or_doubled_name() {
+        for args in [
+            &["photos"][..],
+            &["--file", "a/b.txt"],
+            &["photos", "a/b.txt", "--unit", "photos"],
+            &["photos", "a/b.txt", "--file", "a/b.txt"],
+            &[],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} must not parse");
+        }
+        let lone = parse(&["--unit", "photos"]).expect("clap leaves this to resolve");
+        let err = lone.resolve().unwrap_err().to_string();
+        assert!(err.contains("no file named for unit \"photos\""), "{err}");
+        let doubled = parse(&["--unit", "photos", "x", "--file", "a/b.txt"])
+            .expect("clap leaves this to resolve");
+        let err = doubled.resolve().unwrap_err().to_string();
+        assert!(err.contains("\"x\" is one argument too many"), "{err}");
+    }
 }
