@@ -854,4 +854,66 @@ mod tests {
             "{err}"
         );
     }
+
+    /// ADR-0012 item 210: `collection run [NAME]` takes one `--label`. The
+    /// collection is optional (the only one configured, else named); a second
+    /// `--label` is a usage error from clap that names the one-copy-per-run
+    /// rule and how to write the further copies, and none is clap's own.
+    #[test]
+    fn collection_run_takes_one_label_and_an_optional_collection() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["tapectl", "collection", "run"]
+                    .iter()
+                    .chain(args.iter())
+                    .copied(),
+            )
+        };
+        let run_of = |cli: Cli| match cli.command {
+            Commands::Collection {
+                command:
+                    crate::cli::collection::CollectionCommands::Run {
+                        collection, label, ..
+                    },
+            } => (collection, label.label),
+            other => panic!("not collection run: {other:?}"),
+        };
+        assert_eq!(
+            run_of(parse(&["--label", "L1"]).unwrap()),
+            (None, "L1".to_string())
+        );
+        assert_eq!(
+            run_of(parse(&["keepsake", "--label", "L1"]).unwrap()),
+            (Some("keepsake".to_string()), "L1".to_string())
+        );
+
+        for twice in [
+            &["--label", "L1", "--label", "L2"][..],
+            &["keepsake", "--label", "L1", "--label", "L1"][..],
+        ] {
+            let err = parse(twice).expect_err("a second --label is a usage error");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{err}"
+            );
+            let text = err.to_string();
+            for says in [
+                "collection run takes one --label",
+                "more than one destination label",
+                "One copy per run",
+                "swap in the next cartridge",
+                "tapectl volume write <NEW-LABEL> --init --full-confirm",
+            ] {
+                assert!(text.contains(says), "{says:?} in {text}");
+            }
+        }
+
+        let err = parse(&["keepsake"]).expect_err("--label is required");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
+    }
 }

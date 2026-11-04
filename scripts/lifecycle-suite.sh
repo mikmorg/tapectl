@@ -4377,20 +4377,20 @@ csc_skip_single_cartridge() {
 }
 
 # The ruling itself, pinned cheaply and FIRST: refused, for the stated reason,
-# and before anything is staged. `cmd_run` calls `plan_for_run` before any
-# side effect and `plan_for_run` checks the label count before it resolves a
-# destination budget, so this cannot be passing because the labels happen not
-# to exist.
+# and before anything is staged. Since 1.9.0 (ADR-0012 item 210) a second
+# --label is clap's usage error (exit 2), raised while the command line is
+# parsed, before any home or label is read, so this cannot be passing because
+# the labels happen not to exist.
 csc_multi_label_refused() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: tapectl collection run media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED: more than one destination label, with the swap-and-volume-write remedy) then tapectl stage list --all --json (assert still empty -- refused BEFORE staging)"
+        echo "PLAN: tapectl collection run media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED, exit 2, a usage error: more than one destination label, with the swap-and-volume-write remedy) then tapectl stage list --all --json (assert still empty -- refused BEFORE staging)"
         return 0
     fi
     local out rc
     out="$(TCTL collection run media --batch 0 \
               --label VOL-CS1 --label VOL-CS2 --device "$TAPE_DEV" 2>&1)"; rc=$?
     printf '%s\n' "$out" >"$RUN/log-csc.multi-label.txt"
-    [ "$rc" -ne 0 ] || { echo "collection run accepted two --label values; #229 ruled it refuses: $out"; return 1; }
+    [ "$rc" -eq 2 ] || { echo "collection run did not refuse two --label values as a usage error (exit $rc, want 2); #229 and item 210 rule it refuses: $out"; return 1; }
     grep -q "more than one destination label" <<<"$out" || {
         echo "refused, but not by #229's rule -- the message does not name the label count, so this proves nothing about the ruling: $out"
         return 1

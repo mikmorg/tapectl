@@ -984,6 +984,11 @@ pub fn destination_budget(
 /// [`destination_budget`] so that function's own minimum-across-
 /// destinations arithmetic stays reachable (and tested) even though no
 /// production caller can hand it more than one label today.
+///
+/// Since 1.9.0 (ADR-0012 item 210) the command line cannot reach this
+/// refusal either: `collection run` takes one `--label`, and a second is
+/// clap's usage error before anything is read (`cli::collection::RunLabel`).
+/// It stays for a library caller.
 pub fn plan_for_run(
     conn: &Connection,
     config: &Config,

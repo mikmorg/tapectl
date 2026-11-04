@@ -210,16 +210,10 @@ pub enum CollectionCommands {
         /// is not necessarily batch N here.
         #[arg(long, default_value = "0")]
         batch: usize,
-        /// Destination volume label — already `volume init`'d on its own
-        /// cartridge. Exactly one: tapectl drives no changer, so it cannot
-        /// write a second copy without a human swapping cartridges, and a
-        /// batch run has no point where that swap could happen. More than
-        /// one is refused. For a second and further copy,
-        /// swap in the next cartridge after this run finishes and use
-        /// `tapectl volume write <label>` directly against the same
-        /// staged data.
-        #[arg(long = "label")]
-        labels: Vec<String>,
+        /// `--label LABEL`: the destination volume, exactly one
+        /// ([`RunLabel`], ADR-0012 item 210).
+        #[command(flatten)]
+        label: RunLabel,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -245,6 +239,107 @@ pub enum CollectionCommands {
         #[arg(long)]
         policy_aware: bool,
     },
+}
+
+/// `collection run --label`: the destination volume, exactly one (ADR-0012
+/// item 210). A second `--label` is a usage error, from clap, naming the
+/// rule: one copy per run. A run cannot write a second copy (tapectl drives
+/// no changer, so a second cartridge needs a human to swap it in, and a run
+/// has no point where that could happen), and a repeated `--label` used to
+/// reach the run, which refused it only after resolving the collection. clap
+/// refuses a repeated single-value flag on its own, with words that name no
+/// rule, so the flag is taken as a list and [`FromArgMatches`] refuses a
+/// second value with these.
+///
+/// [`FromArgMatches`]: clap::FromArgMatches
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLabel {
+    pub label: String,
+}
+
+/// The clap id of [`RunLabel`]'s flag.
+const RUN_LABEL: &str = "label";
+
+/// The usage error for a second `--label`. It keeps the words "more than one
+/// destination label" and "swap in the next cartridge", which the lifecycle
+/// suite's collection-second-copy scenario reads.
+fn one_label_per_run(labels: &[String]) -> String {
+    format!(
+        "collection run takes one --label, and was given {} ({}): it refuses more than one \
+         destination label. One copy per run: tapectl drives no changer, so a second copy \
+         needs a human to swap cartridges, and a run has no point where that could happen. \
+         Run it with one --label for the first copy; for each further copy your policy asks \
+         for, swap in the next cartridge and run `tapectl volume write <NEW-LABEL> --init \
+         --full-confirm` against the same staged data.",
+        labels.len(),
+        labels.join(", ")
+    )
+}
+
+impl clap::FromArgMatches for RunLabel {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> std::result::Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(
+        matches: &mut clap::ArgMatches,
+    ) -> std::result::Result<Self, clap::Error> {
+        let labels: Vec<String> = matches
+            .remove_many::<String>(RUN_LABEL)
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        match <[String; 1]>::try_from(labels) {
+            Ok([label]) => Ok(RunLabel { label }),
+            Err(labels) => Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                one_label_per_run(&labels),
+            )),
+        }
+    }
+
+    fn update_from_arg_matches(
+        &mut self,
+        matches: &clap::ArgMatches,
+    ) -> std::result::Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(
+        &mut self,
+        matches: &mut clap::ArgMatches,
+    ) -> std::result::Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(matches)?;
+        Ok(())
+    }
+}
+
+impl clap::Args for RunLabel {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        cmd.arg(
+            clap::Arg::new(RUN_LABEL)
+                .long("label")
+                .value_name("LABEL")
+                .required(true)
+                .action(clap::ArgAction::Append)
+                .help(
+                    "Destination volume label: one, since a run writes one copy. Already \
+                     initialized on its own cartridge, or initialized first with --init",
+                )
+                .long_help(
+                    "Destination volume label: exactly one, since a run writes one copy. \
+                     tapectl drives no changer, so a second copy needs a human to swap \
+                     cartridges, and a run has no point where that could happen: a second \
+                     --label is refused. The volume is already initialized on its own \
+                     cartridge, or --init initializes it first. For each further copy, swap in \
+                     the next cartridge after this run finishes and run `tapectl volume write \
+                     <NEW-LABEL> --init --full-confirm` against the same staged data",
+                ),
+        )
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
 }
 
 /// `collection run`'s readback choice (ADR-0012 2026-10-07 item 31).
@@ -363,7 +458,7 @@ pub fn run(
         CollectionCommands::Run {
             collection: name,
             batch,
-            labels,
+            label,
             device,
             prewrite_hash,
             fill_ceiling,
@@ -376,7 +471,7 @@ pub fn run(
             &config.with_fill_ceiling(*fill_ceiling),
             name.as_deref(),
             *batch,
-            labels,
+            std::slice::from_ref(&label.label),
             &crate::cli::write_device(config, device.as_deref())?,
             *prewrite_hash,
             *jobs,
