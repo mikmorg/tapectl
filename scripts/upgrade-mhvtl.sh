@@ -146,6 +146,9 @@ git clone --quiet --no-checkout "$REPO" "$CAND" && git -C "$CAND" checkout --qui
 gitc() { git -C "$CAND" -c user.name=upgrade-mhvtl -c user.email=upgrade-mhvtl@localhost "$@"; }
 CAND_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$CAND/Cargo.toml" | head -n 1)"
 newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+# Upgrade step 2 backs the catalog up with the OLD binary, in its own spelling
+# (ADR-0012 OQ1): `db backup --to FILE` before 1.9.0, `db backup FILE` from it.
+if newer 1.9.0 "$PREV_VER"; then BACKUP_CMD="tc db backup --to"; else BACKUP_CMD="tc db backup"; fi
 NEW_VER="$CAND_VER"
 STAMPED=0
 if ! newer "$CAND_VER" "$PREV_VER"; then
@@ -387,11 +390,11 @@ step_u1_backup() {
     grep -qx "backup=$BACKUP" "$U_STATE" || { echo "$U_STATE records no backup=$BACKUP"; return 1; }
     # Taken by the OLD binary: first-run.sh's `tc` runs the installed one, and its
     # backup comes before the one install that replaced it.
-    python3 - "$FR_LOG" "$TAPECTL_INSTALL_BIN" "$BACKUP" <<'PY'
+    python3 - "$FR_LOG" "$TAPECTL_INSTALL_BIN" "$BACKUP" "$BACKUP_CMD" <<'PY'
 import sys
-log, binp, backup = sys.argv[1:]
+log, binp, backup, cmd = sys.argv[1:]
 lines = open(log).read().splitlines()
-b = next((i for i, l in enumerate(lines) if l.endswith(f"$ tc db backup --to {backup}")), None)
+b = next((i for i, l in enumerate(lines) if l.endswith(f"$ {cmd} {backup}")), None)
 i = next((i for i, l in enumerate(lines) if f"install -m 0755" in l and l.rstrip().endswith(binp)), None)
 print("backup line", b, "install line", i)
 sys.exit(0 if b is not None and i is not None and b < i else 1)
@@ -459,7 +462,7 @@ step_u2() {
         && has "$RUN/U2.out" "taken already: $BACKUP" && has "$RUN/U2.out" "kept already: $KEPT" \
         && has "$RUN/U2.out" "installed already: $CAND_LINE" \
         && has "$RUN/U2.out" "stopping before upgrade step 12"
-    [ "$(grep -cF -- '$ tc db backup --to' "$FR_LOG")" -eq 1 ] \
+    [ "$(grep -cF -- "\$ $BACKUP_CMD " "$FR_LOG")" -eq 1 ] \
         || { echo "the catalog was not backed up exactly once across both runs"; return 1; }
 }
 check u2_upgrade_resumes step_u2
