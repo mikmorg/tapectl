@@ -3615,6 +3615,42 @@ fn key_list_without_a_tenant_lists_every_tenants_keys() {
     assert!(rows.iter().all(|r| r["tenant"] == "acme"), "{one}");
 }
 
+/// ADR-0012 item 210: `catalog rebuild --from-volume` shows as required in
+/// its usage (clap's own check replaces the runtime one), and File 1's
+/// spelling, frozen for good, parses unchanged.
+#[test]
+fn catalog_rebuild_shows_from_volume_as_required() {
+    use clap::Parser;
+    let home = TempDir::new().unwrap();
+    let out = run_tapectl(home.path(), &["catalog", "rebuild", "--help"]);
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    let usage = help
+        .lines()
+        .find(|l| l.starts_with("Usage:"))
+        .unwrap_or_else(|| panic!("no usage line: {help}"));
+    assert!(
+        usage.contains("[OPTIONS] --from-volume --key <FILE>"),
+        "--from-volume is required in the usage: {usage}"
+    );
+
+    tapectl::cli::Cli::try_parse_from([
+        "tapectl",
+        "catalog",
+        "rebuild",
+        "--from-volume",
+        "--device",
+        "/dev/nst0",
+        "--key",
+        "YOUR_KEY.age.key",
+    ])
+    .expect("File 1's spelling parses");
+    let err = tapectl::cli::Cli::try_parse_from(["tapectl", "catalog", "rebuild", "--key", "k"])
+        .unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    assert!(err.to_string().contains("--from-volume"), "{err}");
+}
+
 /// The stderr twin: an error reported to a closed stderr still exits with
 /// the error's own code (the one it gives with stderr open), not a panic's
 /// 101.

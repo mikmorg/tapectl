@@ -57,9 +57,10 @@ pub enum CatalogCommands {
     /// Reconstruct catalog rows by reading a sealed volume — the path back
     /// when the database is gone and there is no backup
     Rebuild {
-        /// Rebuild from a sealed tape volume. The only source today; named
-        /// rather than implied so a later `--from-export` is additive.
-        #[arg(long = "from-volume")]
+        /// Rebuild from a sealed tape volume. Required: the only source
+        /// today, named rather than implied so a later `--from-export` is
+        /// additive
+        #[arg(long = "from-volume", required = true)]
         from_volume: bool,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
@@ -650,19 +651,14 @@ fn dispatch(
         }
 
         CatalogCommands::Rebuild {
-            from_volume,
+            // ADR-0012 item 210: clap requires it (the usage shows it), so
+            // the runtime check that duplicated it is gone.
+            from_volume: _,
             device,
             key,
             label,
             tenant,
         } => {
-            if !from_volume {
-                return Err(TapectlError::Other(
-                    "catalog rebuild needs a source: pass --from-volume to rebuild \
-                     from a sealed tape"
-                        .to_string(),
-                ));
-            }
             // Issue #241: a real preview would have to open the drive
             // and chain-walk the whole volume — the exact set of rows a
             // real run would insert is not known any other way.
