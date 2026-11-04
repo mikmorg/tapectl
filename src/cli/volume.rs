@@ -5847,7 +5847,8 @@ mod tests {
                 "{arm}: the release and the move must come after the resume's `?`, not before it"
             );
             assert!(
-                !body.contains("release_staging_after_write(") && !body.contains(" move_after_write("),
+                !body.contains("release_staging_after_write(")
+                    && !body.contains(" move_after_write("),
                 "{arm}: the arm itself releases and moves nothing: follow_resume does"
             );
             let seq_start = SRC.find("fn follow_resume(").unwrap();
@@ -5858,7 +5859,10 @@ mod tests {
             let moved = seq
                 .find("move_after_write(conn, label, post_seal.move_to.as_deref())")
                 .expect("the move is the one the resume kept or was told");
-            assert!(release < moved, "the release runs before the move, as after a write");
+            assert!(
+                release < moved,
+                "the release runs before the move, as after a write"
+            );
             assert_eq!(seq.matches("release_staging_after_write(").count(), 1);
             assert_eq!(seq.matches("move_after_write(").count(), 1);
             // And nowhere else in the library: `collection run`, `quick-archive`
@@ -9155,7 +9159,10 @@ mod tests {
 
             for (label, line) in [
                 ("L6-NEW", "  Status:      initialized"),
-                ("L6-OWED", "  Status:      initialized — sealed, confirm pending"),
+                (
+                    "L6-OWED",
+                    "  Status:      initialized — sealed, confirm pending",
+                ),
                 ("L6-DONE", "  Status:      sealed"),
             ] {
                 let info = volume_info(&conn, label, false).unwrap();
@@ -9165,15 +9172,34 @@ mod tests {
                 assert_eq!(json["status"], info.status, "{label}");
             }
             let owed = volume_info(&conn, "L6-OWED", false).unwrap();
-            assert_eq!(serde_json::to_value(&owed).unwrap()["status"], "initialized");
+            assert_eq!(
+                serde_json::to_value(&owed).unwrap()["status"],
+                "initialized"
+            );
 
             // The other states an initialized volume's session can be in.
             for (sealed, writes, state) in [
-                (false, &["interrupted"][..], Some("write interrupted, not sealed")),
-                (false, &["in_progress"][..], Some("write in progress, not sealed")),
-                (false, &["planned"][..], Some("write planned, nothing on the tape yet")),
+                (
+                    false,
+                    &["interrupted"][..],
+                    Some("write interrupted, not sealed"),
+                ),
+                (
+                    false,
+                    &["in_progress"][..],
+                    Some("write in progress, not sealed"),
+                ),
+                (
+                    false,
+                    &["planned"][..],
+                    Some("write planned, nothing on the tape yet"),
+                ),
                 (false, &["aborted"][..], Some("write aborted, not sealed")),
-                (true, &["aborted"][..], Some("sealed, write session aborted")),
+                (
+                    true,
+                    &["aborted"][..],
+                    Some("sealed, write session aborted"),
+                ),
                 (true, &["in_progress"][..], Some("sealed, confirm pending")),
                 (false, &[][..], None),
             ] {

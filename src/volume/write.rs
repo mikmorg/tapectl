@@ -4690,12 +4690,7 @@ fn finish_confirm(
     // resume that asks for the full readback again continues it.
     let resume_hint = confirm_resume_hint(label, post_seal);
     let confirmed = sealed_pending
-        .confirm_under_default_interval(
-            conn,
-            store,
-            post_seal.tier(),
-            default_verify_interval_days,
-        )
+        .confirm_under_default_interval(conn, store, post_seal.tier(), default_verify_interval_days)
         .map_err(|e| match e {
             // Exit 4 (issue #408): a signal stopped the readback.
             TapectlError::Interrupted(at) => TapectlError::WriteInterrupted(format!(
@@ -24799,7 +24794,11 @@ mod tests {
                 assert_eq!(verify_types_of(&s.conn, s.volume_id), ["quick"]);
                 assert_eq!(post, PostSeal::default());
                 let done = follow_resume(&s.conn, &s.config, "RI-OLD", post);
-                assert!(matches!(done.moved, MoveAfterWrite::NotAsked), "{:?}", done.moved);
+                assert!(
+                    matches!(done.moved, MoveAfterWrite::NotAsked),
+                    "{:?}",
+                    done.moved
+                );
                 assert_eq!(location_of(&s.conn, "RI-OLD"), None);
                 let json = crate::cli::volume::resume_done_json("RI-OLD", false, &done);
                 assert_eq!(json["kept_from_write"], serde_json::Value::Null);
@@ -24826,7 +24825,10 @@ mod tests {
                 assert!(msg.contains("--move-to vault"), "{msg}");
                 assert!(msg.contains("Nothing was changed"), "{msg}");
                 assert_eq!(write_statuses(&s.conn, s.volume_id), ["interrupted"]);
-                assert!(verify_types_of(&s.conn, s.volume_id).is_empty(), "no confirm ran");
+                assert!(
+                    verify_types_of(&s.conn, s.volume_id).is_empty(),
+                    "no confirm ran"
+                );
 
                 let same = ResumeAsk {
                     move_to: Some("vault".into()),
@@ -24987,8 +24989,11 @@ mod tests {
                     let tmp = tempfile::TempDir::new().unwrap();
                     let (conn, mut config, volume_id) = swept_write_fixture("L", tmp.path());
                     config.backends.lto[0].capacity_override = Some("2400G".into());
-                    conn.execute("INSERT INTO locations (name, kind) VALUES ('vault', 'shelf')", [])
-                        .unwrap();
+                    conn.execute(
+                        "INSERT INTO locations (name, kind) VALUES ('vault', 'shelf')",
+                        [],
+                    )
+                    .unwrap();
                     if let Some(prepare) = prepare {
                         prepare(&conn, volume_id);
                     }

@@ -832,8 +832,12 @@ fn a_resume_keeps_the_record_and_never_undoes_it() {
         move_to: Some(place.to_string()),
         ..ResumeAsk::default()
     };
-    let p = PostSeal::for_resume("L", rec(|i| i.move_to = Some("vault".into())), &to(" vault"))
-        .unwrap();
+    let p = PostSeal::for_resume(
+        "L",
+        rec(|i| i.move_to = Some("vault".into())),
+        &to(" vault"),
+    )
+    .unwrap();
     assert_eq!(p.move_to.as_deref(), Some("vault"));
     let err = PostSeal::for_resume("L", rec(|i| i.move_to = Some("vault".into())), &to("home"))
         .unwrap_err()
@@ -871,7 +875,11 @@ fn a_resume_keeps_the_record_and_never_undoes_it() {
     )
     .unwrap();
     assert!(p.keep_staging && !p.keep_staging_for_locations);
-    assert_eq!(p.kept_flags(), None, "--keep-staging given wins over the record");
+    assert_eq!(
+        p.kept_flags(),
+        None,
+        "--keep-staging given wins over the record"
+    );
     let p = PostSeal::for_resume("L", rec(|i| i.keep_staging = true), &bare).unwrap();
     assert!(p.keep_staging);
     assert_eq!(p.kept_flags().as_deref(), Some("--keep-staging"));
