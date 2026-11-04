@@ -344,10 +344,9 @@ catalog says the volume is (`tapectl volume info <label>`):
   `audit`, the move to the shelf, the Heir Kit;
 - **a write in progress right now**, or **a session planned that never
   reached the tape** — it stops and names the remedy (let the live writer
-  finish; `tapectl volume abort <label>`, then re-run with a new label,
-  `--from 13 --label <new>`: an aborted label cannot be written again; the
-  new label's `volume init` asks before overwriting the cartridge's File 0,
-  which still names the old one, and marks the old volume `erased`);
+  finish; `tapectl volume abort <label>`, then re-run this step with the
+  same label, `--from 13 --label <label>`: the new write replaces the aborted
+  session, issue #401, and asks before overwriting the cartridge);
 - anything else (quarantined, retired, erased) — it stops and asks for a new
   label.
 

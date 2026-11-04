@@ -2360,7 +2360,7 @@ EOF
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
       ;;
     planned)
-      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`$OP_CMD volume abort $LABEL\`, then re-run under a NEW label: scripts/first-run.sh --from 13 --label <new>. This label cannot be written again once its session is aborted. The cartridge's File 0 still names $LABEL, so the new label's init asks before overwriting it, and marks $LABEL erased"
+      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`$OP_CMD volume abort $LABEL\`, then re-run this step with the SAME label: scripts/first-run.sh --from 13 --label $LABEL (the new write replaces the aborted session, issue #401)"
       ;;
     sealed)
       ok "volume $LABEL is already sealed — going on to the steps after the write it is still owed: its full readback, the shelf, the audit and the Heir Kit"
@@ -2499,7 +2499,7 @@ EOF
     # Issue #414: init already ran (an earlier run of this step stopped
     # between it and the write). Nothing to re-run; the write's own contact
     # check is what proves the loaded tape is this volume's cartridge.
-    note "volume $LABEL is already initialised and unwritten — continuing to the write"
+    note "volume $LABEL is already initialised and unwritten (or its earlier attempts were aborted before the seal, and this write replaces them: issue #401) — continuing to the write"
     : >"$INIT_OUT"
   elif ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
     if grep -q "already exists" "$INIT_OUT"; then

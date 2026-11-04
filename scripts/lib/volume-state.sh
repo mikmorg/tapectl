@@ -15,7 +15,9 @@
 # caller decides "absent" from the command's own refusal, so a busy catalog is
 # never read as "no such volume") and prints one word:
 #
-#   fresh     initialized, no write session recorded: write it
+#   fresh     initialized, and no write session recorded, or every one
+#             ended `aborted`/`failed` before the seal: write it (issue #401:
+#             the new session replaces the abandoned attempts)
 #   resume    initialized with an `interrupted` session: `volume resume`
 #             continues it from its frozen staging files, and `volume write`
 #             refuses it
@@ -23,17 +25,15 @@
 #             crashed session into `interrupted` whenever it opens the catalog
 #             (as `volume info` just did), so this one has a live writer
 #   planned   only a `planned` session: nothing reached the tape; `volume
-#             abort` clears it, then the write runs under a NEW label (the
-#             aborted rows stay, so this label reads `other` from then on and
-#             `writes` is UNIQUE(stage_set_id, volume_id)); `volume resume`
+#             abort` clears it, and the label then reads `fresh` (#401), so
+#             step 13 runs again under the SAME label; `volume resume`
 #             refuses a planned session and says so
-#   sealed    sealed and in service: only the post-write block is left (its
-#             verify --full is run again on a re-entry: a full confirm also
-#             records a full verification, so the JSON cannot tell "the
-#             post-write verify ran" from "the write confirmed in full")
-#   other     anything else (quarantined, retired, erased, an initialized
-#             volume whose sessions all ended `aborted`, an unreadable file):
-#             the caller stops and says why
+#   sealed    sealed and in service: only the post-write block is left (the
+#             re-entry reads `report verify-status` and runs `verify --full`
+#             only when no full readback is recorded, OQ15)
+#   other     anything else (quarantined, retired, erased, a session aborted
+#             AFTER its seal was recorded, an unreadable file): the caller
+#             stops and says why
 #
 # Sourced by scripts/first-run.sh. Kept in its own file with no `set -euo
 # pipefail` prologue so a test can source it directly
@@ -59,6 +59,11 @@ elif status == "initialized":
         print("live")
     elif "planned" in writes:
         print("planned")
+    elif set(writes) <= {"aborted", "failed"} and not v.get("sealed_at"):
+        # Issue #401: every attempt was abandoned before its seal; the next
+        # `volume write` replaces them (their rows go, a
+        # `write_session_superseded` event names them), so write it.
+        print("fresh")
     else:
         print("other")
 elif status == "sealed":

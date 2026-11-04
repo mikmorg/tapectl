@@ -73,6 +73,14 @@ fn info(status: &str, condition: &str, writes: &[&str]) -> String {
     .to_string()
 }
 
+/// [`info`] with `sealed_at` set, as `volume info --json` gives it once the
+/// seal is recorded.
+fn info_sealed_at(status: &str, condition: &str, writes: &[&str]) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&info(status, condition, writes)).unwrap();
+    v["sealed_at"] = serde_json::json!("2026-11-04 20:00:00");
+    v.to_string()
+}
+
 #[test]
 fn an_unwritten_volume_goes_to_the_write() {
     assert_eq!(state_of(&info("initialized", "ok", &[])), "fresh");
@@ -133,8 +141,12 @@ fn everything_else_stops() {
     for status in ["retired", "erased", "full", "active"] {
         assert_eq!(state_of(&info(status, "ok", &["completed"])), "other");
     }
-    // Every session ended `aborted`: neither write nor a plain resume.
-    assert_eq!(state_of(&info("initialized", "ok", &["aborted"])), "other");
+    // A session aborted AFTER its seal was recorded is never written again
+    // (its `volume resume` route is `volume_aborted_seal_recorded`'s).
+    assert_eq!(
+        state_of(&info_sealed_at("initialized", "ok", &["aborted"])),
+        "other"
+    );
     // Unreadable input never reads as "fresh".
     assert_eq!(state_of("not json"), "other");
     assert_eq!(state_of(""), "other");
@@ -217,8 +229,8 @@ fn real_volume_info(home: &Path, label: &str) -> std::path::PathBuf {
 /// The classifier's `writes[].status` key, and the seal helper's
 /// `sealed_at`, pinned against the real binary: a volume with an
 /// `interrupted` session reads `resume`; once that session is `aborted` it
-/// reads `other`, and whether its seal is recorded decides what step 13's
-/// `other` branch tells the operator (ADR-0012 2026-09-23: a clean full
+/// reads `fresh` before its seal (issue #401: the next write replaces it) and
+/// `other` after, where step 13's `other` branch tells the operator (ADR-0012 2026-09-23: a clean full
 /// verify, then `volume resume`, re-confirms an aborted session whose seal
 /// is recorded).
 #[test]
@@ -259,7 +271,10 @@ fn the_real_volume_info_json_of_a_written_volume_classifies() {
     conn.execute("UPDATE writes SET status = 'aborted'", [])
         .unwrap();
     let f = real_volume_info(home.path(), "L6-0001");
-    assert_eq!(state_of_file(&f), "other");
+    // Issue #401: an attempt abandoned before its seal is replaced by the
+    // next write, so the label reads `fresh` (the real JSON's `sealed_at` is
+    // null here, which the classifier must read as "not sealed").
+    assert_eq!(state_of_file(&f), "fresh");
     assert_eq!(
         aborted_seal_recorded_of_file(&f),
         "no",
@@ -332,17 +347,30 @@ fn a_wrong_cartridge_at_the_post_write_verify_is_named_not_blamed_on_the_drive()
     assert!(binding.contains("\"wrong cartridge: volume"));
 }
 
-/// The `planned` branch's remedy must lead somewhere. `volume abort` turns
-/// the session's rows `aborted`, and a label whose sessions are all aborted
-/// classifies as `other` (asserted in `everything_else_stops`), which step
-/// 13 stops on; and `volume write` on that label could not plan anyway —
-/// `writes` is `UNIQUE(stage_set_id, volume_id)` and the aborted row stays.
-/// So after the abort the operator must re-run with a NEW label: `volume
-/// init` on the same cartridge then displaces the old row to `erased`.
+/// The `planned` branch's remedy must lead somewhere (issue #401). `volume
+/// abort` turns the session's rows `aborted`; a label whose every session
+/// ended `aborted` or `failed` before its seal reads `fresh`, because the
+/// next `volume write` replaces the abandoned attempt. So the remedy is the
+/// SAME label again, and step 13 writes it (asking first, as for any fresh
+/// volume). Before #401 the aborted row blocked the plan and the remedy was
+/// a new label; this test pinned that until 1.9.0.
 #[test]
-fn a_planned_session_is_cleared_and_written_under_a_new_label() {
-    // The state the remedy leaves is one step 13 refuses to write again.
-    assert_eq!(state_of(&info("initialized", "ok", &["aborted"])), "other");
+fn a_planned_session_is_cleared_and_written_again_under_the_same_label() {
+    // The state the remedy leaves is one step 13 writes.
+    assert_eq!(state_of(&info("initialized", "ok", &["aborted"])), "fresh");
+    assert_eq!(
+        state_of(&info("initialized", "ok", &["aborted", "failed"])),
+        "fresh"
+    );
+    // ...but never past a seal, nor beside a session still open or done.
+    assert_eq!(
+        state_of(&info_sealed_at("initialized", "ok", &["aborted"])),
+        "other"
+    );
+    assert_eq!(
+        state_of(&info("initialized", "ok", &["aborted", "completed"])),
+        "other"
+    );
 
     let script =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
@@ -358,12 +386,12 @@ fn a_planned_session_is_cleared_and_written_under_a_new_label() {
         "the branch names the abort: {planned}"
     );
     assert!(
-        !planned.contains("--label $LABEL"),
-        "re-running with the same label after the abort is a dead end: {planned}"
+        planned.contains("--from 13 --label $LABEL"),
+        "the branch names the same label: {planned}"
     );
     assert!(
-        planned.contains("--from 13 --label <new>"),
-        "the branch names a new label: {planned}"
+        !planned.contains("--label <new>"),
+        "a new label is no longer needed after the abort (#401): {planned}"
     );
 
     let install =
@@ -371,12 +399,12 @@ fn a_planned_session_is_cleared_and_written_under_a_new_label() {
             .unwrap();
     let flat = install.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        !flat.contains("`tapectl volume abort <label>`, then re-run)"),
-        "docs/install.md §5 must not send the operator back to the same label"
+        flat.contains("`tapectl volume abort <label>`, then re-run this step with the same label"),
+        "docs/install.md §5 names the same label"
     );
     assert!(
-        flat.contains("`tapectl volume abort <label>`, then re-run with a new label"),
-        "docs/install.md §5 names the new label"
+        !flat.contains("then re-run with a new label"),
+        "docs/install.md §5 must not send the operator to a new label"
     );
 }
 
