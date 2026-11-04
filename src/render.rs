@@ -17,12 +17,15 @@ use tabled::settings::{Padding, Style, Width};
 /// `Copy Floor` from `copy floor` or `copy_floor`: every word capitalised.
 pub fn title_case(header: &str) -> String {
     header
-        .split(|c: char| c == ' ' || c == '_')
+        .split([' ', '_'])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut cs = w.chars();
             match cs.next() {
-                Some(f) => f.to_uppercase().chain(cs.flat_map(char::to_lowercase)).collect(),
+                Some(f) => f
+                    .to_uppercase()
+                    .chain(cs.flat_map(char::to_lowercase))
+                    .collect(),
                 None => String::new(),
             }
         })
@@ -72,11 +75,7 @@ pub fn table_with(header: &[&str], rows: Vec<Vec<String>>, width: Option<usize>)
     let mut t = b.build();
     t.with(Style::blank()).with(Padding::new(0, 2, 0, 0));
     if let Some(w) = width {
-        t.with(
-            Width::truncate(w)
-                .suffix("…")
-                .priority::<PriorityMax>(),
-        );
+        t.with(Width::truncate(w).suffix("…").priority::<PriorityMax>());
     }
     t.to_string()
         .lines()
@@ -203,11 +202,17 @@ mod tests {
     #[test]
     fn times() {
         assert_eq!(table_time("2026-11-04 10:30:59"), "2026-11-04 10:30 UTC");
-        assert_eq!(table_time("2026-11-04T12:30:00+02:00"), "2026-11-04 10:30 UTC");
+        assert_eq!(
+            table_time("2026-11-04T12:30:00+02:00"),
+            "2026-11-04 10:30 UTC"
+        );
         assert_eq!(table_time("2026-11-04T10:30:00Z"), "2026-11-04 10:30 UTC");
         assert_eq!(table_time("never"), "never");
         assert_eq!(json_time("2026-11-04 10:30:59"), "2026-11-04T10:30:59Z");
-        assert_eq!(json_time("2026-11-04T12:30:00+02:00"), "2026-11-04T10:30:00Z");
+        assert_eq!(
+            json_time("2026-11-04T12:30:00+02:00"),
+            "2026-11-04T10:30:00Z"
+        );
     }
 
     #[test]
