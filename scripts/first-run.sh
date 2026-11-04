@@ -27,7 +27,8 @@
 #       serial required; runs as YOU). Ruled required before the first write
 #       (ADR-0012, 2026-09-23): a different binary is a different artifact.
 #       It stops tapectl-drive-poll.timer for the rehearsal and starts it again.
-#   13  the first production tape: snapshot → stage → init → write → verify
+#   13  the first production tape: snapshot → stage → init → write, whose full
+#       readback is the tape's first verify (ADR-0012 item 218) → shelf → Heir Kit
 #   14  the systemd timers (weekly audit, daily catalog backup to a second
 #       disk) and the /usr/local/bin/tapectl-op wrapper, via
 #       scripts/install-systemd.sh — then what to do next
@@ -488,8 +489,8 @@ run() {
   return "${PIPESTATUS[0]}"
 }
 # run_capture FILE cmd...: `run`, plus a copy of the output in FILE for the
-# script itself to read back (issue #179 — step 13 needs the bound cartridge's
-# placeholder barcode, and needs to tell one refusal from another).
+# script itself to read back (issue #179 — step 13 reads the barcode init gave
+# the cartridge, and needs to tell one refusal from another).
 run_capture() {
   local f="$1"; shift
   printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $*"
@@ -591,7 +592,11 @@ derive_nodes() {
 # lifecycle suite, lto6-measure, lto6-fill). Step 13 takes it for its writes;
 # step 12 must NOT (the suite takes it itself, and a parent holding it would
 # deadlock the child -- flock is per open file description).
-tape_lock() { exec 9>/tmp/tapectl-tape.lock; flock -n 9 || die "another process holds the tape lock (/tmp/tapectl-tape.lock) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
+# TAPECTL_TAPE_LOCK is a test seam, as TAPECTL_INSTALL_BIN is: the ungated
+# step-13 tests (tests/first_run_volume_state.rs) point it at a file of their
+# own, so they never hold the lock a gate on the same host needs.
+TAPE_LOCK="${TAPECTL_TAPE_LOCK:-/tmp/tapectl-tape.lock}"
+tape_lock() { exec 9>"$TAPE_LOCK"; flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK) — a gate, a rehearsal or a fill is using the drive; wait for it"; }
 # Item 190: step 12 and the drive poll. A poll during the rehearsal records the
 # test cartridge in the PRODUCTION catalog: the rehearsal's homes are throwaway
 # ones, so the production drive lock never sees it. drive_poll_pause refuses
@@ -2163,11 +2168,11 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 [ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now, or finish one an interrupted run left (same label)?" || { ok "nothing to do"; FROM=14; }; }
 if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
-The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs dar, and encrypts the archive once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and, before it seals, reads EVERY byte back and checks it against the plan (confirm). A sealed volume is immutable: there is no append. `volume verify --full` afterwards is a second, independent full read — the first entry in this tape's verification history, which `report verify-status` and the audit build on; on a full tape it takes as long as the write did.
+The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs dar, and encrypts the archive once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session, seals it, and reads EVERY file back against the plan (--full-confirm) before it says the volume is sealed and confirmed. That readback is the tape's first full verify and is recorded as one, so nothing reads the tape a second time here (ADR-0012 item 218): `volume verify --full` is for the periodic re-reads `verify_interval_days` asks for. On a full tape the readback takes about as long as the write. A sealed volume is immutable: there is no append. Once it is confirmed, the write moves the volume to its shelf and releases the staging of each unit that has reached its copy floor (ADR-0012 item 217); a unit still short of it (every unit, after the first of two copies) stays staged for the next tape.
 
 `volume init` also reads the loaded cartridge: its generation from the density code, which fixes this tape's capacity and is checked against what the drive can write, and its medium serial, which binds the volume to a cartridge in the catalog (ADR-0010). Nothing to set for a mixed LTO-5/LTO-6 shelf — each tape is planned against its own size.
 
-Label convention: something you can write on the cartridge, e.g. L6-0001.
+Label convention: something you can write on the cartridge, e.g. L6-0001. A new cartridge takes the label as its barcode, so the sticker and the tape say the same.
 EOF
   derive_nodes
   # B14: the rehearsal on THIS binary is required before the first production
@@ -2196,7 +2201,7 @@ except Exception: pass' 2>/dev/null || true)"
   fi
   tape_lock
   explain <<'EOF'
-A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step. To help, this step raises its own CPU and I/O priority once (sudo renice and ionice: one password prompt; TAPE_NICE and TAPE_IONICE in the profile; ADR-0012 2026-10-15 item 58), so the tape commands it starts run at that priority; that outranks other work on the host, it does not replace the quiet.
+A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write below, and its readback of every file, each move every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step. To help, this step raises its own CPU and I/O priority once (sudo renice and ionice: one password prompt; TAPE_NICE and TAPE_IONICE in the profile; ADR-0012 2026-10-15 item 58), so the tape commands it starts run at that priority; that outranks other work on the host, it does not replace the quiet.
 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
@@ -2211,6 +2216,9 @@ except Exception: pass')" || true
   [ "$CART_STATE" = "empty" ] && die "no cartridge loaded in $DEVICE"
   [ "$CART_STATE" = "loaded" ] || note "drive status could not confirm a loaded cartridge (${CART_STATE:-no answer}); volume init refuses an empty drive on its own"
   ask LABEL "volume label" "${LABEL:-L6-0001}"
+  # The write moves the tape once it is sealed and confirmed (--move-to).
+  if [ -n "$LOCATION" ]; then note "once $LABEL is sealed and confirmed, the write records it at $LOCATION (--location names another place)"
+  else note "no location to record $LABEL at once it is sealed: step 10 adds one, and --location names it"; fi
   # Issue #414: re-entering this step after an interrupted run must pick up
   # where that run stopped, not die. What $LABEL already is in the catalog
   # decides what is left: nothing (the whole path below), an initialised but
@@ -2259,15 +2267,53 @@ EOF
       [ "$HC_ANS" = write ] && { log "host check: operator chose to write on a host that was not quiet"; break; }
     done
   }
+  # copy_outcome RC WHAT (ADR-0012 item 218): how `volume write` (WHAT=write) or
+  # `volume resume` (WHAT=resume) ended, read from its exit status, the write
+  # family's table (`volume write --help`, src/error.rs): 0 sealed and
+  # confirmed, 2 refused with nothing written, 3 the confirm reached no
+  # verdict, 4 interrupted, 5 aborted, 6 the medium proven bad and the volume
+  # quarantined, 75 the catalog busy. Both run with --full-confirm, so 0 means
+  # every file was read back: the tape's first full verify, recorded as one.
+  # Anything else (a signal: 128+N) is said as the status it was. A failure
+  # leaves the staged slices on disk: nothing is released before a confirmed seal.
+  copy_outcome() {
+    local rc="$1" what="$2"
+    case "$rc" in
+      0) ok "$LABEL sealed and read back in full: the $what's confirm read every file back, the tape's first full verify (ADR-0012 item 218)" ;;
+      2) die "the $what refused before anything was written (exit 2): its refusal above says why and what to do, and nothing on the tape changed. Once that is dealt with, re-run scripts/first-run.sh --from 13 --label $LABEL" ;;
+      3)
+        note "$LABEL is sealed, but the confirm's readback reached no verdict: it proved NOTHING about the"
+        note "medium. This reads as a DRIVE or transport problem, so $LABEL is untouched and still in service."
+        explain <<'EOF'
+Do not retire this cartridge, and do not write it again: it is sealed, and re-running this step resumes its session, which reads the tape back again. Clean the drive, check the cable and the SCSI path, keep the SAME cartridge loaded, then re-run this step with the same label.
+EOF
+        die "the $what's confirm did not complete (exit 3: the drive or transport, not the medium) — re-run scripts/first-run.sh --from 13 --label $LABEL; heir kit NOT generated" ;;
+      4) die "write did not seal: interrupted part-way (exit 4). Reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session" ;;
+      5) die "write did not seal: the session aborted (exit 5), and an aborted session does not resume; the tape is not sealed and holds no copy. Why is above (the end of the tape: the plan did not fit; a staged slice that changed). Once that is dealt with, the volume is written again from the beginning by hand: $OP_CMD volume write $LABEL --device $DEVICE --full-confirm${LOCATION:+ --move-to $LOCATION}; then re-run scripts/first-run.sh --from 13 --label $LABEL for the steps after the write" ;;
+      6)
+        note "The catalog has taken $LABEL out of service: the readback proved the MEDIUM bad, so"
+        note "it counts as no copy. That is a real finding about this cartridge."
+        explain <<'EOF'
+Do not trust this tape. The data you staged is still on disk (nothing is released from staging before a copy is sealed and confirmed), so the recovery is a fresh cartridge: load a new tape and re-run this step with a NEW label. Keep this one out of the rotation until you know why it failed; `tapectl volume info` and the drive's own health pages (`tapectl report health`, `sg_logs`) are where to look.
+EOF
+        die "the $what proved the medium bad (exit 6) — $LABEL is out of service, heir kit NOT generated" ;;
+      75) die "the catalog was busy (exit 75): another tapectl command held it, and nothing was written. Wait for that command, then re-run scripts/first-run.sh --from 13 --label $LABEL" ;;
+      *) die "write did not seal (exit $rc) — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session" ;;
+    esac
+  }
   case "$VSTATE" in
     absent|fresh) ;;
     resume)
       explain <<'EOF'
-THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by hand) started writing it and stopped before it was sealed and confirmed — a Ctrl-C, a dropped session, a crash. `volume write` refuses it; `volume resume` continues that same session from its frozen staging files, after checking that the loaded tape is the one it was writing (File 0's identity) and that the tape is not already sealed. A tape whose seal was written but whose confirm did not finish is re-confirmed, never written again. The SAME cartridge must be in the drive. Nothing is staged again: the snapshot and staging phases below are skipped.
+THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by hand) started writing it and stopped before it was sealed and confirmed — a Ctrl-C, a dropped session, a crash. `volume write` refuses it; `volume resume` continues that same session from its frozen staging files, after checking that the loaded tape is the one it was writing (File 0's identity) and that the tape is not already sealed. A tape whose seal was written but whose confirm did not finish is re-confirmed, never written again. The resume keeps what the write asked for (the full readback, the shelf) and is given them again here. The SAME cartridge must be in the drive. Nothing is staged again: the snapshot and staging phases below are skipped.
 EOF
       quiet_host_check
       confirm "Resume the interrupted write of $LABEL on the cartridge in $DEVICE?" || die "stopped before resuming — re-run scripts/first-run.sh --from 13 --label $LABEL when ready"
-      run tc volume resume "$LABEL" --device "$DEVICE" --keep-staging || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
+      # --full-confirm and --move-to as the write gave them (ADR-0012 item 215:
+      # the resume keeps the recorded intent; these add to it, never downgrade it).
+      wrc=0
+      run tc volume resume "$LABEL" --device "$DEVICE" --full-confirm ${LOCATION:+--move-to "$LOCATION"} || wrc=$?
+      copy_outcome "$wrc" resume
       ;;
     live)
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
@@ -2276,7 +2322,7 @@ EOF
       die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`$OP_CMD volume abort $LABEL\`, then re-run under a NEW label: scripts/first-run.sh --from 13 --label <new>. This label cannot be written again once its session is aborted. The cartridge's File 0 still names $LABEL, so the new label's init asks before overwriting it, and marks $LABEL erased"
       ;;
     sealed)
-      ok "volume $LABEL is already sealed — going on to the verify, audit, shelf and Heir Kit steps it is still owed"
+      ok "volume $LABEL is already sealed — going on to the steps after the write it is still owed: its full readback, the shelf, the audit and the Heir Kit"
       ;;
     *)
       VSTAT="$(python3 -c 'import json,sys
@@ -2297,7 +2343,7 @@ EOF
   esac
 if [ "$VSTATE" = absent ] || [ "$VSTATE" = fresh ]; then
   explain <<'EOF'
-THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Do not register it by hand first WITHOUT its serial: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using. (`cartridge register --serial <medium serial>` is matched; a bare barcode is not.)
+THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and gives it the volume's label as its barcode (ADR-0012 item 219): write the label on the cartridge's sticker, and the sticker, the tape and the catalog say the same. The chip serial stays its identity. Do not register it by hand first: init matches on the serial, and a row registered without one (a bare `cartridge register --barcode`) is another cartridge to it — two rows for one tape, or a refusal when that row already carries the label. (`cartridge register --serial <medium serial>` is matched.)
 EOF
   UNITS="$(tc unit list --json 2>/dev/null | python3 -c 'import json,sys
 try:
@@ -2406,7 +2452,7 @@ EOF
   quiet_host_check
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped before writing"
   # Capture init's output as well as logging it: two later steps read it back
-  # -- the placeholder barcode it reports, and which refusal it gave.
+  # -- the barcode it gave the cartridge, and which refusal it gave.
   INIT_OUT="$(dirname "$LOG")/volume-init-$LABEL.out"
   if [ "$VSTATE" = fresh ]; then
     # Issue #414: init already ran (an earlier run of this step stopped
@@ -2466,8 +2512,22 @@ EOF
       # still holds (naming `volume retire`), takes the label File 0 carries
       # as consent, erases, reads the tape back and records it. Offered here,
       # after a dry run that shows what the tape holds; then init runs again.
+      #
+      # Except for THIS catalog's own volume (ADR-0012 item 216): when the
+      # catalog holds the sealed volume and has not given it up (its live copy,
+      # or one quarantined but not retired), init's refusal offers no erase and
+      # says to eject it and load a blank. So does this step: that cartridge is
+      # a copy (the first tape, still loaded when the second should be), never
+      # a tape to erase. Routed on the refusal's own words, pinned by
+      # tests/first_run_refusal_phrases.rs.
+      if grep -F "Leave it as it is: eject it" "$INIT_OUT" >/dev/null; then
+        explain <<'EOF'
+volume init was refused: the loaded cartridge holds a SEALED volume of THIS catalog, which the catalog still counts (the refusal above names it). It is never erased here. The likeliest case is the previous tape still in the drive — the first copy, when the second should be loaded. Leave it as it is: eject it, load a blank cartridge, and re-run this step.
+EOF
+        die "the cartridge in $DEVICE is this catalog's own volume (above): eject it ($OP_CMD drive eject --device $DEVICE), load a blank cartridge, then re-run scripts/first-run.sh --from 13 --label $LABEL"
+      fi
       explain <<'EOF'
-volume init was refused by an ADR-0003 rule — the loaded cartridge already carries a SEALED volume. A sealed volume is immutable, there is no append, and --force does not reach it. The likeliest case right after step 12 is that the TEST cartridge is still in the drive: then do NOT erase anything here — unload it, load the production cartridge, and re-run with --from 13. If this IS the cartridge to reuse (a tape from an old catalog, as after a fresh start), `tapectl cartridge erase` erases it: it reads the tape first and shows what it holds (below), refuses a volume this catalog still counts (retire that first), asks for the label it read from File 0, erases (a filemark at the start of the tape, seconds), reads the tape back to prove it, and records the cartridge. Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
+volume init was refused by an ADR-0003 rule — the loaded cartridge already carries a SEALED volume. A sealed volume is immutable, there is no append, and --force does not reach it. This catalog holds no live copy on it (the refusal above says what it knows of it). The likeliest case right after step 12 is that the TEST cartridge is still in the drive: then do NOT erase anything here — unload it, load the production cartridge, and re-run with --from 13. If this IS the cartridge to reuse (a tape from an old catalog, as after a fresh start), `tapectl cartridge erase` erases it: it reads the tape first and shows what it holds (below), refuses a volume this catalog still counts (retire that first), asks for the label it read from File 0, erases (a filemark at the start of the tape, seconds), reads the tape back to prove it, and records the cartridge. Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
 EOF
       EOUT="$(dirname "$LOG")/cartridge-erase-dry-run.out"
       if ! run_capture "$EOUT" tc cartridge erase --device "$DEVICE" --dry-run; then
@@ -2527,16 +2587,25 @@ EOF
     fi
   fi
   # The cartridge this volume is now bound to, from init's own report lines
-  # (src/volume/write.rs `report_binding`). Best-effort: a missing line costs
-  # the operator a printed hint, never the write.
+  # (src/volume/write.rs `report_binding`). A cartridge registered at this init
+  # takes the volume's label as its barcode (ADR-0012 item 219): `cartridge L
+  # auto-registered from MAM (chip serial S; barcode L, the volume's label)`.
+  # Best-effort: a missing line costs the operator a printed hint, never the write.
   CART_NEW="$(sed -n 's/^cartridge \(.*\) auto-registered from MAM.*/\1/p' "$INIT_OUT" | head -1)"
+  CART_SERIAL="$(sed -n 's/^cartridge .* auto-registered from MAM (chip serial \([^;]*\);.*/\1/p' "$INIT_OUT" | head -1)"
   CART_BOUND="${CART_NEW:-$(sed -n 's/^volume "[^"]*" bound to cartridge \(.*\)$/\1/p' "$INIT_OUT" | head -1)}"
   if [ -n "$CART_NEW" ]; then
-    ok "cartridge $CART_NEW registered from its chip; that serial is its placeholder barcode"
-    note "When you put a sticker on it:  $OP_CMD cartridge relabel $CART_NEW <your-barcode>"
+    ok "cartridge $CART_NEW registered from its chip${CART_SERIAL:+ (chip serial $CART_SERIAL, its identity)}; its barcode is $CART_NEW: write that on its sticker"
   elif [ -n "$CART_BOUND" ]; then
     ok "volume $LABEL bound to the already-registered cartridge $CART_BOUND"
   fi
+  # ADR-0012 item 218, one copy loop: the write reads every file back before it
+  # reports the volume sealed and confirmed (--full-confirm), and that readback
+  # is the tape's first full verify; there is no second read here. --move-to
+  # records the tape at its shelf once it is confirmed, and staging is released
+  # per unit by the write itself (item 217; the copy floor), so neither
+  # --keep-staging nor a `stage clean` follows it any more.
+  #
   # --yes answers `volume write`'s own quiet-host pre-flight (ADR-0012,
   # 2026-09-24 item 7): the host check above asked that question moments ago,
   # before the WRITE confirmation, and a second prompt for the same finding --
@@ -2545,75 +2614,107 @@ EOF
   # here: volume write has no other Tier-2 question and no Tier-3 refusal.
   # A write that stops (a signal, a dropped session, an error mid-tape) is
   # picked up by re-running this step: it finds the interrupted session and
-  # offers `volume resume` (issue #414).
-  run tc volume write "$LABEL" --device "$DEVICE" --yes --keep-staging || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
+  # offers `volume resume` (issue #414). How it ended is its exit status.
+  wrc=0
+  run tc volume write "$LABEL" --device "$DEVICE" --yes --full-confirm ${LOCATION:+--move-to "$LOCATION"} || wrc=$?
+  copy_outcome "$wrc" write
 fi
-  # Issue #265: a failed verify has TWO outcomes and they need opposite
-  # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
-  # medium bad takes the volume out of service; a drive or transport error
-  # proves nothing about the tape and leaves it untouched. Collapsing both into
-  # "do not trust this tape" told the operator the opposite of what the tool had
-  # just decided in one of the two cases, and never mentioned that the other had
-  # silently changed the catalog.
-  VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
-  VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
-  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
-    ok "$LABEL sealed and verified"
-    # #440: the write above kept staging (--keep-staging) so this full verify ran
-    # while the staged slices could still rewrite a bad copy. Now release what the
-    # policy's copies cover; under-copied units stay staged for the next copy.
-    run tc stage clean || note "stage clean did not finish: run tapectl stage clean when you want the staged slices released"
-  else
-    # The loaded tape is not this volume: verify corroborates the cartridge
-    # before reading anything (src/volume/binding.rs `corroborate_volume`)
-    # and refuses "wrong tape:" / "wrong cartridge:". Nothing was read or
-    # recorded, and neither the drive nor the medium is in question.
-    if grep -E "wrong (tape|cartridge):" "$VERIFY_ERR" >/dev/null 2>&1; then
-      note "The cartridge in $DEVICE is not $LABEL's: the verify refused before reading it (above)."
-      note "This is a different cartridge loaded, not a drive or a medium problem; nothing was recorded."
-      die "load $LABEL's cartridge (\`$OP_CMD volume info $LABEL\` names it), then re-run scripts/first-run.sh --from 13 --label $LABEL"
+  # The sealed re-entry (OQ15): a volume sealed by an earlier run, or by hand.
+  # Its full readback is what this step owes it, and it is read only when none
+  # is recorded: a write's full confirm records one, as `volume verify --full`
+  # does (`report verify-status`: a session of type full, outcome passed).
+  if [ "$VSTATE" = sealed ]; then
+    VS_JSON="$(dirname "$LOG")/verify-status-$LABEL.json"
+    FULL_READ=""; FR_RC=0
+    if run_capture_json "$VS_JSON" tc report verify-status --volume "$LABEL" --json; then
+      FULL_READ="$(python3 -c 'import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+    assert isinstance(rows, list)
+except Exception:
+    sys.exit(2)
+done = [r.get("completed") or "?" for r in rows
+        if isinstance(r, dict) and r.get("type") == "full" and r.get("outcome") == "passed"]
+print(max(done) if done else "")' "$VS_JSON")" || FR_RC=$?
+    else
+      FR_RC=2
     fi
-    # `quarantined` is the discriminator (src/cli/volume.rs, `volume verify
-    # --json`): true = the medium was proved bad and the volume is now out of
-    # service; false = the verify failed without proving anything about the
-    # medium. "unknown" if the JSON did not parse, in which case say so rather
-    # than guess which.
-    VERIFY_QUAR="$(python3 -c 'import json,sys
+    if [ "$FR_RC" = 0 ] && [ -n "$FULL_READ" ]; then
+      ok "$LABEL sealed and read back in full: a full readback passed on $FULL_READ (report verify-status), so it is not read again here (ADR-0012 item 218)"
+    else
+      if [ "$FR_RC" = 0 ]; then
+        note "no full readback of $LABEL is recorded (its write confirmed it quickly, or a tapectl before 1.9.0 wrote it): reading it back now"
+      else
+        note "report verify-status could not say whether a full readback of $LABEL is recorded (above): reading it back now, the safe way"
+      fi
+      # Issue #265: a failed verify has TWO outcomes and they need opposite
+      # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
+      # medium bad takes the volume out of service; a drive or transport error
+      # proves nothing about the tape and leaves it untouched. Collapsing both into
+      # "do not trust this tape" told the operator the opposite of what the tool had
+      # just decided in one of the two cases, and never mentioned that the other had
+      # silently changed the catalog.
+      VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
+      VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
+      if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
+        ok "$LABEL sealed and read back in full: volume verify --full passed"
+      else
+        # The loaded tape is not this volume: verify corroborates the cartridge
+        # before reading anything (src/volume/binding.rs `corroborate_volume`)
+        # and refuses "wrong tape:" / "wrong cartridge:". Nothing was read or
+        # recorded, and neither the drive nor the medium is in question.
+        if grep -E "wrong (tape|cartridge):" "$VERIFY_ERR" >/dev/null 2>&1; then
+          note "The cartridge in $DEVICE is not $LABEL's: the verify refused before reading it (above)."
+          note "This is a different cartridge loaded, not a drive or a medium problem; nothing was recorded."
+          die "load $LABEL's cartridge (\`$OP_CMD volume info $LABEL\` names it), then re-run scripts/first-run.sh --from 13 --label $LABEL"
+        fi
+        # `quarantined` is the discriminator (src/cli/volume.rs, `volume verify
+        # --json`): true = the medium was proved bad and the volume is now out of
+        # service; false = the verify failed without proving anything about the
+        # medium. "unknown" if the JSON did not parse, in which case say so rather
+        # than guess which.
+        VERIFY_QUAR="$(python3 -c 'import json,sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     print("unknown"); raise SystemExit(0)
 print("yes" if d.get("quarantined") else "no")' "$VERIFY_JSON" 2>/dev/null || echo unknown)"
-    case "$VERIFY_QUAR" in
-      yes)
-        note "The catalog has taken $LABEL out of service: the verify proved the MEDIUM bad, so"
-        note "its units' copy counts have just dropped. That is a real finding about this cartridge."
-        explain <<'EOF'
-Do not trust this tape. The data you staged is still on disk — nothing has been deleted — so the recovery is to write a fresh cartridge: put a new tape in, `tapectl volume init <new-label>`, `tapectl volume write <new-label>`. Keep this one out of the rotation until you know why it failed; `tapectl volume info` and the drive's own health page (`sg_logs`) are where to look.
+        case "$VERIFY_QUAR" in
+          yes)
+            note "The catalog has taken $LABEL out of service: the verify proved the MEDIUM bad, so"
+            note "its units' copy counts have just dropped. That is a real finding about this cartridge."
+            explain <<'EOF'
+Do not trust this tape. If its units are still staged, the recovery is a fresh cartridge: load a new tape and re-run this step with a NEW label. If staging was released, `stage list --owing` and `audit` name what is short of copies, and another copy's tape is where those slices are read back from (`volume read-slices`). Keep this one out of the rotation until you know why it failed; `tapectl volume info` and the drive's own health pages (`tapectl report health`, `sg_logs`) are where to look.
 EOF
-        die "verify proved the medium bad — $LABEL is out of service, heir kit NOT generated"
-        ;;
-      no)
-        note "The verify did not complete, but it proved NOTHING about the medium: this reads as a"
-        note "DRIVE or transport problem, so $LABEL is untouched and still in service."
-        explain <<'EOF'
-Do not retire this cartridge. Clean the drive, check the cable and the SCSI path, then run the verify again — `tapectl volume verify <label> --device <device> --full`. A verify that then passes clears the volume's condition and finishes this step. The tape has not been altered by a failed read.
+            die "verify proved the medium bad — $LABEL is out of service, heir kit NOT generated"
+            ;;
+          no)
+            note "The verify did not complete, but it proved NOTHING about the medium: this reads as a"
+            note "DRIVE or transport problem, so $LABEL is untouched and still in service."
+            explain <<'EOF'
+Do not retire this cartridge. Clean the drive, check the cable and the SCSI path, then re-run this step with the same label: it finds no full readback recorded and reads the tape again. The tape has not been altered by a failed read.
 EOF
-        die "verify did not complete (drive/transport, not the medium) — re-run it, heir kit NOT generated"
-        ;;
-      *)
-        note "The verify failed and its --json could not be parsed, so this script cannot tell you"
-        note "whether the MEDIUM was proved bad or the DRIVE could not read it. Read $VERIFY_JSON"
-        note "and the output above before deciding; the two cases have opposite remedies."
-        die "verify FAILED and its outcome could not be classified — heir kit NOT generated"
-        ;;
-    esac
+            die "verify did not complete (drive/transport, not the medium) — re-run scripts/first-run.sh --from 13 --label $LABEL; heir kit NOT generated"
+            ;;
+          *)
+            note "The verify failed and its --json could not be parsed, so this script cannot tell you"
+            note "whether the MEDIUM was proved bad or the DRIVE could not read it. Read $VERIFY_JSON"
+            note "and the output above before deciding; the two cases have opposite remedies."
+            die "verify FAILED and its outcome could not be classified — heir kit NOT generated"
+            ;;
+        esac
+      fi
+    fi
   fi
+  # The shelf, whatever path got here: the write and the resume have moved the
+  # tape already (--move-to; a move that failed there is only a warning), and
+  # the move says "already at" then and changes nothing; a volume sealed by
+  # hand is moved here.
+  if [ -n "$LOCATION" ]; then run tc volume move "$LABEL" --to "$LOCATION" || true; fi
   explain <<'EOF'
-`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge, and the staged slices are still on disk (staging is released only once every unit has its min_copies): load a fresh cartridge and run `volume init <label-2>` then `volume write <label-2>`. Only if staging was already cleaned do you need `volume read-slices --from <label-1>` (with the FIRST tape loaded) to bring the slices back before writing the second.
+`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge: the write released the staging of each unit that has reached its copy floor and kept the rest (it named them), so after the first of two copies every unit is still staged. Load a blank cartridge and re-run this step with the next label and the second place (step 14 prints the command). Only if a unit's staging was released while it still needs a copy do you need `volume read-slices <unit> --from <label-1>` (with the FIRST tape loaded) to bring its slices back before writing the second.
 EOF
   run tc audit || true
-  if [ -n "$LOCATION" ]; then run tc volume move "$LABEL" --to "$LOCATION" || true; fi
   ask KIT_OUT "regenerate the heir kit into" "${KIT_OUT:-$HOME/heir-kit}"
   kit_prepare "$KIT_OUT"
   run tc key escrow-kit "$KIT_OUT" && note "Reprint $KIT_OUT/COVER.txt — the catalog inside it now knows this tape."
