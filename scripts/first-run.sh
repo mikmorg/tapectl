@@ -2789,8 +2789,11 @@ elif confirm "Install the audit and backup timers and /usr/local/bin/tapectl-op 
   else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 else note "skipped — later: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
-# What the CTO does next (ADR-0012 items 213, 218, 219): copy 2 is step 13
-# again with the next label and the profile's second place.
+# What the CTO does next (ADR-0012 items 213, 218, 219): the first tape when
+# the catalog holds none (after --upgrade's step 6, say, which runs this step),
+# else the next copy, step 13 again with the next label and the profile's
+# second place. The count is read as step 13 reads it; a home with no catalog
+# (a --home rehearsal before step 7) reads as none.
 # next_label L: L with its trailing number one higher, its width kept
 # (L6-0001 -> L6-0002); <next-label> when L ends in no number.
 next_label() {
@@ -2798,7 +2801,22 @@ next_label() {
     printf '%s%0*d' "${BASH_REMATCH[1]}" "${#BASH_REMATCH[2]}" "$((10#${BASH_REMATCH[2]} + 1))"
   else printf '<next-label>'; fi
 }
-NEXT_LABEL="$(next_label "${LABEL:-}")"
+NV14="$( { tc catalog stats --json 2>/dev/null || true; } | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("volumes",0))
+except Exception: print(0)')"
+FIRST_PLACE="${LOCATION:-${LOCATIONS[0]:-}}"; FIRST_PLACE="${FIRST_PLACE%%|*}"; FIRST_PLACE="${FIRST_PLACE:-<the shelf>}"
+FR_CMD="scripts/first-run.sh${PROFILE:+ --profile $PROFILE}"
+if [ "$NV14" = 0 ]; then
+  NEXT_LABEL="${LABEL:-L6-0001}"
+  NEXT_STEP="   • The first tape: load a blank cartridge and run step 13, which stages every unit, writes the tape, reads
+     every file back and records it at its shelf:
+       $FR_CMD --from 13 --label ${NEXT_LABEL} --location ${FIRST_PLACE}
+     Then copy 2: a second blank cartridge and step 13 again, with the next label and the second place."
+  NEXT_LABEL="$(next_label "$NEXT_LABEL")"
+else
+  NEXT_LABEL="$(next_label "${LABEL:-}")"
+  NEXT_STEP="   • The next copy: load a blank cartridge and run step 13 again, with the next label and the place the tape goes:"
+fi
 NEXT_PLACE="${LOCATIONS[1]:-}"; NEXT_PLACE="${NEXT_PLACE%%|*}"; NEXT_PLACE="${NEXT_PLACE:-<another place>}"
 cat <<EOF
    • Where things stand, any time: ${OP_CMD} status (what is running, the units by state, what to do next).
@@ -2807,8 +2825,8 @@ cat <<EOF
    • Eject with: ${OP_CMD} drive eject (it names the volume and where it belongs; a write or verify in progress refuses it).
      Write the volume's label on the cartridge's sticker: volume init gave the cartridge that label as its
      barcode (ADR-0012 item 219; the chip serial stays its identity).
-   • The next copy: load a blank cartridge and run step 13 again, with the next label and the place the tape goes:
-       scripts/first-run.sh${PROFILE:+ --profile $PROFILE} --from 13 --label ${NEXT_LABEL} --location ${NEXT_PLACE}
+${NEXT_STEP}
+       $FR_CMD --from 13 --label ${NEXT_LABEL} --location ${NEXT_PLACE}
      It is the same loop: the write takes the units still owed a copy from staging, reads every file back,
      records the tape at that place, and releases each unit's staging once it has its copy floor.
      By hand, the same in one command: ${OP_CMD} volume write ${NEXT_LABEL} --init --full-confirm --move-to ${NEXT_PLACE}
