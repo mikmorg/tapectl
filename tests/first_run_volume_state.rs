@@ -416,3 +416,471 @@ fn step_13_resumes_and_finishes_instead_of_dying() {
         "the post-write block (verify --full onwards) runs for every state, after the write path closes"
     );
 }
+
+// ---------------------------------------------------------------- step 13, run
+
+/// Step 13 run for real (`--from 13 --to 13 --auto`), with a stub `tapectl`
+/// that answers each command from this rig's scenario files and records every
+/// call. No drive: `/dev/null` is the device, and the tape lock is the rig's
+/// own file (`TAPECTL_TAPE_LOCK`), so a gate on the same host is never in the
+/// way. `sudo` is a stub that records and does nothing.
+struct Step13 {
+    tmp: TempDir,
+}
+
+/// The stub `tapectl`. `--home H` is dropped; each command prints what the
+/// real one would for what step 13 reads, from `$STUB_SCEN`:
+/// `volume-info.json` (absent: "volume not found", exit 2), `init.out` and
+/// `init.rc`, `write.rc`, `resume.rc`, `verify-status.json` and
+/// `verify-status.rc`, `verify.rc`, `volumes` (the catalog's count).
+const STUB_TAPECTL: &str = r#"#!/bin/bash
+S="$STUB_SCEN"
+printf '%s\n' "$*" >> "$S/calls"
+[ "$1" = --home ] && shift 2
+rc_of() { cat "$S/$1" 2>/dev/null || echo 0; }
+case "$1 $2" in
+  "--version "*) echo "tapectl 1.9.0 (a step-13 stub)" ;;
+  "catalog stats") echo "{\"volumes\": $(cat "$S/volumes" 2>/dev/null || echo 0)}" ;;
+  "location list") echo '[]' ;;
+  "drive status")
+    case " $* " in *" --json "*) echo '{"tape_node":{"cartridge":"loaded"}}' ;; *) echo "drive: a cartridge is loaded" ;; esac ;;
+  "host check") echo "host check: quiet" ;;
+  "volume info")
+    if [ -f "$S/volume-info.json" ]; then cat "$S/volume-info.json"
+    else echo "error: volume not found: $3" >&2; exit 2; fi ;;
+  "unit list") echo '[{"name":"keepsake/a"}]' ;;
+  "snapshot create") echo "unit \"$3\" is unchanged since v1; no snapshot created" ;;
+  "snapshot list") echo '[]' ;;
+  "stage list")
+    case " $* " in *" --json "*) echo '[{"unit":"keepsake/a"}]' ;; *) echo "keepsake/a v1 staged" ;; esac ;;
+  "volume plan") echo "1 tape (an estimate)" ;;
+  "volume init") cat "$S/init.out" 2>/dev/null; exit "$(rc_of init.rc)" ;;
+  "cartridge erase")
+    case " $* " in *" --json "*) echo '{"confirm_label": null}' ;; *) echo "the tape holds a volume this catalog does not know" ;; esac ;;
+  "volume write") rc="$(rc_of write.rc)"; [ "$rc" = 0 ] && echo "volume \"$3\" write completed"; exit "$rc" ;;
+  "volume resume") rc="$(rc_of resume.rc)"; [ "$rc" = 0 ] && echo "volume \"$3\" write resumed and completed"; exit "$rc" ;;
+  "report verify-status") cat "$S/verify-status.json" 2>/dev/null || echo '[]'; exit "$(rc_of verify-status.rc)" ;;
+  "volume verify") echo '{"quarantined": false}'; exit "$(rc_of verify.rc)" ;;
+  "volume move") echo "volume \"$3\" moved to \"$5\"" ;;
+  "audit") echo "audit: copy_count (advisory)"; exit 2 ;;
+  "key escrow-kit") mkdir -p "$3" && echo cover > "$3/COVER.txt" ;;
+  *) echo "stub tapectl: unexpected: $*" >&2; exit 99 ;;
+esac
+"#;
+
+const LABEL: &str = "L8-TEST";
+
+impl Step13 {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        for d in ["h", "state/tapectl", "work", "bin", "scen"] {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        let rig = Step13 { tmp };
+        rig.exe("bin/tapectl", STUB_TAPECTL);
+        rig.exe(
+            "bin/sudo",
+            &format!(
+                "#!/bin/sh\necho \"sudo $*\" >> {}\nexit 0\n",
+                rig.p("scen/sudo-calls").display()
+            ),
+        );
+        // Step 13 refuses under --auto without a green rehearsal of this
+        // binary: the marker step 12 leaves, keyed by the binary's sha256.
+        let sha = Command::new("sha256sum")
+            .arg(rig.p("bin/tapectl"))
+            .output()
+            .expect("sha256sum");
+        let sha = String::from_utf8_lossy(&sha.stdout)[..16].to_string();
+        std::fs::write(
+            rig.p(&format!("state/tapectl/rehearsal-ok-{sha}")),
+            "a stub rehearsal\n",
+        )
+        .unwrap();
+        rig
+    }
+    fn p(&self, rel: &str) -> std::path::PathBuf {
+        self.tmp.path().join(rel)
+    }
+    fn exe(&self, rel: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(self.p(rel), body).unwrap();
+        std::fs::set_permissions(self.p(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    /// A scenario file the stub reads.
+    fn scen(&self, name: &str, body: &str) -> &Self {
+        std::fs::write(self.p(&format!("scen/{name}")), body).unwrap();
+        self
+    }
+    /// `first-run.sh --from 13 --to 13 --auto`; the output, and the stub's calls.
+    fn run(&self) -> (Output, String) {
+        let path = format!(
+            "{}:{}",
+            self.p("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new("bash")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
+            .args(["--no-service-user", "--auto", "--from", "13", "--to", "13"])
+            .args(["--work-dir"])
+            .arg(self.p("work"))
+            .args(["--home"])
+            .arg(self.p("home"))
+            .args(["--tapectl"])
+            .arg(self.p("bin/tapectl"))
+            .args([
+                "--device",
+                "/dev/null",
+                "--label",
+                LABEL,
+                "--location",
+                "fr-rack",
+            ])
+            .env("PATH", path)
+            .env("HOME", self.p("h"))
+            .env("USER", "fr-tester")
+            .env("XDG_STATE_HOME", self.p("state"))
+            .env("STUB_SCEN", self.p("scen"))
+            .env("TAPECTL_TAPE_LOCK", self.p("tape.lock"))
+            .env("TAPECTL_HOME_POINTER", self.p("home-pointer"))
+            .env_remove("TAPECTL_HOME")
+            .env_remove("TAPECTL_LOCAL_PROFILE")
+            .env_remove("SSH_CONNECTION")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn first-run.sh");
+        let calls = std::fs::read_to_string(self.p("scen/calls")).unwrap_or_default();
+        (out, calls)
+    }
+}
+
+use std::process::Output;
+
+fn texts(o: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// The calls that ran `words` (e.g. "volume verify"), after the `--home H`.
+fn calls_of<'a>(calls: &'a str, words: &str) -> Vec<&'a str> {
+    calls
+        .lines()
+        .map(|l| match l.strip_prefix("--home ") {
+            Some(rest) => rest.split_once(' ').map(|(_, r)| r).unwrap_or(""),
+            None => l,
+        })
+        .filter(|l| l.starts_with(words))
+        .collect()
+}
+
+/// `volume info --json` of a volume in `status` with `writes`.
+fn info_json(status: &str, writes: &[&str]) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&info(status, "ok", writes)).unwrap();
+    v["label"] = serde_json::json!(LABEL);
+    v.to_string()
+}
+
+/// init's line for a cartridge it registered (src/volume/write.rs
+/// `binding_lines`, ADR-0012 item 219).
+fn registered_line() -> String {
+    format!(
+        "cartridge {LABEL} auto-registered from MAM (chip serial SER-0123; barcode {LABEL}, \
+         the volume's label)\nvolume \"{LABEL}\" initialized\n"
+    )
+}
+
+/// ADR-0012 item 218: one copy loop. The write runs with --full-confirm and
+/// --move-to the shelf, no --keep-staging; nothing reads the tape a second
+/// time (no `volume verify`), no `stage clean` follows, and the step goes on
+/// to the shelf, the audit and the kit. Item 219: init's line is read for the
+/// barcode the cartridge took, the label, and no `cartridge relabel` is named.
+#[test]
+fn step_13_writes_once_and_its_full_confirm_is_the_verify() {
+    let rig = Step13::new();
+    rig.scen("init.out", &registered_line());
+    let (o, calls) = rig.run();
+    let (out, err) = texts(&o);
+    assert!(o.status.success(), "{out}\n{err}\n{calls}");
+    assert_eq!(
+        calls_of(&calls, "volume write"),
+        vec![format!(
+            "volume write {LABEL} --device /dev/null --yes --full-confirm --move-to fr-rack"
+        )],
+        "{calls}"
+    );
+    assert!(!calls.contains("--keep-staging"), "{calls}");
+    assert!(calls_of(&calls, "volume verify").is_empty(), "{calls}");
+    assert!(calls_of(&calls, "stage clean").is_empty(), "{calls}");
+    assert!(
+        out.contains(&format!(
+            "{LABEL} sealed and read back in full: the write's confirm read every file back"
+        )),
+        "{out}"
+    );
+    for after in ["volume move", "audit", "key escrow-kit"] {
+        assert_eq!(calls_of(&calls, after).len(), 1, "{after}: {calls}");
+    }
+    assert!(
+        out.contains(&format!(
+            "cartridge {LABEL} registered from its chip (chip serial SER-0123, its identity); \
+             its barcode is {LABEL}: write that on its sticker"
+        )),
+        "{out}"
+    );
+    assert!(
+        !out.contains("relabel") && !err.contains("relabel"),
+        "{out}"
+    );
+}
+
+/// ADR-0012 item 218: what went wrong is read from the write's exit status
+/// (the write family's table), each with its own remedy, and nothing after
+/// the write runs: no verify, no kit.
+#[test]
+fn step_13_reads_how_the_write_ended_from_its_exit_status() {
+    let cases = [
+        (
+            "2",
+            "the write refused before anything was written (exit 2)",
+        ),
+        (
+            "3",
+            "the write's confirm did not complete (exit 3: the drive or transport, not the medium)",
+        ),
+        ("4", "write did not seal: interrupted part-way (exit 4)"),
+        ("5", "write did not seal: the session aborted (exit 5)"),
+        ("6", "the write proved the medium bad (exit 6)"),
+        ("75", "the catalog was busy (exit 75)"),
+        ("137", "write did not seal (exit 137)"),
+    ];
+    for (rc, says) in cases {
+        let rig = Step13::new();
+        rig.scen("init.out", &registered_line())
+            .scen("write.rc", rc);
+        let (o, calls) = rig.run();
+        let (out, err) = texts(&o);
+        assert_eq!(o.status.code(), Some(1), "exit {rc}: {out}\n{err}");
+        assert!(err.contains(says), "exit {rc}: {err}");
+        for none in ["volume verify", "key escrow-kit", "volume move", "audit"] {
+            assert!(
+                calls_of(&calls, none).is_empty(),
+                "exit {rc}, {none}: {calls}"
+            );
+        }
+    }
+    // The positive control of the remedies' differences: exit 3 is a sealed
+    // tape whose re-run resumes, exit 6 a medium to replace.
+    let rig = Step13::new();
+    rig.scen("init.out", &registered_line())
+        .scen("write.rc", "3");
+    let (o, _) = rig.run();
+    assert!(texts(&o)
+        .0
+        .contains("so L8-TEST is untouched and still in service"));
+}
+
+/// The resume keeps what the write asked for: --full-confirm and the shelf,
+/// no --keep-staging, and it is classified the same way.
+#[test]
+fn step_13_resumes_with_a_full_confirm_and_reads_its_exit_status() {
+    let rig = Step13::new();
+    rig.scen(
+        "volume-info.json",
+        &info_json("initialized", &["interrupted"]),
+    )
+    .scen("volumes", "1");
+    let (o, calls) = rig.run();
+    let (out, err) = texts(&o);
+    assert!(o.status.success(), "{out}\n{err}\n{calls}");
+    assert_eq!(
+        calls_of(&calls, "volume resume"),
+        vec![format!(
+            "volume resume {LABEL} --device /dev/null --full-confirm --move-to fr-rack"
+        )],
+        "{calls}"
+    );
+    assert!(calls_of(&calls, "volume write").is_empty(), "{calls}");
+    assert!(calls_of(&calls, "volume verify").is_empty(), "{calls}");
+    assert!(
+        out.contains(&format!(
+            "{LABEL} sealed and read back in full: the resume's confirm read every file back"
+        )),
+        "{out}"
+    );
+
+    let rig = Step13::new();
+    rig.scen(
+        "volume-info.json",
+        &info_json("initialized", &["interrupted"]),
+    )
+    .scen("volumes", "1")
+    .scen("resume.rc", "6");
+    let (o, calls) = rig.run();
+    let (_, err) = texts(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("the resume proved the medium bad (exit 6)"),
+        "{err}"
+    );
+    assert!(calls_of(&calls, "key escrow-kit").is_empty(), "{calls}");
+}
+
+/// A `report verify-status --volume L --json` row.
+fn verify_row(kind: &str, outcome: &str, completed: &str) -> serde_json::Value {
+    serde_json::json!({
+        "volume": LABEL, "never_verified": false, "type": kind, "outcome": outcome,
+        "started": completed, "completed": completed, "checked": 4, "passed": 4,
+        "failed": 0, "write_lbp": "on", "write_lbp_note": null, "no_full_verify": false,
+    })
+}
+
+/// OQ15: a sealed re-entry reads the tape again only when no full readback
+/// is recorded for it. Recorded (the write's full confirm): `report
+/// verify-status` is asked, nothing is read, and the step goes on.
+#[test]
+fn a_sealed_reentry_with_a_full_readback_recorded_reads_nothing() {
+    let rig = Step13::new();
+    let rows = serde_json::json!([
+        verify_row("quick", "passed", "2026-11-03 09:00:00"),
+        verify_row("full", "passed", "2026-11-04 10:00:00"),
+    ]);
+    rig.scen("volume-info.json", &info_json("sealed", &["completed"]))
+        .scen("volumes", "1")
+        .scen("verify-status.json", &rows.to_string());
+    let (o, calls) = rig.run();
+    let (out, err) = texts(&o);
+    assert!(o.status.success(), "{out}\n{err}\n{calls}");
+    assert_eq!(
+        calls_of(&calls, "report verify-status"),
+        vec![format!("report verify-status --volume {LABEL} --json")],
+        "{calls}"
+    );
+    for none in [
+        "volume verify",
+        "volume write",
+        "volume resume",
+        "volume init",
+    ] {
+        assert!(calls_of(&calls, none).is_empty(), "{none}: {calls}");
+    }
+    assert!(
+        out.contains(&format!(
+            "{LABEL} sealed and read back in full: a full readback passed on 2026-11-04 10:00:00"
+        )),
+        "{out}"
+    );
+    for after in ["volume move", "audit", "key escrow-kit"] {
+        assert_eq!(calls_of(&calls, after).len(), 1, "{after}: {calls}");
+    }
+}
+
+/// OQ15, the other way: only quick readbacks recorded (or none), or a report
+/// that cannot be read, and the step reads the tape (`volume verify --full`).
+#[test]
+fn a_sealed_reentry_without_a_full_readback_recorded_runs_the_verify() {
+    let quick = serde_json::json!([verify_row("quick", "passed", "2026-11-03 09:00:00")]);
+    let failed = serde_json::json!([verify_row("full", "failed", "2026-11-03 09:00:00")]);
+    for (rows, rc, says) in [
+        (
+            quick.to_string(),
+            "0",
+            "no full readback of L8-TEST is recorded",
+        ),
+        (
+            failed.to_string(),
+            "0",
+            "no full readback of L8-TEST is recorded",
+        ),
+        (
+            "[]".to_string(),
+            "0",
+            "no full readback of L8-TEST is recorded",
+        ),
+        (
+            "not json".to_string(),
+            "0",
+            "report verify-status could not say whether a full readback",
+        ),
+        (
+            "[]".to_string(),
+            "2",
+            "report verify-status could not say whether a full readback",
+        ),
+    ] {
+        let rig = Step13::new();
+        rig.scen("volume-info.json", &info_json("sealed", &["completed"]))
+            .scen("volumes", "1")
+            .scen("verify-status.json", &rows)
+            .scen("verify-status.rc", rc);
+        let (o, calls) = rig.run();
+        let (out, err) = texts(&o);
+        assert!(o.status.success(), "{rows}: {out}\n{err}\n{calls}");
+        assert!(out.contains(says), "{rows}: {out}");
+        assert_eq!(
+            calls_of(&calls, "volume verify"),
+            vec![format!(
+                "volume verify {LABEL} --device /dev/null --full --json"
+            )],
+            "{rows}: {calls}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{LABEL} sealed and read back in full: volume verify --full passed"
+            )),
+            "{rows}: {out}"
+        );
+    }
+}
+
+/// ADR-0012 item 216: with THIS catalog's own sealed volume loaded, init's
+/// refusal offers no erase, and step 13 says to eject it and load a blank:
+/// no `cartridge erase` runs. The control: a sealed volume the catalog does
+/// not hold goes to the erase dry run as before.
+#[test]
+fn this_catalogs_own_sealed_volume_is_ejected_never_erased() {
+    let sealed = format!(
+        "error: refusing to write volume \"{LABEL}\": the loaded cartridge already carries a \
+         SEALED volume — a valid seal marker parses at tape position 12. ADR-0003: sealed \
+         volumes are immutable, there is no append, and --force cannot override this. "
+    );
+    let rig = Step13::new();
+    rig.scen(
+        "init.out",
+        &format!(
+            "{sealed}It is this catalog's live copy: L8-0001, a copy of 3 units. Leave it as it \
+             is: eject it (`tapectl drive eject`) and load a blank cartridge.\n"
+        ),
+    )
+    .scen("init.rc", "2");
+    let (o, calls) = rig.run();
+    let (out, err) = texts(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        err.contains("is this catalog's own volume (above): eject it")
+            && err.contains("load a blank cartridge"),
+        "{err}"
+    );
+    assert!(calls_of(&calls, "cartridge erase").is_empty(), "{calls}");
+    assert!(calls_of(&calls, "volume write").is_empty(), "{calls}");
+
+    let rig = Step13::new();
+    rig.scen(
+        "init.out",
+        &format!(
+            "{sealed}This catalog holds no volume of that identity (`tapectl volume identify` \
+             shows what the tape says). To reuse the cartridge: `tapectl cartridge erase` erases \
+             the tape in the drive, reads it back and records it.\n"
+        ),
+    )
+    .scen("init.rc", "2");
+    let (o, calls) = rig.run();
+    let (out, err) = texts(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        !calls_of(&calls, "cartridge erase").is_empty(),
+        "the erase route is still taken for a tape the catalog does not hold: {calls}"
+    );
+    assert!(!err.contains("is this catalog's own volume"), "{err}");
+}

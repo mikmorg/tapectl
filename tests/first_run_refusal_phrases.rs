@@ -153,3 +153,53 @@ fn no_force_phrase_appears_in_a_refusal_force_cannot_override() {
         }
     }
 }
+
+/// ADR-0012 item 216: with THIS catalog's own sealed volume loaded (its live
+/// copy, or one it holds and has not given up), the SEALED refusal offers no
+/// erase and says to eject it; step 13 routes that case on the phrase below,
+/// before the erase dry run. The phrase is in `SealedHolder::way_on`, appended
+/// to the refusal, not in the refusal literal itself: so it is pinned there,
+/// in the arms that offer no erase and in none that does.
+const EJECT_PHRASE: &str = "Leave it as it is: eject it";
+
+#[test]
+fn step_13_routes_this_catalogs_own_sealed_volume_to_eject_on_the_refusals_words() {
+    let script = routing_lines(&read("scripts/first-run.sh"));
+    assert!(
+        script.contains(EJECT_PHRASE),
+        "first-run.sh no longer routes on {EJECT_PHRASE:?}: update this test with the script"
+    );
+    let joined = joined_string_continuations(&read("src/volume/write.rs"));
+    let at = joined
+        .find("fn way_on(&self)")
+        .expect("SealedHolder::way_on, the refusal's way on");
+    let body = &joined[at..];
+    let body = &body[..body.find("\n}\n").expect("the end of its impl")];
+    // Each arm of the match, by the variant that opens it.
+    let arms: Vec<&str> = body.split("SealedHolder::").skip(1).collect();
+    assert!(
+        arms.len() >= 5,
+        "found {} arm(s) in way_on; expected LiveCopy, Held, GivenUp, NotHeld and NotAsked, \
+         so the split is not looking where it should",
+        arms.len()
+    );
+    let eject: Vec<&&str> = arms.iter().filter(|a| a.contains(EJECT_PHRASE)).collect();
+    assert!(
+        eject.iter().any(|a| a.starts_with("LiveCopy"))
+            && eject.iter().any(|a| a.starts_with("Held")),
+        "the live-copy and held arms must say {EJECT_PHRASE:?}: {eject:?}"
+    );
+    // The positive control of the next check: the erase arms do name it.
+    assert!(
+        arms.iter().filter(|a| a.contains("{ERASE}")).count() >= 2,
+        "the given-up and not-held arms offer the erase: {arms:?}"
+    );
+    for arm in &arms {
+        assert!(
+            !(arm.contains(EJECT_PHRASE)
+                && (arm.contains("{ERASE}") || arm.contains("cartridge erase"))),
+            "an arm that says to eject also offers the erase, so step 13 would refuse a tape \
+             init offers to erase: {arm}"
+        );
+    }
+}
