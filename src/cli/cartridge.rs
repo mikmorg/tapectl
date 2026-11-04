@@ -6,9 +6,21 @@ use tabled::{Table, Tabled};
 use crate::db::events;
 use crate::error::{Result, TapectlError};
 
+/// `cartridge erase --help`'s examples (ADR-0012 item 211).
+const ERASE_EXAMPLES: &str = "\
+Examples:
+  See what the loaded tape is and whether it may be erased, changing nothing:
+    tapectl cartridge erase --dry-run
+  Erase it, typing its label when asked:
+    tapectl cartridge erase
+  Erase unattended, giving the label File 0 shows:
+    tapectl cartridge erase --confirm-label L6-0001";
+
 #[derive(Subcommand, Debug)]
 pub enum CartridgeCommands {
     /// Register a physical cartridge
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Register {
         /// Barcode label
         #[arg(long)]
@@ -16,14 +28,17 @@ pub enum CartridgeCommands {
         /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
         #[arg(long)]
         generation: String,
-        /// Nominal capacity, e.g. "2500G". Decimal, as printed on the
-        /// cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
-        /// `slice_size`/`enospc_buffer` use. Defaults to the generation
-        /// table's marketed figure (ADR-0010) when omitted — give this
-        /// explicitly only when the physical cartridge really differs (a
-        /// declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
+        /// Nominal capacity, e.g. "2500G".
+        ///
+        /// Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012)
+        /// — not the binary unit `slice_size`/`enospc_buffer` use. Defaults to
+        /// the generation table's marketed figure (ADR-0010) when omitted —
+        /// give this explicitly only when the physical cartridge really differs
+        /// (a declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
         #[arg(long)]
         capacity: Option<String>,
+        /// The chip serial you believe this cartridge carries, for one not yet loaded.
+        ///
         /// The medium serial you BELIEVE this cartridge carries, for
         /// pre-registering one that has not been loaded yet.
         ///
@@ -40,10 +55,13 @@ pub enum CartridgeCommands {
         notes: Option<String>,
     },
     /// List cartridges
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     List {
-        /// Filter by status (available, in_use, pending_erase,
-        /// retired_permanent). `offsite` was removed by ADR-0011 -- a
-        /// cartridge's place is a location now; use --location.
+        /// Filter by status (available, in_use, pending_erase, retired_permanent).
+        ///
+        /// `offsite` was removed by ADR-0011 -- a cartridge's place is a
+        /// location now; use --location.
         #[arg(long)]
         status: Option<String>,
         /// Filter by physical location name -- the sibling of `--status`.
@@ -51,6 +69,8 @@ pub enum CartridgeCommands {
         location: Option<String>,
     },
     /// Show cartridge details
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Info {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
@@ -59,10 +79,12 @@ pub enum CartridgeCommands {
     /// Move a cartridge to a location, taking its volumes with it
     ///
     /// ADR-0011: a cartridge's PLACE is a location, not a status. This moves
-    /// `cartridges.location_id` and the `location_id` of every volume
-    /// currently on the cartridge, in one transaction, so the shelf and the
+    /// the cartridge and every volume currently on it, in one transaction,
+    /// so the shelf and the
     /// catalog cannot disagree. `volume move` does the same from the other
     /// end.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Move {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
@@ -83,14 +105,15 @@ pub enum CartridgeCommands {
     ///
     /// ADR-0008 Tier 2: the coverage impact is displayed first, and consent
     /// is asked EVERY time — retiring a medium permanently is a declaration
-    /// worth confirming even when no unit loses coverage by it, which is
-    /// what `cartridge_retire` does deliberately. `--force`/`--yes` supplies
-    /// that consent.
+    /// worth confirming even when no unit loses coverage by it.
+    /// `--force`/`--yes` supplies that consent.
     ///
     /// This said consent was "required when a unit is left below its policy"
     /// until 2026-09-17, which read as "not required otherwise"
     /// — so a script retiring a fully-covered cartridge without `--yes` was
     /// refused by a non-interactive session for a reason the help denied.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Retire {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
@@ -98,16 +121,20 @@ pub enum CartridgeCommands {
         /// Why (appended to the cartridge's notes, never overwriting them)
         #[arg(long)]
         reason: Option<String>,
+        /// Give the Tier-2 consent this command asks on every run; never the Tier-3 refusal.
+        ///
         /// Supply the ADR-0008 Tier-2 consent this command asks on every
         /// run, including when no unit is left below its policy. It does
         /// NOT defeat the Tier-3 refusal — a cartridge holding
         /// the last eligible copy of a live version is refused outright and
-        /// no flag reaches it. See cli::consent.
+        /// no flag reaches it.
         #[arg(long)]
         force: bool,
     },
-    /// Erase the tape in the drive, after identifying it, checking it against
-    /// the catalog and asking for its label; then read it back to prove it
+    /// Erase the tape in the drive, then read it back to prove it.
+    ///
+    /// It identifies the tape first, checks it against the catalog and asks for
+    /// its label.
     ///
     /// ADR-0012 (2026-10-12, items 51 and 52), in order:
     ///
@@ -158,15 +185,21 @@ pub enum CartridgeCommands {
     /// again. 6 = the read-back contradicts the erase (File 0 still holds
     /// data, or the chip serial changed); nothing recorded. 75 = the catalog
     /// was busy.
+    #[command(after_long_help = ERASE_EXAMPLES)]
     Erase {
-        /// Tape device (by-id path). Defaults to the only configured drive;
-        /// required when more than one is configured.
+        /// Tape device (by-id path).
+        ///
+        /// Defaults to the only configured drive; required when more than one
+        /// is configured.
         #[arg(long)]
         device: Option<String>,
-        /// Erase the whole medium instead of writing a filemark at its
-        /// start: hours on real LTO. For a cartridge that leaves your hands.
+        /// Erase the whole medium instead of writing a filemark at its start: hours on real LTO.
+        ///
+        /// For a cartridge that leaves your hands.
         #[arg(long)]
         long: bool,
+        /// The label read from File 0 (or the chip serial), for an unattended erase.
+        ///
         /// The label read from the tape's File 0 (for a tape tapectl did not
         /// write, its chip serial), for an unattended erase. It must equal
         /// what the tape says; `--dry-run` prints it.
@@ -188,16 +221,18 @@ pub enum CartridgeCommands {
     /// this command's own mutation is the cartridge returning to `available`,
     /// and no amount of consent makes a medium declared permanently unfit fit
     /// again. `cartridge unretire` is the way back.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     MarkErased {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
-        /// Override the pending_erase lifecycle precondition (ADR-0008
-        /// Tier 2 — see cli::consent). Does NOT reach a `retired_permanent`
-        /// cartridge — `cartridge unretire` is the way back.
-        /// Does NOT reach the Tier-3 zero-copy floor either:
-        /// if a mounted volume holds a unit's last eligible copy, marking
-        /// the cartridge erased is refused, and no flag waives that.
+        /// Override the pending_erase precondition (an ADR-0008 Tier-2 consent).
+        ///
+        /// Does NOT reach a `retired_permanent` cartridge — `cartridge
+        /// unretire` is the way back. Does NOT reach the Tier-3 zero-copy floor
+        /// either: if a mounted volume holds a unit's last eligible copy,
+        /// marking the cartridge erased is refused, and no flag waives that.
         #[arg(long)]
         force: bool,
     },
@@ -208,18 +243,20 @@ pub enum CartridgeCommands {
     /// correction, and the wrong-medium check at the next init still
     /// applies)." Tier 1 under ADR-0008 — no prompt, no `--force`, no
     /// `--yes`, and it applies to every status, `retired_permanent`
-    /// included. This edits only the `cartridges` row: it never rewrites
-    /// `volumes.media_type` or `volumes.capacity_bytes` (ADR-0010 decision
-    /// 3 — capacity is decided once at init and stored on the volume).
+    /// included. This edits only the cartridge's record: it never changes
+    /// the generation or capacity of a volume on it (ADR-0010 decision 3:
+    /// capacity is decided once at init and stored on the volume).
     ///
     /// `--serial` is a SEPARATE, independently gated correction (ADR-0012
     /// amendment, 2026-09-16): gating is per-flag, not
     /// per-command, because `--generation` is a fact correction (Tier 1)
-    /// while `--serial` is a claim about IDENTITY (Tier 2 — see
-    /// `cli::consent`). It writes only `operator_serial`, never
+    /// while `--serial` is a claim about IDENTITY (Tier 2: it asks for
+    /// consent). It writes only the claimed serial, never the chip-confirmed
     /// `serial_number`, which no operator command may ever touch. At least
     /// one of `--generation`/`--serial` must be given; both may be given in
     /// one call, and each is gated independently.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Edit {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
@@ -227,9 +264,10 @@ pub enum CartridgeCommands {
         /// The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
         #[arg(long)]
         generation: Option<String>,
-        /// Correct the OPERATOR-claimed serial (never the chip-confirmed
-        /// one). Tier 2 under ADR-0008 — gated on consent
-        /// (`cli::consent::confirm`), unlike `--generation` above.
+        /// Correct the OPERATOR-claimed serial (never the chip-confirmed one).
+        ///
+        /// Tier 2 under ADR-0008: it asks for consent (the global `--yes`
+        /// gives it), unlike `--generation` above.
         #[arg(long)]
         serial: Option<String>,
     },
@@ -243,16 +281,19 @@ pub enum CartridgeCommands {
     /// gate — and it is the remedy `volume init`'s auto-register refuses
     /// with when the loaded medium's serial collides with an
     /// already-registered barcode.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Relabel {
-        /// The cartridge: its current barcode, or the serial its chip
-        /// reports
+        /// The cartridge: its current barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// New barcode
         new_barcode: String,
     },
-    /// Reverse a `cartridge retire` — the operator saying they were wrong
-    /// about the *medium*, not that its bytes are gone
+    /// Reverse a `cartridge retire`: the medium is fit after all.
+    ///
+    /// The operator saying they were wrong about the *medium*, not that its
+    /// bytes are gone.
     ///
     /// ADR-0012's consequences bullet: restores the cartridge, and any
     /// volumes retired with it, to the status recorded in the `events`
@@ -268,6 +309,8 @@ pub enum CartridgeCommands {
     /// `cartridge mark-erased` is untouched by this command and remains
     /// the separate, irreversible statement that the bytes are gone
     /// (ADR-0011, corrected 2026-09-14).
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Unretire {
         /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
@@ -292,11 +335,14 @@ pub enum CartridgeCommands {
     /// serial — so a read taken before it was registered is found too.
     /// With neither a barcode nor `--serial`, every row is listed, including
     /// reads no cartridge could be named for. Read-only.
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Journal {
-        /// A registered cartridge: its barcode, or the serial its chip
-        /// reports
+        /// A registered cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: Option<String>,
+        /// Select by the medium serial the chip reported (for a cartridge not registered).
+        ///
         /// Select by the medium serial the chip reported instead (for a
         /// cartridge that is not registered)
         #[arg(long, conflicts_with = "barcode")]

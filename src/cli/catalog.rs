@@ -14,6 +14,8 @@ use crate::volume::rebuild::RebuildReport;
 #[derive(Subcommand, Debug)]
 pub enum CatalogCommands {
     /// List files in a unit's latest snapshot
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     List {
         /// Unit name
         unit: String,
@@ -27,16 +29,21 @@ pub enum CatalogCommands {
     Ls(crate::cli::renamed::Removed),
 
     /// Search for files by pattern, in each unit's newest version
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Search {
-        /// Search pattern. Split on non-alphanumerics; each token is
-        /// PREFIX-matched and all must match (AND). So "foo bar" finds
-        /// paths containing a word starting with foo AND one starting
-        /// with bar -- it is not a substring match, and "ar" will not
-        /// find "bar".
+        /// Search pattern.
+        ///
+        /// Split on non-alphanumerics; each token is PREFIX-matched and all
+        /// must match (AND). So "foo bar" finds paths containing a word
+        /// starting with foo AND one starting with bar -- it is not a substring
+        /// match, and "ar" will not find "bar".
         pattern: String,
         /// Limit results
         #[arg(long, default_value = "50")]
         limit: i64,
+        /// Search every version of each unit, not only its newest.
+        ///
         /// Search every version of each unit, not only its newest: a file
         /// is listed once per version that holds it
         #[arg(long)]
@@ -44,26 +51,38 @@ pub enum CatalogCommands {
     },
 
     /// Show which volume(s) contain a unit
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Locate {
         /// Unit name
         unit: String,
     },
 
-    /// Show catalog statistics. Files and Total are summed over every
-    /// version that still has a file list: Files counts non-directory
-    /// entries, Total counts regular-file bytes.
+    /// Show catalog statistics.
+    ///
+    /// Files and Total are summed over every version that still has a file
+    /// list: Files counts non-directory entries, Total counts regular-file
+    /// bytes.
+    ///
+    /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Stats,
 
-    /// Reconstruct catalog rows by reading a sealed volume — the path back
-    /// when the database is gone and there is no backup
+    /// Reconstruct catalog rows by reading a sealed volume.
+    ///
+    /// The path back when the database is gone and there is no backup.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
     Rebuild {
-        /// Rebuild from a sealed tape volume. Required: the only source
-        /// today, named rather than implied so a later `--from-export` is
-        /// additive
+        /// Rebuild from a sealed tape volume.
+        ///
+        /// Required: the only source today, named rather than implied so a
+        /// later `--from-export` is additive
         #[arg(long = "from-volume", required = true)]
         from_volume: bool,
-        /// Tape device (by-id path). Defaults to the only configured drive;
-        /// required when more than one is configured.
+        /// Tape device (by-id path).
+        ///
+        /// Defaults to the only configured drive; required when more than one
+        /// is configured.
         ///
         /// There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN`
         /// numbering is not stable across reboots on a host with more than
@@ -75,6 +94,8 @@ pub enum CatalogCommands {
         /// `/dev/tape/by-id/`.
         #[arg(long)]
         device: Option<String>,
+        /// Operator or escrow secret key file (an age identity); repeat for several.
+        ///
         /// Operator or escrow secret key file (an age identity,
         /// `AGE-SECRET-KEY-1…`); repeat for several. For this command only:
         /// never copied into the home or registered as any key, so an heir
@@ -84,10 +105,14 @@ pub enum CatalogCommands {
         /// identity is refused, naming it, before the drive is opened
         #[arg(long, required = true, value_name = "FILE")]
         key: Vec<PathBuf>,
+        /// Refuse unless the tape's own label matches (a wrong-tape guard).
+        ///
         /// Refuse unless the tape's own reported label matches — a
         /// wrong-tape guard, not a database lookup
         #[arg(long)]
         label: Option<String>,
+        /// Tenant to file units under when no tenant envelope names their owner.
+        ///
         /// Tenant to file units under when no tenant envelope on this
         /// cartridge names their owner (only reachable with a damaged or
         /// partial tape)

@@ -536,3 +536,173 @@ fn catalog_rebuild_shows_from_volume_as_required() {
     assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     assert!(err.to_string().contains("--from-volume"), "{err}");
 }
+
+/// The tape-side command groups 6B's help sweep covers (ADR-0012 item 211).
+const TAPE_GROUPS: &[&str] = &["volume", "cartridge", "restore", "catalog"];
+
+/// `(path, command)` for every visible command under `cmd`, itself included.
+fn visible_commands<'a>(
+    cmd: &'a clap::Command,
+    path: &str,
+    out: &mut Vec<(String, &'a clap::Command)>,
+) {
+    if cmd.is_hide_set() {
+        return;
+    }
+    out.push((path.to_string(), cmd));
+    for sub in cmd.get_subcommands() {
+        visible_commands(sub, &format!("{path} {}", sub.get_name()), out);
+    }
+}
+
+fn tape_commands(root: &clap::Command) -> Vec<(String, &clap::Command)> {
+    let mut out = Vec::new();
+    for g in TAPE_GROUPS {
+        let group = root
+            .find_subcommand(g)
+            .unwrap_or_else(|| panic!("no `{g}` group"));
+        visible_commands(group, &format!("tapectl {g}"), &mut out);
+    }
+    out
+}
+
+/// ADR-0012 item 211: `-h` gives one line per command and flag. The first
+/// paragraph of every tape-side command's and argument's doc comment (what
+/// `-h` prints) is one short line; the rest is `--help`'s. And help names no
+/// code paths: no module, no source file, no design document.
+#[test]
+fn tape_side_short_help_is_one_line_and_names_no_code_paths() {
+    use clap::CommandFactory;
+    let root = tapectl::cli::Cli::command();
+    let commands = tape_commands(&root);
+    // Positive control: the walk reaches the commands it is about.
+    let names: Vec<&str> = commands.iter().map(|(p, _)| p.as_str()).collect();
+    for want in [
+        "tapectl volume write",
+        "tapectl cartridge erase",
+        "tapectl restore file",
+        "tapectl catalog rebuild",
+        "tapectl volume deposit add",
+    ] {
+        assert!(names.contains(&want), "the walk missed {want}: {names:?}");
+    }
+    let code = |t: &str| {
+        ["cli::", "src/", "docs/", "§", ".rs", "::"]
+            .iter()
+            .find(|n| t.contains(*n))
+            .copied()
+    };
+    let mut bad = Vec::new();
+    for (path, cmd) in &commands {
+        let mut texts: Vec<(String, String, String)> = Vec::new();
+        if let Some(about) = cmd.get_about() {
+            let long = cmd
+                .get_long_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            texts.push((path.clone(), about.to_string(), long));
+        }
+        for arg in cmd.get_arguments() {
+            if arg.is_hide_set() || arg.is_global_set() {
+                continue;
+            }
+            if let Some(h) = arg.get_help() {
+                let long = arg
+                    .get_long_help()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                texts.push((format!("{path} --{}", arg.get_id()), h.to_string(), long));
+            }
+        }
+        for (at, short, long) in texts {
+            if short.contains('\n') || short.chars().count() > 92 {
+                bad.push(format!("{at}: -h is not one short line: {short:?}"));
+            }
+            for t in [&short, &long] {
+                if let Some(n) = code(t) {
+                    bad.push(format!("{at}: names a code path ({n}): {t:?}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// ADR-0012 item 212: each command's `--help` states its own exit codes,
+/// and the most-used tape commands carry EXAMPLES (OQ16) whose command
+/// lines are real: the one copy loop among them.
+#[test]
+fn tape_side_help_states_exit_codes_and_examples() {
+    use clap::CommandFactory;
+    let root = tapectl::cli::Cli::command();
+    let mut missing = Vec::new();
+    for (path, cmd) in tape_commands(&root) {
+        if cmd.has_subcommands() {
+            continue;
+        }
+        let long = cmd
+            .get_long_about()
+            .or(cmd.get_about())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !long.contains("Exit status") {
+            missing.push(path);
+        }
+    }
+    assert!(missing.is_empty(), "no exit status in: {missing:?}");
+
+    let home = TempDir::new().unwrap();
+    for (cmd, want) in [
+        (
+            &["volume", "write"][..],
+            "tapectl volume write L6-0003 --init --full-confirm --move-to offsite",
+        ),
+        (&["volume", "verify"][..], "tapectl volume verify L6-0001"),
+        (
+            &["cartridge", "erase"][..],
+            "tapectl cartridge erase --dry-run",
+        ),
+        (
+            &["restore", "unit"][..],
+            "tapectl restore unit photos --to /srv/restore/photos",
+        ),
+        (
+            &["restore", "file"][..],
+            "tapectl restore file photos 2024/beach.jpg --to /srv/restore",
+        ),
+    ] {
+        let mut args = cmd.to_vec();
+        args.push("--help");
+        let out = run_tapectl(home.path(), &args);
+        assert!(out.status.success(), "{args:?}");
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(help.contains("Examples:"), "{args:?}: {help}");
+        assert!(help.contains(want), "{args:?} lacks `{want}`: {help}");
+        // `-h` keeps to one line per item: no examples there.
+        let mut short = cmd.to_vec();
+        short.push("-h");
+        let out = run_tapectl(home.path(), &short);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("Examples:"),
+            "{short:?}"
+        );
+    }
+
+    // Every example line parses as the command it shows.
+    use clap::Parser;
+    for (_, cmd) in tape_commands(&root) {
+        let Some(after) = cmd.get_after_long_help() else {
+            continue;
+        };
+        for line in after.to_string().lines() {
+            let line = line.trim();
+            if !line.starts_with("tapectl ") {
+                continue;
+            }
+            let argv: Vec<&str> = line.split_whitespace().collect();
+            if let Err(e) = tapectl::cli::Cli::try_parse_from(&argv) {
+                panic!("example `{line}` does not parse: {e}");
+            }
+        }
+    }
+}
