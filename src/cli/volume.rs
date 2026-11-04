@@ -514,13 +514,23 @@ pub enum VolumeCommands {
     /// where each sits against the fill ceiling, and the units that would
     /// wait for the next tape. An estimate: the volume's own files are not
     /// counted.
+    ///
+    /// A plan needs no drive: the tapes are estimated for `--generation`, or
+    /// the configured drive's own generation, and the drive is never opened
+    /// or probed, so it need not be attached. With neither, the plan is
+    /// shown without the estimate. `volume init` decides each cartridge's
+    /// real capacity.
     Plan {
-        /// Number of copies to plan
-        #[arg(long, default_value = "1")]
-        copies: i64,
+        /// Number of copies to plan. Default: the largest copy floor among
+        /// the staged units (each unit's `min_copies`, or the sum of its
+        /// `copies_at` targets when that is larger), which the plan names
+        #[arg(long)]
+        copies: Option<i64>,
         /// Estimate against this media generation rather than the drive's
         /// own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6
-        /// drive. No cartridge need be loaded; this is an estimate, and the
+        /// drive. No cartridge need be loaded, and with no drive configured
+        /// the estimate takes a drive's defaults (the 97% fill ceiling, the
+        /// 50M end-of-tape reserve); this is an estimate, and the
         /// authoritative figure is each volume's own `capacity_bytes` once
         /// `volume init` has detected the medium it is actually on.
         #[arg(long)]
@@ -3078,7 +3088,13 @@ pub fn run(
             fill_ceiling,
             policy_aware,
         } => {
-            let config = &config.with_fill_ceiling(*fill_ceiling);
+            // ADR-0012 item 214: a plan needs no drive. With none configured,
+            // `--generation` stands in for one, and `--fill-ceiling` reaches
+            // it too; the drive is resolved by its configuration alone below
+            // and never opened.
+            let config =
+                &crate::config::planning_config(config, generation.as_deref(), device.as_deref())
+                    .with_fill_ceiling(*fill_ceiling);
             // Show what staged data would be written
             let plan_rows = staged_plan_rows(conn, config, *policy_aware)?;
             let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = plan_rows
@@ -3086,6 +3102,10 @@ pub fn run(
                 .map(|r| (r.unit.clone(), r.version, r.slices, r.size))
                 .collect();
             let finding = |i: usize| plan_rows[i].finding.as_deref();
+            // ADR-0012 item 220 (OQ26): by default, the copies the staged
+            // units' policy asks for, not one.
+            let planned = plan_copies(conn, config, &plan_rows, *copies)?;
+            let copies = planned.copies;
 
             let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
             let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
@@ -3109,6 +3129,26 @@ pub fn run(
                 )?)
             };
 
+            // The drive the tape estimate is made with (ADR-0012 item 214),
+            // resolved before anything is printed so that a plan never prints
+            // and then fails: `None` when there is neither a drive configured
+            // nor `--generation`, and the plan is shown without an estimate.
+            // A `--device` that names no configured drive, or several drives
+            // and no `--device`, is the operator's to fix: an error.
+            let estimate_with = if json_output || rows.is_empty() {
+                None
+            } else {
+                match crate::config::resolve_planning_backend(config, device.as_deref()) {
+                    Ok(backend) => Some(Ok(backend)),
+                    Err(TapectlError::Config(why))
+                        if device.is_none() && config.backends.lto.is_empty() =>
+                    {
+                        Some(Err(why))
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
             // Issue #271: `--json` must be checked BEFORE the `is_empty`
             // branch, not after it -- the empty case used to fall into a
             // plain `println!("no staged data to plan")` regardless of
@@ -3128,7 +3168,13 @@ pub fn run(
                 println!(
                     "{}",
                     serde_json::json!({
-                        "copies": copies, "total_slices": total_slices,
+                        "copies": copies,
+                        // ADR-0012 item 220, additive: where `copies` came
+                        // from, "--copies" or "copy floor", and the unit whose
+                        // floor it is (null unless "copy floor").
+                        "copies_from": planned.from(),
+                        "copy_floor_unit": planned.floor_of,
+                        "total_slices": total_slices,
                         "total_bytes": total_bytes, "units": units,
                         "policy_aware": policy_aware,
                         // #418 R4: an estimate, see `planned_index_bytes`.
@@ -3141,7 +3187,7 @@ pub fn run(
             } else if rows.is_empty() {
                 println!("no staged data to plan");
             } else {
-                println!("volume write plan ({copies} copy/copies):");
+                println!("volume write plan ({}):", planned.describe());
                 for (i, (name, ver, slices, size)) in rows.iter().enumerate() {
                     println!(
                         "  {name} v{ver}: {} slices, {}{}",
@@ -3158,26 +3204,37 @@ pub fn run(
                 // Estimate tapes needed from the configured LTO backend.
                 // ADR-0010: the figure follows the GENERATION being
                 // planned for (`--generation`, else the drive's own), not a
-                // capacity declared on the drive.
-                let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
-                let tape_cap = backend.planning_capacity_bytes(generation.as_deref())? as i64;
-                let factor = backend.fill_ceiling;
-                let usable = backend.fill_budget_bytes(tape_cap as u64) as i64;
-                let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
-                println!(
-                    "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
-                    (factor * 100.0).round() as i64
-                );
-                // ADR-0012 item 113: only when the drive declares
-                // `post_warning_bytes`; every line above is unchanged.
-                let tape = backend.planning_tape_budget(generation.as_deref())?;
-                let mut in_write_order: Vec<(String, i64, u64)> = rows
-                    .iter()
-                    .map(|(name, ver, _, size)| (name.clone(), *ver, size.unwrap_or(0) as u64))
-                    .collect();
-                in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-                for line in plan_bound_lines(&tape, &in_write_order) {
-                    println!("{line}");
+                // capacity declared on the drive. ADR-0012 item 214: the
+                // drive by its configuration alone, never opened; with
+                // neither a drive nor `--generation` there is no figure to
+                // estimate with, and the plan above stands without one.
+                match estimate_with {
+                    None => {}
+                    Some(Err(why)) => println!("estimated tapes: not estimated: {why}"),
+                    Some(Ok(backend)) => {
+                        let tape_cap =
+                            backend.planning_capacity_bytes(generation.as_deref())? as i64;
+                        let factor = backend.fill_ceiling;
+                        let usable = backend.fill_budget_bytes(tape_cap as u64) as i64;
+                        let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
+                        println!(
+                            "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
+                            (factor * 100.0).round() as i64
+                        );
+                        // ADR-0012 item 113: only when the drive declares
+                        // `post_warning_bytes`; every line above is unchanged.
+                        let tape = backend.planning_tape_budget(generation.as_deref())?;
+                        let mut in_write_order: Vec<(String, i64, u64)> = rows
+                            .iter()
+                            .map(|(name, ver, _, size)| {
+                                (name.clone(), *ver, size.unwrap_or(0) as u64)
+                            })
+                            .collect();
+                        in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                        for line in plan_bound_lines(&tape, &in_write_order) {
+                            println!("{line}");
+                        }
+                    }
                 }
                 if let Some(span) = &span {
                     for line in plan_span_lines(span) {
@@ -5177,6 +5234,98 @@ struct PlanRow {
     finding: Option<String>,
 }
 
+/// How many copies `volume plan` plans, and why (ADR-0012 item 220, OQ26).
+struct PlanCopies {
+    copies: i64,
+    /// `--copies` was given, and is the number.
+    given: bool,
+    /// The staged unit whose copy floor is the number, the largest among
+    /// them; `None` when `--copies` was given, or nothing is staged.
+    floor_of: Option<String>,
+}
+
+impl PlanCopies {
+    /// `copies_from` in `--json`.
+    fn from(&self) -> &'static str {
+        if self.given {
+            "--copies"
+        } else {
+            "copy floor"
+        }
+    }
+
+    /// The plan's heading, inside its parentheses: the number and what it
+    /// is.
+    fn describe(&self) -> String {
+        let n = crate::render::plural(self.copies, "copy", "copies");
+        match (&self.floor_of, self.given) {
+            (_, true) => format!("{n}, as --copies asks"),
+            (Some(unit), false) => format!(
+                "{n}: the copy floor of {unit}, the largest among the staged units; --copies \
+                 plans another number"
+            ),
+            (None, false) => format!(
+                "{n}: no staged unit's copy floor could be read (its policy does not resolve); \
+                 --copies plans another number"
+            ),
+        }
+    }
+}
+
+/// `volume plan`'s copies (ADR-0012 item 220, OQ26): `--copies` when given,
+/// else the largest copy floor among the units of `rows` (the staged sets it
+/// plans), through the one copy-floor rule (`coverage::copy_floor` of the
+/// resolved policy's `copy_floor_base`, as `stage clean` retains by). A unit
+/// whose policy does not resolve has no floor to give and is passed over
+/// (`--policy-aware` names it); ties go to the unit listed first. With
+/// nothing staged there is nothing to plan, and the number is 1.
+fn plan_copies(
+    conn: &Connection,
+    config: &Config,
+    rows: &[PlanRow],
+    given: Option<i64>,
+) -> Result<PlanCopies> {
+    if let Some(copies) = given {
+        return Ok(PlanCopies {
+            copies,
+            given: true,
+            floor_of: None,
+        });
+    }
+    let mut largest: Option<(i64, &str)> = None;
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        if !seen.insert(row.unit.as_str()) {
+            continue;
+        }
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, &row.unit)? else {
+            continue;
+        };
+        let resolved = match crate::policy::resolve(conn, config, &unit) {
+            Ok(resolved) => resolved,
+            Err(TapectlError::PolicyUnresolvable { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let floor =
+            crate::policy::coverage::copy_floor(config, resolved.copy_floor_base(), &unit.status);
+        if largest.is_none_or(|(most, _)| floor > most) {
+            largest = Some((floor, row.unit.as_str()));
+        }
+    }
+    Ok(match largest {
+        Some((copies, unit)) => PlanCopies {
+            copies,
+            given: false,
+            floor_of: Some(unit.to_string()),
+        },
+        None => PlanCopies {
+            copies: 1,
+            given: false,
+            floor_of: None,
+        },
+    })
+}
+
 /// `volume plan`'s rows: every `'staged'` stage set, largest first. With
 /// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144), the rows whose
 /// unit falls short of its policy on the audit's own terms
@@ -5225,7 +5374,8 @@ fn planned_index_bytes(
     let generation = generation
         .map(str::to_string)
         .or_else(|| {
-            crate::config::resolve_lto_backend(config, device)
+            // By configuration alone (ADR-0012 item 214): nothing is opened.
+            crate::config::resolve_planning_backend(config, device)
                 .ok()
                 .map(|b| b.generation.clone())
         })
@@ -5344,15 +5494,17 @@ fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64
 /// The plan order `volume plan` shows when a staged unit may span (#478,
 /// `layout-session.md` "The plan order"), against the planned generation's
 /// tape budget: `None` when no staged set may span (the output is then
-/// 1.6.0's) or no drive is configured to plan against; `Err` carries the
-/// refusal a write of the batch would raise from the catalog.
+/// 1.6.0's) or there is neither a drive configured nor `--generation` to
+/// plan against; `Err` carries the refusal a write of the batch would raise
+/// from the catalog. The drive is resolved by its configuration alone and
+/// never opened (ADR-0012 item 214).
 fn plan_span_preview(
     conn: &Connection,
     config: &Config,
     generation: Option<&str>,
     device: Option<&str>,
 ) -> Option<std::result::Result<write::PlanPreview, String>> {
-    let backend = crate::config::resolve_lto_backend(config, device).ok()?;
+    let backend = crate::config::resolve_planning_backend(config, device).ok()?;
     let tape = backend.planning_tape_budget(generation).ok()?;
     match write::plan_preview(
         conn,

@@ -629,3 +629,186 @@ fn with_no_collection_each_command_prints_an_empty_list() {
         );
     }
 }
+
+/// Seeds one staged version of `unit` (a catalog row and no slice file),
+/// as `stage create` leaves one: `volume plan` reads only the catalog.
+fn seed_staged(home: &Path, unit: &str, bytes: i64) {
+    let conn = tapectl::db::open(&home.join(".tapectl/tapectl.db")).unwrap();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             SELECT id, 1, 'current', current_path, 1, ?2 FROM units WHERE name = ?1",
+        rusqlite::params![unit, bytes],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices, total_encrypted_size)
+             SELECT s.id, 'staged', 524288, 1, ?2 FROM snapshots s
+             JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+        rusqlite::params![unit, bytes],
+    )
+    .unwrap();
+}
+
+/// ADR-0012 item 214: planning needs no drive. A drive that is not
+/// attached (its `device_tape` does not exist, so no `device_sg` can be
+/// derived and a write refuses it) plans `volume plan` and `collection
+/// plan` alike, by its device or as the only one, and nothing of it is
+/// opened; with no drive at all `--generation` plans, and without it
+/// `collection plan` names both ways on while `volume plan` shows the plan
+/// with no estimate rather than printing it and failing.
+#[test]
+fn plans_need_no_drive_and_never_open_one() {
+    // alpha staged (for `volume plan`), bravo never archived (a batch).
+    let (home, _root, canonical) = home_and_root(&["alpha", "bravo"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(h, &["collection", "sync"], 0);
+    seed_staged(h, "photos/alpha", 4096);
+
+    // No drive at all.
+    let out = exits(h, &["collection", "plan"], 2);
+    let text = shown(&out);
+    assert!(text.contains("--generation"), "{text}");
+    assert!(text.contains("tapectl drive add"), "{text}");
+    assert!(text.contains(".tapectl/config.toml"), "{text}");
+    let out = exits(h, &["collection", "plan", "--generation", "LTO-6"], 0);
+    assert!(stdout(&out).contains("batch 0"), "{}", shown(&out));
+    let out = exits(h, &["volume", "plan"], 0);
+    assert!(
+        stdout(&out).contains("estimated tapes: not estimated: no drive is configured"),
+        "{}",
+        shown(&out)
+    );
+    let out = exits(h, &["volume", "plan", "--generation", "LTO-6"], 0);
+    assert!(
+        stdout(&out).contains("estimated tapes: 1 (at the 97% fill ceiling)"),
+        "{}",
+        shown(&out)
+    );
+
+    // A drive that is not attached: its path does not exist.
+    let nst = h.join("no-such-nst").display().to_string();
+    let cfg = h.join(".tapectl/config.toml");
+    let text = config_text(h);
+    std::fs::write(
+        &cfg,
+        format!(
+            "{text}\n[[backends.lto]]\nname = \"lto6\"\ndevice_tape = \"{nst}\"\n\
+             generation = \"LTO-6\"\n"
+        ),
+    )
+    .unwrap();
+    for device in [None, Some(nst.as_str())] {
+        let with = |args: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            if let Some(d) = device {
+                v.extend(["--device".to_string(), d.to_string()]);
+            }
+            v
+        };
+        let args = with(&["collection", "plan"]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = exits(h, &args, 0);
+        assert!(
+            stdout(&out).contains("batch 0"),
+            "{device:?}: {}",
+            shown(&out)
+        );
+        let args = with(&["volume", "plan"]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = exits(h, &args, 0);
+        assert!(
+            stdout(&out).contains("estimated tapes: 1 (at the 97% fill ceiling)"),
+            "{device:?}: {}",
+            shown(&out)
+        );
+    }
+    assert!(
+        !h.join("no-such-nst").exists(),
+        "nothing created the device"
+    );
+}
+
+/// ADR-0012 item 220 (OQ26): `volume plan` plans, by default, the largest
+/// copy floor among the staged units it plans, and says whose; `--copies`
+/// still sets the number, and says so.
+#[test]
+fn volume_plan_plans_the_largest_copy_floor_by_default() {
+    let (home, root, canonical) = home_and_root(&["alpha", "bravo"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(h, &["collection", "sync"], 0);
+    exits(h, &["location", "add", "vault"], 0);
+    seed_staged(h, "photos/alpha", 4096);
+    seed_staged(h, "photos/bravo", 2048);
+    let args = ["--json", "volume", "plan", "--generation", "LTO-6"];
+
+    // Both at `[defaults] min_copies`, 2.
+    let plan = json(&exits(h, &args, 0));
+    assert_eq!(plan["copies"], 2, "{plan}");
+    assert_eq!(plan["copies_from"], "copy floor", "{plan}");
+
+    // bravo's policy asks three copies at the vault: its floor is 3, the
+    // largest, though alpha is listed first (it is larger).
+    let dotfile = root.path().join("bravo/.tapectl-unit.toml");
+    let mut d = tapectl::unit::dotfile::read_dotfile(&dotfile).unwrap();
+    d.copies_at = Some([("vault".to_string(), 3)].into_iter().collect());
+    tapectl::unit::dotfile::write_dotfile(&dotfile, &d).unwrap();
+    let plan = json(&exits(h, &args, 0));
+    assert_eq!(plan["copies"], 3, "{plan}");
+    assert_eq!(plan["copy_floor_unit"], "photos/bravo", "{plan}");
+    let out = exits(h, &["volume", "plan", "--generation", "LTO-6"], 0);
+    assert!(
+        stdout(&out).contains(
+            "volume write plan (3 copies: the copy floor of photos/bravo, the largest among \
+             the staged units; --copies plans another number):"
+        ),
+        "{}",
+        shown(&out)
+    );
+
+    let plan = json(&exits(
+        h,
+        &[
+            "--json",
+            "volume",
+            "plan",
+            "--copies",
+            "5",
+            "--generation",
+            "LTO-6",
+        ],
+        0,
+    ));
+    assert_eq!(plan["copies"], 5, "{plan}");
+    assert_eq!(plan["copies_from"], "--copies", "{plan}");
+    assert_eq!(plan["copy_floor_unit"], serde_json::Value::Null, "{plan}");
+    let out = exits(h, &["volume", "plan", "--copies", "1"], 0);
+    assert!(
+        stdout(&out).contains("volume write plan (1 copy, as --copies asks):"),
+        "{}",
+        shown(&out)
+    );
+}

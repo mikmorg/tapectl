@@ -136,9 +136,15 @@ pub enum CollectionCommands {
     /// The units already staged and still owed a copy are listed after the
     /// batches, with the command that writes them.
     ///
+    /// A plan needs no drive: it is sized for `--generation`, or the
+    /// configured drive's own generation, and never opens or probes the
+    /// drive, which need not be attached. `volume init` decides each
+    /// cartridge's real capacity, and `collection run` packs against it.
+    ///
     /// Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a
-    /// collection's root, tenant or archive set, or no drive to plan
-    /// against). Every collection is planned whatever another's problems.
+    /// collection's root, tenant or archive set, or neither a drive
+    /// configured nor `--generation` given). Every collection is planned
+    /// whatever another's problems.
     Plan {
         /// Copies to plan for — informational only (batches don't change;
         /// this scales the printed cartridge-count estimate).
@@ -146,7 +152,9 @@ pub enum CollectionCommands {
         copies: i64,
         /// Plan against this media generation rather than the drive's own
         /// (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6
-        /// drive will write. No cartridge need be loaded.
+        /// drive will write. No cartridge need be loaded, and with no drive
+        /// configured the plan takes a drive's defaults (the 97% fill
+        /// ceiling, the 50M end-of-tape reserve).
         #[arg(long)]
         generation: Option<String>,
         /// Which configured drive to plan against, by its device path. Only
@@ -342,7 +350,10 @@ pub fn run(
             policy_aware,
         } => cmd_plan(
             conn,
-            &config.with_fill_ceiling(*fill_ceiling),
+            // ADR-0012 item 214: with no drive configured, `--generation`
+            // stands in for one; the fill ceiling flag reaches it too.
+            &crate::config::planning_config(config, generation.as_deref(), device.as_deref())
+                .with_fill_ceiling(*fill_ceiling),
             *copies,
             generation.as_deref(),
             device.as_deref(),
@@ -1163,7 +1174,9 @@ fn cmd_plan(
     }
     // No drive to plan against is no collection's problem: refused here,
     // before any collection is read, as each plan below would refuse it.
-    crate::config::resolve_lto_backend(config, device)?;
+    // By configuration alone (ADR-0012 item 214): a plan opens no device and
+    // asks nothing of one, so a drive that is not attached plans as well.
+    crate::config::resolve_planning_backend(config, device)?;
 
     let owing = owing_units(conn, config)?;
     let mut rows = Vec::new();

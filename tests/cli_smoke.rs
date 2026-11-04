@@ -896,7 +896,9 @@ fn volume_plan_json_parses_with_nothing_staged() {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("volume plan --json stdout did not parse as whole JSON: {e}\n{stdout}")
     });
+    // Nothing staged: no copy floor to take, and nothing to plan.
     assert_eq!(parsed["copies"], serde_json::json!(1));
+    assert_eq!(parsed["copy_floor_unit"], serde_json::Value::Null);
     assert_eq!(parsed["total_slices"], serde_json::json!(0));
     assert_eq!(parsed["total_bytes"], serde_json::json!(0));
     assert_eq!(parsed["units"], serde_json::json!([]));
@@ -979,7 +981,11 @@ fn volume_plan_json_parses_with_one_staged_unit() {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("volume plan --json stdout did not parse as whole JSON: {e}\n{stdout}")
     });
-    assert_eq!(parsed["copies"], serde_json::json!(1));
+    // ADR-0012 item 220 (OQ26): the staged unit's copy floor, the default
+    // `min_copies`, not one copy.
+    assert_eq!(parsed["copies"], serde_json::json!(2));
+    assert_eq!(parsed["copies_from"], "copy floor");
+    assert_eq!(parsed["copy_floor_unit"], "photos");
     assert_eq!(parsed["total_slices"], serde_json::json!(1));
     assert_eq!(parsed["total_bytes"], serde_json::json!(32));
     let units = parsed["units"].as_array().expect("units must be an array");

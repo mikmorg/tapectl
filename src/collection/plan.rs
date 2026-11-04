@@ -494,8 +494,9 @@ pub fn plan_for_collection(
     // (ADR-0010) — sizing batches for LTO-5 stock in an LTO-6 drive, say.
     // `None` means the drive's native generation.
     media: Option<&str>,
-    // `--device`: WHICH drive to plan against. Resolved strictly, like every
-    // other write-adjacent command (ADR-0010, "Backends resolve by device").
+    // `--device`: WHICH drive to plan against, matched as a write matches it
+    // (ADR-0010, "Backends resolve by device") but by configuration alone
+    // ([`crate::config::resolve_planning_backend`], ADR-0012 item 214).
     // Before it existed this passed `None` unconditionally, so planning
     // errored outright the moment a second drive was configured rather than
     // asking which one was meant.
@@ -520,7 +521,10 @@ pub fn plan_for_collection_with_budget(
     device: Option<&str>,
     policy_aware: bool,
 ) -> Result<(Packed, TapeBudget)> {
-    let backend = crate::config::resolve_lto_backend(config, device)?;
+    // ADR-0012 item 214: a plan needs no drive, so the drive is resolved from
+    // its configuration alone, never asked anything (no sg pairing, nothing
+    // opened); `volume init` decides the cartridge's real capacity.
+    let backend = crate::config::resolve_planning_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
@@ -1085,6 +1089,20 @@ mod tests {
             batches[0].unit_names(),
             vec!["testlib/alpha", "testlib/beta"]
         );
+
+        // ADR-0012 item 214: a plan needs no drive. A drive that is not
+        // attached (its `device_tape` does not exist, its `device_sg` could
+        // not be derived, which a write refuses) still plans, by its device
+        // or as the only one; nothing of it is asked or opened.
+        let mut detached = config_with_tiny_backend();
+        detached.backends.lto[0].device_tape = "/nonexistent/tapectl-plan/nst".into();
+        detached.backends.lto[0].device_sg = String::new();
+        assert!(crate::config::resolve_lto_backend(&detached, None).is_err());
+        for device in [None, Some("/nonexistent/tapectl-plan/nst")] {
+            let (batches, _) =
+                plan_for_collection(&conn, &detached, &lib, None, device, false).unwrap();
+            assert_eq!(batches.len(), 1, "{device:?}");
+        }
     }
 
     /// Issue #144 (ADR-0012 2026-10-07 item 26): `--policy-aware` packs the

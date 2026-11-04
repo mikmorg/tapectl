@@ -2577,6 +2577,63 @@ fn resolve_lto_backend_unchecked<'a>(
     }
 }
 
+/// The name of the drive [`planning_config`] stands in when none is
+/// configured: never a drive's name, since a drive is named by `drive add`.
+pub const PLANNING_STAND_IN: &str = "(no drive: --generation)";
+
+/// `config` as a PLAN reads it (`volume plan`, `collection plan`; ADR-0012
+/// item 214: planning needs no drive). Unchanged when a drive is configured
+/// or `device` names one. With none configured and `generation` given
+/// (`--generation`), a stand-in drive of that generation is added, with the
+/// defaults a drive's table takes when it leaves them out (the 97% fill
+/// ceiling, the 50M end-of-tape reserve, no `capacity_override`, no
+/// `post_warning_bytes`): a generation is all a plan needs of a drive.
+/// Apply `--fill-ceiling` after this ([`Config::with_fill_ceiling`]) so the
+/// flag reaches the stand-in too. Never hand the result to anything but a
+/// plan: the stand-in has no device.
+pub fn planning_config(config: &Config, generation: Option<&str>, device: Option<&str>) -> Config {
+    let mut planning = config.clone();
+    if let (Some(generation), None, true) = (generation, device, config.backends.lto.is_empty()) {
+        planning.backends.lto.push(LtoBackendConfig {
+            name: PLANNING_STAND_IN.to_string(),
+            device_tape: String::new(),
+            device_sg: String::new(),
+            generation: generation.to_string(),
+            capacity_override: None,
+            fill_ceiling: DEFAULT_FILL_CEILING,
+            enospc_buffer: default_enospc_buffer(),
+            post_warning_bytes: None,
+        });
+    }
+    planning
+}
+
+/// Resolve the drive a PLAN sizes against (`volume plan`, `collection
+/// plan`; ADR-0012 item 214) from the configuration alone. A plan writes
+/// nothing and its drive need not be attached, so unlike
+/// [`resolve_lto_backend`] this asks nothing of the device: no sg pairing
+/// (no sysfs read), no chip, nothing opened, and a `device_tape` that does
+/// not exist resolves by its name. Two `[[backends.lto]]` entries naming one
+/// drive are not refused either: a plan is an estimate, and `config check`
+/// names the collision. `device` picks a configured drive as a write's does
+/// ([`device_matches`]); without it, the only one. No drive at all is an
+/// error naming `--generation` and `drive add`; give `config` through
+/// [`planning_config`] so that `--generation` stands in for one.
+pub fn resolve_planning_backend<'a>(
+    config: &'a Config,
+    device: Option<&str>,
+) -> Result<&'a LtoBackendConfig> {
+    if device.is_none() && config.backends.lto.is_empty() {
+        return Err(TapectlError::Config(format!(
+            "no drive is configured in {} to plan against: plan for a generation with \
+             --generation (LTO-6, say), or add the drive with `tapectl drive add --name lto6 \
+             --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`",
+            config_file_named(config.source_file.as_deref())
+        )));
+    }
+    resolve_lto_backend_unchecked(config, device)
+}
+
 /// Resolve a device path (and, if known, its backend) for a READ path
 /// (`volume identify`, `verify`, `read-slices`, `catalog rebuild`,
 /// `restore`) — LENIENT (ADR-0010): these must stay usable on a rebuilt
@@ -4092,6 +4149,71 @@ mod tests {
             assert!(msg.contains("cannot be derived"), "{msg}");
             assert!(msg.contains("Set device_sg"), "{msg}");
         }
+    }
+
+    /// ADR-0012 item 214: a plan resolves the drive the write path refuses
+    /// above — undeclared, underivable `device_sg`, a `device_tape` that does
+    /// not exist — by its configuration alone, and plans its generation.
+    #[test]
+    fn a_plan_resolves_a_drive_the_write_path_refuses() {
+        let config = Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        assert!(
+            resolve_lto_backend(&config, None).is_err(),
+            "the write refuses"
+        );
+        for device in [None, Some("/nonexistent/tapectl-sg-config/nst-fake-7")] {
+            let b = resolve_planning_backend(&config, device).unwrap();
+            assert_eq!(b.name, "lto1", "{device:?}");
+            assert_eq!(
+                b.planning_capacity_bytes(None).unwrap(),
+                2_500_000_000_000,
+                "the drive's own generation, LTO-6"
+            );
+        }
+        // A device no drive is configured at is still an error naming them.
+        let msg = resolve_planning_backend(&config, Some("/dev/other"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("nst-fake-7"), "{msg}");
+    }
+
+    /// With no drive configured, `--generation` stands in for one (its
+    /// defaults, the flag's fill ceiling); without it the error names both
+    /// ways on and the real config file.
+    #[test]
+    fn with_no_drive_a_plan_takes_the_generation_or_names_both_ways_on() {
+        let config = Config::from_text("", Path::new("/srv/home/config.toml")).unwrap();
+        let msg = resolve_planning_backend(&planning_config(&config, None, None), None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("/srv/home/config.toml"), "{msg}");
+        assert!(msg.contains("--generation"), "{msg}");
+        assert!(msg.contains("tapectl drive add"), "{msg}");
+
+        let planning = planning_config(&config, Some("LTO-5"), None).with_fill_ceiling(Some(0.9));
+        let b = resolve_planning_backend(&planning, None).unwrap();
+        assert_eq!(b.name, PLANNING_STAND_IN);
+        let tape = b.planning_tape_budget(Some("LTO-5")).unwrap();
+        assert_eq!(tape.capacity_bytes, 1_500_000_000_000);
+        assert_eq!(
+            tape.fill_ceiling, 0.9,
+            "--fill-ceiling reaches the stand-in"
+        );
+        assert_eq!(tape.plan_bound_bytes, None, "no post_warning_bytes");
+        // A configured drive is never replaced, and a --device that names
+        // none gets no stand-in.
+        let with = Config::from_text(&backend_toml(Some("/dev/sg5")), Path::new("c.toml")).unwrap();
+        assert_eq!(
+            planning_config(&with, Some("LTO-5"), None)
+                .backends
+                .lto
+                .len(),
+            1
+        );
+        assert!(planning_config(&config, Some("LTO-5"), Some("/dev/x"))
+            .backends
+            .lto
+            .is_empty());
     }
 
     /// The same config with a declared node resolves — the positive control
