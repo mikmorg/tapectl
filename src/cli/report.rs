@@ -3476,10 +3476,13 @@ fn report_age(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(name, ver, status, created)| {
-            serde_json::json!({"unit": name, "version": ver, "status": status,
+        let json: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, ver, status, created)| {
+                serde_json::json!({"unit": name, "version": ver, "status": status,
                                "created_at": crate::render::json_time(created)})
-        }).collect();
+            })
+            .collect();
         crate::render::print_json(&serde_json::Value::Array(json));
     } else if rows.is_empty() {
         println!("no current snapshots");
@@ -5100,7 +5103,10 @@ mod tests {
             .map(|r| r["state"].as_str().unwrap())
             .collect();
         assert!(!states.contains(&"new"), "{json}");
-        assert!(states.contains(&"clean") || states.contains(&"dirty"), "{json}");
+        assert!(
+            states.contains(&"clean") || states.contains(&"dirty"),
+            "{json}"
+        );
     }
 
     /// ADR-0012 item 212: a `--volume` naming no volume is an error (exit 2,
@@ -8004,8 +8010,7 @@ Read error counter page  [0x3]
                          lost unknown",
                         ids[2]
                     ),
-                    "total: 3.5 hours lost, not counting 1 stage with no end recorded"
-                        .to_string(),
+                    "total: 3.5 hours lost, not counting 1 stage with no end recorded".to_string(),
                 ]
             );
 

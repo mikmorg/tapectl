@@ -479,7 +479,11 @@ pub fn clean(
             println!(
                 "  stage set {id} kept: a live session is using it on {} {} \
                  (`--force` does not apply; run this again once it has finished)",
-                if labels.len() == 1 { "volume" } else { "volumes" },
+                if labels.len() == 1 {
+                    "volume"
+                } else {
+                    "volumes"
+                },
                 labels.join(", ")
             );
         }

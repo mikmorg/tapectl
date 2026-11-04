@@ -2521,11 +2521,7 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                     },
                     slice_runs(&span.missing),
                     span.slices,
-                    if span.missing.len() == 1 {
-                        "is"
-                    } else {
-                        "are"
-                    },
+                    if span.missing.len() == 1 { "is" } else { "are" },
                 ),
                 // The next write plans the slices the span still owes first
                 // (layout-session.md, "The plan order").
@@ -4857,7 +4853,8 @@ mod tests {
             assert_eq!(f.len(), 1, "{f:?}");
             assert_eq!(f[0].check, "escrow_identity_mismatch");
             assert!(
-                f[0].message.contains("2 stage sets the current escrow key cannot open all name"),
+                f[0].message
+                    .contains("2 stage sets the current escrow key cannot open all name"),
                 "{}",
                 f[0].message
             );
@@ -4904,7 +4901,8 @@ mod tests {
             let f = findings(&conn, "age1new");
             assert_eq!(f.len(), 1, "{f:?}");
             assert!(
-                f[0].message.contains("1 stage set the current escrow key cannot open names"),
+                f[0].message
+                    .contains("1 stage set the current escrow key cannot open names"),
                 "{}",
                 f[0].message
             );

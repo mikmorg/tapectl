@@ -144,7 +144,9 @@ fn snapshot_rows_to_json(rows: &[SnapshotRow]) -> serde_json::Value {
 /// (binary: a data size), times in UTC.
 fn snapshot_table(rows: &[SnapshotRow], width: Option<usize>) -> String {
     crate::render::table_with(
-        &["id", "unit", "version", "status", "files", "size", "created"],
+        &[
+            "id", "unit", "version", "status", "files", "size", "created",
+        ],
         rows.iter()
             .map(|r| {
                 vec![
@@ -282,7 +284,9 @@ fn end_of_run(
             crate::render::plural(failed.len() as i64, "unit", "units")
         )
     };
-    Some(TapectlError::Other(format!("{head}{failures}{snapshotted}")))
+    Some(TapectlError::Other(format!(
+        "{head}{failures}{snapshotted}"
+    )))
 }
 
 pub fn run(
@@ -523,10 +527,7 @@ pub fn run(
             } else if rows.is_empty() {
                 println!("no snapshots found");
             } else {
-                println!(
-                    "{}",
-                    snapshot_table(&rows, crate::render::terminal_width())
-                );
+                println!("{}", snapshot_table(&rows, crate::render::terminal_width()));
             }
         }
     }

@@ -2880,8 +2880,7 @@ compression = "bogus"
             "{msg}"
         );
         assert!(
-            msg.contains("1 pending unit fits an empty tape")
-                && msg.contains("\"testlib/alpha\""),
+            msg.contains("1 pending unit fits an empty tape") && msg.contains("\"testlib/alpha\""),
             "{msg}"
         );
     }

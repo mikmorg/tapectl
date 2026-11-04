@@ -2572,7 +2572,9 @@ fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
     );
     assert_one_document_or_none(&out.stdout);
     assert!(
-        !String::from_utf8_lossy(&out.stdout).trim_start().starts_with('['),
+        !String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('['),
         "no list on stdout for a failed stage"
     );
 }
@@ -3261,7 +3263,10 @@ fn assert_one_document_or_none(stdout: &[u8]) {
             String::from_utf8_lossy(stdout)
         )
     });
-    assert!(v.get("error").is_some(), "a failure's one document is the error: {v}");
+    assert!(
+        v.get("error").is_some(),
+        "a failure's one document is the error: {v}"
+    );
 }
 
 /// ADR-0012 item 210 (OQ21): `key list` without `--tenant` lists every
@@ -3462,7 +3467,11 @@ fn source_and_report_tables_and_json_keys_after_the_output_sweep() {
         all.extend_from_slice(args);
         serde_json::from_str(&ok(&all)).unwrap_or_else(|e| panic!("{args:?}: one JSON ({e})"))
     };
-    let words = |line: &str| line.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+    let words = |line: &str| {
+        line.split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
     let borderless = |t: &str| !t.contains('|') && !t.contains('+') && !t.contains("--");
     ok(&["init"]);
     ok(&["tenant", "add", "acme"]);

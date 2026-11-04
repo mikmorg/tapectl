@@ -56,7 +56,9 @@ pub fn snapshot_purge(
     tx.commit()?;
 
     if json_output {
-        crate::render::print_json(&serde_json::json!({"unit": unit_name, "version": version, "status": "purged"}));
+        crate::render::print_json(
+            &serde_json::json!({"unit": unit_name, "version": version, "status": "purged"}),
+        );
     } else {
         println!("snapshot {unit_name} v{version} purged");
     }
@@ -498,7 +500,12 @@ pub fn volume_retire(
     // `force`, so `assume_yes` is not even in scope for this decision.
     if let Err(e) = refuse_last_eligible_copy(conn, &action, label, &impacts) {
         if json_output {
-            crate::render::print_json(&retire_refusal_json(label, &impacts, &at_risk, &e.to_string()));
+            crate::render::print_json(&retire_refusal_json(
+                label,
+                &impacts,
+                &at_risk,
+                &e.to_string(),
+            ));
         } else {
             // Impact analysis only -- it already carries the per-version
             // "REFUSED" line. The floor's own text is long, and `main`'s
@@ -557,7 +564,9 @@ pub fn volume_retire(
     }
 
     if json_output {
-        crate::render::print_json(&serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)}));
+        crate::render::print_json(
+            &serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)}),
+        );
     } else {
         print_retire_impact(label, &status, &condition, &impacts, &at_risk);
     }
@@ -1206,7 +1215,11 @@ pub(crate) fn below_policy_facts(
                      (policy requires {requires})",
                     impact.unit_name,
                     version.version,
-                    if missing.len() == 1 { "location" } else { "locations" },
+                    if missing.len() == 1 {
+                        "location"
+                    } else {
+                        "locations"
+                    },
                     missing.join(", ")
                 ));
             }
@@ -1446,8 +1459,8 @@ pub fn cartridge_retire(
     if status == "retired_permanent" {
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode, "status": status, "changed": false,
-                }));
+                "barcode": barcode, "status": status, "changed": false,
+            }));
         } else {
             println!("cartridge \"{barcode}\" is already retired_permanent; nothing to do");
         }
@@ -1524,13 +1537,13 @@ pub fn cartridge_retire(
     if dry_run {
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode,
-                    "status": status,
-                    "volumes_to_retire": volume_labels,
-                    "affected_units": retire_impacts_json(&merged),
-                    "at_risk_units": at_risk,
-                    "dry_run": true,
-                }));
+                "barcode": barcode,
+                "status": status,
+                "volumes_to_retire": volume_labels,
+                "affected_units": retire_impacts_json(&merged),
+                "at_risk_units": at_risk,
+                "dry_run": true,
+            }));
         } else {
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
             println!("\n  DRY RUN — no changes made.");
@@ -1548,13 +1561,13 @@ pub fn cartridge_retire(
             let reason_text = e.to_string();
             if json_output {
                 crate::render::print_json(&serde_json::json!({
-                        "barcode": barcode,
-                        "status": status,
-                        "affected_units": retire_impacts_json(&merged),
-                        "at_risk_units": at_risk,
-                        "consent": "refused",
-                        "reason": reason_text,
-                    }));
+                    "barcode": barcode,
+                    "status": status,
+                    "affected_units": retire_impacts_json(&merged),
+                    "at_risk_units": at_risk,
+                    "consent": "refused",
+                    "reason": reason_text,
+                }));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `volume_retire`.
@@ -1598,13 +1611,13 @@ pub fn cartridge_retire(
         let reason_text = e.to_string();
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode,
-                    "status": status,
-                    "affected_units": retire_impacts_json(&merged),
-                    "at_risk_units": at_risk,
-                    "consent": "refused",
-                    "reason": reason_text,
-                }));
+                "barcode": barcode,
+                "status": status,
+                "affected_units": retire_impacts_json(&merged),
+                "at_risk_units": at_risk,
+                "consent": "refused",
+                "reason": reason_text,
+            }));
         } else {
             // Impact analysis only; see `volume_retire`.
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
@@ -1674,13 +1687,13 @@ pub fn cartridge_retire(
 
     if json_output {
         crate::render::print_json(&serde_json::json!({
-                "barcode": barcode,
-                "status": "retired_permanent",
-                "volumes_retired": volume_labels,
-                "affected_units": retire_impacts_json(&merged),
-                "at_risk_units": at_risk,
-                "changed": true,
-            }));
+            "barcode": barcode,
+            "status": "retired_permanent",
+            "volumes_retired": volume_labels,
+            "affected_units": retire_impacts_json(&merged),
+            "at_risk_units": at_risk,
+            "changed": true,
+        }));
     } else {
         print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
         println!("  Cartridge \"{barcode}\" retired permanently.");
@@ -2038,13 +2051,13 @@ pub fn cartridge_mark_erased(
             let reason = e.to_string();
             if json_output {
                 crate::render::print_json(&serde_json::json!({
-                        "barcode": barcode,
-                        "status": status,
-                        "affected_units": retire_impacts_json(&merged),
-                        "at_risk_units": at_risk,
-                        "consent": "refused",
-                        "reason": reason,
-                    }));
+                    "barcode": barcode,
+                    "status": status,
+                    "affected_units": retire_impacts_json(&merged),
+                    "at_risk_units": at_risk,
+                    "consent": "refused",
+                    "reason": reason,
+                }));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `cartridge_retire`.
@@ -2064,9 +2077,9 @@ pub fn cartridge_mark_erased(
             let reason = e.to_string();
             if json_output {
                 crate::render::print_json(&serde_json::json!({
-                        "barcode": barcode, "status": status,
-                        "consent": "refused", "reason": reason,
-                    }));
+                    "barcode": barcode, "status": status,
+                    "consent": "refused", "reason": reason,
+                }));
             }
             return Err(e);
         }
@@ -2079,8 +2092,8 @@ pub fn cartridge_mark_erased(
 
     if json_output {
         crate::render::print_json(&serde_json::json!({
-                "barcode": barcode, "status": "available", "volumes_erased": volume_labels,
-            }));
+            "barcode": barcode, "status": "available", "volumes_erased": volume_labels,
+        }));
     } else {
         println!("cartridge \"{barcode}\" marked as erased (available for reuse)");
         for label in &volume_labels {
@@ -2489,15 +2502,15 @@ pub fn cartridge_unretire(
     if dry_run {
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode,
-                    "status": status,
-                    "restored_status": restored_cartridge_status,
-                    "cartridge_event_found": cartridge_event_found,
-                    "volumes_restored": volumes_restored,
-                    "volumes_not_restored": volumes_not_restored,
-                    "volumes_quarantine_recovered": volumes_quarantine_recovered,
-                    "dry_run": true,
-                }));
+                "barcode": barcode,
+                "status": status,
+                "restored_status": restored_cartridge_status,
+                "cartridge_event_found": cartridge_event_found,
+                "volumes_restored": volumes_restored,
+                "volumes_not_restored": volumes_not_restored,
+                "volumes_quarantine_recovered": volumes_quarantine_recovered,
+                "dry_run": true,
+            }));
         } else {
             println!("cartridge \"{barcode}\" would be unretired");
             println!("  status: retired_permanent -> {restored_cartridge_status}");
@@ -2594,14 +2607,14 @@ pub fn cartridge_unretire(
 
     if json_output {
         crate::render::print_json(&serde_json::json!({
-                "barcode": barcode,
-                "status": restored_cartridge_status,
-                "cartridge_event_found": cartridge_event_found,
-                "volumes_restored": volumes_restored,
-                "volumes_not_restored": volumes_not_restored,
-                "volumes_quarantine_recovered": volumes_quarantine_recovered,
-                "changed": true,
-            }));
+            "barcode": barcode,
+            "status": restored_cartridge_status,
+            "cartridge_event_found": cartridge_event_found,
+            "volumes_restored": volumes_restored,
+            "volumes_not_restored": volumes_not_restored,
+            "volumes_quarantine_recovered": volumes_quarantine_recovered,
+            "changed": true,
+        }));
     } else {
         println!(
             "cartridge \"{barcode}\" unretired: retired_permanent -> {restored_cartridge_status}"
@@ -2965,14 +2978,14 @@ pub fn unit_mark_tape_only(
             })
         });
         crate::render::print_json(&serde_json::json!({
-                "unit": unit_name,
-                "status": "tape_only",
-                "copies": copy_count,
-                "locations": location_count,
-                "evidence": evidence_json,
-                "evidence_summary": evidence_summary,
-                "thinnest_current_version": thinnest_json,
-            }));
+            "unit": unit_name,
+            "status": "tape_only",
+            "copies": copy_count,
+            "locations": location_count,
+            "evidence": evidence_json,
+            "evidence_summary": evidence_summary,
+            "thinnest_current_version": thinnest_json,
+        }));
     } else {
         println!(
             "unit \"{unit_name}\" marked tape-only ({}, {})",
@@ -3049,9 +3062,9 @@ pub fn export_unit(
         let total: i64 = slices.iter().map(|(_, _, size, _)| size).sum();
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "unit": unit_name, "slices": slices.len(), "total_bytes": total,
-                    "destination": dest_dir, "dry_run": true,
-                }));
+                "unit": unit_name, "slices": slices.len(), "total_bytes": total,
+                "destination": dest_dir, "dry_run": true,
+            }));
         } else {
             println!(
                 "would export {} ({}) from \"{unit_name}\" to {dest_dir} (DRY RUN — \
@@ -3161,7 +3174,9 @@ pub fn export_unit(
     fs::write(Path::new(dest_dir).join("RECOVERY.md"), &recovery)?;
 
     if json_output {
-        crate::render::print_json(&serde_json::json!({"unit": unit_name, "slices": slices.len(), "total_bytes": total, "destination": dest_dir}));
+        crate::render::print_json(
+            &serde_json::json!({"unit": unit_name, "slices": slices.len(), "total_bytes": total, "destination": dest_dir}),
+        );
     } else {
         println!(
             "exported {} ({}) to {}",
@@ -3471,11 +3486,11 @@ pub fn snapshot_delete(
 
     if json_output {
         crate::render::print_json(&serde_json::json!({
-                "unit": unit_name,
-                "version": version,
-                "deleted": true,
-                "warnings": warnings,
-            }));
+            "unit": unit_name,
+            "version": version,
+            "deleted": true,
+            "warnings": warnings,
+        }));
     } else {
         println!("snapshot {unit_name} v{version} deleted (was: {status})");
     }
@@ -3573,7 +3588,9 @@ pub fn snapshot_mark_reclaimable(
     )?;
 
     if json_output {
-        crate::render::print_json(&serde_json::json!({"unit": unit_name, "version": version, "status": "reclaimable"}));
+        crate::render::print_json(
+            &serde_json::json!({"unit": unit_name, "version": version, "status": "reclaimable"}),
+        );
     } else {
         println!("snapshot {unit_name} v{version} marked reclaimable (was: {status})");
     }
@@ -3636,10 +3653,10 @@ pub fn snapshot_diff(
 
     if json_output {
         crate::render::print_json(&serde_json::json!({
-                "unit": unit_name, "v1": v1, "v2": v2,
-                "added": added.len(), "removed": removed.len(),
-                "modified": modified.len(), "unchanged": unchanged,
-            }));
+            "unit": unit_name, "v1": v1, "v2": v2,
+            "added": added.len(), "removed": removed.len(),
+            "modified": modified.len(), "unchanged": unchanged,
+        }));
     } else {
         println!("diff {} v{v1} → v{v2}:", unit_name);
         for (path, size) in &added {
@@ -3833,9 +3850,9 @@ pub fn db_backup(
         let keys_dir = (include_keys && paths.keys_dir.exists()).then_some(&keys_backup);
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "backup": dest, "keys_included": include_keys,
-                    "keys_dir": keys_dir, "dry_run": true,
-                }));
+                "backup": dest, "keys_included": include_keys,
+                "keys_dir": keys_dir, "dry_run": true,
+            }));
         } else if let Some(keys_dir) = keys_dir {
             println!(
                 "would back up database to {dest} and private keys to {}/ (DRY RUN — no \
@@ -3941,8 +3958,8 @@ pub fn db_import(
     if dry_run {
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "source": import_path, "destination": dest_display, "dry_run": true,
-                }));
+                "source": import_path, "destination": dest_display, "dry_run": true,
+            }));
         } else {
             println!(
                 "would import {import_path} over the live database at {dest_display} — no changes made"
@@ -3960,8 +3977,8 @@ pub fn db_import(
         let reason = e.to_string();
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "source": import_path, "consent": "refused", "reason": reason,
-                }));
+                "source": import_path, "consent": "refused", "reason": reason,
+            }));
         }
         return Err(e);
     }
@@ -3971,7 +3988,9 @@ pub fn db_import(
     copy_database_in_one_step(&src_conn, &mut dst_conn)?;
 
     if json_output {
-        crate::render::print_json(&serde_json::json!({"source": import_path, "status": "imported"}));
+        crate::render::print_json(
+            &serde_json::json!({"source": import_path, "status": "imported"}),
+        );
     } else {
         println!("database imported from {import_path}");
     }
@@ -4414,9 +4433,9 @@ pub fn volume_import(
     if dry_run {
         if json_output {
             crate::render::print_json(&serde_json::json!({
-                    "label": label, "generation": canonical_generation,
-                    "capacity_bytes": cap_bytes, "dry_run": true,
-                }));
+                "label": label, "generation": canonical_generation,
+                "capacity_bytes": cap_bytes, "dry_run": true,
+            }));
         } else {
             println!(
                 "would import volume \"{label}\" ({canonical_generation}, {capacity_display}) \
@@ -4440,7 +4459,9 @@ pub fn volume_import(
     let vol_id = conn.last_insert_rowid();
     crate::db::events::log_created(conn, "volume", vol_id, label, None)?;
     if json_output {
-        crate::render::print_json(&serde_json::json!({"id": vol_id, "label": label, "status": "imported"}));
+        crate::render::print_json(
+            &serde_json::json!({"id": vol_id, "label": label, "status": "imported"}),
+        );
     } else {
         println!(
             "volume \"{label}\" imported (id={vol_id}, {canonical_generation}, {capacity_display})"
@@ -4621,7 +4642,9 @@ pub fn quick_archive(
         assume_yes,
     )?;
     if json_output {
-        crate::render::print_json(&serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"}));
+        crate::render::print_json(
+            &serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"}),
+        );
     } else {
         println!("quick-archive complete: \"{unit_name}\" written to \"{volume}\"");
     }
@@ -7080,9 +7103,7 @@ mod tests {
                 .expect_err("two copies left against 2 x 3 must gate")
                 .to_string();
             assert!(
-                msg.contains(
-                    "would be left with 2 copies, below its policy of 6 (tape-only 3x)"
-                ),
+                msg.contains("would be left with 2 copies, below its policy of 6 (tape-only 3x)"),
                 "{msg}"
             );
             assert_eq!(volume_status(&conn, vol_id), "sealed");

@@ -523,7 +523,9 @@ pub fn run(
             }
             crate::unit::rename_unit(conn, current, new)?;
             if json_output {
-                crate::render::print_json(&serde_json::json!({"old_name": current, "new_name": new}));
+                crate::render::print_json(
+                    &serde_json::json!({"old_name": current, "new_name": new}),
+                );
             } else {
                 println!("unit \"{current}\" renamed to \"{new}\"");
             }
@@ -653,7 +655,9 @@ fn unit_list(
             .get(&u.tenant_id)
             .cloned()
             .unwrap_or_else(|| "?".to_string());
-        let archive_set = u.archive_set_id.and_then(|id| archive_sets.get(&id).cloned());
+        let archive_set = u
+            .archive_set_id
+            .and_then(|id| archive_sets.get(&id).cloned());
         out.push(ListedUnit {
             unit: u,
             tenant,
@@ -939,7 +943,11 @@ mod tests {
         );
         // Aligned: each column starts where its header does.
         assert_eq!(lines[1].find("active"), lines[0].find("Status"), "{table}");
-        assert_eq!(lines[2].find("tape_only"), lines[0].find("Status"), "{table}");
+        assert_eq!(
+            lines[2].find("tape_only"),
+            lines[0].find("Status"),
+            "{table}"
+        );
         assert!(!table.contains('|') && !table.contains('+'), "{table}");
     }
 
@@ -965,11 +973,17 @@ mod tests {
         let v = unit_json(&unit, "alice", Some("family"));
         assert_eq!(v["tenant"], "alice", "{v}");
         assert_eq!(v["archive_set"], "family", "{v}");
-        assert!(v.get("tenant_id").is_none() && v.get("archive_set_id").is_none(), "{v}");
+        assert!(
+            v.get("tenant_id").is_none() && v.get("archive_set_id").is_none(),
+            "{v}"
+        );
         assert_eq!(v["created_at"], "2026-11-04T10:30:59Z", "{v}");
         assert_eq!(v["last_scanned"], serde_json::Value::Null, "{v}");
         assert_eq!(v["name"], "photos", "{v}");
-        assert_eq!(unit_json(&unit, "alice", None)["archive_set"], serde_json::Value::Null);
+        assert_eq!(
+            unit_json(&unit, "alice", None)["archive_set"],
+            serde_json::Value::Null
+        );
     }
 
     fn setup_unit(current_path: &str, checksum_mode: &str) -> (Connection, i64) {

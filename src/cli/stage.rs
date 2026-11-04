@@ -401,7 +401,11 @@ fn notes_below_the_table(rows: &[StageSetRow]) -> Vec<String> {
 pub(crate) fn slices_words(numbers: &[i64]) -> String {
     format!(
         "{} {}",
-        if numbers.len() == 1 { "slice" } else { "slices" },
+        if numbers.len() == 1 {
+            "slice"
+        } else {
+            "slices"
+        },
         staging::clean::describe_slice_numbers(numbers)
     )
 }
