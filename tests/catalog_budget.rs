@@ -277,7 +277,7 @@ fn run(command: Command, conn: &Connection, config: &Config) {
         tapectl::cli::catalog::run(conn, config, &c, true, false).unwrap();
     };
     match command {
-        Command::Ls => catalog(CatalogCommands::Ls {
+        Command::Ls => catalog(CatalogCommands::List {
             unit: "unit-0007".to_string(),
             version: None,
         }),

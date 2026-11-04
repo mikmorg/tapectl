@@ -20,11 +20,11 @@ pub enum StageCommands {
         name: Vec<String>,
 
         /// Re-stage a specific snapshot version instead of the latest
-        /// unstaged one — for when `tapectl staging clean --unit <name>
+        /// unstaged one — for when `tapectl stage clean --unit <name>
         /// --version <N>` already released that stage set's slices and
         /// another copy is wanted. Refuses if a stage set for
         /// that version already has live slices; use `volume write` to
-        /// consume them, or `staging clean --unit <name> --version <N>`
+        /// consume them, or `stage clean --unit <name> --version <N>`
         /// to release them first. A plain clean releases it only when it
         /// already has a completed write AND the unit is not currently
         /// below its copy floor (the larger of its policy's min_copies and
@@ -86,12 +86,39 @@ pub enum StageCommands {
         device: Option<String>,
     },
 
-    /// List stage sets
+    /// List the stage sets held in staging, with each version's copies
+    ///
+    /// A stage set is held in staging (`staged`, or `staging` while `stage
+    /// create` makes it) until `stage clean` releases it, and it stays after
+    /// its writes, since it can become the next copy. Copies counts the
+    /// copies of the set's version (a copy is identical content) against its
+    /// unit's copy floor: the larger of its policy's min_copies and the sum
+    /// of its copies_at targets, times the tape-only multiplier for a
+    /// tape-only unit. A staged set with fewer copies than that still owes a
+    /// copy, and `--owing` lists only those: what a `volume write` still has
+    /// to do. Below the table: a staged set that is not whole on disk, and
+    /// one that spans cartridges and is released slice by slice.
     List {
-        /// Filter by status (staging, staged, failed, cleaned)
+        /// Only the stage sets of this status (staging, staged, failed,
+        /// cleaned), held or not
         #[arg(long)]
         status: Option<String>,
+        /// Only the staged sets that still owe a copy
+        #[arg(long)]
+        owing: bool,
+        /// The released (`cleaned`) and `failed` stage sets too
+        #[arg(long)]
+        all: bool,
     },
+
+    /// Release staged slices from disk
+    ///
+    /// A stage set is released once it has a completed write and its unit
+    /// is not below its copy floor; one below it is retained and named, and
+    /// `--force` releases it too. A set that spans cartridges is released
+    /// slice by slice, each slice once it has its copies. A failed set is
+    /// always swept.
+    Clean(crate::cli::staging::CleanArgs),
 
     /// Show details for a stage set
     Info {
@@ -103,36 +130,71 @@ pub enum StageCommands {
     },
 }
 
-#[derive(Tabled, Serialize)]
-struct StageRow {
+/// One stage set as `stage list` shows it, with where its version's
+/// coverage stands. The ONE selection behind `stage list`, `stage list
+/// --owing` and the staging line of the catalog's summary, so they never
+/// disagree about what still owes a copy (issue #352).
+#[derive(Tabled, Serialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageSetRow {
     #[tabled(rename = "ID")]
-    id: i64,
+    pub id: i64,
     #[tabled(rename = "Unit")]
-    unit: String,
+    pub unit: String,
     #[tabled(rename = "Ver")]
-    version: i64,
+    pub version: i64,
     #[tabled(rename = "Status")]
-    status: String,
+    pub status: String,
     /// Raw `Option<i64>`, not a pre-rendered string (issue #205's audit).
-    /// A slice COUNT is a quantity; `SnapshotRow.files` next door already
-    /// carried the correct shape. `display_opt_i64` keeps the table's `-`
-    /// for NULL unchanged.
     #[tabled(rename = "Slices", display_with = "display_opt_i64")]
-    slices: Option<i64>,
-    /// Table-only until CTO decision 2026-09-11 (architecture review C2
-    /// follow-up, C2b). Raw bytes; renamed to `total_encrypted_size` to
-    /// match `stage info --json`'s existing key for the same
-    /// `ss.total_encrypted_size` column (see `StageCommands::Info` below).
-    #[tabled(rename = "Encrypted", display_with = "display_encrypted_mb")]
+    pub slices: Option<i64>,
+    /// Raw bytes; `total_encrypted_size` as `stage info --json` names the
+    /// same column.
+    #[tabled(rename = "Size", display_with = "display_encrypted_size")]
     #[serde(rename = "total_encrypted_size")]
-    encrypted_size: Option<i64>,
-    /// Table-only until CTO decision 2026-09-11 (architecture review C2
-    /// follow-up, C2b).
+    pub size: Option<i64>,
+    /// Copies of this stage set's VERSION
+    /// ([`crate::policy::coverage::copy_count_expr`], snapshot scope: a copy
+    /// is identical content, counted per version, ADR-0012).
+    #[tabled(rename = "Copies", display_with("Self::display_copies", self))]
+    pub copies: i64,
+    /// The unit's copy floor ([`crate::policy::coverage::copy_floor`] of its
+    /// resolved policy), or `None` when its policy cannot be resolved:
+    /// `audit` reports that as `policy_unresolvable`, and here a staged set
+    /// then owes a copy, the conservative reading for outstanding work.
+    #[tabled(skip)]
+    pub copy_floor: Option<i64>,
+    /// A `staged` set whose version has fewer copies than its copy floor.
+    #[tabled(skip)]
+    pub owing: bool,
     #[tabled(rename = "Staged At", display_with = "display_opt_string")]
-    staged_at: Option<String>,
+    pub staged_at: Option<String>,
+    /// Issue #402: what is wrong with a staged set's files on disk; empty
+    /// when it is whole. Printed below the table, not in it.
+    #[tabled(skip)]
+    #[serde(rename = "on_disk_problems")]
+    pub problems: Vec<String>,
+    /// The command that makes the set whole again; `null` when it is.
+    #[tabled(skip)]
+    pub remedy: Option<String>,
+    /// #478 (ADR-0012 item 129): a set released in part, slice by slice:
+    /// the slice numbers released. Empty unless it was.
+    #[tabled(skip)]
+    pub released_slices: Vec<i64>,
+    /// With `released_slices`, the slice numbers still staged.
+    #[tabled(skip)]
+    pub staged_slices: Vec<i64>,
 }
 
-fn display_encrypted_mb(v: &Option<i64>) -> String {
+impl StageSetRow {
+    fn display_copies(&self) -> String {
+        match self.copy_floor {
+            Some(floor) => format!("{} of {floor}", self.copies),
+            None => format!("{} (policy unresolvable)", self.copies),
+        }
+    }
+}
+
+fn display_encrypted_size(v: &Option<i64>) -> String {
     v.map(crate::util::format_bytes_binary).unwrap_or_default()
 }
 
@@ -144,9 +206,181 @@ fn display_opt_string(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
 }
 
-/// `stage list --json` shape. `encrypted_size`/`staged_at` were table-only
-/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
-fn stage_rows_to_json(rows: &[StageRow]) -> serde_json::Value {
+/// Which stage sets [`stage_set_rows`] selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shown<'a> {
+    /// The sets held in staging: `staged`, and `staging` while being made.
+    Held,
+    /// The sets of one status.
+    Status(&'a str),
+    /// Every set.
+    All,
+}
+
+/// The stage sets `shown` selects, in unit, version and id order, each with
+/// its version's copies and its unit's copy floor. A set stays `staged`
+/// after its writes until `stage clean` releases it, so "staged" alone
+/// never meant "awaiting a write": [`StageSetRow::owing`] does.
+pub(crate) fn stage_set_rows(
+    conn: &Connection,
+    config: &Config,
+    shown: Shown<'_>,
+) -> Result<Vec<StageSetRow>> {
+    let copies =
+        crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
+            scope: crate::policy::coverage::CoverageScope::Snapshot { id_expr: "s.id" },
+            exclude_volume: None,
+        });
+    let filter = match shown {
+        Shown::Held => "WHERE ss.status IN ('staged', 'staging')",
+        Shown::Status(_) => "WHERE ss.status = ?1",
+        Shown::All => "",
+    };
+    let sql = format!(
+        "SELECT ss.id, u.name, s.version, ss.status, ss.num_slices,
+                ss.total_encrypted_size, ss.staged_at, {copies}
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         {filter}
+         ORDER BY u.name, s.version, ss.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |row: &rusqlite::Row<'_>| {
+        Ok(StageSetRow {
+            id: row.get(0)?,
+            unit: row.get(1)?,
+            version: row.get(2)?,
+            status: row.get(3)?,
+            slices: row.get(4)?,
+            size: row.get(5)?,
+            staged_at: row.get(6)?,
+            copies: row.get(7)?,
+            copy_floor: None,
+            owing: false,
+            problems: Vec::new(),
+            remedy: None,
+            released_slices: Vec::new(),
+            staged_slices: Vec::new(),
+        })
+    };
+    let mut rows: Vec<StageSetRow> = match shown {
+        Shown::Status(status) => stmt.query_map(params![status], map)?,
+        _ => stmt.query_map([], map)?,
+    }
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut floor_by_unit: std::collections::HashMap<String, Option<i64>> = Default::default();
+    for row in &mut rows {
+        let floor = match floor_by_unit.get(&row.unit) {
+            Some(f) => *f,
+            None => {
+                let f = match crate::db::queries::get_unit_by_name(conn, &row.unit)? {
+                    // The copy floor through the one tape-only rule
+                    // (ADR-0012 2026-10-12 item 43), as `stage clean`
+                    // retains by.
+                    Some(u) => match crate::policy::resolve(conn, config, &u) {
+                        Ok(p) => Some(crate::policy::coverage::copy_floor(
+                            config,
+                            p.copy_floor_base(),
+                            &u.status,
+                        )),
+                        Err(TapectlError::PolicyUnresolvable { .. }) => None,
+                        Err(e) => return Err(e),
+                    },
+                    None => None,
+                };
+                floor_by_unit.insert(row.unit.clone(), f);
+                f
+            }
+        };
+        row.copy_floor = floor;
+        row.owing = row.status == "staged"
+            && match floor {
+                Some(floor) => row.copies < floor,
+                None => true,
+            };
+    }
+    Ok(rows)
+}
+
+/// What a held set's files on disk say (issue #402) and which of its slices
+/// were released (#478), from `staging::clean::staging_status`, the one
+/// reader of both.
+fn add_disk_state(conn: &Connection, rows: &mut [StageSetRow]) -> Result<()> {
+    if !rows
+        .iter()
+        .any(|r| r.status == "staged" || r.status == "staging")
+    {
+        return Ok(());
+    }
+    let mut held: std::collections::HashMap<i64, staging::clean::StagingInfo> =
+        staging::clean::staging_status(conn)?
+            .into_iter()
+            .map(|i| (i.stage_set_id, i))
+            .collect();
+    for row in rows {
+        if let Some(info) = held.remove(&row.id) {
+            row.problems = info.on_disk_problems;
+            row.remedy = info.remedy;
+            row.released_slices = info.released_slices;
+            row.staged_slices = info.staged_slices;
+        }
+    }
+    Ok(())
+}
+
+/// The lines `stage list` prints below its table: each staged set that is
+/// not whole on disk (`volume write` refuses it, issue #402) with its
+/// remedy, then each set released in part (#478).
+fn notes_below_the_table(rows: &[StageSetRow]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for r in rows.iter().filter(|r| !r.problems.is_empty()) {
+        let mut s = format!(
+            "stage set {} ({} v{}) is NOT whole on disk — `volume write` will refuse it:",
+            r.id, r.unit, r.version
+        );
+        for p in &r.problems {
+            s.push_str(&format!("\n  - {p}"));
+        }
+        if let Some(remedy) = &r.remedy {
+            s.push_str(&format!("\n  remedy: {remedy}"));
+        }
+        lines.push(s);
+    }
+    for r in rows.iter().filter(|r| !r.released_slices.is_empty()) {
+        lines.push(format!(
+            "stage set {} ({} v{}) spans cartridges and is released slice by slice: slice(s) \
+             {} released, {} still staged",
+            r.id,
+            r.unit,
+            r.version,
+            staging::clean::describe_slice_numbers(&r.released_slices),
+            staging::clean::describe_slice_numbers(&r.staged_slices),
+        ));
+    }
+    lines
+}
+
+/// `stage list --owing`'s closing line: how many staged sets owe nothing
+/// and are only held. It names the command that decides their release
+/// and promises nothing: `stage clean` judges the UNIT (the least-covered
+/// current version), which a version with its copies does not settle.
+pub(crate) fn held_but_not_owing_line(all_held: &[StageSetRow]) -> Option<String> {
+    let held = all_held
+        .iter()
+        .filter(|r| r.status == "staged" && !r.owing)
+        .count();
+    (held > 0).then(|| {
+        format!(
+            "{held} more stage set(s) have every copy their own version needs and are only \
+             held in staging (`tapectl stage clean` decides which can be released)"
+        )
+    })
+}
+
+/// `stage list --json` shape: the rows, an array.
+fn stage_rows_to_json(rows: &[StageSetRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
@@ -170,53 +404,55 @@ pub fn run(
     assume_yes: bool,
 ) -> Result<()> {
     match command {
-        StageCommands::List { status } => {
+        StageCommands::List { status, owing, all } => {
             if let Some(st) = status {
                 validate_stage_status(st)?;
             }
-            let mut sql = String::from(
-                "SELECT ss.id, u.name, s.version, ss.status, ss.num_slices,
-                        ss.total_encrypted_size, ss.staged_at
-                 FROM stage_sets ss
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 JOIN units u ON u.id = s.unit_id
-                 WHERE 1=1",
-            );
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            if let Some(st) = status {
-                sql.push_str(" AND ss.status = ?");
-                param_values.push(Box::new(st.clone()));
-            }
-            sql.push_str(" ORDER BY ss.created_at DESC");
-
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                param_values.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<StageRow> = stmt
-                .query_map(params_ref.as_slice(), |row| {
-                    let enc_size: Option<i64> = row.get(5)?;
-                    Ok(StageRow {
-                        id: row.get(0)?,
-                        unit: row.get(1)?,
-                        version: row.get(2)?,
-                        status: row.get(3)?,
-                        slices: row.get::<_, Option<i64>>(4)?,
-                        encrypted_size: enc_size,
-                        staged_at: row.get::<_, Option<String>>(6)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let shown = match (status, all) {
+                (Some(st), _) => Shown::Status(st.as_str()),
+                (None, true) => Shown::All,
+                (None, false) => Shown::Held,
+            };
+            let mut rows = stage_set_rows(conn, config, shown)?;
+            let closing = if *owing {
+                let line = held_but_not_owing_line(&rows);
+                rows.retain(|r| r.owing);
+                line
+            } else {
+                None
+            };
+            add_disk_state(conn, &mut rows)?;
 
             if json_output {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&stage_rows_to_json(&rows)).unwrap()
                 );
-            } else if rows.is_empty() {
-                println!("no stage sets found");
             } else {
-                println!("{}", Table::new(rows));
+                if rows.is_empty() {
+                    println!(
+                        "{}",
+                        match (*owing, shown) {
+                            (true, _) => "no stage set owes a copy",
+                            (false, Shown::Held) => "nothing is held in staging",
+                            (false, _) => "no stage sets found",
+                        }
+                    );
+                } else {
+                    let notes = notes_below_the_table(&rows);
+                    println!("{}", Table::new(rows));
+                    for note in notes {
+                        println!("{note}");
+                    }
+                }
+                if let Some(line) = closing {
+                    println!("{line}");
+                }
             }
+        }
+
+        StageCommands::Clean(args) => {
+            crate::cli::staging::clean(conn, paths, config, args, json_output, dry_run)?;
         }
 
         StageCommands::Info { name, version } => {
@@ -260,7 +496,7 @@ pub fn run(
                 })?;
 
             // Once issue #53 lets a snapshot carry several stage sets (a
-            // re-stage after `staging clean`), the query above still shows
+            // re-stage after `stage clean`), the query above still shows
             // only the newest — this count lets both output modes say so
             // without hiding the others' existence.
             let stage_set_count: i64 = conn.query_row(
@@ -520,7 +756,7 @@ fn write_in_flight_status(
         .map(str::to_string))
 }
 
-/// What to do when a write session `staging clean` / `stage create` found
+/// What to do when a write session `stage clean` / `stage create` found
 /// "running" is in fact not (#468). `tapectl db fsck` checks integrity and
 /// foreign keys; it sweeps no session. The two live states differ:
 ///
@@ -604,7 +840,7 @@ fn snapshot_to_stage(
                 .collect();
 
             if !live_ids.is_empty() {
-                // Issues #279 and #292: a bare `staging clean`
+                // Issues #279 and #292: a bare `stage clean`
                 // leaves a live stage set alone for one of FOUR
                 // reasons, and the refusal must name the one that
                 // actually applies. #279 split this two ways and
@@ -661,14 +897,14 @@ fn snapshot_to_stage(
                     // and the `copies_at` sum, `copy_floor_base`).
                     staging::clean::ReleaseBlocker::None => format!(
                         "{head} — use `tapectl volume write` to consume them, or \
-                         `tapectl staging clean --unit {name}` to release them first \
+                         `tapectl stage clean --unit {name}` to release them first \
                          (retained by default if \"{name}\" is below its policy's \
                          copy floor — add --force to release it anyway)"
                     ),
                     // Never written: #279's wording, unchanged.
                     staging::clean::ReleaseBlocker::NeverWritten => format!(
                         "{head} — use `tapectl volume write` to consume them; it has no \
-                         completed write backing it, so `tapectl staging clean \
+                         completed write backing it, so `tapectl stage clean \
                          --unit {name} --version {v}` would leave it untouched — \
                          pass --force to release it"
                     ),
@@ -686,7 +922,7 @@ fn snapshot_to_stage(
                              it, so it was cut there and is not a copy. Write it whole onto \
                              another cartridge with `tapectl volume write <LABEL>` (`--init` \
                              initialises a new one); these slices are what that write \
-                             reads. `tapectl staging clean --unit {name} --version {v}` \
+                             reads. `tapectl stage clean --unit {name} --version {v}` \
                              leaves it untouched until then — pass --force only to give the \
                              version up"
                         )
@@ -703,7 +939,7 @@ fn snapshot_to_stage(
                          cartridge of the same generation writes them (`--init` initialises a \
                          new one). Do not give them up with --force: staging the version again \
                          makes a different stage set, which cannot continue the ranges already \
-                         sealed on tape. `tapectl staging clean --unit {name} --version {v}` \
+                         sealed on tape. `tapectl stage clean --unit {name} --version {v}` \
                          releases each slice once it has its copies",
                         staging::clean::describe_slice_numbers(slices)
                     ),
@@ -723,7 +959,7 @@ fn snapshot_to_stage(
                              releasing them is what would make it unrecoverable. \
                              Reload the same cartridge and resume it, or write these \
                              slices to another volume. Only give them up on purpose \
-                             (`tapectl volume abort`, then `staging clean --force`) \
+                             (`tapectl volume abort`, then `stage clean --force`) \
                              once you have decided the interrupted write is not \
                              worth finishing."
                         )
@@ -762,8 +998,8 @@ fn snapshot_to_stage(
                          (`tapectl volume verify {l}`), `tapectl volume resume {l}` \
                          re-confirms that sealed tape against these frozen staged \
                          files, and once it passes that session no longer holds them. \
-                         Releasing them now (`tapectl staging clean --unit {name} \
-                         --version {v} --force`; a bare `tapectl staging clean` will \
+                         Releasing them now (`tapectl stage clean --unit {name} \
+                         --version {v} --force`; a bare `tapectl stage clean` will \
                          not) forfeits that re-confirmation."
                     ),
                     // Nothing can adopt the session: --force is the
@@ -774,10 +1010,10 @@ fn snapshot_to_stage(
                     staging::clean::ReleaseBlocker::Abandoned { reconfirm_on: None } => {
                         format!(
                             "{head}, left behind by a write session that was aborted \
-                             or failed. A bare `tapectl staging clean` will not release \
+                             or failed. A bare `tapectl stage clean` will not release \
                              them, and writing them to another volume does not change \
                              that — the abandoned session's `writes` row keeps blocking \
-                             it. Release them with `tapectl staging clean --unit {name} \
+                             it. Release them with `tapectl stage clean --unit {name} \
                              --version {v} --force`."
                         )
                     }
@@ -824,38 +1060,93 @@ mod tests {
         }
     }
 
-    /// `stage list --json` shape (issue: C2 row-listing drift).
-    /// `encrypted_size`/`staged_at` are additive since CTO decision
-    /// 2026-09-11 (architecture review C2 follow-up, C2b). The byte count
+    /// `stage list --json` shape (issue: C2 row-listing drift), with what
+    /// 1.9.0 brought in from the commands it absorbed (ADR-0012 item 207): the version's copies, the unit's copy floor and whether
+    /// the set owes a copy, beside the set's own facts. The byte count
     /// (125_829_121) is deliberately not an even multiple of 1 MiB, proving
-    /// the JSON carries the raw fact rather than a value recomputed from
-    /// the table's "120 MiB" text.
+    /// the JSON carries the raw fact rather than the table's rendering.
     #[test]
     fn pin_stage_rows_json_shape() {
         let rows = vec![
-            StageRow {
+            StageSetRow {
                 id: 1,
                 unit: "backups".to_string(),
                 version: 2,
                 status: "staged".to_string(),
                 slices: Some(3),
-                encrypted_size: Some(125_829_121),
+                size: Some(125_829_121),
+                copies: 1,
+                copy_floor: Some(2),
+                owing: true,
                 staged_at: Some("2026-07-01T00:00:00Z".to_string()),
+                problems: vec!["slice 2: no staged file recorded".to_string()],
+                remedy: Some("tapectl volume read-slices backups --from L6-0001".to_string()),
+                released_slices: vec![1],
+                staged_slices: vec![2, 3],
             },
-            StageRow {
+            StageSetRow {
                 id: 2,
                 unit: "photos".to_string(),
                 version: 1,
                 status: "staging".to_string(),
                 slices: None,
-                encrypted_size: None,
+                size: None,
+                copies: 0,
+                copy_floor: None,
+                owing: false,
                 staged_at: None,
+                problems: Vec::new(),
+                remedy: None,
+                released_slices: Vec::new(),
+                staged_slices: Vec::new(),
             },
         ];
         let value = stage_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"id":1,"slices":3,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"id":2,"slices":null,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
+            r#"[{"copies":1,"copy_floor":2,"id":1,"on_disk_problems":["slice 2: no staged file recorded"],"owing":true,"released_slices":[1],"remedy":"tapectl volume read-slices backups --from L6-0001","slices":3,"staged_at":"2026-07-01T00:00:00Z","staged_slices":[2,3],"status":"staged","total_encrypted_size":125829121,"unit":"backups","version":2},{"copies":0,"copy_floor":null,"id":2,"on_disk_problems":[],"owing":false,"released_slices":[],"remedy":null,"slices":null,"staged_at":null,"staged_slices":[],"status":"staging","total_encrypted_size":null,"unit":"photos","version":1}]"#
+        );
+    }
+
+    /// A set released in part is named below the table with the slices
+    /// released and those still staged, and a set not whole on disk with
+    /// its remedy.
+    #[test]
+    fn the_notes_below_the_table_name_a_partial_release_and_a_broken_set() {
+        let mut row = StageSetRow {
+            id: 7,
+            unit: "photos".to_string(),
+            version: 2,
+            status: "staged".to_string(),
+            slices: Some(5),
+            size: Some(1),
+            copies: 1,
+            copy_floor: Some(2),
+            owing: true,
+            staged_at: None,
+            problems: Vec::new(),
+            remedy: None,
+            released_slices: vec![1, 2, 3],
+            staged_slices: vec![4, 5],
+        };
+        assert_eq!(
+            notes_below_the_table(std::slice::from_ref(&row)),
+            vec![
+                "stage set 7 (photos v2) spans cartridges and is released slice by slice: \
+                 slice(s) 1-3 released, 4-5 still staged"
+                    .to_string()
+            ]
+        );
+        row.released_slices.clear();
+        row.problems = vec!["slice 4: gone".to_string()];
+        row.remedy = Some("tapectl stage create photos --version 2".to_string());
+        assert_eq!(
+            notes_below_the_table(&[row]),
+            vec![
+                "stage set 7 (photos v2) is NOT whole on disk — `volume write` will refuse it:\n  \
+                 - slice 4: gone\n  remedy: tapectl stage create photos --version 2"
+                    .to_string()
+            ]
         );
     }
 
@@ -1074,12 +1365,12 @@ mod tests {
             "unexpected error message: {msg}"
         );
         assert!(msg.contains("volume write"));
-        assert!(msg.contains("staging clean"));
+        assert!(msg.contains("stage clean"));
     }
 
     /// Issue #279, one of the two branches: the live stage set above has
     /// NEVER been written anywhere (no `writes` row exists for it at all)
-    /// -- a plain `tapectl staging clean --unit <name>` is a silent no-op
+    /// -- a plain `tapectl stage clean --unit <name>` is a silent no-op
     /// on it (`cleaned 0 stage set(s)`), so `--force` is the only thing
     /// that releases it, regardless of where the unit stands against its
     /// copy floor. The refusal must say exactly that, and must NOT mention
@@ -1334,7 +1625,7 @@ mod tests {
 
     /// Issue #325: "or write them to another volume first" was never a way
     /// to release an abandoned stage set — a second, completed write leaves
-    /// the aborted row in place, and it still blocks a bare `staging clean`
+    /// the aborted row in place, and it still blocks a bare `stage clean`
     /// (`staging::clean`'s `default_guard_refuses_when_a_second_planned_copy_aborted_or_failed`).
     /// The refusal names the one act that does release them.
     #[test]
@@ -1350,7 +1641,7 @@ mod tests {
                 "{status}: {msg}"
             );
             assert!(
-                msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+                msg.contains("tapectl stage clean --unit unit1 --version 1 --force"),
                 "{status}: must name the release that works: {msg}"
             );
             assert!(
@@ -1377,7 +1668,7 @@ mod tests {
         assert!(msg.contains("tapectl volume resume L6-0007"), "{msg}");
         assert!(msg.contains("forfeits"), "{msg}");
         assert!(
-            msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+            msg.contains("tapectl stage clean --unit unit1 --version 1 --force"),
             "the release is still named, with its cost: {msg}"
         );
         assert!(
@@ -1407,7 +1698,7 @@ mod tests {
             );
             assert!(!msg.contains("forfeits"), "{status}/{volume_status}: {msg}");
             assert!(
-                msg.contains("tapectl staging clean --unit unit1 --version 1 --force"),
+                msg.contains("tapectl stage clean --unit unit1 --version 1 --force"),
                 "{status}/{volume_status}: {msg}"
             );
         }
@@ -1439,7 +1730,7 @@ mod tests {
         assert!(msg.contains("`tapectl volume write <LABEL>`"), "{msg}");
         assert!(msg.contains("another cartridge"), "{msg}");
         assert!(
-            msg.contains("tapectl staging clean --unit unit1 --version 1"),
+            msg.contains("tapectl stage clean --unit unit1 --version 1"),
             "{msg}"
         );
         assert!(!msg.contains("volume resume"), "{msg}");
@@ -1504,7 +1795,7 @@ mod tests {
             "--force orphans the sealed range: {msg}"
         );
         assert!(
-            msg.contains("tapectl staging clean --unit unit1 --version 1"),
+            msg.contains("tapectl stage clean --unit unit1 --version 1"),
             "{msg}"
         );
         assert!(!msg.contains("volume resume"), "{msg}");
@@ -1584,7 +1875,7 @@ mod tests {
     /// Issue #279, the other branch and this test module's positive
     /// control: the live stage set DOES have a completed write, and the
     /// unit is below its policy's copy floor -- a plain
-    /// `tapectl staging clean --unit <name>` retains it for exactly that
+    /// `tapectl stage clean --unit <name>` retains it for exactly that
     /// reason, so the refusal says so, naming the copy floor (#493,
     /// ADR-0012 item 149: the larger of `min_copies` and the `copies_at`
     /// sum, so `min_copies` alone could name the wrong number).
@@ -1653,7 +1944,7 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("volume write"), "{msg}");
-        assert!(msg.contains("staging clean"), "{msg}");
+        assert!(msg.contains("stage clean"), "{msg}");
         assert!(
             msg.contains("below its policy's copy floor"),
             "a written, under-copied set names the copy floor: {msg}"

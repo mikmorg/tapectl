@@ -793,7 +793,7 @@ fn recover_orphaned_sessions(conn: &Connection, db_path: &Path) -> Result<()> {
     // Marking ONLY — this never touches the filesystem beyond the lockfiles
     // `is_crashed` itself opens/probes (and releases immediately). Deleting
     // any staging content here would mean opening the DB for a read (e.g.
-    // `report copies`, `catalog ls`) could destroy staging data; actual
+    // `report copies`, `catalog list`) could destroy staging data; actual
     // file cleanup for a `'failed'` set happens later, and only via
     // `staging::clean::clean_staging`.
     let staging_ids: Vec<i64> = {

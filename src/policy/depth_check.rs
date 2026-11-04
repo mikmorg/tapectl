@@ -380,7 +380,7 @@ pub fn describe_tape_device(check: &TapeDeviceCheck) -> String {
     // Issue #329: unlike absence, a PROVEN wrong pairing is a warning — a
     // write through this backend is refused until it is fixed.
     if let Some(problem) = &check.pairing_problem {
-        return format!("warning: {problem} (volume write refuses this backend until then)");
+        return format!("warning: {problem} (volume write refuses this drive until then)");
     }
     let mut missing = Vec::new();
     if !check.device_tape_exists {
@@ -391,12 +391,12 @@ pub fn describe_tape_device(check: &TapeDeviceCheck) -> String {
     }
     if missing.is_empty() {
         format!(
-            "backend \"{}\": device_tape and device_sg both present",
+            "drive \"{}\": device_tape and device_sg both present",
             check.backend_name
         )
     } else {
         format!(
-            "note: backend \"{}\" device path(s) not present: {} — normal if the drive isn't attached",
+            "note: drive \"{}\" device path(s) not present: {} — normal if the drive isn't attached",
             check.backend_name,
             missing.join(", ")
         )
@@ -476,7 +476,7 @@ mod tests {
             device_tape_exists: true,
             device_sg: "/dev/sg-wrong".to_string(),
             device_sg_exists: true,
-            pairing_problem: Some("backend \"lto1\": device_sg = /dev/sg-wrong ...".into()),
+            pairing_problem: Some("drive \"lto1\": device_sg = /dev/sg-wrong ...".into()),
         });
         assert!(line.starts_with("warning: "), "{line}");
         assert!(line.contains("/dev/sg-wrong"), "{line}");

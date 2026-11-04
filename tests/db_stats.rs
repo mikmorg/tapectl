@@ -179,10 +179,7 @@ fn db_stats_says_when_the_journals_are_younger_than_the_window() {
 fn db_backup_says_how_much_it_copied() {
     let home = heavy_home();
     let dest = home.path().join("backup.db");
-    let out = run(
-        home.path(),
-        &["db", "backup", "--to", dest.to_str().unwrap()],
-    );
+    let out = run(home.path(), &["db", "backup", dest.to_str().unwrap()]);
     let text = String::from_utf8_lossy(&out.stdout);
     let len = std::fs::metadata(&dest).unwrap().len();
     assert!(len > 200 * 3600, "the heavy journal was copied: {len}");
@@ -195,7 +192,7 @@ fn db_backup_says_how_much_it_copied() {
     let dest2 = home.path().join("backup2.db");
     let out = run(
         home.path(),
-        &["--json", "db", "backup", "--to", dest2.to_str().unwrap()],
+        &["--json", "db", "backup", dest2.to_str().unwrap()],
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
     assert_eq!(
@@ -217,7 +214,6 @@ fn db_backup_says_how_much_key_material_it_copied() {
             "--json",
             "db",
             "backup",
-            "--to",
             dest.to_str().unwrap(),
             "--include-keys",
         ],
@@ -234,13 +230,7 @@ fn db_backup_says_how_much_key_material_it_copied() {
     let dest2 = home.path().join("again.db");
     let out = run(
         home.path(),
-        &[
-            "db",
-            "backup",
-            "--to",
-            dest2.to_str().unwrap(),
-            "--include-keys",
-        ],
+        &["db", "backup", dest2.to_str().unwrap(), "--include-keys"],
     );
     let text = String::from_utf8_lossy(&out.stdout);
     let shown = tapectl::util::format_bytes_binary(on_disk as i64);

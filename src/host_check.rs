@@ -376,7 +376,7 @@ fn query_unit(unit: &str) -> UnitState {
 }
 
 /// The findings for this host under `cfg`, with `extra_units` checked too
-/// (`host check --unit`).
+/// (`host check --systemd-unit`).
 pub fn check_live(cfg: &HostCheckConfig, extra_units: &[String]) -> Vec<Finding> {
     let mut units = cfg.contender_units.clone();
     for u in extra_units {

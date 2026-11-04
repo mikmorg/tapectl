@@ -55,7 +55,7 @@
 //! ## Leniency, and where it stops
 //!
 //! tapectl must stay usable on a rebuilt machine that has keys and no
-//! `backend add` (ADR-0005's DR path), so leniency is not a defect in
+//! `drive add` (ADR-0005's DR path), so leniency is not a defect in
 //! itself. The line this module draws is narrower: **leniency that changes
 //! which home is used is a defect.** Hence an empty `TAPECTL_HOME` falls
 //! back (it is an unset variable a wrapper forgot to expand, and falling

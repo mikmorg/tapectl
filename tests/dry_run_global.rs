@@ -472,7 +472,6 @@ fn collection_run_dry_run_stages_nothing_and_writes_no_tape() {
         &[
             "collection",
             "run",
-            "--collection",
             "microlib",
             "--batch",
             "0",
@@ -528,7 +527,6 @@ fn collection_run_dry_run_json_carries_the_marker() {
             "--json",
             "collection",
             "run",
-            "--collection",
             "microlib",
             "--label",
             "L1",
@@ -624,7 +622,6 @@ fn a_dry_run_collection_run_still_refuses_an_unknown_label() {
         &[
             "collection",
             "run",
-            "--collection",
             "microlib",
             "--label",
             "NOSUCH",
@@ -971,7 +968,7 @@ fn archive_set_edit_dry_run_changes_nothing() {
     assert_eq!(min_copies, 2, "--dry-run changed min_copies");
 }
 
-/// `backend add`: `config.toml` must be byte-for-byte unchanged.
+/// `drive add`: `config.toml` must be byte-for-byte unchanged.
 #[test]
 fn backend_add_dry_run_does_not_touch_config_file() {
     let home = TempDir::new().unwrap();
@@ -982,7 +979,7 @@ fn backend_add_dry_run_does_not_touch_config_file() {
     ok(
         home.path(),
         &[
-            "backend",
+            "drive",
             "add",
             "--name",
             "p1",
@@ -1492,7 +1489,7 @@ fn db_backup_dry_run_creates_no_file() {
     let dest = home.path().join("backup.db");
     let out = ok(
         home.path(),
-        &["db", "backup", "--to", dest.to_str().unwrap(), "--dry-run"],
+        &["db", "backup", dest.to_str().unwrap(), "--dry-run"],
     );
     assert!(
         !dest.exists(),
@@ -1510,7 +1507,6 @@ fn db_backup_dry_run_creates_no_file() {
         &[
             "db",
             "backup",
-            "--to",
             dest_wk.to_str().unwrap(),
             "--include-keys",
             "--dry-run",
@@ -1671,7 +1667,7 @@ fn db_import_dry_run_does_not_overwrite() {
     let export_path = home.path().join("exported.db");
     ok(
         home.path(),
-        &["db", "backup", "--to", export_path.to_str().unwrap()],
+        &["db", "backup", export_path.to_str().unwrap()],
     );
 
     // Added AFTER the export, so it exists only in the live database — the
@@ -1694,8 +1690,8 @@ fn db_import_dry_run_does_not_overwrite() {
     );
 }
 
-/// Top-level `export` (`main.rs`'s `Commands::Export` -> `operations::
-/// export_unit`): no destination directory, no MANIFEST.toml/SHA256SUMS/
+/// `unit export` (`operations::export_unit`, the top-level `export` before
+/// 1.9.0): no destination directory, no MANIFEST.toml/SHA256SUMS/
 /// RECOVERY.md. The `stage_sets`/`stage_slices` chain is fabricated
 /// directly, the same way `restore_unit_dry_run_reports_a_preview_via_the_
 /// shared_arg_id` above fabricates its write-position chain — a real `dar`
@@ -1763,8 +1759,8 @@ fn export_dry_run_creates_no_destination_directory() {
     let out = ok(
         home.path(),
         &[
+            "unit",
             "export",
-            "--unit",
             "u1",
             "--to",
             dest.to_str().unwrap(),
@@ -1784,8 +1780,8 @@ fn export_dry_run_creates_no_destination_directory() {
     );
 }
 
-/// Top-level `import` (`main.rs`'s `Commands::Import` -> `operations::
-/// volume_import`): no `volumes` row.
+/// `volume import` (`operations::volume_import`, the top-level `import`
+/// before 1.9.0): no `volumes` row.
 #[test]
 fn import_dry_run_inserts_no_volume() {
     let home = TempDir::new().unwrap();
@@ -1794,8 +1790,8 @@ fn import_dry_run_inserts_no_volume() {
     let out = ok(
         home.path(),
         &[
+            "volume",
             "import",
-            "--label",
             "VOL-IMP",
             "--generation",
             "LTO-6",
@@ -1821,13 +1817,13 @@ fn import_dry_run_inserts_no_volume() {
     // A dry run must still refuse a label already taken.
     ok(
         home.path(),
-        &["import", "--label", "VOL-IMP", "--generation", "LTO-6"],
+        &["volume", "import", "VOL-IMP", "--generation", "LTO-6"],
     );
     let dup = run_tapectl(
         home.path(),
         &[
+            "volume",
             "import",
-            "--label",
             "VOL-IMP",
             "--generation",
             "LTO-6",
@@ -1917,7 +1913,7 @@ fn quick_archive_dry_run_refuses_before_resolving_a_backend() {
         "refusal must name --dry-run: {stderr}"
     );
     assert!(
-        !stderr.contains("no LTO backend configured"),
+        !stderr.contains("no LTO drive configured"),
         "the refusal must fire before backend resolution, not surface the backend error: \
          {stderr}"
     );

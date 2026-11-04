@@ -85,7 +85,7 @@ pub struct Planned {
     /// a file that already failed to load (see the module doc).
     pub remaining_problems: Vec<String>,
     /// Advisories that do not stop the edit (a backend's device node that
-    /// does not exist on this machine, as `backend add` warns).
+    /// does not exist on this machine, as `drive add` warns).
     pub warnings: Vec<String>,
 }
 
@@ -535,7 +535,7 @@ fn is_backend_table(table_segs: &[Seg]) -> bool {
     table_segs.len() == 2 && table_segs[0].key == "backends" && table_segs[1].key == "lto"
 }
 
-/// The checks `backend add` makes on a drive's fields that loading a config
+/// The checks `drive add` makes on a drive's fields that loading a config
 /// does not (issue #126/#186): the name's spelling, and the generation in
 /// its canonical form (`lto6` is written `LTO-6`). A device node that does
 /// not exist is a warning, never a refusal — a drive may be configured
@@ -764,7 +764,7 @@ fn plan_add_table(
         slots.push(slot);
     }
     // An entry is addressed by its name, so a second entry with one already
-    // taken could never be selected (`backend add` refuses it too).
+    // taken could never be selected (`drive add` refuses it too).
     if let Some(i) = fields.iter().position(|f| f == "name") {
         let name = slots[i].last().and_then(|v| v.as_str()).unwrap_or_default();
         let mut probe = doc.clone();

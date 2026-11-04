@@ -707,13 +707,13 @@ mod tests {
             "L6-0002",
             "releasing the batch's staging",
             &"database is locked",
-            Some("tapectl staging clean"),
+            Some("tapectl stage clean"),
         );
         assert_eq!(
             w,
             "warning: volume \"L6-0002\" is sealed and confirmed and counts as a copy, but \
              releasing the batch's staging did not finish: database is locked. The tape needs \
-             nothing. To finish it: tapectl staging clean"
+             nothing. To finish it: tapectl stage clean"
         );
         let w = unfinished_after_seal("L6-0002", "recording", &"x", None);
         assert!(

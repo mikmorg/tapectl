@@ -5,7 +5,7 @@
 //! so the write returns the error instead of killing the process). Two ways
 //! that reached an operator:
 //!
-//! - `tapectl catalog ls | head` — `head` exits after ten lines and the next
+//! - `tapectl catalog list | head` — `head` exits after ten lines and the next
 //!   `println!` panicked with exit 101.
 //! - `first-run.sh` runs a write as `run … | tee`. A Ctrl-C kills `tee`, the
 //!   write stops cleanly at its next safe point (or even finishes), and its

@@ -43,7 +43,7 @@
 //! A failure after the erase leaves the staged slices staged, possibly as the
 //! only copy of a unit. Migration 037's `pending_rewrites` records the
 //! rewrite and the stage sets it staged; [`holds`] is the one query every
-//! release path asks (`staging::clean::clean_staging`, which `staging
+//! release path asks (`staging::clean::clean_staging`, which `stage
 //! clean`, `release_if_covered`, `volume write`/`volume resume` and
 //! `collection run` all end in). A set is held while its rewrite is open
 //! AND no eligible volume carries a fully read back copy of it
@@ -186,7 +186,7 @@ impl Hold {
         format!("tapectl volume rewrite --resume {}", self.destination)
     }
 
-    /// One line, for `staging clean` and the release after a write.
+    /// One line, for `stage clean` and the release after a write.
     pub fn describe(&self, stage_set_id: i64) -> String {
         format!(
             "stage set {stage_set_id} kept: it is held by the rewrite of volume \"{}\" (at \
@@ -1676,7 +1676,7 @@ pub fn resume(
     )?;
 
     // The hold may have lifted on another volume: a fully read back copy
-    // exists elsewhere (the copies-elsewhere shape, `staging clean` then
+    // exists elsewhere (the copies-elsewhere shape, `stage clean` then
     // legitimately released the slices; or the slices were written to another
     // cartridge by hand and verified). If the slices are gone there is
     // nothing to write: the record is closed, and the cartridge is free.
@@ -2926,7 +2926,7 @@ mod tests {
             .unwrap();
         let unit_id: i64 = scalar(&s.w.conn, "SELECT id FROM units WHERE name = 'keepsake'");
 
-        // `staging clean --force` (Whole), and `--unit`/`--unit --version`.
+        // `stage clean --force` (Whole), and `--unit`/`--unit --version`.
         for (scope, label) in [
             (CleanScope::Units(&[unit_id]), "Units"),
             (
@@ -3707,7 +3707,7 @@ mod tests {
         assert_eq!(holds(&s.w.conn).unwrap().len(), 2);
         assert_eq!(events_of(&s.w.conn, "rewrite_stopped"), 1);
 
-        // Nothing releases them: not `staging clean` (force or not), not the
+        // Nothing releases them: not `stage clean` (force or not), not the
         // release after a write, not the unit-scoped forms.
         let force = clean_staging(&s.w.conn, &s.w.config, true, CleanScope::Whole).unwrap();
         assert_eq!(force.sets_cleaned, 0, "{force:?}");
@@ -4200,7 +4200,7 @@ mod tests {
 
     /// A rewrite a hard kill left at `staged` (the source not yet retired)
     /// holds nothing: the source is an intact copy, the staged slices are a
-    /// second one, and `staging clean` may release them.
+    /// second one, and `stage clean` may release them.
     #[test]
     fn a_rewrite_left_at_staged_by_a_hard_kill_holds_nothing() {
         use crate::staging::clean::{clean_staging, CleanScope};
@@ -4240,7 +4240,7 @@ mod tests {
     fn resume_closes_a_rewrite_whose_slices_were_released_because_a_copy_exists_elsewhere() {
         use crate::staging::clean::{clean_staging, CleanScope};
         // Shape (a): a copies-elsewhere rewrite fails at the init; the other
-        // copy is fully read back, so `staging clean` releases the slices.
+        // copy is fully read back, so `stage clean` releases the slices.
         let s = scene(1);
         copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
         copy_elsewhere(&s, &s.docs, &[3], true, "OTHER-B");

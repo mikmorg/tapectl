@@ -202,7 +202,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
 
     // Dotfiles that cannot be READ (issue #211's residual). Since #211 an
     // unrecognised `[policy]` key is a hard `PolicyUnresolvable` for `audit`,
-    // `stage create` and `unit status` — so `config check`, the command run
+    // `stage create` and `unit info` — so `config check`, the command run
     // precisely to find bad configuration, must not be the one place that
     // stays silent about it. Advisory: reported, never an exit-code change.
     let unreadable_dotfiles = if paths.db_file.exists() {
@@ -631,7 +631,7 @@ fn print_human(
             .find(|(name, _)| *name == check.backend_name)
         {
             println!(
-                "  backend \"{}\": device_sg is not set; derived {node} from device_tape \
+                "  drive \"{}\": device_sg is not set; derived {node} from device_tape \
                  (the kernel's binding, read from sysfs)",
                 check.backend_name
             );
@@ -648,7 +648,7 @@ fn print_human(
     }
     for name in capacity_override_hits {
         println!(
-            "warning: backend \"{name}\" sets capacity_override — intended \
+            "warning: drive \"{name}\" sets capacity_override — intended \
              for virtual drives (mhvtl) only; a real drive's capacity should \
              come from the loaded cartridge's detected generation (ADR-0010)."
         );
@@ -886,7 +886,7 @@ mod tests {
         let broken = line_for(&config_for(present.to_str().unwrap()));
         assert!(broken.starts_with("warning: "), "{broken}");
         assert!(
-            broken.contains("volume write refuses this backend"),
+            broken.contains("volume write refuses this drive"),
             "{broken}"
         );
     }

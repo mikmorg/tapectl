@@ -38,7 +38,7 @@ pub enum CollectionCommands {
     /// (never deleted or retired — those are operator acts).
     Sync {
         /// Report what would change without mutating anything.
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 
@@ -103,9 +103,10 @@ pub enum CollectionCommands {
     /// confirmed); 1 when every copy sealed but a unit was refused for its
     /// dotfile; 75 when the catalog was busy before anything was written.
     Run {
-        /// Collection name.
-        #[arg(long)]
-        collection: String,
+        /// The collection to run. Defaults to the only configured
+        /// collection; with several configured, name one.
+        #[arg(value_name = "NAME")]
+        collection: Option<String>,
         /// Which batch to execute (0 = first). Numbered against THIS run's
         /// own budget — the destination `--label` volumes' recorded
         /// capacity, not the drive's generation. This matches
@@ -249,7 +250,7 @@ pub fn run(
             conn,
             paths,
             &config.with_fill_ceiling(*fill_ceiling),
-            name,
+            name.as_deref(),
             *batch,
             labels,
             &crate::cli::write_device(config, device.as_deref())?,
@@ -570,7 +571,7 @@ const SPAN_COUNT_CAVEAT: &str = "the count is a minimum: a unit that spans conti
 
 /// Every file the run's release could not remove (issue #108): the
 /// whole-set release's and the per-slice release's. Their `staging_path`
-/// rows are already nulled, so no later `staging clean` can find them.
+/// rows are already nulled, so no later `stage clean` can find them.
 fn stranded_paths(report: &collection::batch::BatchExecutionReport) -> Vec<&std::path::Path> {
     report
         .cleaned
@@ -589,7 +590,7 @@ fn stranded_warning(label: &str, stranded: &[&std::path::Path]) -> Option<String
     }
     let mut msg = format!(
         "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} staged \
-         file(s) could NOT be removed and no later `staging clean` can find them. Remove by hand:",
+         file(s) could NOT be removed and no later `stage clean` can find them. Remove by hand:",
         stranded.len()
     );
     for p in stranded {
@@ -747,7 +748,7 @@ fn cmd_run(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
-    collection_name: &str,
+    collection_name: Option<&str>,
     batch_idx: usize,
     labels: &[String],
     device: &str,
@@ -775,7 +776,8 @@ fn cmd_run(
         }
         None => config,
     };
-    let lib = collection::find_collection(config, collection_name)?;
+    let lib = collection::collection_to_run(config, collection_name)?;
+    let collection_name = lib.name.as_str();
     // No `--generation` here: `collection run` writes to volumes that are
     // already `volume init`-ed, so each destination's real capacity is on
     // its own `volumes.capacity_bytes` row (ADR-0010) — `plan_for_run`
@@ -946,7 +948,7 @@ fn cmd_run(
                 })).collect::<Vec<_>>(),
                 // #478 (ADR-0012 item 129): slices released on their own from
                 // sets that span cartridges, and those still short of copies.
-                // Always present, as `staging clean --json` gives them.
+                // Always present, as `stage clean --json` gives them.
                 "slices_released": crate::cli::staging::slice_runs_json(&report.slices.slices_released),
                 "slices_short": crate::cli::staging::slice_runs_json(&report.slices.slices_short),
                 // Issue #108: the paths, not a count; nothing will find them
@@ -1563,7 +1565,7 @@ mod checksum_mode_tests {
     }
 
     /// #478 (ADR-0012 item 129): `collection run` names each spanning set's
-    /// slices released and kept in `staging clean`'s words, and nothing
+    /// slices released and kept in `stage clean`'s words, and nothing
     /// when there were none.
     #[test]
     fn the_run_names_the_per_slice_release_as_staging_clean_does() {

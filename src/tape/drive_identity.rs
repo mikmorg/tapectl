@@ -400,7 +400,7 @@ pub fn unresolved_sg_problem(backend: &LtoBackendConfig) -> String {
         "it does not exist on this machine (is the drive attached?)"
     };
     format!(
-        "backend \"{name}\": device_sg is not set and cannot be derived from device_tape = \
+        "drive \"{name}\": device_sg is not set and cannot be derived from device_tape = \
          {tape} — {why}. The cartridge chip (MAM) and the drive's log pages are read \
          through the sg node, so tapectl will not guess one. Set device_sg = \"/dev/sgN\" \
          in this [[backends.lto]] entry (`lsscsi -g` lists the nodes).",
@@ -453,7 +453,7 @@ fn pairing_problem(
         return None;
     }
     Some(format!(
-        "backend \"{name}\": device_sg = {configured_sg} is not the drive device_tape = \
+        "drive \"{name}\": device_sg = {configured_sg} is not the drive device_tape = \
          {device_tape} names — the kernel binds that tape node to {}. Its cartridge chip (MAM) \
          and log pages would be read from a different device (/dev/sgN numbering moves across \
          reboots). Set device_sg = \"{}\" in this [[backends.lto]] entry, or remove the \
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(b.device_sg, "");
 
         let problem = sg_pairing_problem(&b).expect("an empty device_sg is a problem");
-        assert!(problem.contains("backend \"lto0\""), "{problem}");
+        assert!(problem.contains("drive \"lto0\""), "{problem}");
         assert!(problem.contains("device_sg is not set"), "{problem}");
         assert!(problem.contains(&b.device_tape), "{problem}");
         assert!(problem.contains("Set device_sg"), "{problem}");

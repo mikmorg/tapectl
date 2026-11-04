@@ -1,54 +1,46 @@
-use clap::Subcommand;
 use rusqlite::{params, params_from_iter, Connection};
-use serde::Serialize;
-use tabled::{Table, Tabled};
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::staging::clean;
 
-#[derive(Subcommand, Debug)]
-pub enum StagingCommands {
-    /// Show staging area status
-    Status,
+/// What `stage clean` releases: its flags.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct CleanArgs {
+    /// Clean all staged sets, not just those with completed writes;
+    /// also releases a unit's staged data that a bare `stage clean`
+    /// would otherwise retain for being below its copy floor (the
+    /// larger of its policy's min_copies and the sum of its copies_at
+    /// targets, times the tape-only multiplier for a tape-only unit)
+    #[arg(long)]
+    pub force: bool,
 
-    /// Clean staged files from disk
-    Clean {
-        /// Clean all staged sets, not just those with completed writes;
-        /// also releases a unit's staged data that a bare `staging clean`
-        /// would otherwise retain for being below its copy floor (the
-        /// larger of its policy's min_copies and the sum of its copies_at
-        /// targets, times the tape-only multiplier for a tape-only unit)
-        #[arg(long)]
-        force: bool,
+    /// Narrow which staged sets are considered for release to this
+    /// unit (repeatable). Without `--force`, the same
+    /// copy-floor split still applies within the named unit(s): one
+    /// below its own copy floor keeps its staged bytes
+    /// retained (pass `--force` to release it too, exactly as for the
+    /// whole-archive form). A `'failed'` stage_set is always swept
+    /// regardless of this scope -- see `CleanScope::Units`'s own
+    /// contract in `src/staging/clean.rs`. An unknown unit name is an
+    /// error, not a silent no-op.
+    #[arg(long = "unit")]
+    pub unit: Vec<String>,
 
-        /// Narrow which staged sets are considered for release to this
-        /// unit (repeatable). Without `--force`, the same
-        /// copy-floor split still applies within the named unit(s): one
-        /// below its own copy floor keeps its staged bytes
-        /// retained (pass `--force` to release it too, exactly as for the
-        /// whole-archive form). A `'failed'` stage_set is always swept
-        /// regardless of this scope -- see `CleanScope::Units`'s own
-        /// contract in `src/staging/clean.rs`. An unknown unit name is an
-        /// error, not a silent no-op.
-        #[arg(long = "unit")]
-        unit: Vec<String>,
-
-        /// Narrow release further, to just this snapshot version within
-        /// the single unit named by `--unit`. Requires
-        /// exactly one `--unit`; zero or more than one is a usage error
-        /// naming the constraint, never a silent widening back to
-        /// unit-level scope. Exists so a `--force` release meant for one
-        /// under-written version of a unit can never also release a
-        /// DIFFERENT, still-unwritten version of that same unit -- see
-        /// `CleanScope::UnitVersion`'s contract in `src/staging/clean.rs`.
-        #[arg(long = "version")]
-        version: Option<i64>,
-    },
+    /// Narrow release further, to just this snapshot version within
+    /// the single unit named by `--unit`. Requires
+    /// exactly one `--unit`; zero or more than one is a usage error
+    /// naming the constraint, never a silent widening back to
+    /// unit-level scope. Exists so a `--force` release meant for one
+    /// under-written version of a unit can never also release a
+    /// DIFFERENT, still-unwritten version of that same unit -- see
+    /// `CleanScope::UnitVersion`'s contract in `src/staging/clean.rs`.
+    #[arg(long = "version")]
+    pub version: Option<i64>,
 }
 
 /// One unit whose eligible copy count is below its own resolved
-/// `min_copies`, among the units a non-force `staging clean` is about to
+/// `min_copies`, among the units a non-force `stage clean` is about to
 /// consider releasing staging for (issue #244, `docs/adr/0012-...md`'s
 /// 2026-09-17 amendment). Since issue #262, this unit's own staged bytes
 /// are RETAINED rather than causing the whole command to refuse; every
@@ -76,13 +68,13 @@ struct UnderCopiedUnit {
 ///
 /// `unit_filter`, when `Some`, narrows the candidate set to just those unit
 /// ids (issue #274's `--unit`) -- the SAME query, not a second one, so a
-/// `--unit`-scoped `staging clean` and the whole-archive form can never
+/// `--unit`-scoped `stage clean` and the whole-archive form can never
 /// disagree about what counts as a release candidate (issue #96). `None`
 /// reproduces the unfiltered, whole-archive query verbatim.
 ///
 /// Returns `(unit id, unit name)` pairs. Shared by
 /// [`under_copied_release_candidates`] (which unit_names to check) and
-/// `StagingCommands::Clean`'s non-force path (the full candidate set, so it
+/// `stage clean`'s non-force path (the full candidate set, so it
 /// can compute "covered" = candidates minus under-copied).
 fn staged_release_candidate_units(
     conn: &Connection,
@@ -140,7 +132,7 @@ fn under_copied_release_candidates(
     for (_, name) in candidates {
         let unit = crate::db::queries::get_unit_by_name(conn, &name)?.ok_or_else(|| {
             TapectlError::Other(format!(
-                "staging clean: unit \"{name}\" has a staged stage_set but is missing \
+                "stage clean: unit \"{name}\" has a staged stage_set but is missing \
                  from the catalog -- the catalog is inconsistent"
             ))
         })?;
@@ -173,7 +165,7 @@ fn under_copied_release_candidates(
 /// The scope actually passed to [`clean::clean_staging`] when releasing
 /// `ids` (issue #278). Ordinarily this is just `CleanScope::Units(ids)` --
 /// but when a `--version` was given, `ids` is guaranteed (by the pairing
-/// check in `StagingCommands::Clean`'s handler) to be exactly the one unit
+/// check in `stage clean`'s handler) to be exactly the one unit
 /// id that version belongs to, so the release narrows one step further, to
 /// `CleanScope::UnitVersion`, matching only that unit's stage_set at that
 /// version rather than every `'staged'` set the unit has.
@@ -188,9 +180,8 @@ fn release_scope(ids: &[i64], version: Option<i64>) -> clean::CleanScope<'_> {
 }
 
 /// Lines naming each retained unit and its shortfall, for both the
-/// human-readable report and the JSON `"retained"` array. Factored out --
-/// like [`staging_rows_to_json`] below -- so a test can assert on the exact
-/// wording without scraping `println!` output.
+/// human-readable report and the JSON `"retained"` array. Factored out so a
+/// test can assert on the exact wording without scraping `println!` output.
 fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
     let mut msg = format!(
         "retained {} unit(s) below their policy's copy floor -- not cleaned; \
@@ -241,430 +232,262 @@ pub(crate) fn slice_release_notice(report: &clean::CleanReport) -> String {
     msg
 }
 
-/// `staging status`'s line for a set released in part (#478).
-fn partly_released_notice(r: &StagingRow) -> String {
-    format!(
-        "stage set {} ({} v{}) spans cartridges and is released slice by slice: slice(s) {} \
-         released, {} still staged",
-        r.id,
-        r.unit,
-        r.version,
-        clean::describe_slice_numbers(&r.released_slices),
-        clean::describe_slice_numbers(&r.staged_slices),
-    )
-}
-
-#[derive(Tabled, Serialize)]
-struct StagingRow {
-    #[tabled(rename = "ID")]
-    #[serde(rename = "stage_set_id")]
-    id: i64,
-    #[tabled(rename = "Unit")]
-    unit: String,
-    #[tabled(rename = "Ver")]
-    version: i64,
-    #[tabled(rename = "Status")]
-    status: String,
-    #[tabled(rename = "Slices", display_with = "display_opt_i64")]
-    #[serde(rename = "num_slices")]
-    slices: Option<i64>,
-    #[tabled(rename = "Size (MiB)", display_with = "display_size_mb")]
-    #[serde(rename = "total_encrypted_size")]
-    encrypted_bytes: Option<i64>,
-    #[tabled(rename = "Writes")]
-    #[serde(rename = "write_count")]
-    writes: i64,
-    /// Table-only until CTO decision 2026-09-11 (architecture review C2
-    /// follow-up, C2b). Renamed to `staged_at` (not `staged`) to match its
-    /// sibling fields' convention in this struct — `id`/`slices`/
-    /// `encrypted_bytes`/`writes` all serialize under the fuller DB-native
-    /// name (`stage_set_id`/`num_slices`/`total_encrypted_size`/
-    /// `write_count`) rather than the short display-oriented field name.
-    #[tabled(rename = "Staged", display_with = "display_opt_string")]
-    #[serde(rename = "staged_at")]
-    staged: Option<String>,
-    /// Issue #402: what is wrong with a 'staged' set's files on disk —
-    /// empty when it is whole. Printed below the table, not in it.
-    #[tabled(skip)]
-    #[serde(rename = "on_disk_problems")]
-    problems: Vec<String>,
-    /// The command that makes the set whole again; `null` when it is.
-    #[tabled(skip)]
-    remedy: Option<String>,
-    /// #478 (ADR-0012 item 129): a set released in part, slice by slice —
-    /// the slice numbers released. Empty unless it was. Printed below the
-    /// table, not in it.
-    #[tabled(skip)]
-    released_slices: Vec<i64>,
-    /// With `released_slices`, the slice numbers still staged; empty when it
-    /// is.
-    #[tabled(skip)]
-    staged_slices: Vec<i64>,
-}
-
-fn display_opt_string(v: &Option<String>) -> String {
-    v.clone().unwrap_or_default()
-}
-
-fn display_opt_i64(v: &Option<i64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_default()
-}
-
-fn display_size_mb(v: &Option<i64>) -> String {
-    v.map(|s| (s / (1024 * 1024)).to_string())
-        .unwrap_or_default()
-}
-
-/// `staging status --json` shape. Change 1 already types `slices` and
-/// `encrypted_bytes` as `Option<i64>` (rather than the pre-formatted display
-/// strings the table needs) because the MiB division the table performs is
-/// lossy -- a string-typed intermediate row could not reconstruct the exact
-/// byte count the JSON contract requires, so there is no honest "verbatim,
-/// then retype later" split for this one field. The row is built once in
-/// `run` and shared by both the table and JSON branches (issue: C2
-/// row-listing drift; previously the JSON branch read straight from the
-/// query results and the table branch built `StagingRow` separately from
-/// the same source, which is how #125-style drift happens even without a
-/// hand-rolled reverse-parse). `staged` (JSON `staged_at`) was table-only
-/// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
-fn staging_rows_to_json(rows: &[StagingRow]) -> serde_json::Value {
-    serde_json::to_value(rows).unwrap()
-}
-
-pub fn run(
+/// `stage clean`: release staged slices from disk, keeping a unit's below
+/// its copy floor unless `--force`.
+pub fn clean(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
-    command: &StagingCommands,
+    args: &CleanArgs,
     json_output: bool,
     dry_run: bool,
 ) -> Result<()> {
-    match command {
-        StagingCommands::Status => {
-            let info = clean::staging_status(conn)?;
-            let rows: Vec<StagingRow> = info
+    let CleanArgs {
+        force,
+        unit,
+        version,
+    } = args;
+    // Issue #241: the #244 min_copies gate right below must
+    // reproduce exactly, or a dry run would claim a release is
+    // safe when the real run refuses it (or vice versa) — "a dry
+    // run that hides a refusal is worse than no dry run".
+    if dry_run {
+        return Err(crate::cli::refuse_dry_run(
+            "stage clean",
+            "it enforces the min_copies release gate, which a preview would \
+             have to reproduce exactly or risk being wrong.",
+        ));
+    }
+
+    // Issue #274: resolve every named `--unit` up front, eagerly --
+    // an unknown name is an error naming the unit, never silently
+    // ignored (it would otherwise just vanish from the narrowed
+    // candidate set below and look like "nothing to clean").
+    let named_ids: Vec<i64> = unit
+        .iter()
+        .map(|name| {
+            crate::db::queries::get_unit_by_name(conn, name)?
+                .map(|u| u.id)
+                .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))
+        })
+        .collect::<Result<Vec<i64>>>()?;
+
+    // Issue #278: `--version` only ever narrows within a SINGLE
+    // named unit -- it says nothing about which unit if more than
+    // one (or none) was named, so that pairing is a usage error
+    // naming the constraint, never a silent fallback to unit-level
+    // scope or to `--version`'s first/only unit guessed some other
+    // way.
+    if version.is_some() && named_ids.len() != 1 {
+        return Err(TapectlError::Other(format!(
+            "`--version` requires exactly one `--unit` naming the unit that \
+             version belongs to, got {} -- pass exactly one `--unit <name>` \
+             alongside `--version <N>`, or drop `--version` to scope by unit alone",
+            named_ids.len()
+        )));
+    }
+
+    // `None` here is exactly the pre-#274 unscoped path -- every
+    // branch below falls back to `CleanScope::Whole` in that case,
+    // reproducing today's output and `CleanScope::Whole`/
+    // covered-ids calls verbatim for a bare `stage clean`.
+    let unit_scope: Option<&[i64]> = if named_ids.is_empty() {
+        None
+    } else {
+        Some(named_ids.as_slice())
+    };
+
+    // Issue #244, ADR-0012's 2026-09-17 amendment, revised by issue
+    // #262: a unit below its own resolved min_copies must have its
+    // staged bytes RETAINED, but that no longer refuses the WHOLE
+    // command -- every other candidate unit that already meets its
+    // own min_copies is released. `--force` is unaffected: it still
+    // releases everything in scope, including under-copied units,
+    // exactly as before.
+    //
+    // `clean_staging` itself stays policy-free (#238's conclusion
+    // for `execute_batch`, restated by ADR-0012's amendment): this
+    // function decides WHICH units are covered, then hands that
+    // selection to `clean_staging` via `CleanScope::Units` -- never
+    // a policy decision inside `clean_staging` itself. `'failed'`
+    // stage_sets carry no copy requirement at all, so they are
+    // swept by `clean_staging` regardless of this scope (issue
+    // #262's ruling on `CleanScope::Units`).
+    let (mut report, retained): (clean::CleanReport, Vec<UnderCopiedUnit>) = if *force {
+        let scope = match unit_scope {
+            Some(ids) => release_scope(ids, *version),
+            None => clean::CleanScope::Whole,
+        };
+        (clean::clean_staging(conn, config, true, scope)?, Vec::new())
+    } else {
+        let candidates = staged_release_candidate_units(conn, unit_scope)?;
+        let under_copied = under_copied_release_candidates(conn, config, unit_scope)?;
+        if under_copied.is_empty() {
+            // Nobody in scope is under-copied -- identical to the
+            // pre-#262 behaviour when unscoped, and still narrowed
+            // to exactly the named units when `--unit` was given
+            // (never widened to `Whole` just because nothing here
+            // needed retaining).
+            let scope = match unit_scope {
+                Some(ids) => release_scope(ids, *version),
+                None => clean::CleanScope::Whole,
+            };
+            (
+                clean::clean_staging(conn, config, false, scope)?,
+                Vec::new(),
+            )
+        } else {
+            let under_ids: std::collections::HashSet<i64> =
+                under_copied.iter().map(|u| u.unit_id).collect();
+            // The candidates are the whole-set rule's
+            // (`release_candidate_predicate_sql`): a set holding a
+            // range is never one, it is released slice by slice
+            // below, whatever this split decides.
+            let covered_ids: Vec<i64> = candidates
                 .into_iter()
-                .map(|i| StagingRow {
-                    id: i.stage_set_id,
-                    unit: i.unit_name,
-                    version: i.version,
-                    status: i.status,
-                    slices: i.num_slices,
-                    encrypted_bytes: i.total_encrypted_size,
-                    writes: i.write_count,
-                    staged: i.staged_at,
-                    problems: i.on_disk_problems,
-                    remedy: i.remedy,
-                    released_slices: i.released_slices,
-                    staged_slices: i.staged_slices,
-                })
+                .map(|(id, _)| id)
+                .filter(|id| !under_ids.contains(id))
                 .collect();
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&staging_rows_to_json(&rows)).unwrap()
-                );
-            } else if rows.is_empty() {
-                println!("no staged data");
-            } else {
-                // Issue #402: a staged set that is not whole on disk cannot
-                // be written (`volume write` refuses it) — say so here,
-                // where the operator looks before a write.
-                let broken: Vec<String> = rows
-                    .iter()
-                    .filter(|r| !r.problems.is_empty())
-                    .map(|r| {
-                        let mut s = format!(
-                            "stage set {} ({} v{}) is NOT whole on disk — `volume write` \
-                             will refuse it:",
-                            r.id, r.unit, r.version
-                        );
-                        for p in &r.problems {
-                            s.push_str(&format!("\n  - {p}"));
-                        }
-                        if let Some(remedy) = &r.remedy {
-                            s.push_str(&format!("\n  remedy: {remedy}"));
-                        }
-                        s
-                    })
-                    .collect();
-                // #478 (ADR-0012 item 129): a set that spans cartridges is
-                // released slice by slice, and stays 'staged' until its last
-                // slice goes.
-                let partly: Vec<String> = rows
-                    .iter()
-                    .filter(|r| !r.released_slices.is_empty())
-                    .map(partly_released_notice)
-                    .collect();
-                println!("{}", Table::new(rows));
-                for b in broken {
-                    println!("{b}");
-                }
-                for p in partly {
-                    println!("{p}");
-                }
+            // `covered_ids` may be empty (every candidate is
+            // under-copied) -- still call `clean_staging`, never
+            // skip it, because its `'failed'` sweep is
+            // unconditional and must run regardless.
+            (
+                clean::clean_staging(conn, config, false, clean::CleanScope::Units(&covered_ids))?,
+                under_copied,
+            )
+        }
+    };
+    // #478 (ADR-0012 items 85 and 129; ruling X15): the sets that
+    // hold a range are released slice by slice, each slice once its
+    // copies meet its unit's floor, over the whole scope and
+    // whatever the min_copies split above decided. `--force` has
+    // already released them whole.
+    if !*force {
+        let scope = match unit_scope {
+            Some(ids) => release_scope(ids, *version),
+            None => clean::CleanScope::Whole,
+        };
+        report.absorb(crate::staging::release::release_ranges(
+            conn, config, scope,
+        )?);
+    }
+    clean::reclaim_session_dirs_and_lockfiles(conn, config, &paths.db_file, *force, &mut report)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "sets_cleaned": report.sets_cleaned,
+                "files_removed": report.files_removed,
+                "bytes_freed": report.bytes_freed,
+                "errors": report.errors,
+                "session_dirs_reclaimed": report.session_dirs_reclaimed,
+                "session_dirs_retained": report.session_dirs_retained,
+                "session_dirs_orphaned": report.session_dirs_orphaned,
+                // Issue #402: kept for a sealed, aborted session
+                // `volume resume` can still re-confirm.
+                "session_dirs_awaiting_reconfirm": report.session_dirs_awaiting_reconfirm,
+                "lockfiles_reclaimed": report.lockfiles_reclaimed,
+                // Issue #465 item 5: a killed run's catalogue
+                // directories and <home>/tmp entries a day old.
+                "home_leftovers_reclaimed": report.home_leftovers_reclaimed,
+                // Issue #108: nothing will ever rediscover these,
+                // so a scripted consumer needs the paths, not a count.
+                "stranded": report.stranded,
+                // Issue #376: stage sets a live session is using,
+                // never released, `--force` or not.
+                "held_by_live_session": report.held_by_live_session.iter().map(|(id, labels)| serde_json::json!({
+                    "stage_set_id": id,
+                    "volumes": labels,
+                })).collect::<Vec<_>>(),
+                // Issue #483: stage sets a pending `volume rewrite`
+                // holds (they may be the only copy until its new
+                // volume has passed a full readback), never
+                // released, `--force` or not.
+                "held_by_pending_rewrite": report.held_by_pending_rewrite.iter().map(|(id, hold)| serde_json::json!({
+                    "stage_set_id": id,
+                    "source": hold.source,
+                    "destination": hold.destination,
+                    "resume": hold.resume_command(),
+                })).collect::<Vec<_>>(),
+                // Issue #262: units whose staged bytes were
+                // retained because they have not met their
+                // resolved min_copies. Always present (empty when
+                // nothing was retained) so a scripted consumer
+                // never has to branch on whether the key exists.
+                "retained": retained.iter().map(|u| serde_json::json!({
+                    "unit": u.unit_name,
+                    "copies": u.copies,
+                    "min_copies": u.min_copies,
+                })).collect::<Vec<_>>(),
+                // #478 (ADR-0012 item 129): slices released on their
+                // own from sets that span cartridges, and those
+                // still short of copies. Always present.
+                "slices_released": slice_runs_json(&report.slices_released),
+                "slices_short": slice_runs_json(&report.slices_short),
+            })
+        );
+    } else {
+        println!(
+            "cleaned {} stage set(s), {} files removed, {} freed",
+            report.sets_cleaned,
+            report.files_removed,
+            crate::util::format_bytes_binary(report.bytes_freed),
+        );
+        println!(
+            "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed; \
+             {} leftovers of killed runs removed",
+            report.session_dirs_reclaimed,
+            report.session_dirs_retained,
+            report.session_dirs_orphaned,
+            report.lockfiles_reclaimed,
+            report.home_leftovers_reclaimed,
+        );
+        if report.errors > 0 {
+            println!("  {} errors", report.errors);
+        }
+        // Issue #402: a sealed tape whose aborted session can still
+        // be counted — its frozen layout stays until then.
+        for label in &report.session_dirs_awaiting_reconfirm {
+            println!(
+                "  session of volume \"{label}\" kept: its tape is sealed and `tapectl \
+                 volume resume {label}` can re-confirm it after a clean `tapectl volume \
+                 verify {label} --full` (`--force` removes it, forfeiting that)"
+            );
+        }
+        // Issue #376: a live session's slices are never released —
+        // a fact, not a judgement, so `--force` does not reach it.
+        for (id, labels) in &report.held_by_live_session {
+            println!(
+                "  stage set {id} kept: a live session is using it on volume(s) {} \
+                 (`--force` does not apply; run this again once it has finished)",
+                labels.join(", ")
+            );
+        }
+        // Issue #483 (ADR-0012 2026-10-19 item 106): a pending
+        // rewrite's staged slices may be the only copy of a unit.
+        for (id, hold) in &report.held_by_pending_rewrite {
+            println!("  {}", hold.describe(*id));
+        }
+        // Issue #108: `stage clean` nulls `staging_path` before it
+        // unlinks, so a file whose unlink failed can never be found
+        // by a later clean. This printout is the operator's only
+        // notice, which is why it names every path rather than
+        // reporting a count.
+        if !report.stranded.is_empty() {
+            println!(
+                "  {} file(s) could NOT be removed and are now stranded permanently —",
+                report.stranded.len()
+            );
+            println!("  no future `stage clean` can find them. Remove by hand:");
+            for p in &report.stranded {
+                println!("    {}", p.display());
             }
         }
-
-        StagingCommands::Clean {
-            force,
-            unit,
-            version,
-        } => {
-            // Issue #241: the #244 min_copies gate right below must
-            // reproduce exactly, or a dry run would claim a release is
-            // safe when the real run refuses it (or vice versa) — "a dry
-            // run that hides a refusal is worse than no dry run".
-            if dry_run {
-                return Err(crate::cli::refuse_dry_run(
-                    "staging clean",
-                    "it enforces the min_copies release gate, which a preview would \
-                     have to reproduce exactly or risk being wrong.",
-                ));
-            }
-
-            // Issue #274: resolve every named `--unit` up front, eagerly --
-            // an unknown name is an error naming the unit, never silently
-            // ignored (it would otherwise just vanish from the narrowed
-            // candidate set below and look like "nothing to clean").
-            let named_ids: Vec<i64> = unit
-                .iter()
-                .map(|name| {
-                    crate::db::queries::get_unit_by_name(conn, name)?
-                        .map(|u| u.id)
-                        .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))
-                })
-                .collect::<Result<Vec<i64>>>()?;
-
-            // Issue #278: `--version` only ever narrows within a SINGLE
-            // named unit -- it says nothing about which unit if more than
-            // one (or none) was named, so that pairing is a usage error
-            // naming the constraint, never a silent fallback to unit-level
-            // scope or to `--version`'s first/only unit guessed some other
-            // way.
-            if version.is_some() && named_ids.len() != 1 {
-                return Err(TapectlError::Other(format!(
-                    "`--version` requires exactly one `--unit` naming the unit that \
-                     version belongs to, got {} -- pass exactly one `--unit <name>` \
-                     alongside `--version <N>`, or drop `--version` to scope by unit alone",
-                    named_ids.len()
-                )));
-            }
-
-            // `None` here is exactly the pre-#274 unscoped path -- every
-            // branch below falls back to `CleanScope::Whole` in that case,
-            // reproducing today's output and `CleanScope::Whole`/
-            // covered-ids calls verbatim for a bare `staging clean`.
-            let unit_scope: Option<&[i64]> = if named_ids.is_empty() {
-                None
-            } else {
-                Some(named_ids.as_slice())
-            };
-
-            // Issue #244, ADR-0012's 2026-09-17 amendment, revised by issue
-            // #262: a unit below its own resolved min_copies must have its
-            // staged bytes RETAINED, but that no longer refuses the WHOLE
-            // command -- every other candidate unit that already meets its
-            // own min_copies is released. `--force` is unaffected: it still
-            // releases everything in scope, including under-copied units,
-            // exactly as before.
-            //
-            // `clean_staging` itself stays policy-free (#238's conclusion
-            // for `execute_batch`, restated by ADR-0012's amendment): this
-            // function decides WHICH units are covered, then hands that
-            // selection to `clean_staging` via `CleanScope::Units` -- never
-            // a policy decision inside `clean_staging` itself. `'failed'`
-            // stage_sets carry no copy requirement at all, so they are
-            // swept by `clean_staging` regardless of this scope (issue
-            // #262's ruling on `CleanScope::Units`).
-            let (mut report, retained): (clean::CleanReport, Vec<UnderCopiedUnit>) = if *force {
-                let scope = match unit_scope {
-                    Some(ids) => release_scope(ids, *version),
-                    None => clean::CleanScope::Whole,
-                };
-                (clean::clean_staging(conn, config, true, scope)?, Vec::new())
-            } else {
-                let candidates = staged_release_candidate_units(conn, unit_scope)?;
-                let under_copied = under_copied_release_candidates(conn, config, unit_scope)?;
-                if under_copied.is_empty() {
-                    // Nobody in scope is under-copied -- identical to the
-                    // pre-#262 behaviour when unscoped, and still narrowed
-                    // to exactly the named units when `--unit` was given
-                    // (never widened to `Whole` just because nothing here
-                    // needed retaining).
-                    let scope = match unit_scope {
-                        Some(ids) => release_scope(ids, *version),
-                        None => clean::CleanScope::Whole,
-                    };
-                    (
-                        clean::clean_staging(conn, config, false, scope)?,
-                        Vec::new(),
-                    )
-                } else {
-                    let under_ids: std::collections::HashSet<i64> =
-                        under_copied.iter().map(|u| u.unit_id).collect();
-                    // The candidates are the whole-set rule's
-                    // (`release_candidate_predicate_sql`): a set holding a
-                    // range is never one, it is released slice by slice
-                    // below, whatever this split decides.
-                    let covered_ids: Vec<i64> = candidates
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .filter(|id| !under_ids.contains(id))
-                        .collect();
-                    // `covered_ids` may be empty (every candidate is
-                    // under-copied) -- still call `clean_staging`, never
-                    // skip it, because its `'failed'` sweep is
-                    // unconditional and must run regardless.
-                    (
-                        clean::clean_staging(
-                            conn,
-                            config,
-                            false,
-                            clean::CleanScope::Units(&covered_ids),
-                        )?,
-                        under_copied,
-                    )
-                }
-            };
-            // #478 (ADR-0012 items 85 and 129; ruling X15): the sets that
-            // hold a range are released slice by slice, each slice once its
-            // copies meet its unit's floor, over the whole scope and
-            // whatever the min_copies split above decided. `--force` has
-            // already released them whole.
-            if !*force {
-                let scope = match unit_scope {
-                    Some(ids) => release_scope(ids, *version),
-                    None => clean::CleanScope::Whole,
-                };
-                report.absorb(crate::staging::release::release_ranges(
-                    conn, config, scope,
-                )?);
-            }
-            clean::reclaim_session_dirs_and_lockfiles(
-                conn,
-                config,
-                &paths.db_file,
-                *force,
-                &mut report,
-            )?;
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "sets_cleaned": report.sets_cleaned,
-                        "files_removed": report.files_removed,
-                        "bytes_freed": report.bytes_freed,
-                        "errors": report.errors,
-                        "session_dirs_reclaimed": report.session_dirs_reclaimed,
-                        "session_dirs_retained": report.session_dirs_retained,
-                        "session_dirs_orphaned": report.session_dirs_orphaned,
-                        // Issue #402: kept for a sealed, aborted session
-                        // `volume resume` can still re-confirm.
-                        "session_dirs_awaiting_reconfirm": report.session_dirs_awaiting_reconfirm,
-                        "lockfiles_reclaimed": report.lockfiles_reclaimed,
-                        // Issue #465 item 5: a killed run's catalogue
-                        // directories and <home>/tmp entries a day old.
-                        "home_leftovers_reclaimed": report.home_leftovers_reclaimed,
-                        // Issue #108: nothing will ever rediscover these,
-                        // so a scripted consumer needs the paths, not a count.
-                        "stranded": report.stranded,
-                        // Issue #376: stage sets a live session is using,
-                        // never released, `--force` or not.
-                        "held_by_live_session": report.held_by_live_session.iter().map(|(id, labels)| serde_json::json!({
-                            "stage_set_id": id,
-                            "volumes": labels,
-                        })).collect::<Vec<_>>(),
-                        // Issue #483: stage sets a pending `volume rewrite`
-                        // holds (they may be the only copy until its new
-                        // volume has passed a full readback), never
-                        // released, `--force` or not.
-                        "held_by_pending_rewrite": report.held_by_pending_rewrite.iter().map(|(id, hold)| serde_json::json!({
-                            "stage_set_id": id,
-                            "source": hold.source,
-                            "destination": hold.destination,
-                            "resume": hold.resume_command(),
-                        })).collect::<Vec<_>>(),
-                        // Issue #262: units whose staged bytes were
-                        // retained because they have not met their
-                        // resolved min_copies. Always present (empty when
-                        // nothing was retained) so a scripted consumer
-                        // never has to branch on whether the key exists.
-                        "retained": retained.iter().map(|u| serde_json::json!({
-                            "unit": u.unit_name,
-                            "copies": u.copies,
-                            "min_copies": u.min_copies,
-                        })).collect::<Vec<_>>(),
-                        // #478 (ADR-0012 item 129): slices released on their
-                        // own from sets that span cartridges, and those
-                        // still short of copies. Always present.
-                        "slices_released": slice_runs_json(&report.slices_released),
-                        "slices_short": slice_runs_json(&report.slices_short),
-                    })
-                );
-            } else {
-                println!(
-                    "cleaned {} stage set(s), {} files removed, {} freed",
-                    report.sets_cleaned,
-                    report.files_removed,
-                    crate::util::format_bytes_binary(report.bytes_freed),
-                );
-                println!(
-                    "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed; \
-                     {} leftovers of killed runs removed",
-                    report.session_dirs_reclaimed,
-                    report.session_dirs_retained,
-                    report.session_dirs_orphaned,
-                    report.lockfiles_reclaimed,
-                    report.home_leftovers_reclaimed,
-                );
-                if report.errors > 0 {
-                    println!("  {} errors", report.errors);
-                }
-                // Issue #402: a sealed tape whose aborted session can still
-                // be counted — its frozen layout stays until then.
-                for label in &report.session_dirs_awaiting_reconfirm {
-                    println!(
-                        "  session of volume \"{label}\" kept: its tape is sealed and `tapectl \
-                         volume resume {label}` can re-confirm it after a clean `tapectl volume \
-                         verify {label} --full` (`--force` removes it, forfeiting that)"
-                    );
-                }
-                // Issue #376: a live session's slices are never released —
-                // a fact, not a judgement, so `--force` does not reach it.
-                for (id, labels) in &report.held_by_live_session {
-                    println!(
-                        "  stage set {id} kept: a live session is using it on volume(s) {} \
-                         (`--force` does not apply; run this again once it has finished)",
-                        labels.join(", ")
-                    );
-                }
-                // Issue #483 (ADR-0012 2026-10-19 item 106): a pending
-                // rewrite's staged slices may be the only copy of a unit.
-                for (id, hold) in &report.held_by_pending_rewrite {
-                    println!("  {}", hold.describe(*id));
-                }
-                // Issue #108: `staging clean` nulls `staging_path` before it
-                // unlinks, so a file whose unlink failed can never be found
-                // by a later clean. This printout is the operator's only
-                // notice, which is why it names every path rather than
-                // reporting a count.
-                if !report.stranded.is_empty() {
-                    println!(
-                        "  {} file(s) could NOT be removed and are now stranded permanently —",
-                        report.stranded.len()
-                    );
-                    println!("  no future `staging clean` can find them. Remove by hand:");
-                    for p in &report.stranded {
-                        println!("    {}", p.display());
-                    }
-                }
-                if !retained.is_empty() {
-                    print!("{}", retention_notice(&retained));
-                }
-                print!("{}", slice_release_notice(&report));
-            }
+        if !retained.is_empty() {
+            print!("{}", retention_notice(&retained));
         }
+        print!("{}", slice_release_notice(&report));
     }
     Ok(())
 }
@@ -764,7 +587,7 @@ mod tests {
     }
 
     /// **Originally "the failing test, before the fix" for issue #244;
-    /// revised for issue #262.** Before #244's fix, `StagingCommands::Clean`
+    /// revised for issue #262.** Before #244's fix, `stage clean`
     /// called `clean::clean_staging` with no policy lookup at all, and
     /// `clean_staging`'s own non-force guard (`EXISTS a writes row AND NOT
     /// EXISTS a non-completed one`) passed vacuously on exactly this shape,
@@ -784,11 +607,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: None,
@@ -799,7 +622,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "issue #262: a bare `staging clean` must not refuse the WHOLE \
+            "issue #262: a bare `stage clean` must not refuse the WHOLE \
              command just because one unit is under-copied -- it must still \
              succeed and merely retain this unit's staged bytes: {result:?}"
         );
@@ -872,11 +695,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: true,
                 unit: Vec::new(),
                 version: None,
@@ -957,7 +780,7 @@ mod tests {
     }
 
     /// **Issue #262's first negative control, written before the fix.**
-    /// Against pre-fix code, `staging clean` (no `--force`) refuses the
+    /// Against pre-fix code, `stage clean` (no `--force`) refuses the
     /// WHOLE command the instant ANY unit is under-copied -- releasing
     /// NOTHING, not even a completely unrelated unit that is fully
     /// covered. This seeds one covered unit ("testlib/covered", 2
@@ -991,11 +814,11 @@ mod tests {
         let under_path =
             seed_staged_unit_with_completed_writes(&conn, dir.path(), tenant_id, "testlib/solo", 1);
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: None,
@@ -1022,7 +845,7 @@ mod tests {
     /// **Issue #262's second negative control, written before the fix.** A
     /// `'failed'` stage_set carries no copy requirement at all --
     /// `clean_staging`'s own doc says it is swept unconditionally, `force`
-    /// or not. It must be swept by a bare `staging clean` even while a
+    /// or not. It must be swept by a bare `stage clean` even while a
     /// DIFFERENT unit is under-copied and retained. Must fail against
     /// unfixed code: the whole command refuses before `clean_staging` is
     /// ever reached, so the failed set's `.age` file survives and its
@@ -1075,11 +898,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: None,
@@ -1118,11 +941,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 1);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: None,
@@ -1174,11 +997,11 @@ mod tests {
             2,
         );
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: vec!["testlib/named".to_string()],
                 version: None,
@@ -1207,11 +1030,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: vec!["testlib/ghost".to_string()],
                 version: None,
@@ -1236,11 +1059,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: true,
                 unit: vec!["testlib/alpha".to_string()],
                 version: None,
@@ -1349,11 +1172,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: true,
                 unit: vec!["photos".to_string()],
                 version: Some(1),
@@ -1391,11 +1214,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: Some(1),
@@ -1433,11 +1256,11 @@ mod tests {
         let config = config_with_staging_dir_and_min_copies(dir.path(), 2);
         let paths = TapectlPaths::new(dir.path().to_path_buf());
 
-        let result = run(
+        let result = clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: vec!["testlib/one".to_string(), "testlib/two".to_string()],
                 version: Some(1),
@@ -1451,7 +1274,7 @@ mod tests {
         assert!(msg.contains("--unit"), "{msg}");
     }
 
-    /// #478 (ADR-0012 items 85 and 129): a bare `staging clean` releases a
+    /// #478 (ADR-0012 items 85 and 129): a bare `stage clean` releases a
     /// spanning set slice by slice: the slices tape 1's range gave their
     /// copies go, the others stay, and the report names both. A whole unit
     /// short of copies beside it is still retained by the min_copies split,
@@ -1473,11 +1296,11 @@ mod tests {
         let short = staged_version(&conn, beta, 1, "current", dir.path(), 0);
         add_write(&conn, &short, "V-B1", "initialized", "completed");
 
-        run(
+        clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: Vec::new(),
                 version: None,
@@ -1514,7 +1337,7 @@ mod tests {
         assert!(slice_release_notice(&clean::CleanReport::default()).is_empty());
     }
 
-    /// `staging clean --unit` narrows the per-slice release too: another
+    /// `stage clean --unit` narrows the per-slice release too: another
     /// unit's span is never reached.
     #[test]
     fn clean_with_unit_releases_only_that_units_span() {
@@ -1531,11 +1354,11 @@ mod tests {
         range_on(&conn, &a, "V-A", 1..=1);
         range_on(&conn, &b, "V-B", 1..=1);
 
-        run(
+        clean(
             &conn,
             &paths,
             &config,
-            &StagingCommands::Clean {
+            &CleanArgs {
                 force: false,
                 unit: vec!["testlib/alpha".to_string()],
                 version: None,
@@ -1547,76 +1370,5 @@ mod tests {
         assert!(!a_files[0].exists() && a_files[1].exists());
         assert!(b_files[0].exists(), "beta was not named");
         assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
-    }
-
-    /// `staging status` names a set released in part, with the slices
-    /// released and those still staged.
-    #[test]
-    fn partly_released_notice_names_released_and_staged_slices() {
-        let row = StagingRow {
-            id: 7,
-            unit: "photos".to_string(),
-            version: 2,
-            status: "staged".to_string(),
-            slices: Some(5),
-            encrypted_bytes: Some(1),
-            writes: 1,
-            staged: None,
-            problems: Vec::new(),
-            remedy: None,
-            released_slices: vec![1, 2, 3],
-            staged_slices: vec![4, 5],
-        };
-        assert_eq!(
-            partly_released_notice(&row),
-            "stage set 7 (photos v2) spans cartridges and is released slice by slice: \
-             slice(s) 1-3 released, 4-5 still staged"
-        );
-    }
-
-    /// `staging status --json` shape (issue: C2 row-listing drift). One row
-    /// has every optional field populated with a byte count that is NOT an
-    /// even multiple of 1 MiB -- proof the JSON carries raw bytes, not the
-    /// table's lossy MiB-divided display value. The other row has every
-    /// optional field absent (`null`).
-    #[test]
-    fn pin_staging_rows_json_shape() {
-        let rows = vec![
-            StagingRow {
-                id: 1,
-                unit: "backups".to_string(),
-                version: 2,
-                status: "staged".to_string(),
-                slices: Some(3),
-                encrypted_bytes: Some(5_242_881),
-                writes: 1,
-                staged: Some("2026-07-01T00:00:00Z".to_string()),
-                problems: vec!["slice 2: no staged file recorded".to_string()],
-                remedy: Some(
-                    "tapectl volume read-slices --from L6-0001 --unit backups".to_string(),
-                ),
-                released_slices: vec![1],
-                staged_slices: vec![2, 3],
-            },
-            StagingRow {
-                id: 2,
-                unit: "photos".to_string(),
-                version: 1,
-                status: "staging".to_string(),
-                slices: None,
-                encrypted_bytes: None,
-                writes: 0,
-                staged: None,
-                problems: Vec::new(),
-                remedy: None,
-                released_slices: Vec::new(),
-                staged_slices: Vec::new(),
-            },
-        ];
-        let value = staging_rows_to_json(&rows);
-        assert_eq!(
-            serde_json::to_string(&value).unwrap(),
-            r#"[{"num_slices":3,"on_disk_problems":["slice 2: no staged file recorded"],"released_slices":[1],"remedy":"tapectl volume read-slices --from L6-0001 --unit backups","stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","staged_slices":[2,3],"status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"on_disk_problems":[],"released_slices":[],"remedy":null,"stage_set_id":2,"staged_at":null,"staged_slices":[],"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
-        );
     }
 }

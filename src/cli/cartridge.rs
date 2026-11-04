@@ -53,6 +53,7 @@ pub enum CartridgeCommands {
     /// Show cartridge details
     Info {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
     },
     /// Move a cartridge to a location, taking its volumes with it
@@ -64,6 +65,7 @@ pub enum CartridgeCommands {
     /// end.
     Move {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Destination location name
         #[arg(long)]
@@ -91,6 +93,7 @@ pub enum CartridgeCommands {
     /// refused by a non-interactive session for a reason the help denied.
     Retire {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Why (appended to the cartridge's notes, never overwriting them)
         #[arg(long)]
@@ -187,6 +190,7 @@ pub enum CartridgeCommands {
     /// again. `cartridge unretire` is the way back.
     MarkErased {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Override the pending_erase lifecycle precondition (ADR-0008
         /// Tier 2 — see cli::consent). Does NOT reach a `retired_permanent`
@@ -218,6 +222,7 @@ pub enum CartridgeCommands {
     /// one call, and each is gated independently.
     Edit {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
         #[arg(long)]
@@ -238,6 +243,7 @@ pub enum CartridgeCommands {
     /// already-registered barcode.
     Relabel {
         /// Current barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// New barcode
         new_barcode: String,
@@ -261,6 +267,7 @@ pub enum CartridgeCommands {
     /// (ADR-0011, corrected 2026-09-14).
     Unretire {
         /// Barcode
+        #[arg(value_name = "CARTRIDGE")]
         barcode: String,
     },
     /// Show the MAM journal: every MAM read taken of a cartridge, verbatim
@@ -284,6 +291,7 @@ pub enum CartridgeCommands {
     /// reads no cartridge could be named for. Read-only.
     Journal {
         /// Barcode of a registered cartridge
+        #[arg(value_name = "CARTRIDGE")]
         barcode: Option<String>,
         /// Select by the medium serial the chip reported instead (for a
         /// cartridge that is not registered)

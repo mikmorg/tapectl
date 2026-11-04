@@ -339,7 +339,7 @@ impl ValidatedLayout {
     /// event saying which rows went; the abort itself stays recorded in the
     /// `write_aborted` event it already has. A volume's `writes` rows thus
     /// keep describing ONE session, which `rehydrate`, `adopt_aborted`,
-    /// `volume abort` and `staging clean`'s guard all assume. Their frozen
+    /// `volume abort` and `stage clean`'s guard all assume. Their frozen
     /// session directories are removed after the commit
     /// ([`supersede_abandoned_attempts`]).
     pub fn plan(
@@ -367,7 +367,7 @@ impl ValidatedLayout {
         // After the commit, never before: a directory removed for rows a
         // rollback then kept would strand them (the DB-then-filesystem order
         // `staging::clean` documents). Best-effort — a directory that cannot
-        // be removed is an orphan `staging clean --force` reclaims, never a
+        // be removed is an orphan `stage clean --force` reclaims, never a
         // reason to fail a write whose rows are already committed.
         for dir in superseded_dirs {
             if dir == session_dir {
@@ -9639,7 +9639,7 @@ mod tests {
         let adopted = InterruptedSession::adopt_aborted(&sa.conn, sa.volume_id)
             .unwrap()
             .expect("fixture premise: adoptable");
-        // The operator's `staging clean --force`: the frozen slices are gone.
+        // The operator's `stage clean --force`: the frozen slices are gone.
         let slice = adopted
             .built
             .layout

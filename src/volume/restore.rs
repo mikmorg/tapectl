@@ -271,7 +271,7 @@ fn restore_through_drive(
 
     // Issue #166: refuse before the store is opened if this drive cannot
     // read the loaded medium. Proceeds silently with no configured backend
-    // or nothing detected — the DR machine with keys and no `backend add`
+    // or nothing detected — the DR machine with keys and no `drive add`
     // yet (ADR-0005), same leniency as the MAM read just below.
     //
     // Both MAM reads are held and journalled when the contact opens (issue
@@ -729,7 +729,7 @@ fn catalog_file_size(
              root and matched exactly; `tapectl catalog search \"<words of the name>\" \
              --all-versions` finds one and names the versions that hold it (without \
              `--all-versions` it searches each unit's newest version only), and `tapectl \
-             catalog ls {unit_name}` lists the newest version's files.",
+             catalog list {unit_name}` lists the newest version's files.",
             selection.version
         ))),
         Some((true, _)) => Err(TapectlError::Other(format!(

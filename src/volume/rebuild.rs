@@ -103,7 +103,7 @@ pub struct RebuildReport {
     pub volume_inserted: bool,
     /// False when the operator envelope carried no `catalog.db` — a tape
     /// written before #83. The restore path is fully rebuilt either way;
-    /// what is lost is the per-file index (`catalog ls`/`search`) and each
+    /// what is lost is the per-file index (`catalog list`/`search`) and each
     /// snapshot's original `source_path`.
     pub had_catalog_db: bool,
     /// True when `catalog.db` carried a `tenants` table (written after the
@@ -354,7 +354,7 @@ pub struct RebuildReport {
     /// recorded onto a row. `false` covers two different facts a report
     /// reader needs told apart: no backend was configured for this device at
     /// all (ADR-0010's DR leniency — `catalog rebuild` stays usable with keys
-    /// and no `backend add`), or a backend was configured and its drive
+    /// and no `drive add`), or a backend was configured and its drive
     /// simply reported no serial. `catalog rebuild` on a `MemStore` (every
     /// test in this module) also reads `false` — there is no MAM to read.
     pub serial_checked: bool,
@@ -662,7 +662,7 @@ pub fn rebuild_from_volume(
     // Before the store open: reading the MAM opens the device read-only and
     // drops the fd, and the st driver refuses a second concurrent open.
     // LENIENT (ADR-0010): rebuild is THE disaster-recovery read path, so a
-    // machine with keys and no `backend add` yields `None` — an absence,
+    // machine with keys and no `drive add` yields `None` — an absence,
     // which corroborates against nothing and proceeds.
     let observed = crate::volume::binding::loaded_medium(config, device, reads);
     let mut store = TapeStore::open_read(device, block_size)?;
@@ -1030,7 +1030,7 @@ fn rebuild_contacted(
 
     // Issue #473: the dar catalogues, after the rows are committed (files
     // placed inside the transaction would be orphaned by a rollback, and
-    // `staging clean` would not know them). Best effort per set: a set that
+    // `stage clean` would not know them). Best effort per set: a set that
     // cannot get its catalogue is named in the report, never a failed rebuild.
     restore_catalogues(conn, operator, &inserted.sets, &mut report);
 
@@ -2403,7 +2403,7 @@ struct RebuiltSet {
 }
 
 /// The tapectl home the catalog lives in, as `<home>/tapectl.db`'s directory
-/// — the rule `staging clean` uses for the lockfiles and its leftovers.
+/// — the rule `stage clean` uses for the lockfiles and its leftovers.
 /// `None` for an in-memory catalog, which has no home.
 fn catalog_home(conn: &Connection) -> Option<std::path::PathBuf> {
     let db = conn.path().filter(|p| !p.is_empty())?;
@@ -2508,7 +2508,7 @@ fn place_catalogue(
     };
 
     // The directory is named by the LOCAL unit's uuid, as `stage create`
-    // and `staging clean` derive it.
+    // and `stage clean` derive it.
     let local_uuid: String = conn.query_row(
         "SELECT u.uuid FROM stage_sets ss
          JOIN snapshots sn ON sn.id = ss.snapshot_id
@@ -2921,7 +2921,7 @@ fn ensure_slice(
         return Ok(id);
     }
     // `staging_path` stays NULL: the slice is on tape, not in staging, and a
-    // path here would send `staging clean` hunting for a file that never
+    // path here would send `stage clean` hunting for a file that never
     // existed on this machine.
     tx.execute(
         "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
@@ -3374,7 +3374,7 @@ enum RebuildIdentity {
     /// A chip-reported serial. Proves which physical cartridge this is —
     /// established at WRITE time by a real MAM read (migration 014's
     /// write-once rule), so a rebuild trusts it without needing its own live
-    /// drive access (ADR-0010's DR leniency: keys and no `backend add`).
+    /// drive access (ADR-0010's DR leniency: keys and no `drive add`).
     Mam(String),
     /// An operator-typed barcode. Corroborated through the catalog binding,
     /// never string-matched against it (ADR-0012) — `cartridge relabel` is

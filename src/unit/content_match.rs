@@ -69,7 +69,7 @@ impl FingerprintDiff {
     /// Compact one-line summary for CLI error messages (`mark-tape-only`'s
     /// guard) and plain-text reports — capped so a unit with thousands of
     /// changed files can't flood a single line. Full, uncapped lists remain
-    /// on the struct itself for callers that want every path (`unit status
+    /// on the struct itself for callers that want every path (`unit info
     /// --dirty`'s plain output, and every JSON caller).
     pub fn describe(&self) -> String {
         const MAX_NAMES: usize = 8;

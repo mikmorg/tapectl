@@ -55,7 +55,7 @@ fn a_held_drive_is_skipped_with_75_and_a_free_one_is_polled() {
         &run(
             home.path(),
             &[
-                "backend",
+                "drive",
                 "add",
                 "--name",
                 "lto0",
@@ -67,7 +67,7 @@ fn a_held_drive_is_skipped_with_75_and_a_free_one_is_polled() {
                 "LTO-6",
             ],
         ),
-        "backend add",
+        "drive add",
     );
 
     // Another tapectl command has the drive: hold its lockfile.
@@ -136,7 +136,7 @@ fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
         &run(
             home.path(),
             &[
-                "backend",
+                "drive",
                 "add",
                 "--name",
                 "lto0",
@@ -146,7 +146,7 @@ fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
                 "LTO-6",
             ],
         ),
-        "backend add without --device-sg",
+        "drive add without --device-sg",
     );
 
     let out = run(home.path(), &["drive", "poll"]);

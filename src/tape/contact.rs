@@ -107,7 +107,7 @@ use crate::tape::st_stats::{self, Point};
 // these are four different operator situations with four different fixes.
 
 /// No `[[backends.lto]]` exists at all — the rebuilt machine with keys and no
-/// `backend add` yet (ADR-0005). No backend means no `device_sg`, so no MAM
+/// `drive add` yet (ADR-0005). No backend means no `device_sg`, so no MAM
 /// read was even possible.
 pub const REASON_NO_BACKEND_CONFIGURED: &str = "no LTO backend is configured on this host";
 
@@ -115,7 +115,7 @@ pub const REASON_NO_BACKEND_CONFIGURED: &str = "no LTO backend is configured on 
 /// read was possible.
 ///
 /// Distinct from [`REASON_NO_BACKEND_CONFIGURED`] because the fixes differ:
-/// one operator needs `backend add`, the other has a `--device` that names
+/// one operator needs `drive add`, the other has a `--device` that names
 /// something their config does not. Issue #313 was the same absence arriving
 /// by a different route on the health path, whose lookup was a raw string
 /// compare; it now resolves through `config::device_matches` too — note that

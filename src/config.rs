@@ -351,7 +351,7 @@ impl Default for DarConfig {
 pub struct BackendsConfig {
     // Skipped when empty so a fresh `init` does not write a bare `lto = []`.
     // That stub is not harmless: TOML rejects a later `[[backends.lto]]` table
-    // as a duplicate key, so `backend add` (#126) could not append to the very
+    // as a duplicate key, so `drive add` (#126) could not append to the very
     // file `init` had just written. Deserialization is unaffected — the
     // `default` covers an absent key, which is what "no drives yet" means.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1198,7 +1198,7 @@ pub fn validate_log_format(value: &str) -> std::result::Result<(), String> {
 }
 
 /// LTO generations a `[[backends.lto]]` entry may declare — the boundary
-/// `backend add` and `config check`/`Config::load` (via
+/// `drive add` and `config check`/`Config::load` (via
 /// [`Config::size_problems`]) both police (issue #186, ADR-0010 decision 1: a
 /// drive declares only the one generation it IS).
 ///
@@ -1214,7 +1214,7 @@ pub fn validate_log_format(value: &str) -> std::result::Result<(), String> {
 /// that writes Type M cartridges declares `LTO-8`
 /// (`can_write(Lto8, Lto7M8)` is `true`).
 ///
-/// One function so `backend add` and the config load/check path state this
+/// One function so `drive add` and the config load/check path state this
 /// refusal once, not as two messages that can drift.
 pub fn validate_drive_generation(value: &str) -> std::result::Result<(), String> {
     let generation = crate::media::Generation::parse(value).ok_or_else(|| {
@@ -2085,7 +2085,7 @@ pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
         |p| p.config_file.display().to_string(),
     );
     TapectlError::Config(format!(
-        "no LTO backend configured — tapectl does not know what tape drive to use.\n\n\
+        "no LTO drive configured — tapectl does not know what tape drive to use.\n\n\
          Add a [[backends.lto]] section to {file}:\n{}\n\n\
          `tapectl init` leaves a commented-out example there to uncomment.",
         LTO_BACKEND_EXAMPLE.trim_end(),
@@ -2496,7 +2496,7 @@ pub fn resolve_lto_backend<'a>(
 ) -> Result<&'a LtoBackendConfig> {
     if let Some(msg) = config.backend_ambiguity_problems().into_iter().next() {
         return Err(TapectlError::Config(format!(
-            "refusing to resolve an LTO backend for a write: {msg} (this config was \
+            "refusing to resolve an LTO drive for a write: {msg} (this config was \
              loaded via a path that tolerates the collision for read-only use; run \
              `tapectl config check` and fix it before writing)"
         )));
@@ -2507,7 +2507,7 @@ pub fn resolve_lto_backend<'a>(
     // names is refused here, before any MAM read or drive contact.
     if let Some(problem) = crate::tape::drive_identity::sg_pairing_problem(backend) {
         return Err(TapectlError::Config(format!(
-            "refusing to resolve an LTO backend for a write: {problem}"
+            "refusing to resolve an LTO drive for a write: {problem}"
         )));
     }
     Ok(backend)
@@ -2552,7 +2552,7 @@ fn resolve_lto_backend_unchecked<'a>(
                 .map(|b| b.name.as_str())
                 .collect();
             Err(TapectlError::Config(format!(
-                "multiple LTO backends configured ({}); pass --device to select one",
+                "multiple LTO drives configured ({}); pass --device to select one",
                 names.join(", ")
             )))
         }
@@ -2562,7 +2562,7 @@ fn resolve_lto_backend_unchecked<'a>(
 /// Resolve a device path (and, if known, its backend) for a READ path
 /// (`volume identify`, `verify`, `read-slices`, `catalog rebuild`,
 /// `restore`) — LENIENT (ADR-0010): these must stay usable on a rebuilt
-/// machine that has keys and no `backend add` yet (ADR-0005's DR path), so
+/// machine that has keys and no `drive add` yet (ADR-0005's DR path), so
 /// an explicit `device` is used exactly as given and the backend is
 /// whatever matches it, or `None` — this function never errors when
 /// `device` is `Some`.
@@ -2627,7 +2627,7 @@ fn resolve_device_unchecked<'a>(
                 .map(|b| b.name.as_str())
                 .collect();
             Err(TapectlError::Config(format!(
-                "multiple LTO backends configured ({}); pass --device to select one",
+                "multiple LTO drives configured ({}); pass --device to select one",
                 names.join(", ")
             )))
         }
@@ -3881,7 +3881,7 @@ mod tests {
     /// generation — but `Generation::can_write(Lto7M8, _)` is `false` for
     /// every medium, so a `[[backends.lto]]` entry declaring it can never
     /// write a single tape (issue #186). `Config::load` (via `size_problems`)
-    /// must refuse it by name, the same as `backend add` does, rather than
+    /// must refuse it by name, the same as `drive add` does, rather than
     /// silently accepting a backend that is unusable the moment it is used.
     #[test]
     fn config_load_refuses_lto7_type_m_as_a_drive_generation() {
@@ -4082,7 +4082,7 @@ mod tests {
     fn resolve_lto_backend_no_device_zero_backends_is_no_lto_backend_error() {
         let config = Config::default();
         let err = resolve_lto_backend(&config, None).unwrap_err();
-        assert!(err.to_string().contains("no LTO backend configured"));
+        assert!(err.to_string().contains("no LTO drive configured"));
     }
 
     #[test]

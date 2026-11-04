@@ -354,12 +354,12 @@ fn a_backend_added_by_config_add_is_what_backend_add_writes() {
         ],
     );
     let after = read(home.path());
-    // The canonical spelling, as `backend add` writes it.
+    // The canonical spelling, as `drive add` writes it.
     assert!(after.contains("generation = \"LTO-6\""), "{after}");
     config_check_passes(home.path());
 
     // Same name, and same drive under a new name: both refused, as
-    // `backend add` refuses them.
+    // `drive add` refuses them.
     refused(
         home.path(),
         &[
@@ -375,7 +375,7 @@ fn a_backend_added_by_config_add_is_what_backend_add_writes() {
     refused(
         home.path(),
         &[
-            "backend",
+            "drive",
             "add",
             "--name",
             "drive-b",
@@ -409,7 +409,7 @@ fn backend_add_still_writes_a_table_that_loads() {
     ok(
         home.path(),
         &[
-            "backend",
+            "drive",
             "add",
             "--name",
             "drive-a",
@@ -441,7 +441,7 @@ fn backend_add_still_writes_a_table_that_loads() {
 }
 
 /// Issue #431: `device_sg` is optional. A drive added with only its tape
-/// node (by `backend add` or `config add`) is written without the key, the
+/// node (by `drive add` or `config add`) is written without the key, the
 /// file loads, and `config check` — which stays advisory, exit 0 — names
 /// what it could not derive rather than printing an empty node. The tape
 /// node is a path that cannot exist here, so nothing real is derived.
@@ -451,7 +451,7 @@ fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
     ok(
         home.path(),
         &[
-            "backend",
+            "drive",
             "add",
             "--name",
             "drive-a",
@@ -482,7 +482,7 @@ fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
     assert!(human.contains("config: valid"), "{human}");
     for name in ["drive-a", "drive-b"] {
         assert!(
-            human.contains(&format!("backend \"{name}\": device_sg is not set")),
+            human.contains(&format!("drive \"{name}\": device_sg is not set")),
             "{name}: {human}"
         );
     }
@@ -511,7 +511,7 @@ fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
 }
 
 /// The stub an older `init` wrote (`lto = []` under `[backends]`) is the
-/// shape that made `backend add` fail once; a table added over it must load.
+/// shape that made `drive add` fail once; a table added over it must load.
 #[test]
 fn an_empty_inline_list_becomes_the_first_table() {
     let home = home();
@@ -524,7 +524,7 @@ fn an_empty_inline_list_becomes_the_first_table() {
     ok(
         home.path(),
         &[
-            "backend",
+            "drive",
             "add",
             "--name",
             "drive-a",

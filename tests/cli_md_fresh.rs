@@ -59,7 +59,7 @@ fn section<'a>(page: &'a str, heading: &str) -> &'a str {
 /// Issue #472: the renderer left out every option whose id is `version`, to
 /// hide clap's own `--version`, so a command's own `--version <N>` (the
 /// snapshot version a unit command names, which the remedies it prints use:
-/// `tapectl staging clean --unit U --version V --force`) was missing from the
+/// `tapectl stage clean --unit U --version V --force`) was missing from the
 /// reference. clap's auto flag is told apart by its action now: the own
 /// option is listed, and the auto `-V/--version` and `-h/--help` still are
 /// not.
@@ -75,10 +75,10 @@ fn a_commands_own_version_option_is_in_the_reference() {
         create.contains("- `--version <VERSION>` — Re-stage a specific snapshot version"),
         "stage create's own --version is missing: {create}"
     );
-    let clean = section(&pages["staging.md"], "### tapectl staging clean");
+    let clean = section(&pages["stage.md"], "### tapectl stage clean");
     assert!(
         clean.contains("- `--version <VERSION>` — Narrow release further"),
-        "staging clean's own --version is missing: {clean}"
+        "stage clean's own --version is missing: {clean}"
     );
 
     // The positive control for the filter's other half: clap's own flags are

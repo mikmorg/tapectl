@@ -23,7 +23,7 @@ pub enum HostCommands {
     Check {
         /// Also check this systemd unit (repeatable), on top of
         /// `[host_check] contender_units`, e.g. a CI runner's timer.
-        #[arg(long = "unit", value_name = "UNIT")]
+        #[arg(long = "systemd-unit", value_name = "UNIT")]
         units: Vec<String>,
     },
 }

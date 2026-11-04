@@ -145,7 +145,7 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 ///
 /// Deliberately narrower than [`in_service_or_provisioned`], which folds in
 /// `active`/`sealed` for inventory/capacity accounting — neither is a
-/// write target. `active` is written only by `tapectl import` (a tape
+/// write target. `active` is written only by `tapectl volume import` (a tape
 /// written elsewhere, not a v2 write session). `blank`/`missing` (migration
 /// 026) and `full` (032), which never had a writer, left the schema. A
 /// `sealed` volume is never written again (ADR-0003), and
@@ -534,7 +534,7 @@ pub enum CoverageScope<'a> {
     /// every per-version question: the MIN that [`CoverageScope::Unit`]
     /// takes across current versions, [`short_of_copies_at`],
     /// [`versions_at_stake`], `snapshot mark-reclaimable` (the SUPERSEDING
-    /// snapshot), `report pending`/`report summary` (a stage set's own
+    /// snapshot), `stage list` and the catalog summary (a stage set's own
     /// version) and `unit mark-tape-only`'s thinnest-version line.
     Snapshot { id_expr: &'a str },
 }
@@ -1139,7 +1139,7 @@ pub enum NamedScope {
     /// with no current snapshot holds 0 everywhere.
     Unit(i64),
     /// ONE version's coverage, by snapshot id — `snapshot mark-reclaimable`
-    /// and `report supersedable` ask it of the SUPERSEDING version, the one
+    /// and `report reclaimable` ask it of the SUPERSEDING version, the one
     /// that must carry the policy once the released version is gone. The
     /// unit form would be the wrong question there: it takes the minimum
     /// over every current version, the one being released included.
@@ -1156,9 +1156,9 @@ pub enum NamedScope {
 ///
 /// ADR-0012 2026-10-12 item 43 (#423 part 2) extended item 34 from the
 /// per-name count to every copy floor: `audit`'s `copy_count`, `unit
-/// mark-tape-only`, `snapshot mark-reclaimable`, `report supersedable`, the
-/// retire family's Tier-2 facts, the staging retention gate and `report
-/// pending` all judge a tape-only unit's copies against `floor × this`.
+/// mark-tape-only`, `snapshot mark-reclaimable`, `report reclaimable`, the
+/// retire family's Tier-2 facts, the staging retention gate and `stage
+/// list --owing` all judge a tape-only unit's copies against `floor × this`.
 /// Item 46 bounds it: the multiplier raises copy floors only — the resolved
 /// `min_copies` ([`copy_floor`]) and the copies each location of the
 /// `copies_at` map must hold ([`location_target`]) — and NEVER a count
@@ -1219,7 +1219,7 @@ pub fn tape_only_note(config: &crate::config::Config, unit_status: &str) -> Stri
 /// its source on disk, and a catalog that never ran `location add` has every
 /// volume at no place at all. A tape-only unit is held to the floor after the
 /// marking exactly as at it: `audit`'s `location_count`, `snapshot
-/// mark-reclaimable`/`report supersedable` ([`short_of_location_floor`]) and
+/// mark-reclaimable`/`report reclaimable` ([`short_of_location_floor`]) and
 /// `unit mark-tape-only` ([`PlaceShortfall::judge`], since it shows the count
 /// whether or not it is short) all go through this floor and that one
 /// comparison.
@@ -1317,7 +1317,7 @@ pub fn places_held_excluding(
 /// `audit`'s `location_count` asks it of [`NamedScope::Unit`] — the unit's
 /// current coverage (`unit mark-tape-only` asks the same of the same scope,
 /// by [`places_held`] and [`PlaceShortfall::judge`], because it prints the
-/// count too). `snapshot mark-reclaimable` and `report supersedable` ask it
+/// count too). `snapshot mark-reclaimable` and `report reclaimable` ask it
 /// of [`NamedScope::Snapshot`], the SUPERSEDING version, which must carry
 /// the unit once the released one is gone.
 pub fn short_of_location_floor(
@@ -1562,7 +1562,7 @@ pub fn judge_copies_at(
 /// 0: nothing can be at a place the catalog does not know.
 ///
 /// `audit`'s `location_presence`, `unit mark-tape-only`'s location gate,
-/// `snapshot mark-reclaimable`/`report supersedable` (of the superseding
+/// `snapshot mark-reclaimable`/`report reclaimable` (of the superseding
 /// version) and the retire family's Tier-2 facts (each version, the volume
 /// given up excluded) all ask this one function, so they can never disagree
 /// about whether a location's target is met. It replaced a count-only

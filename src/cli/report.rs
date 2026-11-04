@@ -8,8 +8,9 @@ use crate::error::Result;
 
 #[derive(Subcommand, Debug)]
 pub enum ReportCommands {
-    /// Overview: units, tapes, tenants, capacity
-    Summary,
+    /// Removed in 1.9.0: `status` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Summary(crate::cli::renamed::Removed),
     /// Units at risk: below min copies/locations
     FireRisk,
     /// Each unit's copy target, copies and shortfall at every location
@@ -49,8 +50,9 @@ pub enum ReportCommands {
         #[arg(long)]
         unit: Option<String>,
     },
-    /// Staged data pending write
-    Pending,
+    /// Removed in 1.9.0: `stage list --owing` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Pending(crate::cli::renamed::Removed),
     /// Verification recency
     VerifyStatus {
         /// Filter to specific volume
@@ -102,7 +104,10 @@ pub enum ReportCommands {
         generation: Option<String>,
     },
     /// Superseded snapshot versions that could be marked reclaimable
-    Supersedable,
+    Reclaimable,
+    /// Removed in 1.9.0: `report reclaimable` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Supersedable(crate::cli::renamed::Removed),
     /// Stage attempts that failed, and the hours each lost
     ///
     /// Every `stage create` that ended without staging its unit, from the
@@ -120,7 +125,11 @@ pub fn run(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        ReportCommands::Summary => report_summary(conn, config, json_output),
+        ReportCommands::Summary(_) => Err(crate::cli::renamed::refused(&["report", "summary"])),
+        ReportCommands::Pending(_) => Err(crate::cli::renamed::refused(&["report", "pending"])),
+        ReportCommands::Supersedable(_) => {
+            Err(crate::cli::renamed::refused(&["report", "supersedable"]))
+        }
         ReportCommands::FireRisk => report_fire_risk(conn, config, json_output),
         ReportCommands::Needs { location, all } => {
             report_needs(conn, config, location.as_deref(), *all, json_output)
@@ -133,7 +142,6 @@ pub fn run(
             json_output,
             &config.defaults.global_excludes,
         ),
-        ReportCommands::Pending => report_pending(conn, config, json_output),
         ReportCommands::VerifyStatus { volume } => {
             report_verify_status(conn, volume.as_deref(), json_output)
         }
@@ -154,7 +162,7 @@ pub fn run(
             plan: true,
             generation,
         } => report_compaction_plan(conn, config, generation.as_deref(), json_output),
-        ReportCommands::Supersedable => report_supersedable(conn, config, json_output),
+        ReportCommands::Reclaimable => report_reclaimable(conn, config, json_output),
         ReportCommands::FailedStages => report_failed_stages(conn, json_output),
     }
 }
@@ -175,7 +183,7 @@ pub fn run(
 /// candidates are listed with their reason rather than hidden: that is
 /// strictly more useful and cannot over-promise, and only the releasable
 /// ones are summed into the total.
-fn report_supersedable(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+fn report_reclaimable(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
     use crate::policy::reclaimable::ReclaimVerdict;
 
     let found = crate::policy::reclaimable::candidates(conn, config)?;
@@ -309,7 +317,7 @@ pub(crate) struct FailedStage {
 /// failed when it never reached `staged` (`staged_at` is set only there) and
 /// is no longer in progress: `failed` (marked by `db::open`'s sweep, or the
 /// failure path's own cleanup leaving it for the sweep), or `cleaned` after
-/// `staging clean` released a failed set's files. A rebuilt row
+/// `stage clean` released a failed set's files. A rebuilt row
 /// (`origin = 'rebuilt'`) was never staged here and is left out. A row
 /// `snapshot delete` removed takes its attempt with it.
 ///
@@ -429,7 +437,7 @@ fn report_failed_stages(conn: &Connection, json_output: bool) -> Result<()> {
 }
 
 /// Count of volumes whose physical media is in service and accounted for
-/// (`report summary`). Group-B (issue #96): inventory, not copy-counting.
+/// (the catalog summary). Group-B (issue #96): inventory, not copy-counting.
 fn in_service_volume_count(conn: &Connection) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM volumes WHERE {}",
@@ -443,7 +451,7 @@ fn in_service_volume_count(conn: &Connection) -> Result<i64> {
 /// Filtered by the SAME predicate on purpose (issue #96): an unfiltered sum
 /// here would report bytes carried by retired, erased, and missing media
 /// beside a count that excludes exactly those volumes, so the two numbers
-/// on one `report summary` line would describe different populations.
+/// on one summary line would describe different populations.
 fn in_service_bytes_written(conn: &Connection) -> Result<i64> {
     let sql = format!(
         "SELECT COALESCE(SUM(bytes_written),0) FROM volumes WHERE {}",
@@ -452,17 +460,20 @@ fn in_service_bytes_written(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
-/// The figures behind `report summary`, gathered once so the text and JSON
-/// forms (and the tests) read the same numbers.
+/// The catalog's overview, gathered once so the text and JSON forms (and
+/// the tests) read the same numbers. It was `report summary`'s; 1.9.0 moved
+/// that command to `status` (ADR-0012 items 209 and 213), which is to show
+/// it, and until it does nothing outside the tests reads it.
 ///
 /// Issue #352: each count says what it counts. `tenants` excludes the
 /// operator (an identity, not a tenant whose data is archived); `volumes`
 /// is [`in_service_volume_count`], i.e. volumes holding data — not the
 /// `active` status, which only `db import` sets; and the staging line
 /// separates stage sets that still owe a copy (the same selection as
-/// `report pending`, [`staged_set_rows`]) from those merely held in
-/// staging until `staging clean` releases them.
+/// `stage list --owing`, [`crate::cli::stage::stage_set_rows`]) from those
+/// merely held in staging until `stage clean` releases them.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Summary {
     pub tenants: i64,
     pub units: i64,
@@ -481,6 +492,7 @@ pub(crate) struct Summary {
     pub staged_owing: i64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Summary {
     pub(crate) fn text_lines(&self) -> Vec<String> {
         let mut lines = vec![
@@ -509,17 +521,17 @@ impl Summary {
         ];
         if self.staged_held > 0 {
             let owing = if self.staged_owing == 0 {
-                // Per VERSION, as `report pending` scores it; `staging
+                // Per VERSION, as `stage list --owing` scores it; `stage
                 // clean` releases per UNIT (the MIN across current
                 // versions) and keeps a held set whose unit is short on
                 // another version, so this names the command that
                 // decides and promises no outcome.
-                "none owe a copy of their own version (`tapectl staging clean` decides \
+                "none owe a copy of their own version (`tapectl stage clean` decides \
                  which can be released)"
                     .to_string()
             } else {
                 format!(
-                    "{} still owe a copy (`tapectl report pending` lists them)",
+                    "{} still owe a copy (`tapectl stage list --owing` lists them)",
                     self.staged_owing
                 )
             };
@@ -542,6 +554,7 @@ impl Summary {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
     let units: i64 = conn.query_row(
         "SELECT COUNT(*) FROM units WHERE status = 'active'",
@@ -564,7 +577,11 @@ pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let total_bytes: i64 = in_service_bytes_written(conn)?;
-    let staged = staged_set_rows(conn, config)?;
+    let staged = crate::cli::stage::stage_set_rows(
+        conn,
+        config,
+        crate::cli::stage::Shown::Status("staged"),
+    )?;
     Ok(Summary {
         tenants,
         units,
@@ -574,20 +591,8 @@ pub(crate) fn summarize(conn: &Connection, config: &Config) -> Result<Summary> {
         ranges,
         total_bytes,
         staged_held: staged.len() as i64,
-        staged_owing: staged.iter().filter(|r| r.owes_a_copy()).count() as i64,
+        staged_owing: staged.iter().filter(|r| r.owing).count() as i64,
     })
-}
-
-fn report_summary(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let summary = summarize(conn, config)?;
-    if json_output {
-        println!("{}", summary.json());
-    } else {
-        for line in summary.text_lines() {
-            println!("{line}");
-        }
-    }
-    Ok(())
 }
 
 /// Per-unit `(name, status, copies, locations, warehouse_deposits)` rows
@@ -1531,7 +1536,7 @@ pub(crate) struct DirtyRow {
 }
 
 /// The scan behind `report dirty`: reuses `fingerprint::classify` — the
-/// same scan `unit status --dirty` and `mark-tape-only`'s guard use — over
+/// same scan `unit info --dirty` and `mark-tape-only`'s guard use — over
 /// every `active` unit (mirroring `pending_units_for_collection`'s own
 /// scope: `missing`/`tape_only`/`retired` units have no live directory this
 /// scan should second-guess), optionally narrowed to one unit by name.
@@ -1636,170 +1641,6 @@ fn report_dirty(
         }
     }
     Ok(())
-}
-
-/// One stage set still held in staging (`stage_sets.status = 'staged'`),
-/// with where its version's coverage stands.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StagedSetRow {
-    pub unit: String,
-    pub version: i64,
-    pub slices: Option<i64>,
-    pub size: Option<i64>,
-    /// Copies of this stage set's VERSION ([`crate::policy::coverage::copy_count_expr`],
-    /// snapshot scope — a copy is identical content, counted per version,
-    /// ADR-0012).
-    pub copies: i64,
-    /// The unit's copy floor: its resolved `min_copies` ([`crate::policy::resolve`]),
-    /// times the tape-only multiplier for a tape-only unit
-    /// ([`crate::policy::coverage::copy_floor`]), or
-    /// `None` when its policy cannot be resolved — `audit` reports that as
-    /// `policy_unresolvable`; here it counts as owing, the conservative
-    /// reading for a list of outstanding work.
-    pub min_copies: Option<i64>,
-}
-
-impl StagedSetRow {
-    /// Whether this stage set's version still needs another copy.
-    pub fn owes_a_copy(&self) -> bool {
-        match self.min_copies {
-            Some(min) => self.copies < min,
-            None => true,
-        }
-    }
-}
-
-/// Every `staged` stage set with its version's copy count and its unit's
-/// resolved `min_copies` — the ONE selection behind `report pending` and
-/// `report summary`'s staging line (issue #352), so the two can never
-/// disagree about what still owes a copy. A stage set stays `staged` after
-/// its writes until `staging clean` releases it (it can become the next
-/// copy), so "staged" alone never meant "awaiting write".
-pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<StagedSetRow>> {
-    let copies =
-        crate::policy::coverage::copy_count_expr(&crate::policy::coverage::CoverageQuery {
-            scope: crate::policy::coverage::CoverageScope::Snapshot { id_expr: "s.id" },
-            exclude_volume: None,
-        });
-    let sql = format!(
-        "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size, {copies}
-         FROM stage_sets ss
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN units u ON u.id = s.unit_id
-         WHERE ss.status = 'staged'
-         ORDER BY u.name, s.version, ss.id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    type Row = (String, i64, Option<i64>, Option<i64>, i64);
-    let raw: Vec<Row> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut min_by_unit: std::collections::HashMap<String, Option<i64>> = Default::default();
-    let mut rows = Vec::with_capacity(raw.len());
-    for (unit, version, slices, size, copies) in raw {
-        let min_copies = match min_by_unit.get(&unit) {
-            Some(m) => *m,
-            None => {
-                let m = match queries::get_unit_by_name(conn, &unit)? {
-                    // The copy floor through the one tape-only rule
-                    // (ADR-0012 2026-10-12 item 43), as `staging clean`
-                    // retains by.
-                    Some(u) => match crate::policy::resolve(conn, config, &u) {
-                        Ok(p) => Some(crate::policy::coverage::copy_floor(
-                            config,
-                            p.copy_floor_base(),
-                            &u.status,
-                        )),
-                        Err(crate::error::TapectlError::PolicyUnresolvable { .. }) => None,
-                        Err(e) => return Err(e),
-                    },
-                    None => None,
-                };
-                min_by_unit.insert(unit.clone(), m);
-                m
-            }
-        };
-        rows.push(StagedSetRow {
-            unit,
-            version,
-            slices,
-            size,
-            copies,
-            min_copies,
-        });
-    }
-    Ok(rows)
-}
-
-fn report_pending(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let all = staged_set_rows(conn, config)?;
-    let rows: Vec<&StagedSetRow> = all.iter().filter(|r| r.owes_a_copy()).collect();
-
-    if json_output {
-        let json: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "unit": r.unit, "version": r.version, "status": "staged",
-                    "slices": r.slices, "size": r.size,
-                    "copies": r.copies, "min_copies": r.min_copies,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else {
-        for line in pending_text_lines(&all) {
-            println!("{line}");
-        }
-    }
-    Ok(())
-}
-
-/// `report pending`'s text form, from the whole [`staged_set_rows`]
-/// selection: the stage sets that still owe a copy, then a count of those
-/// only held in staging. Separate from the printing so a test pins the
-/// wording.
-fn pending_text_lines(all: &[StagedSetRow]) -> Vec<String> {
-    let released = all.iter().filter(|r| !r.owes_a_copy()).count();
-    let owing: Vec<&StagedSetRow> = all.iter().filter(|r| r.owes_a_copy()).collect();
-    let mut lines = Vec::new();
-    if owing.is_empty() {
-        lines.push("no stage set owes a copy".to_string());
-    } else {
-        lines.push("stage sets that still owe a copy:".to_string());
-        for r in owing {
-            let policy = match r.min_copies {
-                Some(min) => format!("{} of {min} copies", r.copies),
-                None => format!(
-                    "{} copies, policy unresolvable (see `tapectl audit`)",
-                    r.copies
-                ),
-            };
-            lines.push(format!(
-                "  {} v{}: {} slices, {} — {policy}",
-                r.unit,
-                r.version,
-                r.slices.unwrap_or(0),
-                crate::util::format_bytes_binary(r.size.unwrap_or(0)),
-            ));
-        }
-    }
-    if released > 0 {
-        lines.push(format!(
-            "{released} more stage set(s) have every copy their own version needs and are \
-             only held in staging (`tapectl staging clean` decides which can be released)"
-        ));
-    }
-    lines
 }
 
 /// One row of `report verify-status`: one volume's verification session —
@@ -5200,7 +5041,7 @@ mod tests {
         }
     }
 
-    /// Issue #90: `report supersedable` must run end-to-end in both
+    /// Issue #90: `report reclaimable` must run end-to-end in both
     /// output modes, and must not perturb `report compaction-candidates`
     /// -- the whole reason it is a sibling report rather than an
     /// extension of that one.
@@ -5228,8 +5069,8 @@ mod tests {
             assert_eq!(row["releasable"], true);
             assert!(row["blocked_reason"].is_null());
 
-            report_supersedable(&conn, &Config::default(), false).unwrap();
-            report_supersedable(&conn, &Config::default(), true).unwrap();
+            report_reclaimable(&conn, &Config::default(), false).unwrap();
+            report_reclaimable(&conn, &Config::default(), true).unwrap();
         }
 
         /// A blocked candidate carries the gate's own refusal text AND
@@ -5256,14 +5097,14 @@ mod tests {
                 "{row}"
             );
 
-            report_supersedable(&conn, &Config::default(), false).unwrap();
-            report_supersedable(&conn, &Config::default(), true).unwrap();
+            report_reclaimable(&conn, &Config::default(), false).unwrap();
+            report_reclaimable(&conn, &Config::default(), true).unwrap();
         }
 
         #[test]
         fn empty_case_renders() {
             let (conn, _unit) = setup("rep-sup-single", 1, "sealed", "active");
-            report_supersedable(&conn, &Config::default(), false).unwrap();
+            report_reclaimable(&conn, &Config::default(), false).unwrap();
         }
 
         #[test]
@@ -5275,7 +5116,7 @@ mod tests {
 
     /// Issue #352: `report summary` said "Pending: 4 stage set(s) awaiting
     /// write" for four stage sets each written twice (they stay `staged`
-    /// until `staging clean` releases them), "Volumes: 2 active" for two
+    /// until `stage clean` releases them), "Volumes: 2 active" for two
     /// SEALED volumes, and "Tenants: 3" for two tenants plus the operator.
     mod issue352_summary_says_what_it_counts {
         use super::*;
@@ -5385,12 +5226,17 @@ mod tests {
         fn pending_rows_are_the_stage_sets_that_still_owe_a_copy() {
             let conn = fixture();
             let config = Config::default();
-            let rows = staged_set_rows(&conn, &config).unwrap();
+            let rows = crate::cli::stage::stage_set_rows(
+                &conn,
+                &config,
+                crate::cli::stage::Shown::Status("staged"),
+            )
+            .unwrap();
             assert_eq!(rows.len(), 4, "every staged set is accounted for: {rows:?}");
             let owing: Vec<(&str, i64, Option<i64>)> = rows
                 .iter()
-                .filter(|r| r.owes_a_copy())
-                .map(|r| (r.unit.as_str(), r.copies, r.min_copies))
+                .filter(|r| r.owing)
+                .map(|r| (r.unit.as_str(), r.copies, r.copy_floor))
                 .collect();
             assert_eq!(
                 owing,
@@ -5417,13 +5263,18 @@ mod tests {
             .unwrap();
             let mut config = Config::default();
             config.compaction.tape_only_safety_multiplier = 3;
-            let rows = staged_set_rows(&conn, &config).unwrap();
+            let rows = crate::cli::stage::stage_set_rows(
+                &conn,
+                &config,
+                crate::cli::stage::Shown::Status("staged"),
+            )
+            .unwrap();
             let docs = rows.iter().find(|r| r.unit == "docs").unwrap();
-            assert_eq!((docs.copies, docs.min_copies), (2, Some(6)));
-            assert!(docs.owes_a_copy());
+            assert_eq!((docs.copies, docs.copy_floor), (2, Some(6)));
+            assert!(docs.owing);
             let photos = rows.iter().find(|r| r.unit == "photos").unwrap();
             assert_eq!(
-                photos.min_copies,
+                photos.copy_floor,
                 Some(2),
                 "an active unit is not multiplied"
             );
@@ -5447,8 +5298,8 @@ mod tests {
                         .to_string(),
                     "  Writes:     5 completed".to_string(),
                     "  Total data: 2.0 KiB on tape".to_string(),
-                    "  Staging:    4 stage set(s) held, 3 still owe a copy (`tapectl report \
-                     pending` lists them)"
+                    "  Staging:    4 stage set(s) held, 3 still owe a copy (`tapectl stage \
+                     list --owing` lists them)"
                         .to_string(),
                 ]
             );
@@ -5477,18 +5328,22 @@ mod tests {
             assert_eq!(
                 summary.text_lines().last().unwrap(),
                 "  Staging:    4 stage set(s) held, none owe a copy of their own version \
-                 (`tapectl staging clean` decides which can be released)"
+                 (`tapectl stage clean` decides which can be released)"
             );
-            assert!(staged_set_rows(&conn, &Config::default())
-                .unwrap()
-                .iter()
-                .all(|r| !r.owes_a_copy()));
+            assert!(crate::cli::stage::stage_set_rows(
+                &conn,
+                &Config::default(),
+                crate::cli::stage::Shown::Status("staged")
+            )
+            .unwrap()
+            .iter()
+            .all(|r| !r.owing));
         }
 
         /// A held stage set's own version can have every copy while its
         /// UNIT still falls short on another current version — here v1,
         /// whose stage set is long released, lost a copy; v2 is staged with
-        /// 2 of 2. `staging clean` scores the unit (the MIN across current
+        /// 2 of 2. `stage clean` scores the unit (the MIN across current
         /// versions) and keeps v2, so neither report may say it releases
         /// them: they name the command that decides, and promise nothing.
         #[test]
@@ -5531,9 +5386,14 @@ mod tests {
                 }
             }
 
-            let rows = staged_set_rows(&conn, &Config::default()).unwrap();
+            let rows = crate::cli::stage::stage_set_rows(
+                &conn,
+                &Config::default(),
+                crate::cli::stage::Shown::Status("staged"),
+            )
+            .unwrap();
             assert_eq!(rows.len(), 1, "only v2 is held: {rows:?}");
-            assert!(!rows[0].owes_a_copy(), "v2 has 2 of 2 copies: {rows:?}");
+            assert!(!rows[0].owing, "v2 has 2 of 2 copies: {rows:?}");
 
             let staging_line = summarize(&conn, &Config::default())
                 .unwrap()
@@ -5543,17 +5403,15 @@ mod tests {
             assert_eq!(
                 staging_line,
                 "  Staging:    1 stage set(s) held, none owe a copy of their own version \
-                 (`tapectl staging clean` decides which can be released)"
+                 (`tapectl stage clean` decides which can be released)"
             );
             assert_eq!(
-                pending_text_lines(&rows),
-                vec![
-                    "no stage set owes a copy".to_string(),
+                crate::cli::stage::held_but_not_owing_line(&rows).as_deref(),
+                Some(
                     "1 more stage set(s) have every copy their own version needs and are \
-                     only held in staging (`tapectl staging clean` decides which can be \
+                     only held in staging (`tapectl stage clean` decides which can be \
                      released)"
-                        .to_string(),
-                ]
+                )
             );
         }
     }
@@ -5782,7 +5640,7 @@ mod tests {
             assert_eq!(in_service_volume_count(&conn).unwrap(), 0);
         }
 
-        /// `report summary` prints the count and the byte total on one line,
+        /// The summary prints the count and the byte total on one line,
         /// so they must describe the same population (issue #96). An
         /// unfiltered sum would report the retired volume's bytes beside a
         /// count of 1, which reads as "one volume holding 3000 bytes".
@@ -7738,7 +7596,7 @@ Read error counter page  [0x3]
         }
 
         /// A failure recorded by its phases (2.5 hours), one released by
-        /// `staging clean` known by dar's report (1 hour), one that stopped
+        /// `stage clean` known by dar's report (1 hour), one that stopped
         /// before recording anything (unknown, not in the total). A staged
         /// set released later, one still staging and a rebuilt row are no
         /// failures.

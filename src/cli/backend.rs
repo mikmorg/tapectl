@@ -1,43 +1,15 @@
-//! `tapectl backend` — populate `[[backends.lto]]` without hand-editing TOML.
+//! `tapectl drive add` — populate `[[backends.lto]]` without hand-editing
+//! TOML. (The module keeps the config's word, `backends.lto`.)
 //!
 //! #126, the follow-up half of #124's first-run cliff. The immediate half made
 //! the missing-backend failure self-explanatory and put a commented example in
 //! a fresh `init`; this is the command that fills it in.
 
-use crate::cli::BackendCommands;
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 
-pub fn run(
-    paths: &TapectlPaths,
-    command: &BackendCommands,
-    json_output: bool,
-    dry_run: bool,
-) -> Result<()> {
-    match command {
-        BackendCommands::Add {
-            name,
-            device_tape,
-            device_sg,
-            generation,
-            capacity_override,
-            enospc_buffer,
-        } => add(
-            paths,
-            name,
-            device_tape,
-            device_sg.as_deref(),
-            generation,
-            capacity_override.as_deref(),
-            enospc_buffer.as_deref(),
-            json_output,
-            dry_run,
-        ),
-    }
-}
-
 /// The `[[backends.lto]]` table for these values, as the `field=value`
-/// list `config add backends.lto` takes (issue #143): `backend add` writes
+/// list `config add backends.lto` takes (issue #143): `drive add` writes
 /// through the same editor, so the two cannot write different tables.
 ///
 /// Pure, so the fields are testable and the command cannot drift from what
@@ -94,7 +66,7 @@ pub fn plan_add(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add(
+pub(crate) fn add(
     paths: &TapectlPaths,
     name: &str,
     device_tape: &str,
@@ -141,7 +113,7 @@ fn add(
     let config = Config::load(&paths.config_file)?;
     if config.backends.lto.iter().any(|b| b.name == name) {
         return Err(TapectlError::Other(format!(
-            "a backend named \"{name}\" already exists in {}\n\n\
+            "a drive named \"{name}\" already exists in {}\n\n\
              Names are how `volume write` picks a drive, so they must be unique. \
              Use a different --name, or edit the existing block.",
             paths.config_file.display()
@@ -163,7 +135,7 @@ fn add(
         .find(|b| crate::config::device_matches(&b.device_tape, device_tape))
     {
         return Err(TapectlError::Other(format!(
-            "device_tape \"{device_tape}\" is already configured as backend \"{}\" \
+            "device_tape \"{device_tape}\" is already configured as drive \"{}\" \
              (device_tape \"{}\") in {}\n\n\
              --device resolves by device_tape, so two backends on the same drive \
              make that resolution ambiguous. Use a different --device-tape, or edit \
@@ -255,7 +227,7 @@ fn add(
             );
         } else {
             println!(
-                "would add backend \"{name}\" to {} ({generation}, tape={device_tape}, \
+                "would add drive \"{name}\" to {} ({generation}, tape={device_tape}, \
                  sg={sg_shown}) (DRY RUN — no changes made)",
                 paths.config_file.display()
             );
@@ -275,7 +247,7 @@ fn add(
         );
     } else {
         println!(
-            "backend \"{name}\" added to {} ({generation}, tape={device_tape}, sg={sg_shown})",
+            "drive \"{name}\" added to {} ({generation}, tape={device_tape}, sg={sg_shown})",
             paths.config_file.display()
         );
         println!("verify it with: tapectl config check");
@@ -291,7 +263,7 @@ mod tests {
         std::path::PathBuf::from("/nonexistent/tapectl-backend-test/config.toml")
     }
 
-    /// The text `backend add` would write over `original`.
+    /// The text `drive add` would write over `original`.
     fn added(original: &str, fields: Vec<String>) -> String {
         plan_add(original, &p(), fields)
             .expect("the add plans")

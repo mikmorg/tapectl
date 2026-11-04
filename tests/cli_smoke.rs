@@ -39,7 +39,7 @@ fn every_write_planned_afresh_takes_fill_ceiling() {
             "tapectl",
             "volume",
             "compact-write",
-            "--destination",
+            "--to",
             "L",
             "--fill-ceiling",
             "99%",
@@ -711,7 +711,7 @@ fn volume_info_heads_its_write_history_writes_not_receipts() {
     assert!(run_tapectl(home.path(), &["init"]).status.success());
     let import = run_tapectl(
         home.path(),
-        &["import", "--label", "INFO-1", "--generation", "LTO-6"],
+        &["volume", "import", "INFO-1", "--generation", "LTO-6"],
     );
     assert!(
         import.status.success(),
@@ -1394,7 +1394,7 @@ fn sigkill(pid: u32) {
 
 /// Test A (issue #98): a stage crashed by SIGKILL is detected as such by
 /// the next `db::open()` sweep — its row moves 'staging' -> 'failed' — and
-/// `staging clean` then removes the half-written slice it left behind.
+/// `stage clean` then removes the half-written slice it left behind.
 #[test]
 fn crashed_stage_is_detected_and_then_cleanable() {
     let home = TempDir::new().expect("home tempdir");
@@ -1416,7 +1416,7 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     // Precondition 1: the row exists and is 'staging' — proves the INSERT
     // + flock + COMMIT sequence has happened.
     poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
-    // Precondition 2: dar has actually produced output — gives `staging
+    // Precondition 2: dar has actually produced output — gives `stage
     // clean`'s prefix scan something real to find and remove.
     let dar_file = poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
     assert!(dar_file.exists());
@@ -1425,7 +1425,7 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     let _ = child.wait();
 
     // Trigger the sweep via any other command's `db::open()`.
-    let status_out = run_tapectl(home.path(), &["staging", "status"]);
+    let status_out = run_tapectl(home.path(), &["stage", "list"]);
     assert!(
         status_out.status.success(),
         "staging status failed: {}",
@@ -1451,15 +1451,15 @@ fn crashed_stage_is_detected_and_then_cleanable() {
         "the sweep must mark status only, never touch files"
     );
 
-    let clean_out = run_tapectl(home.path(), &["staging", "clean"]);
+    let clean_out = run_tapectl(home.path(), &["stage", "clean"]);
     assert!(
         clean_out.status.success(),
-        "staging clean failed: {}",
+        "stage clean failed: {}",
         String::from_utf8_lossy(&clean_out.stderr)
     );
     assert!(
         !dar_file.exists(),
-        "staging clean must remove the crashed stage's half-written slice"
+        "stage clean must remove the crashed stage's half-written slice"
     );
 }
 
@@ -1524,7 +1524,7 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
     let _ = child.wait();
 }
 
-/// `staging clean --json` (issue #95) must emit *pure* JSON (issue #56
+/// `stage clean --json` (issue #95) must emit *pure* JSON (issue #56
 /// defect shape) that includes the new session-dir/lockfile reclamation
 /// counters, on a freshly initialized database with nothing to clean.
 #[test]
@@ -1538,10 +1538,10 @@ fn staging_clean_json_is_pure_and_reports_session_and_lockfile_counters() {
         String::from_utf8_lossy(&init_out.stderr)
     );
 
-    let clean_out = run_tapectl(home.path(), &["staging", "clean", "--json"]);
+    let clean_out = run_tapectl(home.path(), &["stage", "clean", "--json"]);
     assert!(
         clean_out.status.success(),
-        "staging clean --json failed: stderr={}",
+        "stage clean --json failed: stderr={}",
         String::from_utf8_lossy(&clean_out.stderr)
     );
 
@@ -1549,7 +1549,7 @@ fn staging_clean_json_is_pure_and_reports_session_and_lockfile_counters() {
     // payload must fail this, per the #56 defect class.
     let stdout = String::from_utf8_lossy(&clean_out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("staging clean --json stdout did not parse as pure JSON: {e}\nstdout={stdout:?}")
+        panic!("stage clean --json stdout did not parse as pure JSON: {e}\nstdout={stdout:?}")
     });
 
     for key in [
@@ -1564,7 +1564,7 @@ fn staging_clean_json_is_pure_and_reports_session_and_lockfile_counters() {
     ] {
         assert!(
             parsed.get(key).is_some(),
-            "staging clean --json missing key '{key}': {parsed}"
+            "stage clean --json missing key '{key}': {parsed}"
         );
     }
     assert_eq!(parsed["session_dirs_reclaimed"], 0);
@@ -1686,7 +1686,7 @@ fn home_plus_config_does_not_warn() {
 
 /// ADR-0010, "Read paths stay usable without a configured drive": the
 /// machine that most needs `identify`/`verify`/`read-slices`/`restore`/
-/// `catalog rebuild` is the rebuilt one that has keys and no `backend add`
+/// `catalog rebuild` is the rebuilt one that has keys and no `drive add`
 /// yet (ADR-0005's DR path). An explicit `--device` must therefore be taken
 /// exactly as given, with the backend treated as optional — never refused
 /// for want of configuration.
@@ -1989,7 +1989,8 @@ fn write_ambiguous_backend_config(home: &std::path::Path, dev_dir: &std::path::P
 /// refuse.
 ///
 /// Before the fix this failed at the FIRST assertion — `report summary`
-/// exited 2 with the same `error: failed to load config: ...: backends.lto[0]
+/// (1.9.0's `status`; this test now reads `report capacity`, another
+/// report) exited 2 with the same `error: failed to load config: ...: backends.lto[0]
 /// ("a") and backends.lto[1] ("b") both resolve to device_tape ... — two
 /// backends on the same drive make --device resolution ambiguous` every
 /// other command got, because `main.rs` loaded the config strictly before
@@ -2015,10 +2016,10 @@ fn ambiguous_backends_no_longer_brick_a_read_command_but_a_write_still_refuses()
     write_ambiguous_backend_config(home.path(), dev_dir.path());
 
     // Read path: must succeed.
-    let read_out = run_tapectl(home.path(), &["report", "summary"]);
+    let read_out = run_tapectl(home.path(), &["report", "capacity"]);
     assert!(
         read_out.status.success(),
-        "report summary must survive an ambiguous [[backends.lto]] section \
+        "report capacity must survive an ambiguous [[backends.lto]] section \
          (issue #261) — stdout={}\nstderr={}",
         String::from_utf8_lossy(&read_out.stdout),
         String::from_utf8_lossy(&read_out.stderr),
@@ -2067,12 +2068,7 @@ fn ambiguous_backends_do_not_surface_as_a_config_load_failure_for_the_rest_of_th
         vec!["audit".to_string()],
         vec!["catalog".to_string(), "stats".to_string()],
         vec!["report".to_string(), "fire-risk".to_string()],
-        vec![
-            "db".to_string(),
-            "backup".to_string(),
-            "--to".to_string(),
-            backup_arg,
-        ],
+        vec!["db".to_string(), "backup".to_string(), backup_arg],
         vec!["db".to_string(), "fsck".to_string(), "--repair".to_string()],
     ] {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2670,7 +2666,7 @@ fn seed_one_completed_copy_stage_set(home: &std::path::Path, label: &str) {
 }
 
 /// Issue #244 (ADR-0012's 2026-09-17 amendment), revised by issue #262:
-/// `staging clean --json`'s report must itself be a single, parseable JSON
+/// `stage clean --json`'s report must itself be a single, parseable JSON
 /// document on stdout -- never a JSON object beside a plain-text line
 /// (issue #56's defect class, guarded live by
 /// `scripts/lifecycle-suite.sh`'s "assert the WHOLE stdout parses"). This is
@@ -2702,10 +2698,10 @@ fn staging_clean_json_retained_report_is_one_parseable_document() {
 
     seed_one_completed_copy_stage_set(home.path(), "PM244-JSON");
 
-    let out = run_tapectl_noninteractive(home.path(), &["--json", "staging", "clean"]);
+    let out = run_tapectl_noninteractive(home.path(), &["--json", "stage", "clean"]);
     assert!(
         out.status.success(),
-        "issue #262: staging clean must succeed (retaining, not refusing) \
+        "issue #262: stage clean must succeed (retaining, not refusing) \
          when a unit is below its policy's min_copies: stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -2714,7 +2710,7 @@ fn staging_clean_json_retained_report_is_one_parseable_document() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
-            "staging clean --json's report did not parse as one JSON document: {e}\n\
+            "stage clean --json's report did not parse as one JSON document: {e}\n\
              stdout={stdout:?}\nstderr={}",
             String::from_utf8_lossy(&out.stderr)
         )
@@ -2755,10 +2751,10 @@ fn staging_clean_force_still_overrides_the_under_copied_refusal() {
 
     seed_one_completed_copy_stage_set(home.path(), "PM244-FORCE");
 
-    let out = run_tapectl_noninteractive(home.path(), &["staging", "clean", "--force"]);
+    let out = run_tapectl_noninteractive(home.path(), &["stage", "clean", "--force"]);
     assert!(
         out.status.success(),
-        "staging clean --force must still clean: stdout={}\nstderr={}",
+        "stage clean --force must still clean: stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -3051,7 +3047,7 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
 
     let import = run_tapectl(
         home.path(),
-        &["import", "--label", "PH-1", "--generation", "LTO-6"],
+        &["volume", "import", "PH-1", "--generation", "LTO-6"],
     );
     assert!(import.status.success());
     let conn = tapectl::db::open(&home.path().join(".tapectl").join("tapectl.db")).unwrap();
@@ -3268,7 +3264,7 @@ fn a_signal_stops_stage_create_cleanly(signal: &str) {
 
     // As after any failed stage, the next open's sweep marks the set
     // `failed` (its lock is free), and `stage create` starts it over.
-    let swept = run_tapectl(home.path(), &["staging", "status"]);
+    let swept = run_tapectl(home.path(), &["stage", "list"]);
     assert!(swept.status.success());
     let db = home.path().join(".tapectl").join("tapectl.db");
     let conn = rusqlite::Connection::open(db).unwrap();

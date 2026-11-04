@@ -217,7 +217,7 @@ pub fn probe_no_medium(device_tape: &str) -> bool {
 ///   eight of them call before anything else touches the drive
 ///   (`every_read_path_holds_both_reads_for_its_contact` counts them) — and
 ///   before that function's no-backend early return, so the DR machine with
-///   keys and no `backend add` (ADR-0005) is covered too;
+///   keys and no `drive add` (ADR-0005) is covered too;
 /// - every WRITE path (`volume init`, `volume write` and everything built on
 ///   it, `volume resume`): before its own `detect`, and before `volume
 ///   write`'s quiet-host question — an empty drive is refused for its own
@@ -669,7 +669,7 @@ pub fn check_drive_can_read(backend: &LtoBackendConfig, medium: Generation) -> R
 /// Three ways this returns `Ok(())` without ever consulting
 /// [`check_drive_can_read`]:
 /// - no backend resolves for `device` at all (the rebuilt machine with keys
-///   and no `backend add` yet);
+///   and no `drive add` yet);
 /// - a backend resolves, but nothing on the medium yields a recognised
 ///   generation (the same cannot-see-cannot-refuse rule
 ///   `volume::write::check_loaded_generation` already follows — a check
@@ -1111,7 +1111,7 @@ mod tests {
     // ---- check_read_contact: the DR-path leniency (ADR-0010/ADR-0005) ----
 
     /// No backend resolved for this device at all — the rebuilt machine with
-    /// keys and no `backend add` yet. `check_read_contact` must return `Ok`
+    /// keys and no `drive add` yet. `check_read_contact` must return `Ok`
     /// without ever calling `detect` on a real generation mismatch: proven
     /// here by a `Config` with an empty backend list, so a device path that
     /// is not even a real path cannot spuriously "pass" for any other
@@ -1205,7 +1205,7 @@ mod tests {
         assert!(capture.is_some(), "a loaded drive's MAM read is captured");
     }
 
-    /// The DR machine — keys, no `backend add` (ADR-0005) — used to leave
+    /// The DR machine — keys, no `drive add` (ADR-0005) — used to leave
     /// this function before any check at all, and its first drive contact
     /// was the store's blocking open. The empty-drive refusal must not be
     /// skipped by that early return.

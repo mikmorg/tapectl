@@ -15,7 +15,7 @@
 //! The rule is all-or-nothing over the units given, as `collection run` has
 //! always had it: stage once, write N times (`v2-open-questions.md` §11)
 //! means the next copy must find the same staged content this one wrote, so
-//! one short unit keeps every unit's staging. `staging clean` is the
+//! one short unit keeps every unit's staging. `stage clean` is the
 //! per-unit tool — it releases the covered units and retains the short ones.
 //!
 //! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
@@ -342,7 +342,7 @@ fn unit_copy_floor(conn: &Connection, config: &Config, unit_id: i64) -> Result<i
 /// in front of `clean::release_covered_slices`, which stays policy-free, as
 /// [`release_if_covered`] is in front of `clean_staging`. Shared by
 /// `release_if_covered` (so `volume write`, `volume resume` and `collection
-/// run`) and `staging clean`.
+/// run`) and `stage clean`.
 pub(crate) fn release_ranges(
     conn: &Connection,
     config: &Config,

@@ -12,6 +12,7 @@ pub mod host;
 pub mod key;
 pub mod location;
 pub mod operations;
+pub mod renamed;
 pub mod report;
 pub mod restore;
 pub mod snapshot;
@@ -40,7 +41,7 @@ pub struct Cli {
 
     /// Show what would be done without making changes. Commands that
     /// cannot preview refuse the flag rather than ignore it.
-    #[arg(long, global = true)]
+    #[arg(long, short = 'n', global = true)]
     pub dry_run: bool,
 
     /// Enable verbose output
@@ -157,10 +158,11 @@ pub enum Commands {
         command: stage::StageCommands,
     },
 
-    /// Manage staging area
+    /// Removed in 1.9.0: `stage clean` and `stage list` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true, disable_help_subcommand = true)]
     Staging {
         #[command(subcommand)]
-        command: staging::StagingCommands,
+        command: StagingStub,
     },
 
     /// Manage volumes and tape operations
@@ -220,47 +222,13 @@ pub enum Commands {
         command: restore::RestoreCommands,
     },
 
-    /// Export encrypted slices to directory
-    Export {
-        /// Unit name
-        #[arg(long)]
-        unit: String,
-        /// Destination directory
-        #[arg(long)]
-        to: String,
-    },
+    /// Removed in 1.9.0: `unit export` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Export(renamed::Removed),
 
-    /// Import a pre-existing volume into the database
-    Import {
-        /// Volume label
-        #[arg(long)]
-        label: String,
-        /// Backend type
-        #[arg(long, default_value = "lto")]
-        backend: String,
-        /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
-        #[arg(long)]
-        generation: String,
-        /// Capacity (e.g., "2500G"). Decimal, as printed on the cartridge
-        /// (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
-        /// `slice_size`/`enospc_buffer` use.
-        ///
-        /// Defaults to the generation table's native capacity for
-        /// `--generation` when omitted (ADR-0010, decision 3).
-        #[arg(long)]
-        capacity: Option<String>,
-        /// Which configured drive this volume belongs to, by its device path
-        /// (ADR-0010). Only needed when more than one `[[backends.lto]]` is
-        /// configured — with one drive, or none, the behaviour is unchanged.
-        /// Resolved leniently: this command only writes a catalog row and
-        /// never touches the device, so a path no backend claims is not an
-        /// error.
-        #[arg(long)]
-        device: Option<String>,
-        /// Notes
-        #[arg(long)]
-        notes: Option<String>,
-    },
+    /// Removed in 1.9.0: `volume import` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Import(renamed::Removed),
 
     /// Quick archive: create + stage + write in one flow
     ///
@@ -299,13 +267,14 @@ pub enum Commands {
         full_confirm: bool,
     },
 
-    /// Tape drive backends
+    /// Removed in 1.9.0: `drive add` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true, disable_help_subcommand = true)]
     Backend {
         #[command(subcommand)]
-        command: BackendCommands,
+        command: BackendStub,
     },
 
-    /// The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
+    /// The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
     Drive {
         #[command(subcommand)]
         command: drive::DriveCommands,
@@ -349,50 +318,23 @@ pub enum Commands {
     },
 }
 
-/// Tape drive backend configuration (#126).
+/// The `backend` group 1.9.0 removed: its one command is `drive add`.
 #[derive(Subcommand, Debug)]
-pub enum BackendCommands {
-    /// Add an LTO tape drive to the config
-    ///
-    /// Writes a validated `[[backends.lto]]` block in place, so existing
-    /// comments survive, through the editor `config add` uses; the file is
-    /// checked before it is replaced, and a refusal leaves it untouched.
-    /// Find your drive with `ls -l /dev/tape/by-id/`. Prefer the by-id
-    /// path: /dev/nstN numbering is not stable across reboots. The SCSI
-    /// generic node (the sg node, used for the cartridge chip and the
-    /// drive's health pages) is derived from the tape node at every use, so
-    /// it need not be given; --device-sg overrides the derivation.
-    Add {
-        /// Name for this drive, used to select it later. Letters, digits,
-        /// dot, underscore and dash.
-        #[arg(long)]
-        name: String,
-        /// Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
-        #[arg(long)]
-        device_tape: String,
-        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1.
-        /// Optional: left out, tapectl derives it from --device-tape at use
-        /// (the kernel names the pairing), so a /dev/sgN renumbering never
-        /// matters. Given, it overrides the derivation, and a write still
-        /// refuses a node the kernel proves is another drive's.
-        #[arg(long)]
-        device_sg: Option<String>,
-        /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
-        /// drive declares only what it can write; the medium's actual
-        /// generation is detected at `volume init`, not declared here).
-        #[arg(long)]
-        generation: String,
-        /// Capacity override — for virtual drives (mhvtl) and test
-        /// harnesses only. A real drive's capacity follows the loaded
-        /// cartridge's detected generation (ADR-0010); leave this unset.
-        /// Decimal, as printed on the cartridge (K=10^3 ... T=10^12;
-        /// ADR-0012) — not the binary unit `enospc_buffer` uses.
-        #[arg(long)]
-        capacity_override: Option<String>,
-        /// Headroom reserved before end-of-tape, e.g. 50M
-        #[arg(long)]
-        enospc_buffer: Option<String>,
-    },
+pub enum BackendStub {
+    /// Removed in 1.9.0: `drive add`
+    #[command(hide = true, disable_help_flag = true)]
+    Add(renamed::Removed),
+}
+
+/// The `staging` group 1.9.0 removed: `stage clean` and `stage list`.
+#[derive(Subcommand, Debug)]
+pub enum StagingStub {
+    /// Removed in 1.9.0: `stage clean`
+    #[command(hide = true, disable_help_flag = true)]
+    Clean(renamed::Removed),
+    /// Removed in 1.9.0: `stage list`
+    #[command(hide = true, disable_help_flag = true)]
+    Status(renamed::Removed),
 }
 
 /// Database operations.
@@ -405,11 +347,11 @@ pub enum DbCommands {
     /// only grows, and the time a backup takes grows with it.
     Backup {
         /// The backup file to write. Its directory must already exist
-        #[arg(long)]
-        to: String,
+        #[arg(value_name = "PATH")]
+        path: String,
         /// Also copy the private key directory, into a directory beside
         /// the backup named for it with its extension replaced by `.keys`
-        /// (`--to /mnt/usb/tapectl.db` copies the keys to
+        /// (`db backup /mnt/usb/tapectl.db` copies the keys to
         /// `/mnt/usb/tapectl.keys/`). Off by default — the database alone
         /// is the common backup case. Private key material copied this way
         /// must be treated as secret wherever the destination ends up (USB
@@ -482,7 +424,7 @@ pub enum ConfigCommands {
     /// each VALUE is one `field=value` of the new table:
     /// `config add collections name=movies root=/srv/media/movies tenant=family`.
     /// Its name must not already be taken. A drive added as `backends.lto`
-    /// gets the checks `backend add` makes. For a list value
+    /// gets the checks `drive add` makes. For a list value
     /// (`defaults.global_excludes`), each VALUE is appended. Checked and
     /// written as `config set` is.
     Add {
@@ -602,7 +544,10 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
         Commands::QuickArchive { volume, .. } => format!("quick-archive {volume}"),
         Commands::Collection {
             command: C::Run { collection, .. },
-        } => format!("collection run {collection}"),
+        } => match collection {
+            Some(name) => format!("collection run {name}"),
+            None => "collection run".to_string(),
+        },
         Commands::Volume { command } => match command {
             V::Init { label, .. } => format!("volume init {label}"),
             V::Write { label, .. } => {
@@ -635,12 +580,12 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
         Commands::Restore { command } => match command {
             // A dry run reads nothing and opens no session.
             R::Unit { dry_run: true, .. } => return None,
-            R::Unit { unit, .. } => format!("restore unit {unit}"),
+            R::Unit { unit, .. } => format!("restore unit {}", unit.name()),
             R::Volume { dry_run: true, .. } => return None,
             R::Volume { label, .. } => {
                 format!("restore volume {}", label.as_deref().unwrap_or("loaded"))
             }
-            R::File { unit, .. } => format!("restore file {unit}"),
+            R::File { unit, .. } => format!("restore file {}", unit.name()),
             R::RawVolume { .. } => "restore raw-volume".to_string(),
         },
         // A long erase runs for hours on LTO (ADR-0012 2026-10-12 item 52).
@@ -676,7 +621,7 @@ pub(crate) fn write_device(
 /// stay usable without a configured drive").
 ///
 /// `identify`, `verify`, `read-slices`, `restore` and `catalog rebuild` must
-/// work on the rebuilt machine that has keys and no `backend add` yet
+/// work on the rebuilt machine that has keys and no `drive add` yet
 /// (ADR-0005's DR path), so an explicit `--device` is taken exactly as given
 /// and no backend need exist at all. Only the no-`--device` case can fail,
 /// and then because there is genuinely nothing to read from.
@@ -749,14 +694,12 @@ mod tests {
         let cases: &[(&[&str], ErrorContract)] = &[
             (&["volume", "write", "L"], Write),
             (&["volume", "resume", "L"], Write),
-            (&["volume", "compact-write", "--destination", "L"], Write),
+            (&["volume", "compact-write", "--to", "L"], Write),
             (&["volume", "compact", "S", "--to", "L"], Write),
             (&["volume", "rewrite", "S", "--label", "L"], Write),
             (&["volume", "rewrite", "--resume", "L"], Write),
-            (
-                &["collection", "run", "--collection", "c", "--label", "L"],
-                Write,
-            ),
+            (&["collection", "run", "c", "--label", "L"], Write),
+            (&["collection", "run", "--label", "L"], Write),
             (
                 &["quick-archive", "/src", "--tenant", "t", "--volume", "L"],
                 Write,
@@ -773,7 +716,8 @@ mod tests {
             (&["volume", "compact-read", "L"], Ordinary),
             (&["volume", "compact-finish", "L"], Ordinary),
             (&["collection", "plan"], Ordinary),
-            (&["report", "summary"], Ordinary),
+            (&["report", "reclaimable"], Ordinary),
+            (&["status"], Ordinary),
         ];
         for (args, want) in cases {
             let argv: Vec<&str> = std::iter::once("tapectl")
@@ -796,7 +740,7 @@ mod tests {
         );
     }
 
-    /// Issue #169: `import --generation` lost its `"LTO-6"` default and is
+    /// Issue #169: `volume import --generation` lost its `"LTO-6"` default and is
     /// now a plain required `clap` field, so omitting it is a usage error
     /// clap itself enforces — never a value tapectl silently makes up. This
     /// is asserted at the `clap` layer (`Cli::try_parse_from`) rather than
@@ -804,7 +748,7 @@ mod tests {
     /// outside this change's scope fence.
     #[test]
     fn import_without_generation_is_a_usage_error() {
-        let result = Cli::try_parse_from(["tapectl", "import", "--label", "L1"]);
+        let result = Cli::try_parse_from(["tapectl", "volume", "import", "L1"]);
         let err = result.expect_err("missing --generation must be a clap usage error");
         assert_eq!(
             err.kind(),
@@ -823,14 +767,8 @@ mod tests {
     /// diverged correctly.
     #[test]
     fn import_without_capacity_still_parses() {
-        let result = Cli::try_parse_from([
-            "tapectl",
-            "import",
-            "--label",
-            "L1",
-            "--generation",
-            "LTO-6",
-        ]);
+        let result =
+            Cli::try_parse_from(["tapectl", "volume", "import", "L1", "--generation", "LTO-6"]);
         result.expect("omitting --capacity must still parse");
     }
 
@@ -841,15 +779,7 @@ mod tests {
     #[test]
     fn collection_run_full_confirm_first_parses_and_conflicts_with_full_confirm() {
         let run = |extra: &[&str]| {
-            let mut argv = vec![
-                "tapectl",
-                "collection",
-                "run",
-                "--collection",
-                "lib",
-                "--label",
-                "L1",
-            ];
+            let mut argv = vec!["tapectl", "collection", "run", "lib", "--label", "L1"];
             argv.extend_from_slice(extra);
             Cli::try_parse_from(argv)
         };

@@ -85,7 +85,7 @@ fn each_write_command_refused_before_the_tape_moved_exits_2() {
         &[
             "volume",
             "compact-write",
-            "--destination",
+            "--to",
             "NOSUCH",
             "--device",
             NO_DRIVE,
@@ -96,7 +96,6 @@ fn each_write_command_refused_before_the_tape_moved_exits_2() {
         &[
             "collection",
             "run",
-            "--collection",
             "nope",
             "--label",
             "NOSUCH",

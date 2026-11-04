@@ -6,7 +6,7 @@
 //! when it is `true` in `[defaults]`, in an `[[archive_sets]]` table, or on
 //! an `archive_sets` row. `policy::resolve` resolves it and nothing reads
 //! the result: dirty detection (`unit::content_match`, shared by `collection
-//! sync/status`, `unit status --dirty`, `report dirty`, `audit` and
+//! sync/status`, `unit info --dirty`, `report dirty`, `audit` and
 //! `mark-tape-only`'s guard) compares each file's path, size and mtime
 //! only, so a metadata-only change never marks a unit dirty. `false` — the
 //! default — describes exactly that, so only `true` is reported; flagging

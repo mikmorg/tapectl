@@ -2109,7 +2109,7 @@ fn build_write_layout(
     // built in the tapectl home, read once by `build()` into the encrypted
     // operator envelopes, and removed when `catalog_work` drops after
     // `build()`: never under staging (ADR-0012 2026-10-06 item 4), where it
-    // used to stay in the session directory until `staging clean`.
+    // used to stay in the session directory until `stage clean`.
     fs::create_dir_all(session_dir)?;
     let catalog_work = crate::staging::home_work_dir(paths, ".catalog-snapshot-")?;
     let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
@@ -3127,7 +3127,7 @@ fn volume_resume_contacted<'c>(
     // `staging::clean` -> `'cleaned'`, `db::open`'s crash sweep -> `'failed'`,
     // and `read_slices` restoring a set to `'staged'`. `plan` inserts `writes`
     // rows and touches the status not at all. A set stays `'staged'` from
-    // `stage create` until `staging clean` — which is precisely what makes
+    // `stage create` until `stage clean` — which is precisely what makes
     // ADR-0012's per-copy recipe work (`collection run --label A`, swap, then
     // `volume write B` against the same staged bytes), proved on media by the
     // `collection-second-copy` lifecycle scenario (issue #226).
@@ -3451,7 +3451,7 @@ fn adopt_lost_in_contact(
 /// by `volume resume` once a clean full verify is recorded after the abort.
 /// `write_positions`, `volumes.status`, the staged slices and the session
 /// directory are all untouched; the staged files stay pinned until
-/// `staging clean --force` runs — and for a session whose seal is recorded,
+/// `stage clean --force` runs — and for a session whose seal is recorded,
 /// releasing them forfeits that later re-confirmation, which revalidates
 /// against them (issue #324). Returns whether the seal is recorded, so the
 /// caller's closing message can say the same.
@@ -3610,18 +3610,18 @@ pub fn abort_done_message(label: &str, seal: &AbortSeal) -> String {
              stays sealed and unharmed: after a clean full verify (`tapectl volume verify \
              {label}`), `tapectl volume resume {label}` re-confirms it. The staged slices stay \
              pinned — keep staging if you intend to verify and resume; releasing it \
-             (`tapectl staging clean --force`) forfeits that."
+             (`tapectl stage clean --force`) forfeits that."
         ),
         AbortSeal::SealedNotReconfirmable { status } => format!(
             "volume \"{label}\" write session aborted. Its seal was recorded, so this volume is \
              never written again (ADR-0003), but it is `{status}` in the catalog, so `tapectl \
              volume resume` cannot re-confirm it. The staged slices stay pinned until `tapectl \
-             staging clean --force`; releasing them forfeits nothing."
+             stage clean --force`; releasing them forfeits nothing."
         ),
         AbortSeal::Unsealed => format!(
             "volume \"{label}\" write session aborted — the session can no longer be \
              resumed. The cartridge is unsealed and unharmed; the staged slices stay pinned \
-             until `tapectl staging clean --force`."
+             until `tapectl stage clean --force`."
         ),
     }
 }
@@ -3662,7 +3662,7 @@ pub(crate) fn abort_consent_facts(
             "The staged slices stay pinned on disk — keep staging if you intend to verify and \
              resume: after a clean full verify (`tapectl volume verify {label}`), `tapectl \
              volume resume {label}` re-confirms this sealed tape against those frozen staged \
-             files. Releasing them (`tapectl staging clean --force`; plain `tapectl staging \
+             files. Releasing them (`tapectl stage clean --force`; plain `tapectl stage \
              clean` will not) forfeits that re-confirmation."
         )
     } else {
@@ -3671,7 +3671,7 @@ pub(crate) fn abort_consent_facts(
         // plain clean (`staging::clean`'s default guard) — so it is not a
         // way to release them, and must not read like one.
         "The staged slices stay pinned on disk; because this session's `writes` row becomes \
-         ABORTED, plain `tapectl staging clean` will not release them — use `tapectl staging \
+         ABORTED, plain `tapectl stage clean` will not release them — use `tapectl stage \
          clean --force`. Writing them to another volume does not change that: the aborted row \
          still blocks a plain clean."
             .to_string()
@@ -4795,7 +4795,7 @@ pub(crate) fn quarantine_on_medium_evidence(
 ///
 /// LENIENT by construction, which is what lets the read paths share it
 /// (issue #320): a device no configured backend claims — the DR machine
-/// with keys and no `backend add` — gets a warning and nothing else. No
+/// with keys and no `drive add` — gets a warning and nothing else. No
 /// sweep, no row, and never an error, so a restore cannot fail on its
 /// health reading.
 ///
@@ -5579,7 +5579,7 @@ pub(crate) fn precontact_refusal(
 /// would actually re-confirm this volume's aborted session: the session is
 /// adoptable after a clean full verify
 /// ([`session::aborted_session_reconfirmable_after_verify`]) AND its frozen
-/// layout is still on disk -- `staging clean --force` can reclaim the session
+/// layout is still on disk -- `stage clean --force` can reclaim the session
 /// directory, and resume cannot re-confirm without it. The retire path is
 /// named always; it is the reuse path for any sealed cartridge.
 fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Result<String> {
@@ -6392,7 +6392,7 @@ fn close_verify_contact(
     // same one `volume write`/`volume resume` use, so a by-id `--device`
     // finds its backend — and when none resolves, SAY so on the report
     // rather than silently recording nothing (the DR machine with keys and
-    // no `backend add`, ADR-0005: the verify itself is unaffected).
+    // no `drive add`, ADR-0005: the verify itself is unaffected).
     // `session_id` (issue #295) names the `verification_sessions` row a
     // completed verify made; a failed one names none (one stopped during
     // its readback leaves its row `aborted`, issue #410).
@@ -7031,9 +7031,9 @@ struct StagedFile {
 /// What a recovery read has put into staging so far (issue #474), so that a
 /// read which does not finish — a checksum mismatch, a tape error, a signal,
 /// a catalog error — can put staging back as it found it. A slice file with
-/// a `staging_path` on a set that stays `cleaned` is invisible to `staging
-/// clean` (which selects `staged` and `failed` sets) and to `staging
-/// status`, so it would be ciphertext on the staging device nothing names.
+/// a `staging_path` on a set that stays `cleaned` is invisible to `stage
+/// clean` (which selects `staged` and `failed` sets) and to `stage
+/// list`, so it would be ciphertext on the staging device nothing names.
 #[derive(Default)]
 struct StagedRun {
     files: Vec<StagedFile>,
@@ -7092,7 +7092,7 @@ impl StagedRun {
                     path = %f.path.display(),
                     error = %e,
                     "could not remove a staged slice a failed read had written; \
-                     `tapectl staging clean` removes it once it is old enough"
+                     `tapectl stage clean` removes it once it is old enough"
                 ),
             }
             // A prior path equal to this run's own is the file just removed
@@ -7156,8 +7156,8 @@ pub(crate) fn check_recovery_read_space(
     use crate::util::format_bytes_binary as fmt;
     Err(TapectlError::Other(format!(
         "refusing to read {what} into staging: staging directory {} has {} free and the \
-         slices need {}. Nothing was read. `tapectl staging status` shows what staging \
-         holds, and `tapectl staging clean` frees what is already on tape; or point \
+         slices need {}. Nothing was read. `tapectl stage list` shows what staging \
+         holds, and `tapectl stage clean` frees what is already on tape; or point \
          `[staging] directory` at a larger filesystem",
         staging_dir.display(),
         fmt(free),
@@ -7317,7 +7317,7 @@ fn read_slices_contacted(
                 "unit \"{unit_name}\"{} is not on volume \"{from_label}\" whole: the tape sealed \
                  short{} and the unit was cut (volume-format-v2.md §4.2), so no slice of it is \
                  read from this tape. It is still staged, or written whole on another \
-                 cartridge: `tapectl unit status {unit_name}` says where",
+                 cartridge: `tapectl unit info {unit_name}` says where",
                 version.map(|v| format!(" version {v}")).unwrap_or_default(),
                 ended_after
                     .map(|k| format!(" after tape file {k}"))
@@ -7478,11 +7478,11 @@ fn read_slices_into(
         crate::signal::check(|| {
             let again = match version {
                 Some(v) => format!(
-                    "tapectl volume read-slices --from {from_label} --unit {unit_name} \
+                    "tapectl volume read-slices {unit_name} --from {from_label} \
                      --version {v}"
                 ),
                 None => {
-                    format!("tapectl volume read-slices --from {from_label} --unit {unit_name}")
+                    format!("tapectl volume read-slices {unit_name} --from {from_label}")
                 }
             };
             format!(
@@ -8751,7 +8751,7 @@ fn released_slice_refusal(
         .optional()?;
     let remedy = match holder {
         Some(from) => format!(
-            "tapectl volume read-slices --from {from} --unit {} --version {version}",
+            "tapectl volume read-slices {} --from {from} --version {version}",
             unit.name
         ),
         None => {
@@ -8911,7 +8911,7 @@ fn find_staged_data(
 /// [`find_staged_data`] makes — is not whole on disk (issue #402).
 ///
 /// `find_staged_data` keeps the slices that still have a `staging_path`, so
-/// a set an older `staging clean` half-released (or a `compact-read` that
+/// a set an older `stage clean` half-released (or a `compact-read` that
 /// skipped a slice and still promoted its set) reached `build` as a unit
 /// with fewer slices than it has. The seal then recorded a `completed`
 /// write, coverage counts writes rather than slices, and the unit counted
@@ -13308,7 +13308,7 @@ mod tests {
         assert!(matches!(err, TapectlError::Interrupted(_)), "{msg}");
         assert!(msg.contains("after 0 of 1 slices"), "{msg}");
         assert!(
-            msg.contains("tapectl volume read-slices --from RSSTOP --unit rs-stop"),
+            msg.contains("tapectl volume read-slices rs-stop --from RSSTOP"),
             "{msg}"
         );
         let (path, status): (Option<String>, String) = conn
@@ -13594,11 +13594,11 @@ mod tests {
         // remedy is to stage the version again, which works for an active
         // unit.
         assert!(
-            !err.contains("read-slices --from CRBAD"),
+            !err.contains("--from CRBAD"),
             "the remedy must not send the operator back to the failing volume: {err}"
         );
         assert!(
-            err.contains("tapectl staging clean --unit cr-bad --version 1 --force")
+            err.contains("tapectl stage clean --unit cr-bad --version 1 --force")
                 && err.contains("tapectl stage create cr-bad --version 1"),
             "{err}"
         );
@@ -13626,7 +13626,7 @@ mod tests {
         .to_string();
 
         assert!(
-            err.contains("tapectl volume read-slices --from CRGOOD2 --unit cr-bad2 --version 1"),
+            err.contains("tapectl volume read-slices cr-bad2 --from CRGOOD2 --version 1"),
             "{err}"
         );
         assert!(!err.contains("--from CRBAD2"), "{err}");
@@ -15166,7 +15166,7 @@ mod tests {
         assert_eq!(writes, 0, "a refused write must plan nothing");
     }
 
-    /// Issue #402: a staged set an interrupted `staging clean` left with
+    /// Issue #402: a staged set an interrupted `stage clean` left with
     /// one slice's path nulled — `find_staged_data` keeps the slice that
     /// still has a path, and before this the write sealed that one slice
     /// as the whole unit. Seeds a two-slice 'staged' set (`num_slices = 2`)
@@ -15233,7 +15233,7 @@ mod tests {
             "names the slice: {msg}"
         );
         assert!(
-            msg.contains("tapectl staging clean --unit photos --version 1 --force"),
+            msg.contains("tapectl stage clean --unit photos --version 1 --force"),
             "no sealed copy exists, so the remedy is to release and re-stage: {msg}"
         );
         assert!(
@@ -22550,7 +22550,7 @@ mod tests {
         /// `catalog.db` a write puts in its operator envelopes is plaintext
         /// (paths, sizes, hashes), so it is built in the tapectl home and
         /// removed once the envelopes are built — never under staging, where
-        /// it used to sit in the session directory until `staging clean`.
+        /// it used to sit in the session directory until `stage clean`.
         #[test]
         fn a_write_builds_its_catalog_database_outside_staging() {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -25768,7 +25768,7 @@ mod tests {
                         "{err}"
                     );
                     assert!(
-                        err.contains("tapectl volume read-slices --from SX-1 --unit b --version 1"),
+                        err.contains("tapectl volume read-slices b --from SX-1 --version 1"),
                         "{err}"
                     );
                     assert_eq!(code, 2);
@@ -26361,7 +26361,7 @@ mod tests {
                     );
                     assert!(
                         err.contains(
-                            "remedy: tapectl volume read-slices --from SM-1 --unit b --version 1"
+                            "remedy: tapectl volume read-slices b --from SM-1 --version 1"
                         ),
                         "{err}"
                     );
@@ -26378,7 +26378,7 @@ mod tests {
                             Some(volume_id(&f, "SM-1")),
                         )
                         .unwrap(),
-                        "tapectl staging clean --unit b --version 1 --force && tapectl stage \
+                        "tapectl stage clean --unit b --version 1 --force && tapectl stage \
                          create b --version 1",
                         "the volume that failed is never the source"
                     );
@@ -26417,8 +26417,8 @@ mod tests {
                             None
                         )
                         .unwrap(),
-                        "tapectl volume read-slices --from SM-1 --unit b --version 1 && tapectl \
-                         volume read-slices --from SM-2 --unit b --version 1"
+                        "tapectl volume read-slices b --from SM-1 --version 1 && tapectl \
+                         volume read-slices b --from SM-2 --version 1"
                     );
                 }
 
@@ -26568,11 +26568,11 @@ mod tests {
 
     // ---- issue #324: `volume abort`'s operator text, sealed vs unsealed ----
 
-    /// The sentence that sends the operator to `staging clean --force` with
+    /// The sentence that sends the operator to `stage clean --force` with
     /// no caveat. Correct for an unsealed session; for a sealed one it
     /// deletes the frozen files `volume resume`'s re-confirm revalidates
     /// against (ADR-0012, 2026-09-23).
-    const UNQUALIFIED_FORCE_ADVICE: &str = "use `tapectl staging clean --force`";
+    const UNQUALIFIED_FORCE_ADVICE: &str = "use `tapectl stage clean --force`";
 
     #[test]
     fn abort_consent_for_a_sealed_session_says_keep_staging_and_that_releasing_forfeits_resume() {
@@ -26637,10 +26637,10 @@ mod tests {
         let msg = abort_done_message("L6-0001", &AbortSeal::Unsealed);
         assert!(msg.contains("can no longer be resumed"), "{msg}");
         assert!(msg.contains("unsealed"), "{msg}");
-        // Plain `staging clean` does not release an aborted session's slices
+        // Plain `stage clean` does not release an aborted session's slices
         // (`staging::clean::ReleaseBlocker::Abandoned`); the message must
         // name the flag that does.
-        assert!(msg.contains("`tapectl staging clean --force`"), "{msg}");
+        assert!(msg.contains("`tapectl stage clean --force`"), "{msg}");
         assert!(!msg.contains("forfeits"), "{msg}");
     }
 
@@ -26903,7 +26903,7 @@ mod tests {
             assert!(text.contains("`erased`"), "{text}");
             assert!(text.contains("ADR-0003"), "{text}");
         }
-        assert!(facts.contains("`tapectl staging clean --force`"), "{facts}");
+        assert!(facts.contains("`tapectl stage clean --force`"), "{facts}");
         assert!(done.contains("cannot re-confirm"), "{done}");
 
         let yes = AbortSeal::SealedReconfirmable;

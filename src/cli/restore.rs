@@ -12,9 +12,8 @@ const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 pub enum RestoreCommands {
     /// Restore a unit from a volume
     Unit {
-        /// Unit name
-        #[arg(long)]
-        unit: String,
+        #[command(flatten)]
+        unit: UnitArg,
         /// Volume label. Without it the loaded tape names itself: File 0 is
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
@@ -80,7 +79,7 @@ pub enum RestoreCommands {
         #[arg(long, value_name = "FILE")]
         key: Vec<std::path::PathBuf>,
         /// Show what would be restored without restoring
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 
@@ -150,20 +149,26 @@ pub enum RestoreCommands {
         key: Vec<std::path::PathBuf>,
         /// Show what would be restored, unit by unit in tape order, without
         /// opening the drive
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 
     /// Restore a single file from a unit
     File {
-        /// File path within the unit, relative to its root, as `catalog ls`
-        /// prints it. Checked against the catalog's file list for the
+        #[command(flatten)]
+        unit: UnitArg,
+        /// File path within the unit, relative to its root, as `catalog
+        /// list` prints it. Checked against the catalog's file list for the
         /// version before the tape is touched; a directory is refused
-        #[arg(long)]
-        file: String,
-        /// Unit name
-        #[arg(long)]
-        unit: String,
+        #[arg(
+            value_name = "PATH",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        path: Option<String>,
+        /// The file, as a flag: the same as PATH
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
         /// Volume label. Without it the loaded tape names itself: File 0 is
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
@@ -245,6 +250,51 @@ pub enum RestoreCommands {
     },
 }
 
+/// The unit a restore reads: the positional UNIT, or `--unit UNIT`, the
+/// spelling every tape's File 1 prints and an heir may type on any restore
+/// (ADR-0012 items 203 and 210). Exactly one of the two.
+#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
+pub struct UnitArg {
+    /// Unit name
+    #[arg(
+        value_name = "UNIT",
+        required_unless_present = "unit",
+        conflicts_with = "unit"
+    )]
+    name: Option<String>,
+    /// The unit, as a flag: the same as UNIT
+    #[arg(long = "unit", value_name = "UNIT")]
+    unit: Option<String>,
+}
+
+impl UnitArg {
+    /// The unit named, however it was given.
+    pub fn name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.unit.as_deref())
+            .expect("clap requires UNIT or --unit")
+    }
+}
+
+impl From<&str> for UnitArg {
+    fn from(name: &str) -> Self {
+        UnitArg {
+            name: Some(name.to_string()),
+            unit: None,
+        }
+    }
+}
+
+impl RestoreCommands {
+    /// `restore file`'s file, however it was given (PATH or `--file`).
+    fn file_path(path: &Option<String>, file: &Option<String>) -> String {
+        path.clone()
+            .or_else(|| file.clone())
+            .expect("clap requires PATH or --file")
+    }
+}
+
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -276,6 +326,7 @@ pub fn run(
             // Item 107: a `--key` that is not an identity is refused first,
             // by name, before the device is resolved or the drive opened.
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
+            let unit = unit.name();
             // Issue #435: no `--from` restores from the loaded tape, which
             // File 0 names. A dry run opens no drive, so it cannot.
             if from.is_none() && *dry_run {
@@ -355,6 +406,7 @@ pub fn run(
         }
 
         RestoreCommands::File {
+            path,
             file,
             unit,
             from,
@@ -369,6 +421,8 @@ pub fn run(
             // Item 107: refused by name before anything else, as `restore
             // unit` does.
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
+            let unit = unit.name();
+            let file = &RestoreCommands::file_path(path, file);
             // Issue #241: unlike `restore unit`, this has no preview. The
             // catalog check of `--file` runs before any tape contact (issue
             // #406), but proving the entry is really in the archive still

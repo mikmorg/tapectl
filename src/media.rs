@@ -810,7 +810,7 @@ mod tests {
 
     /// Whatever the *value*, the two parsers accept and reject the same
     /// STRINGS — same grammar, different multiplier table — so a validator
-    /// that only checks parseability (e.g. `backend add`'s pre-check of
+    /// that only checks parseability (e.g. `drive add`'s pre-check of
     /// `capacity_override` before it is written to config) is unaffected by
     /// which of the two backs it.
     #[test]

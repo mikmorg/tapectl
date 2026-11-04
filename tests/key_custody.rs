@@ -411,7 +411,7 @@ fn key_type_is_refused_where_the_command_would_ignore_it() {
     assert_eq!(key_row(h, "family", "family-laptop")["key_type"], "backup");
 }
 
-// ── #350(a): `db backup --to … [--include-keys]` ──
+// ── #350(a): `db backup … [--include-keys]` ──
 
 /// A `--to` whose directory does not exist used to reach SQLite and come
 /// back as a bare `unable to open database file`. It is refused by name —
@@ -429,13 +429,7 @@ fn db_backup_refuses_a_missing_destination_directory_by_name() {
         if dry {
             args.push("--dry-run");
         }
-        args.extend([
-            "db",
-            "backup",
-            "--to",
-            dest.to_str().unwrap(),
-            "--include-keys",
-        ]);
+        args.extend(["db", "backup", dest.to_str().unwrap(), "--include-keys"]);
         let err = refused(h, &args);
         assert!(
             err.contains(missing.to_str().unwrap()) && err.contains("does not exist"),
@@ -465,13 +459,7 @@ fn db_backup_names_the_directory_the_private_keys_were_copied_to() {
     let keys_dir = dest_dir.join("tapectl.keys");
     let out = stdout(&ok(
         h,
-        &[
-            "db",
-            "backup",
-            "--to",
-            dest.to_str().unwrap(),
-            "--include-keys",
-        ],
+        &["db", "backup", dest.to_str().unwrap(), "--include-keys"],
     ));
     assert!(
         keys_dir.join(format!("{OP}-primary.age.key")).is_file(),
@@ -491,7 +479,6 @@ fn db_backup_names_the_directory_the_private_keys_were_copied_to() {
             "--json",
             "db",
             "backup",
-            "--to",
             dest2.to_str().unwrap(),
             "--include-keys",
         ],
@@ -507,7 +494,7 @@ fn db_backup_names_the_directory_the_private_keys_were_copied_to() {
     let dest3 = dest_dir.join("third.db");
     let json: serde_json::Value = serde_json::from_str(&stdout(&ok(
         h,
-        &["--json", "db", "backup", "--to", dest3.to_str().unwrap()],
+        &["--json", "db", "backup", dest3.to_str().unwrap()],
     )))
     .unwrap();
     assert_eq!(json["keys_dir"], serde_json::Value::Null, "{json}");
@@ -523,13 +510,7 @@ fn db_backup_refuses_a_destination_that_is_its_own_keys_directory() {
     let dest = h.join("backup.keys");
     let err = refused(
         h,
-        &[
-            "db",
-            "backup",
-            "--to",
-            dest.to_str().unwrap(),
-            "--include-keys",
-        ],
+        &["db", "backup", dest.to_str().unwrap(), "--include-keys"],
     );
     assert!(err.contains(dest.to_str().unwrap()), "{err}");
     assert!(!dest.exists(), "the refusal must not have written anything");
@@ -543,7 +524,7 @@ fn db_backup_refuses_a_directory_as_the_destination_and_suggests_a_file() {
     let h = home.path();
     let usb = h.join("usb");
     std::fs::create_dir(&usb).unwrap();
-    let err = refused(h, &["db", "backup", "--to", usb.to_str().unwrap()]);
+    let err = refused(h, &["db", "backup", usb.to_str().unwrap()]);
     assert!(
         err.contains("is a directory") && err.contains(usb.join("tapectl.db").to_str().unwrap()),
         "{err}"

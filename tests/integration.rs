@@ -2638,7 +2638,6 @@ fn test_db_backup_json_reports_whether_keys_were_included() {
             "--json".to_string(),
             "db".to_string(),
             "backup".to_string(),
-            "--to".to_string(),
             dest.to_str().unwrap().to_string(),
         ];
         if include_keys {
@@ -3088,7 +3087,7 @@ fn volume_retire_tier3_refuses_the_last_eligible_copy() {
     for needle in [
         "LAST eligible copy",
         "unit \"photos\" v3",
-        "tapectl volume read-slices --from L6-SOLE --unit photos",
+        "tapectl volume read-slices photos --from L6-SOLE",
         "tapectl volume init <OTHER-LABEL>",
         // NOT "tapectl stage create photos --version 3". This fixture staged
         // and wrote, and `volume write` leaves the set `staged` -- which is

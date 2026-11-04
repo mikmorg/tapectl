@@ -83,7 +83,7 @@ pub struct BatchExecutionReport {
     pub slices: CleanReport,
     /// `Some` when releasing staging failed after every copy was sealed and
     /// confirmed (a catalog error): the warning naming the unfinished step
-    /// and `tapectl staging clean`, which finishes it. The copies stand, so
+    /// and `tapectl stage clean`, which finishes it. The copies stand, so
     /// the run exits as if the release had been retained (ADR-0012
     /// 2026-10-07 item 33); `cleaned` is `None`, `under_copied` empty and
     /// `slices` empty.
@@ -141,7 +141,7 @@ pub struct BatchExecutionReport {
 /// even then, scopes that call to exactly this batch's own units
 /// (`staging::clean::CleanScope::Units`, via [`batch_unit_ids`], issue
 /// #248): `clean_staging`'s own eligibility SQL has no notion of "batch" at
-/// all, so passing `CleanScope::Whole` here (as `tapectl staging clean`
+/// all, so passing `CleanScope::Whole` here (as `tapectl stage clean`
 /// deliberately still does) would release every eligible stage_set in the
 /// WHOLE database the instant this batch's own gate passed — including a
 /// different batch's unit that is still below its own `min_copies`. A
@@ -416,7 +416,7 @@ fn stage_units(
 /// [`release_if_covered`], with its failure turned into a warning instead
 /// of an error (ADR-0012 2026-10-07 item 33). The copies stand, so a
 /// catalog error here must not make `collection run` exit 2; the warning
-/// names the step and `tapectl staging clean`, which releases what this
+/// names the step and `tapectl stage clean`, which releases what this
 /// did not (it retains, per unit, whatever is still below its policy, as
 /// this release would have).
 fn release_after_copies(
@@ -433,7 +433,7 @@ fn release_after_copies(
                 volume,
                 "releasing the batch's staging",
                 &e,
-                Some("tapectl staging clean"),
+                Some("tapectl stage clean"),
             );
             let nothing = ReleaseOutcome {
                 cleaned: None,
@@ -463,7 +463,7 @@ fn release_after_copies(
 ///
 /// The whole outcome comes back, the per-slice release of the batch's sets
 /// that hold a range included (1.7.0, #478; ADR-0012 item 129), so `collection
-/// run` reports it as `staging clean` does.
+/// run` reports it as `stage clean` does.
 fn release_if_covered(conn: &Connection, config: &Config, batch: &Batch) -> Result<ReleaseOutcome> {
     let unit_ids = batch_unit_ids(conn, batch)?;
     let outcome = crate::staging::release::release_if_covered(conn, config, &unit_ids)?;
@@ -514,7 +514,7 @@ mod tests {
 
     /// ADR-0012 2026-10-07 item 33: a catalog error releasing staging after
     /// the copies are sealed comes back as a warning naming the step and
-    /// `tapectl staging clean`, not as an error — here the batch names a
+    /// `tapectl stage clean`, not as an error — here the batch names a
     /// unit the catalog does not have, so the release's first query fails.
     #[test]
     fn a_failed_release_after_the_copies_is_a_warning() {
@@ -541,7 +541,7 @@ mod tests {
         );
         assert!(warning.contains("\"gone\""), "the cause: {warning}");
         assert!(
-            warning.ends_with("To finish it: tapectl staging clean"),
+            warning.ends_with("To finish it: tapectl stage clean"),
             "{warning}"
         );
     }
@@ -688,7 +688,7 @@ mod tests {
     }
 
     /// ADR-0012 2026-10-12 item 43: the release gate asks the floor
-    /// `staging clean` retains by, the one tape-only rule's. One copy meets
+    /// `stage clean` retains by, the one tape-only rule's. One copy meets
     /// `min_copies = 1` for an active unit (the positive control); tape-only
     /// at 3x it needs 3.
     #[test]

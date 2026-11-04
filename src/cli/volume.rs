@@ -82,7 +82,7 @@ pub enum VolumeCommands {
     /// 2: after a quick confirm too); otherwise it is kept
     /// and the output names each unit that is still short. A release that
     /// fails is a warning and the exit status stays 0. `--keep-staging`
-    /// never releases; `staging clean` does it later.
+    /// never releases; `stage clean` does it later.
     ///
     /// A further copy in one command (ADR-0012 2026-10-15 item 59):
     /// `tapectl volume write L6-0003 --init --full-confirm --move-to
@@ -186,7 +186,7 @@ pub enum VolumeCommands {
         /// Keep the staged slices after the write seals and confirms, even
         /// when every unit written has reached its copy floor.
         /// Without this flag the staging is released then; release it later
-        /// with `tapectl staging clean`.
+        /// with `tapectl stage clean`.
         #[arg(long)]
         keep_staging: bool,
         /// Write only the staged sets that still have need at this location
@@ -304,7 +304,7 @@ pub enum VolumeCommands {
     ///
     /// The tape is never contacted (hence no --device): the cartridge is left
     /// exactly as the session left it, and the staged files stay pinned
-    /// until `staging clean --force` runs. The session becomes ABORTED:
+    /// until `stage clean --force` runs. The session becomes ABORTED:
     /// `volume resume` will not pick it up again unless its seal is recorded
     /// AND a clean full verify is recorded after the abort (ADR-0012,
     /// 2026-09-23), and a session aborted before its seal is never
@@ -401,12 +401,12 @@ pub enum VolumeCommands {
     /// state. The staging directory is checked for room before the first
     /// slice is read, and a read that does not finish removes what it wrote.
     ReadSlices {
-        /// Source volume label
-        #[arg(long)]
-        from: String,
         /// Unit name to read
-        #[arg(long)]
+        #[arg(value_name = "UNIT")]
         unit: String,
+        /// Source volume label
+        #[arg(long, value_name = "LABEL")]
+        from: String,
         /// Read only this version of the unit (a reclaimable or purged
         /// version is read when named). Without it, every version on the
         /// volume except the reclaimable and purged ones is read.
@@ -435,7 +435,7 @@ pub enum VolumeCommands {
     /// quarantined, 75 catalog busy).
     CompactWrite {
         /// Destination volume label
-        #[arg(long)]
+        #[arg(long = "to", value_name = "LABEL")]
         destination: String,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
@@ -514,7 +514,7 @@ pub enum VolumeCommands {
     /// destination — always, with or without `--to`. It therefore needs a
     /// terminal, and without one it refuses before reading anything. To
     /// compact unattended, run the steps separately: `volume compact-read
-    /// <SOURCE>`, swap cartridges, `volume compact-write --destination
+    /// <SOURCE>`, swap cartridges, `volume compact-write --to
     /// <DEST>`, then `volume compact-finish <SOURCE>`.
     ///
     /// Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may
@@ -599,7 +599,7 @@ pub enum VolumeCommands {
     /// From the erase until `NEW` passes that readback the staging disk may
     /// hold the ONLY copy of some units. That window is named in the events
     /// and the session log. If the command stops in it, the staged slices
-    /// stay staged and nothing releases them (`staging clean --force`
+    /// stay staged and nothing releases them (`stage clean --force`
     /// included); the error names the command that finishes the job:
     /// `volume rewrite --resume NEW`.
     ///
@@ -704,6 +704,39 @@ pub enum VolumeCommands {
         /// List every unit carried by this volume instead of the summary
         #[arg(long)]
         units: bool,
+    },
+
+    /// Record a pre-existing volume in the catalog
+    ///
+    /// Writes a catalog row for a tape this catalog has never seen and
+    /// never touches the drive. For a tape tapectl wrote, `catalog rebuild
+    /// --from-volume` reads what is on it instead.
+    Import {
+        /// Volume label
+        #[arg(value_name = "LABEL")]
+        label: String,
+        /// Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
+        #[arg(long)]
+        generation: String,
+        /// Capacity (e.g., "2500G"). Decimal, as printed on the cartridge
+        /// (K=10^3 ... T=10^12; ADR-0012) — not the binary unit
+        /// `slice_size`/`enospc_buffer` use.
+        ///
+        /// Defaults to the generation table's native capacity for
+        /// `--generation` when omitted (ADR-0010, decision 3).
+        #[arg(long)]
+        capacity: Option<String>,
+        /// Which configured drive this volume belongs to, by its device path
+        /// (ADR-0010). Only needed when more than one drive is configured;
+        /// with one drive, or none, the behaviour is unchanged. Resolved
+        /// leniently: this command only writes a catalog row and never
+        /// touches the device, so a path no configured drive claims is not
+        /// an error.
+        #[arg(long)]
+        device: Option<String>,
+        /// Notes
+        #[arg(long)]
+        notes: Option<String>,
     },
 }
 
@@ -942,7 +975,7 @@ impl From<bool> for StagingKeep {
 /// ([`crate::staging::release::release_if_covered`]), over the units the
 /// volume now holds a completed write of. Never fails the write: an error
 /// becomes [`StagingRelease::Failed`], the warning naming the step and
-/// `tapectl staging clean`, which finishes it.
+/// `tapectl stage clean`, which finishes it.
 pub fn release_staging_after_write(
     conn: &Connection,
     config: &Config,
@@ -965,7 +998,7 @@ pub fn release_staging_after_write(
         Ok(None) => StagingRelease::NothingWritten,
         // #478: the per-slice release is reported with the whole-set one,
         // never dropped (its stranded paths are the operator's only notice
-        // of files no later `staging clean` can find, issue #108).
+        // of files no later `stage clean` can find, issue #108).
         Ok(Some(o)) => match o.cleaned {
             Some(mut cleaned) => {
                 cleaned.absorb(o.slices);
@@ -980,7 +1013,7 @@ pub fn release_staging_after_write(
             label,
             "releasing staging",
             &e,
-            Some("tapectl staging clean"),
+            Some("tapectl stage clean"),
         )),
     }
 }
@@ -1065,7 +1098,7 @@ fn release_slices(release: &StagingRelease) -> Option<&crate::staging::clean::Cl
 }
 
 /// The lines naming a per-slice release (#478, ADR-0012 item 129), in
-/// `staging clean`'s words: per stage set that holds a range, the slices
+/// `stage clean`'s words: per stage set that holds a range, the slices
 /// released (each has its copies) and the slices kept, short of copies,
 /// which continue its span. Empty when no set holds a range.
 fn slice_release_lines(r: &crate::staging::clean::CleanReport) -> Vec<String> {
@@ -1089,7 +1122,7 @@ fn slice_release_lines(r: &crate::staging::clean::CleanReport) -> Vec<String> {
 }
 
 /// The warning for staged files a release could not remove (issue #108):
-/// `staging_path` is nulled before the unlink, so no later `staging clean`
+/// `staging_path` is nulled before the unlink, so no later `stage clean`
 /// can find them, and these lines are the operator's only notice.
 fn stranded_lines(label: &str, stranded: &[std::path::PathBuf]) -> Vec<String> {
     if stranded.is_empty() {
@@ -1097,7 +1130,7 @@ fn stranded_lines(label: &str, stranded: &[std::path::PathBuf]) -> Vec<String> {
     }
     let mut lines = vec![format!(
         "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} \
-         staged file(s) could NOT be removed and no later `staging clean` can find them. Remove \
+         staged file(s) could NOT be removed and no later `stage clean` can find them. Remove \
          by hand:",
         stranded.len()
     )];
@@ -1118,7 +1151,7 @@ pub(crate) fn render_staging_release(
     let mut err = Vec::new();
     match release {
         StagingRelease::Kept => out.push(
-            "staging kept (--keep-staging); `tapectl staging clean` releases it when you want it \
+            "staging kept (--keep-staging); `tapectl stage clean` releases it when you want it \
              gone"
                 .to_string(),
         ),
@@ -1139,10 +1172,10 @@ pub(crate) fn render_staging_release(
             out.extend(units.iter().map(|p| format!("  {}", p.describe())));
             out.push(if for_locations {
                 "  write the next copy with `tapectl volume write <label> --for-location \
-                 <location>`; `tapectl staging clean` releases the units that are covered"
+                 <location>`; `tapectl stage clean` releases the units that are covered"
                     .to_string()
             } else {
-                "  write another copy with `tapectl volume write <label>`; `tapectl staging \
+                "  write another copy with `tapectl volume write <label>`; `tapectl stage \
                  clean` releases the units that are covered"
                     .to_string()
             });
@@ -2328,7 +2361,7 @@ pub fn run(
                                  only its condition changed, from \"{}\" to \"quarantined\" — but \
                                  it no longer counts as a copy, so `volume retire` will no longer \
                                  refuse it as the last one — salvage what still reads off it \
-                                 first (`volume read-slices --from {label} --unit <UNIT>`).",
+                                 first (`volume read-slices <UNIT> --from {label}`).",
                                 q.proof.len(),
                                 report.failed,
                                 q.previous_condition,
@@ -3022,7 +3055,7 @@ pub fn run(
                 return Err(crate::cli::refuse_dry_run(
                     "volume rewrite --resume",
                     "what it would do depends on what the drive and the catalog say \
-                     when it runs; `tapectl staging status` shows the held slices.",
+                     when it runs; `tapectl stage list` shows the held slices.",
                 ));
             }
             // Strict, as every write path: a rewrite erases and writes.
@@ -3143,6 +3176,26 @@ pub fn run(
             } else {
                 println!("{}", Table::new(rows));
             }
+        }
+
+        VolumeCommands::Import {
+            label,
+            generation,
+            capacity,
+            device,
+            notes,
+        } => {
+            crate::cli::operations::volume_import(
+                conn,
+                config,
+                label,
+                generation,
+                capacity.as_deref(),
+                device.as_deref(),
+                notes.as_deref(),
+                json_output,
+                dry_run,
+            )?;
         }
 
         VolumeCommands::Info { label, units } => {
@@ -3488,7 +3541,7 @@ fn refuse_unattended_compact(
          Run the three steps separately, which works unattended:\n    \
          tapectl volume compact-read {source}\n    \
          (unload \"{source}\", load the destination)\n    \
-         tapectl volume compact-write --destination {dest}\n    \
+         tapectl volume compact-write --to {dest}\n    \
          tapectl volume compact-finish {source}"
     )))
 }
@@ -3533,7 +3586,7 @@ fn swap_to_destination_with(
     let finish_later = |dest: &str| {
         format!(
             "the live slices of \"{source}\" are staged; to finish, load the destination and \
-             run `tapectl volume compact-write --destination {dest}`, then \
+             run `tapectl volume compact-write --to {dest}`, then \
              `tapectl volume compact-finish {source}`"
         )
     };
@@ -5425,7 +5478,7 @@ mod tests {
                 "{warning}"
             );
             assert!(
-                warning.ends_with("To finish it: tapectl staging clean"),
+                warning.ends_with("To finish it: tapectl stage clean"),
                 "{warning}"
             );
             let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
@@ -7324,10 +7377,7 @@ mod tests {
                 swap_to_destination_with(Some("L6-DST"), SRC, DEV, true, || Ok(String::new()))
                     .expect_err("no answer is not a confirmed swap");
             let msg = err.to_string();
-            assert!(
-                msg.contains("volume compact-write --destination L6-DST"),
-                "{msg}"
-            );
+            assert!(msg.contains("volume compact-write --to L6-DST"), "{msg}");
         }
 
         /// Never reached through `run` (the up-front refusal comes first),
@@ -7355,7 +7405,7 @@ mod tests {
                 assert!(msg.contains("terminal"), "{msg}");
                 for step in [
                     format!("tapectl volume compact-read {SRC}"),
-                    format!("tapectl volume compact-write --destination {dest}"),
+                    format!("tapectl volume compact-write --to {dest}"),
                     format!("tapectl volume compact-finish {SRC}"),
                 ] {
                     assert!(msg.contains(&step), "missing `{step}`: {msg}");

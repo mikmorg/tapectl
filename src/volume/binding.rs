@@ -1741,7 +1741,7 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
 /// LENIENT by construction (ADR-0010, "Read paths stay usable without a
 /// configured drive"): the MAM lives behind the drive's SCSI generic
 /// node, which is only known from a configured backend. A rebuilt machine
-/// with keys and no `backend add` gets `None` — an absence, so every read
+/// with keys and no `drive add` gets `None` — an absence, so every read
 /// path still works, which is exactly ADR-0005's DR path.
 ///
 /// Resolved through [`crate::config::resolve_device`], NOT by comparing
@@ -2957,7 +2957,7 @@ mod tests {
                 .expect_err("the only copy cannot be retired")
                 .to_string();
         assert!(
-            floor.contains("tapectl volume read-slices --from L6-SEALED --unit photos"),
+            floor.contains("tapectl volume read-slices photos --from L6-SEALED"),
             "{floor}"
         );
 

@@ -77,6 +77,12 @@ enum Verdict {
     /// Runs its own preview and makes no change — proven in
     /// `tests/dry_run_global.rs`, not here.
     Honours,
+    /// A spelling 1.9.0 removed (ADR-0012 item 203): a hidden stub that
+    /// refuses by name, naming the new spelling and the release, and exits
+    /// 2, before any home is resolved, so it changes nothing with or
+    /// without `--dry-run`. Probed by
+    /// [`every_renamed_verdict_refuses_by_name_and_changes_nothing`].
+    Renamed,
 }
 
 /// Every clap leaf, one verdict apiece. Order follows the clap tree
@@ -91,7 +97,7 @@ const TABLE: &[(&[&str], Verdict)] = &[
         Verdict::Refuses { probe_args: &[] },
     ),
     (&["audit"], Verdict::ReadOnly),
-    (&["backend", "add"], Verdict::Honours),
+    (&["backend", "add"], Verdict::Renamed),
     // cartridge: register is this branch's fix; the other six were already
     // fixed (issue #230, and the ADR-0012 gated-consent work that followed
     // it) before this branch started — confirmed by reading, not re-fixed.
@@ -113,7 +119,8 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["cartridge", "retire"], Verdict::Honours),
     (&["cartridge", "unretire"], Verdict::Honours),
     (&["catalog", "locate"], Verdict::ReadOnly),
-    (&["catalog", "ls"], Verdict::ReadOnly),
+    (&["catalog", "list"], Verdict::ReadOnly),
+    (&["catalog", "ls"], Verdict::Renamed),
     (
         &["catalog", "rebuild"],
         Verdict::Refuses {
@@ -157,6 +164,10 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // reports what it would record (the cartridge named or found in the
     // drive) and records nothing, not even the drive's row. Proven in
     // `cli::drive`'s unit tests and `tests/drive_cleaning_cli.rs`.
+    // `drive add`, `backend add` before 1.9.0: the dry run plans the edit
+    // and writes nothing (`config.toml` byte-for-byte unchanged), proven in
+    // `tests/dry_run_global.rs`.
+    (&["drive", "add"], Verdict::Honours),
     (&["drive", "cleaned"], Verdict::Honours),
     (&["drive", "cleaning-cartridge", "add"], Verdict::Honours),
     // Issue #429: `--dry-run` checks for a holder, reads the node and the
@@ -172,21 +183,22 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // Issue #428: status reads the st driver's answer and the catalog and
     // writes nothing anywhere (no contact, no journal row, no lock).
     (&["drive", "status"], Verdict::ReadOnly),
-    // export/import/init/quick-archive: top-level `Commands::*` arms in
-    // `main.rs` that call `cli::operations::*`/`cmd_init` directly, never a
+    // init/quick-archive: top-level `Commands::*` arms in `main.rs` that
+    // call `cli::operations::*`/`cmd_init` directly, never a
     // `cli::<mod>::run(...)` dispatch — fixed by issue #247, which extended
     // its scope past #241's "the argument lists of the `cli::<mod>::run(...)`
-    // dispatch calls" fence to cover these four call sites too.
-    (&["export"], Verdict::Honours),
+    // dispatch calls" fence to cover these call sites (and the top-level
+    // `export`/`import` of the time, 1.9.0's `unit export`/`volume import`).
+    (&["export"], Verdict::Renamed),
     // host check: reads /proc and systemd, writes nothing anywhere (ADR-0012,
     // 2026-09-24 amendment, item 7).
     (&["host", "check"], Verdict::ReadOnly),
-    (&["import"], Verdict::Honours),
+    (&["import"], Verdict::Renamed),
     (&["init"], Verdict::Honours),
     (
         &["key", "escrow-kit"],
         Verdict::Refuses {
-            probe_args: &["--out", "/tmp/tapectl-dry-run-contract-nonexistent"],
+            probe_args: &["/tmp/tapectl-dry-run-contract-nonexistent"],
         },
     ),
     (&["key", "export"], Verdict::ReadOnly),
@@ -244,9 +256,10 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["report", "fire-risk"], Verdict::ReadOnly),
     (&["report", "health"], Verdict::ReadOnly),
     (&["report", "needs"], Verdict::ReadOnly),
-    (&["report", "pending"], Verdict::ReadOnly),
-    (&["report", "summary"], Verdict::ReadOnly),
-    (&["report", "supersedable"], Verdict::ReadOnly),
+    (&["report", "pending"], Verdict::Renamed),
+    (&["report", "reclaimable"], Verdict::ReadOnly),
+    (&["report", "summary"], Verdict::Renamed),
+    (&["report", "supersedable"], Verdict::Renamed),
     (&["report", "tape-only"], Verdict::ReadOnly),
     (&["report", "verify-status"], Verdict::ReadOnly),
     (
@@ -307,10 +320,11 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // #493 (ADR-0012 item 151): plans from the catalog and the sources and
     // stages nothing under `--dry-run` — proven in `tests/dry_run_global.rs`.
     (&["stage", "for-location"], Verdict::Honours),
+    (&["stage", "clean"], Verdict::Refuses { probe_args: &[] }),
     (&["stage", "info"], Verdict::ReadOnly),
     (&["stage", "list"], Verdict::ReadOnly),
-    (&["staging", "clean"], Verdict::Refuses { probe_args: &[] }),
-    (&["staging", "status"], Verdict::ReadOnly),
+    (&["staging", "clean"], Verdict::Renamed),
+    (&["staging", "status"], Verdict::Renamed),
     // status: reads the session logs, writes nothing anywhere (issue #393).
     (&["status"], Verdict::ReadOnly),
     (&["tenant", "add"], Verdict::Honours),
@@ -320,6 +334,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["tenant", "reassign"], Verdict::Honours),
     (&["unit", "check-integrity"], Verdict::ReadOnly),
     (&["unit", "discover"], Verdict::Refuses { probe_args: &[] }),
+    // `unit export`, the top-level `export` before 1.9.0: the dry run
+    // creates no destination directory, proven in `tests/dry_run_global.rs`.
+    (&["unit", "export"], Verdict::Honours),
     (
         &["unit", "init"],
         Verdict::Refuses {
@@ -348,7 +365,8 @@ const TABLE: &[(&[&str], Verdict)] = &[
         },
     ),
     (&["unit", "rename"], Verdict::Honours),
-    (&["unit", "status"], Verdict::ReadOnly),
+    (&["unit", "info"], Verdict::ReadOnly),
+    (&["unit", "status"], Verdict::Renamed),
     (&["unit", "tag"], Verdict::Honours),
     (
         &["volume", "abort"],
@@ -377,7 +395,7 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (
         &["volume", "compact-write"],
         Verdict::Refuses {
-            probe_args: &["--destination", "NOSUCHVOL"],
+            probe_args: &["--to", "NOSUCHVOL"],
         },
     ),
     // Issue #483: `volume rewrite SRC --label NEW --dry-run` runs the
@@ -390,6 +408,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["volume", "deposit", "list"], Verdict::ReadOnly),
     (&["volume", "deposit", "remove"], Verdict::Honours),
     (&["volume", "identify"], Verdict::ReadOnly),
+    // `volume import`, the top-level `import` before 1.9.0: the dry run
+    // inserts no `volumes` row, proven in `tests/dry_run_global.rs`.
+    (&["volume", "import"], Verdict::Honours),
     (&["volume", "info"], Verdict::ReadOnly),
     (
         &["volume", "init"],
@@ -403,7 +424,7 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (
         &["volume", "read-slices"],
         Verdict::Refuses {
-            probe_args: &["--from", "NOSUCHVOL", "--unit", "u"],
+            probe_args: &["u", "--from", "NOSUCHVOL"],
         },
     ),
     (
@@ -426,6 +447,48 @@ const TABLE: &[(&[&str], Verdict)] = &[
         },
     ),
 ];
+
+/// Every [`Verdict::Renamed`] entry, run for real on a HOME with nothing
+/// in it: refused by name (exit 2, the new spelling and "1.9.0" on stderr)
+/// with `--dry-run` and without, and with `--help`, which clap would
+/// otherwise answer with the hidden stub's help and exit 0 (ADR-0012 item
+/// 203; OQ4). The HOME is left empty: no `.tapectl` is created.
+#[test]
+fn every_renamed_verdict_refuses_by_name_and_changes_nothing() {
+    let home = TempDir::new().unwrap();
+    let mut failures = Vec::new();
+    for (path, verdict) in TABLE {
+        let Verdict::Renamed = verdict else {
+            continue;
+        };
+        let renamed = tapectl::cli::renamed::command(path)
+            .unwrap_or_else(|| panic!("`{}` is not in the renamed table", path.join(" ")));
+        for extra in [&["--dry-run"][..], &[], &["--help"]] {
+            let mut args: Vec<&str> = path.to_vec();
+            args.extend_from_slice(extra);
+            let out = run_tapectl(home.path(), &args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let new = format!("`tapectl {}`", renamed.new);
+            if out.status.code() != Some(2) || !stderr.contains(&new) || !stderr.contains("1.9.0") {
+                failures.push(format!(
+                    "`tapectl {}` exited {:?}; it must exit 2 naming {new} and 1.9.0: \
+                     stdout={} stderr={stderr}",
+                    args.join(" "),
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                ));
+            }
+        }
+    }
+    let left: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
+    assert!(left.is_empty(), "a refusal created {left:?}");
+    assert!(
+        failures.is_empty(),
+        "{} renamed spelling(s) not refused by name:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
 
 /// Every leaf (a node with no subcommands of its own) in the real clap
 /// tree, as `Vec<String>` path segments.
@@ -475,7 +538,7 @@ fn every_clap_leaf_has_exactly_one_table_verdict() {
     assert!(
         undecided.is_empty(),
         "issue #241's contract has no verdict for: {undecided:?} — every clap leaf must \
-         appear in TABLE (dry_run_contract.rs) as ReadOnly, Refuses or Honours"
+         appear in TABLE (dry_run_contract.rs) as ReadOnly, Refuses, Honours or Renamed"
     );
 
     let stale: Vec<String> = table_paths

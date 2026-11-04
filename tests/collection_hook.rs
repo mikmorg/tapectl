@@ -96,14 +96,7 @@ snapshot_command = '''{command}'''
     (home, root)
 }
 
-const RUN: [&str; 6] = [
-    "collection",
-    "run",
-    "--collection",
-    "microlib",
-    "--label",
-    "L1",
-];
+const RUN: [&str; 5] = ["collection", "run", "microlib", "--label", "L1"];
 
 /// A dry run says which command it would run and runs it not: the marker
 /// the command would have left is absent, and the JSON carries the command.

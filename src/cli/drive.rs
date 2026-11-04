@@ -1,3 +1,6 @@
+//! `tapectl drive add` — declare a drive in `[[backends.lto]]` without
+//! hand-editing TOML; the body is `cli::backend::add`.
+//!
 //! `tapectl drive poll` — read the drive's health on a schedule (ADR-0012,
 //! 2026-10-07 item 29; issue #309). The work is `tape::poll`; this module
 //! resolves the drive, takes its lock BEFORE the catalog is opened, prints
@@ -36,11 +39,53 @@ use crate::tape::poll::{self, PollReport, Probe};
 
 #[derive(Subcommand, Debug)]
 pub enum DriveCommands {
+    /// Add an LTO tape drive to the config
+    ///
+    /// Writes a validated `[[backends.lto]]` block in place, so existing
+    /// comments survive, through the editor `config add` uses; the file is
+    /// checked before it is replaced, and a refusal leaves it untouched.
+    /// Find your drive with `ls -l /dev/tape/by-id/`. Prefer the by-id
+    /// path: /dev/nstN numbering is not stable across reboots. The SCSI
+    /// generic node (the sg node, used for the cartridge chip and the
+    /// drive's health pages) is derived from the tape node at every use, so
+    /// it need not be given; --device-sg overrides the derivation.
+    Add {
+        /// Name for this drive, used to select it later. Letters, digits,
+        /// dot, underscore and dash.
+        #[arg(long)]
+        name: String,
+        /// Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
+        #[arg(long)]
+        device_tape: String,
+        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1.
+        /// Optional: left out, tapectl derives it from --device-tape at use
+        /// (the kernel names the pairing), so a /dev/sgN renumbering never
+        /// matters. Given, it overrides the derivation, and a write still
+        /// refuses a node the kernel proves is another drive's.
+        #[arg(long)]
+        device_sg: Option<String>,
+        /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
+        /// drive declares only what it can write; the medium's actual
+        /// generation is detected at `volume init`, not declared here).
+        #[arg(long)]
+        generation: String,
+        /// Capacity override — for virtual drives (mhvtl) and test
+        /// harnesses only. A real drive's capacity follows the loaded
+        /// cartridge's detected generation (ADR-0010); leave this unset.
+        /// Decimal, as printed on the cartridge (K=10^3 ... T=10^12;
+        /// ADR-0012) — not the binary unit `enospc_buffer` uses.
+        #[arg(long)]
+        capacity_override: Option<String>,
+        /// Headroom reserved before end-of-tape, e.g. 50M
+        #[arg(long)]
+        enospc_buffer: Option<String>,
+    },
+
     /// Read the drive's health pages (and the cartridge chip, when one is
     /// loaded) and record them — read-only, through the SCSI generic node
     /// only
     ///
-    /// Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the backend's
+    /// Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the drive's
     /// `device_sg`, and nothing else: it never opens the tape node, never
     /// moves the tape, never loads or ejects a cartridge. Every log page it
     /// reads is journalled verbatim as a contact of its own (`report
@@ -102,7 +147,7 @@ pub enum DriveCommands {
     Status {
         /// The drive to look at, by its tape node path as configured
         /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
-        /// only configured drive. A path no backend claims is looked at too,
+        /// only configured drive. A path no configured drive claims is looked at too,
         /// without the cartridge chip unless the kernel binds a SCSI generic
         /// node to it.
         #[arg(long)]
@@ -130,9 +175,9 @@ pub enum DriveCommands {
     /// the same way (exit 75).
     ///
     /// Strict, like every command that moves a cartridge: the drive must be
-    /// a configured backend (`tapectl backend add`), whose SCSI generic node
+    /// a configured drive (`tapectl drive add`), whose SCSI generic node
     /// is checked to be the same drive as its tape node. On a machine with
-    /// no backend, `mt -f <device> offline` still works; the catalog is not
+    /// no configured drive, `mt -f <device> offline` still works; the catalog is not
     /// told.
     ///
     /// Exit 0: unloaded and recorded, or nothing to do because the drive was
@@ -251,6 +296,27 @@ pub fn run(
     dry_run: bool,
 ) -> Result<i32> {
     match command {
+        DriveCommands::Add {
+            name,
+            device_tape,
+            device_sg,
+            generation,
+            capacity_override,
+            enospc_buffer,
+        } => {
+            crate::cli::backend::add(
+                paths,
+                name,
+                device_tape,
+                device_sg.as_deref(),
+                generation,
+                capacity_override.as_deref(),
+                enospc_buffer.as_deref(),
+                json_output,
+                dry_run,
+            )?;
+            Ok(EXIT_SUCCESS)
+        }
         DriveCommands::Poll { device } => {
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
@@ -296,7 +362,7 @@ pub fn run(
         // write lock.
         DriveCommands::Status { device } => {
             // Lenient, like every read path: a backend is optional, so a
-            // rebuilt machine with keys and no `backend add` can still ask
+            // rebuilt machine with keys and no `drive add` can still ask
             // what is in its drive.
             let (device, backend) = crate::config::resolve_device(config, device.as_deref())?;
             let conn = crate::db::open(&paths.db_file)?;
@@ -1151,7 +1217,7 @@ pub fn status_text(report: &StatusReport) -> String {
             .backend
             .as_deref()
             .filter(|b| !b.is_empty())
-            .map(|b| format!(" (backend {b})"))
+            .map(|b| format!(" ({b} in the config)"))
             .unwrap_or_default()
     );
     let d = &report.drive;
@@ -1181,7 +1247,7 @@ pub fn status_text(report: &StatusReport) -> String {
             d.declared_generation
                 .as_deref()
                 .filter(|g| !g.is_empty())
-                .map(|g| format!(" (backend declares {g})"))
+                .map(|g| format!(" (the config declares {g})"))
                 .unwrap_or_default(),
         );
     }

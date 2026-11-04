@@ -12,13 +12,13 @@ use crate::error::Result;
 /// #248). This is a SELECTION, never a policy decision: it says which
 /// stage_sets the eligibility rule inside `clean_staging` gets to look at,
 /// not whether any of them may actually be released — that stays entirely
-/// with the caller (`cli::staging::run`'s min_copies gate;
+/// with the caller (`cli::staging::clean`'s min_copies gate;
 /// `staging::release::release_if_covered`, the gate `collection run`,
 /// `volume write` and `volume resume` share), exactly as ADR-0012's #244 amendment requires ("`clean_staging` stays
 /// policy-free; the gate goes in the CLI caller").
 #[derive(Debug, Clone, Copy)]
 pub enum CleanScope<'a> {
-    /// Every stage_set in the database — `tapectl staging clean`'s
+    /// Every stage_set in the database — `tapectl stage clean`'s
     /// original, archive-wide behaviour. The CLI still uses this scope, but
     /// (since issue #262) only when its min_copies check finds nothing
     /// under-copied; when something is, it uses `Units` below instead.
@@ -26,7 +26,7 @@ pub enum CleanScope<'a> {
     /// Restricts the `'staged'` branch to stage_sets whose snapshot belongs
     /// to one of these unit ids — `collection::batch::execute_batch`'s
     /// scope (a batch's release must never reach past its own units into a
-    /// different batch's still-staged data) and `cli::staging::run`'s scope
+    /// different batch's still-staged data) and `cli::staging::clean`'s scope
     /// since issue #262 (release covered units, retain under-copied ones).
     /// An empty slice matches no `'staged'` set; it does not widen back to
     /// `Whole`.
@@ -153,7 +153,7 @@ fn holds_a_range_sql(id_expr: &str) -> String {
     )
 }
 
-/// Why a bare `staging clean` would leave one live stage_set alone — the
+/// Why a bare `stage clean` would leave one live stage_set alone — the
 /// REASON, not just the fact (issue #292).
 ///
 /// [`release_candidate_predicate_sql`] answers a boolean that is correct
@@ -370,7 +370,7 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 ///
 /// **The cost of that ordering, stated honestly (issue #108).** An earlier
 /// version of this comment justified the ordering as "better than leaving an
-/// orphaned file behind for a later `staging clean` to pick up". That was
+/// orphaned file behind for a later `stage clean` to pick up". That was
 /// false, and the falsehood mattered: a later clean **cannot** pick it up.
 /// `.age` discovery is strictly `staging_path IS NOT NULL`, which is the
 /// column this function has just nulled, and `find_prefix_orphans` runs
@@ -399,20 +399,20 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 /// (issue #248). Whether a given `'staged'` stage_set may be released is
 /// still decided entirely by the eligibility rule above (`force`, `writes`
 /// status) plus whatever gate the caller ran before ever calling this
-/// function (`cli::staging::run`'s min_copies split since issue #262:
+/// function (`cli::staging::clean`'s min_copies split since issue #262:
 /// release covered units, retain under-copied ones; `staging::release::
 /// release_if_covered` for a batch or a write) — `clean_staging` itself
 /// stays exactly as policy-free as ADR-0012's #244 amendment requires.
 /// `CleanScope::Whole` reproduces this function's original, unscoped
-/// behaviour verbatim (`tapectl staging clean`'s archive-wide sweep when
+/// behaviour verbatim (`tapectl stage clean`'s archive-wide sweep when
 /// nothing is under-copied). `CleanScope::Units` additionally requires the
 /// stage_set's snapshot to belong to one of the given unit ids —
 /// `execute_batch`'s scope, so one batch's release can never reach into a
-/// different batch's still-staged data; and `cli::staging::run`'s scope for
+/// different batch's still-staged data; and `cli::staging::clean`'s scope for
 /// the units its min_copies check found covered. `CleanScope::UnitVersion`
 /// narrows one step further, to a single unit id AND a single snapshot
 /// version — `cli::audit`'s auto-emitted `--force` recipe (issue #278) and
-/// `cli::staging::run`'s `--unit <name> --version <N>` pair.
+/// `cli::staging::clean`'s `--unit <name> --version <N>` pair.
 ///
 /// **The `'failed'` branch is exempt from `scope` entirely (issue #262).**
 /// A `'failed'` set never reached `'staged'`, so it carries no `writes` row
@@ -628,7 +628,7 @@ pub fn clean_staging(
 ///   rewrite and the absence of a fully read back copy elsewhere), not a
 ///   policy judgement, so it sits beside the live-session check and inside
 ///   the policy-free rule. Every release path funnels through here —
-///   `staging clean`, `release_if_covered` (so `volume write`, `volume
+///   `stage clean`, `release_if_covered` (so `volume write`, `volume
 ///   resume` and `collection run`) — and so inherits it. One query for the
 ///   whole call, not one per candidate.
 fn drop_held<T>(
@@ -1009,7 +1009,8 @@ fn find_prefix_orphans(
     Ok(found)
 }
 
-/// Show staging status.
+/// The stage sets held in staging, with what their files on disk say:
+/// `stage list`'s source for those facts.
 ///
 /// `write_count` counts the writes that put the set's slices on a sealed
 /// tape: `'completed'` ones and, since 1.7.0, `'range'` ones (ADR-0012 item
@@ -1104,7 +1105,7 @@ pub struct CleanReport {
     pub bytes_freed: i64,
     pub errors: usize,
     /// Files whose unlink failed (issue #108). Their `staging_path` rows are
-    /// already nulled, so no future `staging clean` can rediscover them —
+    /// already nulled, so no future `stage clean` can rediscover them —
     /// these paths are the operator's ONLY notice that the files exist, and
     /// removing them is a manual job. Always a subset of `errors`; carried
     /// separately because a count alone does not say *which* file.
@@ -1354,7 +1355,7 @@ const HOME_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 
 
 /// What `cleanup_failed_stage_set` and `TempDir`'s drop remove in-process
 /// and a SIGKILL or a power loss does not (issue #465; `threat-model.md` §3
-/// promises `staging clean` handles what was left):
+/// promises `stage clean` handles what was left):
 ///
 /// - **`<home>/catalogs/<uuid8>/s<id>/`** (issue #419) of a stage set that
 ///   never staged: `staged_at IS NULL`, and `failed` — or `cleaned`, because
@@ -1706,7 +1707,7 @@ mod tests {
         (stage_set_id, path, dir)
     }
 
-    /// Issue #376 (b): `staging clean --force` used to release a stage set
+    /// Issue #376 (b): `stage clean --force` used to release a stage set
     /// whatever its writes' status, so a live writer's next slice open
     /// failed and the tape was left unsealed. With the volume's lock held
     /// (another open file description), `--force` keeps the set and names
@@ -2522,7 +2523,7 @@ mod tests {
 
     /// Issue #108: when an unlink FAILS, the file is stranded permanently —
     /// `staging_path` was nulled before the unlink, and `.age` discovery is
-    /// strictly `staging_path IS NOT NULL`, so no later `staging clean` can
+    /// strictly `staging_path IS NOT NULL`, so no later `stage clean` can
     /// ever find it. The report must therefore carry the PATH, not just bump
     /// an error counter: this is the operator's one and only notice.
     ///
@@ -2971,7 +2972,7 @@ mod tests {
         assert_eq!(report.files_removed, 2);
     }
 
-    /// Issue #402: `staging status` looks at the files, not only the
+    /// Issue #402: `stage list` looks at the files, not only the
     /// status column, and names the remedy.
     #[test]
     fn staging_status_reports_a_staged_set_whose_file_is_gone() {
@@ -2996,7 +2997,7 @@ mod tests {
         assert_eq!(
             info[0].remedy.as_deref(),
             Some(
-                "tapectl staging clean --unit u --version 1 --force && \
+                "tapectl stage clean --unit u --version 1 --force && \
                  tapectl stage create u --version 1"
             )
         );
@@ -3418,7 +3419,7 @@ mod tests {
         assert_eq!(describe_slice_numbers(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
     }
 
-    /// `staging status` shows a set released in part, and the #402 check it
+    /// `stage list` shows a set released in part, and the #402 check it
     /// runs accepts the released slices; a whole staged set lists nothing.
     #[test]
     fn staging_status_shows_a_partly_released_set() {
@@ -3491,7 +3492,7 @@ mod tests {
     /// Issue #465 item 5: a SIGKILL or a power loss mid-stage leaves the
     /// stage set's catalogue directory (`<home>/catalogs/<uuid8>/s<id>/`,
     /// issue #419) behind — `cleanup_failed_stage_set` runs only in-process.
-    /// `staging clean` removes it for a set that never reached `staged`. The
+    /// `stage clean` removes it for a set that never reached `staged`. The
     /// set is `failed` when the sweep looks, or already `cleaned` (the same
     /// command's `clean_staging` releases failed sets first); either way
     /// `staged_at` is NULL. A set that was staged keeps its catalogue — it
@@ -3570,7 +3571,7 @@ mod tests {
 
     /// Issue #465 item 5: `<home>/tmp` holds the plaintext of a stage or a
     /// write for a moment (dar's slice template, the write's `catalog.db`);
-    /// a hard kill leaves it. `staging clean` removes what is older than a
+    /// a hard kill leaves it. `stage clean` removes what is older than a
     /// day — by the newest change anywhere in it, since a live write's file
     /// is rewritten inside a directory whose own mtime stays put — and
     /// never what is younger, which a live run is using.
@@ -3641,7 +3642,7 @@ mod tests {
     /// Issue #474 item 3: `volume read-slices` and `volume compact-read`
     /// make `clone-*` / `compact-*` directories under staging, and
     /// `clean_staging` selects only `staged` and `failed` sets, so what a
-    /// killed or older-build read left in one was never found. `staging
+    /// killed or older-build read left in one was never found. `stage
     /// clean` removes such a directory when no `staged` set references a
     /// file in it and it has been quiet for an hour: not a referenced one
     /// (that is a set's staged data), not a young one (a read may be going

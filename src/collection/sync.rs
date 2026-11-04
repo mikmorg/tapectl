@@ -82,7 +82,7 @@ pub fn sync_collection(
 ///
 /// `config` supplies two things. `config.defaults.global_excludes` (issue
 /// #49) reaches step 3's `pending_units_for_collection` call so this sync's
-/// pending/dirty counts agree with `unit status --dirty`/`report
+/// pending/dirty counts agree with `unit info --dirty`/`report
 /// dirty`/`collection status`. And every unit this registers -- a fresh
 /// folder, a path-keyed one, or an adopted dotfile -- takes its checksum mode
 /// from the resolved policy under `config` (issue #347,

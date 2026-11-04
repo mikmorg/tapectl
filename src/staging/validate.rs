@@ -1253,7 +1253,7 @@ pub fn validate_source(
 ///   - size mismatch        -> DIRTY: a real edit changed both size and
 ///     content. Deliberately kept out of `validate_source`'s BITROT
 ///     wording (and vice versa) so the two outcomes can never be
-///     conflated — full dirty-detection machinery (`unit status --dirty`,
+///     conflated — full dirty-detection machinery (`unit info --dirty`,
 ///     `mark-tape-only`'s guard) is issue #36's scope, not this one's.
 fn check_source_size(full_path: &Path, rel_path: &str, expected_size: i64) -> Result<()> {
     let metadata = std::fs::metadata(full_path).map_err(|e| {

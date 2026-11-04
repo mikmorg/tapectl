@@ -36,6 +36,13 @@ use config::{Config, TapectlPaths};
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
+    // ADR-0012 item 203: a spelling 1.9.0 removed is refused by name,
+    // however it is typed (`--help` and `help <old>` included), before clap
+    // parses the line and before any home is resolved, so the refusal reads
+    // nothing and creates nothing.
+    if let Some(renamed) = cli::renamed::find(&args) {
+        error::exit_with_error_code(&renamed.refusal().into(), error::EXIT_ERROR);
+    }
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(err) => {
@@ -257,6 +264,13 @@ fn run(
     // is now a refusal, and `tapectl completions bash` in the very cron,
     // systemd or container shell that lacks one must keep working — it
     // reads nothing and writes nothing but the script.
+    // ADR-0012 item 203: the second line behind `main`'s scan of the raw
+    // command line. A removed command's hidden stub that clap matched is
+    // refused with the same words, still before any home is resolved.
+    if let Some(renamed) = cli::renamed::parsed(&cli.command) {
+        return Err(renamed.refusal().into());
+    }
+
     if let Commands::Completions { shell } = cli.command {
         let mut cmd = <Cli as clap::CommandFactory>::command();
         clap_complete::generate(shell, &mut cmd, "tapectl", &mut std::io::stdout());
@@ -437,7 +451,7 @@ fn run(
     //   - `Restore` (`Unit`/`File`/`RawVolume`): all three resolve their
     //     device via `cli::read_device` -> `config::resolve_device`, the
     //     LENIENT resolver, by design (ADR-0010's DR path — a rebuilt
-    //     machine has keys and no `backend add` yet). `src/cli/restore.rs`.
+    //     machine has keys and no `drive add` yet). `src/cli/restore.rs`.
     //   - `Catalog` (`Ls`/`Search`/`Locate`/`Stats`/`Rebuild`): only
     //     `Rebuild` touches `config` at all, and only via
     //     `config::resolve_device` + `tape::media_detect::check_read_contact`
@@ -456,9 +470,8 @@ fn run(
     //     the first place.
     //
     // Every other command (`Volume`, `Collection`, `Snapshot`, `Stage`,
-    // `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`, `Export`,
-    // `Import`, `QuickArchive`, `Backend`, `Db::{Export,Import,Stats}`,
-    // `Config::Show`) keeps the strict loader below unconditionally —
+    // `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`, `QuickArchive`,
+    // `Drive`, `Db::{Export,Import,Stats}`, `Config::Show`) keeps the strict loader below unconditionally —
     // several of them (`Volume`, `Collection`, `QuickArchive`) reach
     // `resolve_lto_backend` directly and must never see this door.
     let lenient_backend_ok = matches!(
@@ -547,9 +560,6 @@ fn run(
         Commands::Stage { ref command } => {
             cli::stage::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
         }
-        Commands::Staging { ref command } => {
-            cli::staging::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
-        }
         Commands::Volume { ref command } => {
             // issue #45/H10: `volume::run` now returns a process exit code
             // for `Verify` (issue #356: 0 = passed, 2 = the medium proven
@@ -587,30 +597,6 @@ fn run(
         Commands::Report { ref command } => {
             cli::report::run(&conn, &cfg, command, cli.json)?;
         }
-        Commands::Export { ref unit, ref to } => {
-            cli::operations::export_unit(&conn, unit, to, cli.json, cli.dry_run)?;
-        }
-        Commands::Import {
-            ref label,
-            ref backend,
-            ref generation,
-            ref capacity,
-            ref device,
-            ref notes,
-        } => {
-            cli::operations::volume_import(
-                &conn,
-                &cfg,
-                label,
-                backend,
-                generation,
-                capacity.as_deref(),
-                device.as_deref(),
-                notes.as_deref(),
-                cli.json,
-                cli.dry_run,
-            )?;
-        }
         Commands::QuickArchive {
             ref path,
             ref tenant,
@@ -638,9 +624,6 @@ fn run(
                 cli.yes,
             )?;
         }
-        Commands::Backend { ref command } => {
-            cli::backend::run(&paths, command, cli.json, cli.dry_run)?;
-        }
         Commands::Db { ref command } => {
             // Body lives in `cli::db` (issue #112). The exit CODE comes back
             // here because acting on it — terminating the process — is the
@@ -658,7 +641,11 @@ fn run(
         | Commands::Completions { .. }
         | Commands::Host { .. }
         | Commands::Drive { .. }
-        | Commands::Status { .. } => {
+        | Commands::Status { .. }
+        | Commands::Staging { .. }
+        | Commands::Backend { .. }
+        | Commands::Export(_)
+        | Commands::Import(_) => {
             unreachable!()
         }
     }
@@ -809,9 +796,9 @@ fn cmd_init(
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&paths.config_file)
-            .context("failed to reopen config to append the backend example")?;
+            .context("failed to reopen config to append the drive example")?;
         f.write_all(tapectl::config::LTO_BACKEND_EXAMPLE.as_bytes())
-            .context("failed to append the backend example")?;
+            .context("failed to append the drive example")?;
         // ADR-0012, 2026-09-24 amendment, item 7: the quiet-host keys,
         // documented where the operator will look, commented out so the
         // defaults stay the defaults.

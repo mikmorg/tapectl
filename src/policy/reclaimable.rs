@@ -1,5 +1,5 @@
 //! The `snapshot mark-reclaimable` precondition set, extracted so that
-//! the destructive gate and the advisory `report supersedable` surface
+//! the destructive gate and the advisory `report reclaimable` surface
 //! can never disagree about which snapshots are releasable.
 //!
 //! Issue #90 (as re-scoped): the arithmetic in `report
@@ -9,7 +9,7 @@
 //! *discoverability*: superseded versions pile up silently because
 //! nothing ever prompts the operator to release them.
 //!
-//! `report supersedable` is that prompt. For it to be safe it must list
+//! `report reclaimable` is that prompt. For it to be safe it must list
 //! exactly what `snapshot mark-reclaimable` would accept — a report that
 //! advertises a release the gate then refuses is the same
 //! two-paths-disagree failure class this codebase has already hit in
@@ -520,7 +520,7 @@ pub(crate) mod tests {
         assert_eq!(found[0].version, 1);
     }
 
-    /// Issue #417: `report supersedable` asked the whole of `assess` — a
+    /// Issue #417: `report reclaimable` asked the whole of `assess` — a
     /// unit lookup and a dozen statements — for every superseded snapshot.
     /// The statements `candidates` prepares are counted through SQLite's
     /// authorizer (one `SELECT` action per SELECT prepared) for a unit with
@@ -1128,7 +1128,7 @@ pub(crate) mod tests {
     /// unit while the version superseding it sat entirely in one place, as
     /// long as the copy floor was met. 4 copies in 1 place meets 2 x 2
     /// copies and is short of 2 places; moving one to another place meets it.
-    /// The verdict is `candidates`' too (`report supersedable`).
+    /// The verdict is `candidates`' too (`report reclaimable`).
     #[test]
     fn tape_only_four_copies_in_one_place_is_blocked_by_the_place_floor() {
         let name = "sup-four-in-one";
@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             found[0].verdict, blocked,
-            "`report supersedable` must advertise exactly what the gate refuses"
+            "`report reclaimable` must advertise exactly what the gate refuses"
         );
 
         // Not multiplied: at 3x the copy floor is 6 (the unit holds 4), and

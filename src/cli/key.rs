@@ -110,8 +110,8 @@ pub enum KeyCommands {
     /// session; `audit` warns when the kit has fallen behind the tapes.
     EscrowKit {
         /// Directory to write the kit into (created if absent, mode 0700)
-        #[arg(long)]
-        out: String,
+        #[arg(value_name = "DIR")]
+        dir: String,
     },
 }
 
@@ -441,7 +441,7 @@ pub fn run(
             }
         }
 
-        KeyCommands::EscrowKit { out } => {
+        KeyCommands::EscrowKit { dir: out } => {
             // Issue #241: building a real preview would mean reading and
             // summarising the whole catalog (the same work `generate`
             // does to build `catalog.db.age`) for no benefit over just

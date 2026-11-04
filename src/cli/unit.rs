@@ -52,8 +52,8 @@ pub enum UnitCommands {
         tag: Option<String>,
     },
 
-    /// Show unit status/details
-    Status {
+    /// Show a unit's details, or with --dirty whether it changed
+    Info {
         /// Unit name or path
         name: String,
         /// Show dirty/clean/new status via an on-disk fingerprint scan
@@ -61,6 +61,25 @@ pub enum UnitCommands {
         /// of the usual detail view
         #[arg(long)]
         dirty: bool,
+    },
+
+    /// Removed in 1.9.0: `unit info` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Status(crate::cli::renamed::Removed),
+
+    /// Copy a unit's staged slices, still encrypted, to a directory
+    ///
+    /// The slices of the unit's newest staged stage set, as they lie in the
+    /// staging area (nothing is read from tape), with a manifest of their
+    /// sha256 sums. They stay encrypted, so the copy is as safe to carry as
+    /// a tape.
+    Export {
+        /// Unit name
+        #[arg(value_name = "UNIT")]
+        unit: String,
+        /// Destination directory
+        #[arg(long, value_name = "DIR")]
+        to: String,
     },
 
     /// Add/remove tags
@@ -269,11 +288,17 @@ pub fn run(
             }
         }
 
-        UnitCommands::Status { name, dirty } if *dirty => {
+        UnitCommands::Status(_) => return Err(crate::cli::renamed::refused(&["unit", "status"])),
+
+        UnitCommands::Export { unit, to } => {
+            crate::cli::operations::export_unit(conn, unit, to, json_output, dry_run)?;
+        }
+
+        UnitCommands::Info { name, dirty } if *dirty => {
             show_dirty_status(conn, name, json_output, &config.defaults.global_excludes)?;
         }
 
-        UnitCommands::Status { name, .. } => {
+        UnitCommands::Info { name, .. } => {
             let unit = resolve_unit(conn, name)?;
             let tags = queries::get_tags_for_unit(conn, unit.id)?;
             let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?;
@@ -550,7 +575,7 @@ struct DirtyStatus {
     changes: crate::collection::fingerprint::FingerprintDiff,
 }
 
-/// `unit status --dirty`'s scan: reuses `fingerprint::classify` — the same
+/// `unit info --dirty`'s scan: reuses `fingerprint::classify` — the same
 /// scan the Collection layer (`collection sync|status|plan`) and `report
 /// dirty` use — so this can never disagree with them about whether a
 /// unit's disk matches its last snapshot (issue #36/H10). `global_excludes`

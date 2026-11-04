@@ -51,7 +51,7 @@ pub struct SnapshotOutcome {
 /// nothing (`minted: false`) rather than mint a byte-identical sibling.
 ///
 /// The comparison reuses `unit::content_match::matches_snapshot` — the
-/// exact predicate `unit status --dirty`/`report dirty`/`audit` already use
+/// exact predicate `unit info --dirty`/`report dirty`/`audit` already use
 /// to decide *Dirty* (`collection::fingerprint::classify`) — against the
 /// walk this function has *already* performed (`walked`, below).
 /// It is never re-walked: a second `walk_directory`/`WalkDir` pass here
@@ -299,7 +299,7 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
 /// `status = 'staged'` says the slices were staged; it does not say they
 /// are still there. Three things can make a staged set incomplete:
 ///
-/// - a slice row whose `staging_path` is NULL — a `staging clean` that an
+/// - a slice row whose `staging_path` is NULL — a `stage clean` that an
 ///   older build interrupted between its per-slice updates, or a
 ///   `compact-read` that skipped a slice and still promoted the set;
 /// - fewer slice rows than the set's recorded `num_slices`;
@@ -367,7 +367,7 @@ pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Res
 }
 
 /// The command that makes an incomplete staged set whole again (issue
-/// #402) — `volume write` refuses such a set and `staging status` reports
+/// #402) — `volume write` refuses such a set and `stage list` reports
 /// it, and both name this. The identical ciphertext pulled back from an
 /// in-service sealed copy when there is one (`read-slices` records every
 /// slice's path again); otherwise, for an active unit, the set released and
@@ -410,14 +410,14 @@ pub(crate) fn incomplete_set_remedy(
             .iter()
             .map(|from| {
                 format!(
-                    "tapectl volume read-slices --from {from} --unit {unit_name} --version \
+                    "tapectl volume read-slices {unit_name} --from {from} --version \
                      {version}"
                 )
             })
             .collect::<Vec<_>>()
             .join(" && "),
         [] if unit_status == "active" => format!(
-            "tapectl staging clean --unit {unit_name} --version {version} --force && \
+            "tapectl stage clean --unit {unit_name} --version {version} --force && \
              tapectl stage create {unit_name} --version {version}"
         ),
         [] => format!(
@@ -691,7 +691,7 @@ pub(crate) fn stage_create_admitting(
 ///   record), so keeping the files loses nothing, and
 ///   this command does not delete finished work over a lock wait. The next
 ///   open marks the set `failed` (its lock is free once `stage_create`
-///   returns), and `staging clean` reclaims it.
+///   returns), and `stage clean` reclaims it.
 /// - A set that reached `staged` before the error is complete: its slices
 ///   are the stage, never garbage.
 fn after_failed_stage(
@@ -962,7 +962,7 @@ fn stage_create_inner(
     //
     // `archive_base` is per-*stage-set* (issue #53): it carries
     // `stage_set_id` so two stage sets of the SAME snapshot (a re-stage
-    // after `staging clean` released the first one) never write
+    // after `stage clean` released the first one) never write
     // identically-named `.age` files and silently overwrite each other.
     // `cleanup_failed_stage_set`'s prefix derivation below must move in
     // lockstep with this — both go through `archive_base_name`.
@@ -2253,7 +2253,7 @@ fn ask_to_stage_anyway(
 /// What happens to a stage that proceeds and then runs out of staging.
 const STAGING_RUNS_OUT: &str =
     "if it runs out, the stage stops there and its partial slices are removed. \
-     `tapectl staging status` shows what staging holds; a bare `tapectl staging clean` \
+     `tapectl stage list` shows what staging holds; a bare `tapectl stage clean` \
      frees what failed stages left and what is already on tape";
 
 #[cfg(test)]
@@ -2970,7 +2970,7 @@ fn walk_directory(
             ("regular", None)
         } else {
             // FIFO, socket, block/char device: recorded (so restore and
-            // `catalog ls` still see them) but never content-validated —
+            // `catalog list` still see them) but never content-validated —
             // opening a FIFO with no writer via File::open blocks forever
             // with no timeout, and none of these has "content" to
             // checksum in the first place.
@@ -4713,7 +4713,7 @@ mod tests {
         // Issue #409: it names the fix, since what fills staging is often a
         // failed stage's files or slices already on tape.
         assert!(
-            msg.contains("`tapectl staging status`") && msg.contains("`tapectl staging clean`"),
+            msg.contains("`tapectl stage list`") && msg.contains("`tapectl stage clean`"),
             "names what frees staging: {msg}"
         );
         let rows: i64 = conn

@@ -45,8 +45,10 @@ fn write_subcommand_pages(
     for sub in cmd.get_subcommands() {
         let name = sub.get_name();
         // Skip clap's auto-generated `help` subcommand at every level —
-        // `man tapectl-unit-help` would just duplicate `-h`.
-        if name == "help" {
+        // `man tapectl-unit-help` would just duplicate `-h` — and every
+        // hidden command: a spelling 1.9.0 removed is a stub that only
+        // refuses (ADR-0012 item 203), and has no page.
+        if name == "help" || sub.is_hide_set() {
             continue;
         }
 

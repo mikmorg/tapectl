@@ -35,7 +35,7 @@ pub struct ShadowingDotfile {
 /// This exists because #211 changed what "unreadable" means. Before it, an
 /// unrecognised `[policy]` key was silently ignored, so skipping such a
 /// file cost nothing. After it, that file is a hard `PolicyUnresolvable`
-/// for `audit`, `stage create` and `unit status` — while `config check`,
+/// for `audit`, `stage create` and `unit info` — while `config check`,
 /// the one command an operator runs precisely to find bad configuration,
 /// went on saying nothing. Being loud everywhere except the place people
 /// look is worse than being quiet everywhere (issue #211's residual).

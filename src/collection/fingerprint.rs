@@ -18,7 +18,7 @@
 //! mtime, different bytes). `sha256_on_archive` means "hash at archive
 //! time," so dirty detection for it is deliberately identical to
 //! `mtime_size` (coordinator decision, issue #36). This makes `classify`
-//! the single scanner every caller (`unit status --dirty`, `mark-tape-
+//! the single scanner every caller (`unit info --dirty`, `mark-tape-
 //! only`'s guard, `report dirty`, and the pre-existing `collection
 //! sync/status/plan`) shares — a second, independently-written dirty check
 //! is exactly the class of bug issue #33 spent a cycle fixing (a walk and a
@@ -219,7 +219,7 @@ pub fn classify(
 /// `Database` error from `content_match`'s queries) stays a hard `Err` for
 /// the whole scan. `classify` itself is behaviourally UNCHANGED by this
 /// split: it still calls straight through with `?`, for every caller that
-/// must not distinguish the two failure kinds (`unit status --dirty`,
+/// must not distinguish the two failure kinds (`unit info --dirty`,
 /// `report dirty`, `mark-tape-only`'s guard).
 fn classify_from_walk(
     conn: &Connection,
@@ -265,7 +265,7 @@ fn classify_from_walk(
 ///
 /// `global_excludes` (issue #49) is threaded straight through to the walk
 /// for every unit — required so `collection sync|status|plan|run` (this
-/// function's callers) agree with `unit status --dirty`/`report dirty`
+/// function's callers) agree with `unit info --dirty`/`report dirty`
 /// about which units are dirty. Without it, once `staging::walk_directory`
 /// starts filtering `config.defaults.global_excludes` out of the `files`
 /// table (this same issue), any caller here that kept comparing against an
@@ -1079,7 +1079,7 @@ mod tests {
         );
     }
 
-    /// Direct proof of the property `unit status --dirty` and `collection
+    /// Direct proof of the property `unit info --dirty` and `collection
     /// status` rely on (both call `classify` unmodified): a unit whose
     /// only "changed" file is dotfile-excluded junk must classify as
     /// clean, and stay clean across a SECOND scan too — the #36 trap this
@@ -1169,7 +1169,7 @@ mod tests {
     /// the dotfile test above, but for a unit with NO dotfile override at
     /// all — only `config.defaults.global_excludes`-shaped junk
     /// (`Thumbs.db`) — the ticket's own headline scenario, this time
-    /// exercised through `classify` (the scan `unit status --dirty`,
+    /// exercised through `classify` (the scan `unit info --dirty`,
     /// `report dirty`, and `collection status`/`sync`/`plan` all share)
     /// rather than through the full `stage_create` pipeline.
     #[test]

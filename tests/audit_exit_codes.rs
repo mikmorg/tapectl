@@ -56,7 +56,7 @@ fn an_audit_that_errors_exits_70_not_2() {
     // Positive control: the same error from a command that is not `audit`
     // keeps the ordinary error code, so 70 above is the audit's mapping and
     // not a change to every error.
-    let out = tapectl(home.path(), &["unit", "status", "no-such-unit"]);
+    let out = tapectl(home.path(), &["unit", "info", "no-such-unit"]);
     assert_eq!(
         out.status.code(),
         Some(2),

@@ -189,7 +189,7 @@ impl ReadSlicesCommand {
     /// The command line.
     pub fn command(&self) -> String {
         format!(
-            "tapectl volume read-slices --from {} --unit {} --version {}",
+            "tapectl volume read-slices {} --from {} --version {}",
             self.from, self.unit, self.version
         )
     }
@@ -2157,9 +2157,9 @@ mod tests {
         assert_eq!(
             commands,
             [
-                "tapectl volume read-slices --from H2 --unit split --version 1",
-                "tapectl volume read-slices --from H1 --unit split --version 1",
-                "tapectl volume read-slices --from H1 --unit whole --version 2",
+                "tapectl volume read-slices split --from H2 --version 1",
+                "tapectl volume read-slices split --from H1 --version 1",
+                "tapectl volume read-slices whole --from H1 --version 2",
             ]
         );
         assert_eq!(
@@ -2175,7 +2175,7 @@ mod tests {
         let (out, _) = text_lines(&plan, Some(&staged));
         assert!(
             out.iter()
-                .any(|l| l == "  tapectl volume read-slices --from H2 --unit split --version 1"),
+                .any(|l| l == "  tapectl volume read-slices split --from H2 --version 1"),
             "{out:?}"
         );
         assert!(out

@@ -889,7 +889,7 @@ pub enum LayoutError {
     #[error(
         "stage set {stage_set_id} for unit '{unit}' was encrypted without the current escrow \
          recipient ({reason}) — its slices cannot be recovered with the escrow key; re-stage \
-         it: tapectl staging clean --force (releases the old set), then \
+         it: tapectl stage clean --force (releases the old set), then \
          tapectl stage create {unit} --version <snapshot version> (ADR-0005)"
     )]
     StageSetLacksEscrow {
@@ -2644,7 +2644,7 @@ mod tests {
         // The rendered message must name the remedy the operator has to run.
         let msg = lacking[0].to_string();
         assert!(
-            msg.contains("staging clean --force")
+            msg.contains("stage clean --force")
                 && msg.contains("tapectl stage create photos")
                 && msg.contains("ADR-0005"),
             "message must name the re-stage remedy and the ADR: {msg}"

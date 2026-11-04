@@ -47,7 +47,7 @@ fn backend_add(home: &Path, name: &str, tape: &str, sg: &str) {
         &run(
             home,
             &[
-                "backend",
+                "drive",
                 "add",
                 "--name",
                 name,
@@ -59,11 +59,11 @@ fn backend_add(home: &Path, name: &str, tape: &str, sg: &str) {
                 "LTO-6",
             ],
         ),
-        "backend add",
+        "drive add",
     );
 }
 
-/// A home with one configured (nonexistent) drive. `init` and `backend add`
+/// A home with one configured (nonexistent) drive. `init` and `drive add`
 /// write their own events, so a test compares [`rows_written`] against the
 /// count it took here, never against zero.
 fn configured_home() -> TempDir {

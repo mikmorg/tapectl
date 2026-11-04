@@ -1234,7 +1234,7 @@ fn mhvtl_verify_by_id_device_records_drive_health() {
 }
 
 /// Issue #187, the other half: with NO backend configured at all — the
-/// rebuilt/DR machine with keys and no `backend add` yet (ADR-0005) — verify
+/// rebuilt/DR machine with keys and no `drive add` yet (ADR-0005) — verify
 /// must still succeed, and must SAY that drive health was not collected
 /// rather than silently recording nothing.
 #[test]

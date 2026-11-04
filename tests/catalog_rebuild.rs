@@ -1052,7 +1052,7 @@ fn a_rebuild_contact_takes_exactly_one_health_reading() {
     assert_eq!(drive_serial.as_deref(), Some("XYZZY_A1"));
 }
 
-/// The DR machine this command exists for: keys and no `backend add`. The
+/// The DR machine this command exists for: keys and no `drive add`. The
 /// rebuild SUCCEEDS, and takes no reading — no health row, no journal row —
 /// because no configured drive claims the device.
 #[test]
@@ -3249,7 +3249,7 @@ fn a_second_run_with_the_escrow_key_fills_what_the_first_left_unknown() {
 
 /// The acceptance criterion in as many words: **the DR path works with no
 /// catalog row at all.** A rebuilt machine has keys, a fresh database and no
-/// `backend add`, so there is no volume row, no cartridge row and no medium
+/// `drive add`, so there is no volume row, no cartridge row and no medium
 /// serial — three absences, and an absence never refuses.
 ///
 /// Every other test in this file relies on this; it is stated once on its own

@@ -550,7 +550,7 @@ fn collect_findings(
 // `'created'` row again is for `snapshot create` to mint a fresh one — and
 // ADR-0012 makes `snapshot create` mint nothing when the walk matches the
 // existing content. An unchanged unit whose stage set has since been
-// released (`staging clean`) then cycles between two commands that each
+// released (`stage clean`) then cycles between two commands that each
 // report success and change nothing, exactly as issue #209 (and its
 // precedent, `operations::refuse_last_eligible_copy`, issue #147)
 // describes.
@@ -568,7 +568,7 @@ fn collect_findings(
 //     is never offered, because it reproduces the exact bytes the finding
 //     says are wrong; only a genuine `stage create <unit> --version <n>`
 //     (which re-runs dar against the unit's source path) produces new
-//     ciphertext, preceded by `staging clean` when a live stage set would
+//     ciphertext, preceded by `stage clean` when a live stage set would
 //     otherwise block it (`cli/stage.rs`'s re-stage arm refuses while any
 //     live slices exist for that version).
 // A genuine re-stage needs the source on disk, so it is only offered for
@@ -635,7 +635,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
         match policy::coverage::in_service_copy_of_version(conn, unit.id, *version)? {
             Some(label) => {
                 steps.push(format!(
-                    "tapectl volume read-slices --from {label} --unit {} --version {version}",
+                    "tapectl volume read-slices {} --from {label} --version {version}",
                     unit.name
                 ));
                 any_ready = true;
@@ -690,7 +690,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
 /// would reproduce the exact ciphertext/recipient list the finding says
 /// is wrong.
 ///
-/// `tapectl staging clean --unit <name> --version <v>` is prefixed, one
+/// `tapectl stage clean --unit <name> --version <v>` is prefixed, one
 /// invocation per live version, exactly when that named version still has
 /// live slices blocking a re-stage — every stage set that can reach this
 /// function already has a completed write (that is how the finding fired),
@@ -701,7 +701,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
 /// can therefore never reach past the version it names into a DIFFERENT,
 /// possibly never-written version of the SAME unit. It is `--force`d
 /// exactly when this unit is itself below its own resolved `min_copies` —
-/// the one case where a bare `staging clean` would retain rather than
+/// the one case where a bare `stage clean` would retain rather than
 /// release (ADR-0012's 2026-09-21 amendment, issue #262), which would
 /// otherwise leave the following `stage create --version` refusing on a
 /// still-live stage set. Forcing it here is deliberately narrower than
@@ -751,12 +751,12 @@ fn restage_action(
     for v in &live_versions {
         if under_copied {
             steps.push(format!(
-                "tapectl staging clean --unit {} --version {v} --force",
+                "tapectl stage clean --unit {} --version {v} --force",
                 unit.name
             ));
         } else {
             steps.push(format!(
-                "tapectl staging clean --unit {} --version {v}",
+                "tapectl stage clean --unit {} --version {v}",
                 unit.name
             ));
         }
@@ -1588,7 +1588,7 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 "{sealed_total} sealed volume(s) exist but no heir kit has ever been \
                  generated — nothing off-site can decrypt them"
             ),
-            action: "tapectl key escrow-kit --out <dir>".to_string(),
+            action: "tapectl key escrow-kit <DIR>".to_string(),
         }]);
     };
 
@@ -1677,7 +1677,7 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         unit: "archive".into(),
         check: "escrow_kit_stale".into(),
         message: reasons.join("; and "),
-        action: "tapectl key escrow-kit --out <dir>".to_string(),
+        action: "tapectl key escrow-kit <DIR>".to_string(),
     }])
 }
 
@@ -1786,7 +1786,7 @@ fn read_error_trend_findings(conn: &Connection, factor: f64) -> Result<Vec<Audit
                 // 2026-10-15 item 59) or by `volume init` first, which a
                 // cartridge needing `--generation` or `--cartridge` must do.
                 action: format!(
-                    "tapectl volume read-slices --from {volume} --unit <UNIT> for each unit on \
+                    "tapectl volume read-slices <UNIT> --from {volume} for each unit on \
                      it, then load a fresh cartridge and run tapectl volume write <NEW_LABEL> \
                      --init (or tapectl volume init <NEW_LABEL> first, if the cartridge needs \
                      --generation or --cartridge)"
@@ -2629,7 +2629,7 @@ mod tests {
 
         assert_eq!(
             finding.action,
-            "tapectl volume read-slices --from photos-cleaned-SEALED --unit photos --version 1 && \
+            "tapectl volume read-slices photos --from photos-cleaned-SEALED --version 1 && \
              tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
             "got: {}",
             finding.action
@@ -3095,7 +3095,7 @@ mod tests {
                 !message.contains("misses"),
                 "the secret opens every tape; only the catalog is stale: {message}"
             );
-            assert_eq!(findings[0].action, "tapectl key escrow-kit --out <dir>");
+            assert_eq!(findings[0].action, "tapectl key escrow-kit <DIR>");
         }
 
         /// A sealed volume whose write carries NO completion timestamp
@@ -3199,7 +3199,7 @@ mod tests {
                 "nothing was sealed after the kit: {}",
                 findings[0].message
             );
-            assert_eq!(findings[0].action, "tapectl key escrow-kit --out <dir>");
+            assert_eq!(findings[0].action, "tapectl key escrow-kit <DIR>");
         }
 
         /// `cartridge move` writes a cartridge event; the check attributes it
@@ -3864,7 +3864,7 @@ mod tests {
     }
 
     /// The sibling case: the `'staged'` v1's stage set was force-cleaned
-    /// (`staging clean --force`) before ever being written — the only way
+    /// (`stage clean --force`) before ever being written — the only way
     /// a `'staged'` snapshot can end up with no live stage set, since
     /// reaching `'current'` requires a completed write. A genuine
     /// re-stage is the only path left, and it names the version
@@ -3972,7 +3972,7 @@ mod tests {
     ///
     /// **This test used to pin the unit-wide-`--force` recipe (issue
     /// #274), itself since superseded by issue #278.** A bare, un-scoped
-    /// `tapectl staging clean` prefixed onto this exact under-copied
+    /// `tapectl stage clean` prefixed onto this exact under-copied
     /// fixture would only ever RETAIN "reels"'s staged bytes (ADR-0012's
     /// 2026-09-21 amendment, issue #262), leaving the very next `stage
     /// create --version 1` step refusing on the still-live stage set -- a
@@ -3994,7 +3994,7 @@ mod tests {
         let action = restage_action(&conn, &unit, &[1], "", &resolved).unwrap();
         assert_eq!(
             action,
-            "tapectl staging clean --unit reels --version 1 --force && \
+            "tapectl stage clean --unit reels --version 1 --force && \
              tapectl stage create reels --version 1 && \
              tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> \
              (\"reels\" is below its policy's copy floor of 2, so a bare clean would \
@@ -4129,7 +4129,7 @@ mod tests {
         );
         let action = restage_action(&conn, &unit, &[1], "", &resolved).unwrap();
         assert!(
-            action.contains("tapectl staging clean --unit reels"),
+            action.contains("tapectl stage clean --unit reels"),
             "must scope the clean to this unit: {action}"
         );
         assert!(
@@ -6450,7 +6450,8 @@ mod tests {
                 f.message
             );
             assert!(
-                f.action.contains("volume read-slices --from V-C-RISE"),
+                f.action
+                    .contains("volume read-slices <UNIT> --from V-C-RISE"),
                 "{}",
                 f.action
             );
@@ -6490,7 +6491,7 @@ mod tests {
             let action = &findings[0].action;
 
             for command in [
-                "tapectl volume read-slices --from V-C-RISE --unit <UNIT>",
+                "tapectl volume read-slices <UNIT> --from V-C-RISE",
                 "tapectl volume write <NEW_LABEL> --init",
                 "tapectl volume init <NEW_LABEL>",
             ] {

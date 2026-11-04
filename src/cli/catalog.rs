@@ -14,13 +14,17 @@ use crate::volume::rebuild::RebuildReport;
 #[derive(Subcommand, Debug)]
 pub enum CatalogCommands {
     /// List files in a unit's latest snapshot
-    Ls {
+    List {
         /// Unit name
         unit: String,
         /// Snapshot version (default: latest)
         #[arg(long)]
         version: Option<i64>,
     },
+
+    /// Removed in 1.9.0: `catalog list` (ADR-0012 item 209)
+    #[command(hide = true, disable_help_flag = true)]
+    Ls(crate::cli::renamed::Removed),
 
     /// Search for files by pattern, in each unit's newest version
     Search {
@@ -65,7 +69,7 @@ pub enum CatalogCommands {
         /// one drive, and unlike a read-only dump this command writes what
         /// it reads into the catalog — a silent wrong-device default would
         /// file one tape's contents under another's. The sole configured
-        /// backend's `device_tape` is not a guess about which drive you
+        /// drive's `device_tape` is not a guess about which drive you
         /// meant; a guessed device number is. Resolve by serial through
         /// `/dev/tape/by-id/`.
         #[arg(long)]
@@ -112,7 +116,7 @@ struct FileRow {
     /// count instead of parsing `size`'s one-decimal-rounded text back
     /// (issue #205 -- 1_234_567 and 1_240_000 both render `"1.2 MiB"`).
     /// `#[tabled(skip)]`: the table is explicitly out of scope for this
-    /// fix, a human reading `catalog ls` wants `size`'s `1.2 KiB`, not a
+    /// fix, a human reading `catalog list` wants `size`'s `1.2 KiB`, not a
     /// second raw-bytes column.
     ///
     /// `None` for a directory row, not `Some(0)`. The `files.size_bytes`
@@ -154,7 +158,7 @@ fn display_opt_string(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
 }
 
-/// `catalog ls --json` shape. `modified` was table-only before CTO decision
+/// `catalog list --json` shape. `modified` was table-only before CTO decision
 /// 2026-09-11 (architecture review C2 follow-up, C2b) added it as `Option<String>`.
 fn file_rows_to_json(rows: &[FileRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
@@ -510,7 +514,9 @@ fn dispatch(
     dry_run: bool,
 ) -> Result<()> {
     match command {
-        CatalogCommands::Ls { unit, version } => {
+        CatalogCommands::Ls(_) => return Err(crate::cli::renamed::refused(&["catalog", "ls"])),
+
+        CatalogCommands::List { unit, version } => {
             let unit_row = crate::db::queries::get_unit_by_name(conn, unit)?
                 .ok_or_else(|| TapectlError::UnitNotFound(unit.clone()))?;
 
@@ -673,7 +679,7 @@ fn dispatch(
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             // LENIENT (ADR-0010): rebuild is the disaster-recovery read
             // path — the machine running it typically has keys and no
-            // `backend add` yet, so the backend is optional and only names
+            // `drive add` yet, so the backend is optional and only names
             // the resulting volume row's `backend_name`.
             let (device, backend) = crate::config::resolve_device(config, device.as_deref())?;
             // Issue #166: refuse before the store is opened if this drive
@@ -1091,7 +1097,7 @@ fn match_expression(pattern: &str) -> Option<String> {
 }
 
 /// `catalog search` (issue #380). By default only each unit's NEWEST version
-/// is searched, the one `catalog ls` lists, so a file kept unchanged through
+/// is searched, the one `catalog list` lists, so a file kept unchanged through
 /// ten versions is one hit, not ten; `all_versions` lists it once per
 /// version. Ordered by unit, path and version, never by FTS `rank`: bm25
 /// ranks every match before the LIMIT can apply, which cost seconds on a
@@ -2229,7 +2235,7 @@ mod tests {
         assert!(note.contains("ADR-0012"), "{note}");
     }
 
-    // --- C2 pins: `catalog ls`/`catalog locate` --json shapes, locked down
+    // --- C2 pins: `catalog list`/`catalog locate` --json shapes, locked down
     // BEFORE the row structs are retyped (issue: C2 row-listing drift). ---
 
     /// Issue #236 finding 5: `path` used to store `"d "`/`"  "` prefixed

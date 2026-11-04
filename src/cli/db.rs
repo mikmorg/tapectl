@@ -28,7 +28,10 @@ pub fn run(
 ) -> Result<i32> {
     let mut exit_code = crate::error::EXIT_SUCCESS;
     match command {
-        DbCommands::Backup { to, include_keys } => {
+        DbCommands::Backup {
+            path: to,
+            include_keys,
+        } => {
             // Issue #247: `db_backup` itself checks `dry_run` FIRST, before
             // either `Connection::open` call — so on the dry path it has
             // already printed its own preview and returned, and the success

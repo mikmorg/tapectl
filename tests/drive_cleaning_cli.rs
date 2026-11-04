@@ -58,7 +58,7 @@ fn configured_home() -> TempDir {
         &run(
             home.path(),
             &[
-                "backend",
+                "drive",
                 "add",
                 "--name",
                 "lto0",
@@ -70,7 +70,7 @@ fn configured_home() -> TempDir {
                 "LTO-6",
             ],
         ),
-        "backend add",
+        "drive add",
     );
     home
 }
