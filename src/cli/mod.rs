@@ -398,13 +398,30 @@ pub enum ConfigCommands {
     Show,
     /// Check configuration validity
     Check,
+    /// Print one key's value in force, and where it comes from
+    ///
+    /// The source is config.toml, a default (the key is not in the file), or
+    /// derived (a drive's device_sg, from its device_tape). KEY is spelled as
+    /// for `config set`, and a bare key resolves to the one key of that name:
+    /// `post_warning_bytes` is `backends.lto[lto6].post_warning_bytes` when
+    /// one drive is configured, and with one drive `backends.lto.KEY` names
+    /// its key too. A key that could be several is refused naming each, and a
+    /// misspelt one names the key meant. `--json` gives `key`, `value` (null
+    /// when nothing sets it) and `source` (`config.toml`, `default` or
+    /// `derived`).
+    Get {
+        /// The key, e.g. defaults.slice_size or post_warning_bytes
+        key: String,
+    },
     /// Set one key in config.toml, keeping its comments and layout
     ///
     /// KEY is a dotted path as `config check` prints it:
     /// `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry of a
     /// list of tables is selected by its name or its position from 0:
     /// `collections[movies].unit_depth`, `backends.lto[0].enospc_buffer`.
-    /// A missing table is created.
+    /// A missing table is created. A bare key resolves to the one key of
+    /// that name (`post_warning_bytes` with one drive), and a list of tables
+    /// with one entry needs no selector (`backends.lto.enospc_buffer`).
     ///
     /// VALUE is tried as a TOML number, boolean or array first, and as a
     /// string when that does not load; quote it as TOML (`'"3"'`) to force a

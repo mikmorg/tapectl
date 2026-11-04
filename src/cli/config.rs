@@ -58,6 +58,10 @@ pub fn run(
             Ok(EXIT_SUCCESS)
         }
         ConfigCommands::Check => run_check(conn, paths, json_output),
+        ConfigCommands::Get { key } => {
+            run_get(paths, key, json_output)?;
+            Ok(EXIT_SUCCESS)
+        }
         ConfigCommands::Set { .. } | ConfigCommands::Add { .. } | ConfigCommands::Remove { .. } => {
             // `main.rs` dispatches these to `run_edit` before the strict
             // load (#143); reaching here means a caller skipped that.
@@ -92,7 +96,7 @@ pub fn run_edit(
             key: key.clone(),
             values: values.clone(),
         },
-        ConfigCommands::Show | ConfigCommands::Check => {
+        ConfigCommands::Show | ConfigCommands::Check | ConfigCommands::Get { .. } => {
             unreachable!("run_edit is only called for set/add/remove")
         }
     };
@@ -100,6 +104,44 @@ pub fn run_edit(
     let original = std::fs::read_to_string(file)?;
     let planned = crate::config_edit::plan(&original, file, &edit)?;
     apply_planned(file, &original, &planned, json_output, dry_run)
+}
+
+/// `config get KEY` (ADR-0012 item 214): the value in force and where it
+/// comes from, through [`crate::config_edit::get`]. Reads only.
+fn run_get(paths: &TapectlPaths, key: &str, json_output: bool) -> Result<()> {
+    let original = std::fs::read_to_string(&paths.config_file)?;
+    let effective = crate::config::Config::load(&paths.config_file)?;
+    let got = crate::config_edit::get(&original, &effective, key)?;
+    if json_output {
+        crate::render::print_json(&serde_json::json!({
+            "key": got.key,
+            "value": got.value,
+            "source": got.source.word(),
+        }));
+    } else {
+        println!("{}", describe_got(&got, &paths.config_file));
+    }
+    Ok(())
+}
+
+/// `config get`'s line: the key and its value as config.toml writes it,
+/// then where it comes from, as a TOML comment (`defaults.slice_size =
+/// "1G"  # default`), so the line can be pasted into the file.
+pub(crate) fn describe_got(got: &crate::config_edit::Got, file: &std::path::Path) -> String {
+    use crate::config_edit::Source;
+    let source = match &got.source {
+        Source::File => format!("set in {}", file.display()),
+        Source::Default => "default".to_string(),
+        Source::Derived(how) => format!("derived {how}"),
+    };
+    match &got.value {
+        Some(v) => format!(
+            "{} = {}  # {source}",
+            got.key,
+            crate::config_edit::toml_text_of(v)
+        ),
+        None => format!("{} is not set  # {source}", got.key),
+    }
 }
 
 /// Write (unless `dry_run`) and report a planned edit.
