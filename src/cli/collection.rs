@@ -172,10 +172,9 @@ pub enum CollectionCommands {
     /// Execute one batch: stage every unit in it once, write one session to
     /// the destination label, then release the staging of each unit that
     /// copy brings to its copy floor (the larger of its policy's
-    /// `min_copies` and the sum of its `copies_at` targets) and every
-    /// `copies_at` target; a unit still short keeps its staging for the
-    /// further copies (ADR-0012 item 217). Ends with what the copy holds and
-    /// the next copy's command. Targets a
+    /// `min_copies` and the sum of its `copies_at` targets); a unit still
+    /// short keeps its staging for the further copies (ADR-0012 item 217).
+    /// Ends with what the copy holds and the next copy's command. Targets a
     /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
     /// action.
@@ -1559,7 +1558,9 @@ fn cmd_run(
                     "copies": p.copies,
                     // OQ5: the copy floor, named for what it is.
                     "copy_floor": p.min_copies,
-                    // Additive (item 217): the per-location targets unmet.
+                    // Additive, as `volume write --json` has it: the
+                    // per-location targets unmet (empty: a run releases at
+                    // the copy floor).
                     "short_locations": p.short_at.iter().map(|l| serde_json::json!({
                         "location": l.location,
                         "copies": l.copies,
@@ -1609,7 +1610,7 @@ fn cmd_run(
                     under_copied: report.under_copied,
                     slices: report.slices,
                 },
-                crate::staging::release::Hold::CopyTargets,
+                crate::staging::release::Hold::CopyFloor,
             ),
         };
         let (out, err) = crate::cli::volume::render_staging_release(destination, &release);

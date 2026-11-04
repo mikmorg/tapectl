@@ -74,8 +74,8 @@ pub struct BatchExecutionReport {
     /// The units of the batch whose staging this release freed, by name, in
     /// batch order.
     pub released_units: Vec<String>,
-    /// The units of the batch still short of their copy floor or of a
-    /// per-location target, and by how much: their staging was kept.
+    /// The units of the batch still short of their copy floor, and by how
+    /// much: their staging was kept.
     pub under_copied: Vec<CopyProgress>,
     /// The per-slice release of the batch's stage sets that hold a range
     /// (1.7.0, #478; ADR-0012 item 129), made whatever `cleaned` says: per
@@ -126,9 +126,8 @@ pub struct BatchExecutionReport {
 /// Release (the last step) calls the existing GC guard
 /// (`staging::clean::clean_staging`, non-force) — but **only for the units
 /// of this batch that already have enough eligible copies to meet their
-/// copy floor and every per-location target**
-/// ([`crate::staging::release::release_if_covered`]; per unit since
-/// ADR-0012 item 217).
+/// copy floor** ([`crate::staging::release::release_if_covered`]; per unit
+/// since ADR-0012 item 217).
 /// This gate did not exist before issue #229 and its absence was a real defect, not a
 /// theoretical one: `copy_labels` is now always exactly one label (`collection
 /// run` refuses more, `docs/adr/0012-...md`'s 2026-09-17 amendment), so this
@@ -462,9 +461,9 @@ fn release_after_copies(
 /// this tail instead of calling it, so a revert of the scope back to
 /// `CleanScope::Whole` would have gone undetected.
 ///
-/// The rule itself — release each unit that now meets its copy floor and
-/// every per-location target, scoped to exactly those units (issues #229,
-/// #248; ADR-0012 item 217) — lives in
+/// The rule itself — release each unit that now meets its copy floor,
+/// scoped to exactly those units (issues #229, #248; ADR-0012 item 217) —
+/// lives in
 /// [`crate::staging::release::release_if_covered`] since issue #440, shared
 /// with `volume write` and `volume resume`; this only names the batch's units
 /// for it, in `batch.units` order. [`execute_batch`]'s doc comment says why

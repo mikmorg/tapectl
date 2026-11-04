@@ -14,15 +14,17 @@
 //! failed write).
 //!
 //! **The rule is per unit** (ADR-0012 item 217, amending #440's
-//! all-or-nothing): every unit judged whose copy floor
-//! ([`copy_floor`]) AND every `copies_at` target ([`short_of_copies_at`])
-//! are met is released, and every unit still short of either stays staged,
-//! named with why. It is the per-unit split `stage clean` already makes,
-//! run after each write. Twin copies stay twins without a rule of their
-//! own: when copies 1 and 2 carry the same units, every one of them is
-//! short until copy 2, and covered after it. On mhvtl the all-or-nothing
-//! rule wrote two covered units a third time, held back by a third unit
-//! that was short.
+//! all-or-nothing): every unit judged that meets its copy floor
+//! ([`copy_floor`]) is released, and every unit still short of it stays
+//! staged, named with why. It is the per-unit split `stage clean` already
+//! makes, run after each write. The floor is the default (item 154, which
+//! item 217 leaves standing); `--keep-staging-for-locations`
+//! ([`Hold::EveryLocation`]) also waits for every `copies_at` target
+//! ([`short_of_copies_at`]), still per unit. Twin copies stay twins without
+//! a rule of their own: when copies 1 and 2 carry the same units, every one
+//! of them is short until copy 2, and covered after it. On mhvtl the
+//! all-or-nothing rule wrote two covered units a third time, held back by a
+//! third unit that was short.
 //!
 //! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
 //! stage set planned past where its tape sealed short. It never counts as a
@@ -68,16 +70,17 @@ pub struct CopyProgress {
     /// otherwise ([`tape_only_note`]), so [`CopyProgress::describe`] never
     /// shows a number the policy alone does not explain.
     pub floor_note: String,
-    /// The per-location targets of its unit still unmet
-    /// ([`short_of_copies_at`]; #493, ADR-0012 items 149 and 217), in name
-    /// order. Empty when every target is met or the unit has none, and
-    /// always under [`Hold::CopyFloor`].
+    /// Under [`Hold::EveryLocation`] (`--keep-staging-for-locations`, #493,
+    /// ADR-0012 item 154): the per-location targets of its unit still unmet
+    /// ([`short_of_copies_at`]), in name order. Always empty under
+    /// [`Hold::CopyFloor`].
     pub short_at: Vec<LocationShort>,
 }
 
 impl CopyProgress {
     /// `unit alpha has 1 copy, needs 2` — why its staging was kept; with
-    /// its unmet per-location targets after it (#493, ADR-0012 item 217):
+    /// its unmet per-location targets after it when it was held for them
+    /// (#493):
     /// `unit alpha has 2 copies, its floor 2; still needed: 0 copies at
     /// required location offsite, needs 1`.
     pub fn describe(&self) -> String {
@@ -107,22 +110,18 @@ impl CopyProgress {
 /// and 217).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Hold {
-    /// The default since 1.9.0 (ADR-0012 item 217): a unit is released once
-    /// its copy floor AND every per-location target of its `copies_at` map
-    /// are met. A spanning set's slices are released by the floor alone, one
-    /// by one ([`release_ranges`]).
+    /// The default (item 154, which item 217 leaves standing, and `stage
+    /// clean`'s rule): a unit judged whole is released once it meets its copy
+    /// floor; a spanning set's slices are released by the floor, one by one
+    /// ([`release_ranges`]).
     #[default]
-    CopyTargets,
-    /// The copy floor alone: 1.7.1's default (ADR-0012 item 154) and `stage
-    /// clean`'s rule. No production caller asks for it since item 217; it is
-    /// kept so the default is one line ([`release_if_covered`], and
-    /// `cli::volume`'s `StagingKeep::Release`).
     CopyFloor,
-    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): as
-    /// [`Hold::CopyTargets`] for the units judged whole, and a unit short of
-    /// a per-location target also keeps every slice of a set that spans
-    /// cartridges, since there is no per-slice per-location count to release
-    /// them by.
+    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): a unit
+    /// judged whole is also held while any per-location target of its
+    /// `copies_at` map is unmet, so the next location's copy reuses its
+    /// staging; and a unit short of a target keeps every slice of a set that
+    /// spans cartridges, since there is no per-slice per-location count to
+    /// release them by.
     EveryLocation,
 }
 
@@ -151,10 +150,9 @@ pub struct ReleaseOutcome {
     pub slices: CleanReport,
 }
 
-/// Releases the staged data of each of `unit_ids` whose copy floor and
-/// every per-location target are now met, and keeps the staged data of each
-/// unit still short of either, saying which and why (ADR-0012 item 217,
-/// [`Hold::CopyTargets`]).
+/// Releases the staged data of each of `unit_ids` that now meets its copy
+/// floor, and keeps the staged data of each unit still short of it, saying
+/// which and by how much (ADR-0012 item 217, per unit; [`Hold::CopyFloor`]).
 ///
 /// The release itself is `clean_staging(force = false, CleanScope::Units)`
 /// over the covered units, so its own guard still applies and is what keeps
@@ -185,17 +183,17 @@ pub fn release_if_covered(
     config: &Config,
     unit_ids: &[i64],
 ) -> Result<ReleaseOutcome> {
-    release_if_covered_holding(conn, config, unit_ids, Hold::CopyTargets)
+    release_if_covered_holding(conn, config, unit_ids, Hold::CopyFloor)
 }
 
 /// [`release_if_covered`], waiting for `hold` (#493, ADR-0012 items 154 and
 /// 217). Each unit judged whole is released or kept on its own: short of
-/// its floor, or (unless [`Hold::CopyFloor`]) of a per-location target of
-/// its current coverage (the write just promoted the version it wrote),
-/// it keeps its staging and is reported with what it lacks
-/// ([`CopyProgress`]); covered, it is released whatever the others do.
-/// Under [`Hold::EveryLocation`] a unit short of a target also keeps every
-/// slice of its sets that hold a range.
+/// its floor, or under [`Hold::EveryLocation`] of a per-location target of
+/// its current coverage (the write just promoted the version it wrote, and
+/// the move after it has run), it keeps its staging and is reported with
+/// what it lacks ([`CopyProgress`]); covered, it is released whatever the
+/// others do. Under [`Hold::EveryLocation`] a unit short of a target also
+/// keeps every slice of its sets that hold a range.
 pub fn release_if_covered_holding(
     conn: &Connection,
     config: &Config,
@@ -216,7 +214,7 @@ pub fn release_if_covered_holding(
         let (unit, resolved) = unit_and_policy(conn, config, unit_id)?;
         let short_at = match hold {
             Hold::CopyFloor => Vec::new(),
-            Hold::CopyTargets | Hold::EveryLocation => short_of_copies_at(
+            Hold::EveryLocation => short_of_copies_at(
                 conn,
                 config,
                 NamedScope::Unit(unit_id),
@@ -1029,15 +1027,14 @@ mod tests {
         assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
     }
 
-    /// ADR-0012 item 217: the default release waits for every `copies_at`
-    /// target as well as the floor, so a unit at its floor whose targets are
-    /// unmet keeps its staging and says where it is short, by
-    /// `release_if_covered` and its `Hold::CopyTargets` form alike. The
-    /// control is `Hold::CopyFloor`, 1.7.1's default (item 154), which
-    /// releases the same unit at its floor.
+    /// The default is item 154's, which item 217 leaves standing: released
+    /// at the copy floor whatever a per-location target says, by
+    /// `release_if_covered` and its `Hold::CopyFloor` form alike. The control
+    /// is `--keep-staging-for-locations` (`Hold::EveryLocation`), which holds
+    /// the same unit for offsite.
     #[test]
-    fn the_default_release_waits_for_every_copies_at_target() {
-        for hold in [None, Some(Hold::CopyTargets), Some(Hold::CopyFloor)] {
+    fn the_default_release_is_the_copy_floor_whatever_the_targets_say() {
+        for hold in [None, Some(Hold::CopyFloor), Some(Hold::EveryLocation)] {
             let conn = db::open_memory().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let config = config(dir.path(), 2);
@@ -1051,33 +1048,21 @@ mod tests {
                 None => release_if_covered(&conn, &config, &[alpha]).unwrap(),
                 Some(h) => release_if_covered_holding(&conn, &config, &[alpha], h).unwrap(),
             };
-            if hold == Some(Hold::CopyFloor) {
-                assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
-                assert_eq!(out.cleaned.expect("at the floor").sets_cleaned, 1);
-                assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+            if hold == Some(Hold::EveryLocation) {
+                assert!(out.cleaned.is_none(), "held for offsite");
+                assert_eq!(out.under_copied.len(), 1, "{:?}", out.under_copied);
+                assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
                 continue;
             }
-            assert!(out.cleaned.is_none(), "{hold:?}: held for offsite");
-            assert!(out.released_units.is_empty());
-            assert_eq!(
+            assert!(
+                out.under_copied.is_empty(),
+                "{hold:?}: {:?}",
                 out.under_copied
-                    .iter()
-                    .map(|p| p.describe())
-                    .collect::<Vec<_>>(),
-                [
-                    "unit testlib/alpha has 2 copies, its floor 2; still needed: 0 copies at \
-                  required location offsite, needs 1"
-                ],
-                "{hold:?}"
             );
-            assert!(s.file.exists(), "{hold:?}");
-
-            add_write(&conn, &s, "V-offsite", "sealed", "completed");
-            shelve(&conn, "V-offsite", "offsite");
-            let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-            assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
-            assert_eq!(out.released_units, ["testlib/alpha"]);
+            assert_eq!(out.released_units, ["testlib/alpha"], "{hold:?}");
+            assert_eq!(out.cleaned.expect("at the floor").sets_cleaned, 1);
             assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+            assert!(!s.file.exists(), "{hold:?}");
         }
     }
 
@@ -1533,14 +1518,12 @@ mod tests {
 
     // --- per unit (ADR-0012 item 217) ---
 
-    /// The brief's first shape: two units after copy 2, one covered and one
-    /// at its floor but short of a per-location target. By default only the
-    /// covered one is released; the other is kept and says where it is
-    /// short. Undone (all or nothing), alpha would wait for beta's offsite
-    /// copy; with the targets left out of the default (item 154's floor
-    /// alone), beta would be released too.
+    /// Two units after copy 2 (ADR-0012 item 217): alpha at its floor of 2,
+    /// beta below its floor of 3 (the larger of `min_copies` and its
+    /// `copies_at` sum). Only alpha is released; beta is kept and named.
+    /// Undone (all or nothing), alpha would wait for beta's third copy.
     #[test]
-    fn after_copy_two_only_the_unit_whose_targets_are_met_is_released() {
+    fn after_copy_two_only_the_unit_at_its_floor_is_released() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path(), 2);
@@ -1548,12 +1531,17 @@ mod tests {
         let alpha = unit(&conn, t, "testlib/alpha");
         let beta = unit(&conn, t, "testlib/beta");
         two_targets(&conn, beta);
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":2,\"offsite\":1}' WHERE id = ?1",
+            params![beta],
+        )
+        .unwrap();
         let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
         let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
-        for (label, place) in [("V-1", "home"), ("V-2", "home")] {
+        for label in ["V-1", "V-2"] {
             add_write(&conn, &a, label, "sealed", "completed");
             add_write(&conn, &b, label, "sealed", "completed");
-            shelve(&conn, label, place);
+            shelve(&conn, label, "home");
         }
 
         let ids = unit_ids_written_to(&conn, "V-2").unwrap();
@@ -1566,10 +1554,7 @@ mod tests {
                 .iter()
                 .map(|p| p.describe())
                 .collect::<Vec<_>>(),
-            [
-                "unit testlib/beta has 2 copies, its floor 2; still needed: 0 copies at \
-              required location offsite, needs 1"
-            ]
+            ["unit testlib/beta has 2 copies, needs 3"]
         );
         assert_eq!(stage_set_status(&conn, a.stage_set_id), "cleaned");
         assert!(!a.file.exists());
@@ -1697,7 +1682,7 @@ mod tests {
     /// at home; the unit's targets are one copy at home and one at offsite.
     #[test]
     fn a_span_releases_by_the_floor_unless_its_slices_wait_for_locations() {
-        for hold in [Hold::CopyTargets, Hold::EveryLocation] {
+        for hold in [Hold::CopyFloor, Hold::EveryLocation] {
             let conn = db::open_memory().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let config = config(dir.path(), 2);
@@ -1717,7 +1702,7 @@ mod tests {
             let out = release_if_covered_holding(&conn, &config, &[alpha], hold).unwrap();
 
             assert!(out.under_copied.is_empty(), "a span is not judged whole");
-            if hold == Hold::CopyTargets {
+            if hold == Hold::CopyFloor {
                 assert_eq!(
                     out.slices.slices_released,
                     vec![(s.stage_set_id, vec![1, 2])]
