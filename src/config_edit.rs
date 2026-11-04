@@ -67,6 +67,23 @@ impl Edit {
             Edit::Set { key, .. } | Edit::Add { key, .. } | Edit::Remove { key, .. } => key,
         }
     }
+    /// The same edit of `key` (the key the typed one resolved to).
+    fn with_key(&self, key: String) -> Edit {
+        match self {
+            Edit::Set { value, .. } => Edit::Set {
+                key,
+                value: value.clone(),
+            },
+            Edit::Add { values, .. } => Edit::Add {
+                key,
+                values: values.clone(),
+            },
+            Edit::Remove { values, .. } => Edit::Remove {
+                key,
+                values: values.clone(),
+            },
+        }
+    }
 }
 
 /// An edit that passed, ready to write.
@@ -101,11 +118,19 @@ pub struct Planned {
 /// one collection (`collections[movies].exclude`) is edited here as any
 /// other.
 pub fn plan(original: &str, path: &Path, edit: &Edit) -> Result<Planned> {
-    let segs = parse_key(edit.key())?;
-    if let Some(refusal) = whole_collection_refusal(edit, &segs) {
+    // ADR-0012 item 214: a bare key, and a list of tables with one entry,
+    // resolve against the file before anything else; every message below
+    // names the key resolved. A file that is not TOML is refused, by name,
+    // by `plan_parsed`.
+    let segs = match original.parse::<DocumentMut>() {
+        Ok(doc) => resolve_key(doc.as_table(), edit.key())?,
+        Err(_) => parse_key(edit.key())?,
+    };
+    let edit = edit.with_key(dotted(&segs));
+    if let Some(refusal) = whole_collection_refusal(&edit, &segs) {
         return Err(TapectlError::Other(refusal));
     }
-    plan_parsed(original, path, edit, segs)
+    plan_parsed(original, path, &edit, segs)
 }
 
 /// `[[collections]]` table for `fields` (`field=value`, each value TOML
@@ -165,11 +190,16 @@ fn whole_collection_refusal(edit: &Edit, segs: &[Seg]) -> Option<String> {
 }
 
 fn plan_parsed(original: &str, path: &Path, edit: &Edit, segs: Vec<Seg>) -> Result<Planned> {
-    let doc: DocumentMut = original.parse().map_err(|e| {
+    let doc: DocumentMut = original.parse().map_err(|e: toml_edit::TomlError| {
+        let at = e
+            .span()
+            .map(|s| format!(" at line {}", original[..s.start].lines().count().max(1)))
+            .unwrap_or_default();
         TapectlError::Config(format!(
             "{} is not valid TOML, so it cannot be edited in place — fix it by hand \
-             (`tapectl config check` names the problem): {e}",
-            path.display()
+             (`tapectl config check` names the problem): {}{at}",
+            path.display(),
+            e.message().trim()
         ))
     })?;
     let before = check_text(original, path);
@@ -369,6 +399,424 @@ fn descend<'a>(mut cur: &'a mut Table, segs: &[Seg], create: bool) -> Result<&'a
     Ok(cur)
 }
 
+// ------------------------------------------------------------------ schema
+//
+// ADR-0012 item 214: a key can be found. A bare key resolves against the
+// schema (`post_warning_bytes` is `backends.lto[lto6].post_warning_bytes`
+// with one drive), `backends.lto.KEY` names the only drive's key, and a
+// typo gets a did-you-mean. What keys exist is never listed here: each
+// table's keys are read from the struct's own serde definition (the field
+// list `deny_unknown_fields` refuses an unknown key with), so a key added to
+// a struct is known here with no change. Only the tables themselves, and how
+// each is written, are listed ([`TABLES`]); a test holds that list to
+// [`crate::config::Config`]'s own shape.
+
+/// How a table of config.toml is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// `[name]`: one table.
+    Table,
+    /// `[[name]]`: a list of tables, an entry selected by name or position.
+    List,
+    /// A table whose keys are the operator's own (location names), each a
+    /// value: `[defaults.copies_at]`.
+    Map,
+}
+
+/// Every table of config.toml, by its dotted name, and how it is written.
+const TABLES: &[(&str, Shape)] = &[
+    ("", Shape::Table),
+    ("dar", Shape::Table),
+    ("backends", Shape::Table),
+    ("backends.lto", Shape::List),
+    ("archive_sets", Shape::List),
+    ("archive_sets.copies_at", Shape::Map),
+    ("defaults", Shape::Table),
+    ("defaults.copies_at", Shape::Map),
+    ("staging", Shape::Table),
+    ("discovery", Shape::Table),
+    ("collections", Shape::List),
+    ("compaction", Shape::Table),
+    ("logging", Shape::Table),
+    ("host_check", Shape::Table),
+    ("health", Shape::Table),
+    ("ops", Shape::Table),
+];
+
+/// The key a probe puts in a table to make serde name the table's keys.
+const PROBE_KEY: &str = "__tapectl_probe__";
+
+fn shape_of(table: &str) -> Option<Shape> {
+    TABLES.iter().find(|(t, _)| *t == table).map(|(_, s)| *s)
+}
+
+/// The keys of `table` (a [`Shape::Table`] or [`Shape::List`] of
+/// [`TABLES`]), as the struct behind it declares them: serde's own refusal
+/// of an unknown key lists them (`` unknown field `x`, expected one of `a`,
+/// `b` ``, or `` expected `a` `` for one), the same message
+/// `policy::lenient_config` reads.
+fn table_fields(table: &str, shape: Shape) -> Vec<String> {
+    let header = match (table, shape) {
+        ("", _) => String::new(),
+        (t, Shape::List) => format!("[[{t}]]\n"),
+        (t, _) => format!("[{t}]\n"),
+    };
+    match toml::from_str::<crate::config::Config>(&format!("{header}{PROBE_KEY} = 0\n")) {
+        Ok(_) => Vec::new(),
+        Err(e) => expected_fields(e.message()),
+    }
+}
+
+/// The names serde's unknown-field message lists after "expected".
+fn expected_fields(message: &str) -> Vec<String> {
+    let Some(rest) = message
+        .strip_prefix("unknown field `")
+        .and_then(|r| r.split_once("`, "))
+        .map(|(_, tail)| tail)
+    else {
+        return Vec::new();
+    };
+    rest.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every key that holds a value, by its names (`["backends", "lto",
+/// "post_warning_bytes"]`). A [`Shape::Map`] is one: its value is the whole
+/// map, and its entries are keys under it.
+fn value_keys() -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for (table, shape) in TABLES {
+        if *shape == Shape::Map {
+            continue;
+        }
+        for field in table_fields(table, *shape) {
+            let full = if table.is_empty() {
+                field.clone()
+            } else {
+                format!("{table}.{field}")
+            };
+            if matches!(shape_of(&full), Some(Shape::Table | Shape::List)) {
+                continue;
+            }
+            let mut names: Vec<String> = table
+                .split('.')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            names.push(field);
+            out.push(names);
+        }
+    }
+    out
+}
+
+/// What `names` (a key without its selectors) is in the schema.
+#[derive(Debug, Clone, PartialEq)]
+enum Known {
+    /// A key that holds a value.
+    Value,
+    /// An entry of a [`Shape::Map`]: a location's count.
+    MapEntry,
+    /// A table (or a list of tables, or one entry of one), with its keys.
+    Table(Vec<String>),
+    /// Not a key: the first name that is not, and the keys of the table it
+    /// was looked for in.
+    Unknown { at: usize, siblings: Vec<String> },
+}
+
+fn known(names: &[String]) -> Known {
+    let mut table = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let last = i + 1 == names.len();
+        let shape = shape_of(&table).unwrap_or(Shape::Table);
+        if shape == Shape::Map {
+            return if last {
+                Known::MapEntry
+            } else {
+                Known::Unknown {
+                    at: i + 1,
+                    siblings: Vec::new(),
+                }
+            };
+        }
+        let fields = table_fields(&table, shape);
+        if !fields.contains(name) {
+            return Known::Unknown {
+                at: i,
+                siblings: fields,
+            };
+        }
+        let child = if table.is_empty() {
+            name.clone()
+        } else {
+            format!("{table}.{name}")
+        };
+        match shape_of(&child) {
+            None | Some(Shape::Map) if last => return Known::Value,
+            None => {
+                return Known::Unknown {
+                    at: i + 1,
+                    siblings: Vec::new(),
+                }
+            }
+            Some(s) if last => return Known::Table(table_fields(&child, s)),
+            Some(_) => table = child,
+        }
+    }
+    Known::Table(table_fields("", Shape::Table))
+}
+
+/// Levenshtein distance, by characters (the sibling of `error.rs`'s, which
+/// is that module's own).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = Vec::with_capacity(b.len() + 1);
+        cur.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != *cb);
+            cur.push(substitute.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The names in `among` nearest `typed`, ignoring case: within a third of
+/// its length (at least one edit, at most three), the nearest only, and
+/// none when more than three are equally near.
+fn nearest<'a>(typed: &str, among: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+    let typed = typed.to_lowercase();
+    let limit = (typed.chars().count() / 3).clamp(1, 3);
+    let mut best = usize::MAX;
+    let mut near: Vec<&String> = Vec::new();
+    for name in among {
+        let d = edit_distance(&typed, &name.to_lowercase());
+        if d == 0 || d > limit {
+            continue;
+        }
+        if d < best {
+            best = d;
+            near.clear();
+        }
+        if d == best && !near.contains(&name) {
+            near.push(name);
+        }
+    }
+    if near.len() > 3 {
+        return Vec::new();
+    }
+    near.sort_unstable();
+    near
+}
+
+/// ` — did you mean X?` (or `X or Y`), or nothing.
+fn did_you_mean(choices: &[String]) -> String {
+    if choices.is_empty() {
+        return String::new();
+    }
+    format!(" — did you mean {}?", choices.join(" or "))
+}
+
+/// The keys near `segs` (a key that is not one), spelled with the user's
+/// own selectors: the first unknown name replaced by a near key of its
+/// table. Empty when nothing is near.
+fn suggestions_for(segs: &[Seg]) -> Vec<String> {
+    let names: Vec<String> = segs.iter().map(|s| s.key.clone()).collect();
+    let Known::Unknown { at, siblings } = known(&names) else {
+        return Vec::new();
+    };
+    nearest(&names[at], &siblings)
+        .into_iter()
+        .map(|near| {
+            let mut fixed = segs.to_vec();
+            fixed[at].key = near.clone();
+            dotted(&fixed)
+        })
+        .collect()
+}
+
+/// The entries of the list of tables at `segs` in `root`, as a selector
+/// each (by name when the entry has one, else by position). Empty when the
+/// file has no such list.
+fn list_entries(root: &Table, segs: &[Seg]) -> Vec<Selector> {
+    let Some((last, parents)) = segs.split_last() else {
+        return Vec::new();
+    };
+    let Some(parent) = steps_of(root, parents).and_then(|path| table_at(root, &path)) else {
+        return Vec::new();
+    };
+    match parent.get(&last.key) {
+        Some(Item::ArrayOfTables(aot)) => (0..aot.len())
+            .map(|i| {
+                let name = aot
+                    .get(i)
+                    .and_then(|t| t.get("name"))
+                    .and_then(|v| v.as_str());
+                match name {
+                    // A name two entries share selects neither.
+                    Some(n) if select(aot, &Selector::Name(n.to_string()), "").is_ok() => {
+                        Selector::Name(n.to_string())
+                    }
+                    _ => Selector::Index(i),
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What to say when the list of tables `list` (dotted, e.g. `backends.lto`)
+/// has no entry to take a key from.
+fn no_entries(list: &str, key: &str) -> TapectlError {
+    if list == "backends.lto" {
+        TapectlError::Config(format!(
+            "{key} is a key of a drive, and no drive is configured: add one with `tapectl \
+             drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`"
+        ))
+    } else {
+        TapectlError::Config(format!(
+            "{key} is a key of each [[{list}]] entry, and the file has none"
+        ))
+    }
+}
+
+/// `key` as the operator typed it, resolved to the key it names in the file
+/// whose root table is `root` (ADR-0012 item 214):
+///
+/// - a bare key that is not a top-level table, and not in the file as
+///   typed, resolves against the schema: the one key of that name, with
+///   each list of tables on its way expanded over the file's entries
+///   (`post_warning_bytes` is `backends.lto[lto6].post_warning_bytes` with
+///   one drive); several are refused, naming each, and none is refused with
+///   a did-you-mean;
+/// - a list of tables named without a selector before a key of its entries
+///   (`backends.lto.post_warning_bytes`) is its only entry; with none or
+///   several, it is refused, naming them.
+///
+/// A key the schema does not know is not refused here unless it is bare:
+/// `config set` and `add` refuse it through the edited file's check (which
+/// knows the renamed keys by name), `config remove` takes it out of a file
+/// that has it, and `config get` asks [`known`].
+fn resolve_key(root: &Table, key: &str) -> Result<Vec<Seg>> {
+    let mut segs = parse_key(key)?;
+    if let [only] = segs.as_slice() {
+        let root_fields = table_fields("", Shape::Table);
+        if only.select.is_none() && !root_fields.contains(&only.key) && !root.contains_key(&only.key)
+        {
+            return resolve_bare(root, &only.key);
+        }
+    }
+    for i in 0..segs.len().saturating_sub(1) {
+        if segs[i].select.is_some() {
+            continue;
+        }
+        let names: Vec<&str> = segs[..=i].iter().map(|s| s.key.as_str()).collect();
+        let list = names.join(".");
+        if shape_of(&list) != Some(Shape::List) {
+            continue;
+        }
+        let entries = list_entries(root, &segs[..=i]);
+        match entries.as_slice() {
+            [one] => segs[i].select = Some(one.clone()),
+            [] => return Err(no_entries(&list, key)),
+            many => {
+                let named: Vec<String> = many
+                    .iter()
+                    .map(|sel| {
+                        let mut s = segs.clone();
+                        s[i].select = Some(sel.clone());
+                        dotted(&s)
+                    })
+                    .collect();
+                return Err(TapectlError::Config(format!(
+                    "{key} is ambiguous: {list} has {} entries, so name one: {}",
+                    many.len(),
+                    named.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(segs)
+}
+
+/// A bare key, resolved against the schema ([`resolve_key`]).
+fn resolve_bare(root: &Table, name: &str) -> Result<Vec<Seg>> {
+    let owners: Vec<Vec<String>> = value_keys()
+        .into_iter()
+        .filter(|names| names.last().map(String::as_str) == Some(name))
+        .collect();
+    if owners.is_empty() {
+        let mut every: Vec<String> = value_keys()
+            .into_iter()
+            .filter_map(|names| names.last().cloned())
+            .collect();
+        every.sort_unstable();
+        every.dedup();
+        let near: Vec<String> = nearest(name, &every).into_iter().cloned().collect();
+        return Err(TapectlError::Config(format!(
+            "{name} is not a config key{}",
+            did_you_mean(&near)
+        )));
+    }
+    let mut candidates: Vec<Vec<Seg>> = Vec::new();
+    let mut empty_list: Option<String> = None;
+    for names in &owners {
+        let mut expanded: Vec<Vec<Seg>> = vec![Vec::new()];
+        let mut table = String::new();
+        for n in names {
+            table = if table.is_empty() {
+                n.clone()
+            } else {
+                format!("{table}.{n}")
+            };
+            let list = shape_of(&table) == Some(Shape::List);
+            let mut next = Vec::new();
+            for prefix in &expanded {
+                let mut segs = prefix.clone();
+                segs.push(Seg {
+                    key: n.clone(),
+                    select: None,
+                });
+                if !list {
+                    next.push(segs);
+                    continue;
+                }
+                for sel in list_entries(root, &segs) {
+                    let mut s = segs.clone();
+                    s.last_mut().expect("just pushed").select = Some(sel);
+                    next.push(s);
+                }
+            }
+            if list && next.is_empty() {
+                empty_list.get_or_insert(table.clone());
+            }
+            expanded = next;
+        }
+        candidates.extend(expanded);
+    }
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(no_entries(
+            empty_list.as_deref().unwrap_or_default(),
+            name,
+        )),
+        _ => Err(TapectlError::Config(format!(
+            "{name} is ambiguous: it is {} keys in this file, so name one: {}",
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|s| dotted(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 // ------------------------------------------------------------------ values
 
 /// What `raw` may mean, most specific first: a TOML literal that is not a
@@ -503,7 +951,7 @@ fn refuse_under_unknown(
         let bare = plain(unknown);
         if edited == bare || edited.starts_with(&format!("{bare}.")) {
             return Err(TapectlError::Config(format!(
-                "config {} {} refused; {} is unchanged:\n  - unknown key: {unknown} is \
+                "config {} {} refused ({} is unchanged): unknown key: {unknown} is \
                  already in the file, and no reader accepts it — remove it with \
                  `tapectl config remove {unknown}` (or fix its spelling by hand) instead \
                  of editing under it",
@@ -526,7 +974,7 @@ fn search(
     slots: &[Vec<Value>],
     apply: &dyn Fn(&mut DocumentMut, &[Value]) -> Result<()>,
 ) -> Result<(String, Vec<Value>, LenientReport)> {
-    let mut first: Option<LenientReport> = None;
+    let mut refused: Vec<LenientReport> = Vec::new();
     for pick in combos(slots) {
         let chosen: Vec<Value> = pick
             .iter()
@@ -540,31 +988,213 @@ fn search(
         if acceptable(before, &report) {
             return Ok((text, chosen, report));
         }
-        first.get_or_insert(report);
+        refused.push(report);
     }
-    let report = first.expect("combos always yields at least one choice");
-    let mut problems: Vec<String> = report
-        .problems
+    // The reading to explain: the first whose problem is not only that the
+    // value has the wrong type for the key, since another reading of the
+    // same text (`5` as text for `compression`) says more; else the first.
+    let report = refused
         .iter()
-        .filter(|p| {
-            before.valid || p.as_str() == report.problems[0] || !before.problems.contains(p)
-        })
-        .map(|p| format!("  - {p}"))
-        .collect();
-    problems.extend(
-        report
-            .slice_cap_problems
-            .iter()
-            .filter(|p| !before.slice_cap_problems.contains(p))
-            .map(|p| format!("  - {p}")),
-    );
+        .find(|r| !is_type_error(r))
+        .or(refused.first())
+        .expect("combos always yields at least one choice");
     Err(TapectlError::Config(format!(
-        "config {} {} refused; {} is unchanged:\n{}",
+        "config {} {} refused ({} is unchanged): {}",
         edit.verb(),
         edit.key(),
         path.display(),
-        problems.join("\n")
+        plain_problems(report, before, path, edit).join("; ")
     )))
+}
+
+// ------------------------------------------------------- what was wrong
+
+/// Whether `report`'s problem is a value of the wrong type for its key.
+fn is_type_error(report: &LenientReport) -> bool {
+    !report.valid
+        && report
+            .problems
+            .first()
+            .is_some_and(|p| p.contains("invalid type: "))
+}
+
+/// The problems of a refused edit, each on one line (ADR-0012 item 214: an
+/// error names the key and what was wrong, without the excerpt of the file
+/// the TOML parser draws, and names types plainly). The edited file's own
+/// problem comes first — `report.problems[0]`, which carries a renamed
+/// key's remediation (`policy::lenient_config`'s doc) — with its banner,
+/// excerpt and file path taken off; an unknown key is named with a
+/// did-you-mean instead of serde's list of every key; the line-free
+/// breakdown follows where it says more. On a file that already failed,
+/// only the problems this edit adds are named.
+fn plain_problems(
+    report: &LenientReport,
+    before: &LenientReport,
+    path: &Path,
+    edit: &Edit,
+) -> Vec<String> {
+    let file = path.display().to_string();
+    let strip = |p: &str| -> String {
+        let p = p.strip_prefix("configuration error: ").unwrap_or(p);
+        p.strip_prefix(&format!("{file}: ")).unwrap_or(p).to_string()
+    };
+    let new = |p: &String| before.valid || !before.problems.contains(p);
+    let mut out: Vec<String> = Vec::new();
+    let mut unknown_named = false;
+    if let Some(head) = report.problems.first() {
+        let (message, line) = without_excerpt(&strip(head));
+        if message.starts_with("unknown field `") {
+            for p in report.problems[1..].iter().filter(|p| new(p)) {
+                if let Some(key) = p.strip_prefix("unknown key: ") {
+                    out.push(unknown_key_problem(key, edit));
+                    unknown_named = true;
+                }
+            }
+            if !unknown_named {
+                let typed = message
+                    .strip_prefix("unknown field `")
+                    .and_then(|r| r.split('`').next())
+                    .unwrap_or_default();
+                let fields = expected_fields(&message);
+                let near: Vec<String> = nearest(typed, &fields).into_iter().cloned().collect();
+                out.push(format!(
+                    "{} is not a config key{}",
+                    edit.key(),
+                    did_you_mean(&near)
+                ));
+                unknown_named = true;
+            }
+        } else {
+            out.push(plain_message(&message, line.as_deref(), edit));
+        }
+    }
+    for p in report.problems.iter().skip(1).filter(|p| new(p)) {
+        if let Some(key) = p.strip_prefix("unknown key: ") {
+            let last = key.rsplit('.').next().unwrap_or(key);
+            let last = last.split('[').next().unwrap_or(last);
+            if unknown_named || out.iter().any(|o| o.contains(last)) {
+                continue;
+            }
+            out.push(unknown_key_problem(key, edit));
+            continue;
+        }
+        let p = strip(p);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    for p in &report.slice_cap_problems {
+        if !before.slice_cap_problems.contains(p) {
+            out.push(strip(p));
+        }
+    }
+    out
+}
+
+/// A TOML parser's error without the excerpt it draws of the file: the
+/// message, and the line of the file it pointed at (`key = value`).
+fn without_excerpt(text: &str) -> (String, Option<String>) {
+    if !text.contains("TOML parse error at line") {
+        return (text.trim().to_string(), None);
+    }
+    let mut line = None;
+    let mut message = Vec::new();
+    for l in text.lines() {
+        let t = l.trim_start();
+        if t.starts_with("TOML parse error at line") {
+            continue;
+        }
+        let digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        if let Some(code) = digits.trim_start().strip_prefix('|') {
+            if digits.len() != t.len() && !code.trim().is_empty() {
+                line = Some(code.trim().to_string());
+            }
+            continue;
+        }
+        if !t.is_empty() {
+            message.push(t.to_string());
+        }
+    }
+    (message.join(" "), line)
+}
+
+/// "`key` is not a config key", with a did-you-mean, for the unknown key
+/// `key` the check names (`archive_sets[0].bogus`): spelled as the edit
+/// spelled it when it is the edit's key or under it.
+fn unknown_key_problem(key: &str, edit: &Edit) -> String {
+    let plain = |k: &str| -> Vec<String> {
+        parse_key(k)
+            .map(|segs| segs.into_iter().map(|s| s.key).collect())
+            .unwrap_or_default()
+    };
+    let (shown, segs) = match parse_key(edit.key()) {
+        Ok(edit_segs) if plain(edit.key()).starts_with(&plain(key)) && !plain(key).is_empty() => {
+            (edit.key().to_string(), edit_segs)
+        }
+        _ => (key.to_string(), parse_key(key).unwrap_or_default()),
+    };
+    format!(
+        "{shown} is not a config key{}",
+        did_you_mean(&suggestions_for(&segs))
+    )
+}
+
+/// serde's words in `message` said plainly, naming the key: "invalid type:
+/// string \"lots\", expected i32" is "`defaults.min_copies` takes a whole
+/// number, not \"lots\"". `line` is the file's line the parser pointed at,
+/// which names the key a field of an added table is. Anything else is
+/// returned as it is.
+fn plain_message(message: &str, line: Option<&str>, edit: &Edit) -> String {
+    let field = line
+        .and_then(|l| l.split_once('='))
+        .map(|(k, _)| k.trim().trim_matches('"').to_string());
+    let key = match (&field, edit) {
+        (Some(f), _) if edit.key().rsplit('.').next() == Some(f.as_str()) => edit.key().to_string(),
+        (Some(f), Edit::Add { .. }) => format!("{}.{f}", edit.key()),
+        (Some(f), _) => f.clone(),
+        (None, _) => edit.key().to_string(),
+    };
+    if let Some(rest) = message.strip_prefix("invalid type: ") {
+        if let Some((got, expected)) = rest.split_once(", expected ") {
+            let got = match got.split('`').nth(1) {
+                Some(inner) => inner.to_string(),
+                None => match got.strip_prefix("string ") {
+                    Some(s) => s.to_string(),
+                    None => match got {
+                        "sequence" => "a list".to_string(),
+                        "map" => "a table".to_string(),
+                        other => other.to_string(),
+                    },
+                },
+            };
+            return format!("{key} takes {}, not {got}", plain_type(expected));
+        }
+    }
+    if let Some(rest) = message.strip_prefix("missing field `") {
+        let missing = rest.split('`').next().unwrap_or(rest);
+        return match edit {
+            Edit::Remove { .. } if edit.key().rsplit('.').next() == Some(missing) => {
+                format!("{} is required, so it cannot be removed", edit.key())
+            }
+            _ => format!("{}: {missing} is required", edit.key()),
+        };
+    }
+    message.to_string()
+}
+
+/// A serde type name as an operator would say it.
+fn plain_type(expected: &str) -> &str {
+    match expected.trim() {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+        | "an integer" => "a whole number",
+        "f32" | "f64" | "a float" => "a number",
+        "a boolean" => "true or false",
+        "a string" => "text",
+        "a sequence" => "a list, such as [\"a\", \"b\"]",
+        "a map" => "a table",
+        other if other.starts_with("struct ") => "a table",
+        other => other,
+    }
 }
 
 fn finish(
@@ -1161,6 +1791,19 @@ fn plan_remove(
     raws: &[String],
 ) -> Result<Planned> {
     let (last, parents) = segs.split_last().expect("parse_key yields at least one");
+    // A key that is not there, and that no reader knows, is most likely a
+    // typo: say which key was meant (ADR-0012 item 214).
+    if !in_file(doc.as_table(), segs)? {
+        let near = suggestions_for(segs);
+        if !near.is_empty() {
+            return Err(TapectlError::Config(format!(
+                "{} is not in {}, so there is nothing to remove{}",
+                edit.key(),
+                path.display(),
+                did_you_mean(&near)
+            )));
+        }
+    }
     let mut d = doc.clone();
     // What goes, worked out against the file as it is; a path that is not
     // there is refused below, by name.
@@ -1290,6 +1933,197 @@ fn plan_remove(
         },
     )?;
     Ok(finish(original, text, after, summary, json, Vec::new()))
+}
+
+// --------------------------------------------------------------------- get
+
+/// Where the value `config get` gives came from (ADR-0012 item 214).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// config.toml sets it.
+    File,
+    /// config.toml does not set it: the value tapectl uses then, or none at
+    /// all for an optional key ([`Got::value`] is `None`).
+    Default,
+    /// config.toml does not set it, and tapectl works it out from another
+    /// key: what from, as a phrase.
+    Derived(&'static str),
+}
+
+impl Source {
+    /// The word `--json` gives: `config.toml`, `default` or `derived`.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Source::File => "config.toml",
+            Source::Default => "default",
+            Source::Derived(_) => "derived",
+        }
+    }
+}
+
+/// `config get KEY`'s answer.
+#[derive(Debug, Clone)]
+pub struct Got {
+    /// The key it resolved to: `backends.lto[lto6].post_warning_bytes` for
+    /// `post_warning_bytes`.
+    pub key: String,
+    /// The value in force, as JSON; `None` for an optional key nothing sets.
+    pub value: Option<serde_json::Value>,
+    pub source: Source,
+}
+
+/// The value `key` has in `effective` — the config every command loads from
+/// the file whose text is `original` — and where it came from: the file,
+/// a default, or derived (a drive's `device_sg`, from its `device_tape`,
+/// issue #431). `key` resolves as [`resolve_key`] resolves it; a key the
+/// schema does not know is refused with a did-you-mean, and a table is
+/// refused naming its keys.
+pub fn get(original: &str, effective: &crate::config::Config, key: &str) -> Result<Got> {
+    let doc: DocumentMut = original
+        .parse()
+        .map_err(|e: toml_edit::TomlError| TapectlError::Config(e.message().to_string()))?;
+    let segs = resolve_key(doc.as_table(), key)?;
+    let shown = dotted(&segs);
+    let names: Vec<String> = segs.iter().map(|s| s.key.clone()).collect();
+    match known(&names) {
+        Known::Value | Known::MapEntry => {}
+        Known::Table(fields) => {
+            let plain = names.join(".");
+            return Err(TapectlError::Config(
+                if shape_of(&plain) == Some(Shape::List) && segs.last().is_some_and(|s| s.select.is_none()) {
+                    format!(
+                        "{shown} is a list of tables: get a key of one entry, e.g. \
+                         {shown}[<name>].{}",
+                        fields.first().map(String::as_str).unwrap_or("name")
+                    )
+                } else {
+                    format!(
+                        "{shown} is a table: get one of its keys ({})",
+                        fields
+                            .iter()
+                            .map(|f| format!("{shown}.{f}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            ));
+        }
+        Known::Unknown { .. } => {
+            return Err(TapectlError::Config(format!(
+                "{shown} is not a config key{}",
+                did_you_mean(&suggestions_for(&segs))
+            )))
+        }
+    }
+    for (i, seg) in segs.iter().enumerate() {
+        let plain = names[..=i].join(".");
+        if seg.select.is_some() && shape_of(&plain) != Some(Shape::List) {
+            return Err(TapectlError::Config(format!(
+                "{shown}: {plain} is not a list of tables, so it has no entries to select"
+            )));
+        }
+    }
+    let in_file = in_file(doc.as_table(), &segs)?;
+    let value = value_in(&effective_json(effective), &segs);
+    let source = if in_file {
+        Source::File
+    } else if value.is_some() && names == ["backends", "lto", "device_sg"] {
+        Source::Derived("from device_tape: the sg node the kernel binds to it, read from sysfs")
+    } else {
+        Source::Default
+    };
+    Ok(Got {
+        key: shown,
+        value,
+        source,
+    })
+}
+
+/// Whether the file whose root table is `root` writes the key at `segs`
+/// (as a key, a table, or a key of an inline table). An entry a selector
+/// names that is not there is refused, naming the entries there are.
+fn in_file(root: &Table, segs: &[Seg]) -> Result<bool> {
+    let mut cur: &dyn toml_edit::TableLike = root;
+    for (i, seg) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let Some(item) = cur.get(&seg.key) else {
+            return Ok(false);
+        };
+        let plain = segs[..=i]
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        let next: &dyn toml_edit::TableLike = match (&seg.select, item) {
+            (Some(sel), Item::ArrayOfTables(aot)) => {
+                let idx = select(aot, sel, &plain)?;
+                aot.get(idx).expect("select returned an index in range")
+            }
+            (Some(_), _) => return Ok(false),
+            (None, _) if last => return Ok(true),
+            (None, it) => match it.as_table_like() {
+                Some(t) => t,
+                None => return Ok(false),
+            },
+        };
+        if last {
+            return Ok(true);
+        }
+        cur = next;
+    }
+    Ok(true)
+}
+
+/// `effective` as JSON, with the tables that are optional in the file
+/// (`[host_check]`, `[health]`) at the values they take when absent.
+fn effective_json(effective: &crate::config::Config) -> serde_json::Value {
+    let mut c = effective.clone();
+    c.host_check = Some(effective.host_check());
+    c.health = Some(effective.health());
+    serde_json::to_value(&c).unwrap_or(serde_json::Value::Null)
+}
+
+/// The value at `segs` in `json`; `None` when absent or null (unset).
+fn value_in(json: &serde_json::Value, segs: &[Seg]) -> Option<serde_json::Value> {
+    let mut cur = json;
+    for seg in segs {
+        cur = cur.get(&seg.key)?;
+        if let Some(sel) = &seg.select {
+            let entries = cur.as_array()?;
+            cur = match sel {
+                Selector::Index(i) => entries.get(*i)?,
+                Selector::Name(n) => entries
+                    .iter()
+                    .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(n.as_str()))?,
+            };
+        }
+    }
+    (!cur.is_null()).then(|| cur.clone())
+}
+
+/// A JSON value as TOML text, the way config.toml writes it: `"1G"`,
+/// `0.97`, `["*.tmp"]`, `{ offsite = 2 }`.
+pub fn toml_text_of(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => Value::from(s.as_str()).to_string().trim().to_string(),
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(toml_text_of).collect::<Vec<_>>().join(", ")
+        ),
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            format!(
+                "{{ {} }}",
+                map.iter()
+                    .map(|(k, v)| format!("{k} = {}", toml_text_of(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        other => other.to_string(),
+    }
 }
 
 // ------------------------------------------------------------------- write
