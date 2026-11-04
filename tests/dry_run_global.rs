@@ -1488,15 +1488,16 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
     // this test's own tempdir path, so it never actually checked the slice
     // count -- a wrong count (0, or any other digit sequence not literally
     // "1") would still pass. `src/cli/restore.rs`'s dry-run branch format is
-    // `"would restore \"{}\" v{} from {} ({} slices) to {}"`, and this fixture
-    // wrote exactly one `write_positions` row, so the real preview must
-    // name it as "(1 slices)".
+    // `"would restore \"{}\" v{} from {} ({}) to {}"` with the slice count
+    // as a real plural (ADR-0012 item 212), and this fixture wrote exactly
+    // one `write_positions` row, so the real preview must name it as
+    // "(1 slice)".
     assert!(
         text.contains("would restore"),
         "dry-run output does not name the preview: {text}"
     );
     assert!(
-        text.contains("(1 slices)"),
+        text.contains("(1 slice)"),
         "dry-run output does not report the real slice count: {text}"
     );
     assert!(
@@ -1527,7 +1528,7 @@ fn restore_volume_dry_run_reports_a_preview_via_the_shared_arg_id() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("would restore \"u1\" v1 (1 slices)"),
+        text.contains("would restore \"u1\" v1 (1 slice)"),
         "dry-run output does not preview the unit: {text}"
     );
     assert!(

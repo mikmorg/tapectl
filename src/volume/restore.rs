@@ -8284,7 +8284,7 @@ mod tests {
                 assert!(lines[1].starts_with("FAILED \"ub\" v1"), "{lines:#?}");
                 assert!(lines[1].contains("checksum mismatch"), "{lines:#?}");
                 assert!(lines[2].starts_with("restored \"uc\" v1"), "{lines:#?}");
-                assert_eq!(lines[3], "2 of 3 unit(s) restored from RV-4");
+                assert_eq!(lines[3], "2 of 3 units restored from RV-4");
             }
 
             /// No volume of that label, or two units of which one would
@@ -8951,7 +8951,7 @@ mod tests {
                 lines.contains("not on this tape whole: \"bravo\" v1"),
                 "{lines}"
             );
-            assert!(lines.contains("2 unit(s) left out"), "{lines}");
+            assert!(lines.contains("2 units left out"), "{lines}");
 
             let dest = TempDir::new().unwrap();
             let report = restore_units_from_loaded_store(

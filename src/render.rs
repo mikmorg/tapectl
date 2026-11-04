@@ -160,6 +160,38 @@ pub fn json_error(message: &str, exit_code: i32) -> Value {
     json!({ "error": message, "exit_code": exit_code })
 }
 
+/// [`table_with`] for rows that derive `tabled::Tabled`: its headers (Title
+/// Case) and cells, so one `#[derive(Tabled, Serialize)]` row keeps backing
+/// both the table and `--json`. Callers pass [`terminal_width`] (W6-B's
+/// append).
+pub fn tabled_table<T: tabled::Tabled>(rows: &[T], width: Option<usize>) -> String {
+    let header: Vec<String> = T::headers().into_iter().map(|h| h.into_owned()).collect();
+    let header: Vec<&str> = header.iter().map(String::as_str).collect();
+    let body = rows
+        .iter()
+        .map(|r| r.fields().into_iter().map(|c| c.into_owned()).collect())
+        .collect();
+    table_with(&header, body, width)
+}
+
+/// `#[serde(serialize_with = "crate::render::json_time_ser")]`: a stored
+/// time serialized as [`json_time`] (RFC 3339 with `Z`), the stored value
+/// unchanged (W6-B's append).
+pub fn json_time_ser<S: serde::Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&json_time(v))
+}
+
+/// [`json_time_ser`] for an optional time: `null` stays `null`.
+pub fn json_time_opt_ser<S: serde::Serializer>(
+    v: &Option<String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(t) => s.serialize_str(&json_time(t)),
+        None => s.serialize_none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

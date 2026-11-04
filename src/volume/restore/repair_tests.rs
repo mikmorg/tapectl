@@ -2718,7 +2718,7 @@ pub(crate) mod tests {
         for needle in [
             "not on this tape whole: \"unit-480\" v1, slices 1 to 2 of it on this tape",
             "tapectl restore unit --unit unit-480 --from L6-0001 --version 1",
-            "1 unit(s) held across cartridges left out",
+            "1 unit held across cartridges left out",
         ] {
             assert!(lines.contains(needle), "{needle}: {lines}");
         }

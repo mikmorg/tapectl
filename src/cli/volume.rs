@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use rusqlite::Connection;
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::cli::{read_device, write_device};
 use crate::config::{Config, TapectlPaths};
@@ -1384,9 +1384,8 @@ fn stranded_lines(label: &str, stranded: &[std::path::PathBuf]) -> Vec<String> {
     }
     let mut lines = vec![format!(
         "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} \
-         staged file(s) could NOT be removed and no later `stage clean` can find them. Remove \
-         by hand:",
-        stranded.len()
+         could NOT be removed and no later `stage clean` can find them. Remove by hand:",
+        crate::render::plural(stranded.len() as i64, "staged file", "staged files")
     )];
     lines.extend(stranded.iter().map(|p| format!("  {}", p.display())));
     lines
@@ -1424,11 +1423,10 @@ pub(crate) fn render_staging_release(
                     .as_ref()
                     .map_or((0, 0), |c| (c.sets_cleaned, c.bytes_freed));
                 out.push(format!(
-                    "staging released for {} whose copies are met: {} ({} stage set(s), {} \
-                     freed)",
+                    "staging released for {} whose copies are met: {} ({}, {} freed)",
                     crate::render::plural(released.len() as i64, "unit", "units"),
                     released.join(", "),
-                    sets,
+                    crate::render::plural(sets as i64, "stage set", "stage sets"),
                     crate::util::format_bytes_binary(bytes),
                 ));
             }
@@ -1452,7 +1450,12 @@ pub(crate) fn render_staging_release(
             if let Some(c) = cleaned {
                 for (id, labels) in &c.held_by_live_session {
                     out.push(format!(
-                        "  stage set {id} kept: a live session is using it on volume(s) {}",
+                        "  stage set {id} kept: a live session is using it on {} {}",
+                        if labels.len() == 1 {
+                            "volume"
+                        } else {
+                            "volumes"
+                        },
                         labels.join(", ")
                     ));
                 }
@@ -1474,22 +1477,27 @@ pub(crate) fn render_staging_release(
                 ));
             } else if r.slices_short.is_empty() {
                 out.push(format!(
-                    "staging released: {} stage set(s), {} freed (every unit written has its \
-                     policy's copies)",
-                    r.sets_cleaned,
+                    "staging released: {}, {} freed (every unit written has its policy's \
+                     copies)",
+                    crate::render::plural(r.sets_cleaned as i64, "stage set", "stage sets"),
                     crate::util::format_bytes_binary(r.bytes_freed),
                 ));
             } else {
                 out.push(format!(
-                    "staging released: {} stage set(s), {} freed; a unit that spans cartridges \
-                     keeps the slices still short of copies",
-                    r.sets_cleaned,
+                    "staging released: {}, {} freed; a unit that spans cartridges keeps the \
+                     slices still short of copies",
+                    crate::render::plural(r.sets_cleaned as i64, "stage set", "stage sets"),
                     crate::util::format_bytes_binary(r.bytes_freed),
                 ));
             }
             for (id, labels) in &r.held_by_live_session {
                 out.push(format!(
-                    "  stage set {id} kept: a live session is using it on volume(s) {}",
+                    "  stage set {id} kept: a live session is using it on {} {}",
+                    if labels.len() == 1 {
+                        "volume"
+                    } else {
+                        "volumes"
+                    },
                     labels.join(", ")
                 ));
             }
@@ -1822,8 +1830,12 @@ fn not_for_location_line(
 ) -> Option<String> {
     (!staged.not_for_location.is_empty()).then(|| {
         format!(
-            "volume write --for-location {x}: {} staged set(s) not for {x} stay staged: {}",
-            staged.not_for_location.len(),
+            "volume write --for-location {x}: {} not for {x} stay staged: {}",
+            crate::render::plural(
+                staged.not_for_location.len() as i64,
+                "staged set",
+                "staged sets"
+            ),
             not_for_location_list(&staged.not_for_location)
         )
     })
@@ -1924,8 +1936,8 @@ pub(crate) fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
                     .collect();
                 if !others.is_empty() {
                     println!(
-                        "  {} other volume(s) on that cartridge moved too: {}",
-                        others.len(),
+                        "  {} on that cartridge moved too: {}",
+                        crate::render::plural(others.len() as i64, "other volume", "other volumes"),
                         others.join(", ")
                     );
                 }
@@ -2257,7 +2269,7 @@ fn report_left_initialized(
 ) {
     eprintln!("{}", left_initialized_line(conn, req.label, init.volume_id));
     if req.json_output {
-        println!("{}", left_initialized_json(req.label, init, error));
+        crate::render::print_json(&left_initialized_json(req.label, init, error));
     }
 }
 
@@ -2482,7 +2494,7 @@ pub fn run(
                 barcode.as_deref(),
             )?;
             if json_output {
-                println!("{}", init_json(label, &init));
+                crate::render::print_json(&init_json(label, &init));
             } else {
                 println!("{}", init_text(label, &init));
             }
@@ -2609,10 +2621,10 @@ pub fn run(
                 },
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    for_location_json(write_done_json(label, &done), for_x.as_ref())
-                );
+                crate::render::print_json(&for_location_json(
+                    write_done_json(label, &done),
+                    for_x.as_ref(),
+                ));
             } else {
                 // `write completed` word for word: the gate and fr414 route
                 // on it. Then item 216's summary, the release and the move,
@@ -2691,7 +2703,7 @@ pub fn run(
             // confirmed, whichever of its three routes) gets here. Issue #440.
             let done = follow_resume(conn, config, label, post_seal);
             if json_output {
-                println!("{}", resume_done_json(label, *loaded, &done));
+                crate::render::print_json(&resume_done_json(label, *loaded, &done));
             } else {
                 println!("volume \"{label}\" write resumed and completed");
                 print_staging_release(label, &done.release);
@@ -2736,15 +2748,12 @@ pub fn run(
             }
             let seal = write::volume_abort(conn, label, yes)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "label": label,
-                        "status": "aborted",
-                        "seal_recorded": seal.seal_recorded(),
-                        "reconfirmable": seal == write::AbortSeal::SealedReconfirmable,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "label": label,
+                    "status": "aborted",
+                    "seal_recorded": seal.seal_recorded(),
+                    "reconfirmable": seal == write::AbortSeal::SealedReconfirmable,
+                }));
             } else {
                 println!("{}", write::abort_done_message(label, &seal));
             }
@@ -2847,97 +2856,94 @@ pub fn run(
                 // FULL evidence, including the metadata-position mismatches
                 // that `verification_results` cannot store a row for.
                 let mismatches = verify_mismatches_json(&report);
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "label": label,
-                        // Issue #435, additive: whether the volume was found
-                        // from the loaded tape's File 0 (no label given).
-                        "loaded": loaded,
-                        "tier": tier_name,
-                        "checked": report.checked,
-                        "passed": report.passed,
-                        "failed": report.failed,
-                        "mismatches": mismatches,
-                        // Issue #234: `quarantined` is the headline answer;
-                        // `quarantine` carries what the condition WAS,
-                        // because a volume whose medium was already known
-                        // bad is a different fact from one this verify took
-                        // out of service. `null` on a clean verify and on a
-                        // failed one that proved nothing about the medium.
-                        "quarantined": report.quarantine.is_some(),
-                        // Issue #268, additive: the inverse of `quarantined`.
-                        // True only when this verify actually returned the
-                        // volume to service, never on the ordinary clean
-                        // verify of a healthy one. Issue #280 corrected the
-                        // semantics without renaming the field: a clean
-                        // clear on a `retired` or otherwise non-`sealed`
-                        // volume no longer claims `true` here — that was
-                        // the durability lie this field existed to avoid,
-                        // just stated for the wrong half of the condition.
-                        // `condition_changed` alone (which `cleared` below
-                        // still carries unconditionally) is enough to tell
-                        // a machine reader "the condition moved"; this
-                        // field now also answers "and it counts".
-                        "returned_to_service": returned_to_service_json(
-                            report.cleared.is_some(),
-                            volume_counts_as_copy,
-                        ),
-                        "cleared": report.cleared.as_ref().map(|c| serde_json::json!({
-                            "previous_condition": c.previous_condition,
-                            "condition_changed": true,
-                            // Issue #280: the same derived answer the human
-                            // message gives, plus the status it is derived
-                            // from, so a machine reader is never left to
-                            // infer "does this count" from `status` and
-                            // `eligible` on its own.
-                            "counts_as_copy": volume_counts_as_copy,
-                            "status": current_volume_status,
-                            // Issue #280, additive: the same answer that
-                            // decides whether the human message names
-                            // `tapectl volume resume <label>`.
-                            "resume_would_reconfirm": volume_resume_would_reconfirm,
-                        })),
-                        "quarantine": report.quarantine.as_ref().map(|q| {
-                            // Issue #242: a verify no longer touches
-                            // `status` at all -- `previous_status`/
-                            // `status_changed` are kept (additive-JSON
-                            // rule) but now honestly report a status that
-                            // never moves; `previous_condition`/
-                            // `condition_changed` are the new, accurate
-                            // pair the ADR's amendment is actually about.
-                            let current_status: String = conn
-                                .query_row(
-                                    "SELECT status FROM volumes WHERE label = ?1",
-                                    [label.as_str()],
-                                    |r| r.get(0),
-                                )
-                                .unwrap_or_default();
-                            serde_json::json!({
-                                "previous_status": current_status,
-                                "status_changed": false,
-                                "previous_condition": q.previous_condition,
-                                "condition_changed": q.condition_changed(),
-                                "proof": q.proof.iter().map(|m| serde_json::json!({
-                                    "position": m.position,
-                                    "kind": m.kind.label(),
-                                })).collect::<Vec<_>>(),
-                            })
-                        }),
-                        "drive_health_note": report.drive_health_note,
-                        // ADR-0012 2026-10-07 item 33 (#423), additive:
-                        // `null` when this verify recorded nothing.
-                        "figures": figures_json(report.figures.as_ref()),
-                        // ADR-0012 item 218, additive: the last full
-                        // readback before this verify (a write's full
-                        // confirm or a full verify), and the command it ran
-                        // under; `null` when none had passed.
-                        "last_full_read": report.last_full_read.as_ref().map(|r| serde_json::json!({
-                            "at": crate::render::json_time(&r.at),
-                            "by": r.by,
-                        })),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "label": label,
+                    // Issue #435, additive: whether the volume was found
+                    // from the loaded tape's File 0 (no label given).
+                    "loaded": loaded,
+                    "tier": tier_name,
+                    "checked": report.checked,
+                    "passed": report.passed,
+                    "failed": report.failed,
+                    "mismatches": mismatches,
+                    // Issue #234: `quarantined` is the headline answer;
+                    // `quarantine` carries what the condition WAS,
+                    // because a volume whose medium was already known
+                    // bad is a different fact from one this verify took
+                    // out of service. `null` on a clean verify and on a
+                    // failed one that proved nothing about the medium.
+                    "quarantined": report.quarantine.is_some(),
+                    // Issue #268, additive: the inverse of `quarantined`.
+                    // True only when this verify actually returned the
+                    // volume to service, never on the ordinary clean
+                    // verify of a healthy one. Issue #280 corrected the
+                    // semantics without renaming the field: a clean
+                    // clear on a `retired` or otherwise non-`sealed`
+                    // volume no longer claims `true` here — that was
+                    // the durability lie this field existed to avoid,
+                    // just stated for the wrong half of the condition.
+                    // `condition_changed` alone (which `cleared` below
+                    // still carries unconditionally) is enough to tell
+                    // a machine reader "the condition moved"; this
+                    // field now also answers "and it counts".
+                    "returned_to_service": returned_to_service_json(
+                        report.cleared.is_some(),
+                        volume_counts_as_copy,
+                    ),
+                    "cleared": report.cleared.as_ref().map(|c| serde_json::json!({
+                        "previous_condition": c.previous_condition,
+                        "condition_changed": true,
+                        // Issue #280: the same derived answer the human
+                        // message gives, plus the status it is derived
+                        // from, so a machine reader is never left to
+                        // infer "does this count" from `status` and
+                        // `eligible` on its own.
+                        "counts_as_copy": volume_counts_as_copy,
+                        "status": current_volume_status,
+                        // Issue #280, additive: the same answer that
+                        // decides whether the human message names
+                        // `tapectl volume resume <label>`.
+                        "resume_would_reconfirm": volume_resume_would_reconfirm,
+                    })),
+                    "quarantine": report.quarantine.as_ref().map(|q| {
+                        // Issue #242: a verify no longer touches
+                        // `status` at all -- `previous_status`/
+                        // `status_changed` are kept (additive-JSON
+                        // rule) but now honestly report a status that
+                        // never moves; `previous_condition`/
+                        // `condition_changed` are the new, accurate
+                        // pair the ADR's amendment is actually about.
+                        let current_status: String = conn
+                            .query_row(
+                                "SELECT status FROM volumes WHERE label = ?1",
+                                [label.as_str()],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "previous_status": current_status,
+                            "status_changed": false,
+                            "previous_condition": q.previous_condition,
+                            "condition_changed": q.condition_changed(),
+                            "proof": q.proof.iter().map(|m| serde_json::json!({
+                                "position": m.position,
+                                "kind": m.kind.label(),
+                            })).collect::<Vec<_>>(),
+                        })
+                    }),
+                    "drive_health_note": report.drive_health_note,
+                    // ADR-0012 2026-10-07 item 33 (#423), additive:
+                    // `null` when this verify recorded nothing.
+                    "figures": figures_json(report.figures.as_ref()),
+                    // ADR-0012 item 218, additive: the last full
+                    // readback before this verify (a write's full
+                    // confirm or a full verify), and the command it ran
+                    // under; `null` when none had passed.
+                    "last_full_read": report.last_full_read.as_ref().map(|r| serde_json::json!({
+                        "at": crate::render::json_time(&r.at),
+                        "by": r.by,
+                    })),
+                }));
             } else {
                 println!(
                     "verify {label} ({tier_name} tier): {} checked, {} passed, {} failed",
@@ -2953,22 +2959,22 @@ pub fn run(
                     (Some(q), _) => {
                         if q.condition_changed() {
                             println!(
-                                "volume \"{label}\" QUARANTINED: {} of {} failure(s) prove the \
+                                "volume \"{label}\" QUARANTINED: {} of {} prove the \
                                  medium is bad. Its status is untouched (ADR-0012, 2026-09-17) — \
                                  only its condition changed, from \"{}\" to \"quarantined\" — but \
                                  it no longer counts as a copy, so `volume retire` will no longer \
                                  refuse it as the last one — salvage what still reads off it \
                                  first (`volume read-slices <UNIT> --from {label}`).",
                                 q.proof.len(),
-                                report.failed,
+                                crate::render::plural(report.failed as i64, "failure", "failures"),
                                 q.previous_condition,
                             );
                         } else {
                             println!(
                                 "volume \"{label}\" was ALREADY quarantined; this verify \
-                                 confirms it — {} of {} failure(s) prove the medium is bad.",
+                                 confirms it — {} of {} prove the medium is bad.",
                                 q.proof.len(),
-                                report.failed,
+                                crate::render::plural(report.failed as i64, "failure", "failures"),
                             );
                         }
                     }
@@ -3039,7 +3045,7 @@ pub fn run(
             if json_output {
                 // ADR-0012 item 220: one object, the note and any
                 // contradiction in it; the exit status below is unchanged.
-                println!("{}", identify_json(conn, &id, chip_serial.as_deref())?);
+                crate::render::print_json(&identify_json(conn, &id, chip_serial.as_deref())?);
             } else {
                 // The tape's own account FIRST, always — see `Identified`. A
                 // contradiction is reported after it and through the exit
@@ -3122,7 +3128,7 @@ pub fn run(
                 if dry_run {
                     obj["dry_run"] = serde_json::json!(true);
                 }
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else if outcome.already_there {
                 println!(
                     "volume \"{label}\" is already at \"{}\": nothing changed",
@@ -3136,8 +3142,12 @@ pub fn run(
                     println!("  cartridge \"{barcode}\" would move with it");
                     if !others.is_empty() {
                         println!(
-                            "  {} other volume(s) on that cartridge would move too: {}",
-                            others.len(),
+                            "  {} on that cartridge would move too: {}",
+                            crate::render::plural(
+                                others.len() as i64,
+                                "other volume",
+                                "other volumes"
+                            ),
                             others.join(", ")
                         );
                     }
@@ -3148,8 +3158,12 @@ pub fn run(
                     println!("  cartridge \"{barcode}\" moved with it");
                     if !others.is_empty() {
                         println!(
-                            "  {} other volume(s) on that cartridge moved too: {}",
-                            others.len(),
+                            "  {} on that cartridge moved too: {}",
+                            crate::render::plural(
+                                others.len() as i64,
+                                "other volume",
+                                "other volumes"
+                            ),
                             others.join(", ")
                         );
                     }
@@ -3201,20 +3215,17 @@ pub fn run(
                 .with_mam_reads(&reads),
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "from": from, "unit": unit,
-                        "slices_read": report.slices_read,
-                        "bytes_read": report.bytes_read,
-                        // Issue #474: additive.
-                        "versions": report.versions,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "from": from, "unit": unit,
+                    "slices_read": report.slices_read,
+                    "bytes_read": report.bytes_read,
+                    // Issue #474: additive.
+                    "versions": report.versions,
+                }));
             } else {
                 println!(
-                    "read {} slices ({}) of \"{}\" {} from \"{}\" into staging",
-                    report.slices_read,
+                    "read {} ({}) of \"{}\" {} from \"{}\" into staging",
+                    crate::render::plural(report.slices_read as i64, "slice", "slices"),
                     crate::util::format_bytes_binary(report.bytes_read),
                     unit,
                     versions_phrase(&report.versions),
@@ -3315,39 +3326,37 @@ pub fn run(
                                            "size": size, "finding": finding(i)})
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "copies": copies,
-                        // ADR-0012 item 220, additive: where `copies` came
-                        // from, "--copies" or "copy floor", and the unit whose
-                        // floor it is (null unless "copy floor").
-                        "copies_from": planned.from(),
-                        "copy_floor_unit": planned.floor_of,
-                        "total_slices": total_slices,
-                        "total_bytes": total_bytes, "units": units,
-                        "policy_aware": policy_aware,
-                        // #418 R4: an estimate, see `planned_index_bytes`.
-                        "index_bytes": index,
-                        "index_bytes_on_tape": index.map(|n| 2 * n),
-                        // #478, additive: null unless a staged unit may span.
-                        "spanning": span.as_ref().map(plan_span_json),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "copies": copies,
+                    // ADR-0012 item 220, additive: where `copies` came
+                    // from, "--copies" or "copy floor", and the unit whose
+                    // floor it is (null unless "copy floor").
+                    "copies_from": planned.from(),
+                    "copy_floor_unit": planned.floor_of,
+                    "total_slices": total_slices,
+                    "total_bytes": total_bytes, "units": units,
+                    "policy_aware": policy_aware,
+                    // #418 R4: an estimate, see `planned_index_bytes`.
+                    "index_bytes": index,
+                    "index_bytes_on_tape": index.map(|n| 2 * n),
+                    // #478, additive: null unless a staged unit may span.
+                    "spanning": span.as_ref().map(plan_span_json),
+                }));
             } else if rows.is_empty() {
                 println!("no staged data to plan");
             } else {
                 println!("volume write plan ({}):", planned.describe());
                 for (i, (name, ver, slices, size)) in rows.iter().enumerate() {
                     println!(
-                        "  {name} v{ver}: {} slices, {}{}",
-                        slices.unwrap_or(0),
+                        "  {name} v{ver}: {}, {}{}",
+                        crate::render::plural(slices.unwrap_or(0), "slice", "slices"),
                         crate::util::format_bytes_binary(size.unwrap_or(0)),
                         finding(i).map(|f| format!("  ({f})")).unwrap_or_default(),
                     );
                 }
                 println!(
-                    "\ntotal: {total_slices} slices, {} x {copies} = {}",
+                    "\ntotal: {}, {} x {copies} = {}",
+                    crate::render::plural(total_slices, "slice", "slices"),
                     crate::util::format_bytes_binary(total_bytes),
                     crate::util::format_bytes_binary(total_bytes * copies),
                 );
@@ -3438,14 +3447,13 @@ pub fn run(
                 .with_mam_reads(&reads),
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"label": label, "slices_read": report.slices_read, "bytes_read": report.bytes_read})
+                crate::render::print_json(
+                    &serde_json::json!({"label": label, "slices_read": report.slices_read, "bytes_read": report.bytes_read}),
                 );
             } else {
                 println!(
-                    "compact-read \"{label}\": {} live slices ({}) staged",
-                    report.slices_read,
+                    "compact-read \"{label}\": {} ({}) staged",
+                    crate::render::plural(report.slices_read as i64, "live slice", "live slices"),
                     crate::util::format_bytes_binary(report.bytes_read),
                 );
             }
@@ -3485,9 +3493,8 @@ pub fn run(
                 yes,
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"destination": destination, "status": "completed"})
+                crate::render::print_json(
+                    &serde_json::json!({"destination": destination, "status": "completed"}),
                 );
             } else {
                 println!("compact-write to \"{destination}\" completed");
@@ -3512,14 +3519,11 @@ pub fn run(
             }
             let report = write::compact_finish(conn, config, label, *force || yes)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "label": label,
-                        "status": "retired",
-                        "affected_units": compact_finish_evidence_json(&report),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "label": label,
+                    "status": "retired",
+                    "affected_units": compact_finish_evidence_json(&report),
+                }));
             } else {
                 println!("compact-finish \"{label}\": volume retired");
                 print_compact_finish_evidence(&report);
@@ -3602,8 +3606,8 @@ pub fn run(
                 )?
             };
             println!(
-                "  Read {} slices ({})",
-                report.slices_read,
+                "  Read {} ({})",
+                crate::render::plural(report.slices_read as i64, "slice", "slices"),
                 crate::util::format_bytes_binary(report.bytes_read),
             );
 
@@ -3657,16 +3661,13 @@ pub fn run(
                 Ok(report) => {
                     println!("  Volume \"{label}\" retired");
                     if json_output {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "source": label,
-                                "destination": dest_label,
-                                "status": "completed",
-                                "source_retired": true,
-                                "affected_units": compact_finish_evidence_json(&report),
-                            })
-                        );
+                        crate::render::print_json(&serde_json::json!({
+                            "source": label,
+                            "destination": dest_label,
+                            "status": "completed",
+                            "source_retired": true,
+                            "affected_units": compact_finish_evidence_json(&report),
+                        }));
                     } else {
                         print_compact_finish_evidence(&report);
                         println!("\ncompaction complete: {label} → {dest_label}");
@@ -3676,16 +3677,13 @@ pub fn run(
                     let warning = compact_step3_outcome(label, dest_label, e)?;
                     eprintln!("{warning}");
                     if json_output {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "source": label,
-                                "destination": dest_label,
-                                "status": "source_not_retired",
-                                "source_retired": false,
-                                "warning": warning,
-                            })
-                        );
+                        crate::render::print_json(&serde_json::json!({
+                            "source": label,
+                            "destination": dest_label,
+                            "status": "source_not_retired",
+                            "source_retired": false,
+                            "warning": warning,
+                        }));
                     } else {
                         println!(
                             "\ncompaction written: {label} → {dest_label}; \"{label}\" is not retired"
@@ -3744,7 +3742,7 @@ pub fn run(
                 };
                 let plan = rewrite::plan(conn, config, &opts(src, dest))?;
                 if json_output {
-                    println!("{}", plan.to_json(src, dest));
+                    crate::render::print_json(&plan.to_json(src, dest));
                 } else {
                     for line in plan.describe(src, dest) {
                         println!("{line}");
@@ -3787,14 +3785,14 @@ pub fn run(
                 if let Some(release) = &report.release {
                     base = staging_release_json(base, release);
                 }
-                println!("{base}");
+                crate::render::print_json(&base);
             } else {
                 println!(
-                    "volume rewrite \"{}\" -> \"{}\" complete: {} slice(s){}, sealed and fully \
-                     read back{}",
+                    "volume rewrite \"{}\" -> \"{}\" complete: {}{}, sealed and fully read \
+                     back{}",
                     report.source,
                     report.destination,
-                    report.slices,
+                    crate::render::plural(report.slices as i64, "slice", "slices"),
                     if report.bytes > 0 {
                         format!(" ({})", crate::util::format_bytes_binary(report.bytes))
                     } else {
@@ -3834,7 +3832,10 @@ pub fn run(
             } else if rows.is_empty() {
                 println!("no volumes");
             } else {
-                println!("{}", Table::new(rows));
+                println!(
+                    "{}",
+                    crate::render::tabled_table(&rows, crate::render::terminal_width())
+                );
             }
         }
 
@@ -4003,12 +4004,9 @@ fn run_deposit(
             // run must still refuse what the real run would refuse.
             if dry_run {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"volume": label, "location": to,
+                    crate::render::print_json(&serde_json::json!({"volume": label, "location": to,
                                            "receipt": receipt, "storage_class": storage_class,
-                                           "dry_run": true})
-                    );
+                                           "dry_run": true}));
                 } else {
                     println!(
                         "would record a warehouse deposit of \"{label}\" at \"{to}\" \
@@ -4027,10 +4025,9 @@ fn run_deposit(
             crate::db::events::log_created(conn, "volume_deposit", id, label, None)?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"id": id, "volume": label, "location": to,
-                                       "receipt": receipt, "storage_class": storage_class})
+                crate::render::print_json(
+                    &serde_json::json!({"id": id, "volume": label, "location": to,
+                                       "receipt": receipt, "storage_class": storage_class}),
                 );
             } else {
                 println!(
@@ -4063,7 +4060,7 @@ fn run_deposit(
                     Ok(serde_json::json!({
                         "volume": row.get::<_, String>(0)?,
                         "location": row.get::<_, String>(1)?,
-                        "deposited_at": row.get::<_, String>(2)?,
+                        "deposited_at": crate::render::json_time(&row.get::<_, String>(2)?),
                         "receipt": row.get::<_, Option<String>>(3)?,
                         "storage_class": row.get::<_, Option<String>>(4)?,
                         "notes": row.get::<_, Option<String>>(5)?,
@@ -4081,7 +4078,7 @@ fn run_deposit(
                         "  {} at {} — deposited {}{}",
                         r["volume"].as_str().unwrap_or("?"),
                         r["location"].as_str().unwrap_or("?"),
-                        r["deposited_at"].as_str().unwrap_or("?"),
+                        crate::render::table_time(r["deposited_at"].as_str().unwrap_or("?")),
                         r["receipt"]
                             .as_str()
                             .map(|x| format!(", receipt {x}"))
@@ -4108,9 +4105,8 @@ fn run_deposit(
                     )));
                 }
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"volume": label, "location": from, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"volume": label, "location": from, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -4145,9 +4141,8 @@ fn run_deposit(
             )?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"volume": label, "location": from, "removed": deleted})
+                crate::render::print_json(
+                    &serde_json::json!({"volume": label, "location": from, "removed": deleted}),
                 );
             } else {
                 println!(
@@ -4622,7 +4617,9 @@ struct WriteRow {
     unit: String,
     version: i64,
     status: String,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     started_at: Option<String>,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     completed_at: Option<String>,
     num_slices: Option<i64>,
     bytes: Option<i64>,
@@ -4634,7 +4631,9 @@ struct WriteRow {
 /// or aborted attempt belongs.
 #[derive(Debug, Clone, Serialize)]
 struct VerificationRow {
+    #[serde(serialize_with = "crate::render::json_time_ser")]
     started_at: String,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     completed_at: Option<String>,
     verify_type: String,
     outcome: String,
@@ -4648,6 +4647,7 @@ struct VerificationRow {
 #[derive(Debug, Clone, Serialize)]
 struct DepositRow {
     location: String,
+    #[serde(serialize_with = "crate::render::json_time_ser")]
     deposited_at: String,
     receipt: Option<String>,
     storage_class: Option<String>,
@@ -4678,8 +4678,11 @@ struct VolumeInfo {
     location: Option<String>,
     cartridge_barcode: Option<String>,
     cartridge_serial: Option<String>,
+    #[serde(serialize_with = "crate::render::json_time_ser")]
     created_at: String,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     first_write: Option<String>,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     last_write: Option<String>,
     /// When this volume's own seal was written (`volumes.sealed_at`,
     /// migration 018): set once by the write session's `seal()` and never
@@ -4687,6 +4690,7 @@ struct VolumeInfo {
     /// whose session was then aborted — the fact `volume resume`'s
     /// re-confirmation of an aborted session turns on (ADR-0012
     /// 2026-09-23), and that `scripts/first-run.sh` step 13 reads.
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     sealed_at: Option<String>,
     /// Whether the drive checked the write with Logical Block Protection
     /// (#388, migration 041, `volumes.write_lbp`; ADR-0012 items 161, 165):
@@ -4713,7 +4717,9 @@ struct VolumeInfo {
     unit_count: i64,
     unit_total_bytes: i64,
     tenants: Vec<String>,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     units_first_seen: Option<String>,
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     units_last_seen: Option<String>,
     /// The largest few units by bytes carried (top 5), shown regardless of
     /// `--units` so the summary is never empty just because the full list
@@ -5056,7 +5062,10 @@ fn render_write_history(writes: &[WriteRow]) -> String {
             w.unit,
             w.version,
             w.status,
-            w.completed_at.as_deref().unwrap_or("not completed"),
+            w.completed_at
+                .as_deref()
+                .map(crate::render::table_time)
+                .unwrap_or_else(|| "not completed".to_string()),
         ));
     }
     out
@@ -5093,10 +5102,10 @@ fn figures_json(figures: Option<&crate::volume::figures::Figures>) -> serde_json
 /// began and when the last one completed, each line saying which.
 fn render_write_span(first_write: Option<&str>, last_write: Option<&str>) -> String {
     let first = first_write
-        .map(|t| format!("{t} (started)"))
+        .map(|t| format!("{} (started)", crate::render::table_time(t)))
         .unwrap_or_else(|| "(never written)".to_string());
     let last = last_write
-        .map(|t| format!("{t} (completed)"))
+        .map(|t| format!("{} (completed)", crate::render::table_time(t)))
         .unwrap_or_else(|| "(never written)".to_string());
     format!("  First write: {first}\n  Last write:  {last}\n")
 }
@@ -5151,7 +5160,9 @@ fn session_state<'s>(
 fn render_sealed_line(sealed_at: Option<&str>) -> String {
     format!(
         "  Sealed:      {}",
-        sealed_at.unwrap_or("(no seal recorded)")
+        sealed_at
+            .map(crate::render::table_time)
+            .unwrap_or_else(|| "(no seal recorded)".to_string())
     )
 }
 
@@ -5240,9 +5251,13 @@ fn render_verification_history(verifications: &[VerificationRow]) -> String {
         out.push_str(&format!(
             "    [{}] {}: started {}, completed {} ({}/{} slices passed)\n",
             v.verify_type,
-            v.outcome,
-            v.started_at,
-            v.completed_at.as_deref().unwrap_or("(not completed)"),
+            // OQ19: a verdict word, coloured on a terminal only.
+            crate::render::verdict(&v.outcome),
+            crate::render::table_time(&v.started_at),
+            v.completed_at
+                .as_deref()
+                .map(crate::render::table_time)
+                .unwrap_or_else(|| "(not completed)".to_string()),
             v.slices_passed,
             v.slices_checked,
         ));
@@ -5257,9 +5272,10 @@ fn print_volume_info(info: &VolumeInfo) {
     // condition is a separate, always-shown line rather than folded into
     // Status's text.
     println!("  Condition:   {}", info.condition);
+    // ADR-0012 item 208: the CLI says "drive" (the JSON keeps its keys).
     println!(
-        "  Backend:     {} ({})",
-        info.backend_type, info.backend_name
+        "  Drive:       {} ({})",
+        info.backend_name, info.backend_type
     );
     println!(
         "  Media:       {}",
@@ -5288,7 +5304,10 @@ fn print_volume_info(info: &VolumeInfo) {
         "  Location:    {}",
         info.location.as_deref().unwrap_or("(not placed)")
     );
-    println!("  Created:     {}", info.created_at);
+    println!(
+        "  Created:     {}",
+        crate::render::table_time(&info.created_at)
+    );
     print!(
         "{}",
         render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
@@ -5314,13 +5333,17 @@ fn print_volume_info(info: &VolumeInfo) {
         println!("Units carried: none");
     } else {
         println!(
-            "Units carried: {} ({} across {} tenant(s){})",
+            "Units carried: {} ({} across {}{})",
             info.unit_count,
             crate::util::format_bytes_binary(info.unit_total_bytes),
-            info.tenants.len(),
+            crate::render::plural(info.tenants.len() as i64, "tenant", "tenants"),
             match (&info.units_first_seen, &info.units_last_seen) {
-                (Some(a), Some(b)) if a != b => format!(", {a} .. {b}"),
-                (Some(a), _) => format!(", {a}"),
+                (Some(a), Some(b)) if a != b => format!(
+                    ", {} .. {}",
+                    crate::render::table_time(a),
+                    crate::render::table_time(b)
+                ),
+                (Some(a), _) => format!(", {}", crate::render::table_time(a)),
                 _ => String::new(),
             },
         );
@@ -5357,7 +5380,7 @@ fn print_volume_info(info: &VolumeInfo) {
             println!(
                 "    {} ({}){}",
                 d.location,
-                d.deposited_at,
+                crate::render::table_time(&d.deposited_at),
                 d.receipt
                     .as_deref()
                     .map(|r| format!(", receipt {r}"))
@@ -6453,7 +6476,7 @@ mod tests {
             assert!(
                 out[0].starts_with(
                     "staging released for 1 unit whose copies are met: testlib/alpha (1 stage \
-                     set(s), "
+                     set, "
                 ),
                 "{out:#?}"
             );
@@ -7725,7 +7748,7 @@ mod tests {
             );
             assert_eq!(
                 not_for_location_line("offsite", &selected).unwrap(),
-                "volume write --for-location offsite: 1 staged set(s) not for offsite stay \
+                "volume write --for-location offsite: 1 staged set not for offsite stay \
                  staged: \"testlib/alpha\" v1 (no need at offsite)"
             );
             let json = for_location_json(
@@ -9544,32 +9567,29 @@ mod tests {
             .unwrap();
             let rows = volume_rows(&conn, None).unwrap();
 
-            let table = Table::new(&rows).to_string();
-            let header = table.lines().nth(1).expect(&table);
-            assert!(header.contains("GENERATION"), "{table}");
-            assert!(header.contains("CAPACITY"), "{table}");
-            let cells = |label: &str| -> Vec<String> {
-                table
+            // ADR-0012 item 212: borderless, Title Case headers.
+            let table = crate::render::tabled_table(&rows, None);
+            let header = table.lines().next().expect(&table);
+            assert!(header.starts_with("Label"), "{table}");
+            assert!(!table.contains('|'), "{table}");
+            // The cell under `name` on `label`'s line, by column offset.
+            let cell = |label: &str, name: &str| -> String {
+                let at = header
+                    .find(name)
+                    .unwrap_or_else(|| panic!("no column {name}:\n{table}"));
+                let line = table
                     .lines()
-                    .find(|l| l.contains(label))
-                    .unwrap_or_else(|| panic!("no row for {label}:\n{table}"))
-                    .split('|')
-                    .map(|c| c.trim().to_string())
-                    .collect()
+                    .find(|l| l.starts_with(label))
+                    .unwrap_or_else(|| panic!("no row for {label}:\n{table}"));
+                let rest: String = line.chars().skip(at).collect();
+                rest.split("  ").next().unwrap().trim().to_string()
             };
-            let col = |name: &str| -> usize {
-                header
-                    .split('|')
-                    .position(|c| c.trim() == name)
-                    .unwrap_or_else(|| panic!("no column {name}:\n{table}"))
-            };
-            let (g, c) = (col("GENERATION"), col("CAPACITY"));
-            assert_eq!(cells("L5-0001")[g], "LTO-5", "{table}");
-            assert_eq!(cells("L5-0001")[c], "1.50 TB", "{table}");
-            assert_eq!(cells("L6-0001")[g], "LTO-6", "{table}");
-            assert_eq!(cells("L6-0001")[c], "2.50 TB", "{table}");
-            assert_eq!(cells("OLD-0001")[g], "—", "{table}");
-            assert_eq!(cells("OLD-0001")[c], "0 B", "{table}");
+            assert_eq!(cell("L5-0001", "Generation"), "LTO-5", "{table}");
+            assert_eq!(cell("L5-0001", "Capacity"), "1.50 TB", "{table}");
+            assert_eq!(cell("L6-0001", "Generation"), "LTO-6", "{table}");
+            assert_eq!(cell("L6-0001", "Capacity"), "2.50 TB", "{table}");
+            assert_eq!(cell("OLD-0001", "Generation"), "—", "{table}");
+            assert_eq!(cell("OLD-0001", "Capacity"), "0 B", "{table}");
 
             let json = volume_rows_to_json(&rows);
             let l5 = json
@@ -9768,7 +9788,7 @@ mod tests {
         fn info_prints_the_seal_time_or_says_none_was_recorded() {
             assert_eq!(
                 render_sealed_line(Some("2026-09-12 03:04:05")),
-                "  Sealed:      2026-09-12 03:04:05"
+                "  Sealed:      2026-09-12 03:04 UTC"
             );
             assert_eq!(
                 render_sealed_line(None),
@@ -9892,8 +9912,8 @@ mod tests {
             assert_eq!(info.last_write.as_deref(), Some("2026-10-01 18:06:17"));
             let text = render_write_span(info.first_write.as_deref(), info.last_write.as_deref());
             assert!(
-                text.contains("First write: 2026-10-01 02:53:12 (started)")
-                    && text.contains("Last write:  2026-10-01 18:06:17 (completed)"),
+                text.contains("First write: 2026-10-01 02:53 UTC (started)")
+                    && text.contains("Last write:  2026-10-01 18:06 UTC (completed)"),
                 "{text}"
             );
             assert!(render_write_span(None, None).contains("First write: (never written)"));
@@ -9914,8 +9934,8 @@ mod tests {
             }];
             let text = render_verification_history(&rows);
             assert!(
-                text.contains("started 2026-10-01 08:14:57")
-                    && text.contains("completed 2026-10-01 18:06:17"),
+                text.contains("started 2026-10-01 08:14 UTC")
+                    && text.contains("completed 2026-10-01 18:06 UTC"),
                 "{text}"
             );
             assert_eq!(
@@ -10357,7 +10377,7 @@ mod tests {
         ]);
         assert_eq!(
             text,
-            "Writes:\n    photos v3: some-status (2026-09-01 10:00:00)\n    \
+            "Writes:\n    photos v3: some-status (2026-09-01 10:00 UTC)\n    \
              docs v3: some-status (not completed)\n"
         );
         assert_eq!(render_write_history(&[]), "Writes: none\n");

@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};
@@ -401,8 +401,15 @@ fn volume_history_lines(volumes: &[(String, String, Option<String>)]) -> Vec<Str
     volumes
         .iter()
         .map(|(label, mounted, unmounted)| match unmounted {
-            Some(u) => format!("    {label} (mounted {mounted}, unmounted {u})"),
-            None => format!("    {label} (current, mounted {mounted})"),
+            Some(u) => format!(
+                "    {label} (mounted {}, unmounted {})",
+                crate::render::table_time(mounted),
+                crate::render::table_time(u)
+            ),
+            None => format!(
+                "    {label} (current, mounted {})",
+                crate::render::table_time(mounted)
+            ),
         })
         .collect()
 }
@@ -415,13 +422,18 @@ fn contact_lines(
     last_contact: Option<&crate::tape::cartridge_health::LastContact>,
 ) -> Vec<String> {
     vec![
-        format!("  Last bind:    {}", last_bind.unwrap_or("never")),
+        format!(
+            "  Last bind:    {}",
+            last_bind
+                .map(crate::render::table_time)
+                .unwrap_or_else(|| "never".to_string())
+        ),
         format!(
             "  Last contact: {}",
             last_contact
                 .map(|c| format!(
                     "{} ({}, {})",
-                    c.at,
+                    crate::render::table_time(&c.at),
                     c.operation,
                     c.outcome.as_deref().unwrap_or("did not close")
                 ))
@@ -591,7 +603,10 @@ pub fn run(
                     let bytes = parsed.native_capacity_bytes();
                     (
                         bytes as i64,
-                        format!("{bytes} bytes, the {canonical_generation} default"),
+                        format!(
+                            "{}, the {canonical_generation} default",
+                            crate::util::format_bytes_decimal(bytes as i64)
+                        ),
                     )
                 }
             };
@@ -608,10 +623,9 @@ pub fn run(
             // what the real run would refuse.
             if dry_run {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"barcode": barcode, "generation": canonical_generation,
-                                           "capacity": capacity_display, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"barcode": barcode, "generation": canonical_generation,
+                                           "capacity": capacity_display, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -634,7 +648,7 @@ pub fn run(
             let id = conn.last_insert_rowid();
             events::log_created(conn, "cartridge", id, barcode, None)?;
             if json_output {
-                println!("{}", serde_json::json!({"id": id, "barcode": barcode}));
+                crate::render::print_json(&serde_json::json!({"id": id, "barcode": barcode}));
             } else {
                 println!(
                     "cartridge \"{barcode}\" registered (id={id}, {canonical_generation}, {capacity_display})"
@@ -654,7 +668,10 @@ pub fn run(
             } else if rows.is_empty() {
                 println!("no cartridges registered");
             } else {
-                println!("{}", Table::new(rows));
+                println!(
+                    "{}",
+                    crate::render::tabled_table(&rows, crate::render::terminal_width())
+                );
             }
         }
         CartridgeCommands::Info { barcode } => {
@@ -824,7 +841,7 @@ pub fn run(
                 if dry_run {
                     obj["dry_run"] = serde_json::json!(true);
                 }
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else if outcome.already_there {
                 println!(
                     "cartridge \"{barcode}\" is already at \"{}\": nothing changed",
@@ -838,7 +855,8 @@ pub fn run(
                 match outcome.volumes.len() {
                     0 => println!("  no volumes on this cartridge"),
                     n => println!(
-                        "  {n} volume(s) would move with it: {}",
+                        "  {} would move with it: {}",
+                        crate::render::plural(n as i64, "volume", "volumes"),
                         outcome.volumes.join(", ")
                     ),
                 }
@@ -847,7 +865,8 @@ pub fn run(
                 match outcome.volumes.len() {
                     0 => println!("  no volumes on this cartridge"),
                     n => println!(
-                        "  {n} volume(s) moved with it: {}",
+                        "  {} moved with it: {}",
+                        crate::render::plural(n as i64, "volume", "volumes"),
                         outcome.volumes.join(", ")
                     ),
                 }
@@ -970,7 +989,7 @@ pub fn run(
                         }),
                     );
                 }
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else {
                 if let Some(outcome) = &generation_outcome {
                     if !outcome.changed {
@@ -1061,9 +1080,8 @@ pub fn run(
             // --dry-run like its peers (Retire, MarkErased).
             if dry_run {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"old": barcode, "new": new_barcode, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"old": barcode, "new": new_barcode, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -1092,10 +1110,7 @@ pub fn run(
                 None,
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"old": barcode, "new": new_barcode})
-                );
+                crate::render::print_json(&serde_json::json!({"old": barcode, "new": new_barcode}));
             } else {
                 println!("cartridge \"{barcode}\" relabelled to \"{new_barcode}\"");
             }
@@ -1118,7 +1133,7 @@ pub fn run(
                 Some(id) => {
                     let bytes = journal_raw(conn, &selector, *id)?;
                     if json_output {
-                        println!("{}", journal_raw_json(*id, bytes.as_deref()));
+                        crate::render::print_json(&journal_raw_json(*id, bytes.as_deref()));
                     } else {
                         match bytes {
                             // Verbatim: no added newline, no lossy decode.
@@ -1141,7 +1156,10 @@ pub fn run(
                     } else {
                         let table: Vec<JournalTableRow> =
                             rows.iter().map(JournalTableRow::from).collect();
-                        println!("{}", Table::new(table));
+                        println!(
+                            "{}",
+                            crate::render::tabled_table(&table, crate::render::terminal_width())
+                        );
                     }
                 }
             }
@@ -1202,7 +1220,7 @@ fn cartridge_erase_command(
         if dry_run {
             v["dry_run"] = serde_json::json!(true);
         }
-        println!("{v}");
+        crate::render::print_json(&v);
         return Ok(());
     }
     // A dry run and a tape with nothing to erase showed no facts on the way:
@@ -1316,9 +1334,10 @@ fn journal_raw_json(id: i64, bytes: Option<&[u8]>) -> serde_json::Value {
 
 #[derive(Tabled)]
 struct JournalTableRow {
-    #[tabled(rename = "ID")]
+    #[tabled(rename = "Row")]
     id: i64,
-    #[tabled(rename = "Captured (UTC)")]
+    /// Shown in UTC (`render::table_time`), as every table time is.
+    #[tabled(rename = "Captured")]
     captured_at: String,
     #[tabled(rename = "Contact", display_with = "display_opt_i64_blank")]
     contact_id: Option<i64>,
@@ -1336,13 +1355,16 @@ impl From<&crate::tape::mam_journal::Entry> for JournalTableRow {
     fn from(e: &crate::tape::mam_journal::Entry) -> Self {
         JournalTableRow {
             id: e.id,
-            captured_at: e.captured_at.clone(),
+            captured_at: crate::render::table_time(&e.captured_at),
             contact_id: e.contact_id,
             trigger: e.trigger.clone(),
             hook: e.hook.clone(),
             serial: e.serial_as_read.clone(),
             outcome: if e.ok {
-                format!("ok ({} bytes)", e.raw_bytes.unwrap_or(0))
+                format!(
+                    "ok ({})",
+                    crate::util::format_bytes_binary(e.raw_bytes.unwrap_or(0))
+                )
             } else {
                 format!(
                     "FAILED: {}",
@@ -1721,8 +1743,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "    L6-0002 (current, mounted 2026-09-20 10:00:00)".to_string(),
-                "    L6-0001 (mounted 2026-09-01 10:00:00, unmounted 2026-09-20 09:59:00)"
+                "    L6-0002 (current, mounted 2026-09-20 10:00 UTC)".to_string(),
+                "    L6-0001 (mounted 2026-09-01 10:00 UTC, unmounted 2026-09-20 09:59 UTC)"
                     .to_string(),
             ]
         );
@@ -1740,8 +1762,8 @@ mod tests {
         assert_eq!(
             contact_lines(Some("2026-04-01 00:00:00"), Some(&contact)),
             vec![
-                "  Last bind:    2026-04-01 00:00:00".to_string(),
-                "  Last contact: 2026-10-01 08:00:00 (volume verify, ok)".to_string(),
+                "  Last bind:    2026-04-01 00:00 UTC".to_string(),
+                "  Last contact: 2026-10-01 08:00 UTC (volume verify, ok)".to_string(),
             ]
         );
         assert_eq!(
@@ -1810,8 +1832,10 @@ mod tests {
             volume: None,
             location: None,
         }];
-        let table = Table::new(rows).to_string();
-        let header = table.lines().find(|l| l.contains("Barcode")).unwrap();
+        let table = crate::render::tabled_table(&rows, None);
+        let header = table.lines().next().unwrap();
+        assert!(header.starts_with("Barcode"), "{table}");
+        assert!(!table.contains('|'), "{table}");
         assert!(header.contains("Generation"), "{table}");
         assert!(!header.contains("Type"), "{table}");
     }

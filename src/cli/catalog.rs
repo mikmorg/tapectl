@@ -6,7 +6,7 @@ use clap::Subcommand;
 const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::error::{Result, TapectlError};
 use crate::volume::rebuild::RebuildReport;
@@ -159,7 +159,9 @@ struct FileRow {
     /// follow-up, C2b): the raw `modified_at` column is nullable, so this
     /// carries `Option<String>` (the DB's own timestamp string, unchanged)
     /// rather than the empty-string fallback the table used internally.
-    #[tabled(rename = "Modified", display_with = "display_opt_string")]
+    /// UTC in the table, RFC 3339 with `Z` in `--json` (ADR-0012 item 212).
+    #[tabled(rename = "Modified", display_with = "display_opt_table_time")]
+    #[serde(serialize_with = "crate::render::json_time_opt_ser")]
     modified: Option<String>,
     #[tabled(rename = "SHA256")]
     sha256: String,
@@ -180,8 +182,14 @@ impl FileRow {
     }
 }
 
-fn display_opt_string(v: &Option<String>) -> String {
-    v.clone().unwrap_or_default()
+fn display_table_time(v: &str) -> String {
+    crate::render::table_time(v)
+}
+
+fn display_opt_table_time(v: &Option<String>) -> String {
+    v.as_deref()
+        .map(crate::render::table_time)
+        .unwrap_or_default()
 }
 
 /// `catalog list --json` shape. `modified` was table-only before CTO decision
@@ -253,7 +261,9 @@ struct LocationRow {
     /// not a copy on its own. `Slices` above is the set's count either way.
     #[tabled(rename = "Holds")]
     holds: String,
-    #[tabled(rename = "Written")]
+    /// UTC in the table, RFC 3339 with `Z` in `--json` (ADR-0012 item 212).
+    #[tabled(rename = "Written", display_with = "display_table_time")]
+    #[serde(serialize_with = "crate::render::json_time_ser")]
     written: String,
     /// Whether this volume can actually serve a restore, per ADR-0004's
     /// eligibility rule ("a stage_set claim on a sealed, unquarantined,
@@ -488,9 +498,9 @@ fn catalogue_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String
     let mut lines = Vec::new();
     if report.catalogues_restored > 0 {
         lines.push(format!(
-            "  dar catalogues: {} stage set(s) got theirs back from the operator envelope, so a \
-             copy written from them carries it again",
-            report.catalogues_restored
+            "  dar catalogues: {} got theirs back from the operator envelope, so a copy \
+             written from them carries it again",
+            crate::render::plural(report.catalogues_restored as i64, "stage set", "stage sets")
         ));
     }
     if !report.sets_without_catalogue.is_empty() {
@@ -590,7 +600,10 @@ fn dispatch(
             } else if rows.is_empty() {
                 println!("no files found");
             } else {
-                println!("{}", Table::new(rows));
+                println!(
+                    "{}",
+                    crate::render::tabled_table(&rows, crate::render::terminal_width())
+                );
             }
         }
 
@@ -621,7 +634,10 @@ fn dispatch(
                         crate::util::format_bytes_binary(h.size)
                     );
                 }
-                println!("{} result(s)", rows.len());
+                println!(
+                    "{}",
+                    crate::render::plural(rows.len() as i64, "result", "results")
+                );
             }
         }
 
@@ -639,7 +655,10 @@ fn dispatch(
             } else if rows.is_empty() {
                 println!("unit \"{unit}\" not found on any volume");
             } else {
-                println!("{}", Table::new(&rows));
+                println!(
+                    "{}",
+                    crate::render::tabled_table(&rows, crate::render::terminal_width())
+                );
                 // Say it in words too — a "NO" in a table column is easy to
                 // skim past when you are about to walk to a shelf.
                 let unserviceable: Vec<&str> = rows
@@ -846,11 +865,13 @@ fn dispatch(
                 // #418 R4: additive. The tapes this tape's cross-volume index
                 // names that the catalog lacks: a to-do list, nothing added.
                 obj["cross_volume_index"] = index_json(&report);
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else {
                 println!(
-                    "rebuilt from volume \"{}\" (uuid {}), {} envelope(s) opened",
-                    report.label, report.uuid, report.envelopes_opened
+                    "rebuilt from volume \"{}\" (uuid {}), {} opened",
+                    report.label,
+                    report.uuid,
+                    crate::render::plural(report.envelopes_opened as i64, "envelope", "envelopes")
                 );
                 // Issue #305: what the tape says about its own write, every
                 // run — the dates a rebuilt row now carries.
@@ -866,15 +887,18 @@ fn dispatch(
                     println!("  no changes — the catalog already knew this volume");
                 } else {
                     println!(
-                        "  inserted: {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s),",
-                        report.tenants, report.units, report.snapshots, report.stage_sets
+                        "  inserted: {}, {}, {}, {},",
+                        crate::render::plural(report.tenants as i64, "tenant", "tenants"),
+                        crate::render::plural(report.units as i64, "unit", "units"),
+                        crate::render::plural(report.snapshots as i64, "snapshot", "snapshots"),
+                        crate::render::plural(report.stage_sets as i64, "stage set", "stage sets")
                     );
                     println!(
-                        "            {} slice(s), {} write(s), {} position(s), {} file row(s){}",
-                        report.slices,
-                        report.writes,
-                        report.positions,
-                        report.files,
+                        "            {}, {}, {}, {}{}",
+                        crate::render::plural(report.slices as i64, "slice", "slices"),
+                        crate::render::plural(report.writes as i64, "write", "writes"),
+                        crate::render::plural(report.positions as i64, "position", "positions"),
+                        crate::render::plural(report.files as i64, "file row", "file rows"),
                         if report.volume_inserted {
                             ", 1 volume"
                         } else {
@@ -1039,14 +1063,18 @@ fn dispatch(
                 );
                 if report.attested > 0 {
                     println!(
-                        "  attested: {} stage set(s) — the escrow key decrypted a slice header",
-                        report.attested
+                        "  attested: {} — the escrow key decrypted a slice header",
+                        crate::render::plural(report.attested as i64, "stage set", "stage sets")
                     );
                 }
                 if report.receipts_from_tape > 0 {
                     println!(
-                        "  escrow receipts: {} stage set(s) carried theirs on the tape",
-                        report.receipts_from_tape
+                        "  escrow receipts: {} carried theirs on the tape",
+                        crate::render::plural(
+                            report.receipts_from_tape as i64,
+                            "stage set",
+                            "stage sets"
+                        )
                     );
                 }
                 if report.unknown_remaining > 0 {
@@ -1066,16 +1094,13 @@ fn dispatch(
         CatalogCommands::Stats => {
             let stats = catalog_stats(conn)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "units": stats.units,
-                        "snapshots": stats.snapshots,
-                        "files": stats.files,
-                        "total_size": stats.total_size,
-                        "volumes": stats.volumes,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "units": stats.units,
+                    "snapshots": stats.snapshots,
+                    "files": stats.files,
+                    "total_size": stats.total_size,
+                    "volumes": stats.volumes,
+                }));
             } else {
                 println!("Catalog statistics:");
                 println!("  Units:     {}", stats.units);
@@ -1200,7 +1225,7 @@ fn catalog_stats(conn: &Connection) -> Result<CatalogStats> {
     })
 }
 
-/// The `escrow: ... still report \`?\` (unknown)` lines `catalog rebuild`
+/// The `escrow: still \`?\` (unknown) for ...` lines `catalog rebuild`
 /// prints when `report.unknown_remaining > 0`, extracted out of `run`'s
 /// match arm (issue #236 finding 1) so the exact wording per cause is a
 /// function a test can call directly, rather than something only provable
@@ -1229,19 +1254,27 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
         // remedy omitting it sends the operator to a command that refuses.
         if escrow_registered {
             lines.push(format!(
-                "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) \
+                "  escrow: still `?` (unknown) for {} on this volume \
                  — re-run `tapectl catalog rebuild --from-volume --key <the REGISTERED escrow \
                  secret key>` to attest them, or re-stage",
-                report.unknown_remaining
+                crate::render::plural(
+                    report.unknown_remaining as i64,
+                    "rebuilt stage set",
+                    "rebuilt stage sets"
+                )
             ));
         } else {
             lines.push(format!(
-                "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) \
+                "  escrow: still `?` (unknown) for {} on this volume \
                  — no escrow is registered in this catalog yet: register the ORIGINAL escrow \
                  public key with `tapectl key import --escrow <key>`, then re-run `tapectl \
                  catalog rebuild --from-volume --key <its secret key file>` to attest them, or \
                  re-stage",
-                report.unknown_remaining
+                crate::render::plural(
+                    report.unknown_remaining as i64,
+                    "rebuilt stage set",
+                    "rebuilt stage sets"
+                )
             ));
         }
         return lines;
@@ -1249,25 +1282,38 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
 
     if report.escrow_attest_not_recipient > 0 {
         lines.push(format!(
-            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — the escrow key \
-             is not a recipient of their slices (permanent: re-running will not change this)",
-            report.escrow_attest_not_recipient
+            "  escrow: still `?` (unknown) for {} — the escrow key is not a recipient of \
+             their slices (permanent: re-running will not change this)",
+            crate::render::plural(
+                report.escrow_attest_not_recipient as i64,
+                "rebuilt stage set",
+                "rebuilt stage sets"
+            )
         ));
     }
     if report.escrow_attest_unreadable > 0 {
         lines.push(format!(
-            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — their slice \
+            "  escrow: still `?` (unknown) for {} — their slice \
              header could not be read; the bytes may still be escrow-covered and merely \
              unreadable at this position — try `tapectl volume verify {}`, a copy on another \
              cartridge, or re-running this rebuild",
-            report.escrow_attest_unreadable, report.label
+            crate::render::plural(
+                report.escrow_attest_unreadable as i64,
+                "rebuilt stage set",
+                "rebuilt stage sets"
+            ),
+            report.label
         ));
     }
     if report.escrow_attest_unparseable > 0 {
         lines.push(format!(
-            "  escrow: {} rebuilt stage set(s) still report `?` (unknown) — their slice \
+            "  escrow: still `?` (unknown) for {} — their slice \
              header did not parse; coverage stays unknown",
-            report.escrow_attest_unparseable
+            crate::render::plural(
+                report.escrow_attest_unparseable as i64,
+                "rebuilt stage set",
+                "rebuilt stage sets"
+            )
         ));
     }
     let observed = report.escrow_attest_not_recipient
@@ -1278,9 +1324,13 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
         // attempt (already reported unknown by an earlier rebuild) — there
         // was nothing new for this run to try.
         lines.push(format!(
-            "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) — \
+            "  escrow: still `?` (unknown) for {} on this volume — \
              the escrow key found nothing new to attest this run",
-            report.unknown_remaining
+            crate::render::plural(
+                report.unknown_remaining as i64,
+                "rebuilt stage set",
+                "rebuilt stage sets"
+            )
         ));
     }
     lines
@@ -1430,9 +1480,9 @@ fn index_lines(report: &RebuildReport) -> Vec<String> {
     }
     let n = report.index_volumes_missing.len();
     let mut lines = vec![format!(
-        "  cross-volume index: this tape names {n} other volume(s) this catalog has no row \
-         for. Nothing was added from it (a tape's claim about another tape needs that tape); \
-         load each and run `tapectl catalog rebuild --from-volume --key <key>`:"
+        "  cross-volume index: this tape names {} this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); \
+         load each and run `tapectl catalog rebuild --from-volume --key <key>`:",
+        crate::render::plural(n as i64, "other volume", "other volumes")
     )];
     for v in &report.index_volumes_missing {
         let mut facts = vec![format!("uuid {}", v.uuid)];
@@ -1612,8 +1662,12 @@ fn unreadable_envelope_lines(report: &RebuildReport) -> Vec<String> {
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "  warning: {} tenant envelope(s) on volume \"{}\" could not be read from any copy:",
-        report.unreadable_tenant_envelopes.len(),
+        "  warning: {} on volume \"{}\" could not be read from any copy:",
+        crate::render::plural(
+            report.unreadable_tenant_envelopes.len() as i64,
+            "tenant envelope",
+            "tenant envelopes"
+        ),
         report.label
     )];
     lines.extend(
@@ -1778,7 +1832,7 @@ mod tests {
             ..Default::default()
         };
         let text = super::unreadable_envelope_lines(&report).join("\n");
-        assert!(text.contains("1 tenant envelope(s)"), "{text}");
+        assert!(text.contains("1 tenant envelope on"), "{text}");
         assert!(text.contains("position 4"), "{text}");
         assert!(text.contains("every unit was recorded"), "{text}");
         assert!(text.contains("RESTORE.sh"), "{text}");
@@ -1828,7 +1882,7 @@ mod tests {
         };
         let text = super::index_lines(&report).join("\n");
         assert!(
-            text.contains("names 1 other volume(s) this catalog has no row for"),
+            text.contains("names 1 other volume this catalog has no row for"),
             "{text}"
         );
         assert!(text.contains("Nothing was added from it"), "{text}");

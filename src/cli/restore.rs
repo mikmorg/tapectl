@@ -521,35 +521,32 @@ pub fn run(
             };
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "unit": report.unit_name,
-                        "volume": report.volume_label,
-                        "version": report.version,
-                        "slices": report.slices,
-                        "destination": report.destination,
-                        "dry_run": report.dry_run,
-                        "substitutions": substitutions_json(&report.substitutions),
-                        "filled": filled_json(&report.filled),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "unit": report.unit_name,
+                    "volume": report.volume_label,
+                    "version": report.version,
+                    "slices": report.slices,
+                    "destination": report.destination,
+                    "dry_run": report.dry_run,
+                    "substitutions": substitutions_json(&report.substitutions),
+                    "filled": filled_json(&report.filled),
+                }));
             } else if report.dry_run {
                 println!(
-                    "would restore \"{}\" v{} from {} ({} slices) to {}",
+                    "would restore \"{}\" v{} from {} ({}) to {}",
                     report.unit_name,
                     report.version,
                     report.volume_label,
-                    report.slices,
+                    crate::render::plural(report.slices as i64, "slice", "slices"),
                     report.destination,
                 );
             } else {
                 println!(
-                    "restored \"{}\" v{} from {} ({} slices) to {}",
+                    "restored \"{}\" v{} from {} ({}) to {}",
                     report.unit_name,
                     report.version,
                     report.volume_label,
-                    report.slices,
+                    crate::render::plural(report.slices as i64, "slice", "slices"),
                     report.destination,
                 );
                 for line in repair_lines(&report.substitutions, &report.filled) {
@@ -628,17 +625,14 @@ pub fn run(
             let from = report.volume_label.clone();
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "file": file,
-                        "unit": unit,
-                        "volume": from,
-                        "destination": to,
-                        "substitutions": substitutions_json(&report.substitutions),
-                        "filled": filled_json(&report.filled),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "file": file,
+                    "unit": unit,
+                    "volume": from,
+                    "destination": to,
+                    "substitutions": substitutions_json(&report.substitutions),
+                    "filled": filled_json(&report.filled),
+                }));
             } else {
                 println!("restored \"{file}\" from \"{unit}\" on {from} to {to}");
                 for line in repair_lines(&report.substitutions, &report.filled) {
@@ -728,7 +722,7 @@ pub fn run(
                 let mut obj = units_report_json(&report);
                 obj["cut"] = cut_units_json(&cut);
                 obj["ranges"] = range_units_json(&cut);
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else {
                 for line in units_report_lines(&report) {
                     println!("{line}");
@@ -740,8 +734,8 @@ pub fn run(
             let failed = report.failed();
             if failed > 0 {
                 return Err(TapectlError::Other(format!(
-                    "{failed} of {} units not restored from {}",
-                    report.units.len(),
+                    "{failed} of {} not restored from {}",
+                    crate::render::plural(report.units.len() as i64, "unit", "units"),
                     report.volume_label
                 )));
             }
@@ -827,39 +821,40 @@ pub fn run(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "label": report.label,
-                        "uuid": report.uuid,
-                        "destination": to,
-                        "files_dumped": report.files_dumped,
-                        "bytes_written": report.bytes_written,
-                        "verified_count": report.verified_count,
-                        "mismatched_count": report.mismatched_count,
-                        "unverifiable_count": report.unverifiable_count,
-                        "all_verified": report.all_verified(),
-                        "files": files,
-                        // #420: additive. Where a short tape ended, and the
-                        // planned files after it, not read.
-                        "ended_after": report.ended_after,
-                        "not_on_tape": report
-                            .not_on_tape
-                            .iter()
-                            .map(|(position, kind)| serde_json::json!({
-                                "position": position,
-                                "type": kind,
-                            }))
-                            .collect::<Vec<_>>(),
-                        // #490: on a tape with no seal it accepts, the
-                        // planned file at which END OF DATA came (R2).
-                        "end_of_data_at": report.end_of_data_at,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "label": report.label,
+                    "uuid": report.uuid,
+                    "destination": to,
+                    "files_dumped": report.files_dumped,
+                    "bytes_written": report.bytes_written,
+                    "verified_count": report.verified_count,
+                    "mismatched_count": report.mismatched_count,
+                    "unverifiable_count": report.unverifiable_count,
+                    "all_verified": report.all_verified(),
+                    "files": files,
+                    // #420: additive. Where a short tape ended, and the
+                    // planned files after it, not read.
+                    "ended_after": report.ended_after,
+                    "not_on_tape": report
+                        .not_on_tape
+                        .iter()
+                        .map(|(position, kind)| serde_json::json!({
+                            "position": position,
+                            "type": kind,
+                        }))
+                        .collect::<Vec<_>>(),
+                    // #490: on a tape with no seal it accepts, the
+                    // planned file at which END OF DATA came (R2).
+                    "end_of_data_at": report.end_of_data_at,
+                }));
             } else {
                 println!(
-                    "dumped {} files ({} bytes) from volume \"{}\" (uuid {}) to {}",
-                    report.files_dumped, report.bytes_written, report.label, report.uuid, to
+                    "dumped {} ({}) from volume \"{}\" (uuid {}) to {}",
+                    crate::render::plural(report.files_dumped as i64, "file", "files"),
+                    crate::util::format_bytes_binary(report.bytes_written as i64),
+                    report.label,
+                    report.uuid,
+                    to
                 );
                 println!(
                     "  verified: {}  mismatched: {}  unverifiable: {}",
@@ -882,8 +877,9 @@ pub fn run(
 
             if !report.all_verified() {
                 return Err(TapectlError::Other(format!(
-                    "raw-volume: {} of {} files failed checksum verification",
-                    report.mismatched_count, report.files_dumped
+                    "raw-volume: {} of {} failed checksum verification",
+                    report.mismatched_count,
+                    crate::render::plural(report.files_dumped as i64, "file", "files")
                 )));
             }
         }
@@ -907,9 +903,9 @@ pub(crate) fn repair_lines(
     }
     if !filled.is_empty() {
         lines.push(format!(
-            "  {} file(s) came back damaged or missing and were filled from another copy of \
-             this version, each checked against its recorded checksum:",
-            filled.len()
+            "  {} came back damaged or missing and were filled from another copy of this \
+             version, each checked against its recorded checksum:",
+            crate::render::plural(filled.len() as i64, "file", "files")
         ));
         for (path, from) in filled {
             lines.push(format!("    {path} (from {from})"));
@@ -957,8 +953,11 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
     let mut lines = Vec::with_capacity(report.units.len() + 1);
     for u in &report.units {
         let what = format!(
-            "\"{}\" v{} ({} slices) to {}",
-            u.unit_name, u.version, u.slices, u.destination
+            "\"{}\" v{} ({}) to {}",
+            u.unit_name,
+            u.version,
+            crate::render::plural(u.slices as i64, "slice", "slices"),
+            u.destination
         );
         lines.push(match (&u.error, u.attempted, report.dry_run) {
             (_, _, true) => format!("would restore {what}"),
@@ -971,13 +970,15 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
     let total = report.units.len();
     lines.push(if report.dry_run {
         format!(
-            "would restore {total} unit(s) from {} in one pass",
+            "would restore {} from {} in one pass",
+            crate::render::plural(total as i64, "unit", "units"),
             report.volume_label
         )
     } else {
         format!(
-            "{} of {total} unit(s) restored from {}",
+            "{} of {} restored from {}",
             total - report.failed(),
+            crate::render::plural(total as i64, "unit", "units"),
             report.volume_label
         )
     });
@@ -1018,13 +1019,15 @@ pub(crate) fn cut_units_lines(cut: &[volume::restore::CutUnit], label: &str) -> 
     let ranges = cut.len() - cuts;
     if cuts > 0 {
         lines.push(format!(
-            "{cuts} unit(s) left out: \"{label}\" ended early and does not hold them whole"
+            "{} left out: \"{label}\" ended early and does not hold them whole",
+            crate::render::plural(cuts as i64, "unit", "units")
         ));
     }
     if ranges > 0 {
         lines.push(format!(
-            "{ranges} unit(s) held across cartridges left out: \"{label}\" holds only a range \
-             of each, and `restore volume` restores the units a tape holds whole"
+            "{} held across cartridges left out: \"{label}\" holds only a range of each, \
+             and `restore volume` restores the units a tape holds whole",
+            crate::render::plural(ranges as i64, "unit", "units")
         ));
     }
     lines

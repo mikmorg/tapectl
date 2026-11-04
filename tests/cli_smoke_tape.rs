@@ -706,3 +706,88 @@ fn tape_side_help_states_exit_codes_and_examples() {
         }
     }
 }
+
+/// ADR-0012 item 212: `volume list` and `cartridge list` are borderless,
+/// aligned tables in one header case, with capacities in decimal units;
+/// `volume info` shows its times in UTC and says "drive"; and the one-
+/// document JSON of each family (here `volume move --json`, `cartridge
+/// register --json`, `catalog stats --json`) is pretty-printed, keys
+/// unchanged, with times in RFC 3339.
+#[test]
+fn tape_side_tables_times_and_json_follow_the_output_rules() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let ok = |args: &[&str]| {
+        let out = run_tapectl(h, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["init"]);
+    ok(&["location", "add", "shelf"]);
+    let reg = ok(&[
+        "--json",
+        "cartridge",
+        "register",
+        "--barcode",
+        "TBL001",
+        "--generation",
+        "LTO-6",
+    ]);
+    assert!(reg.lines().count() > 1, "pretty JSON: {reg}");
+    let v: serde_json::Value = serde_json::from_str(&reg).unwrap();
+    assert_eq!(v["barcode"], "TBL001", "{reg}");
+    {
+        let conn = tapectl::db::open(&h.join(".tapectl").join("tapectl.db")).unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, created_at, sealed_at)
+             VALUES ('TBL-0001', 'lto', 'lto6', 'LTO-6', 2500000000000, 'sealed',
+                     '2026-09-02 10:30:59', '2026-09-03 11:00:00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let list = ok(&["volume", "list"]);
+    let header = list.lines().next().unwrap_or_default();
+    assert!(
+        header.starts_with("Label") && header.contains("Min Copies"),
+        "{list}"
+    );
+    assert!(!list.contains('|') && !list.contains("+-"), "{list}");
+    let row = list
+        .lines()
+        .find(|l| l.starts_with("TBL-0001"))
+        .expect(&list);
+    assert!(row.contains("2.50 TB"), "decimal capacity: {list}");
+
+    let carts = ok(&["cartridge", "list"]);
+    assert!(carts.starts_with("Barcode"), "{carts}");
+    assert!(!carts.contains('|') && !carts.contains("+-"), "{carts}");
+
+    let info = ok(&["volume", "info", "TBL-0001"]);
+    assert!(info.contains("Created:     2026-09-02 10:30 UTC"), "{info}");
+    assert!(info.contains("Sealed:      2026-09-03 11:00 UTC"), "{info}");
+    assert!(info.contains("  Drive:       lto6 (lto)"), "{info}");
+
+    let moved = ok(&["--json", "volume", "move", "TBL-0001", "--to", "shelf"]);
+    assert!(moved.lines().count() > 1, "pretty JSON: {moved}");
+    let v: serde_json::Value = serde_json::from_str(&moved).unwrap();
+    assert_eq!(v["label"], "TBL-0001");
+    assert_eq!(v["location"], "shelf");
+    let info: serde_json::Value =
+        serde_json::from_str(&ok(&["--json", "volume", "info", "TBL-0001"])).unwrap();
+    assert_eq!(info["location"], "shelf");
+    assert_eq!(info["status"], "sealed");
+    // RFC 3339 with `Z` in JSON; the stored value is unchanged.
+    assert_eq!(info["created_at"], "2026-09-02T10:30:59Z");
+    assert_eq!(info["sealed_at"], "2026-09-03T11:00:00Z");
+
+    let stats = ok(&["--json", "catalog", "stats"]);
+    assert!(stats.lines().count() > 1, "pretty JSON: {stats}");
+    serde_json::from_str::<serde_json::Value>(&stats).unwrap();
+}
