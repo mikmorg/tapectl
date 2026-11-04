@@ -282,7 +282,17 @@ else
         DRIVE_GENERATION="LTO-$GEN_N"
 
         command -v sg_read_attr >/dev/null || die "sg_read_attr required to verify the named cartridge"
-        MAM_TXT="$(sg_read_attr "$DRIVE_SG" 2>&1)" || die "sg_read_attr failed on $DRIVE_SG"
+        # #511: the first command after a cartridge loads (or a bus reset) gets
+        # a unit attention, sg3_utils' exit 6, so the chip is read once more on
+        # one. A read that still fails dies with what sg_read_attr said: an
+        # empty drive's "Not ready, medium not present" reached the operator on
+        # 2026-11-02 only through a separate sg_turs.
+        MAM_RC=0; MAM_TXT="$(sg_read_attr "$DRIVE_SG" 2>&1)" || MAM_RC=$?
+        if [ "$MAM_RC" = 6 ] || { [ "$MAM_RC" != 0 ] && printf '%s\n' "$MAM_TXT" | grep -i 'unit attention' >/dev/null; }; then
+            echo "lifecycle-suite: sg_read_attr $DRIVE_SG: a unit attention (exit $MAM_RC); reading the chip again" >&2
+            MAM_RC=0; MAM_TXT="$(sg_read_attr "$DRIVE_SG" 2>&1)" || MAM_RC=$?
+        fi
+        [ "$MAM_RC" = 0 ] || die "sg_read_attr failed on $DRIVE_SG (exit $MAM_RC): $MAM_TXT"
         SERIAL="$(echo "$MAM_TXT" | grep -iE '^[[:space:]]*medium serial number[[:space:]]*:' \
             | head -1 | sed 's/^[^:]*: *//' | tr -d ' \r')"
         [ -n "$SERIAL" ] || die "sg_read_attr did not report a medium serial number — cannot verify consent"
