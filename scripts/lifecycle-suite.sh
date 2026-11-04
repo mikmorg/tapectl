@@ -4406,12 +4406,16 @@ csc_multi_label_refused() {
         echo "the refusal happened AFTER staging -- a refused run must cost nothing:"; cat "$f"; return 1; }
 }
 
+# ADR-0012 item 210: the run initializes its own destination (--init, in
+# place of a `volume init`) on the blank cartridge next_tape loaded, and moves
+# the sealed tape (--move-to) to a shelf added here. This scenario never runs
+# under --single-cartridge, so the init needs no --force, as vinit's does not.
 csc_run_first_copy() {
     next_tape VOL-CS1 || return 1
-    vinit VOL-CS1 || return 1
+    TCTL location add csc-shelf --description "collection-second-copy shelf" || return 1
     if [ "$DRY_RUN" = 1 ]; then
-        TCTL collection run media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --yes --json
-        echo "PLAN: assert staging_released=false and every under_copied entry is 1/2"
+        TCTL collection run media --batch 0 --label VOL-CS1 --init --move-to csc-shelf --device "$TAPE_DEV" --yes --json
+        echo "PLAN: assert initialized=true, moved_to=csc-shelf, staging_released=false and every under_copied entry is 1/2"
         return 0
     fi
     # stdout and stderr to SEPARATE files, deliberately. The suite's usual
@@ -4425,11 +4429,13 @@ csc_run_first_copy() {
     # mixed stream. Copy this shape, not the `2>&1` one, for any command that
     # writes to stderr.
     local f="$RUN/log-csc.run1.json" e="$RUN/log-csc.run1.err"
-    TCTL collection run media --batch 0 --label VOL-CS1 \
+    TCTL collection run media --batch 0 --label VOL-CS1 --init --move-to csc-shelf \
         --device "$TAPE_DEV" --yes --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { cat "$e" "$f"; return 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
+assert d["initialized"] is True, d
+assert d["moved_to"] == "csc-shelf" and d["move_warning"] is None, d
 assert d["copies_written"] == 1, d
 assert d["units_staged"] >= 1, d
 assert d["staging_released"] is False, (

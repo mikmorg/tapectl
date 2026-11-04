@@ -839,11 +839,36 @@ fn uninitialized_destination(label: &str) -> TapectlError {
     ))
 }
 
+/// [`uninitialized_destination`] for `collection run`, which can initialize
+/// its destination itself (ADR-0012 items 210 and 220).
+fn uninitialized_run_destination(label: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "volume not found: {label} — a destination volume must already be initialized: \
+         load a blank cartridge, and run `tapectl volume init {label}` then this command \
+         again, or pass --init to this command to initialize it first"
+    ))
+}
+
 pub fn destination_budget(
     conn: &Connection,
     config: &Config,
     device: &str,
     labels: &[String],
+) -> Result<DestinationBudget> {
+    destination_budget_moving_to(conn, config, device, labels, None)
+}
+
+/// [`destination_budget`], its copy-distinctness judged where the tape goes
+/// once sealed and confirmed: `collection run --move-to` (ADR-0012 item
+/// 210), judged as `volume write --move-to` judges it (2026-10-07 item 26,
+/// [`crate::volume::write::moved_elsewhere`]). `None` judges each
+/// destination where it is.
+pub fn destination_budget_moving_to(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    labels: &[String],
+    moved_to: Option<&str>,
 ) -> Result<DestinationBudget> {
     if labels.is_empty() {
         return Err(TapectlError::Other(
@@ -909,11 +934,15 @@ pub fn destination_budget(
         // versions are checked when `volume_write` plans. As there, the
         // cartridge half only fires on an inconsistent catalog: binding the
         // destination erased any copy on its cartridge at `volume init`.
-        let distinct = coverage::copy_distinctness(conn, volume_id, &riding)?;
+        let elsewhere = crate::volume::write::moved_elsewhere(conn, volume_id, moved_to)?;
+        let distinct = coverage::copy_distinctness_at(conn, volume_id, elsewhere, &riding)?;
         if let Some(refusal) = distinct.refusal(label) {
             return Err(TapectlError::Other(refusal));
         }
-        warnings.extend(distinct.warning(label));
+        warnings.extend(match elsewhere {
+            Some(_) => distinct.warning_moved_to(label),
+            None => distinct.warning(label),
+        });
 
         let replace = match &smallest {
             None => true,
@@ -998,6 +1027,22 @@ pub fn plan_for_run(
     // `--policy-aware` (issue #144): see `batches_for_budget`.
     policy_aware: bool,
 ) -> Result<(Packed, DestinationBudget)> {
+    plan_for_run_moving_to(conn, config, lib, device, labels, policy_aware, None)
+}
+
+/// [`plan_for_run`] for a run that moves its tape to `moved_to` once sealed
+/// and confirmed (`collection run --move-to`, ADR-0012 item 210): the
+/// destination's copy distinctness is judged there
+/// ([`destination_budget_moving_to`]).
+pub fn plan_for_run_moving_to(
+    conn: &Connection,
+    config: &Config,
+    lib: &CollectionConfig,
+    device: &str,
+    labels: &[String],
+    policy_aware: bool,
+    moved_to: Option<&str>,
+) -> Result<(Packed, DestinationBudget)> {
     if labels.len() > 1 {
         return Err(TapectlError::Other(format!(
             "collection run: refuses more than one destination label ({} given: {}) — \
@@ -1011,7 +1056,20 @@ pub fn plan_for_run(
             labels.join(", "),
         )));
     }
-    let budget = destination_budget(conn, config, device, labels)?;
+    // A destination no volume carries is most often a blank cartridge not
+    // yet initialized, which this command can initialize itself (`--init`):
+    // said here, where only `collection run` asks.
+    for label in labels {
+        let known: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM volumes WHERE label = ?1)",
+            [label.as_str()],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(uninitialized_run_destination(label));
+        }
+    }
+    let budget = destination_budget_moving_to(conn, config, device, labels, moved_to)?;
     // ADR-0012 item 113, as in `plan_for_collection_with_budget`.
     let packing = Packing {
         fill: budget.bytes,
@@ -1571,14 +1629,22 @@ mod tests {
             false,
         )
         .unwrap_err();
-        // ADR-0012 item 216: the label is not initialized yet — said so,
-        // with the init that makes it, and `volume not found` kept.
+        // ADR-0012 items 216 and 220: the label is not initialized yet —
+        // said so, with the init that makes it and `--init`, which makes it
+        // in the same run, and `volume not found` kept.
         assert_eq!(
             err.to_string(),
             "volume not found: nonexistent — a destination volume must already be \
-             initialized: load a blank cartridge, run `tapectl volume init nonexistent`, \
-             then run this command again"
+             initialized: load a blank cartridge, and run `tapectl volume init nonexistent` \
+             then this command again, or pass --init to this command to initialize it first"
         );
+        // `destination_budget`'s own words, which `stage for-location`
+        // reaches too, name no `--init`: that command has none.
+        let err = destination_budget(&conn, &config, "/dev/null", &["nonexistent".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("volume not found: nonexistent"), "{err}");
+        assert!(!err.contains("--init"), "{err}");
 
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))

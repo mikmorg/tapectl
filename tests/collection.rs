@@ -812,3 +812,137 @@ fn volume_plan_plans_the_largest_copy_floor_by_default() {
         shown(&out)
     );
 }
+
+/// ADR-0012 items 210 and 220, through the binary: `collection run` runs
+/// the only collection without its name and refuses to guess among
+/// several, naming them; a second `--label` is a usage error naming the
+/// rule; a label not initialized names `--init`; and `--init --dry-run`
+/// previews the batch it would write to the volume it would initialize,
+/// touching nothing.
+#[test]
+fn collection_run_picks_the_only_collection_and_takes_one_label() {
+    let (home, _root, canonical) = home_and_root(&["alpha"]);
+    let h = home.path();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "photos",
+            &canonical,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    exits(h, &["collection", "sync"], 0);
+    let nst = h.join("no-such-nst").display().to_string();
+    let text = config_text(h);
+    std::fs::write(
+        h.join(".tapectl/config.toml"),
+        format!(
+            "{text}\n[[backends.lto]]\nname = \"lto6\"\ndevice_tape = \"{nst}\"\n\
+             device_sg = \"{nst}-sg\"\ngeneration = \"LTO-6\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = exits(
+        h,
+        &["collection", "run", "--label", "L1", "--init", "--dry-run"],
+        0,
+    );
+    let text = stdout(&out);
+    for says in [
+        "collection \"photos\" batch 0: 1 unit(s) would be staged",
+        "photos/alpha",
+        "L1, initialized first on the blank cartridge in the drive (--init)",
+    ] {
+        assert!(text.contains(says), "{says:?}: {}", shown(&out));
+    }
+    let doc = json(&exits(
+        h,
+        &[
+            "--json",
+            "collection",
+            "run",
+            "--label",
+            "L1",
+            "--init",
+            "--dry-run",
+        ],
+        0,
+    ));
+    assert_eq!(doc["collection"], "photos", "{doc}");
+    assert_eq!(doc["init"], true, "{doc}");
+    assert_eq!(doc["labels"], serde_json::json!(["L1"]), "{doc}");
+
+    let out = exits(h, &["collection", "run", "--label", "L1", "--dry-run"], 2);
+    assert!(shown(&out).contains("or pass --init"), "{}", shown(&out));
+
+    let out = exits(
+        h,
+        &[
+            "collection",
+            "run",
+            "--label",
+            "L1",
+            "--label",
+            "L2",
+            "--dry-run",
+        ],
+        2,
+    );
+    assert!(
+        shown(&out).contains("more than one destination label"),
+        "{}",
+        shown(&out)
+    );
+
+    // A second collection: the run names the one it means.
+    let other = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(other.path().join("beta")).unwrap();
+    std::fs::write(other.path().join("beta/a.txt"), b"x").unwrap();
+    let other_root = other.path().canonicalize().unwrap().display().to_string();
+    exits(
+        h,
+        &[
+            "collection",
+            "add",
+            "movies",
+            &other_root,
+            "--tenant",
+            "media",
+        ],
+        0,
+    );
+    let out = exits(
+        h,
+        &["collection", "run", "--label", "L1", "--init", "--dry-run"],
+        2,
+    );
+    assert!(shown(&out).contains("photos, movies"), "{}", shown(&out));
+    let out = exits(
+        h,
+        &[
+            "collection",
+            "run",
+            "photos",
+            "--label",
+            "L1",
+            "--init",
+            "--dry-run",
+        ],
+        0,
+    );
+    assert!(stdout(&out).contains("photos/alpha"), "{}", shown(&out));
+    let conn = tapectl::db::open(&h.join(".tapectl/tapectl.db")).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM volumes) + (SELECT COUNT(*) FROM stage_sets)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "a dry run initializes and stages nothing");
+}

@@ -191,6 +191,13 @@ pub enum CollectionCommands {
     /// once it has its copies, and the run names the slices released and the
     /// slices kept for the next `volume write`.
     ///
+    /// With --init the destination is initialized first, on the blank
+    /// cartridge in the drive, as `volume write --init` initializes it, and
+    /// the batch is packed against the capacity the init records. With
+    /// --move-to the tape is moved there once it is sealed and confirmed, as
+    /// `volume write --move-to` moves it; a `volume resume` of an
+    /// interrupted run keeps the move.
+    ///
     /// Exit status: `volume write`'s, the worst outcome among its copies in
     /// the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4
     /// interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and
@@ -210,10 +217,24 @@ pub enum CollectionCommands {
         /// is not necessarily batch N here.
         #[arg(long, default_value = "0")]
         batch: usize,
-        /// `--label LABEL`: the destination volume, exactly one
-        /// ([`RunLabel`], ADR-0012 item 210).
+        // `--label LABEL`: the destination volume, exactly one (`RunLabel`,
+        // ADR-0012 item 210); its help is the flag's own.
         #[command(flatten)]
         label: RunLabel,
+        /// Initialize the destination first: `volume init LABEL` on the
+        /// blank cartridge in the drive, as `volume write --init` runs it (a
+        /// cartridge with no barcode takes the label as its barcode). The
+        /// batch is then packed against the capacity the init records. If
+        /// the run stops after the init, the volume stays initialized and
+        /// the run says what to run next
+        #[arg(long)]
+        init: bool,
+        /// Once the copy is sealed and confirmed, move the tape (the volume
+        /// and its cartridge) to this location, as `volume write --move-to`
+        /// does. A location that does not exist is refused before anything
+        /// is staged
+        #[arg(long, value_name = "LOCATION")]
+        move_to: Option<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -459,28 +480,47 @@ pub fn run(
             collection: name,
             batch,
             label,
+            init,
+            move_to,
             device,
             prewrite_hash,
             fill_ceiling,
             jobs,
             confirm,
             policy_aware,
-        } => cmd_run(
-            conn,
-            paths,
-            &config.with_fill_ceiling(*fill_ceiling),
-            name.as_deref(),
-            *batch,
-            std::slice::from_ref(&label.label),
-            &crate::cli::write_device(config, device.as_deref())?,
-            *prewrite_hash,
-            *jobs,
-            confirm.confirm(),
-            *policy_aware,
-            json_output,
-            global_dry_run,
-            assume_yes,
-        ),
+        } => {
+            let config = &config.with_fill_ceiling(*fill_ceiling);
+            let device = crate::cli::write_device(config, device.as_deref())?;
+            let drive = collection::batch::DeviceRunDrive {
+                conn,
+                paths,
+                config,
+                device: &device,
+                block_size: DEFAULT_BLOCK_SIZE,
+                prewrite_hash: *prewrite_hash,
+                assume_yes,
+            };
+            cmd_run(
+                conn,
+                paths,
+                config,
+                &RunRequest {
+                    collection: name.as_deref(),
+                    batch: *batch,
+                    label: &label.label,
+                    init: *init,
+                    move_to: move_to.as_deref(),
+                    jobs: *jobs,
+                    confirm: confirm.confirm(),
+                    policy_aware: *policy_aware,
+                },
+                &device,
+                &drive,
+                json_output,
+                global_dry_run,
+                assume_yes,
+            )
+        }
     }
 }
 
@@ -1455,26 +1495,53 @@ fn cmd_plan(
 const WRITE_STAGED: &str =
     "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>";
 
+/// What the operator asked of one `collection run` (ADR-0012 item 210).
+pub(crate) struct RunRequest<'a> {
+    /// `NAME`: the collection, or `None` for the only one configured.
+    pub collection: Option<&'a str>,
+    /// `--batch`.
+    pub batch: usize,
+    /// `--label`: the destination volume.
+    pub label: &'a str,
+    /// `--init`: initialize the destination first.
+    pub init: bool,
+    /// `--move-to`: where the tape goes once sealed and confirmed.
+    pub move_to: Option<&'a str>,
+    /// `--jobs`.
+    pub jobs: Option<usize>,
+    pub confirm: collection::batch::RunConfirm,
+    /// `--policy-aware`.
+    pub policy_aware: bool,
+}
+
+/// `collection run`: the collection, then `--move-to`'s destination, checked
+/// before anything is read or staged; with `--init` the batch planned against
+/// the drive's generation to see that it exists, then the destination
+/// initialized ([`collection::batch::RunDrive::init`]); then the batch planned
+/// against the destination's recorded capacity, staged, written, moved and
+/// released ([`run_batch`]).
+///
+/// `drive` makes the two calls that touch the tape
+/// ([`collection::batch::DeviceRunDrive`] on `device` in production).
+///
+/// A run whose init succeeded and whose rest did not leaves the volume
+/// initialized, and says so with the next command ([`run_left_initialized`]),
+/// as `volume write --init` does; the exit code is the rest's.
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
-    collection_name: Option<&str>,
-    batch_idx: usize,
-    labels: &[String],
+    req: &RunRequest<'_>,
     device: &str,
-    prewrite_hash: bool,
-    jobs: Option<usize>,
-    confirm: collection::batch::RunConfirm,
-    policy_aware: bool,
+    drive: &dyn collection::batch::RunDrive,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
 ) -> Result<i32> {
     // `--jobs` stands in for `[staging] jobs` for this run (issue #368).
     let mut with_jobs;
-    let config = match jobs {
+    let config = match req.jobs {
         Some(jobs) => {
             if !(1..=crate::staging::jobs::MAX_JOBS).contains(&jobs) {
                 return Err(TapectlError::Other(format!(
@@ -1488,10 +1555,300 @@ fn cmd_run(
         }
         None => config,
     };
-    let lib = collection::collection_to_run(config, collection_name)?;
+    let lib = collection::collection_to_run(config, req.collection)?;
+    // As `volume write --move-to` (issue #438): a mistyped location is
+    // refused before anything is staged or the tape touched, not found once
+    // the copy is done.
+    if let Some(to) = req.move_to {
+        crate::cli::volume::check_move_destination(conn, to)?;
+    }
+    if !req.init {
+        return run_batch(
+            conn,
+            paths,
+            config,
+            lib,
+            req,
+            device,
+            drive,
+            None,
+            json_output,
+            dry_run,
+            assume_yes,
+        );
+    }
+
+    // `--init` (ADR-0012 item 210). What the catalog and the collection can
+    // refuse is refused before the cartridge is touched, as `volume write
+    // --init` asks its own pre-flight first: a label a volume already has,
+    // and a batch that does not exist. The batch is looked for in a plan
+    // against the drive's generation; once the init has recorded the
+    // cartridge's real capacity, the run plans again against that.
+    refuse_existing_destination(conn, req.label)?;
+    let (packed, tape) = collection::plan::plan_for_collection_with_budget(
+        conn,
+        config,
+        lib,
+        None,
+        Some(device),
+        req.policy_aware,
+    )?;
+    let Some(batch) = packed.batches.get(req.batch) else {
+        return Err(no_such_batch(
+            &lib.name,
+            req.batch,
+            packed.batches.len(),
+            " Nothing was initialized.",
+        ));
+    };
+    if dry_run {
+        if !json_output {
+            println!(
+                "collection \"{}\": budget {} from {} (an estimate: --init has not initialized \
+                 \"{}\" yet, and the run packs against the capacity `volume init` records)",
+                lib.name,
+                crate::util::format_bytes_decimal(i64::try_from(tape.bytes).unwrap_or(i64::MAX)),
+                tape.subject,
+                req.label,
+            );
+            if tape.plan_bound_bytes.is_some() {
+                println!("  packing: {}", tape.describe_packing());
+            }
+            print_refused_plain(&packed.refused);
+        }
+        print_dry_run(
+            &DryRun {
+                lib,
+                batch_idx: req.batch,
+                batch,
+                at: &packed.placement(batch),
+                budget_bytes: tape.bytes,
+                budget_from: &tape.subject,
+                packing_bytes: tape.packing_bytes(),
+                req,
+                refused: &packed.refused,
+                warnings: &[],
+            },
+            json_output,
+        );
+        return Ok(refused_exit_code(!packed.refused.is_empty()));
+    }
+    let init = drive.init(req.label)?;
+    // stderr, so `--json` keeps stdout to the one document, as `volume
+    // write --init` says it.
+    eprintln!(
+        "volume \"{}\" initialized (id={}); staging and writing collection \"{}\" batch {} to \
+         it now. If the run does not complete the volume stays initialized, and what to run \
+         next is said when it stops.",
+        req.label, init.volume_id, lib.name, req.batch
+    );
+    eprintln!("{}", init.medium.operator_line());
+    let ran = run_batch(
+        conn,
+        paths,
+        config,
+        lib,
+        req,
+        device,
+        drive,
+        Some(&init),
+        json_output,
+        dry_run,
+        assume_yes,
+    );
+    if let Err(e) = &ran {
+        run_left_initialized(conn, lib, req.label, &init, e, json_output);
+    }
+    ran
+}
+
+/// `collection run --init LABEL` where a volume already has the label:
+/// refused before anything is read or staged (ADR-0012 item 210). The init
+/// would refuse it too, but only once the batch had been planned.
+fn refuse_existing_destination(conn: &Connection, label: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    crate::naming::validate_volume_label(label)?;
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM volumes WHERE label = ?1",
+            [label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Ok(());
+    };
+    let instead = if status == "initialized" {
+        "run this again without --init to write to it"
+    } else {
+        "name a new label for the blank cartridge in the drive"
+    };
+    Err(TapectlError::Other(format!(
+        "volume \"{label}\" already exists ({status}), and --init initializes a new volume: \
+         {instead}. Nothing was initialized or staged."
+    )))
+}
+
+/// A batch index past the batches a plan found.
+fn no_such_batch(collection: &str, batch: usize, batches: usize, nothing: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "collection \"{collection}\": batch {batch} does not exist ({batches} batch(es) \
+         currently pending — run `collection plan` to see them).{nothing}"
+    ))
+}
+
+/// What a run whose `--init` succeeded says when the rest of it stopped
+/// (ADR-0012 items 210 and 220): the volume stays initialized, and (only
+/// when the error does not, by what the catalog records of the volume now)
+/// the next command, the same run without `--init`. With `--json`, the
+/// document `volume write --init` prints for the same stop, naming the
+/// collection.
+fn run_left_initialized(
+    conn: &Connection,
+    lib: &crate::config::CollectionConfig,
+    label: &str,
+    init: &crate::volume::write::Initialized,
+    error: &TapectlError,
+    json_output: bool,
+) {
+    let fact = format!(
+        "volume \"{label}\" was initialized by this run (id={}) and stays initialized, \
+         whatever followed: the exit code describes the run, not the init.",
+        init.volume_id
+    );
+    let line = match crate::volume::write::stopped_write(conn, label) {
+        Ok(crate::volume::write::StoppedWrite::NothingOpen) => format!(
+            "{fact} Next: `tapectl collection run {} --label {label}` (without --init, which \
+             would be refused: the volume exists).",
+            lib.name
+        ),
+        _ => format!("{fact} The error says what to run next."),
+    };
+    eprintln!("{line}");
+    if json_output {
+        let mut doc = crate::cli::volume::left_initialized_json(label, init, error);
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("collection".into(), lib.name.clone().into());
+        }
+        crate::render::print_json(&doc);
+    }
+}
+
+/// What `collection run --dry-run` reports: the plan the run would carry out
+/// (issue #230).
+struct DryRun<'a> {
+    lib: &'a crate::config::CollectionConfig,
+    batch_idx: usize,
+    batch: &'a collection::selector::Batch,
+    at: &'a collection::plan::BatchPlacement,
+    budget_bytes: u64,
+    /// What the budget is: the destination volume, or with `--init` the
+    /// drive's generation (`one LTO-6 tape`).
+    budget_from: &'a str,
+    packing_bytes: u64,
+    req: &'a RunRequest<'a>,
+    refused: &'a [RefusedUnit],
+    warnings: &'a [String],
+}
+
+/// Print a [`DryRun`]: one JSON document, or the batch's units, the
+/// destination, and what the run would do around them.
+fn print_dry_run(d: &DryRun<'_>, json_output: bool) {
+    let name = d.lib.name.as_str();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "collection": name,
+                "batch": d.batch_idx,
+                "budget_bytes": d.budget_bytes,
+                "budget_from": d.budget_from,
+                "packing_bytes": d.packing_bytes,
+                "past_ceiling": d.at.past_ceiling,
+                "may_span": d.at.may_span,
+                "spans": d.at.spans,
+                "after_tail": d.at.after_tail,
+                "units": d.batch.unit_names(),
+                "labels": [d.req.label],
+                // ADR-0012 item 210, additive.
+                "init": d.req.init,
+                "move_to": d.req.move_to,
+                "dry_run": true,
+                "snapshot_command": d.lib.snapshot_command,
+                "release_command": d.lib.release_command,
+                "refused": refused_json(d.refused),
+                "warnings": d.warnings,
+            })
+        );
+    } else {
+        let nothing = if d.req.init {
+            "nothing initialized or staged"
+        } else {
+            "nothing staged"
+        };
+        println!(
+            "collection \"{name}\" batch {}: {} unit(s) would be staged and written to 1 \
+             destination (DRY RUN — {nothing}, no tape written)",
+            d.batch_idx,
+            d.batch.units.len(),
+        );
+        for u in d.batch.unit_names() {
+            println!("    {u}");
+        }
+        if d.req.init {
+            println!(
+                "  destination(s): {}, initialized first on the blank cartridge in the drive \
+                 (--init)",
+                d.req.label
+            );
+        } else {
+            println!("  destination(s): {}", d.req.label);
+        }
+        if let Some(to) = d.req.move_to {
+            println!(
+                "  then moved to \"{}\" once sealed and confirmed",
+                to.trim()
+            );
+        }
+        if let Some(command) = &d.lib.snapshot_command {
+            println!(
+                "  snapshot_command (would run before any unit is read; not run now): {command}"
+            );
+        }
+    }
+    // Copy-distinctness warnings (issue #144). Only a dry run prints them
+    // here: a real run's `volume write` names them as it writes.
+    for warning in d.warnings {
+        eprintln!("{warning}");
+    }
+}
+
+/// The run once its destination exists: the batch planned against the
+/// destination's recorded capacity (ADR-0010; issue #175), then, unless a
+/// dry run, staged, written, moved and released
+/// ([`collection::batch::execute_batch`]), ending with what the copy holds
+/// and the next copy's command (ADR-0012 item 216). `initialized` is the
+/// init `--init` ran, for the report.
+#[allow(clippy::too_many_arguments)]
+fn run_batch(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    lib: &crate::config::CollectionConfig,
+    req: &RunRequest<'_>,
+    device: &str,
+    drive: &dyn collection::batch::RunDrive,
+    initialized: Option<&crate::volume::write::Initialized>,
+    json_output: bool,
+    dry_run: bool,
+    assume_yes: bool,
+) -> Result<i32> {
     let collection_name = lib.name.as_str();
+    let batch_idx = req.batch;
+    let labels = [req.label.to_string()];
     // No `--generation` here: `collection run` writes to volumes that are
-    // already `volume init`-ed, so each destination's real capacity is on
+    // already `volume init`-ed (by the operator, or by this run's `--init`
+    // just now), so each destination's real capacity is on
     // its own `volumes.capacity_bytes` row (ADR-0010) — `plan_for_run`
     // resolves that budget from every `--label` FIRST (`destination_budget`,
     // never `planning_capacity_bytes`) before planning a single batch, so an
@@ -1505,8 +1862,15 @@ fn cmd_run(
     // `batches` — the batch that follows only ever contains healthy units —
     // so nothing below needs to special-case them; they are only reported,
     // and their presence is what makes this command's exit code non-zero.
-    let (packed, budget) =
-        collection::plan::plan_for_run(conn, config, lib, device, labels, policy_aware)?;
+    let (packed, budget) = collection::plan::plan_for_run_moving_to(
+        conn,
+        config,
+        lib,
+        device,
+        &labels,
+        req.policy_aware,
+        req.move_to,
+    )?;
     let (batches, refused) = (&packed.batches, &packed.refused);
     let exit_code = refused_exit_code(!refused.is_empty());
 
@@ -1532,13 +1896,9 @@ fn cmd_run(
         print_refused_plain(refused);
     }
 
-    let batch = batches.get(batch_idx).ok_or_else(|| {
-        TapectlError::Other(format!(
-            "collection \"{collection_name}\": batch {batch_idx} does not exist \
-             ({} batch(es) currently pending — run `collection plan` to see them)",
-            batches.len()
-        ))
-    })?;
+    let batch = batches
+        .get(batch_idx)
+        .ok_or_else(|| no_such_batch(collection_name, batch_idx, batches.len(), ""))?;
     // ADR-0012 item 113: the units of this batch planned past the fill
     // ceiling, and (#478, items 83, 94, 95 and 123) the units that allow
     // spanning past it and the one that spans, named before anything is
@@ -1563,72 +1923,41 @@ fn cmd_run(
     // the units in the chosen batch, and the destinations they would be
     // written to.
     if dry_run {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "collection": collection_name,
-                    "batch": batch_idx,
-                    "budget_bytes": budget.bytes,
-                    "budget_from": budget.binding_label,
-                    "packing_bytes": budget.packing_bytes(),
-                    "past_ceiling": at.past_ceiling,
-                    "may_span": at.may_span,
-                    "spans": at.spans,
-                    "after_tail": at.after_tail,
-                    "units": batch.unit_names(),
-                    "labels": labels,
-                    "dry_run": true,
-                    "snapshot_command": lib.snapshot_command,
-                    "release_command": lib.release_command,
-                    "refused": refused_json(refused),
-                    "warnings": budget.warnings,
-                })
-            );
-        } else {
-            println!(
-                "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) would be staged \
-                 and written to {} destination{} (DRY RUN — nothing staged, no tape written)",
-                batch.units.len(),
-                labels.len(),
-                if labels.len() == 1 { "" } else { "s" },
-            );
-            for u in batch.unit_names() {
-                println!("    {u}");
-            }
-            println!("  destination(s): {}", labels.join(", "));
-            if let Some(command) = &lib.snapshot_command {
-                println!(
-                    "  snapshot_command (would run before any unit is read; not run now): {command}"
-                );
-            }
-        }
-        // Copy-distinctness warnings (issue #144). Only a dry run prints
-        // them here: a real run's `volume write` names them as it writes.
-        for warning in &budget.warnings {
-            eprintln!("{warning}");
-        }
+        print_dry_run(
+            &DryRun {
+                lib,
+                batch_idx,
+                batch,
+                at: &at,
+                budget_bytes: budget.bytes,
+                budget_from: &budget.binding_label,
+                packing_bytes: budget.packing_bytes(),
+                req,
+                refused,
+                warnings: &budget.warnings,
+            },
+            json_output,
+        );
         return Ok(exit_code);
     }
 
-    let report = collection::batch::execute_batch(
+    let report = collection::batch::execute_batch_with(
         conn,
         paths,
         config,
         lib,
         batch,
-        labels,
-        device,
-        DEFAULT_BLOCK_SIZE,
-        prewrite_hash,
-        confirm,
+        &labels,
+        drive,
+        req.confirm,
+        req.move_to,
         assume_yes,
     )?;
 
     // Issue #108: a file the release could not remove is named, whatever
     // else is printed — nothing will ever find it again.
     let stranded = stranded_paths(&report);
-    let destination = labels.last().map(String::as_str).unwrap_or("?");
+    let destination = req.label;
     if let Some(warning) = stranded_warning(destination, &stranded) {
         eprintln!("{warning}");
     }
@@ -1640,9 +1969,7 @@ fn cmd_run(
     let summary = crate::volume::write::copy_summary(conn, destination).ok();
     let next = crate::cli::volume::next_copy_after(conn, config, destination);
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        let mut doc = serde_json::json!({
                 "collection": collection_name,
                 "batch": batch_idx,
                 "budget_bytes": budget.bytes,
@@ -1692,8 +2019,15 @@ fn cmd_run(
                 "snapshot_path": report.snapshot_path,
                 "snapshot_release_warning": report.snapshot_release_warning,
                 "refused": refused_json(refused),
-            })
-        );
+                // ADR-0012 item 210, additive, as `volume write --json` has
+                // them: whether `--init` initialized the destination, and
+                // what it decided of the medium (null without it).
+                "initialized": initialized.is_some(),
+                "medium": initialized.map(|i| i.medium.to_json()),
+        });
+        // `--move-to`'s keys, `volume write --json`'s own.
+        crate::cli::volume::insert_move_json(&mut doc, &report.moved);
+        println!("{doc}");
     } else {
         println!(
             "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} written \
@@ -1730,6 +2064,10 @@ fn cmd_run(
                 eprintln!("{line}");
             }
         }
+        // `--move-to` (ADR-0012 item 210), in `volume write --move-to`'s
+        // words and place: after the release, so a warning carrying the
+        // command that finishes the move comes last but for the next one.
+        crate::cli::volume::print_move_after_write(destination, &report.moved);
         // The next copy's command, where "swap in the next cartridge" was.
         if let Some(next) = &next {
             println!("{}", crate::cli::volume::next_copy_line(next));
@@ -2341,6 +2679,7 @@ mod checksum_mode_tests {
             release_warning: None,
             snapshot_path: None,
             snapshot_release_warning: None,
+            moved: crate::cli::volume::MoveAfterWrite::NotAsked,
         };
         let stranded = stranded_paths(&report);
         assert_eq!(
@@ -2375,5 +2714,418 @@ mod checksum_mode_tests {
         assert_eq!(json["percent_of_tape_budget"], 30.0);
         assert_eq!(json["above_a_tenth_of_a_cartridge"], true);
         assert!(largest_unit_json(None).is_null());
+    }
+}
+
+/// `collection run --init` and `--move-to` (ADR-0012 item 210), the whole
+/// run on a medium in memory: everything real but the drive. The tenants and
+/// the escrow recipient are made as `init` and `tenant add` make them, the
+/// collection's units registered by `collection sync`, staged by the real dar
+/// and age, the destination initialized by the real `volume init` and written
+/// by the real `volume write` over a [`MemStore`] (`MemDrive`, the
+/// [`collection::batch::RunDrive`] seam), and moved by `volume write
+/// --move-to`'s own step.
+///
+/// [`MemStore`]: crate::store::MemStore
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use crate::cli::cartridge::CartridgeCommands;
+    use crate::cli::location::LocationCommands;
+    use crate::collection::batch::{RunConfirm, RunDrive};
+    use crate::config::{CollectionConfig, LtoBackendConfig};
+    use crate::store::MemStore;
+    use crate::tape::contact::ContactSlot;
+    use crate::volume::write::{self, ContactStore, Initialized, WriteScope};
+    use std::cell::RefCell;
+
+    /// The tape's block size: small, so a slice is a few blocks.
+    const BS: usize = 4096;
+    /// A drive no device is at: every fact check that reads the hardware
+    /// finds nothing, and the injected store is the medium.
+    const DEVICE: &str = "/nonexistent/tapectl-run-init-nst";
+    const DEVICE_SG: &str = "/nonexistent/tapectl-run-init-sg";
+    /// The blank cartridge in the drive, registered by its sticker: no chip
+    /// serial can be read from a medium in memory, so the init is told it
+    /// (`--cartridge`), as span_proofs' are.
+    const CARTRIDGE: &str = "RUN-STK";
+
+    struct Home {
+        conn: Connection,
+        paths: TapectlPaths,
+        config: Config,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// A home with the operator, tenant `media`, the escrow recipient, one
+    /// drive, the collection `keep` of two units (`alpha`, `bravo`) synced,
+    /// the cartridge registered and the location `vault`. `min_copies` is
+    /// `[defaults]`'.
+    fn home(min_copies: i32) -> Home {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        let staging = tmp.path().join("staging");
+        let root = tmp.path().join("keep");
+        std::fs::create_dir_all(&staging).unwrap();
+        for unit in ["alpha", "bravo"] {
+            std::fs::create_dir_all(root.join(unit)).unwrap();
+            std::fs::write(root.join(unit).join("f.txt"), format!("{unit} content")).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+
+        let mut config = Config::default();
+        config.dar.binary = "dar".to_string();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.min_copies = min_copies;
+        config.backends.lto.push(LtoBackendConfig {
+            name: "lto6run".into(),
+            device_tape: DEVICE.into(),
+            device_sg: DEVICE_SG.into(),
+            generation: "LTO-6".into(),
+            capacity_override: None,
+            fill_ceiling: crate::config::DEFAULT_FILL_CEILING,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: None,
+        });
+        let lib = CollectionConfig {
+            name: "keep".into(),
+            root: root.to_string_lossy().into_owned(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
+        };
+        config.collections.push(lib.clone());
+
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "media", None, false).unwrap();
+        crate::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
+        collection::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+        crate::cli::cartridge::run(
+            &conn,
+            &config,
+            &CartridgeCommands::Register {
+                barcode: CARTRIDGE.into(),
+                generation: "LTO-6".into(),
+                capacity: None,
+                serial: None,
+                notes: None,
+            },
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        crate::cli::location::run(
+            &conn,
+            &LocationCommands::Add {
+                name: "vault".into(),
+                description: None,
+                kind: "shelf".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        Home {
+            conn,
+            paths,
+            config,
+            _tmp: tmp,
+        }
+    }
+
+    /// The drive: the cartridge in it, and each call the run made of it.
+    struct MemDrive<'h> {
+        home: &'h Home,
+        medium: RefCell<MemStore>,
+        calls: RefCell<Vec<String>>,
+        /// The write fails, as an interrupted or refused one would.
+        write_fails: bool,
+    }
+
+    impl<'h> MemDrive<'h> {
+        fn new(home: &'h Home) -> Self {
+            MemDrive {
+                home,
+                medium: RefCell::new(MemStore::new(BS)),
+                calls: RefCell::new(Vec::new()),
+                write_fails: false,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RunDrive for MemDrive<'_> {
+        fn init(&self, label: &str) -> Result<Initialized> {
+            self.calls.borrow_mut().push(format!("init {label}"));
+            let mut medium = self.medium.borrow_mut();
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_init_contacted(
+                &self.home.conn,
+                &self.home.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                None,
+                Some(CARTRIDGE),
+                &mut slot,
+                ContactStore::Injected(&mut *medium),
+            );
+            slot.finish_result(r)
+        }
+
+        fn write(&self, label: &str, full_confirm: bool, scope: WriteScope) -> Result<()> {
+            self.calls.borrow_mut().push(format!(
+                "write {label} full_confirm={full_confirm} moved_to={:?}",
+                scope.moved_to
+            ));
+            if self.write_fails {
+                return Err(TapectlError::Other("the drive refused the write".into()));
+            }
+            let mut medium = self.medium.borrow_mut();
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_write_contacted(
+                &self.home.conn,
+                &self.home.paths,
+                &self.home.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                false,
+                false,
+                full_confirm,
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut *medium),
+                scope,
+            );
+            slot.finish_result(r)
+        }
+    }
+
+    fn request<'a>(label: &'a str, init: bool, move_to: Option<&'a str>) -> RunRequest<'a> {
+        RunRequest {
+            collection: None,
+            batch: 0,
+            label,
+            init,
+            move_to,
+            jobs: None,
+            confirm: RunConfirm::Quick,
+            policy_aware: false,
+        }
+    }
+
+    fn run(h: &Home, drive: &MemDrive<'_>, req: &RunRequest<'_>, dry_run: bool) -> Result<i32> {
+        cmd_run(
+            &h.conn, &h.paths, &h.config, req, DEVICE, drive, false, dry_run, true,
+        )
+    }
+
+    fn one<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        one(conn, sql)
+    }
+
+    /// `collection run --label RUN1 --init --move-to vault`, the only
+    /// collection: the destination is initialized first (no volume carried
+    /// the label, so planning against its capacity proves the order), the
+    /// batch staged and written with the move in the write's intent, which a
+    /// `volume resume` keeps (ADR-0012 item 215), and the sealed tape and its
+    /// cartridge moved to the vault. One copy of a two-copy floor: the
+    /// staging stays for the next.
+    #[test]
+    fn a_run_with_init_and_move_to_initializes_writes_and_moves_the_tape() {
+        let h = home(2);
+        let drive = MemDrive::new(&h);
+        let code = run(&h, &drive, &request("RUN1", true, Some("vault")), false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            drive.calls(),
+            [
+                "init RUN1".to_string(),
+                "write RUN1 full_confirm=false moved_to=Some(\"vault\")".to_string()
+            ]
+        );
+        let c = &h.conn;
+        assert_eq!(
+            one::<String>(c, "SELECT status FROM volumes WHERE label = 'RUN1'"),
+            "sealed"
+        );
+        assert_eq!(
+            one::<String>(
+                c,
+                "SELECT l.name FROM volumes v JOIN locations l ON l.id = v.location_id
+                  WHERE v.label = 'RUN1'"
+            ),
+            "vault",
+            "the volume moved"
+        );
+        assert_eq!(
+            one::<String>(
+                c,
+                "SELECT l.name FROM cartridges k JOIN locations l ON l.id = k.location_id
+                  WHERE k.barcode = 'RUN-STK'"
+            ),
+            "vault",
+            "its cartridge moved with it"
+        );
+        assert_eq!(
+            count(
+                c,
+                "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id = w.volume_id
+                  WHERE v.label = 'RUN1' AND w.status = 'completed'"
+            ),
+            2,
+            "both units written"
+        );
+        assert_eq!(
+            count(c, "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'"),
+            2,
+            "one copy of two: both kept"
+        );
+        let session_dir: String = one(
+            c,
+            "SELECT DISTINCT w.session_dir FROM writes w JOIN volumes v ON v.id = w.volume_id
+              WHERE v.label = 'RUN1'",
+        );
+        let intent = crate::volume::session::WriteIntent::read(std::path::Path::new(&session_dir))
+            .unwrap()
+            .expect("the write recorded its intent");
+        assert_eq!(intent.move_to.as_deref(), Some("vault"), "{intent:?}");
+        assert!(!intent.full_confirm, "{intent:?}");
+    }
+
+    /// Without `--init` on a label no volume carries, the run says so with
+    /// both ways on, before anything is staged or the drive touched
+    /// (ADR-0012 item 220); `--init` given, the same label runs.
+    #[test]
+    fn a_run_on_a_label_not_initialized_names_init_and_touches_nothing() {
+        let h = home(2);
+        let drive = MemDrive::new(&h);
+        let err = run(&h, &drive, &request("RUN1", false, None), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("volume not found: RUN1"), "{err}");
+        assert!(err.contains("tapectl volume init RUN1"), "{err}");
+        assert!(err.contains("or pass --init"), "{err}");
+        assert!(drive.calls().is_empty());
+        assert_eq!(count(&h.conn, "SELECT COUNT(*) FROM stage_sets"), 0);
+
+        // With one copy of a two-copy floor, the staging stays.
+        let code = run(&h, &drive, &request("RUN1", true, None), false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            drive.calls(),
+            [
+                "init RUN1".to_string(),
+                "write RUN1 full_confirm=false moved_to=None".to_string()
+            ]
+        );
+        assert_eq!(
+            count(
+                &h.conn,
+                "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'"
+            ),
+            2
+        );
+    }
+
+    /// What `--init` refuses before the cartridge is touched (no drive call,
+    /// nothing staged, no volume made): a label a volume already has, a
+    /// batch that does not exist, a `--move-to` no location has; and its dry
+    /// run initializes nothing.
+    #[test]
+    fn init_refuses_before_the_cartridge_is_touched_and_its_dry_run_initializes_nothing() {
+        let h = home(2);
+        let drive = MemDrive::new(&h);
+        let untouched = |drive: &MemDrive<'_>| {
+            assert!(drive.calls().is_empty(), "{:?}", drive.calls());
+            assert_eq!(count(&h.conn, "SELECT COUNT(*) FROM stage_sets"), 0);
+            assert_eq!(count(&h.conn, "SELECT COUNT(*) FROM snapshots"), 0);
+        };
+
+        let mut past = request("RUN1", true, None);
+        past.batch = 5;
+        let err = run(&h, &drive, &past, false).unwrap_err().to_string();
+        assert!(err.contains("batch 5 does not exist"), "{err}");
+        assert!(err.ends_with("Nothing was initialized."), "{err}");
+        untouched(&drive);
+
+        let err = run(&h, &drive, &request("RUN1", true, Some("nowhere")), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"nowhere\" not found"), "{err}");
+        untouched(&drive);
+
+        assert_eq!(
+            run(&h, &drive, &request("RUN1", true, Some("vault")), true).unwrap(),
+            0
+        );
+        untouched(&drive);
+        assert_eq!(count(&h.conn, "SELECT COUNT(*) FROM volumes"), 0);
+
+        h.conn
+            .execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('RUN1', 'lto', 'lto6run', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+        let err = run(&h, &drive, &request("RUN1", true, None), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("volume \"RUN1\" already exists (initialized)"),
+            "{err}"
+        );
+        assert!(err.contains("without --init"), "{err}");
+        untouched(&drive);
+    }
+
+    /// A run whose write stops after its init leaves the volume initialized
+    /// (the run's error is the write's), and nothing is moved.
+    #[test]
+    fn a_run_that_stops_after_its_init_leaves_the_volume_initialized() {
+        let h = home(2);
+        let mut drive = MemDrive::new(&h);
+        drive.write_fails = true;
+        let err = run(&h, &drive, &request("RUN1", true, Some("vault")), false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "the drive refused the write");
+        assert_eq!(drive.calls().len(), 2);
+        assert_eq!(
+            one::<String>(&h.conn, "SELECT status FROM volumes WHERE label = 'RUN1'"),
+            "initialized"
+        );
+        assert_eq!(
+            count(
+                &h.conn,
+                "SELECT COUNT(*) FROM volumes WHERE label = 'RUN1' AND location_id IS NOT NULL
+                   AND location_id = (SELECT id FROM locations WHERE name = 'vault')"
+            ),
+            0,
+            "not moved"
+        );
+        assert_eq!(
+            write::stopped_write(&h.conn, "RUN1").unwrap(),
+            write::StoppedWrite::NothingOpen,
+            "so the next command is the run again, without --init"
+        );
     }
 }

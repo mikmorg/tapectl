@@ -10,11 +10,11 @@
 //! (`docs/design/v2-implementation-plan.md` T10: "Reuse `volume_write`; do
 //! NOT reimplement the session").
 //!
-//! Not exercised by the automated test suite: every copy is a real tape
-//! write (`volume::write::volume_write` opens a real `TapeStore` device),
-//! same as `volume_write` itself today (only its pre-flight-error paths are
-//! unit-tested; the mhvtl e2e suite is what actually drives a device, and
-//! this workspace's guardrails forbid touching tape devices from here).
+//! Every copy is a real tape write in production
+//! (`volume::write::volume_write_scoped` opens a real `TapeStore` device).
+//! The two calls that touch the drive go through [`RunDrive`], so a test
+//! makes them on a medium in memory and drives the whole run (`collection
+//! run`'s tests in `cli::collection`); the mhvtl suites drive a device.
 
 use rusqlite::Connection;
 
@@ -99,16 +99,148 @@ pub struct BatchExecutionReport {
     /// `Some` when the collection's `release_command` failed: the warning,
     /// already said on stderr. The run's work stands.
     pub snapshot_release_warning: Option<String>,
+    /// What `--move-to` did once the copy was sealed and confirmed
+    /// (ADR-0012 item 210): `volume write --move-to`'s own step, before the
+    /// release.
+    pub(crate) moved: crate::cli::volume::MoveAfterWrite,
+}
+
+/// The two calls of a `collection run` that touch the drive, as a seam (as
+/// `volume write`'s own steps are): what the run does around them — the
+/// plan after the init, the staging before the write, the move and the
+/// release after it — is then testable with a medium in memory. Production
+/// is [`DeviceRunDrive`].
+pub trait RunDrive {
+    /// `volume init <label>` on the loaded cartridge, by `volume write
+    /// --init`'s entry point: a cartridge with no barcode, or its chip serial
+    /// as a placeholder, takes the label as its barcode (ADR-0012 item 219).
+    fn init(&self, label: &str) -> Result<crate::volume::write::Initialized>;
+    /// `volume write <label>` of every staged set; `Ok` only once the tape
+    /// is sealed and confirmed. `scope` carries what follows the seal (the
+    /// move) into the write session's intent, which `volume resume` keeps
+    /// (ADR-0012 item 215).
+    fn write(
+        &self,
+        label: &str,
+        full_confirm: bool,
+        scope: crate::volume::write::WriteScope,
+    ) -> Result<()>;
+}
+
+/// [`RunDrive`] on the real drive at `device`.
+pub struct DeviceRunDrive<'a> {
+    pub conn: &'a Connection,
+    pub paths: &'a TapectlPaths,
+    pub config: &'a Config,
+    pub device: &'a str,
+    pub block_size: usize,
+    /// `--prewrite-hash`, for every copy.
+    pub prewrite_hash: bool,
+    /// The global `--yes`: the quiet-host question.
+    pub assume_yes: bool,
+}
+
+impl RunDrive for DeviceRunDrive<'_> {
+    fn init(&self, label: &str) -> Result<crate::volume::write::Initialized> {
+        crate::volume::write::volume_init_barcoded(
+            self.conn,
+            self.config,
+            label,
+            self.device,
+            self.block_size,
+            false,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn write(
+        &self,
+        label: &str,
+        full_confirm: bool,
+        scope: crate::volume::write::WriteScope,
+    ) -> Result<()> {
+        // `force = false`: the label is a volume already initialized on its
+        // own cartridge (or this run's `--init` just did it), so a contact
+        // check refusal means the wrong cartridge is loaded, and must refuse
+        // (issue #27).
+        crate::volume::write::volume_write_scoped(
+            self.conn,
+            self.paths,
+            self.config,
+            label,
+            self.device,
+            self.block_size,
+            false,
+            false,
+            self.prewrite_hash,
+            full_confirm,
+            self.assume_yes,
+            scope,
+        )
+    }
+}
+
+/// [`execute_batch_with`] on the real drive at `device` ([`DeviceRunDrive`]),
+/// moving nothing: a run without `--move-to`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batch(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    lib: &CollectionConfig,
+    batch: &Batch,
+    copy_labels: &[String],
+    device: &str,
+    block_size: usize,
+    prewrite_hash: bool,
+    confirm: RunConfirm,
+    assume_yes: bool,
+) -> Result<BatchExecutionReport> {
+    let drive = DeviceRunDrive {
+        conn,
+        paths,
+        config,
+        device,
+        block_size,
+        prewrite_hash,
+        assume_yes,
+    };
+    execute_batch_with(
+        conn,
+        paths,
+        config,
+        lib,
+        batch,
+        copy_labels,
+        &drive,
+        confirm,
+        None,
+        assume_yes,
+    )
 }
 
 /// Execute one batch: stage every unit once, write one session per
-/// destination label, then release staging.
+/// destination label, move the tape when `--move-to` asks, then release
+/// staging.
 ///
 /// `copy_labels` names N **pre-existing** volumes (already `volume init`'d
 /// onto their own cartridges) — one per planned copy. This deliberately
-/// does not auto-`volume_init`: that writes tape, and choosing/labelling
-/// destination cartridges is an operator act, not something a batch driver
-/// should do silently.
+/// does not `volume_init` one itself: that writes tape, and choosing and
+/// labelling destination cartridges is an operator act. `collection run
+/// --init` is that act asked for (ADR-0012 item 210), and its caller runs
+/// the init ([`RunDrive::init`]) before planning the batch, since the batch
+/// is packed against the capacity the init records.
+///
+/// `drive` makes the writes ([`RunDrive::write`]; [`DeviceRunDrive`] in
+/// production). `move_to` is `--move-to`: each write records it in its
+/// session's intent, so a `volume resume` of an interrupted copy keeps it
+/// (ADR-0012 item 215), and once the copies are sealed and confirmed the
+/// last is moved there by `volume write --move-to`'s own step
+/// ([`crate::cli::volume::move_after_write`]), before the release, as
+/// `volume write` does it: what follows judges the tape where it now sits.
+/// A move that fails is a warning in the report; the copy stands.
 ///
 /// Copies run strictly sequentially, and the first copy that returns an
 /// error aborts the whole batch immediately (via `?`) rather than
@@ -174,17 +306,16 @@ pub struct BatchExecutionReport {
 /// asked per copy ([`RunConfirm::full_for_copy`]; ADR-0012, 2026-10-06 item
 /// 1 and 2026-10-07 item 31).
 #[allow(clippy::too_many_arguments)]
-pub fn execute_batch(
+pub fn execute_batch_with(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
     lib: &CollectionConfig,
     batch: &Batch,
     copy_labels: &[String],
-    device: &str,
-    block_size: usize,
-    prewrite_hash: bool,
+    drive: &dyn RunDrive,
     confirm: RunConfirm,
+    move_to: Option<&str>,
     assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
@@ -207,26 +338,31 @@ pub fn execute_batch(
     let staged = stage_batch(conn, paths, config, lib, batch, assume_yes)?;
 
     // Session per copy — sequential, abort-on-first-failure (see doc
-    // comment above). `force=false`: each `label` is documented as "already
-    // `volume init`'d on its own cartridge" (`CollectionCommands::Run`'s own
-    // doc comment) — a contact-check refusal here means the wrong physical
+    // comment above). Never forced: each `label` is "already `volume
+    // init`'d on its own cartridge" (`CollectionCommands::Run`'s own doc
+    // comment), so a contact-check refusal here means the wrong physical
     // cartridge got loaded for this batch, which must hard-refuse, not
-    // silently override (issue #27).
+    // silently override (issue #27). Each records `--move-to` in its
+    // session's intent (ADR-0012 item 215).
+    let moved_to = move_to.map(|to| to.trim().to_string());
     for (copy, label) in copy_labels.iter().enumerate() {
-        crate::volume::write::volume_write(
-            conn,
-            paths,
-            config,
+        drive.write(
             label,
-            device,
-            block_size,
-            false,
-            false,
-            prewrite_hash,
             confirm.full_for_copy(copy),
-            assume_yes,
+            crate::volume::write::WriteScope {
+                moved_to: moved_to.clone(),
+                ..crate::volume::write::StagedScope::Every.into()
+            },
         )?;
     }
+
+    // `--move-to`, once every copy is sealed and confirmed, before the
+    // release, as `volume write --move-to` does it (ADR-0012 item 210).
+    let moved = crate::cli::volume::move_after_write(
+        conn,
+        copy_labels.last().map(String::as_str).unwrap_or("?"),
+        move_to,
+    );
 
     // Release staging only when this batch's copy just sealed is enough —
     // see `release_if_covered`'s own doc comment for the gate and the #248
@@ -243,6 +379,7 @@ pub fn execute_batch(
         release_warning,
         snapshot_path: staged.snapshot_path,
         snapshot_release_warning: staged.release_warning,
+        moved,
     })
 }
 
@@ -570,7 +707,7 @@ mod tests {
     #[test]
     fn execute_batch_asks_the_confirm_choice_per_copy() {
         const SRC: &str = include_str!("batch.rs");
-        let f = "pub fn execute_batch(";
+        let f = "pub fn execute_batch_with(";
         let start = SRC.find(f).unwrap();
         let end = SRC[start..].find("\n}\n").unwrap() + start;
         let body = &SRC[start..end];
@@ -1147,7 +1284,7 @@ mod tests {
     #[test]
     fn execute_batch_still_delegates_release_to_the_scoped_helper() {
         const SRC: &str = include_str!("batch.rs");
-        let f = "pub fn execute_batch(";
+        let f = "pub fn execute_batch_with(";
         let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
         // Function bodies end at the first `\n}` in column 0.
         let end = SRC[start..].find("\n}\n").unwrap() + start;
