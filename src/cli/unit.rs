@@ -174,7 +174,7 @@ pub fn run(
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
-) -> Result<()> {
+) -> Result<i32> {
     match command {
         UnitCommands::Init {
             path,
@@ -382,7 +382,7 @@ pub fn run(
                         tags.join(", ")
                     );
                 }
-                return Ok(());
+                return Ok(crate::error::EXIT_SUCCESS);
             }
             // Issue #359: the database AND the unit's dotfile.
             let tags = crate::unit::tag_unit(conn, &unit, add, remove)?;
@@ -415,7 +415,7 @@ pub fn run(
                          changes made)"
                     );
                 }
-                return Ok(());
+                return Ok(crate::error::EXIT_SUCCESS);
             }
             crate::unit::rename_unit(conn, current, new)?;
             if json_output {
@@ -466,7 +466,9 @@ pub fn run(
         }
 
         UnitCommands::CheckIntegrity { name } => {
-            crate::cli::operations::unit_check_integrity(conn, name, json_output)?;
+            // ADR-0012 item 220: 1 on a damaged or missing file, the
+            // CHANGED-only code otherwise (`operations::changed_exit_code`).
+            return crate::cli::operations::unit_check_integrity(conn, name, json_output);
         }
 
         UnitCommands::MarkTapeOnly { name, force } => {
@@ -497,7 +499,7 @@ pub fn run(
             )?;
         }
     }
-    Ok(())
+    Ok(crate::error::EXIT_SUCCESS)
 }
 
 /// One `unit list` row: the unit, its tenant's name and its tags (sorted).
@@ -1309,6 +1311,7 @@ mod mark_tape_only_consent_tests {
             false,
             assume_yes,
         )
+        .map(|_| ())
     }
 
     fn status(conn: &Connection) -> String {

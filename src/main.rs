@@ -568,7 +568,11 @@ fn run(
             cli::key::run(&conn, &paths, command, cli.json, cli.dry_run)?;
         }
         Commands::Unit { ref command } => {
-            cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
+            // ADR-0012 item 220: `unit check-integrity` exits 1 on a damaged
+            // or missing file; every other unit command returns 0.
+            let exit_code =
+                cli::unit::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run, cli.yes)?;
+            exit_if_nonzero(exit_code);
         }
         Commands::Collection { ref command } => {
             // Issue #285: `collection::run` now returns a process exit code

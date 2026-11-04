@@ -83,6 +83,13 @@ pub struct IntegrityReport {
     /// checksums because it has nothing to hash, staged or not.
     pub newer_without_files: Option<i64>,
     pub ok: i64,
+    /// Content that differs at the recorded size while the file's mtime has
+    /// moved since the baseline was snapshotted: an edit, not damage
+    /// (ADR-0012 item 208).
+    pub changed: i64,
+    /// Content that differs at the recorded size and the recorded mtime,
+    /// and (counted with it) content that differs where the baseline
+    /// recorded no mtime to tell an edit from damage.
     pub bitrot: i64,
     pub missing: i64,
     pub size_mismatch: i64,
@@ -94,18 +101,62 @@ pub struct IntegrityReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrityDetail {
     pub path: String,
-    /// `MISSING`, `SIZE_MISMATCH` or `BITROT`.
+    /// `MISSING`, `SIZE_MISMATCH`, `CHANGED` or `BITROT`.
     pub status: &'static str,
     /// The recorded and the on-disk size, for `SIZE_MISMATCH` only.
     pub sizes: Option<(i64, i64)>,
+    /// For `BITROT` only: the baseline recorded no mtime, so whether the
+    /// file was edited or damaged cannot be told ("CHANGED or BITROT").
+    pub no_mtime: bool,
+}
+
+impl IntegrityDetail {
+    /// What the human report says about this path.
+    fn verdict(&self) -> &'static str {
+        if self.no_mtime {
+            "CHANGED or BITROT (no mtime recorded)"
+        } else {
+            self.status
+        }
+    }
 }
 
 impl IntegrityReport {
     /// How many paths were checked — each one stat'd, and hashed at most
     /// once.
     pub fn paths_checked(&self) -> i64 {
-        self.ok + self.bitrot + self.missing + self.size_mismatch
+        self.ok + self.changed + self.bitrot + self.missing + self.size_mismatch
     }
+
+    /// Damaged or missing files: `BITROT` (with the cannot-tell ones),
+    /// `MISSING` or `SIZE_MISMATCH`. Exit 1 (ADR-0012 item 220).
+    pub fn damaged(&self) -> i64 {
+        self.bitrot + self.missing + self.size_mismatch
+    }
+
+    /// The exit code `unit check-integrity` ends with: 1 on any damaged or
+    /// missing file, [`changed_exit_code`] when the only finding is CHANGED,
+    /// 0 when every file is OK.
+    pub fn exit_code(&self) -> i32 {
+        let mut code = crate::error::EXIT_SUCCESS;
+        if self.changed > 0 {
+            code = code.max(changed_exit_code());
+        }
+        if self.damaged() > 0 {
+            code = code.max(crate::error::EXIT_WARNING);
+        }
+        code
+    }
+}
+
+/// The exit code of a `unit check-integrity` whose only finding is CHANGED
+/// files (edited since the baseline was snapshotted). The one place it is
+/// decided: the CTO's question Q40. This is the coordinator's
+/// recommendation, 0 with a one-line note naming `snapshot create`, since an
+/// edit is not damage; the CTO's answer is a change to this line (and its
+/// pin, `changed_exit_code_is_q40s_recommendation`).
+pub fn changed_exit_code() -> i32 {
+    crate::error::EXIT_SUCCESS
 }
 
 /// Compare a unit's source directory against ONE version's staged
@@ -166,18 +217,19 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
     let newer_without_files = newer.filter(|(_, has_files)| !*has_files).map(|(v, _)| v);
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT p.path, fv.size_bytes, fv.sha256
+        "SELECT p.path, fv.size_bytes, fv.sha256, fv.mtime_ns
          FROM {}
          WHERE fv.snapshot_id = ?1 AND fv.kind <> 0 AND fv.sha256 IS NOT NULL
          ORDER BY p.path",
         crate::db::files::VERSION_FILES
     ))?;
-    let staged_files: Vec<(String, i64, String)> = stmt
+    let staged_files: Vec<(String, i64, String, Option<i64>)> = stmt
         .query_map(params![snapshot_id], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 crate::db::files::sha256_to_hex(&row.get::<_, Vec<u8>>(2)?),
+                row.get(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -197,7 +249,7 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
         ..IntegrityReport::default()
     };
 
-    for (rel_path, expected_size, expected_sha) in &staged_files {
+    for (rel_path, expected_size, expected_sha, recorded_mtime) in &staged_files {
         let full_path = Path::new(current_path).join(rel_path);
         if !full_path.exists() {
             report.missing += 1;
@@ -205,6 +257,7 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
                 path: rel_path.clone(),
                 status: "MISSING",
                 sizes: None,
+                no_mtime: false,
             });
             continue;
         }
@@ -215,6 +268,7 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
                 path: rel_path.clone(),
                 status: "SIZE_MISMATCH",
                 sizes: Some((*expected_size, meta.len() as i64)),
+                no_mtime: false,
             });
             continue;
         }
@@ -224,16 +278,33 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
         // fixed buffer, never the file's size, and this can never disagree
         // with the hash `stage_create`'s own baseline was established with.
         let (actual, _) = crate::staging::validate::hash_source_file(&full_path, rel_path)?;
-        if actual != *expected_sha {
-            report.bitrot += 1;
-            report.details.push(IntegrityDetail {
-                path: rel_path.clone(),
-                status: "BITROT",
-                sizes: None,
-            });
-        } else {
+        if actual == *expected_sha {
             report.ok += 1;
+            continue;
         }
+        // ADR-0012 item 208: an edit moves the mtime, damage does not. The
+        // walk records whole seconds (`mtime_ns_from_secs`), so the live
+        // file is read at the same resolution.
+        let mtime_now = {
+            use std::os::unix::fs::MetadataExt;
+            crate::db::files::mtime_ns_from_secs(meta.mtime())
+        };
+        let (status, no_mtime) = match recorded_mtime {
+            Some(then) if mtime_now != Some(*then) => ("CHANGED", false),
+            Some(_) => ("BITROT", false),
+            None => ("BITROT", true),
+        };
+        if status == "CHANGED" {
+            report.changed += 1;
+        } else {
+            report.bitrot += 1;
+        }
+        report.details.push(IntegrityDetail {
+            path: rel_path.clone(),
+            status,
+            sizes: None,
+            no_mtime,
+        });
     }
     Ok(report)
 }
@@ -260,8 +331,19 @@ fn render_integrity(r: &IntegrityReport) -> String {
         ));
     }
     out.push_str(&format!("  OK:            {}\n", r.ok));
+    if r.changed > 0 {
+        out.push_str(&format!("  CHANGED:       {}\n", r.changed));
+    }
     if r.bitrot > 0 {
-        out.push_str(&format!("  BITROT:        {}\n", r.bitrot));
+        let cannot_tell = r.details.iter().filter(|d| d.no_mtime).count();
+        if cannot_tell > 0 {
+            out.push_str(&format!(
+                "  BITROT:        {} ({cannot_tell} CHANGED or BITROT: no mtime recorded)\n",
+                r.bitrot
+            ));
+        } else {
+            out.push_str(&format!("  BITROT:        {}\n", r.bitrot));
+        }
     }
     if r.missing > 0 {
         out.push_str(&format!("  MISSING:       {}\n", r.missing));
@@ -270,7 +352,16 @@ fn render_integrity(r: &IntegrityReport) -> String {
         out.push_str(&format!("  SIZE_MISMATCH: {}\n", r.size_mismatch));
     }
     for d in &r.details {
-        out.push_str(&format!("    {} — {}\n", d.path, d.status));
+        out.push_str(&format!("    {} — {}\n", d.path, d.verdict()));
+    }
+    if r.changed > 0 {
+        out.push_str(&format!(
+            "{} changed since the snapshot (v{}): `tapectl snapshot create {}` archives {}\n",
+            crate::render::plural(r.changed, "file", "files"),
+            r.version,
+            r.unit,
+            if r.changed == 1 { "it" } else { "them" }
+        ));
     }
     out
 }
@@ -288,6 +379,9 @@ fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
                 "path": d.path, "status": d.status,
                 "expected": expected, "actual": actual,
             }),
+            None if d.no_mtime => serde_json::json!({
+                "path": d.path, "status": d.status, "mtime_recorded": false,
+            }),
             None => serde_json::json!({"path": d.path, "status": d.status}),
         })
         .collect();
@@ -296,22 +390,24 @@ fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
         "version": r.version,
         "newer_version_without_checksums": r.newer_without_checksums,
         "newer_version_without_files": r.newer_without_files,
-        "ok": r.ok, "bitrot": r.bitrot,
+        "ok": r.ok, "changed": r.changed, "bitrot": r.bitrot,
         "missing": r.missing, "size_mismatch": r.size_mismatch,
         "details": details,
     })
 }
 
 /// `unit check-integrity`: compare the source against one version's staged
-/// checksums ([`check_integrity`]) and print the result.
-pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<()> {
+/// checksums ([`check_integrity`]), print the result, and return the exit
+/// code ([`IntegrityReport::exit_code`]; it exited 0 whatever it found until
+/// ADR-0012 item 220).
+pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<i32> {
     let report = check_integrity(conn, unit_name)?;
     if json_output {
         println!("{}", integrity_json(&report));
     } else {
         print!("{}", render_integrity(&report));
     }
-    Ok(())
+    Ok(report.exit_code())
 }
 
 /// Retire a volume with impact analysis.
@@ -5078,6 +5174,204 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(json["newer_version_without_files"], 2);
+    }
+
+    /// One regular file of `snapshot_id` with its sha256 and a recorded
+    /// mtime (whole seconds, as the walk records it), or none.
+    fn insert_file_with_mtime(
+        conn: &Connection,
+        snapshot_id: i64,
+        path: &str,
+        size: i64,
+        sha256: &str,
+        mtime_secs: Option<i64>,
+    ) {
+        crate::db::files::fixture::insert_entry(
+            conn,
+            snapshot_id,
+            crate::db::files::FileEntry {
+                path: path.to_string(),
+                kind: crate::db::files::FileKind::from_name("regular").unwrap(),
+                size_bytes: size,
+                mtime_ns: mtime_secs.and_then(crate::db::files::mtime_ns_from_secs),
+                sha256: Some(crate::db::files::sha256_from_hex(sha256).unwrap()),
+                link_target: None,
+            },
+        );
+    }
+
+    /// The file's mtime in whole seconds, as the walk reads it.
+    fn mtime_secs(path: &Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().mtime()
+    }
+
+    /// ADR-0012 item 208: a hash mismatch whose file's mtime moved since the
+    /// snapshot is an edit, CHANGED, never BITROT; the report says how to
+    /// archive it, and the exit is `changed_exit_code()`'s.
+    #[test]
+    fn check_integrity_calls_a_hash_mismatch_with_a_moved_mtime_changed() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"EDIT").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        // Snapshotted an hour before the edit.
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            4,
+            &direct_old_style_hash(b"edit"),
+            Some(mtime_secs(&f) - 3600),
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (report.ok, report.changed, report.bitrot),
+            (0, 1, 0),
+            "{:?}",
+            report.details
+        );
+        assert_eq!(report.details[0].status, "CHANGED");
+        assert_eq!(report.exit_code(), changed_exit_code());
+        let text = render_integrity(&report);
+        assert!(text.contains("CHANGED:       1"), "{text}");
+        assert!(text.contains("f.txt — CHANGED"), "{text}");
+        assert!(
+            text.contains(
+                "1 file changed since the snapshot (v1): `tapectl snapshot create unit1` \
+                 archives it"
+            ),
+            "{text}"
+        );
+        let json = integrity_json(&report);
+        assert_eq!((json["changed"].clone(), json["bitrot"].clone()), (1.into(), 0.into()));
+        assert_eq!(json["details"][0]["status"], "CHANGED");
+    }
+
+    /// ...and the same mismatch at the recorded mtime is damage: BITROT,
+    /// exit 1, and no note pointing at `snapshot create`.
+    #[test]
+    fn check_integrity_calls_a_hash_mismatch_at_the_recorded_mtime_bitrot() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"HELLO").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            5,
+            &direct_old_style_hash(b"hello"),
+            Some(mtime_secs(&f)),
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((report.changed, report.bitrot), (0, 1), "{:?}", report.details);
+        assert_eq!(report.details[0].status, "BITROT");
+        assert!(!report.details[0].no_mtime);
+        assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
+        let text = render_integrity(&report);
+        assert!(text.contains("f.txt — BITROT\n"), "{text}");
+        assert!(!text.contains("snapshot create"), "{text}");
+        assert!(!text.contains("CHANGED"), "{text}");
+        assert_eq!(integrity_json(&report)["details"][0].get("mtime_recorded"), None);
+    }
+
+    /// With no mtime recorded the report cannot tell an edit from damage:
+    /// it says so, and counts the file with BITROT (exit 1).
+    #[test]
+    fn check_integrity_without_a_recorded_mtime_says_it_cannot_tell() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"HELLO").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            5,
+            &direct_old_style_hash(b"hello"),
+            None,
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((report.changed, report.bitrot), (0, 1), "{:?}", report.details);
+        assert!(report.details[0].no_mtime);
+        assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
+        let text = render_integrity(&report);
+        assert!(
+            text.contains("f.txt — CHANGED or BITROT (no mtime recorded)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("BITROT:        1 (1 CHANGED or BITROT: no mtime recorded)"),
+            "{text}"
+        );
+        let json = integrity_json(&report);
+        assert_eq!(json["bitrot"], 1);
+        assert_eq!(json["details"][0]["status"], "BITROT");
+        assert_eq!(json["details"][0]["mtime_recorded"], false);
+    }
+
+    /// ADR-0012 item 220: `check-integrity` exited 0 whatever it found. A
+    /// missing file and a size mismatch exit 1; a clean check exits 0.
+    #[test]
+    fn check_integrity_exits_1_on_a_missing_file_or_a_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            5,
+            &direct_old_style_hash(b"hello"),
+            Some(mtime_secs(&f)),
+        );
+        let clean = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (clean.ok, clean.exit_code()),
+            (1, 0),
+            "positive control: {:?}",
+            clean.details
+        );
+        assert_eq!(unit_check_integrity(&conn, "unit1", true).unwrap(), 0);
+
+        std::fs::write(&f, b"hello, longer").unwrap();
+        let grown = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(grown.size_mismatch, 1);
+        assert_eq!(grown.exit_code(), crate::error::EXIT_WARNING);
+        assert_eq!(
+            unit_check_integrity(&conn, "unit1", true).unwrap(),
+            crate::error::EXIT_WARNING
+        );
+
+        std::fs::remove_file(&f).unwrap();
+        let gone = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(gone.missing, 1);
+        assert_eq!(gone.exit_code(), crate::error::EXIT_WARNING);
+    }
+
+    /// Q40, with the CTO: the exit of a check whose only finding is CHANGED
+    /// is ONE decision, `changed_exit_code()`. This pins the coordinator's
+    /// recommendation (0, with the note); the CTO's answer changes the
+    /// function and this pin. Damage beside a CHANGED file still exits 1.
+    #[test]
+    fn changed_exit_code_is_q40s_recommendation() {
+        assert_eq!(changed_exit_code(), crate::error::EXIT_SUCCESS);
+        let changed_only = IntegrityReport {
+            changed: 2,
+            ok: 1,
+            ..IntegrityReport::default()
+        };
+        assert_eq!(changed_only.exit_code(), changed_exit_code());
+        let changed_and_rot = IntegrityReport {
+            changed: 2,
+            bitrot: 1,
+            ..IntegrityReport::default()
+        };
+        assert_eq!(changed_and_rot.exit_code(), crate::error::EXIT_WARNING);
     }
 
     /// Issue #36/H10: `unit_mark_tape_only`'s dirty guard. Full migrations
