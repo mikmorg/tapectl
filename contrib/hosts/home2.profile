@@ -10,6 +10,14 @@
 # The drive, by serial (the sg node is derived from sysfs; do not pin /dev/sgN:
 # a USB stick moved the numbering on this host).
 DEVICE=/dev/tape/by-id/scsi-HUJ808A5L4-nst
+# The room this drive has past its early warning, which step 8 sets as the
+# drive's post_warning_bytes (ADR-0012 item 200): measured by
+# scripts/lto-profile.sh on this HP LTO-6 on 2026-10-20, whose --emit gave
+# post_warning_bytes = "99008M" (docs/runs/2026-10-20-lto6-profile-and-lbp.md).
+# With it, a write may plan past the fill ceiling to the cartridge's nominal
+# capacity (item 113), and a slice plus the seal must fit in half of it (the
+# slice cap, item 100; docs/lto-profiling.md).
+POST_WARNING_BYTES=99008M
 
 OPERATOR=mikmorg
 
@@ -64,7 +72,14 @@ SVC_HOME_WANT=/srv/archive_meta/tapectl
 # find that one first.
 TAPECTL_HOME_DIR=/srv/archive_meta/tapectl/home
 
-# Staging holds one tape's encrypted slices: acache (md1, LUKS, ~2.3 TB free).
+# Staging holds one tape's encrypted slices: /srv/acache, an unencrypted md
+# RAID0 of 5.5 TB, rebuilt on 2026-10-31 by home-infra's acache-rebuild. Staging
+# holds no plaintext (slices are encrypted in memory, #370, and the catalog
+# snapshot is built in the home), so the disk's own encryption added nothing
+# tapectl relies on (ADR-0012 item 198). /srv/acache is root:root 0710: the
+# service user reaches the staging directory through a u:tapectl:x ACL on it
+# (home2-prep.sh part 4, and acache-rebuild after a rebuild, item 199). Step 7
+# names that directory and the setfacl when the ACL is missing.
 STAGING_DIR=/srv/acache/tapectl-staging
 
 # The daily catalog backup goes to a different array from the home (md3, LUKS).
@@ -100,11 +115,11 @@ TENANTS=(
   "family|family keepsakes — the outer ring"
 )
 
-# keepsake/original-data is one folder per thing: each becomes a unit
-# (keepsake/<folder>), owned by family.
-COLLECTIONS=(
-  "keepsake|/srv/keepsake/original-data|family|1"
-)
+# No COLLECTIONS: a fresh install configures none (ADR-0012 item 204). keepsake's
+# [[collections]] table has been in the home's config.toml since handoff (i)
+# step 5, with its grants; a new collection is added with `tapectl collection
+# add NAME ROOT --tenant T`, which checks the access and prints any setfacl
+# lines it needs (item 206).
 
 # Nothing on home2 touches acache or the drive (operator, 2026-09-28). The
 # load/memory checks still run; memory and I/O pressure do not exist on 4.19.

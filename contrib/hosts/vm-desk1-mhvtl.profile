@@ -1,7 +1,8 @@
 # contrib/hosts/vm-desk1-mhvtl.profile — a rehearsal of scripts/first-run.sh on
-# the dev VM against mhvtl, NEVER the real drive. It exercises every profile
-# mechanism home2.profile uses (work dir, dar path, staging, several locations,
-# tenants, a collection, an explicit contender list) with a throwaway home.
+# the dev VM against mhvtl, NEVER the real drive. It exercises the profile
+# mechanisms home2.profile uses (work dir, dar path, staging, several locations,
+# tenants, an explicit contender list) but POST_WARNING_BYTES (see below), and a
+# collection, which home2.profile no longer sets, with a throwaway home.
 #
 #   cargo build && sudo install -m 0755 "${CARGO_TARGET_DIR:-target}/debug/tapectl" /scratch/fr-bin/tapectl
 #   scripts/mhvtl-device.sh --tape /dev/tape/by-id/scsi-XYZZY_A1-nst --ensure-media   # prints LOADED_TAG
@@ -39,6 +40,16 @@ COLLECTIONS=(
   "keepsake|/scratch/fr-src/keepsake|family|1"
 )
 CONTENDER_UNITS=()
+# No POST_WARNING_BYTES, deliberately (ADR-0012 item 200), so the rehearsal runs
+# step 8's other path: the notice that says what a drive without
+# post_warning_bytes loses. Two reasons. It is a measurement of a real drive's
+# room past its early warning (scripts/lto-profile.sh), and mhvtl has none to
+# measure: its media report no real capacity, which is why the gate gives its
+# drive capacity_override, and a made-up figure here would set the slice cap on
+# nothing. And scripts/upgrade-mhvtl.sh's phase P runs the previous release's
+# first-run.sh on a profile that sources this one: a release before 1.9.0 does
+# not know the name and refuses the profile. tests/first_run_profile.rs proves
+# the path that sets it.
 # Tape commands at raised priority (#432), as home2 runs them (these are also
 # first-run.sh's defaults). The re-entry scenario asserts them on the live write.
 TAPE_NICE=-10
