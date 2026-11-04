@@ -233,8 +233,11 @@ pub(crate) fn lookup_cartridge(
         None => None,
     };
     if let Some(row) = by_serial {
+        // `--cartridge` names a cartridge by its barcode or its chip serial
+        // (ADR-0012 item 208): either names this row.
         let superseded = requested_barcode
-            .filter(|b| *b != row.barcode)
+            .map(str::trim)
+            .filter(|b| *b != row.barcode && Some(*b) != row.serial_number.as_deref())
             .map(str::to_string);
         return Ok(CartridgeLookup {
             row: Some(row),
@@ -242,8 +245,14 @@ pub(crate) fn lookup_cartridge(
         });
     }
 
-    if let Some(barcode) = requested_barcode {
-        let row = select_cartridge(conn, "barcode", barcode)?.ok_or_else(|| {
+    if let Some(barcode) = requested_barcode.map(str::trim) {
+        // A barcode or the chip serial (ADR-0012 item 208), through the one
+        // lookup every `<CARTRIDGE>` argument takes.
+        let found = match crate::db::queries::find_cartridge(conn, barcode)? {
+            Some(found) => cartridge_row_by_id(conn, found.id)?,
+            None => None,
+        };
+        let row = found.ok_or_else(|| {
             TapectlError::Other(format!(
                 "cartridge \"{barcode}\" is not registered. Register it first \
                  (`tapectl cartridge register --barcode {barcode} --generation <GEN>`), \
@@ -260,10 +269,11 @@ pub(crate) fn lookup_cartridge(
         if let (Some(recorded), Some(loaded)) = (&row.serial_number, serial) {
             if recorded != loaded {
                 return Err(TapectlError::Other(format!(
-                    "cartridge \"{barcode}\" is registered with medium serial {recorded}, \
+                    "cartridge \"{b}\" is registered with medium serial {recorded}, \
                      but the drive holds {loaded}. That is a different physical cartridge. \
-                     Load {barcode}, or omit --cartridge and let this medium register \
-                     itself."
+                     Load {b}, or omit --cartridge and let this medium register \
+                     itself.",
+                    b = row.barcode
                 )));
             }
         }
@@ -279,7 +289,7 @@ pub(crate) fn lookup_cartridge(
         if row.serial_number.is_none() {
             if let (Some(claimed), Some(loaded)) = (&row.operator_serial, serial) {
                 if claimed != loaded {
-                    return Err(contradicted_operator_claim(barcode, claimed, loaded));
+                    return Err(contradicted_operator_claim(&row.barcode, claimed, loaded));
                 }
             }
         }
@@ -933,6 +943,214 @@ pub(crate) fn refuse_retired(row: &CartridgeRow) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `row` still wears its chip serial as its barcode: the placeholder
+/// auto-registration and `cartridge erase` give a cartridge until it has a
+/// barcode of its own (ADR-0012 item 219). A row whose chip has not spoken
+/// has no placeholder, whatever its barcode says: that barcode was typed.
+pub(crate) fn wears_placeholder(row: &CartridgeRow) -> bool {
+    row.serial_number.as_deref() == Some(row.barcode.as_str())
+}
+
+/// The barcode `volume init` gives the cartridge it binds (ADR-0012 item
+/// 219): `--barcode` when given, else the volume's label — the operator's
+/// practice, one string on the sticker and on the tape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirstBarcode {
+    pub barcode: String,
+    /// `--barcode` named it; otherwise it is the volume's label.
+    pub from_flag: bool,
+}
+
+impl FirstBarcode {
+    /// Where the barcode came from, for the line init prints.
+    pub(crate) fn source(&self) -> &'static str {
+        if self.from_flag {
+            "from --barcode"
+        } else {
+            "the volume's label"
+        }
+    }
+}
+
+/// What a `volume init` does to the barcode of the cartridge it binds
+/// (ADR-0012 item 219; OQ13), decided with the other FACT checks before the
+/// drive is opened, so a refusal leaves nothing behind.
+///
+/// - A cartridge being registered (the chip's serial matched no row), or one
+///   still wearing its chip serial as a placeholder ([`wears_placeholder`];
+///   1.8.1 registered those), takes `--barcode`, else the volume's label.
+///   `Some` is that barcode.
+/// - A cartridge with a barcode of its own keeps it: `None`. `--barcode`
+///   naming a different one is refused, naming both, with `cartridge
+///   relabel` (the command that changes a sticker); `--cartridge` and
+///   `--barcode` both given and disagreeing are refused naming both.
+/// - With no chip serial (the cartridge named by `--cartridge`), the barcode
+///   is the identity File 0 records for this contact, so it is never changed
+///   here: `None`, and a disagreeing `--barcode` is refused.
+/// - The barcode it would take being ANOTHER cartridge's is refused by name:
+///   that may be this very cartridge registered by hand (name it with
+///   `--cartridge`), or another one wearing the same sticker.
+///
+/// The chip serial stays the identity throughout: this only ever chooses the
+/// sticker's text.
+pub(crate) fn plan_first_barcode(
+    conn: &Connection,
+    label: &str,
+    barcode_flag: Option<&str>,
+    cartridge_flag: Option<&str>,
+    serial: Option<&str>,
+    row: Option<&CartridgeRow>,
+) -> Result<Option<FirstBarcode>> {
+    let flag =
+        match barcode_flag.map(str::trim) {
+            Some("") => return Err(TapectlError::Other(
+                "--barcode is empty: give the text on the cartridge's sticker, or leave it out \
+                 and the cartridge takes the volume's label"
+                    .to_string(),
+            )),
+            other => other,
+        };
+    // A cartridge with a barcode of its own: `--barcode` must agree with it.
+    let keeps = |r: &CartridgeRow| -> Result<Option<FirstBarcode>> {
+        match flag {
+            Some(b) if b != r.barcode => Err(barcode_disagrees(r, b, cartridge_flag)),
+            _ => Ok(None),
+        }
+    };
+    let Some(serial) = serial else {
+        // No chip serial: `--cartridge` named the row, and its barcode is the
+        // identity this contact records on tape (ADR-0012).
+        return match row {
+            Some(r) => keeps(r),
+            None => Ok(None),
+        };
+    };
+    if let Some(r) = row {
+        if !wears_placeholder(r) {
+            return keeps(r);
+        }
+    }
+    let first = FirstBarcode {
+        barcode: flag.unwrap_or(label).to_string(),
+        from_flag: flag.is_some(),
+    };
+    if row.is_some_and(|r| r.barcode == first.barcode) {
+        return Ok(None);
+    }
+    if let Some(other) = select_cartridge(conn, "barcode", &first.barcode)? {
+        return Err(first_barcode_taken(&first, serial, &other));
+    }
+    Ok(Some(first))
+}
+
+/// `--barcode B` against a cartridge that already wears a barcode of its own.
+fn barcode_disagrees(row: &CartridgeRow, flag: &str, cartridge_flag: Option<&str>) -> TapectlError {
+    let chip = match &row.serial_number {
+        Some(s) => format!("chip serial {s}"),
+        None => "no chip serial read yet".to_string(),
+    };
+    let lead = match cartridge_flag {
+        Some(c) => format!(
+            "--cartridge {c} and --barcode {flag} disagree: --cartridge {c} names cartridge \
+             \"{}\" ({chip}), which already wears the barcode \"{}\".",
+            row.barcode, row.barcode
+        ),
+        None => format!(
+            "--barcode {flag}: the loaded cartridge is registered as \"{}\" ({chip}) and \
+             already wears that barcode.",
+            row.barcode
+        ),
+    };
+    TapectlError::Other(format!(
+        "{lead} --barcode names the sticker of a cartridge being registered, or of one still \
+         wearing its chip serial as a placeholder. Leave --barcode out to write to \"{b}\" as \
+         it is, or change its sticker first: `tapectl cartridge relabel {b} {flag}`.",
+        b = row.barcode
+    ))
+}
+
+/// The barcode a cartridge would take is already another cartridge's.
+fn first_barcode_taken(first: &FirstBarcode, serial: &str, other: &CartridgeRow) -> TapectlError {
+    let b = &first.barcode;
+    let lead = if first.from_flag {
+        format!("--barcode {b}: cartridge \"{b}\" is already registered")
+    } else {
+        format!(
+            "this cartridge (chip serial {serial}) would take its volume's label \"{b}\" as its \
+             barcode (ADR-0012 item 219), but cartridge \"{b}\" is already registered"
+        )
+    };
+    match &other.serial_number {
+        // Another chip: certainly another cartridge.
+        Some(theirs) => TapectlError::Other(format!(
+            "{lead}, and its chip reports serial {theirs}: a different cartridge. Each \
+             cartridge wears its own barcode. Give this one its own: `--barcode <sticker>`."
+        )),
+        // Never loaded: it may be this very cartridge, registered by hand.
+        None => TapectlError::Other(format!(
+            "{lead}, and no chip serial is recorded for it yet. tapectl cannot tell whether it \
+             is this cartridge, registered by hand before it was loaded, or another one. If \
+             it is this one, name it: `--cartridge {b}` (its serial is recorded at this \
+             init). If not, give this one its own barcode: `--barcode <sticker>`."
+        )),
+    }
+}
+
+/// Give the cartridge `cartridge_id` its first barcode (ADR-0012 item 219),
+/// in the binding's transaction, recorded as `cartridge relabel` records a
+/// relabel: a `renamed` change of its `barcode`.
+pub(crate) fn give_first_barcode(
+    conn: &Connection,
+    cartridge_id: i64,
+    old: &str,
+    first: &FirstBarcode,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cartridges SET barcode = ?1 WHERE id = ?2",
+        params![first.barcode, cartridge_id],
+    )?;
+    let why = if first.from_flag {
+        "volume init --barcode"
+    } else {
+        "volume init: the volume's label (ADR-0012 item 219)"
+    };
+    events::log_event(
+        conn,
+        "cartridge",
+        cartridge_id,
+        Some(&first.barcode),
+        "renamed",
+        Some("barcode"),
+        Some(old),
+        Some(&first.barcode),
+        Some(why),
+        None,
+    )?;
+    Ok(())
+}
+
+/// The `cartridges` row with id `id`, as [`select_cartridge`] reads one.
+fn cartridge_row_by_id(conn: &Connection, id: i64) -> Result<Option<CartridgeRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, barcode, media_type, nominal_capacity, status, serial_number, operator_serial
+             FROM cartridges WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(CartridgeRow {
+                    id: r.get(0)?,
+                    barcode: r.get(1)?,
+                    media_type: r.get(2)?,
+                    nominal_capacity: r.get(3)?,
+                    status: r.get(4)?,
+                    serial_number: r.get(5)?,
+                    operator_serial: r.get(6)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 pub(crate) fn select_cartridge(
@@ -2351,6 +2569,235 @@ mod tests {
         register(&conn, "BC001", "LTO-6", Some("SER-1"), "available");
         let found = lookup_cartridge(&conn, Some("SER-1"), None).unwrap();
         assert_eq!(found.row.unwrap().barcode, "BC001");
+    }
+
+    // ---- ADR-0012 items 208 and 219: --cartridge and the first barcode ----
+
+    /// Item 208: `--cartridge` names a cartridge by its barcode or its chip
+    /// serial; naming it by serial is not a superseded request.
+    #[test]
+    fn cartridge_flag_takes_the_chip_serial_as_well_as_the_barcode() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "A001L6", "LTO-6", Some("SER-Q"), "available");
+        // A drive that reports no serial: the flag alone names the row.
+        let by_serial = lookup_cartridge(&conn, None, Some("SER-Q")).unwrap();
+        assert_eq!(by_serial.row.unwrap().barcode, "A001L6");
+        let by_barcode = lookup_cartridge(&conn, None, Some("A001L6")).unwrap();
+        assert_eq!(by_barcode.row.unwrap().barcode, "A001L6");
+        // The chip and the flag naming the same row, the flag by serial.
+        let both = lookup_cartridge(&conn, Some("SER-Q"), Some("SER-Q")).unwrap();
+        assert_eq!(both.row.unwrap().barcode, "A001L6");
+        assert!(
+            both.superseded_request.is_none(),
+            "the serial names the row"
+        );
+    }
+
+    fn row_named(conn: &Connection, barcode: &str) -> CartridgeRow {
+        select_cartridge(conn, "barcode", barcode).unwrap().unwrap()
+    }
+
+    /// Item 219: a cartridge being registered takes the volume's label, and
+    /// `--barcode` wins over it.
+    #[test]
+    fn a_cartridge_being_registered_takes_the_label_or_the_barcode_flag() {
+        let conn = db::open_memory().unwrap();
+        let first = plan_first_barcode(&conn, "L6-0001", None, None, Some("SER-N"), None)
+            .unwrap()
+            .expect("a cartridge being registered takes a barcode");
+        assert_eq!(first.barcode, "L6-0001");
+        assert!(!first.from_flag);
+        let first = plan_first_barcode(
+            &conn,
+            "L6-0001",
+            Some(" STICKER-7 "),
+            None,
+            Some("SER-N"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.barcode, "STICKER-7", "--barcode wins over the label");
+        assert!(first.from_flag);
+        let err = plan_first_barcode(&conn, "L6-0001", Some("  "), None, Some("SER-N"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--barcode is empty"), "{err}");
+    }
+
+    /// Item 219: 1.8.1's placeholder (its chip serial as its barcode) takes
+    /// the label at the next init; a barcode of its own is kept.
+    #[test]
+    fn a_placeholder_takes_the_label_and_a_barcode_of_its_own_is_kept() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "SER-P", "LTO-6", Some("SER-P"), "available");
+        let placeholder = row_named(&conn, "SER-P");
+        assert!(wears_placeholder(&placeholder));
+        let first = plan_first_barcode(
+            &conn,
+            "L6-0002",
+            None,
+            None,
+            Some("SER-P"),
+            Some(&placeholder),
+        )
+        .unwrap();
+        assert_eq!(first.map(|f| f.barcode).as_deref(), Some("L6-0002"));
+
+        register(&conn, "A001L6", "LTO-6", Some("SER-A"), "available");
+        let own = row_named(&conn, "A001L6");
+        assert!(!wears_placeholder(&own));
+        assert_eq!(
+            plan_first_barcode(&conn, "L6-0003", None, None, Some("SER-A"), Some(&own)).unwrap(),
+            None,
+            "a cartridge with a barcode of its own keeps it"
+        );
+        // The same barcode given again is no disagreement.
+        assert_eq!(
+            plan_first_barcode(
+                &conn,
+                "L6-0003",
+                Some("A001L6"),
+                None,
+                Some("SER-A"),
+                Some(&own)
+            )
+            .unwrap(),
+            None
+        );
+        // A hand-registered row whose chip has not spoken has no placeholder:
+        // its barcode was typed, and the serial it learns now does not
+        // change it.
+        register(&conn, "HAND-1", "LTO-6", None, "available");
+        let hand = row_named(&conn, "HAND-1");
+        assert_eq!(
+            plan_first_barcode(&conn, "L6-0004", None, None, Some("SER-H"), Some(&hand)).unwrap(),
+            None
+        );
+    }
+
+    /// Item 219: `--barcode` against a cartridge's own barcode is refused,
+    /// naming it and `cartridge relabel`; with `--cartridge` too, naming
+    /// both flags.
+    #[test]
+    fn a_barcode_flag_disagreeing_with_a_cartridges_own_is_refused() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "A001L6", "LTO-6", Some("SER-A"), "available");
+        let own = row_named(&conn, "A001L6");
+        let err = plan_first_barcode(
+            &conn,
+            "L6-0003",
+            Some("B2"),
+            None,
+            Some("SER-A"),
+            Some(&own),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("already wears that barcode")
+                && err.contains("tapectl cartridge relabel A001L6 B2"),
+            "{err}"
+        );
+        let err = plan_first_barcode(
+            &conn,
+            "L6-0003",
+            Some("B2"),
+            Some("A001L6"),
+            Some("SER-A"),
+            Some(&own),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--cartridge A001L6 and --barcode B2 disagree"),
+            "{err}"
+        );
+        // No chip serial: the barcode is the identity this contact records,
+        // so a different --barcode is refused there too.
+        let err = plan_first_barcode(
+            &conn,
+            "L6-0003",
+            Some("B2"),
+            Some("A001L6"),
+            None,
+            Some(&own),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("disagree"), "{err}");
+        assert_eq!(
+            plan_first_barcode(&conn, "L6-0003", None, Some("A001L6"), None, Some(&own)).unwrap(),
+            None,
+            "with no chip serial nothing is relabelled"
+        );
+        // `--cartridge <serial>` with `--barcode` on a placeholder agrees:
+        // the flag gives the placeholder its sticker.
+        register(&conn, "SER-P", "LTO-6", Some("SER-P"), "available");
+        let placeholder = row_named(&conn, "SER-P");
+        let first = plan_first_barcode(
+            &conn,
+            "L6-0005",
+            Some("B5"),
+            Some("SER-P"),
+            Some("SER-P"),
+            Some(&placeholder),
+        )
+        .unwrap();
+        assert_eq!(first.map(|f| f.barcode).as_deref(), Some("B5"));
+    }
+
+    /// Item 219: the barcode a cartridge would take being another
+    /// cartridge's is refused by name, never a duplicate row or a UNIQUE
+    /// failure; a row never loaded may be this cartridge (`--cartridge`).
+    #[test]
+    fn a_first_barcode_another_cartridge_wears_is_refused() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "L6-0004", "LTO-6", None, "available");
+        let err = plan_first_barcode(&conn, "L6-0004", None, None, Some("SER-X"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("its volume's label \"L6-0004\"") && err.contains("--cartridge L6-0004"),
+            "{err}"
+        );
+        register(&conn, "B9", "LTO-6", Some("SER-B9"), "available");
+        let err = plan_first_barcode(&conn, "L6-0009", Some("B9"), None, Some("SER-X"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--barcode B9") && err.contains("SER-B9") && err.contains("different"),
+            "{err}"
+        );
+    }
+
+    /// Item 219: the relabel is recorded as `cartridge relabel` records one.
+    #[test]
+    fn the_first_barcode_is_recorded_as_a_relabel() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "SER-P", "LTO-6", Some("SER-P"), "available");
+        let id = row_named(&conn, "SER-P").id;
+        let first = FirstBarcode {
+            barcode: "L6-0002".into(),
+            from_flag: false,
+        };
+        give_first_barcode(&conn, id, "SER-P", &first).unwrap();
+        assert_eq!(
+            row_named(&conn, "L6-0002").serial_number.as_deref(),
+            Some("SER-P")
+        );
+        let (action, field, old, new): (String, String, String, String) = conn
+            .query_row(
+                "SELECT action, field, old_value, new_value FROM events
+                 WHERE entity_type = 'cartridge' AND entity_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (action.as_str(), field.as_str(), old.as_str(), new.as_str()),
+            ("renamed", "barcode", "SER-P", "L6-0002")
+        );
     }
 
     // ---- ADR-0011: the one status-based refusal binding has -------------

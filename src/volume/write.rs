@@ -34,8 +34,8 @@ use super::layout_model::{
 };
 use super::loaded;
 use super::session::{
-    self, check_tape_contact, AbortedAdoption, ConfirmOutcome, ContactOutcome, QuarantineReason,
-    ResumeAdmission, ResumeOutcome,
+    self, AbortedAdoption, ConfirmOutcome, ContactOutcome, QuarantineReason, ResumeAdmission,
+    ResumeOutcome,
 };
 
 /// STOP-GAP pending an explicit operator/schema decision — see the T8 report.
@@ -181,11 +181,7 @@ pub fn volume_init(
     declared_media: Option<&str>,
     cartridge_barcode: Option<&str>,
 ) -> Result<Initialized> {
-    // The contact cannot be opened here: every refusal above the MAM read
-    // below — a label that already exists, no backend, an empty drive — is a
-    // command that never reached a cartridge. See [`ContactSlot`].
-    let mut contact = ContactSlot::empty();
-    let r = volume_init_contacted(
+    volume_init_barcoded(
         conn,
         config,
         label,
@@ -194,6 +190,41 @@ pub fn volume_init(
         force,
         declared_media,
         cartridge_barcode,
+        None,
+    )
+}
+
+/// [`volume_init`], with `--barcode` (ADR-0012 item 219): the sticker a
+/// cartridge being registered, or one still wearing its chip serial as a
+/// placeholder, takes at this init. `None` gives it the volume's label;
+/// either way the chip serial stays the identity
+/// ([`binding::plan_first_barcode`]).
+#[allow(clippy::too_many_arguments)]
+pub fn volume_init_barcoded(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    declared_media: Option<&str>,
+    cartridge_barcode: Option<&str>,
+    barcode: Option<&str>,
+) -> Result<Initialized> {
+    // The contact cannot be opened here: every refusal above the MAM read
+    // below — a label that already exists, no backend, an empty drive — is a
+    // command that never reached a cartridge. See [`ContactSlot`].
+    let mut contact = ContactSlot::empty();
+    let r = volume_init_contacted_barcoded(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        declared_media,
+        cartridge_barcode,
+        barcode,
         &mut contact,
         ContactStore::Device,
     );
@@ -239,6 +270,9 @@ pub enum ContactStore<'s> {
     Injected(&'s mut dyn Store),
 }
 
+/// [`volume_init_contacted_barcoded`] with no `--barcode`: the tests' and
+/// the span proofs' seam, whose cartridges take the volume's label.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn volume_init_contacted<'c>(
     conn: &'c Connection,
@@ -251,9 +285,40 @@ pub(crate) fn volume_init_contacted<'c>(
     // generation. Only consulted when nothing could be detected; an error
     // when it contradicts a detected density code.
     declared_media: Option<&str>,
-    // `--cartridge <BARCODE>`: bind to this already-registered cartridge
-    // when the medium's serial matches no row (or no serial is readable).
+    // `--cartridge <CARTRIDGE>`: bind to this already-registered cartridge
+    // (by barcode or chip serial) when the medium's serial matches no row
+    // (or no serial is readable).
     cartridge_barcode: Option<&str>,
+    contact: &mut ContactSlot<'c>,
+    store: ContactStore<'_>,
+) -> Result<Initialized> {
+    volume_init_contacted_barcoded(
+        conn,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        declared_media,
+        cartridge_barcode,
+        None,
+        contact,
+        store,
+    )
+}
+
+/// [`volume_init_contacted`] with `--barcode` ([`volume_init_barcoded`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn volume_init_contacted_barcoded<'c>(
+    conn: &'c Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    declared_media: Option<&str>,
+    cartridge_barcode: Option<&str>,
+    barcode: Option<&str>,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
 ) -> Result<Initialized> {
@@ -340,6 +405,7 @@ pub(crate) fn volume_init_contacted<'c>(
         force,
         declared_media,
         cartridge_barcode,
+        barcode,
         backend,
         drive_gen,
         &det,
@@ -389,6 +455,7 @@ fn volume_init_in_contact<'c>(
     force: bool,
     declared_media: Option<&str>,
     cartridge_barcode: Option<&str>,
+    barcode: Option<&str>,
     backend: &crate::config::LtoBackendConfig,
     drive_gen: crate::media::Generation,
     det: &crate::tape::media_detect::Detected,
@@ -433,6 +500,19 @@ fn volume_init_in_contact<'c>(
     if let Some(row) = &lookup.row {
         binding::refuse_retired(row)?;
     }
+    // ADR-0012 item 219: the barcode the cartridge ends with — `--barcode`,
+    // else this volume's label, for a cartridge being registered or still
+    // wearing its chip serial as a placeholder. Decided here with the other
+    // FACT checks: a barcode taken by another cartridge, or `--barcode`
+    // disagreeing with a cartridge's own, refuses before the drive is opened.
+    let first_barcode = binding::plan_first_barcode(
+        conn,
+        label,
+        barcode,
+        cartridge_barcode,
+        serial,
+        lookup.row.as_ref(),
+    )?;
     let row_gen = match &lookup.row {
         Some(r) => match crate::media::Generation::parse(&r.media_type) {
             Some(g) => Some((g, r.barcode.as_str())),
@@ -553,6 +633,7 @@ fn volume_init_in_contact<'c>(
             mam: &det.mam,
             this_contact: contact.id(),
         }),
+        Some(conn),
     )?;
     if let Some(proof) = &blank_proof {
         // ONE line, on stderr where the operator is, and the same words in
@@ -596,7 +677,7 @@ fn volume_init_in_contact<'c>(
     // holding it is what makes this session visible as live to every other
     // process, from the moment the row can be seen.
     let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
-    let bound = binding::bind_cartridge(
+    let mut bound = binding::bind_cartridge(
         &tx,
         volume_id,
         lookup.row.as_ref(),
@@ -604,6 +685,19 @@ fn volume_init_in_contact<'c>(
         generation,
         &det.mam,
     )?;
+    // ADR-0012 item 219, in the same transaction: the cartridge just
+    // registered (under its chip serial), or still wearing that placeholder,
+    // takes its first barcode. `plan_first_barcode` gives one only on a
+    // chip-witnessed contact, so the operator identity File 0 records below
+    // (the barcode, when no serial was read) never moves.
+    let first_barcode = match (first_barcode, bound.cartridge_id, bound.barcode.clone()) {
+        (Some(first), Some(cartridge_id), Some(old)) => {
+            binding::give_first_barcode(&tx, cartridge_id, &old, &first)?;
+            bound.barcode = Some(first.barcode.clone());
+            Some((old, first))
+        }
+        _ => None,
+    };
     match &blank_proof {
         None => {
             events::log_created(&tx, "volume", volume_id, label, None)?;
@@ -645,7 +739,7 @@ fn volume_init_in_contact<'c>(
         }
     }
 
-    report_binding(label, &lookup, &bound);
+    report_binding(label, &lookup, &bound, first_barcode.as_ref());
 
     // Provisional total_files: unknown until the write session builds the
     // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
@@ -709,23 +803,61 @@ fn volume_init_in_contact<'c>(
 /// Say what the binding did — ADR-0010 requires init to WARN about a
 /// displacement, naming the volume and any unit that just lost its last
 /// copy, rather than refuse it. stderr, so `--json` stdout stays parseable.
-fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &binding::BindOutcome) {
+///
+/// `first` is the barcode the cartridge took at this init, with the chip
+/// serial it wore as a placeholder before (ADR-0012 item 219). The first
+/// line keeps the shapes `scripts/first-run.sh` step 13 reads: `cartridge
+/// <barcode> auto-registered from MAM`, and `volume "<label>" bound to
+/// cartridge <barcode>` ending its line.
+fn report_binding(
+    label: &str,
+    lookup: &binding::CartridgeLookup,
+    bound: &binding::BindOutcome,
+    first: Option<&(String, binding::FirstBarcode)>,
+) {
+    for line in binding_lines(label, lookup, bound, first) {
+        eprintln!("{line}");
+    }
+}
+
+/// [`report_binding`]'s lines, so the text is testable.
+fn binding_lines(
+    label: &str,
+    lookup: &binding::CartridgeLookup,
+    bound: &binding::BindOutcome,
+    first: Option<&(String, binding::FirstBarcode)>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(requested) = &lookup.superseded_request {
         if let Some(actual) = &bound.barcode {
-            eprintln!(
+            lines.push(format!(
                 "note: --cartridge {requested} was superseded by the loaded medium's own \
                  serial, which is registered as cartridge {actual}"
-            );
+            ));
         }
     }
     match &bound.barcode {
-        Some(barcode) if bound.auto_registered => {
-            eprintln!("cartridge {barcode} auto-registered from MAM (barcode = medium serial)");
-        }
+        Some(barcode) if bound.auto_registered => match first {
+            Some((serial, first)) => lines.push(format!(
+                "cartridge {barcode} auto-registered from MAM (chip serial {serial}; barcode \
+                 {barcode}, {})",
+                first.source()
+            )),
+            None => lines.push(format!(
+                "cartridge {barcode} auto-registered from MAM (barcode = medium serial)"
+            )),
+        },
         Some(barcode) => {
-            eprintln!("volume \"{label}\" bound to cartridge {barcode}");
+            lines.push(format!("volume \"{label}\" bound to cartridge {barcode}"));
             if bound.serial_recorded {
-                eprintln!("  medium serial recorded on cartridge {barcode}");
+                lines.push(format!("  medium serial recorded on cartridge {barcode}"));
+            }
+            if let Some((placeholder, first)) = first {
+                lines.push(format!(
+                    "  its barcode is now {barcode}, {} (it wore its chip serial {placeholder} \
+                     as a placeholder)",
+                    first.source()
+                ));
             }
         }
         // Unreachable from `volume_init` since ADR-0012 (issue #192):
@@ -736,11 +868,11 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
         // produce an unbound one on a legacy volume. A warning is the right
         // thing to print if that ever reaches here; a panic is not.
         None => {
-            eprintln!(
+            lines.push(format!(
                 "warning: no medium serial readable; volume \"{label}\" is not bound to a \
                  cartridge. Copy counting cannot tell this cartridge from another, and \
                  `volume write` cannot check you reloaded the same one."
-            );
+            ));
         }
     }
 
@@ -753,10 +885,9 @@ fn report_binding(label: &str, lookup: &binding::CartridgeLookup, bound: &bindin
     let now = chrono::Utc::now().naive_utc();
     let barcode = bound.barcode.as_deref().unwrap_or("?");
     for d in &bound.displaced {
-        for line in binding::render_displacement(barcode, d, now) {
-            eprintln!("{line}");
-        }
+        lines.extend(binding::render_displacement(barcode, d, now));
     }
+    lines
 }
 
 /// Bind a volume that `volume init` left unbound, now that a medium serial
@@ -879,7 +1010,7 @@ fn bind_late(
             "note: volume \"{label}\" was unbound after `volume init` (no medium serial was \
              readable then); binding it now from the loaded medium."
         );
-        report_binding(label, &lookup, &bound);
+        report_binding(label, &lookup, &bound, None);
     }
     Ok(bound.cartridge_id)
 }
@@ -2854,6 +2985,7 @@ fn volume_write_in_contact<'c>(
         seal_position,
         force,
         &live_on_cartridge,
+        None,
         None,
     )?;
     // Undo the position change the read-based check above made (TapeStore's
@@ -6103,7 +6235,114 @@ fn decide_fresh_write_contact(
     volume_uuid: &str,
     allow_overwrite: bool,
 ) -> Result<()> {
-    decide_fresh_write_contact_on(outcome, label, volume_uuid, allow_overwrite, &[], None)
+    decide_fresh_write_contact_on(
+        outcome,
+        label,
+        volume_uuid,
+        allow_overwrite,
+        &[],
+        None,
+        &SealedHolder::NotAsked,
+    )
+}
+
+/// What this catalog holds of the SEALED volume a fresh write found on the
+/// loaded cartridge (ADR-0012 item 216): it decides which way on the
+/// [`ContactOutcome::AlreadySealed`] refusal offers. The volume is found by
+/// File 0's uuid ([`loaded::locate`]), as every read of a loaded tape finds
+/// it, and judged by the predicates `cartridge erase` judges it by
+/// ([`coverage::is_given_up`], [`coverage::counts_as_copy`]), so init and the
+/// erase agree on when erasing is offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SealedHolder {
+    /// The catalog was not consulted (a write to an initialized volume):
+    /// the refusal names the reuse path in general terms.
+    NotAsked,
+    /// This catalog has no volume with File 0's uuid, or File 0 names none.
+    NotHeld,
+    /// This catalog holds it given up (`retired` or `erased`).
+    GivenUp { label: String, status: String },
+    /// This catalog holds it and counts it as a copy: its live copy.
+    LiveCopy { label: String, units: i64 },
+    /// This catalog holds it and has not given it up, though it counts as
+    /// no copy now (quarantined, say).
+    Held {
+        label: String,
+        status: String,
+        condition: String,
+    },
+}
+
+impl SealedHolder {
+    /// What the catalog holds of the volume whose File 0 is `file0`.
+    pub(crate) fn of(conn: &Connection, file0: Option<&[u8]>) -> Result<SealedHolder> {
+        let Some(bytes) = file0 else {
+            return Ok(SealedHolder::NotHeld);
+        };
+        let facts = binding::file0_facts_from_text(&String::from_utf8_lossy(bytes));
+        let volume = match loaded::locate(conn, &facts)? {
+            loaded::Located::Known(v) | loaded::Located::UnderAnotherLabel { volume: v, .. } => v,
+            loaded::Located::NoIdentity | loaded::Located::Unknown => {
+                return Ok(SealedHolder::NotHeld)
+            }
+        };
+        Ok(if coverage::is_given_up(conn, volume.volume_id)? {
+            SealedHolder::GivenUp {
+                label: volume.label,
+                status: volume.status,
+            }
+        } else if coverage::counts_as_copy(conn, &volume.label)? {
+            let units = copy_summary(conn, &volume.label)?.units;
+            SealedHolder::LiveCopy {
+                label: volume.label,
+                units,
+            }
+        } else {
+            SealedHolder::Held {
+                label: volume.label,
+                status: volume.status,
+                condition: volume.observed_condition,
+            }
+        })
+    }
+
+    /// The way on the SEALED refusal offers. The erase is offered only when
+    /// this catalog does not hold the volume, or holds it given up; a volume
+    /// it holds is a copy to eject, never a blank to erase. How to erase by
+    /// hand is the troubleshooting guide's, not this refusal's.
+    fn way_on(&self) -> String {
+        const ERASE: &str = "To reuse the cartridge: `tapectl cartridge erase` erases the tape \
+             in the drive, reads it back and records it.";
+        match self {
+            SealedHolder::LiveCopy { label, units } => format!(
+                "It is this catalog's live copy: {label}, a copy of {}. Leave it as it is: \
+                 eject it (`tapectl drive eject`) and load a blank cartridge.",
+                crate::render::plural(*units, "unit", "units")
+            ),
+            SealedHolder::Held {
+                label,
+                status,
+                condition,
+            } => format!(
+                "It is this catalog's volume {label} ({status}, condition {condition}), which \
+                 the catalog has not given up. Leave it as it is: eject it (`tapectl drive \
+                 eject`) and load a blank cartridge."
+            ),
+            SealedHolder::GivenUp { label, status } => format!(
+                "This catalog holds it as volume {label}, {status}. {ERASE} {NEVER_DEGAUSS}"
+            ),
+            SealedHolder::NotHeld => format!(
+                "This catalog holds no volume of that identity (`tapectl volume identify` shows \
+                 what the tape says). {ERASE} {NEVER_DEGAUSS}"
+            ),
+            SealedHolder::NotAsked => format!(
+                "If this cartridge should be reused: retire its current volume if this catalog \
+                 holds it (`tapectl volume retire <label>`), then `tapectl cartridge erase`, \
+                 which erases the tape in the drive, reads it back and records it. \
+                 {NEVER_DEGAUSS}"
+            ),
+        }
+    }
 }
 
 /// [`decide_fresh_write_contact`], knowing `live_on_cartridge`: the live
@@ -6122,6 +6361,10 @@ fn decide_fresh_write_contact(
 /// outcomes; a mismatched pairing is no proof here either. The sealed and
 /// mismatch refusals never look at it, and a live volume on the cartridge
 /// is refused before it is consulted.
+///
+/// And knowing `sealed` (ADR-0012 item 216): what this catalog holds of the
+/// sealed volume [`ContactOutcome::AlreadySealed`] found, which chooses the
+/// way on that refusal offers and nothing else.
 fn decide_fresh_write_contact_on(
     outcome: &ContactOutcome,
     label: &str,
@@ -6129,6 +6372,7 @@ fn decide_fresh_write_contact_on(
     allow_overwrite: bool,
     live_on_cartridge: &[String],
     proof: Option<&binding::BlankProof>,
+    sealed: &SealedHolder,
 ) -> Result<()> {
     match outcome {
         ContactOutcome::Blank | ContactOutcome::Matches => Ok(()),
@@ -6186,15 +6430,14 @@ fn decide_fresh_write_contact_on(
                 )))
             }
         }
+        // ONE literal: `scripts/first-run.sh` step 13 routes on its phrase
+        // (tests/first_run_refusal_phrases.rs), and the way on is its tail.
         ContactOutcome::AlreadySealed { seal_position } => Err(TapectlError::Other(format!(
             "refusing to write volume \"{label}\": the loaded cartridge already carries a SEALED \
              volume — a valid seal marker parses at tape position {seal_position}. ADR-0003: \
              sealed volumes are immutable, there is no append, and --force cannot override this. \
-             If this cartridge should be reused: retire its current volume if this catalog holds \
-             it (`tapectl volume retire <label>`), then `tapectl cartridge erase`, which erases \
-             the tape in the drive, reads it back and records it — or {ERASE_IN_THE_DRIVE} \
-             yourself and run `tapectl cartridge mark-erased` before writing to it again. \
-             {NEVER_DEGAUSS}"
+             {}",
+            sealed.way_on()
         ))),
         // Issue #460: a seal position that would not read, on a tape the
         // medium does not show ends before it. Not absent, so not consent:
@@ -6271,7 +6514,7 @@ fn decide_fresh_write_contact_on(
 
 /// The fresh-write contact check (issue #27): the same File-0 + seal-marker
 /// check `session::InterruptedSession::resume_checking` runs
-/// ([`check_tape_contact`]), applied before the very first byte of a fresh
+/// ([`session::check_tape_contact`]), applied before the very first byte of a fresh
 /// `volume_init`/`volume_write` — closing the gap the issue describes:
 /// neither call read File 0 before this fix, so loading the wrong cartridge
 /// (including one already holding a different, SEALED volume) silently
@@ -6291,6 +6534,7 @@ fn check_fresh_write_contact(
         seal_position,
         allow_overwrite,
         &[],
+        None,
         None,
     )
     .map(|_| ())
@@ -6314,6 +6558,12 @@ pub(crate) struct BlankEvidence<'a> {
 /// Returns the proof when it is what allowed the write, so the caller can
 /// say so and record it; `None` when the tape proved itself (or `--force`
 /// overrode a refusal no proof covered).
+///
+/// Given `catalog` (`volume init`'s; ADR-0012 item 216), a SEALED tape is
+/// looked up there by File 0's uuid, so the refusal says whether it is this
+/// catalog's live copy ([`SealedHolder`]); without it the refusal names the
+/// reuse path in general terms.
+#[allow(clippy::too_many_arguments)]
 fn check_fresh_write_contact_on(
     store: &mut dyn Store,
     label: &str,
@@ -6322,8 +6572,15 @@ fn check_fresh_write_contact_on(
     allow_overwrite: bool,
     live_on_cartridge: &[String],
     evidence: Option<BlankEvidence<'_>>,
+    catalog: Option<&Connection>,
 ) -> Result<Option<binding::BlankProof>> {
-    let outcome = check_tape_contact(store, label, volume_uuid, seal_position);
+    let (outcome, facts) = session::contact_report(store, label, volume_uuid, seal_position);
+    let sealed = match (&outcome, catalog) {
+        (ContactOutcome::AlreadySealed { .. }, Some(conn)) => {
+            SealedHolder::of(conn, facts.file0())?
+        }
+        _ => SealedHolder::NotAsked,
+    };
     let proof = match (&outcome, &evidence) {
         (ContactOutcome::FileZeroUnreadable { .. }, Some(ev)) if live_on_cartridge.is_empty() => {
             binding::chip_blank_proof(ev.mam)
@@ -6340,6 +6597,7 @@ fn check_fresh_write_contact_on(
         allow_overwrite,
         live_on_cartridge,
         proof.as_ref(),
+        &sealed,
     )?;
     Ok(proof)
 }
@@ -12946,7 +13204,7 @@ mod tests {
             ("fn close_verify_contact(", "contact_id,"),
             // Issue #339: init sweeps too, in the function that holds the
             // guard — not in `volume_init_in_contact`, which the `?`s leave.
-            ("fn volume_init_contacted", "contact.id(),"),
+            ("fn volume_init_contacted_barcoded", "contact.id(),"),
         ] {
             let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
             let end = prod[start..].find("\n}\n").unwrap() + start;
@@ -18412,7 +18670,10 @@ mod tests {
     /// Issue #417: the reuse recipe a sealed cartridge's refusals print
     /// erases the tape IN THE DRIVE and warns against a degausser — which
     /// wipes an LTO cartridge's factory servo tracks. It used to say
-    /// "bulk-erase the physical tape". Both refusals that name the step.
+    /// "bulk-erase the physical tape". The seal-recorded refusal names the
+    /// step by hand; the SEALED contact refusal names `cartridge erase`
+    /// only, the `mt` recipe having moved to the troubleshooting guide
+    /// (ADR-0012 item 216).
     #[test]
     fn the_sealed_cartridge_reuse_recipe_erases_in_the_drive_and_never_degausses() {
         let outcome = ContactOutcome::AlreadySealed { seal_position: 12 };
@@ -18421,15 +18682,138 @@ mod tests {
             .to_string();
         let (conn, volume_id) = seal_recorded_fixture(true, None);
         let recorded = seal_recorded_refusal(&conn, "L6-SEALED", volume_id).unwrap();
-        for msg in [contact, recorded] {
-            assert!(msg.contains("erase the tape in the drive"), "{msg}");
-            assert!(msg.contains("`mt -f <device> erase`"), "{msg}");
-            assert!(msg.contains("weof 1"), "{msg}");
+        for msg in [&contact, &recorded] {
             assert!(msg.contains("Never degauss"), "{msg}");
-            assert!(msg.contains("`tapectl cartridge mark-erased`"), "{msg}");
             assert!(msg.contains("`tapectl cartridge erase`"), "{msg}");
             assert!(!msg.contains("bulk-erase the"), "{msg}");
         }
+        assert!(
+            recorded.contains("erase the tape in the drive"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("`mt -f <device> erase`"), "{recorded}");
+        assert!(recorded.contains("weof 1"), "{recorded}");
+        assert!(
+            recorded.contains("`tapectl cartridge mark-erased`"),
+            "{recorded}"
+        );
+        assert!(
+            !contact.contains("mt -f"),
+            "the mt recipe is the docs': {contact}"
+        );
+        assert!(!contact.contains("weof"), "{contact}");
+    }
+
+    /// ADR-0012 item 216: what the SEALED refusal offers follows what this
+    /// catalog holds of the volume on the tape. Its own live copy is to be
+    /// ejected, never erased; a retired volume, or one it does not hold, is
+    /// offered `cartridge erase`. The routed phrase is in every one.
+    #[test]
+    fn the_sealed_refusal_names_this_catalogs_live_copy_and_offers_no_erase() {
+        let sealed = ContactOutcome::AlreadySealed { seal_position: 12 };
+        let refuse = |holder: SealedHolder| {
+            decide_fresh_write_contact_on(&sealed, FW_LABEL, FW_UUID, true, &[], None, &holder)
+                .unwrap_err()
+                .to_string()
+        };
+        let live = refuse(SealedHolder::LiveCopy {
+            label: "L6-0001".into(),
+            units: 3,
+        });
+        assert!(live.contains("already carries a SEALED volume"), "{live}");
+        assert!(
+            live.contains("this catalog's live copy: L6-0001, a copy of 3 units"),
+            "{live}"
+        );
+        assert!(
+            live.contains("tapectl drive eject") && live.contains("load a blank"),
+            "{live}"
+        );
+        assert!(!live.contains("cartridge erase"), "no erase route: {live}");
+        assert!(!live.contains("volume retire"), "no retire route: {live}");
+
+        let held = refuse(SealedHolder::Held {
+            label: "L6-0002".into(),
+            status: "sealed".into(),
+            condition: "quarantined".into(),
+        });
+        assert!(
+            held.contains("L6-0002 (sealed, condition quarantined)"),
+            "{held}"
+        );
+        assert!(!held.contains("cartridge erase"), "{held}");
+
+        for holder in [
+            SealedHolder::GivenUp {
+                label: "L6-0003".into(),
+                status: "retired".into(),
+            },
+            SealedHolder::NotHeld,
+        ] {
+            let msg = refuse(holder);
+            assert!(msg.contains("already carries a SEALED volume"), "{msg}");
+            assert!(msg.contains("`tapectl cartridge erase`"), "{msg}");
+            assert!(!msg.contains("live copy"), "{msg}");
+            assert!(!msg.contains("mt -f"), "{msg}");
+        }
+    }
+
+    /// ADR-0012 item 216: [`SealedHolder::of`] reads the catalog by File 0's
+    /// uuid and judges the volume as `cartridge erase` does.
+    #[test]
+    fn the_sealed_holder_is_found_by_file0s_uuid() {
+        let conn = crate::db::open_memory().unwrap();
+        let thunk = |label: &str, uuid: &str| {
+            layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+                label,
+                uuid,
+                media_type: "LTO-6",
+                tapectl_version: "1.9.0",
+                nominal_capacity: 1,
+                mam_capacity: 0,
+                total_files: 8,
+                mam_manufacturer: "",
+                mam_serial: "SER-1",
+                mam_length: 0,
+                mam_loads: 0,
+                created_at: "2026-11-04T00:00:00Z",
+                cartridge_identity_source: Some("mam"),
+            })
+            .into_bytes()
+        };
+        let volume = |label: &str, uuid: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, ?2, 'lto', 'lto6', 'LTO-6', 2500000000000, ?3)",
+                params![label, uuid, status],
+            )
+            .unwrap();
+        };
+        volume("L6-0001", "uuid-live", "sealed");
+        volume("L6-0002", "uuid-retired", "retired");
+        assert_eq!(
+            SealedHolder::of(&conn, Some(&thunk("L6-0001", "uuid-live"))).unwrap(),
+            SealedHolder::LiveCopy {
+                label: "L6-0001".into(),
+                units: 0
+            }
+        );
+        assert_eq!(
+            SealedHolder::of(&conn, Some(&thunk("L6-0002", "uuid-retired"))).unwrap(),
+            SealedHolder::GivenUp {
+                label: "L6-0002".into(),
+                status: "retired".into()
+            }
+        );
+        assert_eq!(
+            SealedHolder::of(&conn, Some(&thunk("XX-0001", "uuid-foreign"))).unwrap(),
+            SealedHolder::NotHeld
+        );
+        assert_eq!(
+            SealedHolder::of(&conn, None).unwrap(),
+            SealedHolder::NotHeld
+        );
     }
 
     // -- check_fresh_write_contact: full pipeline via MemStore -----
@@ -18494,18 +18878,43 @@ mod tests {
         let outcome = ContactOutcome::FileZeroUnreadable {
             error: "read: Input/output error (os error 5)".into(),
         };
-        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, false, &[], None)
-            .unwrap_err()
-            .to_string();
+        let err = decide_fresh_write_contact_on(
+            &outcome,
+            FW_LABEL,
+            FW_UUID,
+            false,
+            &[],
+            None,
+            &SealedHolder::NotAsked,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("not provably") && err.contains("--force"),
             "{err}"
         );
-        decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &[], None).unwrap();
+        decide_fresh_write_contact_on(
+            &outcome,
+            FW_LABEL,
+            FW_UUID,
+            true,
+            &[],
+            None,
+            &SealedHolder::NotAsked,
+        )
+        .unwrap();
         let live = vec!["L6-0001".to_string()];
-        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &live, None)
-            .unwrap_err()
-            .to_string();
+        let err = decide_fresh_write_contact_on(
+            &outcome,
+            FW_LABEL,
+            FW_UUID,
+            true,
+            &live,
+            None,
+            &SealedHolder::NotAsked,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("L6-0001") && err.contains("--force cannot override"),
             "{err}"
@@ -18534,7 +18943,15 @@ mod tests {
         };
         let empty = ContactOutcome::EmptyFileZero;
         let decide = |outcome: &ContactOutcome, force, live: &[String], p| {
-            decide_fresh_write_contact_on(outcome, FW_LABEL, FW_UUID, force, live, p)
+            decide_fresh_write_contact_on(
+                outcome,
+                FW_LABEL,
+                FW_UUID,
+                force,
+                live,
+                p,
+                &SealedHolder::NotAsked,
+            )
         };
 
         // The pairings, without --force.
@@ -18714,7 +19131,13 @@ mod tests {
                 for live in [Vec::new(), vec!["L6-LIVE".to_string()]] {
                     for proof in [None, Some(&chip), Some(&erase)] {
                         let err = decide_fresh_write_contact_on(
-                            &outcome, FW_LABEL, FW_UUID, force, &live, proof,
+                            &outcome,
+                            FW_LABEL,
+                            FW_UUID,
+                            force,
+                            &live,
+                            proof,
+                            &SealedHolder::NotAsked,
                         )
                         .expect_err("an unreadable seal is never consent");
                         assert_unreadable_seal_refusal(&err.to_string(), 7);
@@ -22026,7 +22449,7 @@ mod tests {
         fn the_three_write_paths_journal_their_read_at_their_contact() {
             const SRC: &str = include_str!("write.rs");
             for (f, op) in [
-                ("fn volume_init_contacted", "VolumeInit"),
+                ("fn volume_init_contacted_barcoded", "VolumeInit"),
                 ("fn volume_write_contacted", "VolumeWrite"),
                 ("fn volume_resume_contacted", "VolumeResume"),
                 ("fn volume_resume_adopt_lost_contacted", "VolumeResume"),
@@ -22360,7 +22783,7 @@ mod tests {
         fn the_three_write_paths_open_their_contact_at_their_own_mam_read() {
             const SRC: &str = include_str!("write.rs");
             for f in [
-                "fn volume_init_contacted",
+                "fn volume_init_contacted_barcoded",
                 "fn volume_write_contacted",
                 "fn volume_resume_contacted",
                 "fn volume_resume_adopt_lost_contacted",
@@ -28314,6 +28737,19 @@ mod tests {
             force: bool,
             cartridge: Option<&str>,
         ) -> Result<Initialized> {
+            init_barcoded_with(conn, label, fake, det, force, cartridge, None)
+        }
+
+        /// [`init_outcome_with`] with `--barcode` (ADR-0012 item 219).
+        fn init_barcoded_with(
+            conn: &Connection,
+            label: &str,
+            fake: &FakeTape,
+            det: &Detected,
+            force: bool,
+            cartridge: Option<&str>,
+            barcode: Option<&str>,
+        ) -> Result<Initialized> {
             let config = config();
             let _drive = InjectedDrive::install(fake);
             let backend = crate::config::resolve_lto_backend(&config, Some(DEVICE))?;
@@ -28338,6 +28774,7 @@ mod tests {
                 force,
                 None,
                 cartridge,
+                barcode,
                 backend,
                 drive_gen,
                 det,
@@ -28469,6 +28906,157 @@ mod tests {
             let d = created_details(&conn, "BP-NEW");
             assert_eq!(d["blank_proof"]["kind"], "chip", "{d}");
             assert_eq!(d["blank_proof"]["life_written_mib"], 0, "{d}");
+        }
+
+        fn barcode_of_serial(conn: &Connection, serial: &str) -> String {
+            conn.query_row(
+                "SELECT barcode FROM cartridges WHERE serial_number = ?1",
+                params![serial],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// ADR-0012 item 219, through the real init: a cartridge registered
+        /// at init takes the volume's label as its barcode, `--barcode`
+        /// wins, and File 0 still records the chip serial as the identity.
+        #[test]
+        fn a_cartridge_registered_at_init_takes_the_label_or_the_barcode_flag() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = unreadable_tape();
+            init_with(
+                &conn,
+                "L6-0001",
+                &fake,
+                &chip(Some("SER-NEW"), Some(0)),
+                false,
+                None,
+            )
+            .expect("init on a never-written cartridge");
+            assert_eq!(barcode_of_serial(&conn, "SER-NEW"), "L6-0001");
+            let file0 = file0_text(&fake);
+            assert!(
+                file0.contains("cartridge_serial = \"SER-NEW\""),
+                "the chip serial stays the identity on tape: {file0}"
+            );
+
+            let conn = crate::db::open_memory().unwrap();
+            let fake = unreadable_tape();
+            init_barcoded_with(
+                &conn,
+                "L6-0001",
+                &fake,
+                &chip(Some("SER-NEW"), Some(0)),
+                false,
+                None,
+                Some("STICKER-7"),
+            )
+            .expect("init with --barcode");
+            assert_eq!(barcode_of_serial(&conn, "SER-NEW"), "STICKER-7");
+        }
+
+        /// ADR-0012 item 219: a cartridge 1.8.1 registered under its chip
+        /// serial (the placeholder) takes the label at its next init; a
+        /// barcode of its own is kept; a refused init relabels nothing.
+        #[test]
+        fn a_placeholder_barcode_becomes_the_label_at_the_next_init() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('SER-P', 'LTO-6', 2500000000000, 'SER-P', 'available')",
+                [],
+            )
+            .unwrap();
+            let fake = unreadable_tape();
+            init_with(
+                &conn,
+                "L6-0002",
+                &fake,
+                &chip(Some("SER-P"), Some(0)),
+                false,
+                None,
+            )
+            .expect("init over the placeholder");
+            assert_eq!(barcode_of_serial(&conn, "SER-P"), "L6-0002");
+
+            // Its barcode is its own now: the next init keeps it.
+            conn.execute("UPDATE volumes SET status = 'retired'", [])
+                .unwrap();
+            let fake = unreadable_tape();
+            init_with(
+                &conn,
+                "L6-0003",
+                &fake,
+                &chip(Some("SER-P"), Some(0)),
+                false,
+                None,
+            )
+            .expect("re-init");
+            assert_eq!(barcode_of_serial(&conn, "SER-P"), "L6-0002");
+
+            // A disagreeing --barcode is refused before the tape is touched.
+            let fake = unreadable_tape();
+            let before = fake.state().files.clone();
+            let err = init_barcoded_with(
+                &conn,
+                "L6-0004",
+                &fake,
+                &chip(Some("SER-P"), Some(0)),
+                false,
+                None,
+                Some("OTHER"),
+            )
+            .expect_err("--barcode disagreeing with the cartridge's own")
+            .to_string();
+            assert!(err.contains("cartridge relabel L6-0002 OTHER"), "{err}");
+            assert_eq!(fake.state().files, before, "nothing written");
+            assert_eq!(barcode_of_serial(&conn, "SER-P"), "L6-0002");
+        }
+
+        /// The init's binding lines keep the shapes first-run.sh step 13
+        /// reads (`cartridge X auto-registered from MAM`, and the bound
+        /// line ending in the barcode), and say where the barcode came from.
+        #[test]
+        fn the_binding_lines_name_the_first_barcode() {
+            let lookup = binding::CartridgeLookup::default();
+            let registered = binding::BindOutcome {
+                cartridge_id: Some(1),
+                barcode: Some("L6-0001".into()),
+                auto_registered: true,
+                ..Default::default()
+            };
+            let first = (
+                "SER-NEW".to_string(),
+                binding::FirstBarcode {
+                    barcode: "L6-0001".into(),
+                    from_flag: false,
+                },
+            );
+            let lines = binding_lines("L6-0001", &lookup, &registered, Some(&first));
+            assert_eq!(
+                lines[0],
+                "cartridge L6-0001 auto-registered from MAM (chip serial SER-NEW; barcode \
+                 L6-0001, the volume's label)"
+            );
+            let bound = binding::BindOutcome {
+                cartridge_id: Some(1),
+                barcode: Some("L6-0002".into()),
+                ..Default::default()
+            };
+            let first = (
+                "SER-P".to_string(),
+                binding::FirstBarcode {
+                    barcode: "L6-0002".into(),
+                    from_flag: true,
+                },
+            );
+            let lines = binding_lines("L6-0002", &lookup, &bound, Some(&first));
+            assert_eq!(lines[0], "volume \"L6-0002\" bound to cartridge L6-0002");
+            assert_eq!(
+                lines[1],
+                "  its barcode is now L6-0002, from --barcode (it wore its chip serial SER-P as \
+                 a placeholder)"
+            );
         }
 
         /// Negative controls for the chip proof: every reading that is not
@@ -29016,6 +29604,7 @@ mod tests {
                 false,
                 declared,
                 cartridge,
+                None,
                 backend,
                 drive_gen,
                 det,

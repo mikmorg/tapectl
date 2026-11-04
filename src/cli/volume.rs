@@ -39,9 +39,10 @@ pub enum VolumeCommands {
         /// written, or this catalog's own `cartridge erase` verified it
         /// blank and nothing has been written since; init prints which
         /// proof it used. Never overrides a cartridge
-        /// that is already SEALED (ADR-0003): retire its volume, erase the
-        /// tape in the drive (`mt erase`, or `mt weof 1` at the start) and
-        /// run `cartridge mark-erased` first for that case. Never degauss
+        /// that is already SEALED (ADR-0003): this catalog's own sealed
+        /// volume is a copy to eject, not a blank; a sealed tape this
+        /// catalog does not hold, or holds retired, is erased first with
+        /// `tapectl cartridge erase` (ADR-0012 item 216). Never degauss
         /// an LTO cartridge: that destroys its servo tracks. It also
         /// never overrides the drive/media compatibility refusal, which is
         /// a physical fact rather than a risk judgement (ADR-0010).
@@ -57,16 +58,28 @@ pub enum VolumeCommands {
         /// hint. It is consulted only when no source reports a recognised code.
         #[arg(long)]
         generation: Option<String>,
-        /// Bind this volume to an already-registered cartridge by barcode.
+        /// Bind this volume to an already-registered cartridge: its
+        /// barcode, or the serial its chip reports.
         ///
         /// Normally unnecessary: `volume init` matches the loaded medium's
-        /// MAM serial to `cartridges.serial_number`, and auto-registers a
-        /// cartridge (barcode = that serial) when nothing matches. Use this
-        /// to attach the volume to a cartridge YOU labelled — the barcode on
-        /// the physical sticker — instead. A serial match wins over this
-        /// flag, since the serial was read off the medium.
-        #[arg(long)]
+        /// chip serial to a registered cartridge, and registers the
+        /// cartridge itself when nothing matches. Use this for a cartridge
+        /// registered by hand before it was ever loaded, or on a drive that
+        /// reports no chip serial, where it names the cartridge. A serial
+        /// match wins over this flag, since the serial was read off the
+        /// medium.
+        #[arg(long, value_name = "CARTRIDGE")]
         cartridge: Option<String>,
+        /// The barcode on the cartridge's sticker, for a cartridge this init
+        /// registers or one still wearing its chip serial as a placeholder
+        /// barcode. Without it such a cartridge takes the volume's label as
+        /// its barcode (ADR-0012 item 219), the usual practice: the same
+        /// text on the sticker and on the tape. A cartridge that already has
+        /// a barcode keeps it, and a different `--barcode` is refused
+        /// (change a sticker with `tapectl cartridge relabel`). The chip
+        /// serial stays the cartridge's identity either way.
+        #[arg(long)]
+        barcode: Option<String>,
     },
 
     /// Write staged data to volume
@@ -142,11 +155,17 @@ pub enum VolumeCommands {
         /// (`volume init <label>`: the same function, the same File 0
         /// consent check and refusals, ADR-0003 and ADR-0012 item 57), then
         /// write it with the tape still loaded. An init that refuses writes
-        /// nothing and exits 2. Only `--force` is taken from `volume init`'s
-        /// flags; when a cartridge needs `--generation` or `--cartridge`,
-        /// run `volume init` yourself first. ADR-0012 2026-10-15 item 59.
+        /// nothing and exits 2. `--force` and `--barcode` are taken from
+        /// `volume init`'s flags; when a cartridge needs `--generation` or
+        /// `--cartridge`, run `volume init` yourself first. ADR-0012
+        /// 2026-10-15 item 59.
         #[arg(long, requires = "label", conflicts_with = "loaded")]
         init: bool,
+        /// With `--init`: the barcode on the cartridge's sticker, as `volume
+        /// init --barcode` takes it. Without it a cartridge being registered
+        /// takes the volume's label (ADR-0012 item 219).
+        #[arg(long, requires = "init")]
+        barcode: Option<String>,
         /// Move the volume, with its cartridge, to this location once it is
         /// sealed and confirmed (`volume move <label> --to LOCATION`). The
         /// location is checked before anything is written. Nothing moves
@@ -1676,6 +1695,8 @@ struct DriveWriteSteps<'a> {
     /// What staging keeps once sealed and confirmed, for the session's
     /// write intent: the release itself is [`write_and_follow`]'s.
     keep: StagingKeep,
+    /// `--barcode`, for the init `--init` runs (ADR-0012 item 219).
+    barcode: Option<String>,
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
@@ -1690,7 +1711,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
     }
 
     fn init(&self, label: &str, force: bool) -> Result<Initialized> {
-        write::volume_init(
+        write::volume_init_barcoded(
             self.conn,
             self.config,
             label,
@@ -1699,6 +1720,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
             force,
             None,
             None,
+            self.barcode.as_deref(),
         )
     }
 
@@ -2150,6 +2172,7 @@ pub fn run(
             force,
             generation,
             cartridge,
+            barcode,
         } => {
             // Issue #241: a meaningful preview would have to open the
             // drive and read the MAM/density register to detect the
@@ -2164,7 +2187,7 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
-            let init = write::volume_init(
+            let init = write::volume_init_barcoded(
                 conn,
                 config,
                 label,
@@ -2173,6 +2196,7 @@ pub fn run(
                 *force,
                 generation.as_deref(),
                 cartridge.as_deref(),
+                barcode.as_deref(),
             )?;
             if json_output {
                 println!("{}", init_json(label, &init));
@@ -2187,6 +2211,7 @@ pub fn run(
             device,
             force,
             init,
+            barcode,
             move_to,
             allow_missing_escrow,
             prewrite_hash,
@@ -2284,6 +2309,7 @@ pub fn run(
                 moved_to: move_to.as_deref().map(|to| to.trim().to_string()),
                 for_location: for_x.as_ref().map(|(x, _)| x.clone()),
                 keep,
+                barcode: barcode.clone(),
             };
             let done = write_and_follow(
                 conn,
@@ -6012,6 +6038,7 @@ mod tests {
                 device: Some("/nonexistent/tapectl-release-nst".into()),
                 force: false,
                 init: false,
+                barcode: None,
                 move_to: None,
                 allow_missing_escrow: false,
                 prewrite_hash: false,
@@ -6055,6 +6082,7 @@ mod tests {
                     device: None,
                     force: false,
                     init: false,
+                    barcode: None,
                     move_to: None,
                     allow_missing_escrow: false,
                     prewrite_hash: false,
@@ -6156,7 +6184,7 @@ mod tests {
             let drive = SRC.find("impl WriteSteps for DriveWriteSteps").unwrap();
             assert!(
                 SRC[drive..drive + 1500].contains("write::volume_write_scoped(")
-                    && SRC[drive..drive + 1500].contains("write::volume_init("),
+                    && SRC[drive..drive + 1500].contains("write::volume_init_barcoded("),
                 "DriveWriteSteps is the real init and the real write"
             );
 
@@ -6969,6 +6997,7 @@ mod tests {
                 device: Some("/nonexistent/tapectl-438-nst".into()),
                 force: false,
                 init,
+                barcode: None,
                 move_to: move_to.map(str::to_string),
                 allow_missing_escrow: false,
                 prewrite_hash: false,
@@ -7387,6 +7416,7 @@ mod tests {
                         moved_to: Some("offsite".into()),
                         for_location: None,
                         keep: StagingKeep::Release,
+                        barcode: None,
                     },
                 };
                 crate::volume::write::shared_place_log::take();
@@ -7603,6 +7633,7 @@ mod tests {
                     device: device.clone(),
                     force: false,
                     init: false,
+                    barcode: None,
                     move_to: None,
                     allow_missing_escrow: false,
                     prewrite_hash: false,
@@ -8517,6 +8548,7 @@ mod tests {
                 device: None,
                 force: false,
                 init: false,
+                barcode: None,
                 move_to: None,
                 allow_missing_escrow: false,
                 prewrite_hash: false,
