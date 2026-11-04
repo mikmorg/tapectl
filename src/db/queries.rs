@@ -775,9 +775,116 @@ pub fn check_nesting_conflict_excluding(
     Ok(None)
 }
 
+// ── Cartridges ──
+
+/// A registered cartridge, as a `<CARTRIDGE>` argument named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CartridgeRef {
+    pub id: i64,
+    /// The sticker it wears now (a relabelable label, ADR-0012).
+    pub barcode: String,
+    /// The serial its chip reported, once one was read: its identity.
+    pub serial_number: Option<String>,
+}
+
+/// The one lookup behind every `<CARTRIDGE>` argument (ADR-0012 item 208): a
+/// barcode, or the chip serial. The barcode is tried first, then the serial
+/// the chip reported (`serial_number`); an operator's claimed serial
+/// (`operator_serial`) is never an identity and is not looked at.
+///
+/// `Ok(None)` when no cartridge has it, so each command keeps its own "not
+/// found". An argument that is one cartridge's barcode and another's chip
+/// serial is refused naming both: either could be meant, and tapectl does not
+/// guess which.
+pub fn find_cartridge(conn: &Connection, arg: &str) -> Result<Option<CartridgeRef>> {
+    let arg = arg.trim();
+    let by = |column: &str| -> Result<Option<CartridgeRef>> {
+        // `column` is one of the two literals below, never operator input.
+        Ok(conn
+            .query_row(
+                &format!("SELECT id, barcode, serial_number FROM cartridges WHERE {column} = ?1"),
+                params![arg],
+                |r| {
+                    Ok(CartridgeRef {
+                        id: r.get(0)?,
+                        barcode: r.get(1)?,
+                        serial_number: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    };
+    let by_barcode = by("barcode")?;
+    let by_serial = by("serial_number")?;
+    match (by_barcode, by_serial) {
+        (Some(b), Some(s)) if b.id != s.id => Err(crate::error::TapectlError::Other(format!(
+            "\"{arg}\" names two cartridges: the one wearing barcode \"{arg}\" (chip serial {}), \
+             and the one whose chip serial is {arg} (barcode \"{}\"). Name it by the other: \
+             `tapectl cartridge list` shows both.",
+            b.serial_number.as_deref().unwrap_or("not read yet"),
+            s.barcode
+        ))),
+        (Some(b), _) => Ok(Some(b)),
+        (None, s) => Ok(s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cartridge(conn: &Connection, barcode: &str, serial: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+             VALUES (?1, 'LTO-6', 2500000000000, ?2)",
+            params![barcode, serial],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// ADR-0012 item 208: a `<CARTRIDGE>` is a barcode or the chip serial.
+    #[test]
+    fn a_cartridge_is_found_by_its_barcode_or_its_chip_serial() {
+        let conn = fresh_conn();
+        let id = cartridge(&conn, "L6-0001", Some("EW7VWMVKF6"));
+        let by_barcode = find_cartridge(&conn, "L6-0001").unwrap().unwrap();
+        let by_serial = find_cartridge(&conn, " EW7VWMVKF6 ").unwrap().unwrap();
+        assert_eq!(by_barcode.id, id);
+        assert_eq!(by_serial, by_barcode);
+        assert_eq!(by_serial.barcode, "L6-0001");
+        assert!(find_cartridge(&conn, "L6-0002").unwrap().is_none());
+    }
+
+    /// An operator's claimed serial is not the chip's, and names nothing.
+    #[test]
+    fn an_operator_claimed_serial_names_no_cartridge() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, operator_serial)
+             VALUES ('A001L6', 'LTO-6', 2500000000000, 'CLAIMED1')",
+            [],
+        )
+        .unwrap();
+        assert!(find_cartridge(&conn, "CLAIMED1").unwrap().is_none());
+    }
+
+    /// One cartridge's barcode that is another's chip serial is refused,
+    /// naming both.
+    #[test]
+    fn a_name_that_is_one_cartridges_barcode_and_anothers_serial_is_refused() {
+        let conn = fresh_conn();
+        cartridge(&conn, "X1", None);
+        cartridge(&conn, "L6-0002", Some("X1"));
+        let err = find_cartridge(&conn, "X1").unwrap_err().to_string();
+        assert!(
+            err.contains("names two cartridges") && err.contains("\"L6-0002\""),
+            "{err}"
+        );
+        // Its own barcode and serial agreeing is no ambiguity.
+        cartridge(&conn, "S9", Some("S9"));
+        assert_eq!(find_cartridge(&conn, "S9").unwrap().unwrap().barcode, "S9");
+    }
 
     fn fresh_conn() -> Connection {
         // Full ordered migration chain (issue #44) — was a hand-applied

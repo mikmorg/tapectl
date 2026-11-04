@@ -52,7 +52,7 @@ pub enum CartridgeCommands {
     },
     /// Show cartridge details
     Info {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
     },
@@ -64,7 +64,7 @@ pub enum CartridgeCommands {
     /// catalog cannot disagree. `volume move` does the same from the other
     /// end.
     Move {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Destination location name
@@ -92,7 +92,7 @@ pub enum CartridgeCommands {
     /// — so a script retiring a fully-covered cartridge without `--yes` was
     /// refused by a non-interactive session for a reason the help denied.
     Retire {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Why (appended to the cartridge's notes, never overwriting them)
@@ -189,7 +189,7 @@ pub enum CartridgeCommands {
     /// and no amount of consent makes a medium declared permanently unfit fit
     /// again. `cartridge unretire` is the way back.
     MarkErased {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// Override the pending_erase lifecycle precondition (ADR-0008
@@ -221,7 +221,7 @@ pub enum CartridgeCommands {
     /// one of `--generation`/`--serial` must be given; both may be given in
     /// one call, and each is gated independently.
     Edit {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
@@ -236,13 +236,16 @@ pub enum CartridgeCommands {
     /// Correct a cartridge's barcode label
     ///
     /// ADR-0012: a cartridge's identity is its chip serial; the barcode is a
-    /// relabelable sticker. This is a Tier 1 label correction under
+    /// relabelable sticker. `volume init` gives a cartridge its first
+    /// barcode (its first volume's label, or `--barcode`; item 219); this
+    /// changes it afterwards. This is a Tier 1 label correction under
     /// ADR-0008, not a destructive act — no prompt, no `--force`, no status
     /// gate — and it is the remedy `volume init`'s auto-register refuses
     /// with when the loaded medium's serial collides with an
     /// already-registered barcode.
     Relabel {
-        /// Current barcode
+        /// The cartridge: its current barcode, or the serial its chip
+        /// reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
         /// New barcode
@@ -266,7 +269,7 @@ pub enum CartridgeCommands {
     /// the separate, irreversible statement that the bytes are gone
     /// (ADR-0011, corrected 2026-09-14).
     Unretire {
-        /// Barcode
+        /// The cartridge: its barcode, or the serial its chip reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: String,
     },
@@ -290,7 +293,8 @@ pub enum CartridgeCommands {
     /// With neither a barcode nor `--serial`, every row is listed, including
     /// reads no cartridge could be named for. Read-only.
     Journal {
-        /// Barcode of a registered cartridge
+        /// A registered cartridge: its barcode, or the serial its chip
+        /// reports
         #[arg(value_name = "CARTRIDGE")]
         barcode: Option<String>,
         /// Select by the medium serial the chip reported instead (for a
@@ -307,12 +311,13 @@ pub enum CartridgeCommands {
 struct CartridgeRow {
     #[tabled(rename = "Barcode")]
     barcode: String,
-    /// Table-only until CTO decision 2026-09-11 (architecture review C2
-    /// follow-up, C2b). JSON key is the field's own name, matching
-    /// `cartridge info --json`'s existing "media_type" key for the same
-    /// column (see `CartridgeCommands::Info` below).
-    #[tabled(rename = "Type")]
-    media_type: String,
+    /// The cartridge's generation (`cartridges.media_type`). Table-only
+    /// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
+    /// Headed and keyed "generation" since 1.9.0 (ADR-0012 item 208: the
+    /// glossary's word, never "type"), the same key `cartridge info --json`
+    /// gives the same column.
+    #[tabled(rename = "Generation")]
+    generation: String,
     #[tabled(rename = "Status")]
     status: String,
     /// ADR-0011: the question an operator asks of a cartridge most often
@@ -412,9 +417,10 @@ fn serial_info_lines(
     )
 }
 
-/// `cartridge list --json` shape. `media_type`/`loads`/`volume` were
-/// table-only until CTO decision 2026-09-11 (architecture review C2
-/// follow-up, C2b); `location` is additive since ADR-0011.
+/// `cartridge list --json` shape. The generation (keyed `media_type` until
+/// 1.9.0)/`loads`/`volume` were table-only until CTO decision 2026-09-11
+/// (architecture review C2 follow-up, C2b); `location` is additive since
+/// ADR-0011.
 fn cartridge_rows_to_json(rows: &[CartridgeRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
@@ -440,6 +446,18 @@ fn validate_cartridge_status(value: &str) -> Result<()> {
     }
     crate::config::validate_closed_set("--status", value, CARTRIDGE_STATUSES)
         .map_err(TapectlError::Other)
+}
+
+/// The barcode a `<CARTRIDGE>` argument names: the cartridge wearing it as
+/// its barcode, or the one whose chip reported it as its serial (ADR-0012
+/// item 208; [`crate::db::queries::find_cartridge`], the one lookup). An
+/// argument no cartridge has comes back as typed, trimmed, so each command
+/// keeps its own "not found".
+fn named(conn: &Connection, arg: &str) -> Result<String> {
+    Ok(match crate::db::queries::find_cartridge(conn, arg)? {
+        Some(found) => found.barcode,
+        None => arg.trim().to_string(),
+    })
 }
 
 pub fn run(
@@ -594,6 +612,9 @@ pub fn run(
             }
         }
         CartridgeCommands::Info { barcode } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             #[allow(clippy::type_complexity)]
             let (
                 id,
@@ -681,7 +702,7 @@ pub fn run(
                     // `operator_serial` likewise (ADR-0012 amendment,
                     // 2026-09-16; issue #197); `wear` likewise (#391).
                     serde_json::json!({
-                        "barcode": barcode, "media_type": media, "status": status,
+                        "barcode": barcode, "generation": media, "status": status,
                         "loads": loads, "location": location, "volumes": volumes.len(),
                         "serial_number": serial_number, "operator_serial": operator_serial,
                         "wear": {"lines": wear.lines(), "warnings": wear.warnings()},
@@ -700,7 +721,7 @@ pub fn run(
                 );
             } else {
                 println!("Cartridge: {barcode}");
-                println!("  Type:     {media}");
+                println!("  Generation: {media}");
                 println!("  Status:   {status}");
                 let (chip_line, operator_line) =
                     serial_info_lines(&serial_number, &operator_serial);
@@ -736,6 +757,9 @@ pub fn run(
             }
         }
         CartridgeCommands::Move { barcode, to } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             // Issue #230: `--dry-run` is global and was silently ignored
             // here — the move committed. `move_together` now honours it and
             // returns the outcome it WOULD have written, so the dry branch
@@ -788,6 +812,9 @@ pub fn run(
             reason,
             force,
         } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             crate::cli::operations::cartridge_retire(
                 conn,
                 config,
@@ -815,6 +842,9 @@ pub fn run(
             )?;
         }
         CartridgeCommands::MarkErased { barcode, force } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             crate::cli::operations::cartridge_mark_erased(
                 conn,
                 barcode,
@@ -829,7 +859,9 @@ pub fn run(
             generation,
             serial,
         } => {
-            let barcode = barcode.trim();
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             // ADR-0012 amendment, 2026-09-16 (issue #197): gating is
             // PER-FLAG, not per-command -- `--generation` stays Tier 1
             // (ungated), `--serial` is Tier 2 (gated via
@@ -947,12 +979,14 @@ pub fn run(
             barcode,
             new_barcode,
         } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             // Same reasoning as `Register` above: a typed barcode is stored
             // trimmed everywhere else, so `relabel` must not become the one
             // remaining writer that leaves a trailing space the unique index
             // cannot catch and that `register`/`info`/`move` would never
-            // match again.
-            let barcode = barcode.trim();
+            // match again. (`named` trims the cartridge argument.)
             let new_barcode = new_barcode.trim();
             let id: i64 = conn
                 .query_row(
@@ -1021,6 +1055,9 @@ pub fn run(
             }
         }
         CartridgeCommands::Unretire { barcode } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = named(conn, barcode)?;
+            let barcode = barcode.as_str();
             crate::cli::operations::cartridge_unretire(conn, barcode, dry_run, json_output)?;
         }
         CartridgeCommands::Journal {
@@ -1028,6 +1065,8 @@ pub fn run(
             serial,
             raw,
         } => {
+            // ADR-0012 item 208: a barcode or the chip serial.
+            let barcode = barcode.as_deref().map(|b| named(conn, b)).transpose()?;
             let selector = journal_selector(conn, barcode.as_deref(), serial.as_deref())?;
             match raw {
                 Some(id) => {
@@ -1602,7 +1641,7 @@ fn cartridge_rows(
         .query_map(bound.as_slice(), |row| {
             Ok(CartridgeRow {
                 barcode: row.get(0)?,
-                media_type: row.get(1)?,
+                generation: row.get(1)?,
                 status: row.get(2)?,
                 loads: row.get::<_, Option<i64>>(3)?,
                 volume: row.get::<_, Option<String>>(4)?,
@@ -1691,7 +1730,7 @@ mod tests {
         let rows = vec![
             CartridgeRow {
                 barcode: "A001L6".to_string(),
-                media_type: "LTO-6".to_string(),
+                generation: "LTO-6".to_string(),
                 status: "available".to_string(),
                 loads: Some(12),
                 volume: Some("L6-0001".to_string()),
@@ -1699,7 +1738,7 @@ mod tests {
             },
             CartridgeRow {
                 barcode: "A002L6".to_string(),
-                media_type: "LTO-6".to_string(),
+                generation: "LTO-6".to_string(),
                 status: "retired_permanent".to_string(),
                 loads: None,
                 volume: None,
@@ -1709,8 +1748,65 @@ mod tests {
         let value = cartridge_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"barcode":"A001L6","loads":12,"location":"home-rack","media_type":"LTO-6","status":"available","volume":"L6-0001"},{"barcode":"A002L6","loads":null,"location":null,"media_type":"LTO-6","status":"retired_permanent","volume":null}]"#
+            r#"[{"barcode":"A001L6","generation":"LTO-6","loads":12,"location":"home-rack","status":"available","volume":"L6-0001"},{"barcode":"A002L6","generation":"LTO-6","loads":null,"location":null,"status":"retired_permanent","volume":null}]"#
         );
+    }
+
+    /// ADR-0012 item 208: the column is the cartridge's generation, headed
+    /// so, never "Type".
+    #[test]
+    fn cartridge_list_heads_the_generation_column_generation() {
+        let rows = vec![CartridgeRow {
+            barcode: "A001L6".to_string(),
+            generation: "LTO-6".to_string(),
+            status: "available".to_string(),
+            loads: None,
+            volume: None,
+            location: None,
+        }];
+        let table = Table::new(rows).to_string();
+        let header = table.lines().find(|l| l.contains("Barcode")).unwrap();
+        assert!(header.contains("Generation"), "{table}");
+        assert!(!header.contains("Type"), "{table}");
+    }
+
+    /// ADR-0012 item 208: every `<CARTRIDGE>` argument takes the chip serial
+    /// as well as the barcode.
+    #[test]
+    fn a_cartridge_argument_is_its_barcode_or_its_chip_serial() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+             VALUES ('L6-0001', 'LTO-6', 2500000000000, 'EW7VWMVKF6')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(named(&conn, "EW7VWMVKF6").unwrap(), "L6-0001");
+        assert_eq!(named(&conn, "L6-0001").unwrap(), "L6-0001");
+        // Nothing has it: as typed, trimmed, for the command's own "not found".
+        assert_eq!(named(&conn, " NOPE ").unwrap(), "NOPE");
+        // Through a command: `cartridge relabel <serial> NEW` relabels it.
+        let config = crate::config::Config::default();
+        run(
+            &conn,
+            &config,
+            &CartridgeCommands::Relabel {
+                barcode: "EW7VWMVKF6".to_string(),
+                new_barcode: "STICKER1".to_string(),
+            },
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let barcode: String = conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE serial_number = 'EW7VWMVKF6'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(barcode, "STICKER1");
     }
 
     fn seed() -> Connection {
