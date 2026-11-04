@@ -7015,6 +7015,15 @@ fn verify_contacted(
         (Tier::Integrity, None) => total,
         _ => None,
     };
+    // ADR-0012 item 218 (OQ15): when this volume was last read back in full
+    // — a write's full confirm counts, and so does an earlier full verify —
+    // said before the read, read before this verify's own row exists, and
+    // then the read goes on: a verify never asks.
+    let last_full_read = last_full_read(conn, volume_id)?;
+    eprintln!(
+        "{}",
+        last_full_read_line(label, last_full_read.as_ref(), tier)
+    );
     conn.execute(
         "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
          VALUES (?1, ?2, 'in_progress')",
@@ -7148,6 +7157,7 @@ fn verify_contacted(
         // a backend to resolve; this store-injectable half has neither.
         drive_health_note: None,
         verify_bytes,
+        last_full_read,
     })
 }
 
@@ -8617,6 +8627,78 @@ pub fn compact_finish(
 
 // ── Internal helpers ──
 
+/// When a volume was last read back in full and by what (ADR-0012 item
+/// 218): the newest PASSED full readback recorded for it, a write's full
+/// confirm or an earlier `volume verify --full` alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastFullRead {
+    /// `verification_sessions.started_at`, the date every staleness clock
+    /// reads ([`crate::policy::evidence::full_readback_date`]).
+    pub at: String,
+    /// The command whose contact the readback ran in (`volume write`,
+    /// `volume resume`, `volume verify`, ...), when one is recorded around
+    /// it; `None` otherwise.
+    pub by: Option<String>,
+}
+
+/// [`LastFullRead`] of volume `volume_id`, or `None` when no full readback
+/// of it has passed. One statement: the readback, and the contact of the
+/// volume open when it started.
+pub(crate) fn last_full_read(conn: &Connection, volume_id: i64) -> Result<Option<LastFullRead>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {dated},
+                        (SELECT c.operation FROM cartridge_contacts c
+                          WHERE c.volume_id = vs.volume_id AND c.opened_at <= vs.started_at
+                            AND (c.closed_at IS NULL OR c.closed_at >= vs.started_at)
+                          ORDER BY c.id DESC LIMIT 1)
+                   FROM verification_sessions vs
+                  WHERE vs.volume_id = ?1 AND vs.verify_type = 'full' AND vs.outcome = 'passed'
+                  ORDER BY {dated} DESC, vs.id DESC LIMIT 1",
+                dated = crate::policy::evidence::full_readback_date("vs"),
+            ),
+            params![volume_id],
+            |r| {
+                Ok(LastFullRead {
+                    at: r.get(0)?,
+                    by: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The line `volume verify` prints before it reads (ADR-0012 item 218,
+/// OQ15): when the last full read of `label` was, and that it reads anyway.
+/// It never asks.
+pub fn last_full_read_line(label: &str, last: Option<&LastFullRead>, tier: Tier) -> String {
+    let now = match tier {
+        Tier::Integrity => "reading it in full again now",
+        Tier::Navigable => "this quick verify reads only its map",
+    };
+    match last {
+        Some(read) => {
+            let by = read
+                .by
+                .as_deref()
+                .map(|op| format!(" (by {op})"))
+                .unwrap_or_default();
+            format!(
+                "volume \"{label}\": last full read {}{by}; {now}",
+                crate::render::table_time(&read.at)
+            )
+        }
+        None => {
+            let now = match tier {
+                Tier::Integrity => "reading it in full now",
+                Tier::Navigable => now,
+            };
+            format!("volume \"{label}\": no full read recorded yet; {now}")
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     /// The `verification_sessions` row this verify wrote (issue #295).
@@ -8714,6 +8796,10 @@ pub struct VerifyReport {
     /// read only the files the interrupted one had not, so the figure would
     /// overstate what it read and understate every rate.
     pub verify_bytes: Option<u64>,
+    /// When the volume was last read back in full before this verify, and by
+    /// what (ADR-0012 item 218): what `volume verify` says before it reads.
+    /// `None` when no full readback had passed, and on a `Default` report.
+    pub last_full_read: Option<LastFullRead>,
 }
 
 impl VerifyReport {
@@ -10425,6 +10511,118 @@ mod tests {
         );
         assert_eq!(units_planned_onto(&conn, "V-SUM").unwrap(), [a, b, c]);
         assert_eq!(copy_summary(&conn, "V-NONE").unwrap().units, 0);
+    }
+
+    /// ADR-0012 item 218: `volume verify` says when the last full read of
+    /// the volume was, then reads anyway. The first verify of a volume has
+    /// none to name; the second names the first, and the command it ran
+    /// under. Both read in full: neither asks.
+    #[test]
+    fn a_verify_names_the_last_full_read_before_it_and_reads_anyway() {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"the bytes the front index promises. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-LAST", "vr-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-LAST'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let verify = |conn: &Connection| {
+            let mut store = mem_store_v2_tape("VR-LAST", &good, &good);
+            volume_verify_with_store(
+                conn,
+                &mut store,
+                "VR-LAST",
+                volume_id,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap()
+        };
+
+        let first = verify(&conn);
+        assert_eq!(first.failed, 0, "{:?}", first.mismatches);
+        assert_eq!(
+            first.last_full_read, None,
+            "nothing was read in full before it"
+        );
+
+        let second = verify(&conn);
+        assert_eq!(second.failed, 0, "it read anyway");
+        let last = second
+            .last_full_read
+            .expect("the first verify is the last full read");
+        assert_eq!(last.by.as_deref(), Some("volume verify"));
+        let started: String = conn
+            .query_row(
+                "SELECT started_at FROM verification_sessions WHERE outcome = 'passed'
+                  ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.at, started);
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM verification_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(sessions, 2, "both verifies read and recorded");
+    }
+
+    /// The line item 218's verify prints, with and without an earlier full
+    /// read, and a write's full confirm named as one: the readback that ran
+    /// inside a `volume write` contact.
+    #[test]
+    fn the_last_full_read_line_names_when_and_by_what() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('L8-0001', 'lto', 'p', 10485760, 'sealed');
+             INSERT INTO cartridge_contacts (volume_id, operation, device, opened_at, closed_at)
+                 VALUES (1, 'volume write', '/dev/nst0', '2026-11-04 03:00:00',
+                         '2026-11-04 04:30:00');
+             INSERT INTO verification_sessions (volume_id, started_at, verify_type, outcome)
+                 VALUES (1, '2026-11-04 04:00:12', 'quick', 'passed'),
+                        (1, '2026-11-04 04:00:00', 'full', 'failed');",
+        )
+        .unwrap();
+        assert_eq!(
+            last_full_read(&conn, 1).unwrap(),
+            None,
+            "a quick readback and a failed full one are no full read"
+        );
+        assert_eq!(
+            last_full_read_line("L8-0001", None, Tier::Integrity),
+            "volume \"L8-0001\": no full read recorded yet; reading it in full now"
+        );
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, started_at, verify_type, outcome)
+             VALUES (1, '2026-11-04 04:01:00', 'full', 'passed')",
+            [],
+        )
+        .unwrap();
+        let last = last_full_read(&conn, 1)
+            .unwrap()
+            .expect("the write's full confirm");
+        assert_eq!(
+            last,
+            LastFullRead {
+                at: "2026-11-04 04:01:00".into(),
+                by: Some("volume write".into()),
+            }
+        );
+        assert_eq!(
+            last_full_read_line("L8-0001", Some(&last), Tier::Integrity),
+            "volume \"L8-0001\": last full read 2026-11-04 04:01 UTC (by volume write); \
+             reading it in full again now"
+        );
+        assert_eq!(
+            last_full_read_line("L8-0001", Some(&last), Tier::Navigable),
+            "volume \"L8-0001\": last full read 2026-11-04 04:01 UTC (by volume write); \
+             this quick verify reads only its map"
+        );
     }
 
     /// THE test for issue #142: a deliberately corrupted slice produces

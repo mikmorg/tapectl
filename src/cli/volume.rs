@@ -2606,6 +2606,14 @@ pub fn run(
                         // ADR-0012 2026-10-07 item 33 (#423), additive:
                         // `null` when this verify recorded nothing.
                         "figures": figures_json(report.figures.as_ref()),
+                        // ADR-0012 item 218, additive: the last full
+                        // readback before this verify (a write's full
+                        // confirm or a full verify), and the command it ran
+                        // under; `null` when none had passed.
+                        "last_full_read": report.last_full_read.as_ref().map(|r| serde_json::json!({
+                            "at": crate::render::json_time(&r.at),
+                            "by": r.by,
+                        })),
                     })
                 );
             } else {
