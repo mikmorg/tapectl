@@ -2507,3 +2507,206 @@ chose to move it now, to `/srv/archive_meta/tapectl/home`.
      `~/.tapectl` beside the home, and handoff (i) step 2's move of the old one is required, not
      tidiness. No binary changes and nothing on tape names the home: home2 keeps 1.8.1, and (i)
      runs `first-run.sh` from step 5 on from the master commit that carries this, not `v1.8.1`.
+
+Ruled 2026-11-03 and 2026-11-04, in a grilling of the decisions handoff (i) steps 1 to 6 had
+accrued (`docs/runs/2026-11-02-1.8.1-handoff-i.md`), which became a review of the CLI. Three
+agents reviewed the commands the docs and run records use most, against the debug build of
+1.8.1 at d1299da8, the last on mhvtl (`docs/audits/2026-11-04-cli-review.md`). The CTO ratified
+each recommendation; an item names the option where there was a choice. Settled without a
+question: the escrow identity is kept (item 194 holds), and hold-builds and a broker notice go
+up before each copy.
+
+198. **Staging stays on home2's unencrypted RAID0.** home-infra's `acache-rebuild` (commit
+     d97c305) rebuilt `/srv/acache` on 2026-10-31 as an unencrypted md RAID0 of 5.5 TB, and
+     `home2.profile`'s comment still described the old LUKS array. Staging holds no plaintext:
+     slices are encrypted in memory (#370) and the catalog snapshot is built in the home
+     (2026-10-06 item 4), so the disk's own encryption added nothing tapectl relies on. The
+     profile's comment is corrected.
+199. **tapectl diagnoses a staging directory the service user cannot reach; the host's script
+     grants the access** (option (b)). The rebuild recreated `/srv/acache` root:root 0710 without
+     `home2-prep.sh` part 4's `u:tapectl:x`, so (i) step 5 died at `first-run.sh`'s staging check,
+     which blamed the staging directory itself. The check now names the parent the service user
+     cannot traverse, prints the `setfacl` remedy, offers no `chown`, and tests existence as the
+     service user (#511's third defect). home-infra's `acache-rebuild` gains one line after its
+     `chmod 710`, `setfacl -m u:tapectl:x`; the coordinator makes that edit on home2 and shows the
+     CTO the diff before committing it.
+200. **`POST_WARNING_BYTES` is a host profile variable.** `first-run.sh` sets the drive's
+     `post_warning_bytes` from it after init; `home2.profile` sets 99008M and names its source,
+     `scripts/lto-profile.sh` on the HP LTO-6 (2026-10-20). A run without it says once what is
+     lost (planning past the fill ceiling, item 113; the slice cap, item 100) and points to
+     `docs/lto-profiling.md`.
+201. **The version rule, amended (amends 2026-09-30 item 2).** The minor version moves when
+     generated on-tape bytes change, or when a command or flag spelling is removed (item 203);
+     the patch for any other build installed on a production host. A change to scripts alone is
+     no release: nothing installed changes, and the run record names the commit the scripts ran
+     from. The CLI release below is therefore 1.9.0.
+202. **The broker notice before each copy asks for home2 quiet too,** from `volume init` to the
+     end of the full readback, not only for vm-desk1's builds to hold. The CTO gives the start
+     time about 15 minutes ahead.
+203. **A renamed command or flag loses its old spelling at once** (option (c)). The old spelling
+     is refused by name: the error gives the new spelling and the release that renamed it, and
+     exits 2, as a stale config key is refused by name. The exceptions are the three commands
+     every tape's File 1 prints, which work for good: `tapectl init --operator …
+     --escrow-public-key …`, `tapectl catalog rebuild --from-volume --device … --key …` and
+     `tapectl restore unit --unit … --device … --to … --key …`. The Heir Kit's cover sheet names
+     commands too; the kit carries its own tapectl, so its sheet and its binary agree, and a kit
+     is regenerated after a rename touches one of them.
+204. **`keepsake` leaves `home2.profile`; copies 1 and 2 are unchanged.** The CTO's ruling ("take
+     out the keepsake collection command and add instructions on how to add new collections")
+     takes the line out of the profile, so a fresh install configures no collection;
+     `first-run.sh` keeps `COLLECTIONS` for other profiles. The new home's `config.toml` keeps the
+     keepsake table (i) step 11 wrote, with its grants. `keepsake` is registered by `collection
+     sync` before copy 1, so both copies write it as (i) planned. The instructions are item 206.
+205. **Copy 1 waits for 1.9.0, which carries everything below** (option (c); amends the order
+     of items 195 and 197). Handoff (i) pauses after step 6. 1.9.0 is built, proven by the whole
+     chain, tagged, and installed on home2 by `first-run.sh --upgrade` with its rehearsal before
+     copy 1, so the fresh start's tapes and the operator's habits begin on the reviewed CLI. The
+     scripts batch that was to follow (i) ships inside it, proven by the same chain: #511's three
+     defects with item 199's diagnosis, item 200, item 198's comment, item 204. Nothing is at
+     risk meanwhile, since `keepsake` is on the old L6-0001 and L6-0002 and on disk; the accepted
+     cost is that those tapes carry 1.1.0's RESTORE.sh until they are rewritten.
+206. **`collection add` and `collection remove`.** `config add collections` accepted a missing or
+     relative root, an unknown tenant and an overlapping root, and nothing pointed to it. `tapectl
+     collection add NAME ROOT --tenant T [--unit-depth N] [--exclude G]… [--archive-set S]
+     [--no-dotfiles]` refuses each of those, checks that the service user can read the tree and
+     write each unit folder, prints the exact `setfacl` lines when it cannot (it runs as the
+     service user and cannot grant them), then shows the sync dry run. `collection remove NAME`
+     takes a collection out of the config and leaves its units. `config add collections` is
+     refused by name and points to it. The operator guide's "Adding a collection" is written
+     once, around the command.
+207. **"Pending" means what the glossary says,** a unit Never Archived or Dirty. `collection
+     status` prints both forms and the staged units (`3 pending (2 never archived, 1 dirty) · 3
+     staged, awaiting a write · 3 under-copied`), and `collection plan` lists the staged units
+     with the command that writes them. `stage list`, `staging status` and `report pending`, three
+     views of the same stage sets, become `stage list` with a copies column and `--owing`. The
+     JSON `pending` key takes the glossary's meaning, beside new `never_archived` and `staged`
+     keys, and "new" becomes "never archived". The glossary gains **Staged**.
+208. **The words follow the glossary.** The CLI says "drive" where it said backend (the glossary's
+     Store avoids "backend"); the config key `[[backends.lto]]` keeps its name (option (a)), since
+     renaming it would add a config migration to the upgrade copy 1 waits on. Every `<BARCODE>`
+     argument becomes `<CARTRIDGE>`, a barcode or the chip serial. `unit check-integrity` reports
+     a hash mismatch as CHANGED when the file's mtime moved since the snapshot and BITROT only
+     when it did not, provided the snapshot still records mtime (the build checks). Operator text
+     says File 0; "ID thunk" stays in the format documents. Text that contradicts the glossary is
+     fixed: "emergency/heir path", "end of tape" (early warning, or the hard end), `cartridge
+     list`'s "Type" (Generation), "partial tape" (unsealed), and the JSON `min_copies` keys that
+     carry the copy floor (`copy_floor`). The glossary gains the CLI's nouns.
+209. **The renames** (item 203 applies to each). `backend add` → `drive add`, and the `backend`
+     group goes. `staging clean` → `stage clean`; `staging status` and `report pending` → `stage
+     list`; the `staging` group goes. `unit status NAME` → `unit info NAME`, `--dirty` with it.
+     `catalog ls` → `catalog list`. `report supersedable` → `report reclaimable`. The top-level
+     `export` → `unit export` and `import` → `volume import`. `volume compact-write --destination`
+     → `--to`. `host check --unit` → `--systemd-unit`. `--dry-run` gains `-n`. Not renamed: `config
+     check` and `host check` (no merged `doctor`: host check runs before there is a config), the
+     `volume compact*` family and `quick-archive`. A rename in a tape command's group also lands in
+     `tapectl-op`'s list of tape commands and in `check-tapectl-op.sh`.
+210. **The unit is an argument** (option (a)). `restore unit`, `restore file`, `unit export` and
+     `volume read-slices` take the unit as a positional. The restore family keeps `--unit` beside
+     it, since File 1 prints `restore unit --unit` and an heir will type it on `restore file` too;
+     the other two take the positional only. `collection run [NAME]` defaults to the only
+     collection, takes one `--label`, and gains `--init` and `--move-to`. `snapshot create` takes
+     several units, and `--all-dirty`. `db backup [PATH]` and `key escrow-kit [DIR]` take
+     positionals; a directory gets a dated file name, and an existing backup is never overwritten
+     silently. `catalog rebuild --from-volume` shows as required. `key list` without `--tenant`
+     lists every tenant.
+211. **Help.** The global options sit under their own heading after the command's own. `-h` gives
+     one line per command and flag, `--help` the full text, and help wraps to the terminal. Help
+     names no code paths. The most-used commands get an EXAMPLES section. The top-level help is
+     grouped by job in workflow order: Set up, Sources, Stage and write, Check, Restore, Drive and
+     cartridges, Catalog and maintenance. `--verbose` says it is debug tracing. Shell completions
+     and man pages are installed, for `tapectl-op` too.
+212. **Output, JSON and exit codes.** Tables are aligned columns without boxes, in one header
+     case, fitted to the terminal. Times have one format, labelled UTC in tables and RFC 3339 with
+     `Z` in JSON. Sizes are human-readable everywhere under the decimal/binary rule (2026-09-14);
+     size input also accepts KiB to TiB, while a bare or SI suffix keeps its meaning in each field
+     (home2's `99008M` is unchanged). Plurals are real. Colour marks verdict words only, only on a
+     terminal, and never under `NO_COLOR` (option (b)). Under `--json`, errors are JSON on stdout
+     (`{"error": …, "exit_code": N}`), names replace database ids, each command has one shape, and
+     all of it is pretty-printed. One exit-code table is in the CLI reference, and each command's
+     `--help` states its own codes. An unknown `--unit` or `--tenant` is an error everywhere;
+     `collection sync` and `status` exit 1 for warnings and 2 for errors.
+213. **`status` is the home screen, and the home is always named** (option (a)). `tapectl status`
+     prints the home and why it was chosen, what is running, units by state (pending, staged,
+     under-copied), tapes due for a verify and the next commands. `report summary` is refused by
+     name and points to it; `status --json` keeps its keys and adds. The "not initialized" error
+     names the path and the rule that chose it, and offers `init` only for a new archive. Run as
+     root with `/etc/tapectl/home` present, tapectl refuses and names `tapectl-op` instead of
+     opening `/root/.tapectl`. `--home`'s help gives the whole search order, `config check` starts
+     with the home, and `init` ends with the next steps.
+214. **Config keys can be found, and planning needs no drive.** `config get KEY` gives the
+     effective value and where it came from. A bare key resolves against the schema
+     (`post_warning_bytes` → `backends.lto[lto6].post_warning_bytes`), and with one drive
+     `backends.lto.KEY` works. Key typos get a did-you-mean, types are named plainly, and errors
+     drop the excerpt of the file. `config check` reports, at exit 0, a missing drive, an unset
+     `post_warning_bytes` with its cost and `scripts/lto-profile.sh`, and a collection whose root
+     or tenant does not exist. `volume plan` and `collection plan` estimate from `--generation` or
+     the configured drive's generation and never open the device; `volume init` still decides
+     capacity (ADR-0010). An error for a missing drive names the real config path and `drive
+     add`, and `init`'s config template carries a commented `post_warning_bytes`.
+215. **`volume resume` keeps what the interrupted write asked for** (option (a)). The write
+     session records `--full-confirm` and `--move-to`, and a resume honours them and says so. On
+     mhvtl, a plain resume after a Ctrl-C past the seal ran only a quick confirm and never moved
+     the tape, and said nothing of either.
+216. **What a copy says at its end, and when the cartridge was not swapped.** A write's summary
+     says the volume is sealed and confirmed, with its units, slices and bytes and whether the full
+     readback passed, then the real next command: `--init`, and the location policy is still short
+     of. The LBP, chip-wear and feed-ratio blocks follow the summary, or move behind `-v` unless a
+     threshold trips; `collection run` ends the same way. With this catalog's sealed volume still
+     loaded, `volume init` and `write --init` name it as this catalog's live copy and say to eject
+     it and load a blank; the erase routes are offered only when the catalog does not hold the
+     volume or holds it retired, and the `mt` recipe moves to the troubleshooting guide. `volume
+     not found` suggests the nearest label, ignoring case. `collection run` on a label not yet
+     initialised says so. The erase prompt names whose volume it is, and the erase prints its
+     facts before its refusal, and once. The phrases scripts route on stay word for word: `write
+     completed`, `already carries a SEALED volume`, `volume not found`.
+217. **Staging is released unit by unit once each unit's copies are met** (option (b); amends the
+     all-or-nothing release of #440). After each write, every unit whose copy floor and copy
+     targets are met is released, as `staging clean` already does per unit, and the short units
+     stay staged. On mhvtl the all-or-nothing rule wrote two covered units a third time. Twin
+     copies stay twins: when copies 1 and 2 carry the same units, every unit is short until
+     copy 2.
+218. **One copy loop: `volume write … --full-confirm`** (option (a)). Its readback is the tape's
+     first full verify and is recorded as one; `volume verify --full` is for the periodic re-reads
+     `verify_interval_days` asks for, and `verify` says when the last full read was. `first-run.sh`
+     step 13 writes with `--full-confirm` and drops its separate verify, and the documented loops
+     follow. The second read cost 3 to 4 hours on a full LTO-6 and read the same bytes with the
+     same code minutes later.
+219. **A cartridge's first barcode is its first volume's label, and a drive's generation is read
+     from the drive.** `volume init` and `write --init` take `--barcode`; a cartridge with none, or
+     with its chip serial as a placeholder, takes the volume's label, the operator's practice
+     (L6-0001 on the sticker and on the tape), so handoff (i)'s `cartridge relabel` goes. The chip
+     serial stays the identity. `drive eject` names the volume and where it belongs. `drive add`
+     reads the generation from an attached drive and needs `--generation` only when the drive is
+     not attached.
+220. **The defects the reviews found are fixed in 1.9.0.**
+     - A failed dotfile write leaves a half-registered unit: `collection sync` and `unit init`
+       insert the row, then write the dotfile, with no transaction, and every later sync calls the
+       folder "nested". The fix is one transaction, a repair for rows already stuck, and an error
+       that names the missing `setfacl`.
+     - `audit --action-plan` gives a staged unit a fix that fails at its second command, and
+       reports each never-written unit twice.
+     - `collection sync --dry-run` predicts a different result than the real run (names are
+       checked only on the real run).
+     - `unit check-integrity` exits 0 on damaged or missing files; it exits 1, and the lifecycle
+       suite follows.
+     - `completions zsh | head` panics with exit 101.
+     - `report copies --unit nope` prints nothing and exits 0.
+     - One collection with a missing root fails `collection status` for every collection, and one
+       with a misspelled tenant shows as clean.
+     - `volume identify` ignores `--json`; the collection commands print two JSON shapes.
+     - `report fire-risk` says it checks locations and checks copies only.
+     - After an interrupted copy two hints disagree, and `volume info` shows `Status: initialized`
+       beside a `Sealed:` time.
+     - Raw tracing lines reach the operator, among them an heir's "matched no configured
+       [[backends.lto]] entry", twice, on a path with no config by design.
+     - `restore unit --dry-run` without `--from` refuses, though the real run finds the tape.
+     - `volume plan` plans one copy under a two-copy policy.
+     - The ssh warning prints before a mistyped label fails.
+     - `volume move` to the tape's current place prints "moved".
+221. **1.9.0 moves no byte on tape, and dated records keep their words.** No renamed command
+     appears in on-tape text, and on-tape text keeps its words where the CLI's change ("ID thunk"
+     in RESTORE.sh's comments, for one), so every golden pin holds; aligning them would be a
+     re-pin the CTO opens. `docs/runs`, `docs/audits` and the ADRs keep old spellings as history,
+     and item 203's refusals send a reader to the new ones. The glossary's new entries (Fill
+     ceiling; Catalog, Tenant, Unit, Snapshot, Staged, Cartridge, Volume, File 0, Drive and
+     Location; Barcode's first label) are in `CONTEXT.md`.
