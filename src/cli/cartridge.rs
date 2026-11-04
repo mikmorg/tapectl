@@ -327,7 +327,7 @@ pub enum CartridgeCommands {
     /// rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive
     /// cleaned` (against no contact). `drive status` records nothing, by
     /// design, and neither does any `--dry-run`: their reads are not here.
-    /// Lists the rows, oldest first; `--raw <ID>` prints one row's tool
+    /// Lists the rows, oldest first; `--raw <ROW>` prints one row's tool
     /// output exactly as captured.
     ///
     /// A cartridge's rows are found two ways: reads taken in a contact
@@ -348,7 +348,7 @@ pub enum CartridgeCommands {
         #[arg(long, conflicts_with = "barcode")]
         serial: Option<String>,
         /// Print this journal row's raw `sg_read_attr` output, byte for byte
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ROW")]
         raw: Option<i64>,
     },
 }

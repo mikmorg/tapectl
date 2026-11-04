@@ -50,7 +50,7 @@ pub enum CatalogCommands {
         all_versions: bool,
     },
 
-    /// Show which volume(s) contain a unit
+    /// Show which volumes hold a unit
     ///
     /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
     Locate {
