@@ -195,7 +195,9 @@ pub fn run(
                      name collisions as it goes; a faithful preview would duplicate that logic.",
                 ));
             }
-            let unit_id = crate::unit::init_unit_with_config(
+            // ADR-0012 item 220: a folder registered before 1.9.0 whose
+            // dotfile was never written is completed, not refused as nested.
+            let registration = crate::unit::register_unit(
                 conn,
                 config,
                 path,
@@ -204,13 +206,23 @@ pub fn run(
                 tag,
                 archive_set.as_deref(),
             )?;
+            let unit_id = registration.id();
             if json_output {
                 let unit =
                     queries::get_unit_by_name(conn, &resolve_unit_name(conn, unit_id)?)?.unwrap();
                 println!("{}", serde_json::to_string_pretty(&unit).unwrap());
             } else {
                 let unit_name = resolve_unit_name(conn, unit_id)?;
-                println!("unit \"{unit_name}\" initialized (id={unit_id})");
+                match registration {
+                    crate::unit::Registration::Created(_) => {
+                        println!("unit \"{unit_name}\" initialized (id={unit_id})")
+                    }
+                    crate::unit::Registration::Completed(_) => println!(
+                        "unit \"{unit_name}\" was registered without its {}; written now with \
+                         the unit's own identity (id={unit_id})",
+                        crate::unit::dotfile::UNIT_DOTFILE
+                    ),
+                }
             }
         }
 

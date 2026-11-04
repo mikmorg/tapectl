@@ -85,6 +85,10 @@ pub fn init_unit(
 /// Initialize a single unit at the given directory path. Its
 /// `units.checksum_mode` is the resolved policy's under `config`
 /// (`creation_checksum_mode`, issue #347).
+///
+/// The row and the dotfile go together or not at all (ADR-0012 item 220):
+/// see [`register_unit`], which this is, less which of its two outcomes it
+/// was.
 pub fn init_unit_with_config(
     conn: &Connection,
     config: &Config,
@@ -94,6 +98,133 @@ pub fn init_unit_with_config(
     tags: &[String],
     archive_set: Option<&str>,
 ) -> Result<i64> {
+    Ok(register_unit(
+        conn,
+        config,
+        dir_path,
+        tenant_name,
+        name_override,
+        tags,
+        archive_set,
+    )?
+    .id())
+}
+
+/// What [`register_unit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    /// A new unit: its row and its dotfile, written together.
+    Created(i64),
+    /// A unit registered before 1.9.0 whose dotfile was never written (the
+    /// half-registered unit, ADR-0012 item 220): its dotfile is written now,
+    /// with the row's own uuid, and its row is unchanged.
+    Completed(i64),
+}
+
+impl Registration {
+    pub fn id(self) -> i64 {
+        match self {
+            Registration::Created(id) | Registration::Completed(id) => id,
+        }
+    }
+}
+
+/// Register the directory at `dir_path` as a unit: [`plan_new_unit`]'s
+/// checks, then [`write_new_unit`], which commits the row only once the
+/// dotfile is on disk.
+///
+/// A directory the catalog already holds at exactly this path with no
+/// dotfile is the half-registered unit a dotfile write left before 1.9.0:
+/// it is completed ([`complete_registration`]), never reported as nested in
+/// itself. Its identity is the row's, so it is completed only for the
+/// tenant that owns it, and under its own name when `--name` is given.
+pub fn register_unit(
+    conn: &Connection,
+    config: &Config,
+    dir_path: &str,
+    tenant_name: &str,
+    name_override: Option<&str>,
+    tags: &[String],
+    archive_set: Option<&str>,
+) -> Result<Registration> {
+    if let Some(stuck) = half_registered_at(conn, dir_path)? {
+        // A collection with `dotfiles = false` registers its units by path,
+        // with no dotfile by design: such a unit is whole, not stuck.
+        let path = stuck.current_path.as_deref().unwrap_or(dir_path);
+        if let Some(lib) = config.collections.iter().find(|lib| {
+            !lib.dotfiles
+                && crate::collection::canonical_root(lib)
+                    .is_ok_and(|root| crate::collection::is_under_root(path, &root))
+        }) {
+            return Err(TapectlError::Other(format!(
+                "{path} is already registered as unit \"{}\" by collection \"{}\", which keeps \
+                 no {} in its folders (dotfiles = false)",
+                stuck.name,
+                lib.name,
+                dotfile::UNIT_DOTFILE
+            )));
+        }
+        let owner = tenant_name_of(conn, stuck.tenant_id)?;
+        if owner != tenant_name || name_override.is_some_and(|n| n != stuck.name) {
+            return Err(TapectlError::Other(format!(
+                "{} is already registered as unit \"{}\" (tenant \"{owner}\"), but its {} was \
+                 never written; run this again as `--tenant {owner}`{} to write it with that \
+                 unit's own identity",
+                stuck.current_path.as_deref().unwrap_or(dir_path),
+                stuck.name,
+                dotfile::UNIT_DOTFILE,
+                if name_override.is_some() {
+                    format!(" and `--name {}` or no --name", stuck.name)
+                } else {
+                    String::new()
+                },
+            )));
+        }
+        complete_registration(conn, &stuck).map_err(|e| TapectlError::Other(e.describe()))?;
+        return Ok(Registration::Completed(stuck.id));
+    }
+    let new = plan_new_unit(
+        conn,
+        config,
+        dir_path,
+        tenant_name,
+        name_override,
+        tags,
+        archive_set,
+    )?;
+    match write_new_unit(conn, &new) {
+        Ok(id) => Ok(Registration::Created(id)),
+        Err(RegisterError::Catalog(e)) => Err(e),
+        Err(RegisterError::Dotfile(e)) => Err(TapectlError::Other(e.describe())),
+    }
+}
+
+/// A unit about to be registered: every check registration makes, made,
+/// and nothing written. `collection sync --dry-run` stops here, so it
+/// refuses what the real run refuses (ADR-0012 item 220).
+#[derive(Debug, Clone)]
+pub struct NewUnit {
+    /// The directory, canonical.
+    pub path: String,
+    pub name: String,
+    pub tenant_id: i64,
+    pub tenant_name: String,
+    pub archive_set: Option<String>,
+    pub archive_set_id: Option<i64>,
+    pub checksum_mode: String,
+    pub tags: Vec<String>,
+}
+
+/// Every check [`register_unit`] makes before it writes, in its order.
+pub fn plan_new_unit(
+    conn: &Connection,
+    config: &Config,
+    dir_path: &str,
+    tenant_name: &str,
+    name_override: Option<&str>,
+    tags: &[String],
+    archive_set: Option<&str>,
+) -> Result<NewUnit> {
     let abs_path = std::fs::canonicalize(dir_path)
         .map_err(|_| TapectlError::UnitPathNotFound(dir_path.to_string()))?;
     let abs_str = abs_path.to_string_lossy().to_string();
@@ -107,7 +238,7 @@ pub fn init_unit_with_config(
     nesting::check_nesting(conn, &abs_str)?;
 
     // Check for existing dotfile
-    let dotfile_path = abs_path.join(".tapectl-unit.toml");
+    let dotfile_path = abs_path.join(dotfile::UNIT_DOTFILE);
     if dotfile_path.exists() {
         return Err(TapectlError::UnitAlreadyExists(abs_str));
     }
@@ -146,37 +277,107 @@ pub fn init_unit_with_config(
     // > [defaults].
     let checksum_mode = creation_checksum_mode(conn, config, &unit_name, archive_set_id, &abs_str)?;
 
-    let uuid = Uuid::new_v4().to_string();
-
-    // Insert into DB
-    let unit_id = queries::insert_unit(
-        conn,
-        &uuid,
-        &unit_name,
-        tenant.id,
+    Ok(NewUnit {
+        path: abs_str,
+        name: unit_name,
+        tenant_id: tenant.id,
+        tenant_name: tenant_name.to_string(),
+        archive_set: archive_set.map(str::to_string),
         archive_set_id,
-        &abs_str,
-        &checksum_mode,
-        true,
-    )?;
-    events::log_created(conn, "unit", unit_id, &unit_name, Some(tenant.id))?;
+        checksum_mode,
+        tags: tags.to_vec(),
+    })
+}
 
-    // Record initial path history
-    queries::update_unit_path(conn, unit_id, &abs_str)?;
+/// Why [`write_new_unit`] wrote nothing.
+#[derive(Debug)]
+pub enum RegisterError {
+    /// The catalog refused the row (a name taken since the plan, a busy
+    /// catalog). No dotfile was written.
+    Catalog(TapectlError),
+    /// The dotfile could not be written, so the row was rolled back.
+    Dotfile(DotfileUnwritable),
+}
 
-    // Add tags
-    for tag in tags {
-        queries::add_tag_to_unit(conn, unit_id, tag)?;
+/// A unit's `.tapectl-unit.toml` could not be written into its folder.
+#[derive(Debug)]
+pub struct DotfileUnwritable {
+    /// The folder, canonical.
+    pub dir: String,
+    pub cause: TapectlError,
+}
+
+impl DotfileUnwritable {
+    /// Permission was the reason: an ACL grant fixes it.
+    pub fn permission_denied(&self) -> bool {
+        matches!(&self.cause, TapectlError::Io(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied)
     }
 
-    // Create dotfile
+    /// The operator's line: what failed, as whom, and (for a permission
+    /// failure) the grant that fixes it.
+    pub fn describe(&self) -> String {
+        let user = effective_user_name();
+        let mut line = format!(
+            "cannot write {} in {} as user {user}: {}",
+            dotfile::UNIT_DOTFILE,
+            self.dir,
+            self.cause
+        );
+        if self.permission_denied() {
+            line.push_str(&format!(
+                "; grant it: sudo setfacl -m u:{user}:rwX {}",
+                shell_word(&self.dir)
+            ));
+        }
+        line
+    }
+}
+
+/// Write `new`'s row and its dotfile as one change (ADR-0012 item 220): the
+/// row, its creation event, its path history and its tags are written in a
+/// transaction that commits only once the dotfile is on disk, so a dotfile
+/// that cannot be written leaves no row. Before 1.9.0 the row was committed
+/// first, and a folder the user could not write was left registered with no
+/// dotfile, which every later sync called "nested" in itself.
+///
+/// The dotfile is written before the commit: a commit that then fails
+/// leaves a dotfile with no row, which the next `collection sync` or `unit
+/// discover` adopts under the same uuid, so the unit's identity holds
+/// either way. This removes a dotfile it wrote when the commit fails all
+/// the same, so `unit init` can simply be run again.
+pub fn write_new_unit(conn: &Connection, new: &NewUnit) -> std::result::Result<i64, RegisterError> {
+    let uuid = Uuid::new_v4().to_string();
+    let dotfile_path = Path::new(&new.path).join(dotfile::UNIT_DOTFILE);
+    let tx = Atomic::begin(conn).map_err(RegisterError::Catalog)?;
+    let unit_id = (|| -> Result<i64> {
+        let unit_id = queries::insert_unit(
+            conn,
+            &uuid,
+            &new.name,
+            new.tenant_id,
+            new.archive_set_id,
+            &new.path,
+            &new.checksum_mode,
+            true,
+        )?;
+        events::log_created(conn, "unit", unit_id, &new.name, Some(new.tenant_id))?;
+        // Record initial path history
+        queries::update_unit_path(conn, unit_id, &new.path)?;
+        for tag in &new.tags {
+            queries::add_tag_to_unit(conn, unit_id, tag)?;
+        }
+        Ok(unit_id)
+    })()
+    .map_err(RegisterError::Catalog)?;
+
     let dotfile_data = dotfile::UnitDotfile {
-        uuid: uuid.clone(),
-        name: unit_name.clone(),
+        uuid,
+        name: new.name.clone(),
         created: chrono::Utc::now().to_rfc3339(),
-        tags: tags.to_vec(),
-        tenant: tenant_name.to_string(),
-        archive_set: archive_set.map(|s| s.to_string()),
+        tags: new.tags.clone(),
+        tenant: new.tenant_name.clone(),
+        archive_set: new.archive_set.clone(),
         checksum_mode: None,
         compression: None,
         slice_size: None,
@@ -185,9 +386,204 @@ pub fn init_unit_with_config(
         copies_at: None,
         exclude_patterns: Vec::new(),
     };
-    dotfile::write_dotfile(&dotfile_path, &dotfile_data)?;
-
+    if let Err(cause) = dotfile::write_dotfile(&dotfile_path, &dotfile_data) {
+        // A write that failed part-way (a full disk) may have left a
+        // fragment; it was not there before (`plan_new_unit` checked).
+        let _ = std::fs::remove_file(&dotfile_path);
+        return Err(RegisterError::Dotfile(DotfileUnwritable {
+            dir: new.path.clone(),
+            cause,
+        }));
+    }
+    if let Err(e) = tx.commit() {
+        let _ = std::fs::remove_file(&dotfile_path);
+        return Err(RegisterError::Catalog(e));
+    }
     Ok(unit_id)
+}
+
+/// The unit the catalog holds at exactly `dir_path` when that folder has no
+/// dotfile: the half-registered unit (ADR-0012 item 220). `None` for a
+/// folder with a dotfile, a folder the catalog does not hold, or a path
+/// that does not resolve.
+pub fn half_registered_at(
+    conn: &Connection,
+    dir_path: &str,
+) -> Result<Option<crate::db::models::Unit>> {
+    let Ok(abs) = std::fs::canonicalize(dir_path) else {
+        return Ok(None);
+    };
+    if !abs.is_dir() || abs.join(dotfile::UNIT_DOTFILE).exists() {
+        return Ok(None);
+    }
+    queries::get_unit_by_path(conn, &abs.to_string_lossy())
+}
+
+/// Write the dotfile of a unit whose row exists and whose dotfile was never
+/// written (ADR-0012 item 220): the row's own uuid, name, tenant, archive
+/// set and tags, so the folder takes the identity the catalog already
+/// gave it. The row itself is unchanged; the completion is recorded as an
+/// event. Refuses (writing nothing) when a dotfile is already there.
+pub fn complete_registration(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+) -> std::result::Result<(), DotfileUnwritable> {
+    let dir = unit.current_path.clone().unwrap_or_default();
+    let fail = |cause: TapectlError| DotfileUnwritable {
+        dir: dir.clone(),
+        cause,
+    };
+    let dotfile_path = Path::new(&dir).join(dotfile::UNIT_DOTFILE);
+    if dotfile_path.exists() {
+        return Err(fail(TapectlError::UnitAlreadyExists(
+            dotfile_path.display().to_string(),
+        )));
+    }
+    let data = completed_dotfile(conn, unit).map_err(&fail)?;
+    if let Err(cause) = dotfile::write_dotfile(&dotfile_path, &data) {
+        let _ = std::fs::remove_file(&dotfile_path);
+        return Err(fail(cause));
+    }
+    events::log_field_change(
+        conn,
+        "unit",
+        unit.id,
+        &unit.name,
+        "dotfile_completed",
+        "dotfile",
+        None,
+        &dotfile_path.display().to_string(),
+        Some(unit.tenant_id),
+    )
+    .map_err(&fail)?;
+    Ok(())
+}
+
+/// The dotfile [`complete_registration`] writes for `unit`.
+fn completed_dotfile(
+    conn: &Connection,
+    unit: &crate::db::models::Unit,
+) -> Result<dotfile::UnitDotfile> {
+    let archive_set: Option<String> = match unit.archive_set_id {
+        Some(id) => Some(conn.query_row(
+            "SELECT name FROM archive_sets WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?),
+        None => None,
+    };
+    // `units.created_at` is `datetime('now')`, UTC without a zone; the
+    // dotfile's `created` is RFC 3339, as `write_new_unit` writes it.
+    let created = chrono::NaiveDateTime::parse_from_str(&unit.created_at, "%Y-%m-%d %H:%M:%S")
+        .map(|t| t.and_utc().to_rfc3339())
+        .unwrap_or_else(|_| unit.created_at.clone());
+    Ok(dotfile::UnitDotfile {
+        uuid: unit.uuid.clone(),
+        name: unit.name.clone(),
+        created,
+        tags: queries::get_tags_for_unit(conn, unit.id)?,
+        tenant: tenant_name_of(conn, unit.tenant_id)?,
+        archive_set,
+        checksum_mode: None,
+        compression: None,
+        slice_size: None,
+        warehouse_copies: None,
+        allow_spanning: None,
+        copies_at: None,
+        exclude_patterns: Vec::new(),
+    })
+}
+
+fn tenant_name_of(conn: &Connection, tenant_id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT name FROM tenants WHERE id = ?1",
+        rusqlite::params![tenant_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// The name of the user this process runs as (its effective uid), for the
+/// `setfacl` lines a refusal prints; the uid itself when it has no name.
+pub fn effective_user_name() -> String {
+    let uid = nix::unistd::geteuid();
+    match nix::unistd::User::from_uid(uid) {
+        Ok(Some(user)) => user.name,
+        _ => uid.as_raw().to_string(),
+    }
+}
+
+/// `s` as one shell word: bare when it holds only characters a shell
+/// leaves alone, single-quoted otherwise.
+pub fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@,=%".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Run `f`'s writes on `conn` as one change: all of them or none
+/// (see [`Atomic`]).
+pub(crate) fn atomically<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let tx = Atomic::begin(conn)?;
+    let value = f()?;
+    tx.commit()?;
+    Ok(value)
+}
+
+/// One atomic change on `conn`: an IMMEDIATE transaction (the busy policy's
+/// rule 2, `db::busy`) when none is open, a savepoint inside the caller's
+/// when one is. Rolled back on drop unless committed.
+struct Atomic<'c> {
+    conn: &'c Connection,
+    nested: bool,
+    done: bool,
+}
+
+const SAVEPOINT: &str = "tapectl_unit_registration";
+
+impl<'c> Atomic<'c> {
+    fn begin(conn: &'c Connection) -> Result<Self> {
+        let nested = !conn.is_autocommit();
+        if nested {
+            conn.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
+        } else {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            conn,
+            nested,
+            done: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.done = true;
+        if self.nested {
+            self.conn.execute_batch(&format!("RELEASE {SAVEPOINT}"))?;
+        } else if let Err(e) = self.conn.execute_batch("COMMIT") {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(e.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Atomic<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let sql = if self.nested {
+            format!("ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}")
+        } else {
+            "ROLLBACK".to_string()
+        };
+        let _ = self.conn.execute_batch(&sql);
+    }
 }
 
 /// Bulk-initialize units from a list of directories under a parent, each
