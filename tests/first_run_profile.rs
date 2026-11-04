@@ -557,6 +557,18 @@ fn step12_with(
     sg: &str,
     extra: &[&str],
 ) -> (Output, String) {
+    step12_sg(rig, service, timer, sg, extra, "exit 0")
+}
+
+/// `step12_with`, with `sg_read_attr`'s stub body given (`sh`).
+fn step12_sg(
+    rig: &Rig,
+    service: &str,
+    timer: &str,
+    sg: &str,
+    extra: &[&str],
+    sg_read_attr: &str,
+) -> (Output, String) {
     let bin = rig.p("bin");
     let calls = rig.p("calls");
     // One run's calls: a rig may run the step more than once.
@@ -583,7 +595,7 @@ exit 0"#
         ),
     );
     stub(&bin, "age", "exit 0");
-    stub(&bin, "sg_read_attr", "exit 0");
+    stub(&bin, "sg_read_attr", sg_read_attr);
     // A TEST_BARCODE from the profile, not from --barcode: the rehearsal is
     // offered, and under --auto its erase is refused (a default is never consent).
     let profile = rig.profile("p.profile", "TEST_BARCODE=TESTSERIAL\n");
@@ -690,6 +702,122 @@ fn step_12_waits_for_a_running_poll_and_leaves_an_inactive_timer_alone() {
     );
     assert!(!calls.contains("sudo systemctl"), "{calls}");
     assert!(!out.contains("THE DRIVE POLL"), "{out}");
+}
+
+// ------------------------------------------- step 12: the chip's preview (#511)
+
+/// The question step 12 asks for the test cartridge's serial.
+const SERIAL_QUESTION: &str = "medium serial of the TEST cartridge in the drive";
+
+/// #511's first defect: on 2026-11-02 the drive was empty, the preview printed
+/// nothing, and step 12 asked for the serial "as printed above". Now Not Ready
+/// refuses with sg_read_attr's own words, before anything is asked, without a
+/// second read, and the poll timer the step stopped is started again.
+#[test]
+fn step_12_refuses_a_drive_that_is_not_ready_before_asking_for_the_serial() {
+    let rig = Rig::new();
+    let calls = rig.p("calls");
+    let (o, calls) = step12_sg(
+        &rig,
+        "inactive",
+        "active",
+        "/dev/null",
+        &[],
+        &format!(
+            "echo \"sg_read_attr $*\" >> {}\n\
+             echo 'Read attribute failed: Not ready, medium not present' >&2\nexit 2",
+            calls.display()
+        ),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}\n{calls}");
+    assert!(
+        err.contains(
+            "the drive is not ready: sg_read_attr /dev/null exited 2: \
+             Read attribute failed: Not ready, medium not present"
+        ) && err.contains("nothing was asked and nothing was erased"),
+        "{err}"
+    );
+    assert!(!out.contains(SERIAL_QUESTION), "the serial was asked: {out}");
+    assert!(!out.contains("supplied via a flag"), "{out}");
+    assert_eq!(
+        calls.matches("sg_read_attr /dev/null").count(),
+        1,
+        "Not Ready is not read again: {calls}"
+    );
+    stop_then_start(&calls);
+}
+
+/// #511's first defect, the other two answers. A unit attention (the first
+/// command after the cartridge loaded, 2026-11-02 23:32) is read again, once,
+/// and the chip's serial is shown before the question. Any other failure says
+/// what failed, with sg_read_attr's words and exit status, and the step goes on
+/// to the question (the suite checks the serial against the chip itself).
+#[test]
+fn step_12_reads_the_chip_again_on_a_unit_attention_and_says_what_else_failed() {
+    let rig = Rig::new();
+    let calls = rig.p("calls");
+    let count = rig.p("sg-count");
+    let (o, calls_seen) = step12_sg(
+        &rig,
+        "inactive",
+        "inactive",
+        "/dev/null",
+        &[],
+        &format!(
+            "echo \"sg_read_attr $*\" >> {calls}\n\
+             n=$(cat {count} 2>/dev/null || echo 0); echo $((n + 1)) > {count}\n\
+             if [ \"$n\" = 0 ]; then echo 'Read attribute failed: Unit attention' >&2; exit 6; fi\n\
+             echo '  Medium serial number: TESTSERIAL'",
+            calls = calls.display(),
+            count = count.display()
+        ),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}\n{err}\n{calls_seen}");
+    assert!(
+        out.contains("a unit attention (exit 6)") && out.contains("reading the chip again"),
+        "{out}"
+    );
+    assert_eq!(
+        calls_seen.matches("sg_read_attr /dev/null").count(),
+        2,
+        "{calls_seen}"
+    );
+    let serial = out
+        .find("Medium serial number: TESTSERIAL")
+        .unwrap_or_else(|| panic!("the chip's serial was not shown: {out}"));
+    let question = out
+        .find(SERIAL_QUESTION)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(serial < question, "{out}");
+
+    let (o, calls_seen) = step12_sg(
+        &rig,
+        "inactive",
+        "inactive",
+        "/dev/null",
+        &[],
+        &format!(
+            "echo \"sg_read_attr $*\" >> {}\n\
+             echo 'sg_read_attr: open error: Permission denied' >&2\nexit 15",
+            calls.display()
+        ),
+    );
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}\n{err}\n{calls_seen}");
+    let failed = out
+        .find("sg_read_attr /dev/null failed (exit 15): sg_read_attr: open error: Permission denied")
+        .unwrap_or_else(|| panic!("{out}"));
+    let question = out
+        .find(SERIAL_QUESTION)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(failed < question, "{out}");
+    assert_eq!(
+        calls_seen.matches("sg_read_attr /dev/null").count(),
+        1,
+        "{calls_seen}"
+    );
 }
 
 // ------------------------------------------- step 12: a cartridge the catalog knows

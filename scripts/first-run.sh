@@ -632,6 +632,54 @@ drive_poll_resume() {
   return 0
 }
 drive_poll_on_exit() { local rc=$?; drive_poll_resume; return "$rc"; }
+# An sg3_utils tool's exit status is the sense category of a failed command
+# (sg3_utils(8)): 2 not ready, 6 unit attention. The words are matched too, for
+# a wrapper that does not pass the status on. A unit attention is asked about
+# first and is never "not ready": its usual additional sense after a load,
+# "Not ready to ready change, medium may have changed", says "not ready" too.
+sg_unit_attention() { [ "$1" = 6 ] || printf '%s\n' "$2" | grep -i 'unit attention' >/dev/null; }
+sg_not_ready() {
+  sg_unit_attention "$1" "$2" && return 1
+  [ "$1" = 2 ] || printf '%s\n' "$2" | grep -i 'not ready' >/dev/null
+}
+# mam_preview (#511): step 12's look at the loaded cartridge's chip, before the
+# serial is asked for. sg_read_attr runs as you when your login can open the sg
+# node (the tape group can on home2), and with sudo only when it cannot: on a
+# host whose sudo asks for a password, an unattended run used to hang here.
+#   - A unit attention (the drive's first answer after a cartridge loads, or
+#     after a reset) is read again, once.
+#   - Not ready (no cartridge, or one still loading) refuses with sg's own words
+#     before anything is asked: on 2026-11-02 the preview printed nothing, twice,
+#     and the operator typed the serial from memory for an empty drive.
+#   - Any other failure says what failed and goes on to the question: the
+#     suite reads the chip itself and refuses a serial that is not the loaded one.
+mam_preview() {
+  local out="" rc=0 try pre=()
+  if [ -z "$SG" ]; then
+    note "no sg node for $DEVICE, so the chip is not read here: type the serial printed on the cartridge; the suite checks it against the chip"
+    return 0
+  fi
+  if ! { [ -r "$SG" ] && [ -w "$SG" ]; }; then pre=(sudo); fi
+  for try in 1 2; do
+    rc=0
+    printf '   %s$ %ssg_read_attr %s%s\n' "$B" "${pre[*]:+${pre[*]} }" "$SG" "$R"
+    log "\$ ${pre[*]:+${pre[*]} }sg_read_attr $SG"
+    out="$(${pre[@]+"${pre[@]}"} sg_read_attr "$SG" 2>&1)" || rc=$?
+    printf '%s\n' "$out" >>"$LOG"
+    if [ "$rc" = 0 ]; then
+      printf '%s\n' "$out" | grep -iE "Medium serial|manufacturer" \
+        || note "sg_read_attr $SG answered, but named no medium serial: type the serial printed on the cartridge; the suite checks it against the chip"
+      return 0
+    fi
+    if ! sg_unit_attention "$rc" "$out" || [ "$try" = 2 ]; then break; fi
+    note "sg_read_attr $SG: a unit attention (exit $rc), the drive's first answer after a cartridge loads or a reset; reading the chip again"
+  done
+  out="$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+  if sg_not_ready "$rc" "$out"; then
+    die "the drive is not ready: sg_read_attr $SG exited $rc: $out. No cartridge is loaded, or it is still loading; nothing was asked and nothing was erased. Load the TEST cartridge, wait for the drive to settle, then re-run scripts/first-run.sh --from 12"
+  fi
+  note "sg_read_attr $SG failed (exit $rc): $out. The chip could not be read here: type the serial printed on the cartridge; the suite checks it against the chip"
+}
 # The DRIVE's own generation, parsed from its INQUIRY product id (issue #178).
 # shellcheck source=lib/drive-generation.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/drive-generation.sh"
@@ -2072,13 +2120,8 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     svc_in_group "$USER" "$DEVGRP" || die "$USER is not in group $DEVGRP — cannot run the rehearsal"
     WRAP=(sg "$DEVGRP" -c)   # this login predates the membership; sg opens a shell with it now
   fi
-  # Step 12 runs as you: read the chip directly when your login can open the
-  # SG node (the tape group can on home2), sudo only when it cannot. On a host
-  # whose sudo asks for a password, an unattended run used to hang here.
-  if [ -n "$SG" ]; then
-    if [ -r "$SG" ] && [ -w "$SG" ]; then run sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true
-    else run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
-  fi
+  # Step 12 runs as you; the chip is read before the serial is asked for.
+  mam_preview
   ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
   if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
