@@ -2278,7 +2278,7 @@ fn report_left_initialized(
 ) {
     eprintln!("{}", left_initialized_line(conn, req.label, init.volume_id));
     if req.json_output {
-        crate::render::print_json(&left_initialized_json(req.label, init, error));
+        println!("{}", left_initialized_json(req.label, init, error));
     }
 }
 
