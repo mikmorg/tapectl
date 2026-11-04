@@ -1943,6 +1943,67 @@ pub fn unit_shortfall(
     )
 }
 
+// ── Where the next copy goes (ADR-0012 items 213 and 216) ──
+
+/// What a set of units still needs after a copy, for the next command a
+/// write ends with (ADR-0012 item 216) and `status` names (item 213).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextCopy {
+    /// Every unit meets its copy floor and every per-location target: there
+    /// is nothing to write for them.
+    Covered,
+    /// At least one is short. `location` is the place a `copies_at` target
+    /// is still unmet: a target with no copy there before one with too few,
+    /// then the larger shortfall, then the name. `None` when only a copy
+    /// floor is short, so no policy names the place.
+    Owed { location: Option<String> },
+}
+
+/// [`NextCopy`] for `unit_ids`, judged by [`unit_shortfall`] — the copy
+/// floor and every per-location target, through the one tape-only rule, the
+/// same terms the release after a write keeps a unit's staging for (item
+/// 217). Statements per unit: its row, its policy, its copies, and its copies
+/// at its targets when it has any.
+pub fn next_copy(
+    conn: &Connection,
+    config: &crate::config::Config,
+    unit_ids: &[i64],
+) -> crate::error::Result<NextCopy> {
+    use std::cmp::Reverse;
+    let mut owed = false;
+    // (has no copy there, short by, the name reversed): the largest is the
+    // place to name, so the first name wins a tie.
+    let mut place: Option<(bool, i64, Reverse<String>)> = None;
+    for &unit_id in unit_ids {
+        let name: String = conn.query_row(
+            "SELECT name FROM units WHERE id = ?1",
+            params![unit_id],
+            |r| r.get(0),
+        )?;
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, &name)? else {
+            continue;
+        };
+        let short = unit_shortfall(conn, config, &unit)?;
+        if !short.any() {
+            continue;
+        }
+        owed = true;
+        for at in &short.locations {
+            let key = (at.copies == 0, at.short_by(), Reverse(at.location.clone()));
+            if place.as_ref().is_none_or(|best| key > *best) {
+                place = Some(key);
+            }
+        }
+    }
+    Ok(if owed {
+        NextCopy::Owed {
+            location: place.map(|(_, _, Reverse(name))| name),
+        }
+    } else {
+        NextCopy::Covered
+    })
+}
+
 // ── Copy distinctness at plan time (ADR-0012 2026-10-07 item 26, #144) ──
 
 /// A copy that already exists of a version a write is about to put on a
@@ -7246,5 +7307,83 @@ pub(crate) mod tests {
             describe_targets(&btree(&[("garage", 0), ("home", 2), ("offsite", 1)])),
             "2 at home, 1 at offsite"
         );
+    }
+
+    /// ADR-0012 item 216: the next copy of a set of units goes where a
+    /// `copies_at` target is unmet — a place with no copy before one with
+    /// too few — or, when only a copy floor is short, to no place a policy
+    /// names; and nowhere when every unit is covered.
+    #[test]
+    fn next_copy_names_the_place_policy_is_still_short_of() {
+        use crate::staging::release::fixtures::{add_write, config, staged_version, tenant, unit};
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        conn.execute_batch(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf');
+             INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');
+             INSERT INTO locations (name, kind) VALUES ('vault', 'shelf');",
+        )
+        .unwrap();
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+        let shelve = |label: &str, place: &str| {
+            conn.execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = ?2)
+                  WHERE label = ?1",
+                params![label, place],
+            )
+            .unwrap();
+        };
+        add_write(&conn, &a, "V-1", "sealed", "completed");
+        add_write(&conn, &b, "V-1", "sealed", "completed");
+        shelve("V-1", "home");
+
+        // Short of the floor, no targets: owed, and no place is named.
+        assert_eq!(
+            next_copy(&conn, &config, &[alpha, beta]).unwrap(),
+            NextCopy::Owed { location: None }
+        );
+
+        // Beta's targets: two at home (one there), one at vault and one at
+        // offsite (none there). A place with no copy comes first, then the
+        // name: offsite.
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":2,\"offsite\":1,\"vault\":1}'
+              WHERE id = ?1",
+            params![beta],
+        )
+        .unwrap();
+        assert_eq!(
+            next_copy(&conn, &config, &[alpha, beta]).unwrap(),
+            NextCopy::Owed {
+                location: Some("offsite".into())
+            }
+        );
+
+        // Copies at offsite and vault: home is the place still short.
+        add_write(&conn, &a, "V-2", "sealed", "completed");
+        add_write(&conn, &b, "V-2", "sealed", "completed");
+        shelve("V-2", "offsite");
+        add_write(&conn, &b, "V-3", "sealed", "completed");
+        shelve("V-3", "vault");
+        assert_eq!(
+            next_copy(&conn, &config, &[alpha, beta]).unwrap(),
+            NextCopy::Owed {
+                location: Some("home".into())
+            }
+        );
+
+        // Every target met and alpha at its floor: nothing to do.
+        add_write(&conn, &b, "V-4", "sealed", "completed");
+        shelve("V-4", "home");
+        assert_eq!(
+            next_copy(&conn, &config, &[alpha, beta]).unwrap(),
+            NextCopy::Covered
+        );
+        assert_eq!(next_copy(&conn, &config, &[]).unwrap(), NextCopy::Covered);
     }
 }

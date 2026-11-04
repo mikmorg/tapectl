@@ -306,12 +306,19 @@ fn staged_whole_sets(conn: &Connection, unit_ids: &[i64]) -> Result<Vec<(i64, i6
     ))?;
     let mut rows = stmt
         .query_map(rusqlite::params_from_iter(unit_ids.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.sort_by_key(|(set, unit, _)| {
         (
-            unit_ids.iter().position(|u| u == unit).unwrap_or(usize::MAX),
+            unit_ids
+                .iter()
+                .position(|u| u == unit)
+                .unwrap_or(usize::MAX),
             *set,
         )
     });
@@ -868,7 +875,10 @@ mod tests {
         assert_eq!(named, ["unit testlib/beta has 1 copy, needs 2"]);
         assert_eq!(out.released_units, ["testlib/alpha"]);
         assert_eq!(out.cleaned.expect("alpha is covered").sets_cleaned, 1);
-        assert!(!a.file.exists(), "the covered unit does not wait for the short one");
+        assert!(
+            !a.file.exists(),
+            "the covered unit does not wait for the short one"
+        );
         assert_eq!(stage_set_status(&conn, a.stage_set_id), "cleaned");
         assert!(b.file.exists(), "the next copy reuses beta's staged bytes");
         assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
@@ -1054,8 +1064,10 @@ mod tests {
                     .iter()
                     .map(|p| p.describe())
                     .collect::<Vec<_>>(),
-                ["unit testlib/alpha has 2 copies, its floor 2; still needed: 0 copies at \
-                  required location offsite, needs 1"],
+                [
+                    "unit testlib/alpha has 2 copies, its floor 2; still needed: 0 copies at \
+                  required location offsite, needs 1"
+                ],
                 "{hold:?}"
             );
             assert!(s.file.exists(), "{hold:?}");
@@ -1364,7 +1376,10 @@ mod tests {
         let ids = unit_ids_written_to(&conn, "V-T1").unwrap();
         assert_eq!(ids, [alpha, beta]);
         let out = release_if_covered(&conn, &config, &ids).unwrap();
-        assert!(out.cleaned.is_none(), "beta, the one unit judged whole, is short");
+        assert!(
+            out.cleaned.is_none(),
+            "beta, the one unit judged whole, is short"
+        );
         assert_eq!(
             out.under_copied
                 .iter()
@@ -1551,8 +1566,10 @@ mod tests {
                 .iter()
                 .map(|p| p.describe())
                 .collect::<Vec<_>>(),
-            ["unit testlib/beta has 2 copies, its floor 2; still needed: 0 copies at \
-              required location offsite, needs 1"]
+            [
+                "unit testlib/beta has 2 copies, its floor 2; still needed: 0 copies at \
+              required location offsite, needs 1"
+            ]
         );
         assert_eq!(stage_set_status(&conn, a.stage_set_id), "cleaned");
         assert!(!a.file.exists());
@@ -1589,8 +1606,12 @@ mod tests {
         for s in &sets {
             add_write(&conn, s, "V-COPY1", "sealed", "completed");
         }
-        let out = release_if_covered(&conn, &config, &unit_ids_written_to(&conn, "V-COPY1").unwrap())
-            .unwrap();
+        let out = release_if_covered(
+            &conn,
+            &config,
+            &unit_ids_written_to(&conn, "V-COPY1").unwrap(),
+        )
+        .unwrap();
         assert!(out.cleaned.is_none() && out.released_units.is_empty());
         assert_eq!(
             out.under_copied
@@ -1603,13 +1624,20 @@ mod tests {
                 "unit testlib/gamma has 1 copy, needs 4 (tape-only 2x)",
             ]
         );
-        assert!(sets.iter().all(|s| s.file.exists()), "every twin is short until copy 2");
+        assert!(
+            sets.iter().all(|s| s.file.exists()),
+            "every twin is short until copy 2"
+        );
 
         for s in &sets {
             add_write(&conn, s, "V-COPY2", "sealed", "completed");
         }
-        let out = release_if_covered(&conn, &config, &unit_ids_written_to(&conn, "V-COPY2").unwrap())
-            .unwrap();
+        let out = release_if_covered(
+            &conn,
+            &config,
+            &unit_ids_written_to(&conn, "V-COPY2").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out.released_units, ["testlib/alpha", "testlib/beta"]);
         assert_eq!(out.cleaned.expect("the twins are covered").sets_cleaned, 2);
         assert_eq!(
@@ -1651,9 +1679,8 @@ mod tests {
         add_write(&conn, &b, "V-3", "sealed", "completed");
         shelve(&conn, "V-3", "offsite");
 
-        let out =
-            release_if_covered_holding(&conn, &config, &[alpha, beta], Hold::EveryLocation)
-                .unwrap();
+        let out = release_if_covered_holding(&conn, &config, &[alpha, beta], Hold::EveryLocation)
+            .unwrap();
 
         assert_eq!(out.released_units, ["testlib/alpha"]);
         assert_eq!(out.under_copied.len(), 1, "{:?}", out.under_copied);

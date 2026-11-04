@@ -170,10 +170,12 @@ pub enum CollectionCommands {
     },
 
     /// Execute one batch: stage every unit in it once, write one session to
-    /// the destination label, then release staging IF that copy already
-    /// meets every unit's copy floor (the larger of its policy's
-    /// `min_copies` and the sum of its `copies_at` targets) — otherwise staging is
-    /// retained for the further copies still needed. Targets a
+    /// the destination label, then release the staging of each unit that
+    /// copy brings to its copy floor (the larger of its policy's
+    /// `min_copies` and the sum of its `copies_at` targets) and every
+    /// `copies_at` target; a unit still short keeps its staging for the
+    /// further copies (ADR-0012 item 217). Ends with what the copy holds and
+    /// the next copy's command. Targets a
     /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
     /// action.
@@ -1526,6 +1528,10 @@ fn cmd_run(
     // A stage set released whole, or slice by slice to its last slice (#478).
     let sets_released =
         report.cleaned.as_ref().map_or(0, |c| c.sets_cleaned) + report.slices.sets_cleaned;
+    // ADR-0012 item 216: the run ends as `volume write` does, with what the
+    // copy holds and the next copy's command. Best-effort: the copy stands.
+    let summary = crate::volume::write::copy_summary(conn, destination).ok();
+    let next = crate::cli::volume::next_copy_after(conn, config, destination);
     if json_output {
         println!(
             "{}",
@@ -1569,6 +1575,11 @@ fn cmd_run(
                 // again.
                 "stranded": stranded,
                 "release_warning": report.release_warning,
+                // ADR-0012 item 216, additive, as `volume write --json` has
+                // them: what the copy holds, and the next copy's command
+                // (null when every unit is covered or the catalog could not say).
+                "summary": summary,
+                "next_command": next.as_ref().and_then(crate::cli::volume::next_copy_command),
                 "snapshot_path": report.snapshot_path,
                 "snapshot_release_warning": report.snapshot_release_warning,
                 "refused": refused_json(refused),
@@ -1581,6 +1592,9 @@ fn cmd_run(
             report.units_staged,
             crate::render::plural(report.copies_written as i64, "copy", "copies"),
         );
+        if let Some(summary) = &summary {
+            println!("{}", summary.line());
+        }
         // The release block `volume write` prints (ADR-0012 items 216 and
         // 217): the units released, the units kept and why, the slices of a
         // set that spans cartridges. Its stranded files were named above.
@@ -1606,6 +1620,10 @@ fn cmd_run(
             for line in err {
                 eprintln!("{line}");
             }
+        }
+        // The next copy's command, where "swap in the next cartridge" was.
+        if let Some(next) = &next {
+            println!("{}", crate::cli::volume::next_copy_line(next));
         }
     }
     Ok(exit_code)

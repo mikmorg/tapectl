@@ -5508,6 +5508,98 @@ pub fn recorded_ending(conn: &Connection, label: &str) -> Result<RecordedEnding>
     })
 }
 
+/// What a sealed and confirmed volume holds, for the summary a copy ends
+/// with (ADR-0012 item 216): read from the catalog once the write returned
+/// `Ok`, never from the session that wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CopySummary {
+    /// The units with a `completed` write or a `range` on the volume.
+    pub units: i64,
+    /// The slices written there (`write_positions` `written`).
+    pub slices: i64,
+    /// Those slices' bytes on tape (their encrypted sizes): the bytes the
+    /// write put on tape, the files around them aside.
+    pub bytes: i64,
+    /// The newest passing readback's kind, `"full"` or `"quick"` (the tier
+    /// the confirm ran, which a refusal under Logical Block Protection raises
+    /// to full, ADR-0012 item 186); `None` when none is recorded.
+    pub readback: Option<String>,
+}
+
+impl CopySummary {
+    /// `sealed and confirmed: 4 units, 12 slices, 3.2 GiB; full readback
+    /// passed`, every data size in binary units as everywhere else.
+    pub fn line(&self) -> String {
+        let readback = match self.readback.as_deref() {
+            Some(kind) => format!("{kind} readback passed"),
+            None => "readback passed".to_string(),
+        };
+        format!(
+            "sealed and confirmed: {}, {}, {}; {readback}",
+            crate::render::plural(self.units, "unit", "units"),
+            crate::render::plural(self.slices, "slice", "slices"),
+            progress::format_bytes(self.bytes.max(0) as u64),
+        )
+    }
+}
+
+/// [`CopySummary`] of the volume labelled `label`: three statements.
+pub fn copy_summary(conn: &Connection, label: &str) -> Result<CopySummary> {
+    let units: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT sn.unit_id) FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_sets ss ON ss.id = w.stage_set_id
+           JOIN snapshots sn ON sn.id = ss.snapshot_id
+          WHERE v.label = ?1 AND w.status IN ('completed', 'range')",
+        params![label],
+        |r| r.get(0),
+    )?;
+    let (slices, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(sl.encrypted_bytes), 0) FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+          WHERE v.label = ?1 AND w.status IN ('completed', 'range') AND wp.status = 'written'",
+        params![label],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let readback: Option<String> = conn
+        .query_row(
+            "SELECT vs.verify_type FROM verification_sessions vs
+               JOIN volumes v ON v.id = vs.volume_id
+              WHERE v.label = ?1 AND vs.outcome = 'passed'
+              ORDER BY vs.id DESC LIMIT 1",
+            params![label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(CopySummary {
+        units,
+        slices,
+        bytes,
+        readback,
+    })
+}
+
+/// The units a write of the volume labelled `label` was planned to carry:
+/// those with a `completed`, `range` or `cut` write on it, in id order. The
+/// cut ones are still owed a copy, so the next command a write ends with
+/// judges them too (ADR-0012 item 216).
+pub fn units_planned_onto(conn: &Connection, label: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sn.unit_id FROM writes w
+           JOIN volumes v ON v.id = w.volume_id
+           JOIN stage_sets ss ON ss.id = w.stage_set_id
+           JOIN snapshots sn ON sn.id = ss.snapshot_id
+          WHERE v.label = ?1 AND w.status IN ('completed', 'range', 'cut')
+          ORDER BY sn.unit_id",
+    )?;
+    let ids = stmt
+        .query_map(params![label], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
 /// A unit a volume holds as a range (#478, `writes.status = 'range'`): the
 /// run of its stage set's slices `written` there, by slice number.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -10269,6 +10361,70 @@ mod tests {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
+    }
+
+    /// ADR-0012 item 216: what a sealed and confirmed volume holds, for the
+    /// summary a copy ends with. A unit written whole and a unit's range
+    /// both count as units on it; only the slices `written` there count, at
+    /// their bytes on tape; the readback is the newest that passed, and a
+    /// cut unit is planned onto the volume without being on it.
+    #[test]
+    fn the_copy_summary_counts_what_the_volume_holds() {
+        use crate::staging::release::fixtures::{
+            add_write, cut_from, range_on, staged_span, staged_version, tenant, unit,
+        };
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let t = tenant(&conn);
+        let a = unit(&conn, t, "a");
+        let b = unit(&conn, t, "b");
+        let c = unit(&conn, t, "c");
+        let (whole, _) = staged_span(&conn, a, 1, "current", dir.path(), 2);
+        add_write(&conn, &whole, "V-SUM", "sealed", "completed");
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             SELECT (SELECT MAX(id) FROM writes), id, CAST(10 + slice_number AS TEXT), 'written'
+               FROM stage_slices WHERE stage_set_id = ?1",
+            params![whole.stage_set_id],
+        )
+        .unwrap();
+        let (span, _) = staged_span(&conn, b, 1, "staged", dir.path(), 3);
+        range_on(&conn, &span, "V-SUM", 1..=1);
+        let cut = staged_version(&conn, c, 1, "staged", dir.path(), 0);
+        cut_from(&conn, &cut, "V-SUM", 13);
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             SELECT id, 'full', 'passed' FROM volumes WHERE label = 'V-SUM'",
+            [],
+        )
+        .unwrap();
+
+        let summary = copy_summary(&conn, "V-SUM").unwrap();
+        assert_eq!(
+            summary,
+            CopySummary {
+                units: 2,
+                slices: 3,
+                bytes: 3 * 19,
+                readback: Some("full".into()),
+            }
+        );
+        assert_eq!(
+            summary.line(),
+            "sealed and confirmed: 2 units, 3 slices, 57 B; full readback passed"
+        );
+        let quick = CopySummary {
+            units: 1,
+            slices: 1,
+            bytes: 13_210_000_000,
+            readback: Some("quick".into()),
+        };
+        assert_eq!(
+            quick.line(),
+            "sealed and confirmed: 1 unit, 1 slice, 12.3 GiB; quick readback passed"
+        );
+        assert_eq!(units_planned_onto(&conn, "V-SUM").unwrap(), [a, b, c]);
+        assert_eq!(copy_summary(&conn, "V-NONE").unwrap().units, 0);
     }
 
     /// THE test for issue #142: a deliberately corrupted slice produces

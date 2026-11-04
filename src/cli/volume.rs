@@ -1764,6 +1764,12 @@ struct WriteDone {
     ending: write::RecordedEnding,
     release: StagingRelease,
     moved: MoveAfterWrite,
+    /// What the volume holds, for the summary after `write completed`
+    /// (ADR-0012 item 216); `None` when the catalog could not say.
+    summary: Option<write::CopySummary>,
+    /// What the units the write was for still need, for the next command
+    /// it ends with (item 216); `None` when the catalog could not say.
+    next: Option<crate::policy::coverage::NextCopy>,
 }
 
 /// `volume write`, with its optional `--init` before and `--move-to` after
@@ -1844,13 +1850,58 @@ fn write_and_follow(
     let ending = write::recorded_ending(conn, req.label).unwrap_or_default();
     let moved = move_after_write(conn, req.label, req.move_to);
     let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
+    // ADR-0012 item 216: the summary and the next command, read after the
+    // move and the release so the next command judges the tape where it
+    // now sits. Best-effort: the copy stands whatever these read.
+    let summary = write::copy_summary(conn, req.label).ok();
+    let next = next_copy_after(conn, config, req.label);
     Ok(WriteDone {
         loaded: req.loaded,
         initialized,
         ending,
         release,
         moved,
+        summary,
+        next,
     })
+}
+
+/// What the units a write of `label` was for still need
+/// ([`crate::policy::coverage::next_copy`] over
+/// [`write::units_planned_onto`], the cut ones included): the next command a
+/// copy ends with (ADR-0012 item 216). `None` when the catalog could not
+/// say: the copy stands, and nothing is printed for it.
+pub(crate) fn next_copy_after(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+) -> Option<crate::policy::coverage::NextCopy> {
+    write::units_planned_onto(conn, label)
+        .and_then(|ids| crate::policy::coverage::next_copy(conn, config, &ids))
+        .ok()
+}
+
+/// The next copy's command (ADR-0012 item 216): a new cartridge, initialised,
+/// written, read back in full and moved to the place policy is still short
+/// of, or `<location>` when only a copy floor is short and no policy names
+/// one. `None` when every unit is covered.
+pub(crate) fn next_copy_command(next: &crate::policy::coverage::NextCopy) -> Option<String> {
+    match next {
+        crate::policy::coverage::NextCopy::Covered => None,
+        crate::policy::coverage::NextCopy::Owed { location } => Some(format!(
+            "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to {}",
+            location.as_deref().unwrap_or("<location>")
+        )),
+    }
+}
+
+/// The line a copy ends with (ADR-0012 item 216): the next command, or that
+/// there is nothing to do.
+pub(crate) fn next_copy_line(next: &crate::policy::coverage::NextCopy) -> String {
+    match next_copy_command(next) {
+        Some(command) => format!("next: {command}"),
+        None => "next: nothing to do; every unit written has its policy's copies".to_string(),
+    }
 }
 
 /// What `volume write --init --json` prints on stdout when its write half
@@ -1946,6 +1997,12 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             "range_units": done.ending.range_units,
             "deferred_units": done.ending.deferred_units,
             "keep_together": done.ending.keep_together,
+            // ADR-0012 item 216, additive: what the volume holds (units,
+            // slices, bytes, and the readback that passed, "full" or
+            // "quick"), and the next copy's command (null when every unit
+            // written is covered). Null when the catalog could not say.
+            "summary": done.summary,
+            "next_command": done.next.as_ref().and_then(next_copy_command),
         }),
         &done.release,
     );
@@ -2235,9 +2292,18 @@ pub fn run(
                     for_location_json(write_done_json(label, &done), for_x.as_ref())
                 );
             } else {
+                // `write completed` word for word: the gate and fr414 route
+                // on it. Then item 216's summary, the release and the move,
+                // and the next command last.
                 println!("volume \"{label}\" write completed");
+                if let Some(summary) = &done.summary {
+                    println!("{}", summary.line());
+                }
                 print_staging_release(label, &done.release);
                 print_move_after_write(label, &done.moved);
+                if let Some(next) = &done.next {
+                    println!("{}", next_copy_line(next));
+                }
             }
         }
 
@@ -2308,6 +2374,11 @@ pub fn run(
                 println!("volume \"{label}\" write resumed and completed");
                 print_staging_release(label, &done.release);
                 print_move_after_write(label, &done.moved);
+                // The release block no longer names the next copy itself
+                // (ADR-0012 item 216): the one next command, as after a write.
+                if let Some(next) = next_copy_after(conn, config, label) {
+                    println!("{}", next_copy_line(&next));
+                }
             }
         }
 
@@ -5498,6 +5569,8 @@ mod tests {
                 ending,
                 release: StagingRelease::NothingWritten,
                 moved: MoveAfterWrite::NotAsked,
+                summary: None,
+                next: None,
             };
             let span = done(RecordedEnding {
                 ended_after: None,
@@ -5680,6 +5753,108 @@ mod tests {
                 }])
             );
             assert_eq!(json["units_released"], serde_json::json!([]));
+        }
+
+        /// ADR-0012 item 216: a copy ends with the real next command — a
+        /// new label with `--init`, a full readback, and the place policy is
+        /// still short of — or says there is nothing to do. Read after the
+        /// release from the catalog: one unit of the write short of its
+        /// offsite target names offsite; covered, nothing.
+        #[test]
+        fn a_copy_ends_with_the_next_command_naming_the_short_location() {
+            use crate::policy::coverage::NextCopy;
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = config(dir.path(), 2);
+            conn.execute_batch(
+                "INSERT INTO locations (name, kind) VALUES ('home', 'shelf');
+                 INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf');",
+            )
+            .unwrap();
+            let t = tenant(&conn);
+            let alpha = unit(&conn, t, "testlib/alpha");
+            conn.execute(
+                "UPDATE units SET copies_at_frozen = '{\"home\":1,\"offsite\":1}' WHERE id = ?1",
+                rusqlite::params![alpha],
+            )
+            .unwrap();
+            let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+            add_write(&conn, &a, "V-1", "sealed", "completed");
+            conn.execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+                [],
+            )
+            .unwrap();
+
+            let next = next_copy_after(&conn, &config, "V-1").expect("the catalog answers");
+            assert_eq!(
+                next,
+                NextCopy::Owed {
+                    location: Some("offsite".into())
+                }
+            );
+            assert_eq!(
+                next_copy_line(&next),
+                "next: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to offsite"
+            );
+            assert_eq!(
+                next_copy_line(&NextCopy::Owed { location: None }),
+                "next: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>"
+            );
+
+            add_write(&conn, &a, "V-2", "sealed", "completed");
+            conn.execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'offsite')
+                  WHERE label = 'V-2'",
+                [],
+            )
+            .unwrap();
+            let next = next_copy_after(&conn, &config, "V-2").unwrap();
+            assert_eq!(next, NextCopy::Covered);
+            assert_eq!(next_copy_command(&next), None);
+            assert_eq!(
+                next_copy_line(&next),
+                "next: nothing to do; every unit written has its policy's copies"
+            );
+        }
+
+        /// ADR-0012 item 216, the wiring: `volume write` prints `write
+        /// completed` word for word, then the summary, the release, the
+        /// move, and the next command last; `collection run` ends with the
+        /// same summary and next command where it said "swap in the next
+        /// cartridge". By source, as the order pins above.
+        #[test]
+        fn a_copy_ends_with_its_summary_and_then_the_next_command() {
+            const SRC: &str = include_str!("volume.rs");
+            let run_body = &SRC[SRC.find("pub fn run(").unwrap()..];
+            let start = run_body.find("VolumeCommands::Write {\n").unwrap();
+            let arm = &run_body[start
+                ..start
+                    + run_body[start..]
+                        .find("VolumeCommands::Resume {\n")
+                        .unwrap()];
+            let at = |needle: &str| {
+                arm.find(needle)
+                    .unwrap_or_else(|| panic!("the Write arm no longer has {needle}"))
+            };
+            let order = [
+                at("println!(\"volume \\\"{label}\\\" write completed\");"),
+                at("summary.line()"),
+                at("print_staging_release(label, &done.release);"),
+                at("print_move_after_write(label, &done.moved);"),
+                at("next_copy_line(next)"),
+            ];
+            assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+
+            let collection = include_str!("collection.rs");
+            let collection = collection.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let ending = &collection[collection.find("fn cmd_run(").unwrap()..];
+            assert!(
+                ending.contains("summary.line()")
+                    && ending.contains("crate::cli::volume::next_copy_line(next)")
+                    && !ending.contains("swap in the next cartridge and run"),
+                "collection run ends as volume write does"
+            );
         }
 
         /// ADR-0012 item 217: one write, two units, one covered and one
