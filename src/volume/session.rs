@@ -631,6 +631,110 @@ impl ReadyToSeal {
     }
 }
 
+// ── what the write asked for past its seal (ADR-0012 item 215) ──
+
+/// The file in a write session's directory that records what the write asked
+/// for once its tape is sealed ([`WriteIntent`]). It sits beside the frozen
+/// Layout (`build::LAYOUT_SIDECAR`), and like it is a staging-side file: never
+/// a `LayoutEntry`, never on the medium, and removed with the directory. A
+/// session directory written before tapectl 1.9.0 has none.
+pub const WRITE_INTENT_FILE: &str = "write-intent.json";
+
+/// What a write asked for once its tape is sealed (ADR-0012 item 215):
+/// `volume write`'s `--full-confirm`, `--move-to`, `--for-location`,
+/// `--keep-staging` and `--keep-staging-for-locations`. The write records it
+/// in its session directory before any byte reaches the tape
+/// ([`Self::record`]), so a stop at any point leaves it, and `volume resume`
+/// reads it back ([`InterruptedSession::recorded_intent`]) and keeps it.
+///
+/// Missing keys read as off (`serde(default)`), so the record can gain a key
+/// without a resume misreading an older one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WriteIntent {
+    /// `--full-confirm`: the confirm reads every file back.
+    pub full_confirm: bool,
+    /// Where the tape is moved once it is sealed and confirmed: `--move-to
+    /// Y`'s Y, or X under `--for-location X`.
+    pub move_to: Option<String>,
+    /// `--for-location X`. Its selection is frozen in the Layout; what a
+    /// resume keeps of it is the move to X.
+    pub for_location: Option<String>,
+    /// `--keep-staging`: the staged slices stay after the copy.
+    pub keep_staging: bool,
+    /// `--keep-staging-for-locations`: the staging is released only once
+    /// every per-location copy target is met.
+    pub keep_staging_for_locations: bool,
+}
+
+impl WriteIntent {
+    /// Record this intent in `session_dir`, flushed to the disk before it
+    /// returns: the caller writes the tape only after.
+    pub fn record(&self, session_dir: &Path) -> Result<()> {
+        use std::io::Write as _;
+        let path = session_dir.join(WRITE_INTENT_FILE);
+        let unwritten = |e: &dyn std::fmt::Display| {
+            TapectlError::Other(format!(
+                "cannot record the write's intent at {}: {e}",
+                path.display()
+            ))
+        };
+        let json = serde_json::to_vec_pretty(self).map_err(|e| unwritten(&e))?;
+        let mut file = std::fs::File::create(&path).map_err(|e| unwritten(&e))?;
+        file.write_all(&json).map_err(|e| unwritten(&e))?;
+        file.sync_all().map_err(|e| unwritten(&e))?;
+        Ok(())
+    }
+
+    /// The intent recorded in `session_dir`, or `None` when there is none (a
+    /// session directory written before tapectl 1.9.0). A file that is there
+    /// and does not read is an error naming it, never `None`: a resume that
+    /// guessed could run a shorter confirm than the write asked for.
+    pub fn read(session_dir: &Path) -> Result<Option<Self>> {
+        let path = session_dir.join(WRITE_INTENT_FILE);
+        let unreadable = |e: &dyn std::fmt::Display| {
+            TapectlError::Other(format!(
+                "the write intent recorded with its session at {} cannot be read: {e}",
+                path.display()
+            ))
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| unreadable(&e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(unreadable(&e)),
+        }
+    }
+
+    /// The flags this intent stands for, as `volume write` takes them, in
+    /// one order: `--full-confirm`, then `--for-location X` or `--move-to
+    /// Y`, then the staging flag. Empty when it asks for nothing a bare
+    /// `volume resume` would not do.
+    pub fn flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if self.full_confirm {
+            flags.push("--full-confirm".to_string());
+        }
+        match (&self.for_location, &self.move_to) {
+            (Some(x), Some(to)) if to.trim() != x.trim() => {
+                flags.push(format!("--for-location {}", x.trim()));
+                flags.push(format!("--move-to {}", to.trim()));
+            }
+            (Some(x), _) => flags.push(format!("--for-location {}", x.trim())),
+            (None, Some(to)) => flags.push(format!("--move-to {}", to.trim())),
+            (None, None) => {}
+        }
+        if self.keep_staging {
+            flags.push("--keep-staging".to_string());
+        }
+        if self.keep_staging_for_locations {
+            flags.push("--keep-staging-for-locations".to_string());
+        }
+        flags
+    }
+}
+
 /// SIGINT (or a startup-sweep-detected crash) stopped execution between
 /// entries — or, since ADR-0012's 2026-09-23 amendment (#280), an `aborted`
 /// session with a recorded seal that [`Self::adopt_aborted`] picked up for
@@ -1901,6 +2005,15 @@ impl InterruptedSession {
 
     pub fn layout(&self) -> &super::layout_model::Layout {
         &self.built.layout
+    }
+
+    /// What the write that began this session asked for once its tape is
+    /// sealed, read from the session directory ([`WriteIntent::read`]):
+    /// `None` for a session directory written before tapectl 1.9.0. Read only
+    /// by `volume resume`, never by [`Self::rehydrate`], so a record that does
+    /// not read refuses the resume and nothing else.
+    pub fn recorded_intent(&self) -> Result<Option<WriteIntent>> {
+        WriteIntent::read(&self.built.session_dir)
     }
 
     /// Whether resuming this session can only READ the tape: its volume's

@@ -1192,7 +1192,20 @@ pub(crate) fn volume_write_contacted<'c>(
     let WriteScope {
         staged: scope,
         moved_to,
+        for_location,
+        keep_staging,
+        keep_staging_for_locations,
     } = only_stage_sets.into();
+    // ADR-0012 item 215: what this write asks for once its tape is sealed,
+    // recorded in the session directory before any byte reaches the tape
+    // (`volume_write_in_contact`), so `volume resume` keeps it.
+    let post_seal = PostSeal::of_write(session::WriteIntent {
+        full_confirm,
+        move_to: moved_to.clone(),
+        for_location,
+        keep_staging,
+        keep_staging_for_locations,
+    });
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
             "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
@@ -1436,7 +1449,7 @@ pub(crate) fn volume_write_contacted<'c>(
         force,
         allow_missing_escrow,
         SliceCheck::from_prewrite_hash(prewrite_hash),
-        Tier::write_confirm(full_confirm),
+        &post_seal,
         StagedWrite {
             backend,
             volume_id,
@@ -2538,7 +2551,9 @@ fn volume_write_in_contact<'c>(
     force: bool,
     allow_missing_escrow: bool,
     slice_check: SliceCheck,
-    confirm_tier: Tier,
+    // The confirm, the move and the staging release this write asks for
+    // once sealed (ADR-0012 item 215): recorded below, then the hints.
+    post_seal: &PostSeal,
     staged: StagedWrite<'_>,
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
@@ -2703,6 +2718,17 @@ fn volume_write_in_contact<'c>(
         (built, inputs, None)
     };
     phase.done();
+    // ADR-0012 item 215: what this write asks for once its tape is sealed,
+    // into the session directory `build` just made, beside its frozen
+    // Layout — before the pre-flight, the drive and `plan`, so every stop
+    // that leaves a session to resume leaves this with it. A write that
+    // cannot record it writes nothing: a resume without it would run the
+    // confirm and the release a bare `volume resume` runs.
+    if let Some(intent) = &post_seal.recorded {
+        intent.record(&session_dir).map_err(|e| {
+            TapectlError::Other(format!("volume \"{label}\": {e}. Nothing was written."))
+        })?;
+    }
     // Snapshot the Layout before the typestate chain consumes `built` — the
     // terminal `SealedSession` only exposes `volume_id`/`label`, not the
     // entries, and `bytes_written`/`num_data_files` bookkeeping (below) needs
@@ -2909,7 +2935,7 @@ fn volume_write_in_contact<'c>(
         &layout_snapshot,
         block_size as u64,
         execute_outcome.into(),
-        confirm_tier,
+        post_seal,
         Some(config.defaults.verify_interval_days),
     )?;
     // #478: the units the plan left for a later tape, named once the write
@@ -2956,7 +2982,10 @@ fn volume_write_in_contact<'c>(
 /// The frozen generated zones are re-hashed byte-identical either way.
 ///
 /// `full_confirm` is `--full-confirm`, as on [`volume_write`]: the confirm
-/// this resume runs, or re-enters, reads every file back.
+/// this resume runs, or re-enters, reads every file back. What the
+/// interrupted write recorded is kept as [`volume_resume_asked`] keeps it;
+/// this is that function told nothing but `full_confirm`, for a caller that
+/// moves and releases nothing after (`volume rewrite`).
 #[allow(clippy::too_many_arguments)]
 pub fn volume_resume(
     conn: &Connection,
@@ -2968,6 +2997,43 @@ pub fn volume_resume(
     prewrite_hash: bool,
     full_confirm: bool,
 ) -> Result<()> {
+    volume_resume_asked(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        prewrite_hash,
+        &ResumeAsk {
+            full_confirm,
+            ..ResumeAsk::default()
+        },
+    )
+    .map(|_| ())
+}
+
+/// [`volume_resume`], told what `volume resume` was told on its own command
+/// line (`asked`: `--full-confirm`, `--move-to`, `--keep-staging`). The
+/// write that began the session recorded what it asked for once its tape is
+/// sealed ([`session::WriteIntent`], ADR-0012 item 215), and the resume
+/// keeps that too ([`PostSeal::for_resume`]: a full confirm is never
+/// downgraded, a different `--move-to` is refused naming both), saying what
+/// it keeps before the drive is touched. The confirm runs here; the move and
+/// the staging release are the caller's, from the [`PostSeal`] returned once
+/// the volume is sealed and confirmed. A session directory written before
+/// tapectl 1.9.0 records nothing, and the resume does what `asked` says.
+#[allow(clippy::too_many_arguments)]
+pub fn volume_resume_asked(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    prewrite_hash: bool,
+    asked: &ResumeAsk,
+) -> Result<PostSeal> {
     // See [`ContactSlot`]: resume refuses on the volume's status, on its
     // `writes` rows and on a missing backend long before it reads the MAM,
     // and none of those refusals is a contact.
@@ -2980,14 +3046,15 @@ pub fn volume_resume(
         device,
         block_size,
         SliceCheck::from_prewrite_hash(prewrite_hash),
-        Tier::write_confirm(full_confirm),
+        asked,
         &mut contact,
+        ContactStore::Device,
     );
     contact.finish_result(r)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn volume_resume_contacted<'c>(
+pub(crate) fn volume_resume_contacted<'c>(
     conn: &'c Connection,
     // See `volume_write`'s `_paths` for why this is unused but kept.
     _paths: &TapectlPaths,
@@ -2996,9 +3063,12 @@ fn volume_resume_contacted<'c>(
     device: &str,
     block_size: usize,
     slice_check: SliceCheck,
-    confirm_tier: Tier,
+    asked: &ResumeAsk,
     contact: &mut ContactSlot<'c>,
-) -> Result<()> {
+    // `Device` in production; a test's store stands in for the drive, as on
+    // `volume_write_contacted`.
+    store: ContactStore<'_>,
+) -> Result<PostSeal> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
             "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
@@ -3059,9 +3129,13 @@ fn volume_resume_contacted<'c>(
         if let Some(refused) = adopt_lost::recorded_evidence(conn, volume_id)? {
             return Err(adopt_lost::refusal(label, &refused));
         }
+        // No session directory, so no recorded intent: what follows the
+        // adoption is what this command was told.
+        let post_seal = PostSeal::for_resume(label, None, asked)?;
         return volume_resume_adopt_lost_contacted(
             conn, config, label, device, block_size, volume_id, contact,
-        );
+        )
+        .map(|()| post_seal);
     }
     if coverage::has_completed_write(conn, volume_id)? {
         return Err(TapectlError::VolumeHasRecordedWrite {
@@ -3093,6 +3167,27 @@ fn volume_resume_contacted<'c>(
             }
         },
     };
+
+    // ADR-0012 item 215: what the interrupted write asked for once its tape
+    // is sealed, from its session directory, with what this command was
+    // told — decided here, from the catalog and the disk, before the drive
+    // is touched, so a conflict is refused with nothing changed and the
+    // operator hears what the resume keeps before hours of readback.
+    let recorded = session.recorded_intent().map_err(|e| {
+        TapectlError::Other(format!(
+            "volume \"{label}\": {e}. It records what the interrupted write asked for once its \
+             tape is sealed (its confirm, a move, what staging keeps), and a resume does not \
+             guess it. Remove the file to resume as a session written before tapectl 1.9.0 \
+             would, giving on the resume the flags the write had (`--full-confirm`, \
+             `--move-to LOCATION`, `--keep-staging`). Nothing was changed."
+        ))
+    })?;
+    let post_seal = PostSeal::for_resume(label, recorded, asked)?;
+    if let Some(kept) = post_seal.kept_flags() {
+        progress::say(&format!(
+            "volume \"{label}\": resuming with the interrupted write's {kept}"
+        ));
+    }
 
     // Snapshot before `resume` consumes the session (same reason
     // `volume_write` clones its Layout: the terminal `SealedSession` exposes
@@ -3206,8 +3301,9 @@ fn volume_resume_contacted<'c>(
         &layout_snapshot,
         &keys,
         slice_check,
-        confirm_tier,
+        &post_seal,
         Some(config.defaults.verify_interval_days),
+        store,
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -3248,7 +3344,7 @@ fn volume_resume_contacted<'c>(
         phase_timings::Subject::Volume(volume_id),
     );
 
-    result
+    result.map(|()| post_seal)
 }
 
 /// Everything `volume resume` does INSIDE its contact, from the
@@ -3256,10 +3352,10 @@ fn volume_resume_contacted<'c>(
 /// [`volume_resume_contacted`] (issue #342, the shape `volume init` took in
 /// #339 and `volume write` takes in [`volume_write_in_contact`]) so that
 /// function can take the post-command sweep after this one returns,
-/// whichever way it returned. The body is unchanged by the split. No store
-/// seam: nothing ungated can rehydrate an interrupted session, so the
-/// production `TapeStore::open_as` stays inline and the once-per-contact
-/// shape is pinned by source scan.
+/// whichever way it returned. The body is unchanged by the split. The store
+/// seam is `volume write`'s ([`ContactStore`]): production opens
+/// `TapeStore::open_as` inline, with the mode the recorded seal decides
+/// (pinned by source scan); a test's store is never opened.
 #[allow(clippy::too_many_arguments)]
 fn volume_resume_in_contact(
     conn: &Connection,
@@ -3275,8 +3371,9 @@ fn volume_resume_in_contact(
     layout_snapshot: &Layout,
     keys: &KeyAvailability,
     slice_check: SliceCheck,
-    confirm_tier: Tier,
+    post_seal: &PostSeal,
     default_verify_interval_days: Option<i64>,
+    store: ContactStore<'_>,
 ) -> Result<()> {
     binding::corroborate_volume(
         conn,
@@ -3310,22 +3407,29 @@ fn volume_resume_in_contact(
         OpenMode::ReadWrite
     };
     let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open_as(device, block_size, mode, usable_bytes)?;
+    let mut opened;
+    let store: &mut dyn Store = match store {
+        ContactStore::Device => {
+            opened = TapeStore::open_as(device, block_size, mode, usable_bytes)?;
+            &mut opened
+        }
+        ContactStore::Injected(s) => s,
+    };
     phase.done();
 
     info!(label, volume_id, "resuming interrupted volume write");
-    let outcome = session.resume(conn, keys, slice_check, &mut store)?;
+    let outcome = session.resume(conn, keys, slice_check, store)?;
 
     // Every `Err` above and this one return to the caller's sweep.
     finish_session(
         conn,
-        &mut store,
+        store,
         volume_id,
         label,
         layout_snapshot,
         block_size as u64,
         outcome,
-        confirm_tier,
+        post_seal,
         default_verify_interval_days,
     )
 }
@@ -4016,7 +4120,9 @@ fn finish_session(
     layout: &Layout,
     block_size: u64,
     outcome: ResumeOutcome,
-    confirm_tier: Tier,
+    // What follows the seal (ADR-0012 item 215): the confirm's tier, and
+    // what the hints tell the operator a resume will do.
+    post_seal: &PostSeal,
     default_verify_interval_days: Option<i64>,
 ) -> Result<()> {
     match outcome {
@@ -4128,10 +4234,11 @@ fn finish_session(
                 )
                 .map_err(|e| e.in_write_session(label))?;
                 // Exit 4 (issue #408), with the text `Interrupted` printed.
-                // #468: the same command `finish_confirm` names, with
-                // `--full-confirm` when this write asked for the full readback
-                // (a bare resume runs the quick confirm instead).
-                let resume_hint = confirm_resume_hint(label, confirm_tier);
+                // The same command `finish_confirm` names (#468): the resume
+                // that finishes this session, with what it will do — the
+                // confirm, then the move the write asked for (ADR-0012 items
+                // 215 and 220: one next command, chosen by the state).
+                let resume_hint = confirm_resume_hint(label, post_seal);
                 return Err(TapectlError::WriteInterrupted(format!(
                     "stopped by a signal: volume \"{label}\": interrupted after seal, before \
                      confirm -- the tape IS sealed but its readback never ran, so the catalog \
@@ -4149,7 +4256,7 @@ fn finish_session(
                 layout,
                 block_size,
                 sealed_pending,
-                confirm_tier,
+                post_seal,
                 default_verify_interval_days,
             )
         }
@@ -4170,7 +4277,7 @@ fn finish_session(
                 layout,
                 block_size,
                 sealed_pending,
-                confirm_tier,
+                post_seal,
                 default_verify_interval_days,
             )
         }
@@ -4192,13 +4299,18 @@ fn finish_session(
             // Issue #408: a staged-file read error or a drive error other
             // than a full medium stops the write resumably, and says which.
             // Both exit 4, interrupted (ADR-0012, 2026-10-07 item 20).
+            // ADR-0012 item 220: the one command that continues this
+            // session as asked ([`PostSeal::resume_command`]), and what of
+            // the write it keeps.
+            let resume = post_seal.resume_command(label);
+            let keeps = post_seal.keeps_clause();
             Err(match i.reason() {
                 None => TapectlError::WriteInterrupted(format!(
                     "stopped by a signal: volume \"{label}\" write interrupted — the tape is \
                      left unsealed, and \
                      the session's `writes`/`write_positions` rows are in the `interrupted` state. \
-                     Reload the same cartridge and run `tapectl volume resume {label}` to continue \
-                     from where it stopped."
+                     Reload the same cartridge and run `{resume}` to continue from where it \
+                     stopped{keeps}."
                 )),
                 Some(reason) => TapectlError::WriteInterrupted(format!(
                     "volume \"{label}\" write interrupted: {reason}. The tape is left unsealed and \
@@ -4206,7 +4318,7 @@ fn finish_session(
                      whole, and resume writes this one again from its start. Fix the cause — a \
                      staged source error is the staging disk, a tape I/O error the drive or the \
                      cartridge (clean the drive, reseat it) — then, with the same cartridge \
-                     loaded, run `tapectl volume resume {label}`."
+                     loaded, run `{resume}`{keeps}."
                 )),
             })
         }
@@ -4367,22 +4479,190 @@ fn park_after_seal(marker: &str) -> bool {
     }
 }
 
-/// The command that re-enters a sealed volume's confirm, as an instruction to
-/// finish "Reload the same cartridge and ...". `volume resume` runs the QUICK
-/// confirm unless it is given `--full-confirm`, so a write that asked for the
-/// full readback names the flag, or the operator's resume would sign off a
-/// shorter check than the one that was stopped (#410, #468). Files a full
-/// readback already read back clean are not read again.
-fn confirm_resume_hint(label: &str, tier: Tier) -> String {
-    match tier {
-        Tier::Integrity => format!(
-            "run `tapectl volume resume {label} --full-confirm` to continue the full readback \
-             (files it already read back clean are not read again)"
-        ),
-        Tier::Navigable => {
-            format!("run `tapectl volume resume {label}` to retry the confirm readback")
+/// What `volume resume` was told on its own command line. Each flag keeps
+/// its meaning; [`PostSeal::for_resume`] adds what the interrupted write
+/// recorded (ADR-0012 item 215).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeAsk {
+    /// `--full-confirm`.
+    pub full_confirm: bool,
+    /// `--move-to LOCATION`: move the volume there once it is sealed and
+    /// confirmed.
+    pub move_to: Option<String>,
+    /// `--keep-staging`.
+    pub keep_staging: bool,
+}
+
+/// What a write session does once its tape is sealed (ADR-0012 item 215):
+/// the confirm it runs, the move and the staging release that follow it, and
+/// the intent its session directory records ([`session::WriteIntent`]), which
+/// is what a bare `volume resume` would keep. A write records all of it
+/// ([`Self::of_write`]); a resume combines what it was told with what the
+/// write recorded ([`Self::for_resume`]). The confirm runs in the library;
+/// the move and the release are the command's, after an `Ok`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostSeal {
+    /// The confirm reads every file back.
+    pub full_confirm: bool,
+    /// Where the volume is moved once sealed and confirmed.
+    pub move_to: Option<String>,
+    /// The staged slices all stay (`--keep-staging`).
+    pub keep_staging: bool,
+    /// The staging is released only once every per-location target is met
+    /// (`--keep-staging-for-locations`); `keep_staging` wins over it.
+    pub keep_staging_for_locations: bool,
+    /// The intent the session directory records: what a write asked, or
+    /// `None` for a session directory written before tapectl 1.9.0 (and for
+    /// a lost write `volume resume` adopts, which has no session directory).
+    pub recorded: Option<session::WriteIntent>,
+}
+
+impl PostSeal {
+    /// A write's: what it asked for, all of it recorded.
+    fn of_write(intent: session::WriteIntent) -> Self {
+        PostSeal {
+            full_confirm: intent.full_confirm,
+            move_to: intent.move_to.clone(),
+            keep_staging: intent.keep_staging,
+            keep_staging_for_locations: intent.keep_staging_for_locations,
+            recorded: Some(intent),
         }
     }
+
+    /// A resume's: what it was told (`asked`) with what the interrupted
+    /// write recorded (`recorded`), by conservative rules, each the one that
+    /// does not undo what either asked for:
+    ///
+    /// - the full readback runs when either asked for it: a full confirm is
+    ///   never downgraded to a quick one;
+    /// - a `--move-to` that names a different place than the recorded one
+    ///   (`--move-to` or `--for-location`) is refused naming both, before
+    ///   anything is touched: the operator decides where the tape goes;
+    /// - staging keeps the most either asked to keep: `--keep-staging` over
+    ///   `--keep-staging-for-locations` over the release by copy floor.
+    ///
+    /// With nothing recorded it is exactly `asked`.
+    pub fn for_resume(
+        label: &str,
+        recorded: Option<session::WriteIntent>,
+        asked: &ResumeAsk,
+    ) -> Result<Self> {
+        let Some(rec) = recorded else {
+            return Ok(PostSeal {
+                full_confirm: asked.full_confirm,
+                move_to: asked.move_to.as_deref().map(|to| to.trim().to_string()),
+                keep_staging: asked.keep_staging,
+                keep_staging_for_locations: false,
+                recorded: None,
+            });
+        };
+        let recorded_move = rec.move_to.as_deref().map(str::trim);
+        let move_to = match (asked.move_to.as_deref().map(str::trim), recorded_move) {
+            (Some(given), Some(was)) if given != was => {
+                let was_flag = match rec.for_location.as_deref() {
+                    Some(x) => format!("--for-location {}", x.trim()),
+                    None => format!("--move-to {was}"),
+                };
+                return Err(TapectlError::Other(format!(
+                    "volume \"{label}\": --move-to \"{given}\" contradicts the interrupted \
+                     write's {was_flag}, recorded with its session: a resume finishes what the \
+                     write asked for. Run `tapectl volume resume {label}` to move it to \"{was}\" \
+                     once it is sealed and confirmed, then `tapectl volume move {label} --to \
+                     {given}` if it belongs there. Nothing was changed."
+                )));
+            }
+            (Some(given), _) => Some(given.to_string()),
+            (None, was) => was.map(str::to_string),
+        };
+        let keep_staging = asked.keep_staging || rec.keep_staging;
+        Ok(PostSeal {
+            full_confirm: asked.full_confirm || rec.full_confirm,
+            move_to,
+            keep_staging,
+            keep_staging_for_locations: !keep_staging && rec.keep_staging_for_locations,
+            recorded: Some(rec),
+        })
+    }
+
+    /// The confirm's tier.
+    pub fn tier(&self) -> Tier {
+        Tier::write_confirm(self.full_confirm)
+    }
+
+    /// The recorded flags this resume keeps, as `volume write` takes them
+    /// (`--full-confirm --move-to vault`): what `volume resume` says it is
+    /// keeping. `None` when the session records nothing a bare resume would
+    /// not do, or nothing at all.
+    pub fn kept_flags(&self) -> Option<String> {
+        let rec = self.recorded.as_ref()?;
+        let kept = session::WriteIntent {
+            // `--keep-staging` given to the resume wins over a recorded
+            // `--keep-staging-for-locations`: that one is not kept.
+            keep_staging_for_locations: rec.keep_staging_for_locations
+                && self.keep_staging_for_locations,
+            ..rec.clone()
+        };
+        let flags = kept.flags();
+        (!flags.is_empty()).then(|| flags.join(" "))
+    }
+
+    /// The `volume resume` that finishes this session as asked: the flags
+    /// the session's record does not keep are named, and only those. After a
+    /// write it is the bare command; for a session written before tapectl
+    /// 1.9.0 it names what this resume was told (`--full-confirm`, #468).
+    pub fn resume_command(&self, label: &str) -> String {
+        let rec = self.recorded.clone().unwrap_or_default();
+        let mut cmd = format!("tapectl volume resume {label}");
+        if self.full_confirm && !rec.full_confirm {
+            cmd.push_str(" --full-confirm");
+        }
+        if let Some(to) = &self.move_to {
+            if rec.move_to.as_deref().map(str::trim) != Some(to.trim()) {
+                cmd.push_str(&format!(" --move-to {to}"));
+            }
+        }
+        if self.keep_staging && !rec.keep_staging {
+            cmd.push_str(" --keep-staging");
+        }
+        cmd
+    }
+
+    /// `" (it keeps the write's --full-confirm --move-to vault)"` when the
+    /// record asks for something a bare resume would not do, else empty.
+    fn keeps_clause(&self) -> String {
+        self.kept_flags()
+            .map(|kept| format!(" (it keeps the write's {kept})"))
+            .unwrap_or_default()
+    }
+}
+
+/// The command that re-enters a sealed volume's confirm, as an instruction to
+/// finish "Reload the same cartridge and ...", and what it will do: the
+/// confirm, then the move (ADR-0012 items 215 and 220). The command is
+/// [`PostSeal::resume_command`]: bare when the session records what the write
+/// asked for, so the resume keeps it; with `--full-confirm` when it records
+/// nothing and this run read in full, or the operator's resume would sign off
+/// a shorter check than the one that was stopped (#410, #468). Files a full
+/// readback already read back clean are not read again.
+fn confirm_resume_hint(label: &str, post_seal: &PostSeal) -> String {
+    let cmd = post_seal.resume_command(label);
+    let confirm = match post_seal.tier() {
+        Tier::Integrity => {
+            "continue the full readback (files it already read back clean are not read again)"
+        }
+        Tier::Navigable => "retry the confirm readback",
+    };
+    let then_move = post_seal
+        .move_to
+        .as_deref()
+        .map(|to| format!(", then move the tape to \"{to}\""))
+        .unwrap_or_default();
+    let as_asked = if post_seal.kept_flags().is_some() {
+        ", as the write asked"
+    } else {
+        ""
+    };
+    format!("run `{cmd}` to {confirm}{then_move}{as_asked}")
 }
 
 /// The seal->confirm tail shared by a fresh [`ReadyToSeal`] (which calls
@@ -4399,7 +4679,7 @@ fn finish_confirm(
     layout: &Layout,
     block_size: u64,
     sealed_pending: session::SealedPending,
-    confirm_tier: Tier,
+    post_seal: &PostSeal,
     default_verify_interval_days: Option<i64>,
 ) -> Result<()> {
     // Issue #404: a signal during the readback stops it between files.
@@ -4408,9 +4688,14 @@ fn finish_confirm(
     // the seal stays recorded: `volume resume` re-enters confirm. A full
     // readback keeps what it read back clean as it goes (issue #410), so a
     // resume that asks for the full readback again continues it.
-    let resume_hint = confirm_resume_hint(label, confirm_tier);
+    let resume_hint = confirm_resume_hint(label, post_seal);
     let confirmed = sealed_pending
-        .confirm_under_default_interval(conn, store, confirm_tier, default_verify_interval_days)
+        .confirm_under_default_interval(
+            conn,
+            store,
+            post_seal.tier(),
+            default_verify_interval_days,
+        )
         .map_err(|e| match e {
             // Exit 4 (issue #408): a signal stopped the readback.
             TapectlError::Interrupted(at) => TapectlError::WriteInterrupted(format!(
@@ -5572,6 +5857,57 @@ pub(crate) fn precontact_refusal(
         return Ok(Some(seal_recorded_refusal(conn, label, volume_id)?));
     }
     Ok(None)
+}
+
+/// Where a volume's write stands after a write of it stopped, from what the
+/// catalog records of it — `volumes.status`, `observed_condition`,
+/// `sealed_at` and its `writes` rows — so that what follows the stop names
+/// one next command, chosen by the state and not by the error (ADR-0012 item
+/// 220).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppedWrite {
+    /// No write session is open and no seal is recorded: nothing was
+    /// planned, or the session aborted before its seal. `volume write`
+    /// (again) is next.
+    NothingOpen,
+    /// A session was planned and never started, so the tape is untouched:
+    /// `volume abort` clears it, then the volume is written again.
+    Planned,
+    /// A session stopped part-way, `sealed` or not: `volume resume`
+    /// continues it, and its error says so.
+    Open { sealed: bool },
+    /// Anything else (sealed and confirmed, quarantined, a seal recorded
+    /// with its session aborted): the error names its own way on.
+    Other,
+}
+
+/// [`StoppedWrite`] for `label`, read from the catalog alone.
+pub fn stopped_write(conn: &Connection, label: &str) -> Result<StoppedWrite> {
+    let (volume_id, status, condition, sealed): (i64, String, String, bool) = conn
+        .query_row(
+            "SELECT id, status, observed_condition, sealed_at IS NOT NULL FROM volumes
+             WHERE label = ?1",
+            params![label],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+    if !coverage::is_write_target(&status, &condition) {
+        return Ok(StoppedWrite::Other);
+    }
+    let statuses: Vec<String> = conn
+        .prepare("SELECT DISTINCT status FROM writes WHERE volume_id = ?1")?
+        .query_map(params![volume_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has = |s: &str| statuses.iter().any(|t| t == s);
+    Ok(if has("in_progress") || has("interrupted") {
+        StoppedWrite::Open { sealed }
+    } else if has("planned") {
+        StoppedWrite::Planned
+    } else if sealed || has("completed") {
+        StoppedWrite::Other
+    } else {
+        StoppedWrite::NothingOpen
+    })
 }
 
 /// The refusal for a fresh write to a volume whose seal the catalog records
@@ -8528,6 +8864,15 @@ pub struct WriteScope {
     /// write, so an unregistered name reaches here only from a library
     /// caller.
     pub moved_to: Option<String>,
+    /// `volume write --for-location X`'s X. The selection it made is
+    /// `staged` and the move is `moved_to`; this names the flag in the
+    /// session's write intent (ADR-0012 item 215).
+    pub for_location: Option<String>,
+    /// `--keep-staging`, recorded in the session's write intent so `volume
+    /// resume` keeps it. The release itself is the caller's, after the write.
+    pub keep_staging: bool,
+    /// `--keep-staging-for-locations`, recorded as `keep_staging` is.
+    pub keep_staging_for_locations: bool,
 }
 
 /// A scope that moves nothing: every caller that predates #493's move.
@@ -8536,6 +8881,9 @@ impl From<StagedScope> for WriteScope {
         WriteScope {
             staged,
             moved_to: None,
+            for_location: None,
+            keep_staging: false,
+            keep_staging_for_locations: false,
         }
     }
 }
@@ -15587,7 +15935,7 @@ mod tests {
             "/nonexistent/tapectl-resume-lost-test-nst",
             512 * 1024,
             false,
-            false,
+            false, // --full-confirm
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -16101,6 +16449,9 @@ mod tests {
                 WriteScope {
                     staged: StagedScope::Every,
                     moved_to: moved_to.map(str::to_string),
+                    for_location: None,
+                    keep_staging: false,
+                    keep_staging_for_locations: false,
                 },
             )
             .expect_err("no backend is configured");
@@ -23532,7 +23883,7 @@ mod tests {
                 &layout,
                 512 * 1024,
                 outcome,
-                Tier::write_confirm(false),
+                &PostSeal::default(),
                 None,
             )
             .expect("the resume seals and confirms");
@@ -23573,11 +23924,13 @@ mod tests {
             assert_eq!(code, 6, "{err}");
         }
 
-        /// #468: every message that sends the operator to `volume resume` to
-        /// re-enter a sealed volume's confirm names `--full-confirm` when the
-        /// write asked for the full readback (a bare resume runs the quick
-        /// confirm), and the command it names is one the CLI accepts. Three
-        /// of the four sites said the bare command.
+        /// #468, under ADR-0012 item 215: every message that sends the
+        /// operator to `volume resume` to re-enter a sealed volume's confirm
+        /// names the resume that runs the confirm the write asked for, says
+        /// which, and is a command the CLI accepts. The write records
+        /// `--full-confirm` with its session, so the bare resume keeps it and
+        /// the message says so; the flag is named only where nothing records
+        /// it (`confirm_resume_hint_names_what_the_session_does_not_record`).
         #[test]
         fn the_resume_a_stopped_confirm_names_matches_the_tier_it_was_stopped_at() {
             use crate::cli::operations::remedy_commands::assert_names_parsing_commands;
@@ -23637,15 +23990,77 @@ mod tests {
                     assert_eq!(got, code, "{what}: {msg}");
                     assert!(msg.contains(site), "{what}: wrong site: {msg}");
                     let bare = format!("tapectl volume resume {label}");
-                    let full = format!("tapectl volume resume {label} --full-confirm");
+                    assert_names_parsing_commands(&msg, &[], &[&bare]);
                     if full_confirm {
-                        assert_names_parsing_commands(&msg, &[], &[&full]);
+                        assert!(
+                            msg.contains(&format!(
+                                "run `{bare}` to continue the full readback (files it already \
+                                 read back clean are not read again), as the write asked"
+                            )),
+                            "{what}: {msg}"
+                        );
                     } else {
-                        assert_names_parsing_commands(&msg, &[], &[&bare]);
-                        assert!(!msg.contains("--full-confirm"), "{what}: {msg}");
+                        assert!(
+                            msg.contains(&format!("run `{bare}` to retry the confirm readback")),
+                            "{what}: {msg}"
+                        );
+                        assert!(!msg.contains("full readback"), "{what}: {msg}");
                     }
+                    assert!(
+                        !msg.contains(&format!("{bare} --full-confirm")),
+                        "{what}: the write's --full-confirm is recorded, a bare resume keeps it: \
+                         {msg}"
+                    );
                 }
             }
+        }
+
+        /// The hint's command names the flags the session's record does not
+        /// keep, and only those: a session written before tapectl 1.9.0
+        /// records nothing, so a resume of it told `--full-confirm` or
+        /// `--move-to` that stops again names them (#468's rule, kept for
+        /// it), and one whose write recorded them names the bare command.
+        #[test]
+        fn confirm_resume_hint_names_what_the_session_does_not_record() {
+            use crate::cli::operations::remedy_commands::assert_names_parsing_commands;
+            use crate::volume::session::WriteIntent;
+            let told = ResumeAsk {
+                full_confirm: true,
+                move_to: Some("vault".into()),
+                keep_staging: true,
+            };
+            let old = PostSeal::for_resume("L1", None, &told).unwrap();
+            let hint = confirm_resume_hint("L1", &old);
+            assert_eq!(
+                hint,
+                "run `tapectl volume resume L1 --full-confirm --move-to vault --keep-staging` to \
+                 continue the full readback (files it already read back clean are not read \
+                 again), then move the tape to \"vault\""
+            );
+            assert_names_parsing_commands(
+                &hint,
+                &[],
+                &["tapectl volume resume L1 --full-confirm --move-to vault --keep-staging"],
+            );
+            let quick = PostSeal::for_resume("L1", None, &ResumeAsk::default()).unwrap();
+            assert_eq!(
+                confirm_resume_hint("L1", &quick),
+                "run `tapectl volume resume L1` to retry the confirm readback",
+                "a session with nothing recorded and nothing told: today's hint"
+            );
+            let recorded = WriteIntent {
+                full_confirm: true,
+                move_to: Some("vault".into()),
+                keep_staging: true,
+                ..WriteIntent::default()
+            };
+            let kept = PostSeal::for_resume("L1", Some(recorded), &ResumeAsk::default()).unwrap();
+            assert_eq!(
+                confirm_resume_hint("L1", &kept),
+                "run `tapectl volume resume L1` to continue the full readback (files it already \
+                 read back clean are not read again), then move the tape to \"vault\", as the \
+                 write asked"
+            );
         }
 
         /// Issue #386: a MemStore write inside a progress session records
@@ -24154,6 +24569,455 @@ mod tests {
         // The confirm is the chain walk's own (`ConfirmPlan::with_ending` and
         // `reading_back`): the quick confirm after a warning reads entry K and
         // the seal back (ADR-0012 item 114), a full one walks files 0 to K.
+        // ── ADR-0012 items 215 and 220: an interrupted copy keeps what its
+        //    write asked for, and says one next command ──
+        mod interrupted_copy {
+            use super::*;
+            use crate::cli::volume::{follow_resume, left_initialized_line, MoveAfterWrite};
+            use crate::volume::session::{WriteIntent, WRITE_INTENT_FILE};
+
+            /// A write stopped by its store, with the catalog and the home it
+            /// ran in kept for what follows.
+            struct Stopped {
+                r: Result<()>,
+                conn: Connection,
+                config: Config,
+                paths: TapectlPaths,
+                volume_id: i64,
+                _tmp: tempfile::TempDir,
+            }
+
+            /// One `volume write` of a fresh fixture over `store`, with
+            /// `--full-confirm` as given and `scope`'s move and staging
+            /// flags; the locations `vault` and `home` exist.
+            fn stopped(
+                label: &str,
+                store: &mut dyn Store,
+                full_confirm: bool,
+                scope: WriteScope,
+            ) -> Stopped {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (conn, mut config, volume_id) = swept_write_fixture(label, tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                for location in ["vault", "home"] {
+                    conn.execute(
+                        "INSERT INTO locations (name, kind) VALUES (?1, 'shelf')",
+                        [location],
+                    )
+                    .unwrap();
+                }
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let mut slot = ContactSlot::empty();
+                let r = volume_write_contacted(
+                    &conn,
+                    &paths,
+                    &config,
+                    label,
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    false,
+                    full_confirm,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(store),
+                    scope,
+                );
+                let r = slot.finish_result(r).map(|_| ());
+                crate::signal::interrupt_this_thread(false);
+                Stopped {
+                    r,
+                    conn,
+                    config,
+                    paths,
+                    volume_id,
+                    _tmp: tmp,
+                }
+            }
+
+            /// `volume write --move-to <to>`'s scope.
+            fn moving_to(to: &str) -> WriteScope {
+                WriteScope {
+                    staged: StagedScope::Every,
+                    moved_to: Some(to.to_string()),
+                    for_location: None,
+                    keep_staging: false,
+                    keep_staging_for_locations: false,
+                }
+            }
+
+            /// `volume resume <label>` over `store`, as told by `asked`, and
+            /// what it told the operator.
+            fn resume(
+                s: &Stopped,
+                label: &str,
+                store: &mut dyn Store,
+                asked: &ResumeAsk,
+            ) -> (Result<PostSeal>, crate::progress::heard::Heard) {
+                crate::progress::heard::during(|| {
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_resume_contacted(
+                        &s.conn,
+                        &s.paths,
+                        &s.config,
+                        label,
+                        GENCHK_DEVICE,
+                        512 * 1024,
+                        SliceCheck::Size,
+                        asked,
+                        &mut slot,
+                        ContactStore::Injected(store),
+                    );
+                    slot.finish_result(r)
+                })
+            }
+
+            fn session_dir_of(conn: &Connection, volume_id: i64) -> std::path::PathBuf {
+                let dir: String = conn
+                    .query_row(
+                        "SELECT session_dir FROM writes WHERE volume_id = ?1 LIMIT 1",
+                        params![volume_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                dir.into()
+            }
+
+            fn location_of(conn: &Connection, label: &str) -> Option<String> {
+                conn.query_row(
+                    "SELECT l.name FROM volumes v LEFT JOIN locations l ON l.id = v.location_id
+                     WHERE v.label = ?1",
+                    params![label],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            }
+
+            fn write_statuses(conn: &Connection, volume_id: i64) -> Vec<String> {
+                conn.prepare("SELECT DISTINCT status FROM writes WHERE volume_id = ?1")
+                    .unwrap()
+                    .query_map(params![volume_id], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect()
+            }
+
+            /// Every `tapectl volume write|resume|abort …` command `text`
+            /// names, distinct, in order.
+            fn next_commands(text: &str) -> Vec<String> {
+                let mut found: Vec<String> = Vec::new();
+                for piece in text.split('`').skip(1).step_by(2) {
+                    let is_next = ["write", "resume", "abort"]
+                        .iter()
+                        .any(|v| piece.starts_with(&format!("tapectl volume {v} ")));
+                    if is_next && !found.iter().any(|f| f == piece) {
+                        found.push(piece.to_string());
+                    }
+                }
+                found
+            }
+
+            /// Item 215: a write under `--full-confirm --move-to vault` that a
+            /// signal stops past its seal, then a BARE `volume resume`: the
+            /// resume says it keeps both, the confirm it runs is the full
+            /// readback, and once sealed and confirmed the tape is moved to
+            /// vault — what the operator typed once.
+            #[test]
+            fn a_bare_resume_keeps_the_stopped_writes_full_confirm_and_move() {
+                let mut store = Faulty {
+                    inner: MemStore::new(512 * 1024),
+                    fault: Fault::SignalAfterSeal,
+                };
+                let s = stopped("RI-KEEP", &mut store, true, moving_to("vault"));
+                let err = s.r.as_ref().unwrap_err().to_string();
+                assert!(err.contains("interrupted after seal"), "{err}");
+                assert_eq!(
+                    WriteIntent::read(&session_dir_of(&s.conn, s.volume_id)).unwrap(),
+                    Some(WriteIntent {
+                        full_confirm: true,
+                        move_to: Some("vault".into()),
+                        ..WriteIntent::default()
+                    }),
+                    "the write recorded what it asked for beside its frozen Layout"
+                );
+                assert!(verify_types_of(&s.conn, s.volume_id).is_empty());
+
+                let (r, heard) = resume(&s, "RI-KEEP", &mut store.inner, &ResumeAsk::default());
+                let post = r.expect("the bare resume seals and confirms");
+                assert_eq!(
+                    heard.count(
+                        "volume \"RI-KEEP\": resuming with the interrupted write's \
+                         --full-confirm --move-to vault"
+                    ),
+                    (1, 1),
+                    "said once, on stderr and in the session log: {:?}",
+                    heard.stderr
+                );
+                assert_eq!(
+                    verify_types_of(&s.conn, s.volume_id),
+                    ["full"],
+                    "the full readback the write asked for, not the quick confirm"
+                );
+                assert!(post.full_confirm);
+                assert_eq!(post.move_to.as_deref(), Some("vault"));
+
+                let done = follow_resume(&s.conn, &s.config, "RI-KEEP", post);
+                assert!(
+                    matches!(&done.moved, MoveAfterWrite::Moved { to, .. } if to == "vault"),
+                    "{:?}",
+                    done.moved
+                );
+                assert_eq!(location_of(&s.conn, "RI-KEEP").as_deref(), Some("vault"));
+                let json = crate::cli::volume::resume_done_json("RI-KEEP", false, &done);
+                assert_eq!(json["moved_to"], "vault");
+                assert_eq!(json["kept_from_write"], "--full-confirm --move-to vault");
+            }
+
+            /// The control: a session directory written by tapectl 1.8.1
+            /// records nothing, and the bare resume of the same stop does
+            /// what it always did — the quick confirm, no move — and says
+            /// nothing new.
+            #[test]
+            fn a_session_written_before_the_intent_was_recorded_resumes_as_before() {
+                let mut store = Faulty {
+                    inner: MemStore::new(512 * 1024),
+                    fault: Fault::SignalAfterSeal,
+                };
+                let s = stopped("RI-OLD", &mut store, true, moving_to("vault"));
+                assert!(s.r.is_err());
+                let intent = session_dir_of(&s.conn, s.volume_id).join(WRITE_INTENT_FILE);
+                std::fs::remove_file(&intent).expect("the write recorded its intent");
+
+                let (r, heard) = resume(&s, "RI-OLD", &mut store.inner, &ResumeAsk::default());
+                let post = r.expect("the bare resume seals and confirms");
+                assert_eq!(heard.count("resuming with"), (0, 0), "{:?}", heard.stderr);
+                assert_eq!(verify_types_of(&s.conn, s.volume_id), ["quick"]);
+                assert_eq!(post, PostSeal::default());
+                let done = follow_resume(&s.conn, &s.config, "RI-OLD", post);
+                assert!(matches!(done.moved, MoveAfterWrite::NotAsked), "{:?}", done.moved);
+                assert_eq!(location_of(&s.conn, "RI-OLD"), None);
+                let json = crate::cli::volume::resume_done_json("RI-OLD", false, &done);
+                assert_eq!(json["kept_from_write"], serde_json::Value::Null);
+            }
+
+            /// A `--move-to` given to the resume that names another place than
+            /// the write's is refused naming both, before the drive is
+            /// touched; the same place is no conflict.
+            #[test]
+            fn a_resume_told_to_move_elsewhere_is_refused_naming_both() {
+                let mut store = Faulty {
+                    inner: MemStore::new(512 * 1024),
+                    fault: Fault::SignalAfterSeal,
+                };
+                let s = stopped("RI-MOVE", &mut store, false, moving_to("vault"));
+                assert!(s.r.is_err());
+                let elsewhere = ResumeAsk {
+                    move_to: Some("home".into()),
+                    ..ResumeAsk::default()
+                };
+                let (r, _) = resume(&s, "RI-MOVE", &mut store.inner, &elsewhere);
+                let msg = r.unwrap_err().to_string();
+                assert!(msg.contains("--move-to \"home\""), "{msg}");
+                assert!(msg.contains("--move-to vault"), "{msg}");
+                assert!(msg.contains("Nothing was changed"), "{msg}");
+                assert_eq!(write_statuses(&s.conn, s.volume_id), ["interrupted"]);
+                assert!(verify_types_of(&s.conn, s.volume_id).is_empty(), "no confirm ran");
+
+                let same = ResumeAsk {
+                    move_to: Some("vault".into()),
+                    ..ResumeAsk::default()
+                };
+                let (r, _) = resume(&s, "RI-MOVE", &mut store.inner, &same);
+                let post = r.expect("the same place is what the write asked");
+                assert_eq!(post.move_to.as_deref(), Some("vault"));
+                assert_eq!(verify_types_of(&s.conn, s.volume_id), ["quick"]);
+            }
+
+            /// Item 215's "before any byte reaches tape": the intent is on
+            /// disk when the store takes the first one.
+            #[test]
+            fn the_intent_is_on_disk_before_the_first_byte_reaches_the_tape() {
+                struct IntentFirst {
+                    inner: MemStore,
+                    sessions: std::path::PathBuf,
+                    seen_at_first_write: Option<Vec<WriteIntent>>,
+                }
+                impl Store for IntentFirst {
+                    fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                        self.inner.capacity()
+                    }
+                    fn execute(
+                        &mut self,
+                        src: &mut dyn std::io::Read,
+                        len: u64,
+                        sync: bool,
+                    ) -> Result<u64> {
+                        if self.seen_at_first_write.is_none() {
+                            let mut seen = Vec::new();
+                            for dir in fs::read_dir(&self.sessions).unwrap() {
+                                if let Some(i) = WriteIntent::read(&dir.unwrap().path()).unwrap() {
+                                    seen.push(i);
+                                }
+                            }
+                            self.seen_at_first_write = Some(seen);
+                        }
+                        self.inner.execute(src, len, sync)
+                    }
+                    fn read_file(
+                        &mut self,
+                        position: u32,
+                        sink: &mut dyn std::io::Write,
+                    ) -> Result<u64> {
+                        self.inner.read_file(position, sink)
+                    }
+                    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                        self.inner.reposition_for_resume(file_index)
+                    }
+                    fn blank_at_bot(&mut self) -> Result<bool> {
+                        self.inner.blank_at_bot()
+                    }
+                }
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut store = IntentFirst {
+                    inner: MemStore::new(512 * 1024),
+                    sessions: tmp.path().join("staging").join("sessions"),
+                    seen_at_first_write: None,
+                };
+                let scope = WriteScope {
+                    staged: StagedScope::Every,
+                    moved_to: Some("vault".into()),
+                    for_location: Some("vault".into()),
+                    keep_staging: false,
+                    keep_staging_for_locations: true,
+                };
+                let (conn, mut config, _) = swept_write_fixture("RI-FIRST", tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let mut slot = ContactSlot::empty();
+                let r = volume_write_contacted(
+                    &conn,
+                    &paths,
+                    &config,
+                    "RI-FIRST",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut store),
+                    scope,
+                );
+                slot.finish_result(r).expect("the write seals and confirms");
+                assert_eq!(
+                    store.seen_at_first_write,
+                    Some(vec![WriteIntent {
+                        full_confirm: true,
+                        move_to: Some("vault".into()),
+                        for_location: Some("vault".into()),
+                        keep_staging: false,
+                        keep_staging_for_locations: true,
+                    }])
+                );
+            }
+
+            /// Item 220: after an interrupted copy (`volume write --init
+            /// --full-confirm --move-to vault`), the line about the init and
+            /// the write's error name ONE next command between them, chosen
+            /// by what the catalog records of the volume: a session left open
+            /// is resumed — sealed, the resume says it confirms and then
+            /// moves — and with none open the volume is written again.
+            #[test]
+            fn an_interrupted_copy_names_one_next_command_chosen_by_its_state() {
+                type Prepare = fn(&Connection, i64);
+                fn no_slice_on_disk(conn: &Connection, _volume_id: i64) {
+                    let path: String = conn
+                        .query_row("SELECT staging_path FROM stage_slices LIMIT 1", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    fs::remove_file(path).unwrap();
+                }
+                // (fault, prepares the staging, the state, the one command, a
+                // phrase the output must hold)
+                let cases: [(Fault, Option<Prepare>, StoppedWrite, &str, &str); 4] = [
+                    (
+                        Fault::SignalAfterSeal,
+                        None,
+                        StoppedWrite::Open { sealed: true },
+                        "tapectl volume resume L",
+                        "to continue the full readback (files it already read back clean \
+                         are not read again), then move the tape to \"vault\", as the write \
+                         asked",
+                    ),
+                    (
+                        Fault::WriteIo,
+                        None,
+                        StoppedWrite::Open { sealed: false },
+                        "tapectl volume resume L",
+                        "(it keeps the write's --full-confirm --move-to vault)",
+                    ),
+                    (
+                        Fault::SealFull,
+                        None,
+                        StoppedWrite::NothingOpen,
+                        "tapectl volume write L",
+                        "write aborted",
+                    ),
+                    (
+                        Fault::WriteIo,
+                        Some(no_slice_on_disk),
+                        StoppedWrite::NothingOpen,
+                        "tapectl volume write L",
+                        "failed pre-write validation",
+                    ),
+                ];
+                for (fault, prepare, state, command, phrase) in cases {
+                    let mut store = Faulty {
+                        inner: MemStore::new(512 * 1024),
+                        fault,
+                    };
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let (conn, mut config, volume_id) = swept_write_fixture("L", tmp.path());
+                    config.backends.lto[0].capacity_override = Some("2400G".into());
+                    conn.execute("INSERT INTO locations (name, kind) VALUES ('vault', 'shelf')", [])
+                        .unwrap();
+                    if let Some(prepare) = prepare {
+                        prepare(&conn, volume_id);
+                    }
+                    let paths = TapectlPaths::new(tmp.path().join("home"));
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &conn,
+                        &paths,
+                        &config,
+                        "L",
+                        GENCHK_DEVICE,
+                        512 * 1024,
+                        false,
+                        false,
+                        false,
+                        true,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(&mut store),
+                        moving_to("vault"),
+                    );
+                    let r = slot.finish_result(r);
+                    crate::signal::interrupt_this_thread(false);
+                    let err = r.expect_err("the write stops").to_string();
+                    assert_eq!(stopped_write(&conn, "L").unwrap(), state, "{err}");
+                    let line = left_initialized_line(&conn, "L", volume_id);
+                    let all = format!("{line}\n{err}");
+                    assert_eq!(next_commands(&all), [command], "{state:?}: {all}");
+                    assert!(all.contains(phrase), "{state:?}: {all}");
+                }
+            }
+        }
+
         mod short_ending {
             use super::*;
             use crate::staging::clean::{release_blocker, ReleaseBlocker};

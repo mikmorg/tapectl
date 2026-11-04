@@ -249,7 +249,17 @@ pub enum VolumeCommands {
     /// seal marker, which is what the re-confirm path above is about.
     ///
     /// Once the resumed volume is sealed and confirmed, staging is released
-    /// or kept exactly as `volume write` does it (`--keep-staging` opts out).
+    /// or kept exactly as `volume write` does it (`--keep-staging` opts out),
+    /// and the volume is moved as `volume write --move-to` moves it.
+    ///
+    /// The write that began the session recorded what it asked for once its
+    /// tape is sealed: `--full-confirm`, `--move-to`, `--for-location`'s
+    /// move, `--keep-staging` and `--keep-staging-for-locations`. A resume
+    /// keeps all of it, and says so before it touches the drive; the flags
+    /// given here add to it. A full confirm is never downgraded to a quick
+    /// one, and a `--move-to` naming another place than the recorded one is
+    /// refused naming both. A session written before tapectl 1.9.0 recorded
+    /// nothing, and the resume does what its own flags say.
     ///
     /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
     /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
@@ -282,16 +292,24 @@ pub enum VolumeCommands {
         /// was interrupted CONTINUES: the files it already read back clean
         /// are not read again, as long as the front index on the tape is
         /// the one they were checked against. Without this flag the resume
-        /// runs the quick confirm and the readback is left to `volume
-        /// verify`. A session in which the drive refused a write with Logical
-        /// Block Protection armed, in any run, confirms in full regardless
-        /// (ADR-0012 item 186).
+        /// runs the confirm the interrupted write asked for: the full
+        /// readback when it had `--full-confirm`, else the quick confirm,
+        /// which leaves the readback to `volume verify`. A session in which
+        /// the drive refused a write with Logical Block Protection armed, in
+        /// any run, confirms in full regardless (ADR-0012 item 186).
         #[arg(long)]
         full_confirm: bool,
         /// See `volume write --keep-staging`: the staged slices stay even
         /// when this resume completes the last copy the policy asks for.
         #[arg(long)]
         keep_staging: bool,
+        /// Move the volume, with its cartridge, to this location once it is
+        /// sealed and confirmed, as `volume write --move-to` does. The
+        /// interrupted write's own `--move-to` or `--for-location` is kept
+        /// without this flag; naming another place here is refused, naming
+        /// both. The location is checked before the drive is touched.
+        #[arg(long, value_name = "LOCATION")]
+        move_to: Option<String>,
     },
 
     /// Deliberately abandon a volume's unfinished write session:
@@ -1322,7 +1340,7 @@ fn resolve_loaded_for(
 
 /// What `--move-to` did once a copy was sealed and confirmed (issue #438).
 #[derive(Debug)]
-enum MoveAfterWrite {
+pub(crate) enum MoveAfterWrite {
     /// `--move-to` was not given.
     NotAsked,
     /// The volume and its cartridge now sit at `to`.
@@ -1566,6 +1584,12 @@ struct DriveWriteSteps<'a> {
     /// write's shared-place warning judges it (#493, ADR-0012 2026-10-07
     /// item 26); with `--init` too, since the write half is this one.
     moved_to: Option<String>,
+    /// `--for-location X`'s X, for the session's write intent (ADR-0012
+    /// item 215): `volume resume` keeps the move it asked for.
+    for_location: Option<String>,
+    /// What staging keeps once sealed and confirmed, for the session's
+    /// write intent: the release itself is [`write_and_follow`]'s.
+    keep: StagingKeep,
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
@@ -1608,6 +1632,9 @@ impl WriteSteps for DriveWriteSteps<'_> {
             write::WriteScope {
                 staged: self.scope.clone(),
                 moved_to: self.moved_to.clone(),
+                for_location: self.for_location.clone(),
+                keep_staging: self.keep == StagingKeep::All,
+                keep_staging_for_locations: self.keep == StagingKeep::UntilEveryLocation,
             },
         )
     }
@@ -1707,11 +1734,13 @@ fn write_and_follow(
         steps.preflight(req.label)?;
         let init = steps.init(req.label, req.force)?;
         // stderr, so `--json` keeps stdout to the one document. The write
-        // below may stop; the operator is told what stands and how to go on.
+        // below may stop; the operator is told what stands. How to go on is
+        // said once, when it stops, chosen by the state it stopped in
+        // ([`left_initialized_line`], ADR-0012 item 220): naming both ways
+        // here was a second hint beside it.
         eprintln!(
             "volume \"{0}\" initialized (id={1}); writing it now. If the write does not \
-             complete the volume stays initialized: `tapectl volume write {0}` (without \
-             --init) writes it, `tapectl volume resume {0}` continues an interrupted write.",
+             complete the volume stays initialized, and what to run next is said when it stops.",
             req.label, init.volume_id
         );
         // What the init decided about the medium (issue #482), where the
@@ -1725,7 +1754,7 @@ fn write_and_follow(
     // Issue #445: a write that fails leaves the volume this command
     // initialised initialised, and says so before the error is printed.
     if let (Err(e), Some(init)) = (&written, &initialized) {
-        report_left_initialized(req, init, e);
+        report_left_initialized(conn, req, init, e);
     }
     written?;
     // Reached only when the write above returned `Ok` — sealed AND
@@ -1770,19 +1799,40 @@ fn left_initialized_json(
 /// A write that failed after `--init` initialised the volume: say so, on
 /// stderr, and with `--json` on stdout (issue #445). The pre-write line told
 /// the operator the volume would stay initialised; this one is the verdict,
-/// printed after the write stopped and before the error itself, and names
-/// the exact retry — `--init` again would be refused, the volume exists.
-fn report_left_initialized(req: &WriteRequest<'_>, init: &Initialized, error: &TapectlError) {
-    let volume_id = init.volume_id;
-    eprintln!(
-        "volume \"{0}\" was initialized by this command (id={volume_id}) and stays \
-         initialized, whatever the write that followed did: its exit code describes the write, \
-         not the init. `tapectl volume write {0}` (without --init, which would be refused: the \
-         volume exists) writes it; `tapectl volume resume {0}` continues an interrupted write.",
-        req.label
-    );
+/// printed after the write stopped and before the error itself
+/// ([`left_initialized_line`]).
+fn report_left_initialized(
+    conn: &Connection,
+    req: &WriteRequest<'_>,
+    init: &Initialized,
+    error: &TapectlError,
+) {
+    eprintln!("{}", left_initialized_line(conn, req.label, init.volume_id));
     if req.json_output {
         println!("{}", left_initialized_json(req.label, init, error));
+    }
+}
+
+/// [`report_left_initialized`]'s line: the volume stays initialised, and —
+/// only when the error that follows does not — the next command, chosen by
+/// what the catalog records of the volume now (ADR-0012 item 220), so the
+/// two never disagree. With no session open (nothing was planned, or the
+/// session aborted before its seal), `volume write` without `--init` (which
+/// would be refused: the volume exists). A session left open is the error's
+/// to name: its `volume resume` says what it will do. Anything else, the
+/// error names its own way on.
+pub(crate) fn left_initialized_line(conn: &Connection, label: &str, volume_id: i64) -> String {
+    let fact = format!(
+        "volume \"{label}\" was initialized by this command (id={volume_id}) and stays \
+         initialized, whatever the write that followed did: its exit code describes the write, \
+         not the init."
+    );
+    match write::stopped_write(conn, label) {
+        Ok(write::StoppedWrite::NothingOpen) => format!(
+            "{fact} Next: `tapectl volume write {label}` (without --init, which would be \
+             refused: the volume exists)."
+        ),
+        _ => format!("{fact} The error says what to run next."),
     }
 }
 
@@ -1820,12 +1870,20 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
         }),
         &done.release,
     );
+    insert_move_json(&mut base, &done.moved);
+    base
+}
+
+/// The move keys `volume write --json` and `volume resume --json` share:
+/// `moved_to`, `move_warning`, `moved_cartridge` and `volumes_moved`, null
+/// or empty unless a move was asked for.
+fn insert_move_json(base: &mut serde_json::Value, moved: &MoveAfterWrite) {
     let (moved_to, warning, cartridge, volumes): (
         Option<&str>,
         Option<&str>,
         Option<&str>,
         Vec<&str>,
-    ) = match &done.moved {
+    ) = match moved {
         MoveAfterWrite::NotAsked => (None, None, None, Vec::new()),
         MoveAfterWrite::Moved { to, outcome } => (
             Some(to.as_str()),
@@ -1841,6 +1899,60 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
         obj.insert("moved_cartridge".into(), cartridge.into());
         obj.insert("volumes_moved".into(), volumes.into());
     }
+}
+
+/// What one `volume resume` did once the volume was sealed and confirmed.
+#[derive(Debug)]
+pub(crate) struct ResumeDone {
+    /// What followed the seal: the resume's flags with what the interrupted
+    /// write recorded (ADR-0012 item 215).
+    pub(crate) post_seal: write::PostSeal,
+    pub(crate) release: StagingRelease,
+    pub(crate) moved: MoveAfterWrite,
+}
+
+/// What follows a resume that returned `Ok` — sealed and confirmed: the
+/// staging release, then the move, exactly as [`write_and_follow`] does
+/// them after a write, from what the resume decided to keep
+/// ([`write::PostSeal`]). Neither step can fail the resume: the copy stands.
+pub(crate) fn follow_resume(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    post_seal: write::PostSeal,
+) -> ResumeDone {
+    let keep = if post_seal.keep_staging {
+        StagingKeep::All
+    } else if post_seal.keep_staging_for_locations {
+        StagingKeep::UntilEveryLocation
+    } else {
+        StagingKeep::Release
+    };
+    let release = release_staging_after_write(conn, config, label, keep);
+    let moved = move_after_write(conn, label, post_seal.move_to.as_deref());
+    ResumeDone {
+        post_seal,
+        release,
+        moved,
+    }
+}
+
+/// `volume resume --json`: the keys it always had, plus — additive — the
+/// move keys `volume write --json` has and `kept_from_write`, the flags of
+/// the interrupted write the resume kept (ADR-0012 item 215), as one string,
+/// or null when it kept none.
+pub(crate) fn resume_done_json(label: &str, loaded: bool, done: &ResumeDone) -> serde_json::Value {
+    let mut base = staging_release_json(
+        serde_json::json!({
+            "label": label,
+            "status": "completed",
+            "resumed": true,
+            "loaded": loaded,
+            "kept_from_write": done.post_seal.kept_flags(),
+        }),
+        &done.release,
+    );
+    insert_move_json(&mut base, &done.moved);
     base
 }
 
@@ -1998,6 +2110,13 @@ pub fn run(
                     eprintln!("{line}");
                 }
             }
+            let keep = if *keep_staging {
+                StagingKeep::All
+            } else if *keep_staging_for_locations {
+                StagingKeep::UntilEveryLocation
+            } else {
+                StagingKeep::Release
+            };
             let steps = DriveWriteSteps {
                 conn,
                 paths,
@@ -2013,13 +2132,8 @@ pub fn run(
                 },
                 // `move_to` is X under `--for-location X` (decided above).
                 moved_to: move_to.as_deref().map(|to| to.trim().to_string()),
-            };
-            let keep = if *keep_staging {
-                StagingKeep::All
-            } else if *keep_staging_for_locations {
-                StagingKeep::UntilEveryLocation
-            } else {
-                StagingKeep::Release
+                for_location: for_x.as_ref().map(|(x, _)| x.clone()),
+                keep,
             };
             let done = write_and_follow(
                 conn,
@@ -2054,6 +2168,7 @@ pub fn run(
             prewrite_hash,
             full_confirm,
             keep_staging,
+            move_to,
         } => {
             // Issue #241: same reasoning as `volume write` — resuming
             // reopens the drive and revalidates the frozen staging files
@@ -2065,6 +2180,13 @@ pub fn run(
                     "a real preview would have to open the drive and revalidate the \
                      interrupted session's staged slices against it.",
                 ));
+            }
+            // As for `volume write --move-to` (issue #438): a mistyped
+            // location is refused before the drive is touched. A move the
+            // interrupted write recorded is not checked here: a place
+            // removed since is the move's warning once the copy stands.
+            if let Some(to) = move_to {
+                check_move_destination(conn, to)?;
             }
             let device = write_device(config, device.as_deref())?;
             // Issue #435: as for `volume write`, `--loaded` takes the
@@ -2083,7 +2205,7 @@ pub fn run(
                     ))
                 }
             };
-            write::volume_resume(
+            let post_seal = write::volume_resume_asked(
                 conn,
                 paths,
                 config,
@@ -2091,27 +2213,21 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *prewrite_hash,
-                *full_confirm,
+                &write::ResumeAsk {
+                    full_confirm: *full_confirm,
+                    move_to: move_to.clone(),
+                    keep_staging: *keep_staging,
+                },
             )?;
             // As for `volume write`: only an `Ok` resume (sealed and
             // confirmed, whichever of its three routes) gets here. Issue #440.
-            let release = release_staging_after_write(conn, config, label, *keep_staging);
+            let done = follow_resume(conn, config, label, post_seal);
             if json_output {
-                println!(
-                    "{}",
-                    staging_release_json(
-                        serde_json::json!({
-                            "label": label,
-                            "status": "completed",
-                            "resumed": true,
-                            "loaded": loaded,
-                        }),
-                        &release
-                    )
-                );
+                println!("{}", resume_done_json(label, *loaded, &done));
             } else {
                 println!("volume \"{label}\" write resumed and completed");
-                print_staging_release(label, &release);
+                print_staging_release(label, &done.release);
+                print_move_after_write(label, &done.moved);
             }
         }
 
@@ -4076,6 +4192,15 @@ struct VolumeInfo {
 }
 
 impl VolumeInfo {
+    /// The Status line ([`render_status_line`]).
+    fn status_line(&self) -> String {
+        render_status_line(
+            &self.status,
+            self.sealed_at.as_deref(),
+            self.writes.iter().map(|w| w.status.as_str()),
+        )
+    }
+
     /// The write-check line ([`render_write_check_line`]); a volume with
     /// neither a write nor a seal recorded has had nothing written yet.
     fn write_check_line(&self) -> String {
@@ -4432,6 +4557,49 @@ fn render_write_span(first_write: Option<&str>, last_write: Option<&str>) -> Str
     format!("  First write: {first}\n  Last write:  {last}\n")
 }
 
+/// `volume info`'s Status line: the stored status, and, on an `initialized`
+/// volume with a write session recorded, where that session stands (ADR-0012
+/// item 220) — so a sealed tape whose confirm is still owed reads `initialized
+/// — sealed, confirm pending`, never `initialized` beside a `Sealed:` time.
+/// Derived from `volumes.sealed_at` and the `writes` rows `volume info`
+/// already reads, so it sends no statement of its own; `volumes.status` and
+/// `--json`'s `status` are the stored value, unchanged.
+fn render_status_line<'s>(
+    status: &str,
+    sealed_at: Option<&str>,
+    writes: impl IntoIterator<Item = &'s str>,
+) -> String {
+    match session_state(status, sealed_at.is_some(), writes) {
+        Some(state) => format!("  Status:      {status} — {state}"),
+        None => format!("  Status:      {status}"),
+    }
+}
+
+/// Where an `initialized` volume's write session stands, from its seal and
+/// its `writes` rows' statuses; `None` for any other status, and for an
+/// `initialized` volume with nothing recorded to say.
+fn session_state<'s>(
+    status: &str,
+    sealed: bool,
+    writes: impl IntoIterator<Item = &'s str>,
+) -> Option<&'static str> {
+    if status != "initialized" {
+        return None;
+    }
+    let statuses: Vec<&str> = writes.into_iter().collect();
+    let has = |s: &str| statuses.contains(&s);
+    let open = has("planned") || has("in_progress") || has("interrupted");
+    Some(match (sealed, open) {
+        (true, true) => "sealed, confirm pending",
+        (true, false) if has("aborted") => "sealed, write session aborted",
+        (false, _) if has("in_progress") => "write in progress, not sealed",
+        (false, _) if has("interrupted") => "write interrupted, not sealed",
+        (false, _) if has("planned") => "write planned, nothing on the tape yet",
+        (false, false) if has("aborted") => "write aborted, not sealed",
+        _ => return None,
+    })
+}
+
 /// `volume info`'s seal line (issue #305): `volumes.sealed_at`, which `--json`
 /// carried and the human output never printed — on a rebuilt volume it is
 /// the seal marker's own date, the one thing the tape says about when its
@@ -4540,7 +4708,7 @@ fn render_verification_history(verifications: &[VerificationRow]) -> String {
 
 fn print_volume_info(info: &VolumeInfo) {
     println!("Volume: {}", info.label);
-    println!("  Status:      {}", info.status);
+    println!("{}", info.status_line());
     // Issue #242: since a quarantined volume can read Status "sealed", the
     // condition is a separate, always-shown line rather than folded into
     // Status's text.
@@ -5574,6 +5742,7 @@ mod tests {
                     prewrite_hash: false,
                     full_confirm: false,
                     keep_staging: false,
+                    move_to: None,
                 },
             ] {
                 let err = run(&conn, &paths, &config, &cmd, false, true, true)
@@ -5659,27 +5828,39 @@ mod tests {
                 "DriveWriteSteps is the real init and the real write"
             );
 
-            // `volume resume`.
+            // `volume resume`: the arm resumes, then hands what the resume
+            // kept of the interrupted write (ADR-0012 item 215) to
+            // `follow_resume`, behind the resume's own `?`.
             let arm = "VolumeCommands::Resume {\n";
             let start = run_body.find(arm).unwrap();
             let body = &run_body
                 [start..start + run_body[start..].find("VolumeCommands::Abort {").unwrap()];
             let call = body
-                .find("write::volume_resume(")
-                .unwrap_or_else(|| panic!("{arm}: no write"));
-            let question = call + body[call..].find(")?;").expect("the write's own `?`");
-            let release = body
-                .find("release_staging_after_write(conn, config, label, *keep_staging)")
-                .unwrap_or_else(|| panic!("{arm}: no release honouring --keep-staging"));
+                .find("write::volume_resume_asked(")
+                .unwrap_or_else(|| panic!("{arm}: no resume"));
+            let question = call + body[call..].find(")?;").expect("the resume's own `?`");
+            let follow = body
+                .find("follow_resume(conn, config, label, post_seal)")
+                .unwrap_or_else(|| panic!("{arm}: nothing follows the resume"));
             assert!(
-                release > question,
-                "{arm}: the release must come after the write's `?`, not before it"
+                follow > question,
+                "{arm}: the release and the move must come after the resume's `?`, not before it"
             );
-            assert_eq!(
-                body.matches("release_staging_after_write(").count(),
-                1,
-                "{arm}: one release call"
+            assert!(
+                !body.contains("release_staging_after_write(") && !body.contains(" move_after_write("),
+                "{arm}: the arm itself releases and moves nothing: follow_resume does"
             );
+            let seq_start = SRC.find("fn follow_resume(").unwrap();
+            let seq = &SRC[seq_start..seq_start + SRC[seq_start..].find("\n}\n").unwrap()];
+            let release = seq
+                .find("release_staging_after_write(conn, config, label, keep)")
+                .expect("the release honours what the resume keeps");
+            let moved = seq
+                .find("move_after_write(conn, label, post_seal.move_to.as_deref())")
+                .expect("the move is the one the resume kept or was told");
+            assert!(release < moved, "the release runs before the move, as after a write");
+            assert_eq!(seq.matches("release_staging_after_write(").count(), 1);
+            assert_eq!(seq.matches("move_after_write(").count(), 1);
             // And nowhere else in the library: `collection run`, `quick-archive`
             // and `volume compact*` reach `volume_write` directly and have
             // their own release step, so a release inside it would double up.
@@ -6859,6 +7040,8 @@ mod tests {
                         assume_yes: true,
                         scope: write::StagedScope::Every,
                         moved_to: Some("offsite".into()),
+                        for_location: None,
+                        keep: StagingKeep::Release,
                     },
                 };
                 crate::volume::write::shared_place_log::take();
@@ -7091,6 +7274,7 @@ mod tests {
                     prewrite_hash: false,
                     full_confirm: false,
                     keep_staging: false,
+                    move_to: None,
                 },
             ] {
                 let err = run(&conn, &paths, &config, &cmd, false, true, false)
@@ -8004,6 +8188,7 @@ mod tests {
                 prewrite_hash: false,
                 full_confirm: false,
                 keep_staging: false,
+                move_to: None,
             },
             VolumeCommands::CompactWrite {
                 destination: "L".into(),
@@ -8913,6 +9098,94 @@ mod tests {
                 7,
                 "--units lists every unit carried"
             );
+        }
+
+        /// ADR-0012 item 220: the Status line shows where an `initialized`
+        /// volume's write session stands, from what `volume info` already
+        /// reads — a sealed tape whose confirm is owed reads `initialized —
+        /// sealed, confirm pending`, never `initialized` beside a `Sealed:`
+        /// time — while `--json`'s `status` stays the stored value.
+        #[test]
+        fn info_status_line_says_where_the_write_session_stands() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                       capacity_bytes, status, sealed_at)
+                     VALUES ('L6-NEW', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized',
+                             NULL),
+                            ('L6-OWED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized',
+                             '2026-11-04 05:12:15'),
+                            ('L6-DONE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                             '2026-11-04 05:12:15');",
+            )
+            .unwrap();
+            let tenant_id: i64 = conn
+                .query_row("SELECT id FROM tenants WHERE name = 't'", [], |r| r.get(0))
+                .unwrap();
+            let add = |unit: &str, label: &str, status: &str| {
+                conn.execute(
+                    "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                    params![unit, tenant_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, 1, 'full', 'current', '/x')",
+                    params![conn.last_insert_rowid()],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, total_encrypted_size)
+                     VALUES (?1, 'staged', 524288, 1000)",
+                    params![snap_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ?1, ?2, id, ?3 FROM volumes WHERE label = ?4",
+                    params![conn.last_insert_rowid(), snap_id, status, label],
+                )
+                .unwrap();
+            };
+            add("owed", "L6-OWED", "interrupted");
+            add("done", "L6-DONE", "completed");
+
+            for (label, line) in [
+                ("L6-NEW", "  Status:      initialized"),
+                ("L6-OWED", "  Status:      initialized — sealed, confirm pending"),
+                ("L6-DONE", "  Status:      sealed"),
+            ] {
+                let info = volume_info(&conn, label, false).unwrap();
+                assert_eq!(info.status_line(), line, "{label}");
+                // Display only: the stored status is what `--json` says.
+                let json = serde_json::to_value(&info).unwrap();
+                assert_eq!(json["status"], info.status, "{label}");
+            }
+            let owed = volume_info(&conn, "L6-OWED", false).unwrap();
+            assert_eq!(serde_json::to_value(&owed).unwrap()["status"], "initialized");
+
+            // The other states an initialized volume's session can be in.
+            for (sealed, writes, state) in [
+                (false, &["interrupted"][..], Some("write interrupted, not sealed")),
+                (false, &["in_progress"][..], Some("write in progress, not sealed")),
+                (false, &["planned"][..], Some("write planned, nothing on the tape yet")),
+                (false, &["aborted"][..], Some("write aborted, not sealed")),
+                (true, &["aborted"][..], Some("sealed, write session aborted")),
+                (true, &["in_progress"][..], Some("sealed, confirm pending")),
+                (false, &[][..], None),
+            ] {
+                assert_eq!(
+                    session_state("initialized", sealed, writes.iter().copied()),
+                    state,
+                    "sealed={sealed} {writes:?}"
+                );
+            }
+            // Any other status is shown as stored.
+            assert_eq!(session_state("sealed", true, ["completed"]), None);
+            assert_eq!(session_state("retired", true, ["interrupted"]), None);
         }
 
         /// #490: a short volume names where it ended and the units it cut,

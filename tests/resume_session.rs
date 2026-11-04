@@ -716,3 +716,163 @@ fn abort_marks_the_session_aborted_and_unresumable() {
         .expect_err("a second abort has nothing to do");
     assert!(err.to_string().contains("no unfinished write session"));
 }
+
+// ── ADR-0012 item 215: the write's intent past its seal ──
+
+use tapectl::volume::session::{WriteIntent, WRITE_INTENT_FILE};
+use tapectl::volume::write::{PostSeal, ResumeAsk};
+
+/// The intent a write records beside its frozen Layout survives the process
+/// as the Layout does, and a restarted resume reads it back from the session
+/// directory the `writes` rows name — nothing carried in memory.
+#[test]
+fn the_write_intent_survives_a_restart_beside_the_frozen_layout() {
+    let f = make_fixture();
+    let intent = WriteIntent {
+        full_confirm: true,
+        move_to: Some("vault".to_string()),
+        for_location: None,
+        keep_staging: false,
+        keep_staging_for_locations: true,
+    };
+    intent.record(&f.built.session_dir).unwrap();
+    let _store = interrupt_after(&f, 9);
+
+    let conn = db::open(&f.db_path).unwrap();
+    let session = InterruptedSession::rehydrate(&conn, f.volume_id)
+        .unwrap()
+        .expect("an interrupted session to resume");
+    assert_eq!(session.recorded_intent().unwrap(), Some(intent));
+
+    // Like `layout.json`, a staging-side file: never a LayoutEntry.
+    let intent_path = f.built.session_dir.join(WRITE_INTENT_FILE);
+    for e in &f.built.layout.entries {
+        if let tapectl::volume::layout_model::ContentSource::Staged(p)
+        | tapectl::volume::layout_model::ContentSource::Materialized(p) = &e.source
+        {
+            assert_ne!(p, &intent_path);
+        }
+    }
+}
+
+/// A session directory written by tapectl 1.8.1 has no intent file: it reads
+/// as none, and the resume does what it is told, as before.
+#[test]
+fn a_session_directory_with_no_intent_reads_as_none() {
+    let f = make_fixture();
+    let _store = interrupt_after(&f, 9);
+    let conn = db::open(&f.db_path).unwrap();
+    let session = InterruptedSession::rehydrate(&conn, f.volume_id)
+        .unwrap()
+        .expect("an interrupted session to resume");
+    assert_eq!(session.recorded_intent().unwrap(), None);
+    let told = ResumeAsk {
+        full_confirm: false,
+        move_to: Some("home".to_string()),
+        keep_staging: true,
+    };
+    let post = PostSeal::for_resume("RESUMETEST", None, &told).unwrap();
+    assert_eq!(
+        post,
+        PostSeal {
+            full_confirm: false,
+            move_to: Some("home".to_string()),
+            keep_staging: true,
+            keep_staging_for_locations: false,
+            recorded: None,
+        }
+    );
+    assert_eq!(post.kept_flags(), None, "nothing recorded, nothing to say");
+}
+
+/// An intent file that is there and does not read refuses, naming it: a
+/// resume that guessed could run a shorter confirm than the write asked for.
+#[test]
+fn an_intent_that_does_not_read_is_an_error_naming_the_file() {
+    let f = make_fixture();
+    let path = f.built.session_dir.join(WRITE_INTENT_FILE);
+    std::fs::write(&path, b"{ not json").unwrap();
+    let _store = interrupt_after(&f, 9);
+    let conn = db::open(&f.db_path).unwrap();
+    let session = InterruptedSession::rehydrate(&conn, f.volume_id)
+        .unwrap()
+        .expect("the session itself still rehydrates");
+    let err = session.recorded_intent().unwrap_err().to_string();
+    assert!(err.contains(&path.display().to_string()), "{err}");
+}
+
+/// The conservative rules a resume combines its own flags with the record by:
+/// a full confirm is never downgraded; a different `--move-to` is refused
+/// naming both; staging keeps the most either asked to keep.
+#[test]
+fn a_resume_keeps_the_record_and_never_undoes_it() {
+    let rec = |f: fn(&mut WriteIntent)| {
+        let mut i = WriteIntent::default();
+        f(&mut i);
+        Some(i)
+    };
+    let bare = ResumeAsk::default();
+
+    // Full confirm: either asks, it runs.
+    let p = PostSeal::for_resume("L", rec(|i| i.full_confirm = true), &bare).unwrap();
+    assert!(p.full_confirm);
+    assert_eq!(p.kept_flags().as_deref(), Some("--full-confirm"));
+    let told_full = ResumeAsk {
+        full_confirm: true,
+        ..ResumeAsk::default()
+    };
+    let p = PostSeal::for_resume("L", rec(|_| {}), &told_full).unwrap();
+    assert!(p.full_confirm);
+    assert_eq!(p.kept_flags(), None, "the record asked nothing");
+
+    // The move: kept, or the same place given, or refused naming both.
+    let p = PostSeal::for_resume("L", rec(|i| i.move_to = Some("vault".into())), &bare).unwrap();
+    assert_eq!(p.move_to.as_deref(), Some("vault"));
+    let to = |place: &str| ResumeAsk {
+        move_to: Some(place.to_string()),
+        ..ResumeAsk::default()
+    };
+    let p = PostSeal::for_resume("L", rec(|i| i.move_to = Some("vault".into())), &to(" vault"))
+        .unwrap();
+    assert_eq!(p.move_to.as_deref(), Some("vault"));
+    let err = PostSeal::for_resume("L", rec(|i| i.move_to = Some("vault".into())), &to("home"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--move-to \"home\"") && err.contains("--move-to vault"),
+        "{err}"
+    );
+    let for_x = rec(|i| {
+        i.for_location = Some("offsite".into());
+        i.move_to = Some("offsite".into());
+    });
+    let err = PostSeal::for_resume("L", for_x.clone(), &to("home"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--move-to \"home\"") && err.contains("--for-location offsite"),
+        "{err}"
+    );
+    let p = PostSeal::for_resume("L", for_x, &bare).unwrap();
+    assert_eq!(p.move_to.as_deref(), Some("offsite"));
+    assert_eq!(p.kept_flags().as_deref(), Some("--for-location offsite"));
+
+    // Staging keeps the most either asked to keep.
+    let p = PostSeal::for_resume("L", rec(|i| i.keep_staging_for_locations = true), &bare).unwrap();
+    assert!(p.keep_staging_for_locations && !p.keep_staging);
+    let told_keep = ResumeAsk {
+        keep_staging: true,
+        ..ResumeAsk::default()
+    };
+    let p = PostSeal::for_resume(
+        "L",
+        rec(|i| i.keep_staging_for_locations = true),
+        &told_keep,
+    )
+    .unwrap();
+    assert!(p.keep_staging && !p.keep_staging_for_locations);
+    assert_eq!(p.kept_flags(), None, "--keep-staging given wins over the record");
+    let p = PostSeal::for_resume("L", rec(|i| i.keep_staging = true), &bare).unwrap();
+    assert!(p.keep_staging);
+    assert_eq!(p.kept_flags().as_deref(), Some("--keep-staging"));
+}

@@ -78,6 +78,17 @@ fn each_write_command_refused_before_the_tape_moved_exits_2() {
             NO_DRIVE,
         ][..],
         &["volume", "resume", "NOSUCH", "--device", NO_DRIVE][..],
+        // ADR-0012 item 215: resume's `--move-to` is checked as the write's
+        // is, before anything is touched.
+        &[
+            "volume",
+            "resume",
+            "NOSUCH",
+            "--move-to",
+            "nowhere",
+            "--device",
+            NO_DRIVE,
+        ][..],
         // Issue #435: `--loaded` names the volume from the tape, which here
         // does not exist — refused before anything is written.
         &["volume", "write", "--loaded", "--device", NO_DRIVE][..],
@@ -143,4 +154,30 @@ fn a_write_command_line_that_does_not_parse_exits_2() {
         let out = tapectl(home.path(), args);
         assert_exit(&out, 2, &format!("{args:?}"));
     }
+}
+
+/// ADR-0012 item 215: `volume resume --move-to` is checked as `volume write
+/// --move-to` is — a location that does not exist is refused by name, before
+/// the volume is looked up or the drive touched — and exits 2.
+#[test]
+fn resume_refuses_an_unknown_move_to_before_anything_else() {
+    let home = initialised_home();
+    let out = tapectl(
+        home.path(),
+        &[
+            "volume",
+            "resume",
+            "NOSUCH",
+            "--move-to",
+            "nowhere",
+            "--device",
+            NO_DRIVE,
+        ],
+    );
+    assert_exit(&out, 2, "resume --move-to nowhere");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--move-to location \"nowhere\" not found"),
+        "the location is named, not the volume: {stderr}"
+    );
 }
