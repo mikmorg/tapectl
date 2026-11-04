@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-**Next: (i), home2 starts over on 1.8.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`). Step 0 is done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53 (`docs/runs/2026-11-02-1.8.1-handoff-i.md`); steps 1 to 10 are next. On 2026-11-03 the CTO moved the new home out of the hidden `.tapectl`, to `/srv/archive_meta/tapectl/home` (item 197), so steps 5 on run `first-run.sh` from `origin/master`. What follows is the history before it.
+**Next: (i), home2 starts over on 1.8.1, paused after step 6 for 1.9.0** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`; amended 2026-11-04, item 205: copy 1 waits for 1.9.0). Steps 0 to 6 are done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53, and the new home `/srv/archive_meta/tapectl/home` (item 197) has its catalog, keys and keepsake's collection table since 2026-11-03, with no units yet (`docs/runs/2026-11-02-1.8.1-handoff-i.md`). Copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`), which carries the scripts batch too; home2 installs it by `--upgrade`, registers keepsake, then writes copies 1 and 2 (the block before step 7). What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
@@ -45,7 +45,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
 | (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183): **done 2026-10-29** | **you** (sudo for the install, and returning the test cartridge first) |
-| (i) | Install 1.8.1 with `first-run.sh --upgrade`, then start home2 over on it: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193-195) | **you** (sudo, the escrow key, the cartridges) |
+| (i) | Install 1.8.1 with `first-run.sh --upgrade`, then start home2 over on it: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193-195). Paused after step 6 (2026-11-03): copy 1 waits for 1.9.0 (item 205) | **you** (sudo, the escrow key, the cartridges) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -559,7 +559,9 @@ inside tmux, in this order. (c) and (d) are the model. What differs from them:
 - **the new home is visible**: `/srv/archive_meta/tapectl/home`, not the hidden
   `/srv/archive_meta/tapectl/.tapectl` (ruled 2026-11-03, item 197). `home2.profile`'s
   `TAPECTL_HOME_DIR` names it, so from step 5 on `first-run.sh` runs from `origin/master`, which
-  carries it; the installed binary stays 1.8.1.
+  carries it; the installed binary stays 1.8.1;
+- **1.9.0 goes on before copy 1** (ruled 2026-11-04, item 205), so the fresh start's tapes begin
+  on the reviewed CLI. (i) pauses after step 6; the block before step 7 says what comes first.
 
 Never run step 7 under `script` or `tee`. If you mint an escrow identity, its secret prints there
 once, and only `first-run.sh`'s own log leaves step 7's output out.
@@ -674,11 +676,37 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
    compare with the old config for anything else set by hand:
 
    ```bash
-   sudo -u tapectl -H tapectl --home /srv/archive_meta/tapectl/home config set 'backends.lto[0].post_warning_bytes' 99008M
+   sudo -u tapectl -H tapectl config set 'backends.lto[0].post_warning_bytes' 99008M
    sudo diff /srv/archive_meta/tapectl/.tapectl-old/config.toml /srv/archive_meta/tapectl/home/config.toml
    ```
 
-7. **Copy 1.** Tell the coordinator first, so vm-desk1's builds hold while the drive writes.
+   No `--home`: step 5 pointed `/etc/tapectl/home` at the new home.
+
+**Paused here, for 1.9.0 (ruled 2026-11-04, ADR-0012 item 205).** Steps 0 to 6 are done
+(2026-11-02 and 2026-11-03; the run record). Copy 1 waits for 1.9.0, the CLI review's release
+(items 198-221). It also carries the scripts batch: #511, the staging diagnosis (item 199),
+`POST_WARNING_BYTES` (item 200) and keepsake out of `home2.profile` (item 204). Before step 7,
+in this order:
+
+- **Install 1.9.0 with `first-run.sh --upgrade`** on the new home, once `v1.9.0` is tagged,
+  rehearsing on EW7VWMVKF6 as step 0 did. It is a drive step: tell the coordinator first, who
+  sends the broker notice. The command is written here when 1.9.0 lands.
+- **Register keepsake** (item 204). In step 5, `first-run.sh`'s step 11 wrote keepsake's table
+  but its sync was declined, so the new catalog has no units, and step 13 writes only
+  registered ones:
+
+  ```bash
+  sudo -u tapectl -H tapectl collection sync --dry-run   # 27 to create
+  sudo -u tapectl -H tapectl collection sync --yes
+  ```
+
+- **Copies 1 and 2 run on one loop, `volume write … --full-confirm`** (item 218), with no
+  separate `volume verify --full`. 1.9.0 changes `first-run.sh` step 13 to match and gives a
+  cartridge its volume's label as its barcode (item 219). Steps 7 to 9 below are rewritten for
+  1.9.0's commands when it lands; until then they describe 1.8.1's.
+
+7. **Copy 1.** Tell the coordinator first, about 15 minutes ahead, so vm-desk1's builds hold and
+   home2 stays quiet while the drive writes (item 202).
    Load L6-0001 and run `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13`.
    - Step 13's `volume init` refuses the sealed volume on the tape and offers `cartridge erase`,
      as in (c), "L6-0001 at its volume init". The dry run shows File 0's label `L6-0001`,
