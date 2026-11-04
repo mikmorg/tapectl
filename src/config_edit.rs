@@ -26,7 +26,10 @@
 //! `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry in a list
 //! of tables (`[[collections]]`, `[[archive_sets]]`, `[[backends.lto]]`) is
 //! selected by its `name`, or by its position from 0:
-//! `collections[movies].unit_depth`, `archive_sets[1]`.
+//! `collections[movies].unit_depth`, `archive_sets[1]`. A bare key resolves
+//! to the one key of that name, and a list of tables with one entry needs no
+//! selector (ADR-0012 item 214, [`resolve_key`]); `config get` reads a key
+//! the same way ([`get`]).
 //!
 //! Values are typed by what the file accepts: a value that reads as a TOML
 //! number, boolean, date or array is tried as one first, and as a string if
