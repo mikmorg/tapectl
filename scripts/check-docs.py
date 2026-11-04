@@ -36,6 +36,9 @@ DEFAULT_FILES = ["README.md"] + sorted(
 
 FENCE = re.compile(r"^(\s*)(```|~~~)\s*([\w+-]*)")
 
+# The `--help` headings that list something other than subcommands.
+NOT_COMMAND_HEADINGS = {"Arguments", "Options", "Global options", "Examples"}
+
 
 def find_bin(explicit):
     if explicit:
@@ -61,21 +64,26 @@ class Help:
         return self.cache[key]
 
     def subcommands(self, path):
+        """The subcommands `--help` lists: the lines under every heading after
+        the Usage line that is not an option, argument or example heading.
+        A subcommand lists them under `Commands:`; the top level groups them
+        under one heading per job (ADR-0012 item 211)."""
         rc, out = self.get(path)
         if rc != 0:
             return None
-        subs, on = set(), False
+        subs, usage, on = set(), False, False
         for line in out.splitlines():
-            if line.startswith("Commands:"):
-                on = True
+            if line.startswith("Usage:"):
+                usage = True
+                continue
+            heading = re.match(r"^([A-Z][A-Za-z ]*):\s*$", line)
+            if usage and heading:
+                on = heading.group(1) not in NOT_COMMAND_HEADINGS
                 continue
             if on:
-                m = re.match(r"^  (\S+)", line)
+                m = re.match(r"^  ([a-z][a-z0-9-]*)(\s|$)", line)
                 if m:
                     subs.add(m.group(1))
-                elif line.strip() == "" or not line.startswith(" "):
-                    if subs:
-                        on = False
         return subs
 
     def flags(self, path):
@@ -297,7 +305,10 @@ def self_test(binary):
     good = ["tapectl volume write L6-0001 --device /dev/tape/by-id/x-nst --yes",
             "tapectl --home /tmp/h audit --json", "tapectl catalog search '*.jpg'",
             "tapectl catalog search 'IMG 101'",
-            "tapectl --home /tmp/h volume verify L6-0001 --device /dev/tape/by-id/x-nst --full"]
+            "tapectl --home /tmp/h volume verify L6-0001 --device /dev/tape/by-id/x-nst --full",
+            # A command from the first, a middle and the last group of the
+            # grouped top-level help, and a global option given after one.
+            "tapectl init --no-escrow", "tapectl status --json", "tapectl db stats --home /tmp/h"]
     ok = True
     for line, want in bad.items():
         p = check_command(helpdb, shlex.split(line)[1:])

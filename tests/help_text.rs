@@ -151,3 +151,66 @@ fn receipt_in_help_means_only_the_recipients_or_a_deposit() {
         );
     }
 }
+
+/// ADR-0012 item 211: the top-level help groups the commands by job, in
+/// workflow order. Every visible top-level command is in exactly one group,
+/// no hidden stub of a removed spelling is in any, and the help the binary
+/// prints lists them so.
+#[test]
+fn the_top_level_help_lists_every_visible_command_once_in_its_group() {
+    use tapectl::cli::HELP_GROUPS;
+    let mut cmd = tapectl::cli::command();
+    let visible: std::collections::BTreeSet<String> = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(|s| s.get_name().to_string())
+        .collect();
+    let hidden: Vec<String> = cmd
+        .get_subcommands()
+        .filter(|s| s.is_hide_set())
+        .map(|s| s.get_name().to_string())
+        .collect();
+    // Positive controls: the tree has both kinds, `help` among the visible.
+    assert!(visible.contains("help") && visible.contains("status"));
+    assert!(hidden.iter().any(|h| h == "backend"), "{hidden:?}");
+
+    let grouped: Vec<String> = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter().map(|n| n.to_string()))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &grouped {
+        assert!(seen.insert(name.clone()), "{name} is in two groups");
+        assert!(visible.contains(name), "{name} is grouped and not a visible command");
+    }
+    assert_eq!(seen, visible, "every visible command is in a group");
+
+    for help in [
+        cmd.render_long_help().to_string(),
+        cmd.render_help().to_string(),
+    ] {
+        let listed: Vec<String> = help
+            .lines()
+            .skip_while(|l| !l.starts_with("Usage:"))
+            .take_while(|l| !l.starts_with(tapectl::cli::GLOBAL_OPTIONS))
+            .filter_map(|l| l.strip_prefix("  "))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(listed, grouped, "the help lists the groups in order:\n{help}");
+        let headings: Vec<&str> = help
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| !l.starts_with(' '))
+            .collect();
+        let want: Vec<&str> = HELP_GROUPS
+            .iter()
+            .map(|(h, _)| *h)
+            .chain([tapectl::cli::GLOBAL_OPTIONS])
+            .collect();
+        assert_eq!(headings, want, "{help}");
+        for h in &hidden {
+            assert!(!listed.contains(h), "the hidden {h} is listed:\n{help}");
+        }
+    }
+}

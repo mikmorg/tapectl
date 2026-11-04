@@ -33,33 +33,49 @@ use clap::{Parser, Subcommand};
 // page's DESCRIPTION — keep this a plain comment.)
 /// tapectl — Multi-Tenant Archival Storage Management System
 #[derive(Parser, Debug)]
-#[command(name = "tapectl", version = crate::build_info::VERSION, about)]
+#[command(
+    name = "tapectl",
+    version = crate::build_info::VERSION,
+    about,
+    after_long_help = ROOT_AFTER_LONG_HELP
+)]
 pub struct Cli {
-    /// Output in JSON format
-    #[arg(long, global = true)]
+    /// Output in JSON format, errors included
+    ///
+    /// Under it an error is one JSON document on stdout, `{"error": …,
+    /// "exit_code": N}`, and the exit code is the command's own.
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS)]
     pub json: bool,
 
-    /// Show what would be done without making changes. Commands that
-    /// cannot preview refuse the flag rather than ignore it.
-    #[arg(long, short = 'n', global = true)]
+    /// Show what would be done without making changes
+    ///
+    /// Commands that cannot preview refuse the flag rather than ignore it.
+    #[arg(long, short = 'n', global = true, help_heading = GLOBAL_OPTIONS)]
     pub dry_run: bool,
 
-    /// Enable verbose output
-    #[arg(long, short, global = true)]
+    /// Debug tracing on stderr
+    ///
+    /// Raises the log level to DEBUG (never lowers a `[logging] level` set
+    /// higher); it never changes what a command does or prints on stdout.
+    #[arg(long, short, global = true, help_heading = GLOBAL_OPTIONS)]
     pub verbose: bool,
 
-    /// No live progress on stderr. Long operations (stage create, volume
-    /// write/resume/verify/read-slices, restore) still write their session
-    /// log under <home>/logs/
-    #[arg(long, short, global = true)]
+    /// No live progress on stderr
+    ///
+    /// Long operations (stage create, volume write/resume/verify/read-slices,
+    /// restore) still write their session log under <home>/logs/.
+    #[arg(long, short, global = true, help_heading = GLOBAL_OPTIONS)]
     pub quiet: bool,
 
-    /// Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a
-    /// Tier-3 refusal — those are facts, not risks to accept
-    #[arg(long, short, global = true)]
+    /// Answer yes to the confirmation prompts of risks you may accept
+    ///
+    /// It never reaches a refusal: what is refused is a fact, not a risk to
+    /// accept (ADR-0008, Tier 3), and a command's own --force names what it
+    /// overrides.
+    #[arg(long, short, global = true, help_heading = GLOBAL_OPTIONS)]
     pub yes: bool,
 
-    /// Path to config file.
+    /// Path to config file
     ///
     /// NOTE: on its own this ALSO relocates the whole tapectl home to the
     /// config file's parent directory — database, keys, staging, stage
@@ -68,10 +84,10 @@ pub struct Cli {
     /// works, but it is surprising enough that it now warns. Use --home
     /// when you mean "operate on a different archive", and --config only
     /// to point at a config file inside that home.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS)]
     pub config: Option<String>,
 
-    /// tapectl home directory: database, keys, catalogs, stage-reports, logs.
+    /// tapectl home directory: database, keys, catalogs, stage-reports, logs
     ///
     /// The home is the first of: --home; TAPECTL_HOME; the directory of
     /// --config; this account's ~/.tapectl, when it exists; the home named by
@@ -85,48 +101,194 @@ pub struct Cli {
     /// As root the home pointer is never read, and on a host that has one
     /// tapectl refuses unless --home or TAPECTL_HOME names the home: the
     /// service user's commands run through `tapectl-op`.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS)]
     pub home: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
 }
 
+/// The heading the global options are listed under, after a command's own
+/// (ADR-0012 item 211).
+pub const GLOBAL_OPTIONS: &str = "Global options";
+
+/// The end of `tapectl --help`: the exit codes every command shares, and
+/// where a command's own are (ADR-0012 item 212).
+const ROOT_AFTER_LONG_HELP: &str = "\
+Exit status: 0 = done; 2 = an error, a usage error included; 75 = the catalog was busy, run it \
+again. A command with codes of its own (audit, host check, config check, db fsck, volume verify, \
+cartridge erase, the commands that write a tape, the drive commands) names them in its own \
+--help, and the CLI reference has every code in one table.";
+
+/// The top-level help's groups: by job, in workflow order (ADR-0012 item
+/// 211). Every visible top-level command is in exactly one group and no
+/// hidden one is in any (`tests/help_text.rs` holds it to the tree); the help
+/// lists them in this order.
+pub const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Set up",
+        &[
+            "init",
+            "tenant",
+            "key",
+            "location",
+            "archive-set",
+            "config",
+            "host",
+        ],
+    ),
+    ("Sources", &["collection", "unit", "snapshot"]),
+    ("Stage and write", &["stage", "volume", "quick-archive"]),
+    ("Check", &["status", "audit", "report"]),
+    ("Restore", &["restore"]),
+    ("Drive and cartridges", &["drive", "cartridge"]),
+    (
+        "Catalog and maintenance",
+        &["catalog", "db", "completions", "help"],
+    ),
+];
+
+/// The command line tapectl parses: the derived [`Cli`] with its top-level
+/// help grouped by [`HELP_GROUPS`]. The binary parses with this, so
+/// `tapectl --help`, `tapectl -h` and `tapectl help` show the groups.
+pub fn command() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    // Built first, so clap's own `help` command is there to be listed.
+    cmd.build();
+    let template = grouped_help_template(&cmd);
+    cmd.help_template(template)
+}
+
+/// Parse `args` (argv, the program name first) as the binary does, with
+/// [`command`]'s grouped help.
+pub fn try_parse_from(args: &[std::ffi::OsString]) -> Result<Cli, clap::Error> {
+    use clap::FromArgMatches;
+    let mut cmd = command();
+    let mut matches = cmd.try_get_matches_from_mut(args)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cmd))
+}
+
+/// clap's default help template with the command list replaced by
+/// [`HELP_GROUPS`], each command with its one-line about, and every option
+/// (all of them global at the top level, `-h` and `-V` with them) under
+/// [`GLOBAL_OPTIONS`].
+fn grouped_help_template(cmd: &clap::Command) -> String {
+    let styles = cmd.get_styles();
+    let header = styles.get_header();
+    let literal = styles.get_literal();
+    let width = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(0);
+    let mut groups = String::new();
+    for (heading, names) in HELP_GROUPS {
+        groups.push_str(&format!("{header}{heading}:{header:#}\n"));
+        for name in *names {
+            let about = cmd
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_about())
+                .map(|about| about.to_string())
+                .unwrap_or_default();
+            let pad = width - name.len();
+            groups.push_str(&format!(
+                "  {literal}{name}{literal:#}{:pad$}  {about}\n",
+                ""
+            ));
+        }
+        groups.push('\n');
+    }
+    format!(
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\
+         {header}{GLOBAL_OPTIONS}:{header:#}\n{{options}}{{after-help}}"
+    )
+}
+
+/// The command tree shell completions are generated from: [`command`]
+/// without the hidden stubs of the spellings 1.9.0 removed (`backend`,
+/// `staging`, `export`, `import`, `report pending`, …), which completion would
+/// otherwise offer (clap_complete lists hidden commands too). Rebuilt from
+/// the visible commands, keeping what completion reads: names, abouts, the
+/// arguments and their groups.
+pub fn completion_command() -> clap::Command {
+    use clap::CommandFactory;
+    // clap takes a name as `&'static str` (without its `string` feature):
+    // leaked, once per name, by a command that prints a script and exits.
+    fn leak(s: &str) -> &'static str {
+        Box::leak(s.to_owned().into_boxed_str())
+    }
+    fn visible(cmd: &clap::Command) -> clap::Command {
+        let mut out = clap::Command::new(leak(cmd.get_name()))
+            .args(cmd.get_arguments().cloned())
+            .groups(cmd.get_groups().cloned())
+            .subcommands(
+                cmd.get_subcommands()
+                    .filter(|sub| !sub.is_hide_set())
+                    .map(visible),
+            );
+        if let Some(about) = cmd.get_about() {
+            out = out.about(about.clone());
+        }
+        if let Some(about) = cmd.get_long_about() {
+            out = out.long_about(about.clone());
+        }
+        if let Some(version) = cmd.get_version() {
+            out = out.version(leak(version));
+        }
+        if cmd.is_disable_help_subcommand_set() {
+            out = out.disable_help_subcommand(true);
+        }
+        if cmd.is_disable_help_flag_set() {
+            out = out.disable_help_flag(true);
+        }
+        out
+    }
+    visible(&Cli::command())
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize tapectl (DB, config, operator tenant, keys, and the
-    /// permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or
-    /// --escrow-public-key to adopt an existing one instead of minting a new
-    /// identity)
+    /// Make a new archive: catalog, config, operator tenant, keys, escrow
+    ///
+    /// Creates the database, config.toml, the operator tenant with its keys,
+    /// and the permanent escrow recipient (ADR-0005), whose secret it prints
+    /// once. --no-escrow skips the escrow recipient; --escrow-public-key
+    /// adopts an existing one instead of minting a new identity. It ends with
+    /// the next steps.
     Init {
-        /// Name of the operator tenant. Defaults to the login name
-        /// ($USER) — except under a system account (a uid below UID_MIN in
-        /// /etc/login.defs, such as a `tapectl` service user), where it is
-        /// required: `init` refuses rather than name the operator after the
-        /// account.
+        /// Name of the operator tenant (default: the login name)
+        ///
+        /// Defaults to the login name ($USER), except under a system account
+        /// (a uid below UID_MIN in /etc/login.defs, such as a `tapectl`
+        /// service user), where it is required: `init` refuses rather than
+        /// name the operator after the account.
         #[arg(long)]
         operator: Option<String>,
-        /// Do NOT create the permanent escrow recipient (ADR-0005) at init.
-        /// By default `init` generates it and prints its secret once. Use this
-        /// only when you will adopt an existing escrow identity with
-        /// `key import --escrow` instead, or in tests/tooling that register
-        /// escrow separately.
+        /// Do not create the permanent escrow recipient now
+        ///
+        /// By default `init` generates it (ADR-0005) and prints its secret
+        /// once. Use this only when you will adopt an existing escrow
+        /// identity with `key import --escrow` instead, or in tests and
+        /// tooling that register escrow separately.
         #[arg(long)]
         no_escrow: bool,
-        /// Register THIS existing escrow public key (an age1… literal, or a
-        /// path to a .pub file) instead of minting a new identity — the
-        /// disaster-recovery form: a rebuilt machine adopts the original
-        /// recipient from the heir kit's cover sheet so every tape's
-        /// receipts keep matching.
+        /// Adopt this escrow public key instead of minting a new identity
+        ///
+        /// An age1… literal, or a path to a .pub file. The disaster-recovery
+        /// form: a rebuilt machine adopts the original recipient from the heir
+        /// kit's cover sheet so every tape's receipts keep matching.
         #[arg(long, value_name = "KEY_OR_FILE", conflicts_with = "no_escrow")]
         escrow_public_key: Option<String>,
-        /// Adopt this existing age identity file (the SECRET) as the
-        /// operator's primary key instead of minting a pair, as `tenant add
+        /// Adopt this age identity file as the operator's primary key
+        ///
+        /// The SECRET, used instead of minting a pair, as `tenant add
         /// --adopt-key` does for a tenant: stored byte for byte as
-        /// keys/<operator>-primary.age.key, mode 0600, and nothing is
-        /// minted. A path only, never a key on the command line. Refused
-        /// before anything is created when it is not one X25519 identity,
-        /// or when it is the secret of --escrow-public-key.
+        /// keys/<operator>-primary.age.key, mode 0600, and nothing is minted.
+        /// A path only, never a key on the command line. Refused before
+        /// anything is created when it is not one X25519 identity, or when it
+        /// is the secret of --escrow-public-key.
         #[arg(long, value_name = "PATH")]
         operator_key: Option<std::path::PathBuf>,
     },
@@ -149,7 +311,10 @@ pub enum Commands {
         command: unit::UnitCommands,
     },
 
-    /// Manage media collections (folder=unit factory + batch tape driver)
+    /// Manage collections: folders of units, written in batches
+    ///
+    /// A collection is a source root whose folders are units (one folder, one
+    /// unit); `collection run` stages and writes them a batch at a time.
     Collection {
         #[command(subcommand)]
         command: collection::CollectionCommands,
@@ -207,7 +372,7 @@ pub enum Commands {
         unit: Option<String>,
     },
 
-    /// Browse and search file catalog
+    /// Browse and search the file catalog
     Catalog {
         #[command(subcommand)]
         command: catalog::CatalogCommands,
@@ -242,8 +407,8 @@ pub enum Commands {
     /// Quick archive: create + stage + write in one flow
     ///
     /// The volume must already exist — run `tapectl volume init LABEL
-    /// --device /dev/tape/by-id/<drive>-nst` first. This command creates the unit, snapshot and
-    /// stage set, but not the volume.
+    /// --device /dev/tape/by-id/<drive>-nst` first. This command creates the
+    /// unit, snapshot and stage set, but not the volume.
     ///
     /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
     /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
@@ -254,15 +419,18 @@ pub enum Commands {
         /// Tenant name
         #[arg(long)]
         tenant: String,
-        /// Label of an ALREADY-INITIALIZED volume to write to. Create it with
-        /// `tapectl volume init LABEL --device ...`; quick-archive does not.
+        /// Label of an already initialized volume to write to
+        ///
+        /// Create it with `tapectl volume init LABEL --device ...`;
+        /// quick-archive does not.
         #[arg(long)]
         volume: String,
         /// Tags
         #[arg(long, short)]
         tag: Vec<String>,
-        /// Tape device (by-id path). Defaults to the only configured drive;
-        /// required when more than one is configured.
+        /// Tape device (by-id path; default: the only configured drive)
+        ///
+        /// Required when more than one drive is configured.
         #[arg(long)]
         device: Option<String>,
         /// See `volume write --prewrite-hash`.
@@ -283,19 +451,23 @@ pub enum Commands {
         command: BackendStub,
     },
 
-    /// The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
+    /// The tape drive: add it, see what is loaded, eject, health, cleanings
+    ///
+    /// Declare one (`drive add`), what is in it now (`drive status`), eject
+    /// it (`drive eject`), its health on a schedule (`drive poll`), its
+    /// cleanings (`drive cleaned`).
     Drive {
         #[command(subcommand)]
         command: drive::DriveCommands,
     },
 
-    /// Database operations
+    /// Back up, check, export and inspect the catalog database
     Db {
         #[command(subcommand)]
         command: DbCommands,
     },
 
-    /// Configuration management
+    /// Show, check, read and edit config.toml
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
@@ -307,10 +479,10 @@ pub enum Commands {
         command: host::HostCommands,
     },
 
-    /// The home screen: the home and why it was chosen, what is running,
-    /// the units by state, the volumes due a verify, and the next commands
+    /// The home screen: the home, what is running, units by state, next steps
     ///
-    /// The home is named with the rule that chose it (see --home). What is
+    /// The home and why it was chosen, what is running, the units by state,
+    /// the volumes due a verify, and the next commands. The home is named with the rule that chose it (see --home). What is
     /// running and how the last sessions ended come from the session logs:
     /// the live session's phase, progress, rate and ETA, and each recent
     /// session's outcome and phase timings. Then, from the catalog, the units
@@ -327,14 +499,26 @@ pub enum Commands {
     /// Exit status: 0 = shown (the catalog read, or an `[ops] group` account
     /// shown its part); 2 = the catalog could not be read (not initialized,
     /// damaged or busy), said on stderr after the home and the sessions.
+    #[command(after_long_help = "\
+Examples:
+  # Where things stand, and the next command
+  tapectl status
+  # The same as one JSON document; `next` holds the next commands
+  tapectl --json status
+  # From an operator account, the service user's whole view
+  tapectl-op status")]
     Status {
-        /// How many finished sessions to show, newest first (running ones
-        /// are always shown)
+        /// How many finished sessions to show, newest first
+        ///
+        /// Running sessions are always shown.
         #[arg(long, default_value_t = 5)]
         last: usize,
     },
 
-    /// Generate shell completions
+    /// Print a shell completion script
+    ///
+    /// `tapectl completions bash` prints the script bash-completion loads;
+    /// scripts/install-systemd.sh installs it for `tapectl` and `tapectl-op`.
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
@@ -369,15 +553,24 @@ pub enum DbCommands {
     /// Prints the size of the copy it wrote, and of the key files when it
     /// copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog
     /// only grows, and the time a backup takes grows with it.
+    #[command(after_long_help = "\
+Examples:
+  # A dated file in a directory on another disk
+  tapectl db backup /mnt/backup/
+  # A file of your naming, and the private keys beside it (secret)
+  tapectl db backup /mnt/usb/tapectl.db --include-keys")]
     Backup {
-        /// The backup file to write, or a directory to write
-        /// `tapectl-YYYYmmddTHHMMSSZ.db` into (the scheduled backup's name).
-        /// An existing file is refused, never overwritten. The directory
-        /// must already exist
+        /// The backup file to write, or a directory for a dated one
+        ///
+        /// A directory gets `tapectl-YYYYmmddTHHMMSSZ.db` (the scheduled
+        /// backup's name) and must already exist. An existing file is
+        /// refused, never overwritten.
         #[arg(value_name = "PATH")]
         path: String,
-        /// Also copy the private key directory, into a directory beside
-        /// the backup named for it with its extension replaced by `.keys`
+        /// Also copy the private key directory, beside the backup
+        ///
+        /// Into a directory beside the backup named for it with its extension
+        /// replaced by `.keys`
         /// (`db backup /mnt/usb/tapectl.db` copies the keys to
         /// `/mnt/usb/tapectl.keys/`). Off by default — the database alone
         /// is the common backup case. Private key material copied this way
@@ -387,9 +580,14 @@ pub enum DbCommands {
         include_keys: bool,
     },
     /// Check database integrity
+    ///
+    /// Exit status: 0 = clean; 1 = problems found, repaired or not; 2 = the
+    /// database's integrity is broken (or an error).
     Fsck {
-        /// Delete rows whose foreign-key parent is missing, closing the
-        /// graph in one transaction (children first, in effect); logged
+        /// Delete rows whose foreign-key parent is missing
+        ///
+        /// Closes the graph in one transaction (children first, in effect);
+        /// logged.
         #[arg(long)]
         repair: bool,
     },
@@ -423,7 +621,14 @@ pub enum DbCommands {
 pub enum ConfigCommands {
     /// Show current configuration
     Show,
-    /// Check configuration validity
+    /// Check config.toml: whether every command can load it, and advice
+    ///
+    /// Says whether every other command can load the file (`config: valid`
+    /// or `config: INVALID`), names the home it checked and why that one,
+    /// then gives advice that never changes the exit code.
+    ///
+    /// Exit status: 0 = the configuration is valid; 2 = it is invalid (or an
+    /// error).
     Check,
     /// Print one key's value in force, and where it comes from
     ///
@@ -436,6 +641,13 @@ pub enum ConfigCommands {
     /// misspelt one names the key meant. `--json` gives `key`, `value` (null
     /// when nothing sets it) and `source` (`config.toml`, `default` or
     /// `derived`).
+    #[command(after_long_help = "\
+Examples:
+  tapectl config get defaults.slice_size
+  # One drive configured: its key by the bare name
+  tapectl config get post_warning_bytes
+  # The same key, spelled in full, for a script
+  tapectl --json config get 'backends.lto[lto6].post_warning_bytes'")]
     Get {
         /// The key, e.g. defaults.slice_size or post_warning_bytes
         key: String,
@@ -455,6 +667,14 @@ pub enum ConfigCommands {
     /// string. The edited file is checked as every command loads it before
     /// it is written: an unknown key or a bad value is refused by name and
     /// the file is left exactly as it was. The file is replaced atomically.
+    #[command(after_long_help = "\
+Examples:
+  tapectl config set defaults.slice_size 2G
+  tapectl config set defaults.verify_interval_days 365
+  # One drive configured: its key by the bare name
+  tapectl config set enospc_buffer 50M
+  # An entry of a list of tables, by its name
+  tapectl config set 'collections[movies].unit_depth' 2")]
     Set {
         /// The key, e.g. defaults.slice_size
         key: String,
@@ -476,8 +696,9 @@ pub enum ConfigCommands {
     Add {
         /// The list, e.g. defaults.global_excludes
         key: String,
-        /// field=value pairs for a table, or the values to append (after
-        /// `--` when one begins with `-`)
+        /// field=value pairs for a table, or the values to append
+        ///
+        /// After `--` when one begins with `-`.
         #[arg(required = true)]
         values: Vec<String>,
     },
@@ -495,8 +716,9 @@ pub enum ConfigCommands {
     Remove {
         /// The key, table or list
         key: String,
-        /// Values to remove from a list (none: remove KEY itself); after
-        /// `--` when one begins with `-`
+        /// Values to remove from a list (none: remove KEY itself)
+        ///
+        /// After `--` when one begins with `-`.
         values: Vec<String>,
     },
 }
@@ -701,6 +923,127 @@ pub(crate) fn refuse_dry_run(command: &str, why: &str) -> crate::error::TapectlE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tapectl completions SHELL`'s script, as `main` generates it.
+    fn completion_script(shell: clap_complete::Shell) -> String {
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut completion_command(), "tapectl", &mut script);
+        String::from_utf8(script).unwrap()
+    }
+
+    /// Every hidden command of the tree, as its words (`["report", "pending"]`).
+    fn hidden_paths() -> Vec<Vec<String>> {
+        fn walk(cmd: &clap::Command, path: &[String], out: &mut Vec<Vec<String>>) {
+            for sub in cmd.get_subcommands() {
+                let mut p = path.to_vec();
+                p.push(sub.get_name().to_string());
+                if sub.is_hide_set() {
+                    out.push(p);
+                } else {
+                    walk(sub, &p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        use clap::CommandFactory;
+        walk(&Cli::command(), &[], &mut out);
+        out
+    }
+
+    /// Whether `script`, `shell`'s completion script, offers the command
+    /// `path` (its words) after its parent: bash's case arm for it, zsh's
+    /// entry in its parent's list of commands, fish's candidate after its
+    /// parent.
+    fn offers(shell: clap_complete::Shell, script: &str, path: &[&str]) -> bool {
+        let (parent, name) = path.split_at(path.len() - 1);
+        let name = name[0];
+        match shell {
+            clap_complete::Shell::Bash => {
+                let parent: Vec<String> = std::iter::once("tapectl".to_string())
+                    .chain(parent.iter().map(|w| w.replace('-', "__")))
+                    .collect();
+                script.contains(&format!("{},{name})", parent.join("__")))
+            }
+            clap_complete::Shell::Zsh => {
+                let list: String = parent.iter().map(|w| format!("__{w}")).collect();
+                let head = format!("_tapectl{list}_commands() {{");
+                script.split(&head).nth(1).is_some_and(|body| {
+                    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+                    body.contains(&format!("\n'{name}:"))
+                })
+            }
+            clap_complete::Shell::Fish => {
+                let after = match parent {
+                    [] => "__fish_tapectl_needs_command\"".to_string(),
+                    [first, ..] => format!("__fish_tapectl_using_subcommand {first};"),
+                };
+                let mut lines = script.lines().filter(|l| l.contains(&after));
+                if let [_, second] = parent {
+                    lines.any(|l| {
+                        l.contains(&format!("__fish_seen_subcommand_from {second};"))
+                            && l.contains(&format!("-a \"{name}\""))
+                    })
+                } else {
+                    lines.any(|l| l.contains(&format!("-a \"{name}\"")))
+                }
+            }
+            _ => unreachable!("only bash, zsh and fish are checked"),
+        }
+    }
+
+    /// ADR-0012 item 203's residual: completion offers no hidden stub of a
+    /// spelling 1.9.0 removed, in any shell, while it still offers the live
+    /// commands, some of the same names among them (the positive control:
+    /// the same search finds a command that must be there).
+    #[test]
+    fn completions_offer_no_hidden_stub() {
+        let hidden = hidden_paths();
+        for stub in [&["backend"][..], &["staging"], &["export"], &["import"]] {
+            assert!(
+                hidden.iter().any(|h| h == stub),
+                "{stub:?} is no longer a hidden stub: update this test"
+            );
+        }
+        assert!(hidden.iter().any(|h| h == &["report", "pending"]));
+        let live: &[&[&str]] = &[
+            &["drive"],
+            &["status"],
+            &["drive", "add"],
+            &["drive", "status"],
+            &["stage", "list"],
+            &["unit", "export"],
+            &["volume", "import"],
+            &["drive", "cleaning-cartridge", "add"],
+        ];
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let script = completion_script(shell);
+            // The negative's positive control: the same search finds the
+            // stubs in a script generated from the whole tree.
+            let mut whole = Vec::new();
+            {
+                use clap::CommandFactory;
+                clap_complete::generate(shell, &mut Cli::command(), "tapectl", &mut whole);
+            }
+            let whole = String::from_utf8(whole).unwrap();
+            for stub in [&["backend"][..], &["report", "pending"], &["staging", "clean"]] {
+                assert!(offers(shell, &whole, stub), "{shell}: the search misses {stub:?}");
+            }
+            for path in live {
+                assert!(offers(shell, &script, path), "{shell} lacks {path:?}");
+            }
+            for path in &hidden {
+                let path: Vec<&str> = path.iter().map(String::as_str).collect();
+                assert!(
+                    !offers(shell, &script, &path),
+                    "{shell} offers the hidden {path:?}"
+                );
+            }
+        }
+    }
 
     /// Issue #427: a several-unit `stage create` names its session by the
     /// first unit and a count, never by every unit.

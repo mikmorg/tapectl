@@ -232,8 +232,18 @@ if [ "$(field thome "$out")" = "$WORK/thome" ] && [ "$(field uid "$out")" = "$(i
 if [ -n "$BIN" ]; then
   echo "names: the wrapper's words against $BIN"
   [ -x "$BIN" ] || die "--tapectl $BIN is not executable"
-  top="$("$BIN" --help 2>&1 | sed -n '/^Commands:/,/^$/p' | awk 'NR>1 && NF {print $1}')"
-  valued="$("$BIN" --help 2>&1 | sed -n '/^Options:/,$p' | sed -n 's/^ *\(-[a-zA-Z], \)\{0,1\}--\([a-z-]*\) <.*/\2/p' | sort | tr '\n' ' ')"
+  # commands_of ARGS...: the subcommands `tapectl ARGS --help` lists, under every
+  # heading after the Usage line that is not an option, argument or example one
+  # (the top level groups its commands by job, ADR-0012 item 211).
+  commands_of() {
+    "$BIN" "$@" --help 2>&1 | awk '
+      /^Usage:/ { usage = 1; next }
+      usage && /^[A-Z][A-Za-z ]*:$/ { on = ($0 != "Arguments:" && $0 != "Options:" && $0 != "Global options:" && $0 != "Examples:"); next }
+      on && /^  [a-z]/ { print $1 }'
+  }
+  top="$(commands_of)"
+  # The top level lists every option, global ones included, under its option headings.
+  valued="$("$BIN" --help 2>&1 | awk '/^(Global options|Options):$/ { on = 1 } on' | sed -n 's/^ *\(-[a-zA-Z], \)\{0,1\}--\([a-z-]*\) <.*/\2/p' | sort | tr '\n' ' ')"
   [ "$valued" = "config home " ] && pass "names: --config and --home are the only global options that take a value" \
     || fail "names: global options that take a value are '$valued', the wrapper skips only 'config home'"
   printf '%s\n' "$top" | grep -x quick-archive >/dev/null && pass "names: quick-archive is a top-level command" || fail "names: no top-level quick-archive"
@@ -241,7 +251,7 @@ if [ -n "$BIN" ]; then
               "volume init" "volume identify" "restore unit" "restore file" "restore volume" "restore raw-volume" "cartridge erase" "collection run" \
               "catalog rebuild" "drive poll" "drive eject"; do
     set -- $pair
-    if "$BIN" "$1" --help 2>&1 | sed -n '/^Commands:/,/^$/p' | awk 'NR>1 && NF {print $1}' | grep -x "$2" >/dev/null; then pass "names: $1 $2 exists"; else fail "names: '$1 $2' is not a subcommand of $BIN"; fi
+    if commands_of "$1" | grep -x "$2" >/dev/null; then pass "names: $1 $2 exists"; else fail "names: '$1 $2' is not a subcommand of $BIN"; fi
   done
 fi
 

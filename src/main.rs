@@ -29,7 +29,6 @@ use tapectl::{cli, config, db, error, signal, startup, tenant};
 use std::ffi::OsString;
 
 use anyhow::{bail, Context};
-use clap::Parser;
 
 use cli::{Cli, Commands, ConfigCommands};
 use config::{Config, TapectlPaths};
@@ -43,7 +42,8 @@ fn main() {
     if let Some(renamed) = cli::renamed::find(&args) {
         error::exit_with_error_code(&renamed.refusal().into(), error::EXIT_ERROR);
     }
-    let cli = match Cli::try_parse_from(&args) {
+    // The grouped top-level help (ADR-0012 item 211) is `cli::command()`'s.
+    let cli = match cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(err) => {
             // Exactly `clap::Error::exit`, with the code decided here: it
@@ -288,7 +288,8 @@ fn run(
     }
 
     if let Commands::Completions { shell } = cli.command {
-        let mut cmd = <Cli as clap::CommandFactory>::command();
+        // Without the hidden stubs of removed spellings (ADR-0012 item 203).
+        let mut cmd = cli::completion_command();
         // ADR-0012 item 220: `clap_complete` `expect`s its own writes, so
         // given stdout itself `completions zsh | head -3` panicked (exit 101)
         // once `head` had gone. Generated into memory, written once through
