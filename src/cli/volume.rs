@@ -1592,7 +1592,11 @@ pub(crate) enum MoveAfterWrite {
 /// ([`crate::cli::location::move_volume`]), so the shelf and the catalog
 /// cannot drift (ADR-0011). Never fails the write: an error becomes
 /// [`MoveAfterWrite::Failed`].
-fn move_after_write(conn: &Connection, label: &str, move_to: Option<&str>) -> MoveAfterWrite {
+pub(crate) fn move_after_write(
+    conn: &Connection,
+    label: &str,
+    move_to: Option<&str>,
+) -> MoveAfterWrite {
     let Some(to) = move_to else {
         return MoveAfterWrite::NotAsked;
     };
@@ -1718,7 +1722,7 @@ fn for_location_json(
 /// (it exists; it is not a warehouse, which no physical cartridge can be
 /// moved into); the mover itself, [`move_after_write`], still decides the
 /// move and reports whatever else it finds as a warning.
-fn check_move_destination(conn: &Connection, location: &str) -> Result<()> {
+pub(crate) fn check_move_destination(conn: &Connection, location: &str) -> Result<()> {
     use rusqlite::OptionalExtension;
     let name = location.trim();
     let kind: Option<String> = conn
@@ -1753,7 +1757,7 @@ fn check_move_destination(conn: &Connection, location: &str) -> Result<()> {
 /// The human lines for [`MoveAfterWrite`], printed after the staging lines
 /// so a warning — which carries the command that finishes the step — is the
 /// last thing on the screen. The moved lines are `volume move`'s own.
-fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
+pub(crate) fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
     match moved {
         MoveAfterWrite::NotAsked => {}
         MoveAfterWrite::Moved { to, outcome } if outcome.already_there => {
@@ -2078,7 +2082,7 @@ pub(crate) fn next_copy_line(next: &crate::policy::coverage::NextCopy) -> String
 /// the code that elsewhere means "the medium untouched". `initialized` is
 /// the key the success document already has; `volume_status` is what the
 /// catalog holds now.
-fn left_initialized_json(
+pub(crate) fn left_initialized_json(
     label: &str,
     init: &Initialized,
     error: &TapectlError,
@@ -2181,7 +2185,7 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
 /// The move keys `volume write --json` and `volume resume --json` share:
 /// `moved_to`, `move_warning`, `moved_cartridge` and `volumes_moved`, null
 /// or empty unless a move was asked for.
-fn insert_move_json(base: &mut serde_json::Value, moved: &MoveAfterWrite) {
+pub(crate) fn insert_move_json(base: &mut serde_json::Value, moved: &MoveAfterWrite) {
     let (moved_to, warning, cartridge, volumes): (
         Option<&str>,
         Option<&str>,
