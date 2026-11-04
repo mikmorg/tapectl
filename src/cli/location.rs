@@ -667,6 +667,10 @@ fn rename_in_dotfiles(conn: &Connection, old: &str, new: &str) -> Result<Dotfile
 pub struct MoveOutcome {
     pub cartridge: Option<String>,
     pub volumes: Vec<String>,
+    /// The cartridge and every volume on it were already at the destination
+    /// (ADR-0012 item 220): nothing was changed and no event was written.
+    /// The command says it is already there, never "moved".
+    pub already_there: bool,
 }
 
 /// The single mover behind BOTH `volume move` and `cartridge move`
@@ -851,13 +855,34 @@ fn move_together(
         )));
     }
 
+    // ADR-0012 item 220: a move to where the cartridge and every volume on it
+    // already are changes nothing, so it writes nothing — no movement row, no
+    // event — and says so. A volume whose place disagrees with its
+    // cartridge's is not already there: the move puts them together.
+    let at_destination = |table: &str, id: i64| -> Result<bool> {
+        let here: Option<i64> = conn.query_row(
+            &format!("SELECT location_id FROM {table} WHERE id = ?1"),
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(here == Some(loc_id))
+    };
+    let mut already_there = match &cartridge {
+        Some((cart_id, _)) => at_destination("cartridges", *cart_id)?,
+        None => true,
+    };
+    for (vol_id, _) in volumes {
+        already_there = already_there && at_destination("volumes", *vol_id)?;
+    }
+
     // Issue #230: everything above this line is a lookup or a refusal, so a
     // dry run has already surfaced every reason this move could fail. From
     // here down it is all writes.
-    if dry_run {
+    if dry_run || already_there {
         return Ok(MoveOutcome {
             cartridge: cartridge.map(|(_, barcode)| barcode),
             volumes: volumes.iter().map(|(_, label)| label.clone()).collect(),
+            already_there,
         });
     }
 
@@ -924,6 +949,7 @@ fn move_together(
     Ok(MoveOutcome {
         cartridge: cartridge.map(|(_, barcode)| barcode),
         volumes: volumes.iter().map(|(_, label)| label.clone()).collect(),
+        already_there: false,
     })
 }
 
@@ -1922,5 +1948,49 @@ mod tests {
             home.volumes, 0,
             "an erased volume's stale location_id must not be counted as physically present"
         );
+    }
+
+    /// ADR-0012 item 220: `volume move` to where the tape already is changes
+    /// nothing — no movement row, no event — and says it is already there,
+    /// a dry run alike. A sibling volume whose place disagrees with its
+    /// cartridge's is not already there: that move goes ahead and puts them
+    /// together.
+    #[test]
+    fn a_move_to_where_the_tape_already_is_says_so_and_writes_nothing() {
+        let conn = setup_bound();
+        let first = move_volume(&conn, "L6-0001", "home", false).unwrap();
+        assert!(!first.already_there, "the first move moves");
+        let rows = |conn: &Connection| -> (i64, i64) {
+            (
+                conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                    .unwrap(),
+                conn.query_row("SELECT COUNT(*) FROM volume_movements", [], |r| r.get(0))
+                    .unwrap(),
+            )
+        };
+        let before = rows(&conn);
+        for dry_run in [true, false] {
+            let again = move_volume(&conn, "L6-0001", "home", dry_run).unwrap();
+            assert!(again.already_there, "dry run {dry_run}");
+            assert_eq!(again.cartridge.as_deref(), Some("A001L6"));
+            assert_eq!(rows(&conn), before, "dry run {dry_run}: nothing written");
+        }
+        let again = move_cartridge(&conn, "A001L6", " home", false).unwrap();
+        assert!(again.already_there, "the cartridge's own move alike");
+        assert_eq!(rows(&conn), before);
+
+        // A sibling recorded elsewhere: the move is real.
+        conn.execute(
+            "UPDATE volumes SET location_id = NULL WHERE label = 'L6-0002'",
+            [],
+        )
+        .unwrap();
+        let mended = move_volume(&conn, "L6-0001", "home", false).unwrap();
+        assert!(!mended.already_there);
+        assert_eq!(
+            location_of(&conn, "volumes", "label", "L6-0002").as_deref(),
+            Some("home")
+        );
+        assert!(rows(&conn).0 > before.0, "a real move logs its events");
     }
 }
