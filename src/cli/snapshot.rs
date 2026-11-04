@@ -529,7 +529,15 @@ mod tests {
             name: vec!["unit1".into(), "unit2".into()],
         };
         crate::signal::interrupt_this_thread(true);
-        let err = run(&conn, &paths, &Config::default(), &create, true, false, false);
+        let err = run(
+            &conn,
+            &paths,
+            &Config::default(),
+            &create,
+            true,
+            false,
+            false,
+        );
         crate::signal::interrupt_this_thread(false);
         let err = err.unwrap_err();
         assert!(matches!(err, TapectlError::Interrupted(_)), "{err}");
@@ -541,7 +549,16 @@ mod tests {
         assert_eq!((versions(&conn, "unit1"), versions(&conn, "unit2")), (1, 0));
 
         // Positive control: with no signal both are snapshotted.
-        run(&conn, &paths, &Config::default(), &create, true, false, false).unwrap();
+        run(
+            &conn,
+            &paths,
+            &Config::default(),
+            &create,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(versions(&conn, "unit2"), 1);
     }
 

@@ -549,8 +549,15 @@ fn db_backup_into_a_directory_writes_the_dated_file_and_never_overwrites() {
     let before = std::fs::read(&written[0]).unwrap();
     let err = refused(h, &["db", "backup", written[0].to_str().unwrap()]);
     assert!(
-        err.contains(&format!("{} exists: name another file", written[0].display())),
+        err.contains(&format!(
+            "{} exists: name another file",
+            written[0].display()
+        )),
         "{err}"
     );
-    assert_eq!(std::fs::read(&written[0]).unwrap(), before, "not overwritten");
+    assert_eq!(
+        std::fs::read(&written[0]).unwrap(),
+        before,
+        "not overwritten"
+    );
 }

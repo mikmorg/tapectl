@@ -3506,10 +3506,7 @@ fn unit_check_integrity_exits_1_when_a_staged_file_is_missing() {
     );
 
     std::fs::remove_file(source.path().join("b.txt")).unwrap();
-    let out = run_tapectl(
-        home.path(),
-        &["--json", "unit", "check-integrity", &unit],
-    );
+    let out = run_tapectl(home.path(), &["--json", "unit", "check-integrity", &unit]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -3517,7 +3514,11 @@ fn unit_check_integrity_exits_1_when_a_staged_file_is_missing() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
-    assert_eq!((v["missing"].clone(), v["ok"].clone()), (1.into(), 1.into()), "{v}");
+    assert_eq!(
+        (v["missing"].clone(), v["ok"].clone()),
+        (1.into(), 1.into()),
+        "{v}"
+    );
 }
 
 /// ADR-0012 item 210: `snapshot create` takes several units. Each is walked
@@ -3625,7 +3626,8 @@ fn key_list_without_a_tenant_lists_every_tenants_keys() {
         ("op", "op-primary"),
     ] {
         assert!(
-            text.lines().any(|l| l.starts_with(tenant) && l.contains(alias)),
+            text.lines()
+                .any(|l| l.starts_with(tenant) && l.contains(alias)),
             "{tenant}'s {alias} on its own row: {text}"
         );
     }
@@ -3637,7 +3639,10 @@ fn key_list_without_a_tenant_lists_every_tenants_keys() {
         .iter()
         .map(|r| {
             (
-                r["tenant"].as_str().expect("every row names its tenant").to_owned(),
+                r["tenant"]
+                    .as_str()
+                    .expect("every row names its tenant")
+                    .to_owned(),
                 r["alias"].as_str().unwrap().to_owned(),
             )
         })

@@ -235,10 +235,8 @@ pub fn run(
             let t = crate::tenant::require_tenant(conn, tenant)?;
             let key_list = queries::list_keys_for_tenant(conn, t.id)?;
             if json_output {
-                let listed: Vec<(String, EncryptionKey)> = key_list
-                    .into_iter()
-                    .map(|k| (t.name.clone(), k))
-                    .collect();
+                let listed: Vec<(String, EncryptionKey)> =
+                    key_list.into_iter().map(|k| (t.name.clone(), k)).collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&key_list_json(&listed)).unwrap()

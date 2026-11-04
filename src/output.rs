@@ -116,7 +116,10 @@ mod tests {
 
     #[test]
     fn bytes_to_a_closed_pipe_are_dropped() {
-        finish("stdout", write_all_flushed(&mut ClosedPipe, b"#compdef x\n"));
+        finish(
+            "stdout",
+            write_all_flushed(&mut ClosedPipe, b"#compdef x\n"),
+        );
     }
 
     #[test]

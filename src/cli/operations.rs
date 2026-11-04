@@ -3821,9 +3821,7 @@ fn precreate_private_file(path: &Path) -> Result<bool> {
         .open(path)
     {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(backup_exists_refusal(path))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(backup_exists_refusal(path)),
         Err(_) => Ok(false),
     }
 }
@@ -5295,7 +5293,10 @@ mod tests {
             "{text}"
         );
         let json = integrity_json(&report);
-        assert_eq!((json["changed"].clone(), json["bitrot"].clone()), (1.into(), 0.into()));
+        assert_eq!(
+            (json["changed"].clone(), json["bitrot"].clone()),
+            (1.into(), 0.into())
+        );
         assert_eq!(json["details"][0]["status"], "CHANGED");
     }
 
@@ -5317,7 +5318,12 @@ mod tests {
         );
 
         let report = check_integrity(&conn, "unit1").unwrap();
-        assert_eq!((report.changed, report.bitrot), (0, 1), "{:?}", report.details);
+        assert_eq!(
+            (report.changed, report.bitrot),
+            (0, 1),
+            "{:?}",
+            report.details
+        );
         assert_eq!(report.details[0].status, "BITROT");
         assert!(!report.details[0].no_mtime);
         assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
@@ -5325,7 +5331,10 @@ mod tests {
         assert!(text.contains("f.txt — BITROT\n"), "{text}");
         assert!(!text.contains("snapshot create"), "{text}");
         assert!(!text.contains("CHANGED"), "{text}");
-        assert_eq!(integrity_json(&report)["details"][0].get("mtime_recorded"), None);
+        assert_eq!(
+            integrity_json(&report)["details"][0].get("mtime_recorded"),
+            None
+        );
     }
 
     /// With no mtime recorded the report cannot tell an edit from damage:
@@ -5345,7 +5354,12 @@ mod tests {
         );
 
         let report = check_integrity(&conn, "unit1").unwrap();
-        assert_eq!((report.changed, report.bitrot), (0, 1), "{:?}", report.details);
+        assert_eq!(
+            (report.changed, report.bitrot),
+            (0, 1),
+            "{:?}",
+            report.details
+        );
         assert!(report.details[0].no_mtime);
         assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
         let text = render_integrity(&report);
@@ -10081,7 +10095,9 @@ mod tests {
         fn a_directory_gets_the_scheduled_backups_dated_name() {
             use chrono::TimeZone;
             let dir = TempDir::new().unwrap();
-            let at = chrono::Utc.with_ymd_and_hms(2026, 11, 4, 10, 30, 5).unwrap();
+            let at = chrono::Utc
+                .with_ymd_and_hms(2026, 11, 4, 10, 30, 5)
+                .unwrap();
             assert_eq!(
                 backup_file(dir.path(), at),
                 dir.path().join("tapectl-20261104T103005Z.db")
@@ -10093,7 +10109,13 @@ mod tests {
             let report = db_backup(&paths, dir.path().to_str().unwrap(), true, false, false)
                 .unwrap()
                 .expect("a real backup");
-            let name = report.file.file_name().unwrap().to_str().unwrap().to_owned();
+            let name = report
+                .file
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
             assert_eq!(report.file.parent(), Some(dir.path()));
             assert!(
                 name.len() == "tapectl-YYYYmmddTHHMMSSZ.db".len()
