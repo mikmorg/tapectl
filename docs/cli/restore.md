@@ -15,7 +15,7 @@ tapectl restore [OPTIONS] <COMMAND>
 - [`unit`](#tapectl-restore-unit) — Restore a unit from a volume
 - [`volume`](#tapectl-restore-volume) — Restore several units from one volume in one pass over the tape
 - [`file`](#tapectl-restore-file) — Restore a single file from a unit
-- [`raw-volume`](#tapectl-restore-raw-volume) — Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
+- [`raw-volume`](#tapectl-restore-raw-volume) — Dump every file off a tape verbatim, using only what is on the tape itself (no database needed): the files the heir path reads, without RESTORE.sh. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
 
 ### tapectl restore unit
 
@@ -32,7 +32,7 @@ tapectl restore unit [OPTIONS] --to <TO> <UNIT|--unit <UNIT>>
 **Options**
 
 - `--unit <UNIT>` — The unit, as a flag: the same as UNIT
-- `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with --dry-run, which opens no drive. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
+- `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Without it, --dry-run (which opens no drive) previews from the one volume this catalog has holding the unit, and names it; when several hold it they are listed, to name one here. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--version <VERSION>` — Snapshot version to restore. Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
@@ -80,7 +80,7 @@ tapectl restore file [OPTIONS] --to <TO> <UNIT|--unit <UNIT>> <PATH|--file <PATH
 
 **Arguments**
 
-- `[UNIT]` — Unit name
+- `[UNIT]` — Unit name. After --unit, the file's PATH instead
 - `[PATH]` — File path within the unit, relative to its root, as `catalog list` prints it. Checked against the catalog's file list for the version before the tape is touched; a directory is refused
 
 **Options**
@@ -98,7 +98,7 @@ tapectl restore file [OPTIONS] --to <TO> <UNIT|--unit <UNIT>> <PATH|--file <PATH
 
 ### tapectl restore raw-volume
 
-Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
+Dump every file off a tape verbatim, using only what is on the tape itself (no database needed): the files the heir path reads, without RESTORE.sh. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
 
 ```text
 tapectl restore raw-volume [OPTIONS] --to <TO>

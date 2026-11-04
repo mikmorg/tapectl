@@ -12,7 +12,7 @@ tapectl report [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`fire-risk`](#tapectl-report-fire-risk) — Units at risk: below min copies/locations
+- [`fire-risk`](#tapectl-report-fire-risk) — Units below their copy floor, judged by copies only
 - [`needs`](#tapectl-report-needs) — Each unit's copy target, copies and shortfall at every location
 - [`copies`](#tapectl-report-copies) — Copy count distribution per unit
 - [`tape-only`](#tapectl-report-tape-only) — Tape-only unit status
@@ -29,7 +29,9 @@ tapectl report [OPTIONS] <COMMAND>
 
 ### tapectl report fire-risk
 
-Units at risk: below min copies/locations
+Units below their copy floor, judged by copies only
+
+A unit is listed when it has fewer copies than its copy floor (the larger of `min_copies` and its `copies_at` sum, raised by the tape-only multiplier for a tape-only unit), or when its policy will not resolve. The places its copies are in are counted and shown, not judged: `report needs` judges each location, and `audit` judges everything.
 
 ```text
 tapectl report fire-risk [OPTIONS]

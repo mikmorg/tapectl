@@ -59,7 +59,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`collection sync`](collection.md#tapectl-collection-sync) | Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts) |
 | &nbsp;&nbsp;[`collection status`](collection.md#tapectl-collection-status) | Show each configured collection's pending, staged, under-copied and missing units |
 | &nbsp;&nbsp;[`collection plan`](collection.md#tapectl-collection-plan) | Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units |
-| &nbsp;&nbsp;[`collection run`](collection.md#tapectl-collection-run) | Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already meets every unit's copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets) — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action |
+| &nbsp;&nbsp;[`collection run`](collection.md#tapectl-collection-run) | Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR-0012 item 217). Ends with what the copy holds and the next copy's command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action |
 | [`snapshot`](snapshot.md) | Manage snapshots |
 | &nbsp;&nbsp;[`snapshot create`](snapshot.md#tapectl-snapshot-create) | Create a snapshot (fast directory walk + manifest) |
 | &nbsp;&nbsp;[`snapshot list`](snapshot.md#tapectl-snapshot-list) | List snapshots |
@@ -124,7 +124,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`location info`](location.md#tapectl-location-info) | Show location details |
 | &nbsp;&nbsp;[`location rename`](location.md#tapectl-location-rename) | Rename a location |
 | [`report`](report.md) | Generate reports |
-| &nbsp;&nbsp;[`report fire-risk`](report.md#tapectl-report-fire-risk) | Units at risk: below min copies/locations |
+| &nbsp;&nbsp;[`report fire-risk`](report.md#tapectl-report-fire-risk) | Units below their copy floor, judged by copies only |
 | &nbsp;&nbsp;[`report needs`](report.md#tapectl-report-needs) | Each unit's copy target, copies and shortfall at every location |
 | &nbsp;&nbsp;[`report copies`](report.md#tapectl-report-copies) | Copy count distribution per unit |
 | &nbsp;&nbsp;[`report tape-only`](report.md#tapectl-report-tape-only) | Tape-only unit status |
@@ -142,7 +142,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`restore unit`](restore.md#tapectl-restore-unit) | Restore a unit from a volume |
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
-| &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`) |
+| &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed): the files the heir path reads, without RESTORE.sh. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`) |
 | [`quick-archive`](quick-archive.md) | Quick archive: create + stage + write in one flow |
 | [`drive`](drive.md) | The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`) |
 | &nbsp;&nbsp;[`drive add`](drive.md#tapectl-drive-add) | Add an LTO tape drive to the config |

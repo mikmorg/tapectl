@@ -17,7 +17,7 @@ tapectl collection [OPTIONS] <COMMAND>
 - [`sync`](#tapectl-collection-sync) — Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
 - [`status`](#tapectl-collection-status) — Show each configured collection's pending, staged, under-copied and missing units
 - [`plan`](#tapectl-collection-plan) — Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units
-- [`run`](#tapectl-collection-run) — Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already meets every unit's copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets) — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action
+- [`run`](#tapectl-collection-run) — Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR-0012 item 217). Ends with what the copy holds and the next copy's command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action
 
 ### tapectl collection add
 
@@ -110,7 +110,7 @@ tapectl collection plan [OPTIONS]
 
 ### tapectl collection run
 
-Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already meets every unit's copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets) — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action.
+Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR-0012 item 217). Ends with what the copy holds and the next copy's command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action.
 
 A unit that spans cartridges is released slice by slice, each slice once it has its copies, and the run names the slices released and the slices kept for the next `volume write`.
 

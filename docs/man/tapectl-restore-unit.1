@@ -16,7 +16,7 @@ Output in JSON format
 The unit, as a flag: the same as UNIT
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
-Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
+Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Without it, \-\-dry\-run (which opens no drive) previews from the one volume this catalog has holding the unit, and names it; when several hold it they are listed, to name one here. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
 .TP
 \fB\-\-to\fR \fI<TO>\fR
 Destination directory
