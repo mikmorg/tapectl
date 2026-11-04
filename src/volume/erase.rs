@@ -292,7 +292,7 @@ impl EraseReport {
 
     /// Whose volume the tape holds: this catalog's (found by File 0's uuid,
     /// with its status), another catalog's (a uuid this catalog does not
-    /// know), or what the medium is when it holds no tapectl volume.
+    /// know), or what the medium is when it holds no volume at all.
     fn whose(&self) -> String {
         let file0 = self.file0.as_ref();
         let label = file0.and_then(|f| f.label.as_deref());
