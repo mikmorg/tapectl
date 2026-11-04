@@ -274,14 +274,16 @@ Show bin-packing plan for pending staged data
 
 When a staged unit may span (`allow_spanning`), it also shows the order one write of everything staged takes (owed runs of a span in progress, whole units, units that may span), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume's own files are not counted.
 
+A plan needs no drive: the tapes are estimated for `--generation`, or the configured drive's own generation, and the drive is never opened or probed, so it need not be attached. With neither, the plan is shown without the estimate. `volume init` decides each cartridge's real capacity.
+
 ```text
 tapectl volume plan [OPTIONS]
 ```
 
 **Options**
 
-- `--copies <COPIES>` *(default: `1`)* — Number of copies to plan
-- `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on
+- `--copies <COPIES>` — Number of copies to plan. Default: the largest copy floor among the staged units (each unit's `min_copies`, or the sum of its `copies_at` targets when that is larger), which the plan names
+- `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded, and with no drive configured the estimate takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve); this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
 - `--fill-ceiling <FILL_CEILING>` — Estimate at this fill ceiling instead of the drive's `fill_ceiling` (default 97%): `0.99` or `99%`
 - `--policy-aware` — List first the staged units a write would help: those whose audit finds too few copies or a required location with no copy, each with what it falls short of. `volume write` writes every staged set either way; this orders the listing only

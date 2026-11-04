@@ -94,7 +94,9 @@ A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes 
 
 The units already staged and still owed a copy are listed after the batches, with the command that writes them.
 
-Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a collection's root, tenant or archive set, or no drive to plan against). Every collection is planned whatever another's problems.
+A plan needs no drive: it is sized for `--generation`, or the configured drive's own generation, and never opens or probes the drive, which need not be attached. `volume init` decides each cartridge's real capacity, and `collection run` packs against it.
+
+Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a collection's root, tenant or archive set, or neither a drive configured nor `--generation` given). Every collection is planned whatever another's problems.
 
 ```text
 tapectl collection plan [OPTIONS]
@@ -103,7 +105,7 @@ tapectl collection plan [OPTIONS]
 **Options**
 
 - `--copies <COPIES>` *(default: `2`)* — Copies to plan for — informational only (batches don't change; this scales the printed cartridge-count estimate)
-- `--generation <GENERATION>` — Plan against this media generation rather than the drive's own (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded
+- `--generation <GENERATION>` — Plan against this media generation rather than the drive's own (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded, and with no drive configured the plan takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve)
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
 - `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
 - `--policy-aware` — Pack first the units a write would help: those whose audit finds too few copies or a required location with no copy (a never-archived unit always does). Each group stays in name order. Batch numbers then follow this order, so give `collection run` the same flag to run the batch reviewed here
@@ -114,10 +116,12 @@ Execute one batch: stage every unit in it once, write one session to the destina
 
 A unit that spans cartridges is released slice by slice, each slice once it has its copies, and the run names the slices released and the slices kept for the next `volume write`.
 
+With --init the destination is initialized first, on the blank cartridge in the drive, as `volume write --init` initializes it, and the batch is packed against the capacity the init records. With --move-to the tape is moved there once it is sealed and confirmed, as `volume write --move-to` moves it; a `volume resume` of an interrupted run keeps the move.
+
 Exit status: `volume write`'s, the worst outcome among its copies in the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4 interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and confirmed); 1 when every copy sealed but a unit was refused for its dotfile; 75 when the catalog was busy before anything was written.
 
 ```text
-tapectl collection run [OPTIONS] [NAME]
+tapectl collection run [OPTIONS] --label <LABEL> [NAME]
 ```
 
 **Arguments**
@@ -127,7 +131,9 @@ tapectl collection run [OPTIONS] [NAME]
 **Options**
 
 - `--batch <BATCH>` *(default: `0`)* — Which batch to execute (0 = first). Numbered against THIS run's own budget — the destination `--label` volumes' recorded capacity, not the drive's generation. This matches `collection plan`'s ordering only when `plan` was run (`--generation <GEN>`) for the generation those volumes were actually initialised as; otherwise the batch reviewed in `plan` is not necessarily batch N here
-- `--label <LABELS>` — Destination volume label — already `volume init`'d on its own cartridge. Exactly one: tapectl drives no changer, so it cannot write a second copy without a human swapping cartridges, and a batch run has no point where that swap could happen. More than one is refused. For a second and further copy, swap in the next cartridge after this run finishes and use `tapectl volume write <label>` directly against the same staged data
+- `--label <LABEL>` *(required)* — Destination volume label: exactly one, since a run writes one copy. tapectl drives no changer, so a second copy needs a human to swap cartridges, and a run has no point where that could happen: a second --label is refused. The volume is already initialized on its own cartridge, or --init initializes it first. For each further copy, swap in the next cartridge after this run finishes and run `tapectl volume write <NEW-LABEL> --init --full-confirm` against the same staged data
+- `--init` — Initialize the destination first: `volume init LABEL` on the blank cartridge in the drive, as `volume write --init` runs it (a cartridge with no barcode takes the label as its barcode). The batch is then packed against the capacity the init records. If the run stops after the init, the volume stays initialized and the run says what to run next
+- `--move-to <LOCATION>` — Once the copy is sealed and confirmed, move the tape (the volume and its cartridge) to this location, as `volume write --move-to` does. A location that does not exist is refused before anything is staged
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: full-hash every staged slice before the tape moves, for every copy this run writes
 - `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)

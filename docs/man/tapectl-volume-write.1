@@ -63,7 +63,9 @@ Seal slices that were staged before the escrow recipient existed (ADR\-0005). On
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-\-prewrite\-hash\fR
 Full\-hash every staged slice from disk before the tape moves (tri\-layer L1). Off by default (ADR\-0012, 2026\-09\-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch

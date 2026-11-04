@@ -12,7 +12,9 @@ A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes 
 .PP
 The units already staged and still owed a copy are listed after the batches, with the command that writes them.
 .PP
-Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a collection\*(Aqs root, tenant or archive set, or no drive to plan against). Every collection is planned whatever another\*(Aqs problems.
+A plan needs no drive: it is sized for `\-\-generation`, or the configured drive\*(Aqs own generation, and never opens or probes the drive, which need not be attached. `volume init` decides each cartridge\*(Aqs real capacity, and `collection run` packs against it.
+.PP
+Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a collection\*(Aqs root, tenant or archive set, or neither a drive configured nor `\-\-generation` given). Every collection is planned whatever another\*(Aqs problems.
 .SH OPTIONS
 .TP
 \fB\-\-copies\fR \fI<COPIES>\fR [default: 2]
@@ -22,7 +24,7 @@ Copies to plan for — informational only (batches don\*(Aqt change; this scales
 Output in JSON format
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
-Plan against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. sizing batches for LTO\-5 stock that an LTO\-6 drive will write. No cartridge need be loaded
+Plan against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. sizing batches for LTO\-5 stock that an LTO\-6 drive will write. No cartridge need be loaded, and with no drive configured the plan takes a drive\*(Aqs defaults (the 97% fill ceiling, the 50M end\-of\-tape reserve)
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
@@ -53,7 +55,9 @@ NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

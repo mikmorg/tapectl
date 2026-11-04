@@ -4,11 +4,13 @@
 .SH NAME
 tapectl\-collection\-run \- Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy\*(Aqs `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR\-0012 item 217). Ends with what the copy holds and the next copy\*(Aqs command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH SYNOPSIS
-\fBtapectl collection run\fR [\fB\-\-batch\fR] [\fB\-\-json\fR] [\fB\-\-label\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-jobs\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-home\fR] [\fB\-\-full\-confirm\-first\fR] [\fB\-\-policy\-aware\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fINAME\fR] 
+\fBtapectl collection run\fR [\fB\-\-batch\fR] [\fB\-\-json\fR] <\fB\-\-label\fR> [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-init\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-move\-to\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-jobs\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-full\-confirm\-first\fR] [\fB\-\-policy\-aware\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fINAME\fR] 
 .SH DESCRIPTION
 Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy\*(Aqs `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR\-0012 item 217). Ends with what the copy holds and the next copy\*(Aqs command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action.
 .PP
 A unit that spans cartridges is released slice by slice, each slice once it has its copies, and the run names the slices released and the slices kept for the next `volume write`.
+.PP
+With \-\-init the destination is initialized first, on the blank cartridge in the drive, as `volume write \-\-init` initializes it, and the batch is packed against the capacity the init records. With \-\-move\-to the tape is moved there once it is sealed and confirmed, as `volume write \-\-move\-to` moves it; a `volume resume` of an interrupted run keeps the move.
 .PP
 Exit status: `volume write`\*(Aqs, the worst outcome among its copies in the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4 interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and confirmed); 1 when every copy sealed but a unit was refused for its dotfile; 75 when the catalog was busy before anything was written.
 .SH OPTIONS
@@ -19,26 +21,26 @@ Which batch to execute (0 = first). Numbered against THIS run\*(Aqs own budget �
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-label\fR \fI<LABELS>\fR
-Destination volume label — already `volume init`\*(Aqd on its own cartridge. Exactly one: tapectl drives no changer, so it cannot write a second copy without a human swapping cartridges, and a batch run has no point where that swap could happen. More than one is refused. For a second and further copy, swap in the next cartridge after this run finishes and use `tapectl volume write <label>` directly against the same staged data
+\fB\-\-label\fR \fI<LABEL>\fR
+Destination volume label: exactly one, since a run writes one copy. tapectl drives no changer, so a second copy needs a human to swap cartridges, and a run has no point where that could happen: a second \-\-label is refused. The volume is already initialized on its own cartridge, or \-\-init initializes it first. For each further copy, swap in the next cartridge after this run finishes and run `tapectl volume write <NEW\-LABEL> \-\-init \-\-full\-confirm` against the same staged data
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
+\fB\-\-init\fR
+Initialize the destination first: `volume init LABEL` on the blank cartridge in the drive, as `volume write \-\-init` runs it (a cartridge with no barcode takes the label as its barcode). The batch is then packed against the capacity the init records. If the run stops after the init, the volume stays initialized and the run says what to run next
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
-\fB\-\-prewrite\-hash\fR
-See `volume write \-\-prewrite\-hash`: full\-hash every staged slice before the tape moves, for every copy this run writes
+\fB\-\-move\-to\fR \fI<LOCATION>\fR
+Once the copy is sealed and confirmed, move the tape (the volume and its cartridge) to this location, as `volume write \-\-move\-to` does. A location that does not exist is refused before anything is staged
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
 .TP
-\fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
-Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012)
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
@@ -48,16 +50,24 @@ Path to config file.
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
+\fB\-\-prewrite\-hash\fR
+See `volume write \-\-prewrite\-hash`: full\-hash every staged slice before the tape moves, for every copy this run writes
+.TP
+\fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
+Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012)
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+.TP
 \fB\-\-jobs\fR \fI<JOBS>\fR
 How many of the batch\*(Aqs units to stage at once (1 to 16), as `stage create \-\-jobs`. Defaults to `[staging] jobs`, itself 1
 .TP
 \fB\-\-full\-confirm\fR
 See `volume write \-\-full\-confirm`: read every copy this run writes back in full after sealing it
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-\-full\-confirm\-first\fR
 Read the run\*(Aqs first copy back in full after sealing it and confirm the others quickly: the one full readback to have before the run releases staging. A run writes one copy today, so this reads back the same copy `\-\-full\-confirm` does

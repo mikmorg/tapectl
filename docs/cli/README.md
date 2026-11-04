@@ -22,7 +22,9 @@ Accepted by every command, before or after the subcommand.
     NOTE: on its own this ALSO relocates the whole tapectl home to the config file's parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use --home when you mean "operate on a different archive", and --config only to point at a config file inside that home.
 - `--home <HOME>` — tapectl home directory: database, keys, catalogs, stage-reports, logs.
   
-    Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless --config overrides it. Also settable as TAPECTL_HOME.
+    The home is the first of: --home; TAPECTL_HOME; the directory of --config; this account's ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless --config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+  
+    As root the home pointer is never read, and on a host that has one tapectl refuses unless --home or TAPECTL_HOME names the home: the service user's commands run through `tapectl-op`.
 
 ## Commands
 
@@ -166,5 +168,5 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`config remove`](config.md#tapectl-config-remove) | Remove a key, an entry of a list of tables, or values from a list |
 | [`host`](host.md) | This host's fitness to feed a tape drive (the quiet-host check) |
 | &nbsp;&nbsp;[`host check`](host.md#tapectl-host-check) | Is this host quiet enough to write a tape? |
-| [`status`](status.md) | What is running and how the last sessions ended, from the session logs alone: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Opens no catalog and no config, so an account in the home's `[ops] group` can run it (`tapectl --home <service home> status`) without sudo |
+| [`status`](status.md) | The home screen: the home and why it was chosen, what is running, the units by state, the volumes due a verify, and the next commands |
 | [`completions`](completions.md) | Generate shell completions |

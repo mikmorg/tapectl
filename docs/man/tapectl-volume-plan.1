@@ -9,16 +9,18 @@ tapectl\-volume\-plan \- Show bin\-packing plan for pending staged data
 Show bin\-packing plan for pending staged data
 .PP
 When a staged unit may span (`allow_spanning`), it also shows the order one write of everything staged takes (owed runs of a span in progress, whole units, units that may span), the slices each plans, where each sits against the fill ceiling, and the units that would wait for the next tape. An estimate: the volume\*(Aqs own files are not counted.
+.PP
+A plan needs no drive: the tapes are estimated for `\-\-generation`, or the configured drive\*(Aqs own generation, and the drive is never opened or probed, so it need not be attached. With neither, the plan is shown without the estimate. `volume init` decides each cartridge\*(Aqs real capacity.
 .SH OPTIONS
 .TP
-\fB\-\-copies\fR \fI<COPIES>\fR [default: 1]
-Number of copies to plan
+\fB\-\-copies\fR \fI<COPIES>\fR
+Number of copies to plan. Default: the largest copy floor among the staged units (each unit\*(Aqs `min_copies`, or the sum of its `copies_at` targets when that is larger), which the plan names
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
-Estimate against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. counting LTO\-5 cartridges for an LTO\-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume\*(Aqs own `capacity_bytes` once `volume init` has detected the medium it is actually on
+Estimate against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. counting LTO\-5 cartridges for an LTO\-6 drive. No cartridge need be loaded, and with no drive configured the estimate takes a drive\*(Aqs defaults (the 97% fill ceiling, the 50M end\-of\-tape reserve); this is an estimate, and the authoritative figure is each volume\*(Aqs own `capacity_bytes` once `volume init` has detected the medium it is actually on
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
@@ -49,7 +51,9 @@ NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
-Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
