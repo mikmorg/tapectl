@@ -3048,15 +3048,31 @@ rfc_restore_file_symlink() {
 
 rfc_check_integrity_clean() { TCTL unit check-integrity photos; }
 
+# ADR-0012 items 208 and 220 (1.9.0): an edit reads CHANGED (the hash differs
+# and the mtime moved since the snapshot), never BITROT, and check-integrity's
+# exit follows what it found: 1 on BITROT, MISSING or SIZE_MISMATCH; a
+# CHANGED-only check exits as `changed_exit_code()` decides, 0 today (Q40,
+# with the CTO: if it becomes 1, CHANGED_RC below follows it). `modify` flips
+# byte 0 long after the snapshot, so its file reads CHANGED -- unless the seed
+# picked the 0-byte fixture file, which `modify` grows to one byte: a
+# SIZE_MISMATCH, exit 1.
 rfc_check_integrity_after_modify() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert bitrot+size_mismatch > 0, naming the changed file)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert changed+size_mismatch > 0 and bitrot = 0; exit 0 when only CHANGED, 1 on a size mismatch)"; return 0; }
     mutate_source "$SRC/photos" "$SEED" modify || return 1
-    local logf="$RUN/log-rfc.integrity_modify.json"
-    TCTL unit check-integrity photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
-    python3 -c '
-import json, sys
+    local logf="$RUN/log-rfc.integrity_modify.json" rc=0
+    TCTL unit check-integrity photos --json >"$logf" 2>"$logf.err" || rc=$?
+    case "$rc" in
+        0 | 1) ;;
+        *) echo "check-integrity exited $rc: neither a verdict (0) nor a finding (1)"; cat "$logf.err" "$logf"; return 1 ;;
+    esac
+    RC="$rc" CHANGED_RC=0 python3 -c '
+import json, os, sys
 d = json.load(open(sys.argv[1]))
-assert (d.get("bitrot", 0) + d.get("size_mismatch", 0)) > 0, d
+assert d.get("bitrot", 0) == 0, ("an edit read as BITROT", d)
+assert d.get("changed", 0) + d.get("size_mismatch", 0) > 0, ("the modified file was not found", d)
+damaged = d["bitrot"] + d["missing"] + d["size_mismatch"]
+want = 1 if damaged else int(os.environ["CHANGED_RC"])
+assert int(os.environ["RC"]) == want, ("exit %s, expected %d" % (os.environ["RC"], want), d)
 ' "$logf" || { cat "$logf"; return 1; }
 }
 
@@ -3380,7 +3396,11 @@ pm_capture_staged() { # pm_capture_staged <unit>
     rm -rf "${sd:?}/pm-staged/${1:?}"
     cp -a "$SRC/$1" "$sd/pm-staged/$1"
 }
-pm_op_check_integrity() { TCTL unit check-integrity "$1"; }
+# 1.9.0 (ADR-0012 item 220): check-integrity exits 1 when it finds a file
+# damaged, missing or resized, which a walk that mutates sources produces on
+# purpose (delete, rename, an emptied file grown). The op checks that it answers
+# by its contract, 0 or 1; anything else (2 an error, 101 a panic) fails.
+pm_op_check_integrity() { local rc; TCTL unit check-integrity "$1"; rc=$?; [ "$rc" -le 1 ]; }
 pm_op_key_rotate()      { TCTL key rotate --tenant alice; }
 pm_op_audit()           { local rc; TCTL audit; rc=$?; [ "$rc" -le 2 ]; }
 # `--force` because this is a RANDOMISED walk: whether the staged data is
