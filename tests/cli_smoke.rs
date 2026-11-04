@@ -3479,6 +3479,79 @@ fn completions_into_a_closed_pipe_exit_0() {
     assert_eq!(closed.status.code(), Some(0), "stderr: {stderr}");
 }
 
+/// ADR-0012 item 210: `snapshot create` takes several units. Each is walked
+/// and reported on its own; one that fails (here a unit that does not
+/// exist) stops none of the others, and the command then exits with an
+/// error naming it. With `--json`, several units are an array of the units
+/// snapshotted; one unit is the object it always was.
+#[test]
+fn snapshot_create_takes_several_units_and_one_failing_stops_none() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let ok = |args: &[&str]| {
+        let out = run_tapectl(h, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    ok(&["init"]);
+    ok(&["tenant", "add", "acme"]);
+    let src = TempDir::new().unwrap();
+    for u in ["alpha", "gamma"] {
+        let d = src.path().join(u);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f.txt"), u).unwrap();
+        ok(&[
+            "unit",
+            "init",
+            d.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            u,
+        ]);
+    }
+
+    let out = run_tapectl(h, &["snapshot", "create", "alpha", "nope", "gamma"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("snapshot created: alpha v1"), "{stdout}");
+    assert!(
+        stdout.contains("snapshot created: gamma v1"),
+        "the unit after the failing one still ran: {stdout}"
+    );
+    assert!(
+        stderr.contains("1 unit of 3 failed") && stderr.contains("nope"),
+        "{stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+
+    // Several units under --json: one array, one object per unit.
+    let out = ok(&["--json", "snapshot", "create", "alpha", "gamma"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON value");
+    let units: Vec<&str> = v
+        .as_array()
+        .expect("several units are an array")
+        .iter()
+        .map(|r| r["unit"].as_str().unwrap())
+        .collect();
+    assert_eq!(units, ["alpha", "gamma"], "{v}");
+    assert_eq!(v[0]["minted"], false, "unchanged since v1: {v}");
+
+    // One unit: the object it always was.
+    let out = ok(&["--json", "snapshot", "create", "alpha"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON value");
+    assert_eq!(v["unit"], "alpha", "{v}");
+
+    // A unit named twice is refused before any walk.
+    let out = run_tapectl(h, &["snapshot", "create", "alpha", "alpha"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("named twice"));
+}
+
 /// The stderr twin: an error reported to a closed stderr still exits with
 /// the error's own code (the one it gives with stderr open), not a panic's
 /// 101.

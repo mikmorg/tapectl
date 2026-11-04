@@ -11,8 +11,13 @@ use crate::staging;
 pub enum SnapshotCommands {
     /// Create a snapshot (fast directory walk + manifest)
     Create {
-        /// Unit name
-        name: String,
+        /// Unit name(s). Each unit is walked and reported on its own: one
+        /// that fails does not stop the others, and the command then exits
+        /// with an error naming every unit that failed
+        #[arg(required = true, value_name = "NAME")]
+        name: Vec<String>,
+        // Q41: the flag that snapshots every dirty unit goes here once the
+        // CTO has named it (OQ22).
     },
 
     /// List snapshots
@@ -140,6 +145,79 @@ fn validate_snapshot_status(value: &str) -> Result<()> {
         .map_err(TapectlError::Other)
 }
 
+/// What one unit's `snapshot create` printed: its line and its JSON object.
+struct Created {
+    line: String,
+    json: serde_json::Value,
+}
+
+/// `snapshot create` of one unit.
+fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created> {
+    // ADR-0012 / issue #159: `snapshot_create_detailed` may report an
+    // existing version instead of minting one — `outcome.minted` says which.
+    // Success either way, not a refusal. `outcome.snapshot_id` names the row
+    // (new or reused) to look up below regardless.
+    let outcome = staging::snapshot_create_detailed(conn, name, config)?;
+
+    let (total_size, file_count): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT total_size, file_count FROM snapshots WHERE id = ?1",
+        params![outcome.snapshot_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+
+    let json = serde_json::json!({
+        "snapshot_id": outcome.snapshot_id,
+        "unit": name,
+        "version": outcome.version,
+        "total_size": total_size,
+        "file_count": file_count,
+        // Same shape whether minted or not (issue #159): one key, `true` on
+        // the created path, `false` when an existing version was reported
+        // instead — never two different JSON shapes for the same command.
+        "minted": outcome.minted,
+    });
+    let line = if outcome.minted {
+        format!(
+            "snapshot created: {} v{} ({} files, {})",
+            name,
+            outcome.version,
+            file_count.unwrap_or(0),
+            crate::util::format_bytes_binary(total_size.unwrap_or(0)),
+        )
+    } else {
+        format!(
+            "unit \"{name}\" is unchanged since v{}; no snapshot created",
+            outcome.version,
+        )
+    };
+    Ok(Created { line, json })
+}
+
+/// The error a `snapshot create` of `named` units ends with, `None` when
+/// none failed. One unit named: its own error, exactly as before. Several:
+/// one error naming each unit that failed and why, after the others were
+/// reported.
+fn several_failed(named: usize, mut failed: Vec<(&str, TapectlError)>) -> Option<TapectlError> {
+    if failed.is_empty() {
+        return None;
+    }
+    if named == 1 {
+        return Some(failed.remove(0).1);
+    }
+    let mut text = if failed.len() == named {
+        format!("all {named} units failed:")
+    } else {
+        format!(
+            "{} of {named} failed (the others are reported above):",
+            crate::render::plural(failed.len() as i64, "unit", "units")
+        )
+    };
+    for (name, e) in &failed {
+        text.push_str(&format!("\n  {name}: {e}"));
+    }
+    Some(TapectlError::Other(text))
+}
+
 pub fn run(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -150,7 +228,7 @@ pub fn run(
     assume_yes: bool,
 ) -> Result<()> {
     match command {
-        SnapshotCommands::Create { name } => {
+        SnapshotCommands::Create { name: names } => {
             // Issue #241: the sha256 directory walk IS the work — the
             // only way to know whether content changed (and so whether a
             // new version would be minted) is to run it, so there is
@@ -162,49 +240,41 @@ pub fn run(
                      version would be minted ARE the command's own work.",
                 ));
             }
-            // ADR-0012 / issue #159: `snapshot_create_detailed` may report
-            // an existing version instead of minting one — `outcome.minted`
-            // says which. Exit 0 either way; this is success, not a
-            // refusal. `outcome.snapshot_id` names the row (new or reused)
-            // to look up below regardless.
-            let outcome = staging::snapshot_create_detailed(conn, name, config)?;
-
-            let (total_size, file_count): (Option<i64>, Option<i64>) = conn.query_row(
-                "SELECT total_size, file_count FROM snapshots WHERE id = ?1",
-                params![outcome.snapshot_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "snapshot_id": outcome.snapshot_id,
-                        "unit": name,
-                        "version": outcome.version,
-                        "total_size": total_size,
-                        "file_count": file_count,
-                        // Same shape whether minted or not (issue #159):
-                        // one key, `true` on the created path, `false`
-                        // when an existing version was reported instead —
-                        // never two different JSON shapes for the same
-                        // command.
-                        "minted": outcome.minted,
-                    })
-                );
-            } else if outcome.minted {
-                println!(
-                    "snapshot created: {} v{} ({} files, {})",
-                    name,
-                    outcome.version,
-                    file_count.unwrap_or(0),
-                    crate::util::format_bytes_binary(total_size.unwrap_or(0)),
-                );
-            } else {
-                println!(
-                    "unit \"{name}\" is unchanged since v{}; no snapshot created",
-                    outcome.version,
-                );
+            for (i, n) in names.iter().enumerate() {
+                if names[..i].contains(n) {
+                    return Err(TapectlError::Other(format!(
+                        "unit \"{n}\" is named twice; a unit is snapshotted once"
+                    )));
+                }
+            }
+            // ADR-0012 item 210: several units, each judged and reported on
+            // its own as it finishes; a unit that fails does not stop the
+            // ones after it.
+            let mut rows = Vec::with_capacity(names.len());
+            let mut failed: Vec<(&str, TapectlError)> = Vec::new();
+            for name in names {
+                match create_one(conn, config, name) {
+                    Ok(created) => {
+                        if !json_output {
+                            println!("{}", created.line);
+                        }
+                        rows.push(created.json);
+                    }
+                    Err(e) => failed.push((name, e)),
+                }
+            }
+            if json_output && !rows.is_empty() {
+                // One unit: the object it always was. Several: an array of
+                // the units snapshotted (as `stage create` prints).
+                let out = if names.len() == 1 {
+                    rows.remove(0)
+                } else {
+                    serde_json::Value::Array(rows)
+                };
+                println!("{out}");
+            }
+            if let Some(err) = several_failed(names.len(), failed) {
+                return Err(err);
             }
         }
 
