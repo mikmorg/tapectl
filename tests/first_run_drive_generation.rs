@@ -53,7 +53,7 @@ fn recognised_drive_models_yield_their_own_generation() {
 #[test]
 fn every_recognised_answer_round_trips_generation_parse() {
     // The string this script writes into config.toml must be one tapectl can
-    // read back; otherwise first-run hands `backend add` a value it refuses.
+    // read back; otherwise first-run hands `drive add` a value it refuses.
     for model in [
         "ULT3580-TD6",
         "ULT3580-TD8",

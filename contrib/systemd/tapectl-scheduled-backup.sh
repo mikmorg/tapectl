@@ -85,11 +85,11 @@ mkdir -p "$DIR" || fail "cannot create $DIR"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$DIR/tapectl-$STAMP.db"
 
-echo "== tapectl db backup --to $OUT =="
+echo "== tapectl db backup $OUT =="
 if [ "$INCLUDE_KEYS" = 1 ]; then
-	"$TAPECTL" db backup --to "$OUT" --include-keys
+	"$TAPECTL" db backup "$OUT" --include-keys
 else
-	"$TAPECTL" db backup --to "$OUT"
+	"$TAPECTL" db backup "$OUT"
 fi
 rc=$?
 if [ "$rc" -eq 75 ]; then

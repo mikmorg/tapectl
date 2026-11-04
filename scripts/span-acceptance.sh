@@ -815,7 +815,7 @@ run cfg-copies 0 tctl config set defaults.min_copies 1
 # Every file of the copy is archived, so the restore can be compared with all of it.
 run cfg-excludes 0 tctl config set defaults.global_excludes '[]'
 run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
-run backend 0 tctl backend add --name spn --device-tape "$TAPE_DEV" --generation LTO-6
+run backend 0 tctl drive add --name spn --device-tape "$TAPE_DEV" --generation LTO-6
 # Item 123: a unit that may span is planned past the fill ceiling only on a drive that declares it.
 run cfg-pwb 0 tctl config set 'backends.lto[0].post_warning_bytes' "\"$POST_WARNING\""
 [ -z "$ENOSPC_BUFFER" ] || run cfg-reserve 0 tctl config set 'backends.lto[0].enospc_buffer' "\"$ENOSPC_BUFFER\""
@@ -903,7 +903,7 @@ fi
 [ "$END_MIN" -ge $((WARNING_AT + MARGIN)) ] || fail "$UNIT_S ends by $END_MIN at the earliest, not $MARGIN bytes past the warning at $WARNING_AT: it would be written whole"
 [ "$END_MIN" -gt "$CAPACITY" ] || fail "$UNIT_S ends by $END_MIN, within the plan bound $CAPACITY: it would not be the span's tail (item 123)"
 log "  $UNIT_S starts between $START_MIN and $START_MAX and ends past $END_MIN; the warning expected at $WARNING_AT"
-run staging-status any tctl --json staging status
+run staging-status any tctl --json stage list --all
 # The plan, before any tape: the filler whole under the ceiling, the unit that may span the
 # tail, planned to its end (items 83 and 123), nothing deferred or refused.
 run plan 0 tctl --json volume plan
@@ -1184,7 +1184,7 @@ grep -F "tapectl volume retire $LABEL1" "$STEP_DIR/erase-refused.out" "$STEP_DIR
     || fail "cartridge erase's refusal does not name 'tapectl volume retire $LABEL1'"
 # The filler leaves staging now, while tape 1 still gives it its copy: `volume write` writes
 # everything staged, and a 2.4 TB filler on tape 2 would end $UNIT_S in a range again.
-run release-filler 0 tctl --yes staging clean --unit "$UNIT_F"
+run release-filler 0 tctl --yes stage clean --unit "$UNIT_F"
 STAGED="$(stage_statuses)"
 log "  stage sets before tape 2: $STAGED"
 [ "$STAGED" = "$UNIT_F=cleaned $UNIT_S=staged " ] || fail "stage sets before tape 2 are '$STAGED', expected the filler released and $UNIT_S staged"

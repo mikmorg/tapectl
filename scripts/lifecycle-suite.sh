@@ -1182,7 +1182,7 @@ print(row[0] if row else "")
 PY
 )"
     if [ -z "$slice" ] || [ ! -f "$slice" ]; then
-        skip "$RM_TAG.isolation" "no live staged slice for $RM_UNIT (already released by staging clean) — crypto isolation already proved by other tags in this run"
+        skip "$RM_TAG.isolation" "no live staged slice for $RM_UNIT (already released by stage clean) — crypto isolation already proved by other tags in this run"
         return $?
     fi
     # Positive control (#471, as the gate's step_crosskey got in #415): the
@@ -1353,12 +1353,12 @@ NEWHOME_TCTL() {
 }
 
 # pending_count — number of pending (staged, unwritten) stage sets, via
-# `report pending --json` (a plain JSON array — src/cli/report.rs
-# report_pending) rather than sqlite3 directly (guardrail: no direct DB
+# `stage list --owing --json` (a plain JSON array of staged sets) rather
+# than sqlite3 directly (guardrail: no direct DB
 # access except the one documented read-only exception this isn't).
 pending_count() {
     if [ "$DRY_RUN" = 1 ]; then echo 0; return 0; fi
-    TCTL report pending --json 2>/dev/null | python3 -c '
+    TCTL stage list --owing --json 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 print(len(d) if isinstance(d, list) else 0)
@@ -1471,7 +1471,7 @@ fy_units() {
 fy_snapshots() { TCTL snapshot create photos && TCTL snapshot create docs && TCTL snapshot create big; }
 fy_stage()     { TCTL stage create photos && TCTL stage create docs && TCTL stage create big; }
 fy_pending_is_three() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl report pending --json (assert 3 entries)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage list --owing --json (assert 3 entries)"; return 0; }
     local n; n="$(pending_count)"
     [ "$n" = 3 ] || { echo "expected 3 pending stage sets, got $n"; return 1; }
 }
@@ -1515,7 +1515,7 @@ fy_audit() {
     return 0
 }
 fy_fsck()      { TCTL db fsck; }
-fy_summary()   { TCTL report summary; }
+fy_summary()   { TCTL status; }
 
 # Issue #270: proves the --json captures in this file keep stdout CLEAN.
 #
@@ -1672,7 +1672,7 @@ ev_restore_v1_from_vola() {
     assert_identical "$sd/pristine-v1-photos" "$to"
 }
 
-ev_supersedable() { TCTL report supersedable; }
+ev_supersedable() { TCTL report reclaimable; }
 ev_age()          { TCTL report age; }
 
 scenario_evolving_source() {
@@ -1959,7 +1959,7 @@ scenario_tenant_reassign() {
 # mark-tape-only must refuse photos naming the multiplier and pass it with
 # --yes; a freshly-written "solo" unit with only 1 copy must
 # be REFUSED, naming the shortfall. Then reclaim v1 (mark-reclaimable ->
-# purge), staging clean, and prove the LATEST version is still restorable.
+# purge), stage clean, and prove the LATEST version is still restorable.
 #
 # --single-cartridge note: next_tape's single-cartridge branch now retires
 # the previous label in the DB before reusing its cartridge (added this
@@ -2046,13 +2046,13 @@ tor_purge_v1_photos() {
     TCTL snapshot purge --version 1 photos
 }
 
-# `staging clean` at this point in the scenario is the ADR-0012 refusal, not
+# `stage clean` at this point in the scenario is the ADR-0012 refusal, not
 # housekeeping — and asserting both halves is worth more than adding --force
 # and moving on.
 #
 # `solo` has exactly ONE completed copy against this suite's min_copies = 2 (the
 # check immediately above, tor.mark_tape_only_solo_refused, asserts that very
-# fact). Issue #244's ruling makes a bare `staging clean` REFUSE that, naming
+# fact). Issue #244's ruling makes a bare `stage clean` REFUSE that, naming
 # the under-copied unit, because releasing here destroys the only cheap route
 # to the second copy the operator's own policy requires. `--force` is the
 # documented override and the scenario genuinely means it: it is done with
@@ -2063,9 +2063,9 @@ tor_purge_v1_photos() {
 # instead. Without that, this check would have gone PASS -> FAIL on the next
 # --all with the fix looking like the culprit.
 tor_staging_clean() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean (expect SUCCESS, retaining solo at 1/2 copies and naming --force), assert solo still 'staged', then tapectl staging clean --force"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage clean (expect SUCCESS, retaining solo at 1/2 copies and naming --force), assert solo still 'staged', then tapectl stage clean --force"; return 0; }
     local out rc
-    out="$(TCTL staging clean 2>&1)"; rc=$?
+    out="$(TCTL stage clean 2>&1)"; rc=$?
     # ADR-0012's 2026-09-21 amendment (issue #262) corrected #244's ruling from
     # "the command refuses" to "the command retains the under-copied units and
     # succeeds". The protection is unchanged -- solo's staged bytes must still
@@ -2076,15 +2076,15 @@ tor_staging_clean() {
     # unit's release until staging filled; and --force, the only escape, has a
     # wider candidate set than the gate it bypasses.
     [ "$rc" -eq 0 ] || {
-        echo "staging clean must now SUCCEED while retaining the under-copied unit (issue #262), got rc=$rc: $out"
+        echo "stage clean must now SUCCEED while retaining the under-copied unit (issue #262), got rc=$rc: $out"
         return 1
     }
     echo "$out" | grep "solo" >/dev/null || {
-        echo "staging clean retained data but did not name the under-copied unit, so an operator cannot tell which one: $out"
+        echo "stage clean retained data but did not name the under-copied unit, so an operator cannot tell which one: $out"
         return 1
     }
     echo "$out" | grep -- "--force" >/dev/null || {
-        echo "staging clean retained data without naming --force as the override: $out"
+        echo "stage clean retained data without naming --force as the override: $out"
         return 1
     }
     # The load-bearing assertion, and the reason the exit code was never the
@@ -2100,7 +2100,7 @@ print(sum(1 for r in rows if isinstance(r, dict)
           and "solo" in str(r.get("unit", ""))))
 ' 2>/dev/null || echo 0)"
     [ "${still:-0}" -ge 1 ] || {
-        echo "solo is at 1/2 copies and its staged data was released by a bare \`staging clean\` -- issue #244's protection is not holding: $out"
+        echo "solo is at 1/2 copies and its staged data was released by a bare \`stage clean\` -- issue #244's protection is not holding: $out"
         return 1
     }
     # Put the retention notice in the report. Without this the log shows only
@@ -2110,7 +2110,7 @@ print(sum(1 for r in rows if isinstance(r, dict)
     # see is how this suite produced five greens for the wrong reason.
     echo "the retention notice, verbatim:"
     echo "$out" | sed 's/^/    /'
-    TCTL staging clean --force
+    TCTL stage clean --force
 }
 tor_report_copies() { TCTL report copies; }
 
@@ -2164,7 +2164,7 @@ scenario_tape_only_and_reclaim() {
 # next_tape fix). The whole scenario SKIPs there, visibly, rather than
 # faking a single-cartridge shape that wouldn't test compaction at all.
 #
-# Sequence: VOL-E starts with photos/docs/big v1. `staging clean` then
+# Sequence: VOL-E starts with photos/docs/big v1. `stage clean` then
 # RELEASES those three stage sets — without it they stay 'staged' and every
 # later `volume write` writes them again (see cp_release_staging; this is
 # what made VOL-F a full second copy of everything, issue #198). photos v2
@@ -2190,7 +2190,7 @@ cp_write_photos_v2_on_volf() {
     vinit VOL-F && TCTL volume write VOL-F --device "$TAPE_DEV" --yes
 }
 
-# `staging clean` is the RELEASE half of tapectl's stage-once / write-N-
+# `stage clean` is the RELEASE half of tapectl's stage-once / write-N-
 # copies / release design (CLAUDE.md, Collection layer). `volume write`
 # writes every stage set that is still 'staged' and deliberately leaves it
 # 'staged' (src/volume/write.rs `find_staged_data`), so until something
@@ -2210,7 +2210,7 @@ cp_write_photos_v2_on_volf() {
 # CLI caller now refuses first when any unit's staged data sits below its
 # policy's `min_copies`, and here all three do:
 #
-#     error: staging clean refused: ... (issue #244). Pass --force ...
+#     error: stage clean refused: ... (issue #244). Pass --force ...
 #       big: 1/2 copies
 #       docs: 1/2 copies
 #       photos: 1/2 copies
@@ -2227,7 +2227,7 @@ cp_write_photos_v2_on_volf() {
 # The refusal itself is asserted by `tor.staging_clean`
 # (tape-only-and-reclaim), which owns that rule and fails if the gate ever
 # stops holding. This is a setup step; it does not re-assert it.
-cp_release_staging() { TCTL staging clean --force; }
+cp_release_staging() { TCTL stage clean --force; }
 
 # A second COPY of photos v2 — not a new version, and the reason this
 # scenario was RED on master (issue #198).
@@ -2302,7 +2302,7 @@ cp_compact_finish_refused_first() {
 cp_write_volg() {
     next_tape VOL-G || return 1
     vinit VOL-G || return 1
-    TCTL volume compact-write --destination VOL-G --device "$TAPE_DEV" --yes
+    TCTL volume compact-write --to VOL-G --device "$TAPE_DEV" --yes
 }
 
 # --yes because this act is now ADR-0008 Tier 2 (issue #147): finishing the
@@ -2419,7 +2419,7 @@ rr_retire_refused_sole_copy() {
 # the compaction scenario, and it made this scenario red on master too
 # (measured 2026-09-16: 10 checks, 6 passed, 4 failed, first failure here).
 # `volume write` leaves every stage set it writes `'staged'`
-# (src/volume/write.rs `find_staged_data`; `staging clean` is the release
+# (src/volume/write.rs `find_staged_data`; `stage clean` is the release
 # half of that design), and `stage create` refuses a version that still has
 # a live set:
 #
@@ -2457,8 +2457,8 @@ rr_staging_released_by_second_copy() {
         skip "rr.staging_released_by_second_copy" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage list --json; assert stage sets exist, one is cleaned, none staged"; return 0; }
-    TCTL stage list --json 2>/dev/null | python3 -c '
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage list --all --json; assert stage sets exist, one is cleaned, none staged"; return 0; }
+    TCTL stage list --all --json 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 rows = [r for r in (d if isinstance(d, list) else d.get("stage_sets", [])) if isinstance(r, dict)]
@@ -2615,9 +2615,9 @@ PY
 # raw-volume` — which touches nothing in the DB — needs a bare `tapectl
 # init` on the new home first. Recorded here rather than assumed.
 dl_backup() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup --to \$sd/backup.db --include-keys"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup \$sd/backup.db --include-keys"; return 0; }
     local sd; sd="$(dirname "$HOME_DIR")"
-    TCTL db backup --to "$sd/backup.db" --include-keys
+    TCTL db backup "$sd/backup.db" --include-keys
 }
 
 # (a) NEW empty home + `db import`: restores the FULL catalog (units,
@@ -2660,7 +2660,7 @@ dl_scenario_a_db_import() {
 # in a new way".
 dl_scenario_b_raw_and_import() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: new home (init only); tapectl restore raw-volume --to DIR --json (assert all_verified, DB-less); tapectl import --label VOL-A; assert restore unit --unit photos REFUSES and names the unit (import registers a cartridge, it does not rebuild a catalog — that is arm (d))"
+        echo "PLAN: new home (init only); tapectl restore raw-volume --to DIR --json (assert all_verified, DB-less); tapectl volume import VOL-A; assert restore unit --unit photos REFUSES and names the unit (import registers a cartridge, it does not rebuild a catalog — that is arm (d))"
         return 0
     fi
     local sd newhome; sd="$(dirname "$HOME_DIR")"; newhome="$sd/newhome-b"
@@ -2675,8 +2675,8 @@ d = json.load(open(sys.argv[1]))
 assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
 ' "$rawlog" || { echo "raw-volume did not verify cleanly:"; cat "$rawlog"; return 1; }
 
-    NEWHOME_TCTL "$newhome" import --label VOL-A --generation LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
-        || { echo "top-level 'tapectl import' itself failed:"; cat "$sd/dl.b.import.txt"; return 1; }
+    NEWHOME_TCTL "$newhome" volume import VOL-A --generation LTO-6 >"$sd/dl.b.import.txt" 2>&1 \
+        || { echo "'tapectl volume import' itself failed:"; cat "$sd/dl.b.import.txt"; return 1; }
     local to="$sd/dl.b.restore-photos"
     if NEWHOME_TCTL "$newhome" restore unit --unit photos --from VOL-A --to "$to" --device "$TAPE_DEV" \
         >"$sd/dl.b.restore.txt" 2>&1; then
@@ -2884,7 +2884,7 @@ eo_snapshots() { TCTL snapshot create unitA && TCTL snapshot create unitB; }
 
 eo_stage_before_escrow_refused() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: tapectl stage create unitA (expect refusal containing 'no escrow recipient is registered'); tapectl stage list --json (expect [])"
+        echo "PLAN: tapectl stage create unitA (expect refusal containing 'no escrow recipient is registered'); tapectl stage list --all --json (expect [])"
         return 0
     fi
     local out rc
@@ -2900,7 +2900,7 @@ eo_stage_before_escrow_refused() {
         return 1
     fi
     local listing
-    listing="$(TCTL stage list --json 2>&1)"
+    listing="$(TCTL stage list --all --json 2>&1)"
     echo "$listing" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -2951,7 +2951,7 @@ scenario_escrow_ordering() {
 # File/link entries are the rows whose raw `is_directory` is false.
 #
 # This used to discriminate on a literal "d " prefix baked into the JSON
-# `path`, because it once was: `catalog ls --json` emitted a display marker
+# `path`, because it once was: `catalog list --json` emitted a display marker
 # inside a raw fact. Issue #236 finding 5 removed it (commit f7f2431) --
 # correctly, per the C2b rule that a `--json` value is the raw fact and
 # `display_with` renders it for the table only -- and this check silently
@@ -2963,9 +2963,9 @@ scenario_escrow_ordering() {
 # than merely not matching -- a discriminator that matches nothing looks
 # exactly like a discriminator that is stale.
 rfc_catalog_ls_matches_find() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog ls photos --json; compare non-directory entry count to find \$SRC/photos -type f -o -type l"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl catalog list photos --json; compare non-directory entry count to find \$SRC/photos -type f -o -type l"; return 0; }
     local logf="$RUN/log-rfc.catalog_ls.json"
-    TCTL catalog ls photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
+    TCTL catalog list photos --json >"$logf" 2>"$logf.err" || { cat "$logf.err" "$logf"; return 1; }
     local expect actual
     expect="$(find "$SRC/photos" \( -type f -o -type l \) | wc -l)"
     actual="$(python3 -c '
@@ -2974,8 +2974,8 @@ d = json.load(open(sys.argv[1]))
 assert not any(r.get("path", "").startswith("d ") for r in d), (
     "a display marker is baked into the raw JSON path again (issue #236 finding 5)", d)
 print(sum(1 for r in d if not r.get("is_directory")))
-' "$logf")" || { echo "catalog ls --json is not the shape this check reads:"; cat "$logf"; return 1; }
-    [ "$expect" = "$actual" ] || { echo "catalog ls photos: expected $expect file/link entries (find), got $actual (catalog)"; cat "$logf"; return 1; }
+' "$logf")" || { echo "catalog list --json is not the shape this check reads:"; cat "$logf"; return 1; }
+    [ "$expect" = "$actual" ] || { echo "catalog list photos: expected $expect file/link entries (find), got $actual (catalog)"; cat "$logf"; return 1; }
 }
 
 rfc_catalog_search() {
@@ -3178,7 +3178,7 @@ col_plan()   { TCTL collection plan; }
 col_run_batch() {
     next_tape VOL-COL1 || return 1
     vinit VOL-COL1 || return 1
-    TCTL collection run --collection media --batch 0 --label VOL-COL1 --device "$TAPE_DEV" --yes
+    TCTL collection run media --batch 0 --label VOL-COL1 --device "$TAPE_DEV" --yes
 }
 
 # Rename-by-uuid: add a 5th folder AND rename the 3rd, in one sync. If the
@@ -3373,16 +3373,23 @@ pm_op_key_rotate()      { TCTL key rotate --tenant alice; }
 pm_op_audit()           { local rc; TCTL audit; rc=$?; [ "$rc" -le 2 ]; }
 # `--force` because this is a RANDOMISED walk: whether the staged data is
 # below `min_copies` when this operation fires depends on where the RNG
-# placed the preceding writes, so a bare `staging clean` passes or fails by
+# placed the preceding writes, so a bare `stage clean` passes or fails by
 # seed after issue #244. A seed-dependent check proves nothing on the seed
 # it passes and blocks the run on the seed it does not -- the same trap the
 # `permute` copy_count assertion already hit. The walk is not testing
 # #244's gate (`tor.staging_clean` is); it is testing that a long random
 # sequence of operations leaves the archive restorable, and "release
 # whatever is staged" is the operator intent at this step.
-pm_op_staging_clean()   { TCTL staging clean --force; }
+pm_op_staging_clean()   { TCTL stage clean --force; }
 pm_op_db_fsck()         { TCTL db fsck; }
-pm_op_report_random()   { TCTL report "$1"; }
+pm_op_report_random() {
+    case "$1" in
+        summary)      TCTL status ;;
+        pending)      TCTL stage list --owing ;;
+        supersedable) TCTL report reclaimable ;;
+        *)            TCTL report "$1" ;;
+    esac
+}
 
 pm_op_write_next_volume() {
     local n; n="$(pending_count)"
@@ -3986,9 +3993,9 @@ sct_setup() {
 # Taken while VOL-S is `initialized` and File 0 is stamped but no data is
 # written. This is the state the stale catalog will be rolled back to.
 sct_backup_while_writable() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup --to \$sd/sct-pre-write.db --include-keys (VOL-S still 'initialized')"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl db backup \$sd/sct-pre-write.db --include-keys (VOL-S still 'initialized')"; return 0; }
     local sd; sd="$(dirname "$HOME_DIR")"
-    TCTL db backup --to "$sd/sct-pre-write.db" --include-keys
+    TCTL db backup "$sd/sct-pre-write.db" --include-keys
 }
 
 sct_write_and_seal() {
@@ -4341,11 +4348,11 @@ csc_skip_single_cartridge() {
 # to exist.
 csc_multi_label_refused() {
     if [ "$DRY_RUN" = 1 ]; then
-        echo "PLAN: tapectl collection run --collection media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED: more than one destination label, with the swap-and-volume-write remedy) then tapectl stage list --json (assert still empty -- refused BEFORE staging)"
+        echo "PLAN: tapectl collection run media --batch 0 --label VOL-CS1 --label VOL-CS2 (expect REFUSED: more than one destination label, with the swap-and-volume-write remedy) then tapectl stage list --all --json (assert still empty -- refused BEFORE staging)"
         return 0
     fi
     local out rc
-    out="$(TCTL collection run --collection media --batch 0 \
+    out="$(TCTL collection run media --batch 0 \
               --label VOL-CS1 --label VOL-CS2 --device "$TAPE_DEV" 2>&1)"; rc=$?
     printf '%s\n' "$out" >"$RUN/log-csc.multi-label.txt"
     [ "$rc" -ne 0 ] || { echo "collection run accepted two --label values; #229 ruled it refuses: $out"; return 1; }
@@ -4359,7 +4366,7 @@ csc_multi_label_refused() {
     grep -q "swap in the next cartridge" <<<"$out" || {
         echo "the refusal does not tell the operator how to write the further copies: $out"; return 1; }
     local f="$RUN/log-csc.staged-after-refusal.json"
-    TCTL stage list --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
+    TCTL stage list --all --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d == [], d' "$f" || {
         echo "the refusal happened AFTER staging -- a refused run must cost nothing:"; cat "$f"; return 1; }
 }
@@ -4368,7 +4375,7 @@ csc_run_first_copy() {
     next_tape VOL-CS1 || return 1
     vinit VOL-CS1 || return 1
     if [ "$DRY_RUN" = 1 ]; then
-        TCTL collection run --collection media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --yes --json
+        TCTL collection run media --batch 0 --label VOL-CS1 --device "$TAPE_DEV" --yes --json
         echo "PLAN: assert staging_released=false and every under_copied entry is 1/2"
         return 0
     fi
@@ -4383,7 +4390,7 @@ csc_run_first_copy() {
     # mixed stream. Copy this shape, not the `2>&1` one, for any command that
     # writes to stderr.
     local f="$RUN/log-csc.run1.json" e="$RUN/log-csc.run1.err"
-    TCTL collection run --collection media --batch 0 --label VOL-CS1 \
+    TCTL collection run media --batch 0 --label VOL-CS1 \
         --device "$TAPE_DEV" --yes --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
     python3 - "$f" <<'PY2' || { cat "$e" "$f"; return 1; }
 import json, sys
@@ -4411,7 +4418,7 @@ PY2
 # what makes this an assertion about BYTES rather than about row counts.
 csc_fingerprint() { # csc_fingerprint <outfile>
     local out="$1" listf="$1.list" units="$1.units"
-    TCTL stage list --json >"$listf" 2>"$listf.err" || { cat "$listf.err" "$listf"; return 1; }
+    TCTL stage list --all --json >"$listf" 2>"$listf.err" || { cat "$listf.err" "$listf"; return 1; }
     python3 - "$listf" "$out" "$units" <<'PY2' || { cat "$listf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
@@ -4470,7 +4477,7 @@ PY2
 }
 
 csc_capture_staged() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: record stage list --json + per-unit stage info --json (stage_set_id, stage_set_count, every slice sha256) as the pre-second-copy fingerprint"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: record stage list --all --json + per-unit stage info --json (stage_set_id, stage_set_count, every slice sha256) as the pre-second-copy fingerprint"; return 0; }
     csc_fingerprint "$RUN/csc.fingerprint.before"
 }
 
@@ -4516,19 +4523,19 @@ PY2
 # did not because #238's gate held. This is the third state, after "retained" and
 # "consumed".
 csc_staging_released() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean; assert every stage set is 'cleaned' and no .age file survives under the staging directory"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage clean; assert every stage set is 'cleaned' and no .age file survives under the staging directory"; return 0; }
     local f="$RUN/log-csc.clean.txt" lf="$RUN/log-csc.staged-final.json"
     # Prove there is something to release before releasing it, so "everything
     # is cleaned afterwards" cannot be satisfied by "everything was already
     # cleaned beforehand" (same vacuity trap as csc_fingerprint's guard).
-    TCTL stage list --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
-    python3 - "$lf" <<'PY2' || { echo "nothing was still staged before staging clean ran -- the release happened earlier than the second copy:"; cat "$lf"; return 1; }
+    TCTL stage list --all --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
+    python3 - "$lf" <<'PY2' || { echo "nothing was still staged before stage clean ran -- the release happened earlier than the second copy:"; cat "$lf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
 assert rows and all(r["status"] == "staged" for r in rows), rows
 PY2
-    TCTL staging clean >"$f" 2>&1 || { cat "$f"; return 1; }
-    TCTL stage list --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
+    TCTL stage clean >"$f" 2>&1 || { cat "$f"; return 1; }
+    TCTL stage list --all --json >"$lf" 2>"$lf.err" || { cat "$lf.err" "$lf"; return 1; }
     python3 - "$lf" <<'PY2' || { echo "stage sets are not 'cleaned' after both copies sealed:"; cat "$lf"; return 1; }
 import json, sys
 rows = json.load(open(sys.argv[1]))
@@ -4538,7 +4545,7 @@ for r in rows:
 PY2
     local staging_dir; staging_dir="$(dirname "$HOME_DIR")/staging"
     local left; left="$(find "$staging_dir" -name '*.age' 2>/dev/null | wc -l)"
-    [ "$left" = 0 ] || { echo "$left .age file(s) survived staging clean under $staging_dir"; find "$staging_dir" -name '*.age'; return 1; }
+    [ "$left" = 0 ] || { echo "$left .age file(s) survived stage clean under $staging_dir"; find "$staging_dir" -name '*.age'; return 1; }
 }
 
 scenario_collection_second_copy() {
@@ -4641,7 +4648,7 @@ rw_reclaim_big_v1() {
 # Release what the write left staged (it stays staged at 1/2 copies), so the
 # rewrite's own read is the only thing in staging -- before the reclaim, the
 # order the compaction scenario uses.
-rw_release_staging() { TCTL staging clean --force; }
+rw_release_staging() { TCTL stage clean --force; }
 
 rw_volume_status() { # rw_volume_status <label> -> prints its catalog status
     TCTL volume list --json 2>/dev/null | python3 -c '
@@ -4781,9 +4788,9 @@ rw_capacity_after() {
 }
 
 rw_hold_is_gone() {
-    if [ "$DRY_RUN" = 1 ]; then echo "PLAN: tapectl staging clean --force (expect no 'held by the rewrite' line: the rewrite is finished)"; return 0; fi
+    if [ "$DRY_RUN" = 1 ]; then echo "PLAN: tapectl stage clean --force (expect no 'held by the rewrite' line: the rewrite is finished)"; return 0; fi
     local out
-    out="$(TCTL staging clean --force 2>&1)" || { echo "$out"; return 1; }
+    out="$(TCTL stage clean --force 2>&1)" || { echo "$out"; return 1; }
     if grep -q "held by the rewrite" <<<"$out"; then
         echo "a finished rewrite still holds staged slices: $out"; return 1
     fi

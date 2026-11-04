@@ -1664,7 +1664,7 @@ if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then
 else
   derive_nodes
 explain <<'EOF'
-`backend add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010).
+`drive add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010).
 EOF
   [ -n "$DEVICE" ] || die "no device chosen — run with --from 6"
   ask BNAME "backend name" "lto6"
@@ -1725,7 +1725,7 @@ EOF
   fi
   # Issue #431: no device_sg line -- tapectl derives the sg node from device_tape
   # through sysfs every time the config loads, so an /dev/sgN renumbering never matters.
-  run tc backend add --name "$BNAME" --device-tape "$DEVICE" --generation "$DGEN"
+  run tc drive add --name "$BNAME" --device-tape "$DEVICE" --generation "$DGEN"
   run tc config check || true
 fi
 }
@@ -1741,7 +1741,7 @@ if [ -f "$KIT_OUT/COVER.txt" ] && ! confirm "A kit already exists in $KIT_OUT �
   kit_prepare "$KIT_OUT"
   # kit_finish runs whatever the kit command did, so a failure never leaves
   # the kit directory owned by the service user (#469).
-  kerc=0; run tc key escrow-kit --out "$KIT_OUT" || kerc=$?; kit_finish "$KIT_OUT"
+  kerc=0; run tc key escrow-kit "$KIT_OUT" || kerc=$?; kit_finish "$KIT_OUT"
   [ "$kerc" = 0 ] || die "key escrow-kit exited $kerc (above); fix that and re-run scripts/first-run.sh --from 9 --to 9"
   [ -r "$KIT_OUT/COVER.txt" ] || die "$KIT_OUT/COVER.txt is not readable by $USER"
 fi
@@ -2230,9 +2230,9 @@ PY
       || die "staging failed (see $so) -- the units it staged stay staged, and re-running this step skips them"
   fi
   explain <<'EOF'
-`staging status` lists what is staged and what it weighs; `volume plan` totals it against the drive's generation and estimates how many tapes it needs. It is an ESTIMATE (it says so): the authoritative figure is the capacity `volume init` records once it has detected the loaded cartridge, and the gate that refuses an over-full plan is inside `volume write`, before any byte is written. If the estimate already says more than one tape, stage fewer units now — nothing has been written yet.
+`stage list` lists what is staged and what it weighs; `volume plan` totals it against the drive's generation and estimates how many tapes it needs. It is an ESTIMATE (it says so): the authoritative figure is the capacity `volume init` records once it has detected the loaded cartridge, and the gate that refuses an over-full plan is inside `volume write`, before any byte is written. If the estimate already says more than one tape, stage fewer units now — nothing has been written yet.
 EOF
-  run tc staging status || true
+  run tc stage list || true
   # `volume plan` reads the staged stage_sets and totals their encrypted size
   # against the drive -- the authoritative estimate, and the script never ran
   # it. This is the last point before the destructive confirm at which the
@@ -2400,7 +2400,7 @@ fi
     # #440: the write above kept staging (--keep-staging) so this full verify ran
     # while the staged slices could still rewrite a bad copy. Now release what the
     # policy's copies cover; under-copied units stay staged for the next copy.
-    run tc staging clean || note "staging clean did not finish: run tapectl staging clean when you want the staged slices released"
+    run tc stage clean || note "stage clean did not finish: run tapectl stage clean when you want the staged slices released"
   else
     # The loaded tape is not this volume: verify corroborates the cartridge
     # before reading anything (src/volume/binding.rs `corroborate_volume`)
@@ -2454,7 +2454,7 @@ EOF
   if [ -n "$LOCATION" ]; then run tc volume move "$LABEL" --to "$LOCATION" || true; fi
   ask KIT_OUT "regenerate the heir kit into" "${KIT_OUT:-$HOME/heir-kit}"
   kit_prepare "$KIT_OUT"
-  run tc key escrow-kit --out "$KIT_OUT" && note "Reprint $KIT_OUT/COVER.txt — the catalog inside it now knows this tape."
+  run tc key escrow-kit "$KIT_OUT" && note "Reprint $KIT_OUT/COVER.txt — the catalog inside it now knows this tape."
   kit_finish "$KIT_OUT"
 fi
 }
@@ -2494,10 +2494,10 @@ cat <<EOF
    • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,
      \`${OP_CMD} volume init <label-2>\`, \`${OP_CMD} volume write <label-2> --keep-staging\`, then \`volume move <label-2> --to <other shelf>\`
      (or both in one: \`${OP_CMD} volume write <label-2> --init --full-confirm --move-to <other shelf>\`).
-     (Only if staging was cleaned: load tape 1 first and \`volume read-slices --from ${LABEL:-<label>} --unit <unit>\` per unit.)
+     (Only if staging was cleaned: load tape 1 first and \`volume read-slices <unit> --from ${LABEL:-<label>}\` per unit.)
    • \`tapectl audit\` runs weekly and the catalog is copied daily to ${BACKUP_DIR:-$BACKUP_DIR_DEFAULT} (systemctl list-timers 'tapectl-*');
      after each session: sudo systemctl start tapectl-backup.service, and regenerate the heir kit (step 9).
-   • \`${OP_CMD} report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
+   • \`${OP_CMD} status\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
      \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
    • Disaster recovery, the whole procedure: docs/operator-guide.md, "Disaster Recovery".
    • Reinstall, move to another host, uninstall: docs/install.md.

@@ -151,7 +151,7 @@ for args in \
   "volume write L1 --device /dev/x --yes" \
   "volume resume L1" "volume verify L1 --full --json" "volume rewrite L1 --label L1b" \
   "volume compact-write L2" "volume compact L1 --to L2" \
-  "volume read-slices --from L1" "volume compact-read L1" \
+  "volume read-slices u --from L1" "volume compact-read L1" \
   "volume init L1 --device /dev/x" "volume init write" "volume identify --device /dev/x" \
   "restore unit u" "restore file u f" "restore volume L1" "restore raw-volume L1 /out" \
   "cartridge erase --device /dev/x" "collection run keepsake" "drive poll" "drive eject" \
@@ -166,7 +166,7 @@ done
 
 echo "plain: everything else, and labels that equal a tape subcommand's name"
 for args in \
-  "status" "unit list" "report summary" "audit" "catalog stats" "tenant list" \
+  "status" "unit list" "unit info u" "stage list" "stage list --owing" "stage clean" "drive add" "catalog list u" "collection add c /x" "audit" "catalog stats" "tenant list" \
   "volume info write" "volume info resume" "volume list" "volume plan" \
   "volume abort verify" "volume retire write" "volume move run" "drive status" "drive cleaned" \
   "catalog locate eject" \

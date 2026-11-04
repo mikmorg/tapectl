@@ -889,7 +889,7 @@ run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
 run cfg-copies 0 tctl config set defaults.min_copies 1
 run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
-run backend 0 tctl backend add --name lba --device-tape "$TAPE_DEV" --generation LTO-6
+run backend 0 tctl drive add --name lba --device-tape "$TAPE_DEV" --generation LTO-6
 run config-check 0 tctl config check
 cp "$CFG" "$RUN/config.toml"
 run tenant 0 tctl tenant add "$TENANT"

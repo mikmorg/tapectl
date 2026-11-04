@@ -535,7 +535,7 @@ run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
 run cfg-copies 0 tctl config set defaults.min_copies 1
 run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
-run backend 0 tctl backend add --name ssa --device-tape "$TAPE_DEV" --generation LTO-6
+run backend 0 tctl drive add --name ssa --device-tape "$TAPE_DEV" --generation LTO-6
 run cfg-pwb 0 tctl config set 'backends.lto[0].post_warning_bytes' "\"$POST_WARNING\""
 [ -z "$ENOSPC_BUFFER" ] || run cfg-reserve 0 tctl config set 'backends.lto[0].enospc_buffer' "\"$ENOSPC_BUFFER\""
 run config-check 0 tctl config check
@@ -572,7 +572,7 @@ if [ "$MHVTL" = 1 ] && [ -z "$HOOK_AT" ]; then
     HOOK_AT=$(( FX_UNITS_BEFORE_PADDED_BYTES + 2 * MiB + FX_FILLER_PADDED_BYTES * 98 / 100 ))
 fi
 [ "$MHVTL" = 0 ] || log "  rehearsal: TAPECTL_TEST_EARLY_WARNING_AT=$HOOK_AT for the first write only"
-run staging-status any tctl --json staging status
+run staging-status any tctl --json stage list --all
 run plan any tctl volume plan
 end_step
 
@@ -713,7 +713,7 @@ begin_step 7 rewrite "the cut unit written whole onto the same cartridge as $LAB
 # `volume write` writes every staged set, so before the next one only the cut real unit may be
 # staged. The whole units were released after step 3; the filler, cut and with no copy
 # anywhere, is released by hand, which needs --force (ReleaseBlocker::Cut).
-run release-filler 0 tctl staging clean --unit "$UNIT_F" --force
+run release-filler 0 tctl stage clean --unit "$UNIT_F" --force
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id ORDER BY u.name" | tr '\n' ' ')"
 log "  stage sets before the second write: $STAGED"

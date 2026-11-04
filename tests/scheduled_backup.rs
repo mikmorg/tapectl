@@ -15,7 +15,7 @@ fn stub(dir: &Path, name: &str, body: &str) {
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A `tapectl` whose `db backup --to X` writes a SQLite header to X and
+/// A `tapectl` whose `db backup X` writes a SQLite header to X and
 /// exits `backup_rc` (no file at all when it is not 0), and whose `db fsck`
 /// exits 0.
 fn tapectl_stub(bin: &Path, backup_rc: i32) {
@@ -25,7 +25,7 @@ fn tapectl_stub(bin: &Path, backup_rc: i32) {
         &format!(
             r#"if [ "$1 $2" = "db backup" ]; then
   [ {backup_rc} = 0 ] || exit {backup_rc}
-  printf 'SQLite format 3\000 stub' > "$4"; exit 0
+  printf 'SQLite format 3\000 stub' > "$3"; exit 0
 fi
 exit 0"#
         ),

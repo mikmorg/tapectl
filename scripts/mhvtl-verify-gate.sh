@@ -2072,9 +2072,9 @@ step_erase_then_init_no_force() {
         local escrow="--no-escrow"; [ "$h" = p ] && escrow=""
         # shellcheck disable=SC2086 # empty or one word, by construction
         "$BIN" --home "$w/$h" init --operator "gate-$h" $escrow >/dev/null 2>&1 \
-            && "$BIN" --home "$w/$h" backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 >/dev/null 2>&1 \
+            && "$BIN" --home "$w/$h" drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 >/dev/null 2>&1 \
             && "$BIN" --home "$w/$h" config set staging.directory "$w/$h/staging" >/dev/null 2>&1 \
-            || { echo "home $h: init/backend add/config set failed"; return 1; }
+            || { echo "home $h: init/drive add/config set failed"; return 1; }
     done
     "$BIN" --home "$w/p" volume init EP-0001 --device "$TAPE_DEV" >"$w/p-init.out" 2>&1 \
         && "$BIN" --home "$w/p" quick-archive "$w/src/u1" --tenant gate-p --volume EP-0001 --device "$TAPE_DEV" --yes >"$w/p-write.out" 2>&1 \
@@ -2140,11 +2140,11 @@ step_heir_short_seal() {
     # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
     # its secret going only to this run's log.
     SSC init --operator gate-s \
-        && SSC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && SSC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
         && SSC config set staging.directory "$SS/home/staging" \
         && SSC config set defaults.slice_size 4M \
         && SSC tenant add alice \
-        || { echo "home: init/backend add/config set/tenant add failed"; return 1; }
+        || { echo "home: init/drive add/config set/tenant add failed"; return 1; }
     for u in sa-whole sb-cut sc-after; do
         SSC unit init "$SS/src/$u" --tenant alice --name "$u" && SSC snapshot create "$u" && SSC stage create "$u" \
             || { echo "unit $u: init/snapshot/stage failed"; return 1; }
@@ -2314,14 +2314,14 @@ PY
     # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
     # its secret going only to this run's log.
     BCC init --operator gate-bc \
-        && BCC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && BCC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
         && BCC config set staging.directory "$BC/home/staging" \
         && BCC config set defaults.slice_size 6M \
         && BCC tenant add alice \
         && BCC unit init "$BC/src/bc-many" --tenant alice --name bc-many \
         && BCC snapshot create bc-many \
         && BCC stage create bc-many \
-        || { echo "home: init/backend add/config set/tenant add/unit init/snapshot/stage failed"; return 1; }
+        || { echo "home: init/drive add/config set/tenant add/unit init/snapshot/stage failed"; return 1; }
     # The fixture's own control: the catalogue dar is given is far more than a pipe
     # holds (64 KiB), and the unit has more than one slice.
     cat_path="$(bc_q "SELECT catalog_path FROM stage_sets")" || return 1
@@ -2492,7 +2492,7 @@ PY
     # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
     # its secret going only to this run's log.
     BSRC init --operator gate-bsr \
-        && BSRC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && BSRC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
         && BSRC config set staging.directory "$BSR/home/staging" \
         && BSRC tenant add alice \
         && BSRC unit init "$BSR/src/bsr-probe" --tenant alice --name bsr-probe \
@@ -2501,7 +2501,7 @@ PY
         && BSRC snapshot create bsr-bound \
         && BSRC config set defaults.slice_size 16M \
         && BSRC stage create bsr-probe \
-        || { echo "home: init/backend add/config set/tenant add/unit init/snapshot/probe stage failed"; return 1; }
+        || { echo "home: init/drive add/config set/tenant add/unit init/snapshot/probe stage failed"; return 1; }
     bsr_slice1 bsr-probe || return 1
     p="$(python3 - "$BSR/bsr-probe.1.plain" "$BSR/src/bsr-probe/one.bin" <<'PY'
 import sys
@@ -2726,12 +2726,12 @@ sp_home() { # sp_home <ctl> <dir> <operator> <min_copies>
     "$ctl" init --operator "$op" --no-escrow \
         && "$ctl" key generate --escrow >"$d/escrow.out" 2>&1 \
         && chmod 600 "$d/escrow.out" \
-        && "$ctl" backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && "$ctl" drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
         && "$ctl" config set staging.directory "$d/home/staging" \
         && "$ctl" config set defaults.slice_size 4M \
         && "$ctl" config set defaults.min_copies "$copies" \
         && "$ctl" tenant add alice \
-        || { echo "home $d: init, escrow, backend add, config set or tenant add failed"; return 1; }
+        || { echo "home $d: init, escrow, drive add, config set or tenant add failed"; return 1; }
 }
 # unit init each source under <dir>/src for alice, the one that may span with `allow_spanning =
 # true` in its dotfile's [policy] (as an operator sets it), then snapshot and stage each.

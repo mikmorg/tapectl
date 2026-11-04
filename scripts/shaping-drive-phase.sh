@@ -472,7 +472,7 @@ with the acceptance's own tapectl (an installed 1.5.0 refuses that home's catalo
   <its tapectl> --home <the acceptance home> --yes volume retire SSA-0002
   <its tapectl> --home <the acceptance home> cartridge erase --device $TAPE_DEV --confirm-label SSA-0002"
 if [ "$FRESH" = 1 ]; then
-    probe "$PROBE_HOME" backend add --name probe --device-tape "$TAPE_DEV" --generation LTO-6 >"$PRE/probe-backend.out" 2>&1 \
+    probe "$PROBE_HOME" drive add --name probe --device-tape "$TAPE_DEV" --generation LTO-6 >"$PRE/probe-backend.out" 2>&1 \
         || die "the probe home could not add the drive (see $PRE/probe-backend.out)"
     erase_probe "$PROBE_HOME" "$PRE/erase-probe"
     [ "$RC" = 0 ] || die "cartridge erase --dry-run refused in a fresh catalog (see $PRE/erase-probe.err)"
@@ -933,7 +933,7 @@ if [ "$FRESH" = 1 ]; then
     run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
     run cfg-copies 0 tctl config set defaults.min_copies 1
     run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
-    run backend 0 tctl backend add --name shp --device-tape "$TAPE_DEV" --generation LTO-6
+    run backend 0 tctl drive add --name shp --device-tape "$TAPE_DEV" --generation LTO-6
     run config-check 0 tctl config check
     cp "$CFG" "$RUN/config.toml"
     run tenant 0 tctl tenant add "$TENANT"
@@ -977,7 +977,7 @@ if [ "$(stat -c %s "$LOAD_FILE" 2>/dev/null || echo 0)" != $((LOAD_MIB * MiB)) ]
     mkdir -p "$(dirname "$LOAD_FILE")"
     dd if=/dev/urandom of="$LOAD_FILE" bs=1M count="$LOAD_MIB" iflag=fullblock status=none || fail "cannot make the load file $LOAD_FILE"
 fi
-run staging-status any tctl --json staging status
+run staging-status any tctl --json stage list --all
 run plan any tctl volume plan
 end_step
 
@@ -1046,7 +1046,7 @@ give_up_previous
 PREV=""; rm -f "$STATE/last-label"
 if [ "$CLEANUP" = 1 ]; then
     CLEAN_ARGS=(); for u in $UNITS; do CLEAN_ARGS+=(--unit "$u"); done
-    run release 0 tctl staging clean "${CLEAN_ARGS[@]}" --force
+    run release 0 tctl stage clean "${CLEAN_ARGS[@]}" --force
     rm -f "$LOAD_FILE"; log "  --cleanup: the staged unit released and $LOAD_FILE removed"
 fi
 end_step
