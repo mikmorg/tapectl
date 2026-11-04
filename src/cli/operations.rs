@@ -3811,7 +3811,8 @@ fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
 /// `create_new`: a file that appeared after [`check_backup_destination`]
 /// is refused too, never written over (OQ20). Any other failure is left to
 /// SQLite's own open, which reports an unwritable destination by name.
-fn precreate_private_file(path: &Path) -> Result<()> {
+/// Whether this call created the file.
+fn precreate_private_file(path: &Path) -> Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     match fs::OpenOptions::new()
         .write(true)
@@ -3819,10 +3820,11 @@ fn precreate_private_file(path: &Path) -> Result<()> {
         .mode(0o600)
         .open(path)
     {
+        Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(backup_exists_refusal(path))
         }
-        _ => Ok(()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -3907,12 +3909,21 @@ pub fn db_backup(
     // destination may be removable or foreign-owned media that cannot be
     // chmod'ed, and that is no reason to fail a backup. Only a file that is
     // there already refuses (OQ20).
-    precreate_private_file(&file)?;
-    let mut dst_conn = rusqlite::Connection::open(&file)?;
-
-    copy_database_in_one_step(&src_conn, &mut dst_conn)?;
-    // Closed before it is measured, so the size is the finished file's.
-    drop(dst_conn);
+    let created = precreate_private_file(&file)?;
+    // The file is this run's own from here: a copy that fails (a busy
+    // catalog, a full disk) removes the file this run created, so running
+    // the same command again is not refused as "exists" by what the failure
+    // left. The connection is closed with the closure, before the file is
+    // measured, so the size is the finished file's.
+    let copied = rusqlite::Connection::open(&file)
+        .map_err(TapectlError::from)
+        .and_then(|mut dst_conn| copy_database_in_one_step(&src_conn, &mut dst_conn));
+    if let Err(e) = copied {
+        if created {
+            let _ = fs::remove_file(&file);
+        }
+        return Err(e);
+    }
     crate::config::secure_path(&file, 0o600);
     let db_bytes = fs::metadata(&file)?.len();
 
@@ -10025,6 +10036,22 @@ mod tests {
                 .to_string();
             assert!(err.contains("exists: name another file"), "{err}");
             assert!(!dest_tmp.path().join("nowhere").exists());
+        }
+
+        /// A copy that fails removes the file it created, so running the
+        /// same command again is not refused as "exists" by the leftover.
+        #[test]
+        fn a_failed_copy_leaves_no_file_behind() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            fs::write(&paths.db_file, b"not a database at all, and long enough").unwrap();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+
+            let err = db_backup(&paths, dest.to_str().unwrap(), false, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("exists"), "the copy itself failed: {err}");
+            assert!(!dest.exists(), "the failed copy's file was removed");
         }
 
         /// ...and with `--include-keys`, neither is the keys directory
