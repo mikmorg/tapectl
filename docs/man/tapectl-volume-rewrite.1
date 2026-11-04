@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-rewrite \- Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
 .SH SYNOPSIS
-\fBtapectl volume rewrite\fR [\fB\-\-json\fR] [\fB\-\-label\fR] [\fB\-\-dry\-run\fR] [\fB\-\-resume\fR] [\fB\-\-only\-copy\-on\-staging\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-with\-staged\fR] [\fB\-\-keep\-staging\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fISOURCE\fR] 
+\fBtapectl volume rewrite\fR [\fB\-\-json\fR] [\fB\-\-label\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-resume\fR] [\fB\-\-only\-copy\-on\-staging\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-with\-staged\fR] [\fB\-\-keep\-staging\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fISOURCE\fR] 
 .SH DESCRIPTION
 Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
 .PP
@@ -18,7 +18,7 @@ Reads the live slices into staging, retires the volume, erases its cartridge and
 .PP
 4. The source is retired, its cartridge erased (`cartridge erase`\*(Aqs own checks), `NEW` initialised on it, the staged slices written with the FULL confirm (every file read back), and only then is staging released.
 .PP
-From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`staging clean \-\-force` included); the error names the command that finishes the job: `volume rewrite \-\-resume NEW`.
+From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`stage clean \-\-force` included); the error names the command that finishes the job: `volume rewrite \-\-resume NEW`.
 .PP
 `\-\-dry\-run` runs the checks of step 1 and shows the plan and the consent it would need, touching nothing.
 .PP
@@ -31,7 +31,7 @@ Output in JSON format
 \fB\-\-label\fR \fI<NEW>\fR
 The label of the NEW volume that will carry the slices on the same cartridge (not with \-\-resume)
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-resume\fR \fI<NEW>\fR

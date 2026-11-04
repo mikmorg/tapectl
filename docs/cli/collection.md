@@ -27,7 +27,7 @@ tapectl collection sync [OPTIONS]
 
 **Options**
 
-- `--dry-run` — Report what would change without mutating anything
+- `-n, --dry-run` — Report what would change without mutating anything
 
 ### tapectl collection status
 
@@ -64,12 +64,15 @@ A unit that spans cartridges is released slice by slice, each slice once it has 
 Exit status: `volume write`'s, the worst outcome among its copies in the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4 interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and confirmed); 1 when every copy sealed but a unit was refused for its dotfile; 75 when the catalog was busy before anything was written.
 
 ```text
-tapectl collection run [OPTIONS] --collection <COLLECTION>
+tapectl collection run [OPTIONS] [NAME]
 ```
+
+**Arguments**
+
+- `[NAME]` — The collection to run. Defaults to the only configured collection; with several configured, name one
 
 **Options**
 
-- `--collection <COLLECTION>` *(required)* — Collection name
 - `--batch <BATCH>` *(default: `0`)* — Which batch to execute (0 = first). Numbered against THIS run's own budget — the destination `--label` volumes' recorded capacity, not the drive's generation. This matches `collection plan`'s ordering only when `plan` was run (`--generation <GEN>`) for the generation those volumes were actually initialised as; otherwise the batch reviewed in `plan` is not necessarily batch N here
 - `--label <LABELS>` — Destination volume label — already `volume init`'d on its own cartridge. Exactly one: tapectl drives no changer, so it cannot write a second copy without a human swapping cartridges, and a batch run has no point where that swap could happen. More than one is refused. For a second and further copy, swap in the next cartridge after this run finishes and use `tapectl volume write <label>` directly against the same staged data
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured

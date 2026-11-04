@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-snapshot\-purge \- Purge a reclaimable snapshot (remove DB records)
 .SH SYNOPSIS
-\fBtapectl snapshot purge\fR [\fB\-\-json\fR] <\fB\-\-version\fR> [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl snapshot purge\fR [\fB\-\-json\fR] <\fB\-\-version\fR> [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Purge a reclaimable snapshot (remove DB records)
 .SH OPTIONS
@@ -15,7 +15,7 @@ Output in JSON format
 \fB\-\-version\fR \fI<VERSION>\fR
 Snapshot version
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR

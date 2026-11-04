@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-retire \- Retire a cartridge permanently — it must never be written again
 .SH SYNOPSIS
-\fBtapectl cartridge retire\fR [\fB\-\-json\fR] [\fB\-\-reason\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
+\fBtapectl cartridge retire\fR [\fB\-\-json\fR] [\fB\-\-reason\fR] [\fB\-\-force\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fICARTRIDGE\fR> 
 .SH DESCRIPTION
 Retire a cartridge permanently — it must never be written again
 .PP
@@ -21,11 +21,11 @@ Output in JSON format
 \fB\-\-reason\fR \fI<REASON>\fR
 Why (appended to the cartridge\*(Aqs notes, never overwriting them)
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-force\fR
 Supply the ADR\-0008 Tier\-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier\-3 refusal — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
@@ -49,5 +49,5 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fIBARCODE\fR>
+<\fICARTRIDGE\fR>
 Barcode

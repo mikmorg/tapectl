@@ -30,6 +30,7 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`deposit`](#tapectl-volume-deposit) — Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006)
 - [`list`](#tapectl-volume-list) — List every volume, most recently written first
 - [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
+- [`import`](#tapectl-volume-import) — Record a pre-existing volume in the catalog
 
 ### tapectl volume init
 
@@ -62,7 +63,7 @@ Write staged data to volume
 
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR-0012); no flag overrides it.
 
-Once the volume is sealed and confirmed, staging is released if every unit written has reached its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets, times the tape-only multiplier for a tape-only unit; ADR-0012, 2026-10-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `--keep-staging` never releases; `staging clean` does it later.
+Once the volume is sealed and confirmed, staging is released if every unit written has reached its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets, times the tape-only multiplier for a tape-only unit; ADR-0012, 2026-10-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `--keep-staging` never releases; `stage clean` does it later.
 
 A further copy in one command (ADR-0012 2026-10-15 item 59): `tapectl volume write L6-0003 --init --full-confirm --move-to offsite` initialises the loaded cartridge, writes the volume, reads every file back, and moves the sealed volume (and its cartridge) to `offsite`. Each step keeps its own checks and the command stops at the first one that fails: an init that refuses writes nothing, and nothing moves unless the write sealed and confirmed.
 
@@ -89,7 +90,7 @@ tapectl volume write [OPTIONS] [LABEL]
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
 - `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much
 - `--full-confirm` — After sealing, read every file back and hash it against the front index (tri-layer L3, hours on a full cartridge). Off by default (ADR-0012, 2026-10-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR-0012 item 186)
-- `--keep-staging` — Keep the staged slices after the write seals and confirms, even when every unit written has reached its copy floor. Without this flag the staging is released then; release it later with `tapectl staging clean`
+- `--keep-staging` — Keep the staged slices after the write seals and confirms, even when every unit written has reached its copy floor. Without this flag the staging is released then; release it later with `tapectl stage clean`
 - `--for-location <LOCATION>` — Write only the staged sets that still have need at this location (ADR-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `--move-to LOCATION` does; a different `--move-to` is refused. Stage for it with `tapectl stage for-location`. Without this flag the write takes every staged set
 - `--keep-staging-for-locations` — Release the staging only once every per-location copy target of each unit written is met, not at its copy floor (ADR-0012 item 154), so the next location's copy reuses these staged slices instead of staging again. Use it when staging has room; the output names the locations that still need each unit
 
@@ -131,7 +132,7 @@ tapectl volume resume [OPTIONS] [LABEL]
 
 Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
 
-The tape is never contacted (hence no --device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `staging clean --force` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR-0012, 2026-09-23), and a session aborted before its seal is never resumable. When the seal is recorded, keep staging if you intend to verify and resume: that re-confirm revalidates against the staged files, so releasing them forfeits it.
+The tape is never contacted (hence no --device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `stage clean --force` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR-0012, 2026-09-23), and a session aborted before its seal is never resumable. When the seal is recorded, keep staging if you intend to verify and resume: that re-confirm revalidates against the staged files, so releasing them forfeits it.
 
 ```text
 tapectl volume abort [OPTIONS] <LABEL>
@@ -212,13 +213,16 @@ Read encrypted slices from a volume into staging (then use `volume write` to wri
 Reads the unit's slices off the loaded tape, checks each against its recorded hash, and records where it put them, so `volume write` can write them to another cartridge without the source directory. Every version of the unit on the volume is read except those marked reclaimable or purged; `--version` reads one version, whatever its state. The staging directory is checked for room before the first slice is read, and a read that does not finish removes what it wrote.
 
 ```text
-tapectl volume read-slices [OPTIONS] --from <FROM> --unit <UNIT>
+tapectl volume read-slices [OPTIONS] --from <LABEL> <UNIT>
 ```
+
+**Arguments**
+
+- `<UNIT>` — Unit name to read
 
 **Options**
 
-- `--from <FROM>` *(required)* — Source volume label
-- `--unit <UNIT>` *(required)* — Unit name to read
+- `--from <LABEL>` *(required)* — Source volume label
 - `--version <N>` — Read only this version of the unit (a reclaimable or purged version is read when named). Without it, every version on the volume except the reclaimable and purged ones is read
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 
@@ -245,12 +249,12 @@ Write compaction slices from staging to destination (compaction step 2)
 Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy).
 
 ```text
-tapectl volume compact-write [OPTIONS] --destination <DESTINATION>
+tapectl volume compact-write [OPTIONS] --to <LABEL>
 ```
 
 **Options**
 
-- `--destination <DESTINATION>` *(required)* — Destination volume label
+- `--to <LABEL>` *(required)* — Destination volume label
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`. A compaction whose source volume predates the escrow recipient needs this to proceed
 - `--prewrite-hash` — See `volume write --prewrite-hash`
@@ -295,7 +299,7 @@ tapectl volume compact-finish [OPTIONS] <LABEL>
 
 Interactive compaction: read + write + finish in one flow
 
-One drive (`--device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `--to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact-read <SOURCE>`, swap cartridges, `volume compact-write --destination <DEST>`, then `volume compact-finish <SOURCE>`.
+One drive (`--device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `--to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact-read <SOURCE>`, swap cartridges, `volume compact-write --to <DEST>`, then `volume compact-finish <SOURCE>`.
 
 Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may refuse non-interactively without `--force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact-finish <SOURCE> --force` completes the flow without re-reading or re-writing anything.
 
@@ -333,7 +337,7 @@ Reads the live slices into staging, retires the volume, erases its cartridge and
 
 4. The source is retired, its cartridge erased (`cartridge erase`'s own checks), `NEW` initialised on it, the staged slices written with the FULL confirm (every file read back), and only then is staging released.
 
-From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`staging clean --force` included); the error names the command that finishes the job: `volume rewrite --resume NEW`.
+From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`stage clean --force` included); the error names the command that finishes the job: `volume rewrite --resume NEW`.
 
 `--dry-run` runs the checks of step 1 and shows the plan and the consent it would need, touching nothing.
 
@@ -457,4 +461,27 @@ tapectl volume info [OPTIONS] <LABEL>
 **Options**
 
 - `--units` — List every unit carried by this volume instead of the summary
+
+### tapectl volume import
+
+Record a pre-existing volume in the catalog
+
+Writes a catalog row for a tape this catalog has never seen and never touches the drive. For a tape tapectl wrote, `catalog rebuild --from-volume` reads what is on it instead.
+
+```text
+tapectl volume import [OPTIONS] --generation <GENERATION> <LABEL>
+```
+
+**Arguments**
+
+- `<LABEL>` — Volume label
+
+**Options**
+
+- `--generation <GENERATION>` *(required)* — Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
+- `--capacity <CAPACITY>` — Capacity (e.g., "2500G"). Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
+  
+    Defaults to the generation table's native capacity for `--generation` when omitted (ADR-0010, decision 3).
+- `--device <DEVICE>` — Which configured drive this volume belongs to, by its device path (ADR-0010). Only needed when more than one drive is configured; with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no configured drive claims is not an error
+- `--notes <NOTES>` — Notes
 

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-compact\-finish \- Retire source volume after compaction (compaction step 3)
 .SH SYNOPSIS
-\fBtapectl volume compact\-finish\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume compact\-finish\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Retire source volume after compaction (compaction step 3)
 .SH OPTIONS
@@ -15,7 +15,7 @@ Waive the ADR\-0008 Tier\-2 prompt: proceed when the retirement leaves a live ve
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR

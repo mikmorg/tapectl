@@ -13,7 +13,7 @@ definitions it parses. For what to *do* with them, start at the
 Accepted by every command, before or after the subcommand.
 
 - `--json` — Output in JSON format
-- `--dry-run` — Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+- `-n, --dry-run` — Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 - `-v, --verbose` — Enable verbose output
 - `-q, --quiet` — No live progress on stderr. Long operations (stage create, volume write/resume/verify/read-slices, restore) still write their session log under <home>/logs/
 - `-y, --yes` — Skip ADR-0008 Tier-2 confirmation prompts. It never reaches a Tier-3 refusal — those are facts, not risks to accept
@@ -46,7 +46,8 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`unit init`](unit.md#tapectl-unit-init) | Initialize a directory as an archival unit |
 | &nbsp;&nbsp;[`unit init-bulk`](unit.md#tapectl-unit-init-bulk) | Bulk-initialize subdirectories as units |
 | &nbsp;&nbsp;[`unit list`](unit.md#tapectl-unit-list) | List units |
-| &nbsp;&nbsp;[`unit status`](unit.md#tapectl-unit-status) | Show unit status/details |
+| &nbsp;&nbsp;[`unit info`](unit.md#tapectl-unit-info) | Show a unit's details, or with --dirty whether it changed |
+| &nbsp;&nbsp;[`unit export`](unit.md#tapectl-unit-export) | Copy a unit's staged slices, still encrypted, to a directory |
 | &nbsp;&nbsp;[`unit tag`](unit.md#tapectl-unit-tag) | Add/remove tags |
 | &nbsp;&nbsp;[`unit rename`](unit.md#tapectl-unit-rename) | Rename a unit |
 | &nbsp;&nbsp;[`unit discover`](unit.md#tapectl-unit-discover) | Scan watch_roots for .tapectl-unit.toml dotfiles |
@@ -67,11 +68,9 @@ Accepted by every command, before or after the subcommand.
 | [`stage`](stage.md) | Stage snapshots for writing |
 | &nbsp;&nbsp;[`stage create`](stage.md#tapectl-stage-create) | Create staged slices (validate → dar → encrypt → checksums) |
 | &nbsp;&nbsp;[`stage for-location`](stage.md#tapectl-stage-for-location) | Stage what a location needs, packed into one volume bound there |
-| &nbsp;&nbsp;[`stage list`](stage.md#tapectl-stage-list) | List stage sets |
+| &nbsp;&nbsp;[`stage list`](stage.md#tapectl-stage-list) | List the stage sets held in staging, with each version's copies |
+| &nbsp;&nbsp;[`stage clean`](stage.md#tapectl-stage-clean) | Release staged slices from disk |
 | &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show details for a stage set |
-| [`staging`](staging.md) | Manage staging area |
-| &nbsp;&nbsp;[`staging status`](staging.md#tapectl-staging-status) | Show staging area status |
-| &nbsp;&nbsp;[`staging clean`](staging.md#tapectl-staging-clean) | Clean staged files from disk |
 | [`volume`](volume.md) | Manage volumes and tape operations |
 | &nbsp;&nbsp;[`volume init`](volume.md#tapectl-volume-init) | Initialize a new volume (write ID thunk to tape) |
 | &nbsp;&nbsp;[`volume write`](volume.md#tapectl-volume-write) | Write staged data to volume |
@@ -91,6 +90,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`volume deposit`](volume.md#tapectl-volume-deposit) | Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006) |
 | &nbsp;&nbsp;[`volume list`](volume.md#tapectl-volume-list) | List every volume, most recently written first |
 | &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits |
+| &nbsp;&nbsp;[`volume import`](volume.md#tapectl-volume-import) | Record a pre-existing volume in the catalog |
 | [`cartridge`](cartridge.md) | Manage physical cartridges |
 | &nbsp;&nbsp;[`cartridge register`](cartridge.md#tapectl-cartridge-register) | Register a physical cartridge |
 | &nbsp;&nbsp;[`cartridge list`](cartridge.md#tapectl-cartridge-list) | List cartridges |
@@ -111,7 +111,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`archive-set sync`](archive-set.md#tapectl-archive-set-sync) | Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names) |
 | [`audit`](audit.md) | Policy compliance audit |
 | [`catalog`](catalog.md) | Browse and search file catalog |
-| &nbsp;&nbsp;[`catalog ls`](catalog.md#tapectl-catalog-ls) | List files in a unit's latest snapshot |
+| &nbsp;&nbsp;[`catalog list`](catalog.md#tapectl-catalog-list) | List files in a unit's latest snapshot |
 | &nbsp;&nbsp;[`catalog search`](catalog.md#tapectl-catalog-search) | Search for files by pattern, in each unit's newest version |
 | &nbsp;&nbsp;[`catalog locate`](catalog.md#tapectl-catalog-locate) | Show which volume(s) contain a unit |
 | &nbsp;&nbsp;[`catalog stats`](catalog.md#tapectl-catalog-stats) | Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes |
@@ -122,13 +122,11 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`location info`](location.md#tapectl-location-info) | Show location details |
 | &nbsp;&nbsp;[`location rename`](location.md#tapectl-location-rename) | Rename a location |
 | [`report`](report.md) | Generate reports |
-| &nbsp;&nbsp;[`report summary`](report.md#tapectl-report-summary) | Overview: units, tapes, tenants, capacity |
 | &nbsp;&nbsp;[`report fire-risk`](report.md#tapectl-report-fire-risk) | Units at risk: below min copies/locations |
 | &nbsp;&nbsp;[`report needs`](report.md#tapectl-report-needs) | Each unit's copy target, copies and shortfall at every location |
 | &nbsp;&nbsp;[`report copies`](report.md#tapectl-report-copies) | Copy count distribution per unit |
 | &nbsp;&nbsp;[`report tape-only`](report.md#tapectl-report-tape-only) | Tape-only unit status |
 | &nbsp;&nbsp;[`report dirty`](report.md#tapectl-report-dirty) | Units with changes since last snapshot |
-| &nbsp;&nbsp;[`report pending`](report.md#tapectl-report-pending) | Staged data pending write |
 | &nbsp;&nbsp;[`report verify-status`](report.md#tapectl-report-verify-status) | Verification recency |
 | &nbsp;&nbsp;[`report health`](report.md#tapectl-report-health) | Drive error trends, and drive cleanings |
 | &nbsp;&nbsp;[`report cartridge-health`](report.md#tapectl-report-cartridge-health) | Every cartridge's health, worst first, and why |
@@ -136,19 +134,16 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`report age`](report.md#tapectl-report-age) | Snapshot age distribution |
 | &nbsp;&nbsp;[`report events`](report.md#tapectl-report-events) | Audit trail browsing |
 | &nbsp;&nbsp;[`report compaction-candidates`](report.md#tapectl-report-compaction-candidates) | Volumes flagged for compaction |
-| &nbsp;&nbsp;[`report supersedable`](report.md#tapectl-report-supersedable) | Superseded snapshot versions that could be marked reclaimable |
+| &nbsp;&nbsp;[`report reclaimable`](report.md#tapectl-report-reclaimable) | Superseded snapshot versions that could be marked reclaimable |
 | &nbsp;&nbsp;[`report failed-stages`](report.md#tapectl-report-failed-stages) | Stage attempts that failed, and the hours each lost |
 | [`restore`](restore.md) | Restore data from volumes |
 | &nbsp;&nbsp;[`restore unit`](restore.md#tapectl-restore-unit) | Restore a unit from a volume |
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
 | &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`) |
-| [`export`](export.md) | Export encrypted slices to directory |
-| [`import`](import.md) | Import a pre-existing volume into the database |
 | [`quick-archive`](quick-archive.md) | Quick archive: create + stage + write in one flow |
-| [`backend`](backend.md) | Tape drive backends |
-| &nbsp;&nbsp;[`backend add`](backend.md#tapectl-backend-add) | Add an LTO tape drive to the config |
-| [`drive`](drive.md) | The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`) |
+| [`drive`](drive.md) | The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`) |
+| &nbsp;&nbsp;[`drive add`](drive.md#tapectl-drive-add) | Add an LTO tape drive to the config |
 | &nbsp;&nbsp;[`drive poll`](drive.md#tapectl-drive-poll) | Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only |
 | &nbsp;&nbsp;[`drive status`](drive.md#tapectl-drive-status) | Show what is in the drive right now, without touching it or the tape |
 | &nbsp;&nbsp;[`drive eject`](drive.md#tapectl-drive-eject) | Unload the cartridge from the drive, and tell the catalog it left |

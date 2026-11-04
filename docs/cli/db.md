@@ -25,13 +25,16 @@ Back up the database, and optionally the private key directory
 Prints the size of the copy it wrote, and of the key files when it copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog only grows, and the time a backup takes grows with it.
 
 ```text
-tapectl db backup [OPTIONS] --to <TO>
+tapectl db backup [OPTIONS] <PATH>
 ```
+
+**Arguments**
+
+- `<PATH>` — The backup file to write. Its directory must already exist
 
 **Options**
 
-- `--to <TO>` *(required)* — The backup file to write. Its directory must already exist
-- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`--to /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...)
+- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`db backup /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...)
 
 ### tapectl db fsck
 

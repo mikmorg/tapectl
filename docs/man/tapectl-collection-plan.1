@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-collection\-plan \- Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units
 .SH SYNOPSIS
-\fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-policy\-aware\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-generation\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-policy\-aware\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units.
 .PP
@@ -17,11 +17,11 @@ Copies to plan for — informational only (batches don\*(Aqt change; this scales
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Plan against this media generation rather than the drive\*(Aqs own (ADR\-0010) — e.g. sizing batches for LTO\-5 stock that an LTO\-6 drive will write. No cartridge need be loaded
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi\-drive config rather than asking

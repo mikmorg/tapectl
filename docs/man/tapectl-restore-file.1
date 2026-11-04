@@ -4,22 +4,22 @@
 .SH NAME
 tapectl\-restore\-file \- Restore a single file from a unit
 .SH SYNOPSIS
-\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-key\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore file\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-file\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-key\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] [\fIPATH\fR] 
 .SH DESCRIPTION
 Restore a single file from a unit
 .SH OPTIONS
 .TP
-\fB\-\-file\fR \fI<FILE>\fR
-File path within the unit, relative to its root, as `catalog ls` prints it. Checked against the catalog\*(Aqs file list for the version before the tape is touched; a directory is refused
-.TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-unit\fR \fI<UNIT>\fR
-Unit name
+The unit, as a flag: the same as UNIT
+.TP
+\fB\-\-file\fR \fI<PATH>\fR
+The file, as a flag: the same as PATH
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
 Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1, as for `restore unit`; the others are asked for in slice order
@@ -66,3 +66,9 @@ An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in t
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+[\fIUNIT\fR]
+Unit name
+.TP
+[\fIPATH\fR]
+File path within the unit, relative to its root, as `catalog list` prints it. Checked against the catalog\*(Aqs file list for the version before the tape is touched; a directory is refused

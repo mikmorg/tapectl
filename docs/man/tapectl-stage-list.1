@@ -2,21 +2,29 @@
 .el .ds Aq '
 .TH tapectl-stage-list 1  "tapectl-stage-list " 
 .SH NAME
-tapectl\-stage\-list \- List stage sets
+tapectl\-stage\-list \- List the stage sets held in staging, with each version\*(Aqs copies
 .SH SYNOPSIS
-\fBtapectl stage list\fR [\fB\-\-json\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl stage list\fR [\fB\-\-json\fR] [\fB\-\-status\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-owing\fR] [\fB\-\-all\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-List stage sets
+List the stage sets held in staging, with each version\*(Aqs copies
+.PP
+A stage set is held in staging (`staged`, or `staging` while `stage create` makes it) until `stage clean` releases it, and it stays after its writes, since it can become the next copy. Copies counts the copies of the set\*(Aqs version (a copy is identical content) against its unit\*(Aqs copy floor: the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times the tape\-only multiplier for a tape\-only unit. A staged set with fewer copies than that still owes a copy, and `\-\-owing` lists only those: what a `volume write` still has to do. Below the table: a staged set that is not whole on disk, and one that spans cartridges and is released slice by slice.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
 \fB\-\-status\fR \fI<STATUS>\fR
-Filter by status (staging, staged, failed, cleaned)
+Only the stage sets of this status (staging, staged, failed, cleaned), held or not
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-\-owing\fR
+Only the staged sets that still owe a copy
+.TP
+\fB\-\-all\fR
+The released (`cleaned`) and `failed` stage sets too
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

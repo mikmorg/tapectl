@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-archive\-set\-create \- Create a new archive set policy
 .SH SYNOPSIS
-\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-checksum\-mode\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-home\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl archive\-set create\fR [\fB\-\-json\fR] [\fB\-\-min\-copies\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-required\-locations\fR] [\fB\-\-encrypt\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-compression\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-checksum\-mode\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-slice\-size\fR] [\fB\-\-home\fR] [\fB\-\-verify\-interval\-days\fR] [\fB\-\-warehouse\-copies\fR] [\fB\-\-preserve\-xattrs\fR] [\fB\-\-preserve\-acls\fR] [\fB\-\-preserve\-fsa\fR] [\fB\-\-dirty\-on\-metadata\-change\fR] [\fB\-\-allow\-spanning\fR] [\fB\-\-copies\-at\fR] [\fB\-d\fR|\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create a new archive set policy
 .SH OPTIONS
@@ -15,7 +15,7 @@ Output in JSON format
 \fB\-\-min\-copies\fR \fI<MIN_COPIES>\fR
 Minimum copy count
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-required\-locations\fR \fI<REQUIRED_LOCATIONS>\fR

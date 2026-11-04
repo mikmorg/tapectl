@@ -4,11 +4,11 @@
 .SH NAME
 tapectl\-volume\-compact \- Interactive compaction: read + write + finish in one flow
 .SH SYNOPSIS
-\fBtapectl volume compact\fR [\fB\-\-json\fR] [\fB\-\-to\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-force\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume compact\fR [\fB\-\-json\fR] [\fB\-\-to\fR] [\fB\-\-device\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-force\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Interactive compaction: read + write + finish in one flow
 .PP
-One drive (`\-\-device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `\-\-to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact\-read <SOURCE>`, swap cartridges, `volume compact\-write \-\-destination <DEST>`, then `volume compact\-finish <SOURCE>`.
+One drive (`\-\-device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `\-\-to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact\-read <SOURCE>`, swap cartridges, `volume compact\-write \-\-to <DEST>`, then `volume compact\-finish <SOURCE>`.
 .PP
 Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non\-interactively without `\-\-force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact\-finish <SOURCE> \-\-force` completes the flow without re\-reading or re\-writing anything.
 .PP
@@ -24,7 +24,7 @@ Destination volume label (already initialised). With it, the pause after step 1 
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-allow\-missing\-escrow\fR

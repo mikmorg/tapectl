@@ -1,21 +1,23 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-staging-clean 1  "tapectl-staging-clean " 
+.TH tapectl-stage-clean 1  "tapectl-stage-clean " 
 .SH NAME
-tapectl\-staging\-clean \- Clean staged files from disk
+tapectl\-stage\-clean \- Release staged slices from disk
 .SH SYNOPSIS
-\fBtapectl staging clean\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-version\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl stage clean\fR [\fB\-\-force\fR] [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-version\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Clean staged files from disk
+Release staged slices from disk
+.PP
+A stage set is released once it has a completed write and its unit is not below its copy floor; one below it is retained and named, and `\-\-force` releases it too. A set that spans cartridges is released slice by slice, each slice once it has its copies. A failed set is always swept.
 .SH OPTIONS
 .TP
 \fB\-\-force\fR
-Clean all staged sets, not just those with completed writes; also releases a unit\*(Aqs staged data that a bare `staging clean` would otherwise retain for being below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times the tape\-only multiplier for a tape\-only unit)
+Clean all staged sets, not just those with completed writes; also releases a unit\*(Aqs staged data that a bare `stage clean` would otherwise retain for being below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times the tape\-only multiplier for a tape\-only unit)
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-unit\fR \fI<UNIT>\fR

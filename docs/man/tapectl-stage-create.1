@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-stage\-create \- Create staged slices (validate → dar → encrypt → checksums)
 .SH SYNOPSIS
-\fBtapectl stage create\fR [\fB\-\-json\fR] [\fB\-\-version\fR] [\fB\-\-dry\-run\fR] [\fB\-\-jobs\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl stage create\fR [\fB\-\-json\fR] [\fB\-\-version\fR] [\fB\-\-jobs\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Create staged slices (validate → dar → encrypt → checksums)
 .PP
@@ -15,13 +15,13 @@ Several units may be named; `\-\-jobs` stages that many at once.
 Output in JSON format
 .TP
 \fB\-\-version\fR \fI<VERSION>\fR
-Re\-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl staging clean \-\-unit <name> \-\-version <N>` already released that stage set\*(Aqs slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `staging clean \-\-unit <name> \-\-version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape\-only unit); add `\-\-force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor
-.TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Re\-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl stage clean \-\-unit <name> \-\-version <N>` already released that stage set\*(Aqs slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `stage clean \-\-unit <name> \-\-version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape\-only unit); add `\-\-force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor
 .TP
 \fB\-\-jobs\fR \fI<JOBS>\fR
 How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host\*(Aqs available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

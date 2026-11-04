@@ -26,5 +26,5 @@ tapectl host check [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Also check this systemd unit (repeatable), on top of `[host_check] contender_units`, e.g. a CI runner's timer
+- `--systemd-unit <UNIT>` — Also check this systemd unit (repeatable), on top of `[host_check] contender_units`, e.g. a CI runner's timer
 

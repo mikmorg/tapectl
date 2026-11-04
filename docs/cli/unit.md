@@ -15,7 +15,8 @@ tapectl unit [OPTIONS] <COMMAND>
 - [`init`](#tapectl-unit-init) — Initialize a directory as an archival unit
 - [`init-bulk`](#tapectl-unit-init-bulk) — Bulk-initialize subdirectories as units
 - [`list`](#tapectl-unit-list) — List units
-- [`status`](#tapectl-unit-status) — Show unit status/details
+- [`info`](#tapectl-unit-info) — Show a unit's details, or with --dirty whether it changed
+- [`export`](#tapectl-unit-export) — Copy a unit's staged slices, still encrypted, to a directory
 - [`tag`](#tapectl-unit-tag) — Add/remove tags
 - [`rename`](#tapectl-unit-rename) — Rename a unit
 - [`discover`](#tapectl-unit-discover) — Scan watch_roots for .tapectl-unit.toml dotfiles
@@ -72,12 +73,12 @@ tapectl unit list [OPTIONS]
 - `--status <STATUS>` — Filter by status (active, tape_only, missing)
 - `-t, --tag <TAG>` — Filter by tag
 
-### tapectl unit status
+### tapectl unit info
 
-Show unit status/details
+Show a unit's details, or with --dirty whether it changed
 
 ```text
-tapectl unit status [OPTIONS] <NAME>
+tapectl unit info [OPTIONS] <NAME>
 ```
 
 **Arguments**
@@ -87,6 +88,24 @@ tapectl unit status [OPTIONS] <NAME>
 **Options**
 
 - `--dirty` — Show dirty/clean/new status via an on-disk fingerprint scan (checksum_mode-aware — see `unit init`'s checksum_mode) instead of the usual detail view
+
+### tapectl unit export
+
+Copy a unit's staged slices, still encrypted, to a directory
+
+The slices of the unit's newest staged stage set, as they lie in the staging area (nothing is read from tape), with a manifest of their sha256 sums. They stay encrypted, so the copy is as safe to carry as a tape.
+
+```text
+tapectl unit export [OPTIONS] --to <DIR> <UNIT>
+```
+
+**Arguments**
+
+- `<UNIT>` — Unit name
+
+**Options**
+
+- `--to <DIR>` *(required)* — Destination directory
 
 ### tapectl unit tag
 

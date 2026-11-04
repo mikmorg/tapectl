@@ -1,18 +1,21 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-backend 1  "tapectl-backend " 
+.TH tapectl-catalog-list 1  "tapectl-catalog-list " 
 .SH NAME
-tapectl\-backend \- Tape drive backends
+tapectl\-catalog\-list \- List files in a unit\*(Aqs latest snapshot
 .SH SYNOPSIS
-\fBtapectl backend\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl catalog list\fR [\fB\-\-json\fR] [\fB\-\-version\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIUNIT\fR> 
 .SH DESCRIPTION
-Tape drive backends
+List files in a unit\*(Aqs latest snapshot
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-\-version\fR \fI<VERSION>\fR
+Snapshot version (default: latest)
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
@@ -36,10 +39,6 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
 .TP
-tapectl\-backend\-add(1)
-Add an LTO tape drive to the config
-.TP
-tapectl\-backend\-help(1)
-Print this message or the help of the given subcommand(s)
+<\fIUNIT\fR>
+Unit name

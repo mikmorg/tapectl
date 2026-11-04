@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-drive\-eject \- Unload the cartridge from the drive, and tell the catalog it left
 .SH SYNOPSIS
-\fBtapectl drive eject\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl drive eject\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Unload the cartridge from the drive, and tell the catalog it left
 .PP
@@ -12,7 +12,7 @@ Reads the cartridge chip\*(Aqs serial (READ ATTRIBUTE through the SCSI generic n
 .PP
 Refuses while any tapectl command holds the drive or a volume (a write, a verify, a restore, a poll): exit 75, naming the holder\*(Aqs pid and command, with nothing sent to the drive and nothing recorded. There is no `\-\-force`. Once it has the drive it holds the drive\*(Aqs lock until it exits, so no command can start a tape operation mid\-eject. The tape node being open in a process that is not tapectl is refused the same way (exit 75).
 .PP
-Strict, like every command that moves a cartridge: the drive must be a configured backend (`tapectl backend add`), whose SCSI generic node is checked to be the same drive as its tape node. On a machine with no backend, `mt \-f <device> offline` still works; the catalog is not told.
+Strict, like every command that moves a cartridge: the drive must be a configured drive (`tapectl drive add`), whose SCSI generic node is checked to be the same drive as its tape node. On a machine with no configured drive, `mt \-f <device> offline` still works; the catalog is not told.
 .PP
 Exit 0: unloaded and recorded, or nothing to do because the drive was already empty (no contact, no event: no cartridge was in the drive). Exit 75: refused, a tapectl command or another process has the drive. Exit 2: not unloaded — the tape node could not be read, a cartridge is present and the drive is not ready (loading, or faulted), or the unload failed (the contact is recorded as failed; there is no event). A catalog that cannot record the event after a good unload is a warning, not a failure.
 .PP
@@ -25,7 +25,7 @@ The drive to eject from, by its tape node path as configured (`[[backends.lto]].
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR

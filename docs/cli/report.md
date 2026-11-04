@@ -12,13 +12,11 @@ tapectl report [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`summary`](#tapectl-report-summary) — Overview: units, tapes, tenants, capacity
 - [`fire-risk`](#tapectl-report-fire-risk) — Units at risk: below min copies/locations
 - [`needs`](#tapectl-report-needs) — Each unit's copy target, copies and shortfall at every location
 - [`copies`](#tapectl-report-copies) — Copy count distribution per unit
 - [`tape-only`](#tapectl-report-tape-only) — Tape-only unit status
 - [`dirty`](#tapectl-report-dirty) — Units with changes since last snapshot
-- [`pending`](#tapectl-report-pending) — Staged data pending write
 - [`verify-status`](#tapectl-report-verify-status) — Verification recency
 - [`health`](#tapectl-report-health) — Drive error trends, and drive cleanings
 - [`cartridge-health`](#tapectl-report-cartridge-health) — Every cartridge's health, worst first, and why
@@ -26,16 +24,8 @@ tapectl report [OPTIONS] <COMMAND>
 - [`age`](#tapectl-report-age) — Snapshot age distribution
 - [`events`](#tapectl-report-events) — Audit trail browsing
 - [`compaction-candidates`](#tapectl-report-compaction-candidates) — Volumes flagged for compaction
-- [`supersedable`](#tapectl-report-supersedable) — Superseded snapshot versions that could be marked reclaimable
+- [`reclaimable`](#tapectl-report-reclaimable) — Superseded snapshot versions that could be marked reclaimable
 - [`failed-stages`](#tapectl-report-failed-stages) — Stage attempts that failed, and the hours each lost
-
-### tapectl report summary
-
-Overview: units, tapes, tenants, capacity
-
-```text
-tapectl report summary [OPTIONS]
-```
 
 ### tapectl report fire-risk
 
@@ -97,14 +87,6 @@ tapectl report dirty [OPTIONS]
 **Options**
 
 - `--unit <UNIT>` — Filter to specific unit
-
-### tapectl report pending
-
-Staged data pending write
-
-```text
-tapectl report pending [OPTIONS]
-```
 
 ### tapectl report verify-status
 
@@ -190,12 +172,12 @@ tapectl report compaction-candidates [OPTIONS]
 - `--plan` — Group the candidates by what fits one destination tape
 - `--generation <GENERATION>` — Plan for destination tapes of this generation (e.g. LTO-6, LTO-7) instead of the drive's own. Only with --plan
 
-### tapectl report supersedable
+### tapectl report reclaimable
 
 Superseded snapshot versions that could be marked reclaimable
 
 ```text
-tapectl report supersedable [OPTIONS]
+tapectl report reclaimable [OPTIONS]
 ```
 
 ### tapectl report failed-stages

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-status \- What is running and how the last sessions ended, from the session logs alone: the live session\*(Aqs phase, progress, rate and ETA, and each recent session\*(Aqs outcome and phase timings. Opens no catalog and no config, so an account in the home\*(Aqs `[ops] group` can run it (`tapectl \-\-home <service home> status`) without sudo
 .SH SYNOPSIS
-\fBtapectl status\fR [\fB\-\-json\fR] [\fB\-\-last\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl status\fR [\fB\-\-json\fR] [\fB\-\-last\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 What is running and how the last sessions ended, from the session logs alone: the live session\*(Aqs phase, progress, rate and ETA, and each recent session\*(Aqs outcome and phase timings. Opens no catalog and no config, so an account in the home\*(Aqs `[ops] group` can run it (`tapectl \-\-home <service home> status`) without sudo
 .SH OPTIONS
@@ -15,7 +15,7 @@ Output in JSON format
 \fB\-\-last\fR \fI<LAST>\fR [default: 5]
 How many finished sessions to show, newest first (running ones are always shown)
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR

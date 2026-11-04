@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-unit \- Restore a unit from a volume
 .SH SYNOPSIS
-\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> [\fB\-\-from\fR] <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-key\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore unit\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-from\fR] <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-key\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] 
 .SH DESCRIPTION
 Restore a unit from a volume
 .SH OPTIONS
@@ -13,7 +13,7 @@ Restore a unit from a volume
 Output in JSON format
 .TP
 \fB\-\-unit\fR \fI<UNIT>\fR
-Unit name
+The unit, as a flag: the same as UNIT
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
 Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
@@ -61,8 +61,11 @@ Decrypt every slice to the scratch directory before dar extracts them, even when
 \fB\-\-key\fR \fI<FILE>\fR
 An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in this command only; repeat for several. It is added to the home\*(Aqs own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild \-\-from\-volume \-\-key`. A file that is not an identity is refused, naming it, before the drive is opened
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be restored without restoring
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+[\fIUNIT\fR]
+Unit name

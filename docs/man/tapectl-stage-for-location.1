@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-stage\-for\-location \- Stage what a location needs, packed into one volume bound there
 .SH SYNOPSIS
-\fBtapectl stage for\-location\fR [\fB\-\-json\fR] <\fB\-\-volume\fR> [\fB\-\-dry\-run\fR] [\fB\-\-jobs\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILOCATION\fR> 
+\fBtapectl stage for\-location\fR [\fB\-\-json\fR] <\fB\-\-volume\fR> [\fB\-\-jobs\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILOCATION\fR> 
 .SH DESCRIPTION
 Stage what a location needs, packed into one volume bound there
 .PP
@@ -19,11 +19,11 @@ Output in JSON format
 \fB\-\-volume\fR \fI<LABEL>\fR
 The volume to fill: `volume init` done, nothing written yet
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-jobs\fR \fI<JOBS>\fR
 How many units to stage at once (1 to 16), as `stage create \-\-jobs`. Defaults to `[staging] jobs`
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 The drive whose fill ceiling and end\-of\-tape reserve size the volume\*(Aqs room (no drive is touched). Defaults to the only configured drive; required when more than one is configured

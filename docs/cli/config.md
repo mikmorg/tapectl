@@ -55,7 +55,7 @@ tapectl config set [OPTIONS] <KEY> <VALUE>
 
 Add a table to a list of tables, or values to a list
 
-For a list of tables (`collections`, `archive_sets`, `backends.lto`) each VALUE is one `field=value` of the new table: `config add collections name=movies root=/srv/media/movies tenant=family`. Its name must not already be taken. A drive added as `backends.lto` gets the checks `backend add` makes. For a list value (`defaults.global_excludes`), each VALUE is appended. Checked and written as `config set` is.
+For a list of tables (`collections`, `archive_sets`, `backends.lto`) each VALUE is one `field=value` of the new table: `config add collections name=movies root=/srv/media/movies tenant=family`. Its name must not already be taken. A drive added as `backends.lto` gets the checks `drive add` makes. For a list value (`defaults.global_excludes`), each VALUE is appended. Checked and written as `config set` is.
 
 ```text
 tapectl config add [OPTIONS] <KEY> <VALUES>...

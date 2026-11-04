@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-unretire \- Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
 .SH SYNOPSIS
-\fBtapectl cartridge unretire\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIBARCODE\fR> 
+\fBtapectl cartridge unretire\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fICARTRIDGE\fR> 
 .SH DESCRIPTION
 Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
 .PP
@@ -16,7 +16,7 @@ Tier 1 under ADR\-0008: a correction of a claim, not a destructive act — no pr
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
@@ -41,5 +41,5 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fIBARCODE\fR>
+<\fICARTRIDGE\fR>
 Barcode

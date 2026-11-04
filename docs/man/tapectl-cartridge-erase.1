@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-erase \- Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
 .SH SYNOPSIS
-\fBtapectl cartridge erase\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-long\fR] [\fB\-\-confirm\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl cartridge erase\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-long\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-confirm\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
 .PP
@@ -23,11 +23,11 @@ Tape device (by\-id path). Defaults to the only configured drive; required when 
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-long\fR
 Erase the whole medium instead of writing a filemark at its start: hours on real LTO. For a cartridge that leaves your hands
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-confirm\-label\fR \fI<LABEL>\fR
 The label read from the tape\*(Aqs File 0 (for a tape tapectl did not write, its chip serial), for an unattended erase. It must equal what the tape says; `\-\-dry\-run` prints it

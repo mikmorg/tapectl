@@ -100,10 +100,10 @@ Writes four files: COVER.txt (the plain-text cover sheet — the artifact with t
 This command stops at the files. Printing them, sealing them into tamper-evident envelopes and distributing them across at least two independent failure domains is the operator's part, and the cover sheet states those requirements. Re-run after each production write session; `audit` warns when the kit has fallen behind the tapes.
 
 ```text
-tapectl key escrow-kit [OPTIONS] --out <OUT>
+tapectl key escrow-kit [OPTIONS] <DIR>
 ```
 
-**Options**
+**Arguments**
 
-- `--out <OUT>` *(required)* — Directory to write the kit into (created if absent, mode 0700)
+- `<DIR>` — Directory to write the kit into (created if absent, mode 0700)
 

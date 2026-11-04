@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-cartridge\-list \- List cartridges
 .SH SYNOPSIS
-\fBtapectl cartridge list\fR [\fB\-\-json\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-location\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl cartridge list\fR [\fB\-\-json\fR] [\fB\-\-status\fR] [\fB\-\-location\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 List cartridges
 .SH OPTIONS
@@ -15,11 +15,11 @@ Output in JSON format
 \fB\-\-status\fR \fI<STATUS>\fR
 Filter by status (available, in_use, pending_erase, retired_permanent). `offsite` was removed by ADR\-0011 \-\- a cartridge\*(Aqs place is a location now; use \-\-location
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-location\fR \fI<LOCATION>\fR
 Filter by physical location name \-\- the sibling of `\-\-status`
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

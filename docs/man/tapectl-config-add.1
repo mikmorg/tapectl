@@ -4,17 +4,17 @@
 .SH NAME
 tapectl\-config\-add \- Add a table to a list of tables, or values to a list
 .SH SYNOPSIS
-\fBtapectl config add\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> <\fIVALUES\fR> 
+\fBtapectl config add\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> <\fIVALUES\fR> 
 .SH DESCRIPTION
 Add a table to a list of tables, or values to a list
 .PP
-For a list of tables (`collections`, `archive_sets`, `backends.lto`) each VALUE is one `field=value` of the new table: `config add collections name=movies root=/srv/media/movies tenant=family`. Its name must not already be taken. A drive added as `backends.lto` gets the checks `backend add` makes. For a list value (`defaults.global_excludes`), each VALUE is appended. Checked and written as `config set` is.
+For a list of tables (`collections`, `archive_sets`, `backends.lto`) each VALUE is one `field=value` of the new table: `config add collections name=movies root=/srv/media/movies tenant=family`. Its name must not already be taken. A drive added as `backends.lto` gets the checks `drive add` makes. For a list value (`defaults.global_excludes`), each VALUE is appended. Checked and written as `config set` is.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR

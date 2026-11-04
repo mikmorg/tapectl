@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-key\-generate \- Generate a new keypair for a tenant, or the permanent escrow recipient with \-\-escrow (ADR\-0005)
 .SH SYNOPSIS
-\fBtapectl key generate\fR [\fB\-\-json\fR] [\fB\-\-tenant\fR] [\fB\-\-alias\fR] [\fB\-\-dry\-run\fR] [\fB\-\-key\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-description\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl key generate\fR [\fB\-\-json\fR] [\fB\-\-tenant\fR] [\fB\-\-alias\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-key\-type\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-description\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Generate a new keypair for a tenant, or the permanent escrow recipient with \-\-escrow (ADR\-0005)
 .SH OPTIONS
@@ -18,7 +18,7 @@ Tenant name (required unless \-\-escrow)
 \fB\-\-alias\fR \fI<ALIAS>\fR
 Key alias (e.g., "primary", "backup", "2026") (required unless \-\-escrow)
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-key\-type\fR \fI<KEY_TYPE>\fR [default: primary]

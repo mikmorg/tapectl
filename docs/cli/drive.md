@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
+The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
 
 ```text
 tapectl drive [OPTIONS] <COMMAND>
@@ -12,17 +12,37 @@ tapectl drive [OPTIONS] <COMMAND>
 
 **Subcommands**
 
+- [`add`](#tapectl-drive-add) — Add an LTO tape drive to the config
 - [`poll`](#tapectl-drive-poll) — Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only
 - [`status`](#tapectl-drive-status) — Show what is in the drive right now, without touching it or the tape
 - [`eject`](#tapectl-drive-eject) — Unload the cartridge from the drive, and tell the catalog it left
 - [`cleaned`](#tapectl-drive-cleaned) — Record that the drive was cleaned — a record, not an action
 - [`cleaning-cartridge`](#tapectl-drive-cleaning-cartridge) — Register the cleaning cartridges you use, so their uses are counted
 
+### tapectl drive add
+
+Add an LTO tape drive to the config
+
+Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls -l /dev/tape/by-id/`. Prefer the by-id path: /dev/nstN numbering is not stable across reboots. The SCSI generic node (the sg node, used for the cartridge chip and the drive's health pages) is derived from the tape node at every use, so it need not be given; --device-sg overrides the derivation.
+
+```text
+tapectl drive add [OPTIONS] --name <NAME> --device-tape <DEVICE_TAPE> --generation <GENERATION>
+```
+
+**Options**
+
+- `--name <NAME>` *(required)* — Name for this drive, used to select it later. Letters, digits, dot, underscore and dash
+- `--device-tape <DEVICE_TAPE>` *(required)* — Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
+- `--device-sg <DEVICE_SG>` — SCSI generic node used for health/MAM queries, e.g. /dev/sg1. Optional: left out, tapectl derives it from --device-tape at use (the kernel names the pairing), so a /dev/sgN renumbering never matters. Given, it overrides the derivation, and a write still refuses a node the kernel proves is another drive's
+- `--generation <GENERATION>` *(required)* — Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a drive declares only what it can write; the medium's actual generation is detected at `volume init`, not declared here)
+- `--capacity-override <CAPACITY_OVERRIDE>` — Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive's capacity follows the loaded cartridge's detected generation (ADR-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `enospc_buffer` uses
+- `--enospc-buffer <ENOSPC_BUFFER>` — Headroom reserved before end-of-tape, e.g. 50M
+
 ### tapectl drive poll
 
 Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only
 
-Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the backend's `device_sg`, and nothing else: it never opens the tape node, never moves the tape, never loads or ejects a cartridge. Every log page it reads is journalled verbatim as a contact of its own (`report health` shows the reading), so a TapeAlert page the drive clears on read is never lost. With no known cartridge loaded the reading is the drive's alone.
+Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the drive's `device_sg`, and nothing else: it never opens the tape node, never moves the tape, never loads or ejects a cartridge. Every log page it reads is journalled verbatim as a contact of its own (`report health` shows the reading), so a TapeAlert page the drive clears on read is never lost. With no known cartridge loaded the reading is the drive's alone.
 
 Takes the drive lock without waiting: while a tapectl command has the drive, or another command is writing the catalog, it reads nothing and exits 75. It reads no page the catalog cannot record. Exit 0: recorded, the drive reported nothing. Exit 1: recorded, and the drive raised a TapeAlert or reported an unrecovered error (named). Exit 2: no reading — the sg node could not be read, the drive is not configured, or the catalog refuses writes — or a reading the catalog could not record (named, and printed in full). Run daily by `contrib/systemd/tapectl-drive-poll.timer`.
 
@@ -52,7 +72,7 @@ tapectl drive status [OPTIONS]
 
 **Options**
 
-- `--device <DEVICE>` — The drive to look at, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive. A path no backend claims is looked at too, without the cartridge chip unless the kernel binds a SCSI generic node to it
+- `--device <DEVICE>` — The drive to look at, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive. A path no configured drive claims is looked at too, without the cartridge chip unless the kernel binds a SCSI generic node to it
 
 ### tapectl drive eject
 
@@ -62,7 +82,7 @@ Reads the cartridge chip's serial (READ ATTRIBUTE through the SCSI generic node;
 
 Refuses while any tapectl command holds the drive or a volume (a write, a verify, a restore, a poll): exit 75, naming the holder's pid and command, with nothing sent to the drive and nothing recorded. There is no `--force`. Once it has the drive it holds the drive's lock until it exits, so no command can start a tape operation mid-eject. The tape node being open in a process that is not tapectl is refused the same way (exit 75).
 
-Strict, like every command that moves a cartridge: the drive must be a configured backend (`tapectl backend add`), whose SCSI generic node is checked to be the same drive as its tape node. On a machine with no backend, `mt -f <device> offline` still works; the catalog is not told.
+Strict, like every command that moves a cartridge: the drive must be a configured drive (`tapectl drive add`), whose SCSI generic node is checked to be the same drive as its tape node. On a machine with no configured drive, `mt -f <device> offline` still works; the catalog is not told.
 
 Exit 0: unloaded and recorded, or nothing to do because the drive was already empty (no contact, no event: no cartridge was in the drive). Exit 75: refused, a tapectl command or another process has the drive. Exit 2: not unloaded — the tape node could not be read, a cartridge is present and the drive is not ready (loading, or faulted), or the unload failed (the contact is recorded as failed; there is no event). A catalog that cannot record the event after a good unload is a warning, not a failure.
 

@@ -60,12 +60,12 @@ tapectl cartridge list [OPTIONS]
 Show cartridge details
 
 ```text
-tapectl cartridge info [OPTIONS] <BARCODE>
+tapectl cartridge info [OPTIONS] <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 ### tapectl cartridge move
 
@@ -74,12 +74,12 @@ Move a cartridge to a location, taking its volumes with it
 ADR-0011: a cartridge's PLACE is a location, not a status. This moves `cartridges.location_id` and the `location_id` of every volume currently on the cartridge, in one transaction, so the shelf and the catalog cannot disagree. `volume move` does the same from the other end.
 
 ```text
-tapectl cartridge move [OPTIONS] --to <TO> <BARCODE>
+tapectl cartridge move [OPTIONS] --to <TO> <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 **Options**
 
@@ -96,12 +96,12 @@ ADR-0008 Tier 2: the coverage impact is displayed first, and consent is asked EV
 This said consent was "required when a unit is left below its policy" until 2026-09-17, which read as "not required otherwise" — so a script retiring a fully-covered cartridge without `--yes` was refused by a non-interactive session for a reason the help denied.
 
 ```text
-tapectl cartridge retire [OPTIONS] <BARCODE>
+tapectl cartridge retire [OPTIONS] <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 **Options**
 
@@ -139,12 +139,12 @@ Mark a cartridge as erased (available for reuse)
 Refused outright on a `retired_permanent` cartridge — no `--force`, no `--yes`, no exception (ADR-0011, corrected 2026-09-14): this command's own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
 
 ```text
-tapectl cartridge mark-erased [OPTIONS] <BARCODE>
+tapectl cartridge mark-erased [OPTIONS] <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 **Options**
 
@@ -159,12 +159,12 @@ ADR-0012, *Rulings recorded as consequences*: "`cartridge edit --generation` cor
 `--serial` is a SEPARATE, independently gated correction (ADR-0012 amendment, 2026-09-16): gating is per-flag, not per-command, because `--generation` is a fact correction (Tier 1) while `--serial` is a claim about IDENTITY (Tier 2 — see `cli::consent`). It writes only `operator_serial`, never `serial_number`, which no operator command may ever touch. At least one of `--generation`/`--serial` must be given; both may be given in one call, and each is gated independently.
 
 ```text
-tapectl cartridge edit [OPTIONS] <BARCODE>
+tapectl cartridge edit [OPTIONS] <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 **Options**
 
@@ -178,12 +178,12 @@ Correct a cartridge's barcode label
 ADR-0012: a cartridge's identity is its chip serial; the barcode is a relabelable sticker. This is a Tier 1 label correction under ADR-0008, not a destructive act — no prompt, no `--force`, no status gate — and it is the remedy `volume init`'s auto-register refuses with when the loaded medium's serial collides with an already-registered barcode.
 
 ```text
-tapectl cartridge relabel [OPTIONS] <BARCODE> <NEW_BARCODE>
+tapectl cartridge relabel [OPTIONS] <CARTRIDGE> <NEW_BARCODE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Current barcode
+- `<CARTRIDGE>` — Current barcode
 - `<NEW_BARCODE>` — New barcode
 
 ### tapectl cartridge unretire
@@ -195,12 +195,12 @@ ADR-0012's consequences bullet: restores the cartridge, and any volumes retired 
 Tier 1 under ADR-0008: a correction of a claim, not a destructive act — no prompt, no `--force`, no `--yes`. Refuses when the cartridge is not `retired_permanent`, naming its actual status. `cartridge mark-erased` is untouched by this command and remains the separate, irreversible statement that the bytes are gone (ADR-0011, corrected 2026-09-14).
 
 ```text
-tapectl cartridge unretire [OPTIONS] <BARCODE>
+tapectl cartridge unretire [OPTIONS] <CARTRIDGE>
 ```
 
 **Arguments**
 
-- `<BARCODE>` — Barcode
+- `<CARTRIDGE>` — Barcode
 
 ### tapectl cartridge journal
 
@@ -211,12 +211,12 @@ ADR-0013: every `sg_read_attr` a recording command runs is kept whole — includ
 A cartridge's rows are found two ways: reads taken in a contact attributed to it, and reads whose chip serial is its confirmed serial — so a read taken before it was registered is found too. With neither a barcode nor `--serial`, every row is listed, including reads no cartridge could be named for. Read-only.
 
 ```text
-tapectl cartridge journal [OPTIONS] [BARCODE]
+tapectl cartridge journal [OPTIONS] [CARTRIDGE]
 ```
 
 **Arguments**
 
-- `[BARCODE]` — Barcode of a registered cartridge
+- `[CARTRIDGE]` — Barcode of a registered cartridge
 
 **Options**
 

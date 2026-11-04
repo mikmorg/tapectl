@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-snapshot\-mark\-reclaimable \- Mark a snapshot as reclaimable (with enforced preconditions)
 .SH SYNOPSIS
-\fBtapectl snapshot mark\-reclaimable\fR [\fB\-\-json\fR] <\fB\-\-version\fR> [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl snapshot mark\-reclaimable\fR [\fB\-\-json\fR] <\fB\-\-version\fR> [\fB\-\-force\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
 Mark a snapshot as reclaimable (with enforced preconditions)
 .SH OPTIONS
@@ -15,11 +15,11 @@ Output in JSON format
 \fB\-\-version\fR \fI<VERSION>\fR
 Snapshot version
 .TP
-\fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-force\fR
 Confirm in advance, as the global \-\-yes does: mark the version even though the version superseding it is short of its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets) or of a copy target at a location of its copies_at map (an archive set\*(Aqs required_locations counts as one copy at each name); for a tape\-only unit, the multiplied floors. Without either flag a terminal asks, and a non\-interactive run refuses, naming the shortfall. Only \-\-force (not \-\-yes, not a prompt) marks a version no current version supersedes — that releases the unit\*(Aqs only current version
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

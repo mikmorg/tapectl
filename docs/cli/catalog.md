@@ -12,18 +12,18 @@ tapectl catalog [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`ls`](#tapectl-catalog-ls) — List files in a unit's latest snapshot
+- [`list`](#tapectl-catalog-list) — List files in a unit's latest snapshot
 - [`search`](#tapectl-catalog-search) — Search for files by pattern, in each unit's newest version
 - [`locate`](#tapectl-catalog-locate) — Show which volume(s) contain a unit
 - [`stats`](#tapectl-catalog-stats) — Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes
 - [`rebuild`](#tapectl-catalog-rebuild) — Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 
-### tapectl catalog ls
+### tapectl catalog list
 
 List files in a unit's latest snapshot
 
 ```text
-tapectl catalog ls [OPTIONS] <UNIT>
+tapectl catalog list [OPTIONS] <UNIT>
 ```
 
 **Arguments**
@@ -84,7 +84,7 @@ tapectl catalog rebuild [OPTIONS] --key <FILE>
 - `--from-volume` — Rebuild from a sealed tape volume. The only source today; named rather than implied so a later `--from-export` is additive
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured.
   
-    There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read-only dump this command writes what it reads into the catalog — a silent wrong-device default would file one tape's contents under another's. The sole configured backend's `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by-id/`.
+    There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read-only dump this command writes what it reads into the catalog — a silent wrong-device default would file one tape's contents under another's. The sole configured drive's `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by-id/`.
 - `--key <FILE>` *(required)* — Operator or escrow secret key file (an age identity, `AGE-SECRET-KEY-1…`); repeat for several. For this command only: never copied into the home or registered as any key, so an heir can rebuild with the escrow key alone and then restore with the same `--key`. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh; a file that is not an identity is refused, naming it, before the drive is opened
 - `--label <LABEL>` — Refuse unless the tape's own reported label matches — a wrong-tape guard, not a database lookup
 - `--tenant <TENANT>` *(default: `recovered`)* — Tenant to file units under when no tenant envelope on this cartridge names their owner (only reachable with a damaged or partial tape)

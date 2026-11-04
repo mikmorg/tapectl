@@ -22,12 +22,16 @@ tapectl restore [OPTIONS] <COMMAND>
 Restore a unit from a volume
 
 ```text
-tapectl restore unit [OPTIONS] --unit <UNIT> --to <TO>
+tapectl restore unit [OPTIONS] --to <TO> <UNIT|--unit <UNIT>>
 ```
+
+**Arguments**
+
+- `[UNIT]` — Unit name
 
 **Options**
 
-- `--unit <UNIT>` *(required)* — Unit name
+- `--unit <UNIT>` — The unit, as a flag: the same as UNIT
 - `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with --dry-run, which opens no drive. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
@@ -37,7 +41,7 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --to <TO>
 - `--no-space-check` — Skip the free-space check (the unit's size when it streams; about twice that when its slices are spooled, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 - `--spool` — Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit's size with the scratch directory and --to on one disk. Across cartridges too: a version held across cartridges is read from each in turn into the scratch directory, and dar extracts once the last is read; without it the slices stream into one extraction across the swaps
 - `--key <FILE>` — An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt with in this command only; repeat for several. It is added to the home's own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild --from-volume --key`. A file that is not an identity is refused, naming it, before the drive is opened
-- `--dry-run` — Show what would be restored without restoring
+- `-n, --dry-run` — Show what would be restored without restoring
 
 ### tapectl restore volume
 
@@ -64,20 +68,25 @@ tapectl restore volume [OPTIONS] --to <DIR> [LABEL]
 - `--spool` — Spool every unit's slices to the scratch directory instead of streaming them into dar (see `restore unit --spool`)
 - `--fail-fast` — Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
 - `--key <FILE>` — An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt with in this command only; repeat for several. It is added to the home's own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild --from-volume --key`. A file that is not an identity is refused, naming it, before the drive is opened
-- `--dry-run` — Show what would be restored, unit by unit in tape order, without opening the drive
+- `-n, --dry-run` — Show what would be restored, unit by unit in tape order, without opening the drive
 
 ### tapectl restore file
 
 Restore a single file from a unit
 
 ```text
-tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --to <TO>
+tapectl restore file [OPTIONS] --to <TO> <UNIT|--unit <UNIT>> <PATH|--file <PATH>>
 ```
+
+**Arguments**
+
+- `[UNIT]` — Unit name
+- `[PATH]` — File path within the unit, relative to its root, as `catalog list` prints it. Checked against the catalog's file list for the version before the tape is touched; a directory is refused
 
 **Options**
 
-- `--file <FILE>` *(required)* — File path within the unit, relative to its root, as `catalog ls` prints it. Checked against the catalog's file list for the version before the tape is touched; a directory is refused
-- `--unit <UNIT>` *(required)* — Unit name
+- `--unit <UNIT>` — The unit, as a flag: the same as UNIT
+- `--file <PATH>` — The file, as a flag: the same as PATH
 - `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1, as for `restore unit`; the others are asked for in slice order
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured

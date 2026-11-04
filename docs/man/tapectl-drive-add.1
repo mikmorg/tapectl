@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-backend-add 1  "tapectl-backend-add " 
+.TH tapectl-drive-add 1  "tapectl-drive-add " 
 .SH NAME
-tapectl\-backend\-add \- Add an LTO tape drive to the config
+tapectl\-drive\-add \- Add an LTO tape drive to the config
 .SH SYNOPSIS
-\fBtapectl backend add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-\-dry\-run\fR] [\fB\-\-device\-sg\fR] [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-generation\fR> [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-capacity\-override\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl drive add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-device\-sg\fR] [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-generation\fR> [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-capacity\-override\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Add an LTO tape drive to the config
 .PP
@@ -20,7 +20,7 @@ Name for this drive, used to select it later. Letters, digits, dot, underscore a
 \fB\-\-device\-tape\fR \fI<DEVICE_TAPE>\fR
 Tape device node, e.g. /dev/tape/by\-id/scsi\-XXXX\-nst
 .TP
-\fB\-\-dry\-run\fR
+\fB\-n\fR, \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-device\-sg\fR \fI<DEVICE_SG>\fR
