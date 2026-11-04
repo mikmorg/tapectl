@@ -409,7 +409,16 @@ pub enum VolumeCommands {
         quick: bool,
     },
 
-    /// Identify a tape (read ID thunk)
+    /// Identify the loaded tape: print its File 0, and say on stderr what
+    /// this catalog makes of it
+    ///
+    /// With `--json`, one object: File 0's `label` and `uuid` (and its text
+    /// as `file0`), the catalog's `status`, `condition` and `location` for
+    /// that volume (null when it has none of that uuid), the `cartridge`
+    /// (the chip `serial` read now, the catalog's `barcode` for it, and the
+    /// identity File 0 records), the `sealed` facts the catalog records,
+    /// and the `note` and `contradiction`. A tape that contradicts the
+    /// catalog still exits non-zero.
     Identify {
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
@@ -1362,6 +1371,17 @@ fn identify_loaded_tape(
     config: &Config,
     device: &str,
 ) -> Result<write::Identified> {
+    identify_loaded_tape_read(conn, config, device).map(|(id, _)| id)
+}
+
+/// [`identify_loaded_tape`], with the chip serial its MAM read gave (`None`
+/// when no backend resolved or the chip did not answer), for `volume
+/// identify --json` (ADR-0012 item 220). The same one read, not a second.
+fn identify_loaded_tape_read(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+) -> Result<(write::Identified, Option<String>)> {
     // Issue #166: refuse before the store is opened if this drive cannot
     // read the loaded medium. Proceeds silently with no configured backend
     // (ADR-0010's DR-path leniency).
@@ -1370,11 +1390,15 @@ fn identify_loaded_tape(
     // Before the store open: reading the MAM opens the device read-only and
     // drops the fd, and the st driver refuses a second concurrent open.
     let observed = crate::volume::binding::loaded_medium(config, device, &reads);
+    let chip_serial = observed
+        .as_ref()
+        .and_then(|(_, mam)| mam.serial.clone())
+        .filter(|s| !s.is_empty());
     let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
     // Corroborated (ADR-0012, issue #193) where there is a catalog row to
     // compare against; the bare `volume_identify` stays the DB-less File 0
     // reader the heir path mirrors.
-    write::volume_identify_corroborated(
+    let id = write::volume_identify_corroborated(
         conn,
         &mut store,
         ContactSite::new(
@@ -1384,7 +1408,106 @@ fn identify_loaded_tape(
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
         )
         .with_mam_reads(&reads),
-    )
+    )?;
+    Ok((id, chip_serial))
+}
+
+/// `volume identify --json` (ADR-0012 item 220): ONE object — what File 0
+/// says (`label`, `uuid`, and the text itself as `file0`), what the catalog
+/// holds of it (`status`, `condition`, `location`, null when it has no
+/// volume of that uuid), the cartridge (the chip serial read now, the
+/// catalog's barcode for it, File 0's own identity claim), the `sealed`
+/// facts the catalog records, and the `note`/`contradiction` the human form
+/// prints on stderr. The tape's own account is never withheld: a
+/// contradiction is in the object, and the exit status says it too.
+fn identify_json(
+    conn: &Connection,
+    id: &write::Identified,
+    chip_serial: Option<&str>,
+) -> Result<serde_json::Value> {
+    use crate::volume::loaded::{locate, Located};
+    use rusqlite::OptionalExtension;
+    let file0 = crate::volume::binding::file0_facts_from_text(&id.text);
+    let volume = match locate(conn, &file0)? {
+        Located::Known(v) | Located::UnderAnotherLabel { volume: v, .. } => Some(v),
+        Located::NoIdentity | Located::Unknown => None,
+    };
+    let (status, condition, location, sealed) = match &volume {
+        None => (None, None, None, serde_json::Value::Null),
+        Some(v) => {
+            let (sealed_at, ended_after, location): (Option<String>, Option<i64>, Option<String>) =
+                conn.query_row(
+                    "SELECT v.sealed_at, v.ended_after, l.name FROM volumes v
+                       LEFT JOIN locations l ON l.id = v.location_id
+                      WHERE v.id = ?1",
+                    [v.volume_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            let sealed = match sealed_at {
+                None => serde_json::Value::Null,
+                Some(at) => {
+                    let copy = write::copy_summary(conn, &v.label)?;
+                    serde_json::json!({
+                        "sealed_at": crate::render::json_time(&at),
+                        "short": ended_after.is_some(),
+                        "ended_after": ended_after,
+                        "units": copy.units,
+                        "slices": copy.slices,
+                        "bytes": copy.bytes,
+                        "counts_as_copy": crate::policy::coverage::counts_as_copy(conn, &v.label)?,
+                    })
+                }
+            };
+            (
+                Some(v.status.clone()),
+                Some(v.observed_condition.clone()),
+                location,
+                sealed,
+            )
+        }
+    };
+    // The catalog's barcode for the chip in the drive; with no chip serial,
+    // the cartridge the catalog has this volume on.
+    let barcode: Option<String> = match (chip_serial, &volume) {
+        (Some(serial), _) => conn
+            .query_row(
+                "SELECT barcode FROM cartridges WHERE serial_number = ?1",
+                [serial],
+                |r| r.get(0),
+            )
+            .optional()?,
+        (None, Some(v)) => conn
+            .query_row(
+                "SELECT c.barcode FROM cartridge_volumes cv
+                   JOIN cartridges c ON c.id = cv.cartridge_id
+                  WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+                [v.volume_id],
+                |r| r.get(0),
+            )
+            .optional()?,
+        (None, None) => None,
+    };
+    Ok(serde_json::json!({
+        "label": file0.label,
+        "uuid": file0.uuid,
+        "catalog_label": volume.as_ref().map(|v| v.label.clone()),
+        "status": status,
+        "condition": condition,
+        "location": location,
+        "cartridge": {
+            "serial": chip_serial,
+            "barcode": barcode,
+            "file0_serial": file0.media.as_ref().map(|m| m.cartridge_serial.clone()),
+            "identity_source": file0
+                .media
+                .as_ref()
+                .and_then(|m| m.cartridge_identity_source.clone()),
+        },
+        "sealed": sealed,
+        "note": id.catalog_note,
+        "contradiction": id.contradiction,
+        "file0": id.text,
+    }))
 }
 
 /// What a `--loaded` write command works on.
@@ -2752,21 +2875,31 @@ pub fn run(
 
         VolumeCommands::Identify { device } => {
             let device = read_device(config, device.as_deref())?;
-            let id = identify_loaded_tape(conn, config, &device)?;
-            // The tape's own account FIRST, always — see `Identified`. A
-            // contradiction is reported after it and through the exit code,
-            // never by withholding the answer the operator asked for.
-            println!("{}", id.text);
-            // Issue #435: what the catalog makes of the tape — which volume
-            // it is, or that the catalog does not know it (a fact, not an
-            // error). On stderr, so stdout stays File 0 for anything parsing
-            // it. The note and the exit status below come from ONE lookup
-            // (`Identified`, issue #443), so they cannot disagree.
-            if let Some(note) = &id.catalog_note {
-                eprintln!("{note}");
+            let (id, chip_serial) = identify_loaded_tape_read(conn, config, &device)?;
+            if json_output {
+                // ADR-0012 item 220: one object, the note and any
+                // contradiction in it; the exit status below is unchanged.
+                println!("{}", identify_json(conn, &id, chip_serial.as_deref())?);
+            } else {
+                // The tape's own account FIRST, always — see `Identified`. A
+                // contradiction is reported after it and through the exit
+                // code, never by withholding the answer the operator asked
+                // for.
+                println!("{}", id.text);
+                // Issue #435: what the catalog makes of the tape — which
+                // volume it is, or that the catalog does not know it (a fact,
+                // not an error). On stderr, so stdout stays File 0 for
+                // anything parsing it. The note and the exit status below
+                // come from ONE lookup (`Identified`, issue #443), so they
+                // cannot disagree.
+                if let Some(note) = &id.catalog_note {
+                    eprintln!("{note}");
+                }
             }
             if let Some(why) = id.contradiction {
-                eprintln!("\nwarning: this tape contradicts the catalog.\n{why}");
+                if !json_output {
+                    eprintln!("\nwarning: this tape contradicts the catalog.\n{why}");
+                }
                 return Err(TapectlError::Other(
                     "the loaded tape and the catalog disagree (above); the tape's own \
                      identity is printed unchanged"
@@ -5409,6 +5542,86 @@ fn staged_plan_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012 item 220: `volume identify --json` is one object carrying
+    /// File 0's identity, the catalog's status, the cartridge's serial and
+    /// barcode and the sealed facts; a tape the catalog does not know has
+    /// nulls there, never a missing key.
+    #[test]
+    fn identify_json_is_one_object_with_the_catalogs_view() {
+        let conn = crate::db::open_memory().unwrap();
+        let file0 =
+            crate::volume::layout::generate_id_thunk_v2(&crate::volume::layout::IdThunkV2Params {
+                label: "L6-0001",
+                uuid: "uuid-1",
+                media_type: "LTO-6",
+                tapectl_version: "1.9.0",
+                nominal_capacity: 1,
+                mam_capacity: 0,
+                total_files: 8,
+                mam_manufacturer: "",
+                mam_serial: "EW7VWMVKF6",
+                mam_length: 0,
+                mam_loads: 0,
+                created_at: "2026-11-04T00:00:00Z",
+                cartridge_identity_source: Some("mam"),
+            });
+        let id = write::Identified {
+            text: file0.clone(),
+            contradiction: None,
+            catalog_note: Some("catalog: this tape is volume \"L6-0001\" (status sealed)".into()),
+        };
+        // Not in the catalog: the tape's own account, nulls for the rest.
+        let v = identify_json(&conn, &id, Some("EW7VWMVKF6")).unwrap();
+        assert_eq!(v["label"], "L6-0001");
+        assert_eq!(v["uuid"], "uuid-1");
+        assert!(v["status"].is_null() && v["sealed"].is_null(), "{v}");
+        assert_eq!(v["cartridge"]["serial"], "EW7VWMVKF6");
+        assert!(v["cartridge"]["barcode"].is_null(), "{v}");
+        assert_eq!(v["cartridge"]["file0_serial"], "EW7VWMVKF6");
+        assert_eq!(v["cartridge"]["identity_source"], "mam");
+        assert_eq!(v["file0"], file0.as_str());
+
+        conn.execute_batch(
+            "INSERT INTO locations (name) VALUES ('offsite');
+             INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, sealed_at, location_id)
+             VALUES ('L6-0001', 'uuid-1', 'lto', 'lto6', 'LTO-6', 2500000000000, 'sealed',
+                     '2026-11-04 01:02:03', (SELECT id FROM locations WHERE name = 'offsite'));
+             INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+             VALUES ('L6-0001', 'LTO-6', 2500000000000, 'EW7VWMVKF6');",
+        )
+        .unwrap();
+        let v = identify_json(&conn, &id, Some("EW7VWMVKF6")).unwrap();
+        assert_eq!(v["status"], "sealed", "{v}");
+        assert_eq!(v["condition"], "ok", "{v}");
+        assert_eq!(v["location"], "offsite", "{v}");
+        assert_eq!(v["catalog_label"], "L6-0001");
+        assert_eq!(v["cartridge"]["barcode"], "L6-0001");
+        assert_eq!(v["sealed"]["sealed_at"], "2026-11-04T01:02:03Z", "{v}");
+        assert_eq!(v["sealed"]["short"], false);
+        assert_eq!(v["sealed"]["units"], 0);
+        assert_eq!(v["note"], id.catalog_note.as_deref().unwrap());
+        assert!(v["contradiction"].is_null());
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cartridge",
+                "catalog_label",
+                "condition",
+                "contradiction",
+                "file0",
+                "label",
+                "location",
+                "note",
+                "sealed",
+                "status",
+                "uuid"
+            ]
+        );
+    }
 
     /// #420 (`volume-format-v2.md` §5 step 3): when the seal and the catalog
     /// disagree about where the tape ended, the verify is inconclusive, so

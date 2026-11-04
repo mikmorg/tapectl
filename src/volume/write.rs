@@ -509,7 +509,9 @@ fn volume_init_in_contact<'c>(
         conn,
         label,
         barcode,
-        cartridge_barcode,
+        // A `--cartridge` the chip's serial superseded named no part of
+        // this binding, so it is not one of the two flags that can disagree.
+        cartridge_barcode.filter(|_| lookup.superseded_request.is_none()),
         serial,
         lookup.row.as_ref(),
     )?;
@@ -691,7 +693,7 @@ fn volume_init_in_contact<'c>(
     // chip-witnessed contact, so the operator identity File 0 records below
     // (the barcode, when no serial was read) never moves.
     let first_barcode = match (first_barcode, bound.cartridge_id, bound.barcode.clone()) {
-        (Some(first), Some(cartridge_id), Some(old)) => {
+        (Some(first), Some(cartridge_id), Some(old)) if old != first.barcode => {
             binding::give_first_barcode(&tx, cartridge_id, &old, &first)?;
             bound.barcode = Some(first.barcode.clone());
             Some((old, first))
