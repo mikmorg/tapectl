@@ -834,7 +834,7 @@ for b in (d.get("backends") or {}).get("lto") or []:
 # run and a re-run. Set when the drive has none; left, and said, when it already
 # says the same; never replaced: a drive that says something else is refused,
 # naming both values and both ways on. Without POST_WARNING_BYTES, a drive that
-# has no value gets the notice of what that loses, once, here.
+# has no value gets one line here; what that loses is config check's note, once.
 drive_post_warning() {
   local hit name cur
   hit="$(drive_setting "$1" "$2")" \
@@ -849,7 +849,9 @@ drive_post_warning() {
     if [ -n "$cur" ]; then
       ok "drive $name: post_warning_bytes = $cur (already set; the profile sets no POST_WARNING_BYTES)"
     else
-      note "drive $name has no post_warning_bytes (the profile sets no POST_WARNING_BYTES). Without it, a write's plan stops at the fill ceiling instead of reaching the cartridge's nominal capacity (ADR-0012 item 113), and no slice cap keeps a slice and the seal inside the drive's room past its early warning (item 100). Measure the drive with scripts/lto-profile.sh and set the key: docs/lto-profiling.md"
+      # The binary's own `config check`, just above, already said what a drive
+      # without the key loses (1.9.0, item 214): say only the profile's part.
+      note "the profile sets no POST_WARNING_BYTES, so drive $name keeps no post_warning_bytes: config check's note above says what that costs. Measure the drive with scripts/lto-profile.sh (docs/lto-profiling.md), then set POST_WARNING_BYTES in the profile and re-run with --from 8"
     fi
   elif [ -z "$cur" ]; then
     run tc config set "backends.lto[$name].post_warning_bytes" "$POST_WARNING_BYTES" \

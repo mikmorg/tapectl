@@ -510,22 +510,35 @@ fn step_8_without_post_warning_bytes_says_once_what_is_lost() {
     let profile = rig.profile("p.profile", "OPERATOR=fr-tester\n");
     for run in ["first", "re-run"] {
         let out = ok(&step8(&rig, &profile, &home));
+        // What is lost is said once, by the binary's `config check` note
+        // (1.9.0, item 214); the script adds only the profile's part, once.
         assert_eq!(
             out.matches("has no post_warning_bytes").count(),
             1,
             "{run}: {out}"
         );
+        assert_eq!(
+            out.matches(
+                "the profile sets no POST_WARNING_BYTES, so drive lto6 keeps no post_warning_bytes"
+            )
+            .count(),
+            1,
+            "{run}: {out}"
+        );
         assert!(
-            out.contains(
-                "drive lto6 has no post_warning_bytes (the profile sets no POST_WARNING_BYTES)"
-            ) && out.contains("fill ceiling")
+            out.contains("fill ceiling")
                 && out.contains("item 113")
                 && out.contains("slice cap")
                 && out.contains("item 100")
                 && out.contains("docs/lto-profiling.md"),
             "{run}: {out}"
         );
-        assert!(!out.contains("config set"), "{run}: {out}");
+        // The script runs no `config set` (a note may quote one).
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("$ ") && l.contains("config set")),
+            "{run}: {out}"
+        );
         let written = std::fs::read_to_string(&cfg).unwrap();
         assert!(post_warning_lines(&written).is_empty(), "{run}: {written}");
     }
