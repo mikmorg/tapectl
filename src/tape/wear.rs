@@ -372,6 +372,12 @@ fn cartridge_for_write(conn: &Connection, volume_id: i64, mam: &MamInfo) -> Resu
 /// journal's newest page 0x17 / 0x2E for that cartridge. Never refuses and
 /// never fails the write: a catalog error here is a log warning.
 pub fn preflight_lines(conn: &Connection, volume_id: i64, mam: &MamInfo) -> Vec<String> {
+    preflight_wear(conn, volume_id, mam).map_or_else(Vec::new, |w| w.lines())
+}
+
+/// The [`Wear`] behind [`preflight_lines`], or `None` when the catalog could
+/// not be read (a log warning).
+fn preflight_wear(conn: &Connection, volume_id: i64, mam: &MamInfo) -> Option<Wear> {
     let wear = match cartridge_for_write(conn, volume_id, mam) {
         Ok(Some(id)) => for_cartridge(conn, id, Some(mam)),
         // A cartridge the catalog does not know yet: the chip is all there is.
@@ -382,24 +388,65 @@ pub fn preflight_lines(conn: &Connection, volume_id: i64, mam: &MamInfo) -> Vec<
         Err(e) => Err(e),
     };
     match wear {
-        Ok(w) => w.lines(),
+        Ok(w) => Some(w),
         Err(e) => {
             tracing::warn!(err = %e, "worn-cartridge pre-flight: the catalog could not be read");
-            Vec::new()
+            None
         }
     }
 }
 
-/// Print [`preflight_lines`] to stderr, the operator channel the write's
-/// other pre-flight notices use.
-pub fn preflight_notice(conn: &Connection, volume_id: i64, label: &str, mam: &MamInfo) {
-    let lines = preflight_lines(conn, volume_id, mam);
-    if lines.is_empty() {
-        return;
+/// Where [`preflight_notice`] says a cartridge's wear (OQ12, ADR-0012 item
+/// 216): on stderr, where the write's other pre-flight notices are, only
+/// when the hardware raised something ([`Wear::warnings`]); figures alone
+/// are information, for the session log and stderr under `-v`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WearNotice {
+    /// A warning: the block on stderr, figures and all.
+    Stderr(Vec<String>),
+    /// Figures only: one INFO event.
+    Info(Vec<String>),
+    /// Nothing to say.
+    None,
+}
+
+impl WearNotice {
+    /// The notice for `wear`'s lines.
+    pub fn of(wear: &Wear) -> WearNotice {
+        let lines = wear.lines();
+        if lines.is_empty() {
+            WearNotice::None
+        } else if wear.warnings().is_empty() {
+            WearNotice::Info(lines)
+        } else {
+            WearNotice::Stderr(lines)
+        }
     }
-    eprintln!("volume \"{label}\": cartridge wear (figures only; ADR-0012 sets no threshold yet):");
-    for l in lines {
-        eprintln!("  {l}");
+}
+
+/// Say [`preflight_lines`]: on stderr, the operator channel the write's
+/// other pre-flight notices use, when the hardware raised a warning; else
+/// as an INFO event, in the session log and behind `-v` (OQ12: the chip's
+/// wear figures are information, and the summary a write ends with is what
+/// the operator reads).
+pub fn preflight_notice(conn: &Connection, volume_id: i64, label: &str, mam: &MamInfo) {
+    let Some(wear) = preflight_wear(conn, volume_id, mam) else {
+        return;
+    };
+    let header = format!(
+        "volume \"{label}\": cartridge wear (figures only; ADR-0012 sets no threshold yet):"
+    );
+    match WearNotice::of(&wear) {
+        WearNotice::None => {}
+        WearNotice::Info(lines) => {
+            tracing::info!("{header} {}", lines.join("; "));
+        }
+        WearNotice::Stderr(lines) => {
+            eprintln!("{header}");
+            for l in lines {
+                eprintln!("  {l}");
+            }
+        }
     }
 }
 
@@ -800,5 +847,34 @@ mod tests {
         // Neither: the chip alone, and "no reading" said for the drive.
         let text = preflight_lines(&conn, 404, &stranger).join("\n");
         assert!(text.contains("page 0x17: no reading recorded"), "{text}");
+    }
+
+    /// OQ12 (ADR-0012 item 216): the write's wear block reaches stderr only
+    /// when the hardware raised something; figures alone are an INFO event
+    /// (the session log, and stderr under `-v`). Undone, the figures would
+    /// print on stderr before every write.
+    #[test]
+    fn wear_figures_alone_are_information_and_a_raised_count_is_a_warning() {
+        let stats = |uw| Wear {
+            volume_stats: Some((
+                "2026-11-04 04:00:00".to_string(),
+                VolumeStatistics {
+                    unrecovered_write_errors: Some(uw),
+                    unrecovered_read_errors: Some(0),
+                    ..VolumeStatistics::default()
+                },
+            )),
+            ..Wear::default()
+        };
+        assert!(matches!(WearNotice::of(&stats(0)), WearNotice::Info(l) if !l.is_empty()));
+        match WearNotice::of(&stats(2)) {
+            WearNotice::Stderr(lines) => assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("WARNING: worn cartridge?")),
+                "{lines:?}"
+            ),
+            other => panic!("a raised count is a warning: {other:?}"),
+        }
     }
 }
