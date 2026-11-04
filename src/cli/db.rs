@@ -45,14 +45,19 @@ pub fn run(
             //
             // Issue #310: and it says how much it copied — the journals are
             // never pruned, and what their growth costs is this copy's time.
+            //
+            // ADR-0012 item 210 (OQ20): PATH may be a directory, where the
+            // backup gets a dated name, so every line names the file the
+            // report says was written, never the argument.
             let report =
                 crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
             if let Some(report) = report {
                 let size = crate::util::format_bytes_binary(report.db_bytes as i64);
+                let to = report.file.display();
                 if json_output {
                     println!(
                         "{}",
-                        serde_json::json!({"backup": to, "keys_included": include_keys,
+                        serde_json::json!({"backup": to.to_string(), "keys_included": include_keys,
                                            "keys_dir": report.keys_dir,
                                            "size_bytes": report.db_bytes,
                                            "keys_bytes": report.keys_bytes})

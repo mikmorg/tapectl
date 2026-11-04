@@ -346,7 +346,10 @@ pub enum DbCommands {
     /// copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog
     /// only grows, and the time a backup takes grows with it.
     Backup {
-        /// The backup file to write. Its directory must already exist
+        /// The backup file to write, or a directory to write
+        /// `tapectl-YYYYmmddTHHMMSSZ.db` into (the scheduled backup's name).
+        /// An existing file is refused, never overwritten. The directory
+        /// must already exist
         #[arg(value_name = "PATH")]
         path: String,
         /// Also copy the private key directory, into a directory beside

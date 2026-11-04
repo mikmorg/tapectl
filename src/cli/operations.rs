@@ -3727,28 +3727,43 @@ fn get_file_map(
 /// (`/mnt/usb/tapectl.db` → `/mnt/usb/tapectl.keys/`; `backup` →
 /// `backup.keys/`). Every backup made so far has this layout, so it is kept
 /// as the rule (issue #350) — the help text used to say `<dest>.keys`, which
-/// is only right for a `--to` with no extension.
+/// is only right for a backup file with no extension.
 pub fn keys_backup_path(dest: &Path) -> std::path::PathBuf {
     dest.with_extension("keys")
 }
 
-/// Refuse, by name, a `--to` that cannot be written (issue #350), before
-/// anything is opened. SQLite's own answer to each of these was a bare
-/// `unable to open database file`.
+/// The file `db backup PATH` writes (ADR-0012 item 210, OQ20): `path`
+/// itself, or, when `path` is a directory, `tapectl-YYYYmmddTHHMMSSZ.db`
+/// inside it (`now`, UTC) — the name the scheduled backup gives its copies.
+/// A directory used to be refused with a file name to use instead.
+pub fn backup_file(path: &Path, now: chrono::DateTime<chrono::Utc>) -> std::path::PathBuf {
+    if path.is_dir() {
+        path.join(format!("tapectl-{}.db", now.format("%Y%m%dT%H%M%SZ")))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The refusal of a backup over `path`, which exists: a backup is never
+/// written over another file, and never renamed aside (OQ20).
+fn backup_exists_refusal(path: &Path) -> TapectlError {
+    TapectlError::Other(format!(
+        "db backup refuses: {} exists: name another file (a backup never overwrites one), \
+         or a directory, where it gets a dated name",
+        path.display()
+    ))
+}
+
+/// Refuse, by name, a backup file that cannot be written (issue #350), or
+/// that exists (OQ20), before anything is opened. SQLite's own answer to
+/// each of the first kind was a bare `unable to open database file`.
 ///
-/// A missing directory is refused rather than created: `--to` usually
-/// points at removable or network media, and a mistyped or unmounted path
+/// A missing directory is refused rather than created: the backup usually
+/// goes to removable or network media, and a mistyped or unmounted path
 /// would otherwise quietly grow a directory tree on the local disk and put
 /// the backup — with `--include-keys`, the private keys — where nobody will
 /// look for it.
 fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
-    if dest.is_dir() {
-        return Err(TapectlError::Other(format!(
-            "db backup refuses: --to {} is a directory; --to names the backup FILE, e.g. {}",
-            dest.display(),
-            dest.join("tapectl.db").display()
-        )));
-    }
     let dir = match dest.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -3763,45 +3778,65 @@ fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
     }
     if !dir.is_dir() {
         return Err(TapectlError::Other(format!(
-            "db backup refuses: {} is not a directory, so --to {} cannot be written",
+            "db backup refuses: {} is not a directory, so {} cannot be written",
             dir.display(),
             dest.display()
         )));
     }
     if include_keys && keys_backup_path(dest) == dest {
         return Err(TapectlError::Other(format!(
-            "db backup refuses: --to {} ends in .keys, which is exactly where --include-keys \
+            "db backup refuses: {} ends in .keys, which is exactly where --include-keys \
              puts the private-key directory — the database file and the key directory would \
-             be the same path; give --to another extension, e.g. .db",
+             be the same path; give the backup file another extension, e.g. .db",
             dest.display()
+        )));
+    }
+    // A dangling symlink is there too: `symlink_metadata`, not `exists`.
+    if dest.symlink_metadata().is_ok() {
+        return Err(backup_exists_refusal(dest));
+    }
+    let keys = keys_backup_path(dest);
+    if include_keys && keys.symlink_metadata().is_ok() {
+        return Err(TapectlError::Other(format!(
+            "db backup refuses: {} exists, and --include-keys copies the private keys there: \
+             name another backup file",
+            keys.display()
         )));
     }
     Ok(())
 }
 
-/// Create `path` empty with mode 0600 when it does not exist, so SQLite
-/// opens an inode that was never readable by anyone else (and gives its
-/// journal the same mode). An existing file is left exactly as it is — the
-/// caller tightens it afterwards — and a failure is ignored: SQLite's own
-/// open reports an unwritable destination, by name.
-fn precreate_private_file(path: &Path) {
+/// Create `path` empty with mode 0600, so SQLite opens an inode that was
+/// never readable by anyone else (and gives its journal the same mode).
+/// `create_new`: a file that appeared after [`check_backup_destination`]
+/// is refused too, never written over (OQ20). Any other failure is left to
+/// SQLite's own open, which reports an unwritable destination by name.
+fn precreate_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let _ = fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .mode(0o600)
-        .open(path);
+        .open(path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(backup_exists_refusal(path))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What a real `db backup` copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupReport {
+    /// The file written: `PATH`, or the dated file in the directory `PATH`
+    /// named ([`backup_file`]).
+    pub file: std::path::PathBuf,
     /// Where the private keys went — `None` without `--include-keys`, or
     /// when there was no key directory to copy — so the caller can name it
     /// (issue #350).
     pub keys_dir: Option<std::path::PathBuf>,
-    /// The size of the database file written at `--to` (issue #310): what
+    /// The size of the database file written (issue #310): what
     /// grows with the never-pruned journals is the time this copy takes.
     pub db_bytes: u64,
     /// The summed size of the key files copied; 0 when none were.
@@ -3827,8 +3862,10 @@ pub fn db_backup(
     dry_run: bool,
     json_output: bool,
 ) -> Result<Option<BackupReport>> {
-    check_backup_destination(Path::new(dest), include_keys)?;
-    let keys_backup = keys_backup_path(Path::new(dest));
+    let file = backup_file(Path::new(dest), chrono::Utc::now());
+    check_backup_destination(&file, include_keys)?;
+    let keys_backup = keys_backup_path(&file);
+    let dest = file.display().to_string();
 
     if dry_run {
         let keys_dir = (include_keys && paths.keys_dir.exists()).then_some(&keys_backup);
@@ -3864,19 +3901,20 @@ pub fn db_backup(
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
     // Issue #459 item 4: the backup is the whole catalog — every tenant's
     // unit names and paths — so it is private like the live one (`db::open`
-    // makes the live file 0600). A new file is created 0600 FROM THE FIRST
-    // byte rather than at the process umask and tightened afterwards, and an
-    // existing destination is tightened below. Best effort throughout, as
-    // `secure_path` is: the destination may be removable or foreign-owned
-    // media that cannot be chmod'ed, and that is no reason to fail a backup.
-    precreate_private_file(Path::new(dest));
-    let mut dst_conn = rusqlite::Connection::open(dest)?;
+    // makes the live file 0600). The file is created 0600 FROM THE FIRST
+    // byte rather than at the process umask and tightened afterwards (and
+    // tightened again below). Best effort, as `secure_path` is: the
+    // destination may be removable or foreign-owned media that cannot be
+    // chmod'ed, and that is no reason to fail a backup. Only a file that is
+    // there already refuses (OQ20).
+    precreate_private_file(&file)?;
+    let mut dst_conn = rusqlite::Connection::open(&file)?;
 
     copy_database_in_one_step(&src_conn, &mut dst_conn)?;
     // Closed before it is measured, so the size is the finished file's.
     drop(dst_conn);
-    crate::config::secure_path(Path::new(dest), 0o600);
-    let db_bytes = fs::metadata(dest)?.len();
+    crate::config::secure_path(&file, 0o600);
+    let db_bytes = fs::metadata(&file)?.len();
 
     // Issue #40: unconditionally copying every private key to an arbitrary
     // operator-chosen destination (USB stick, network share, cloud-synced
@@ -3901,8 +3939,9 @@ pub fn db_backup(
         info!("--include-keys not set; private keys were not copied to this backup");
     }
 
-    info!(dest = dest, bytes = db_bytes, "database backup complete");
+    info!(dest = %dest, bytes = db_bytes, "database backup complete");
     Ok(Some(BackupReport {
+        file,
         keys_dir: keys_copied_to,
         db_bytes,
         keys_bytes,
@@ -9954,29 +9993,98 @@ mod tests {
             );
         }
 
-        /// Issue #459 item 4: `db backup X` wrote X at the process umask
-        /// (0644 under the usual 022) — the whole catalog, readable by every
-        /// local user — and only the scheduled wrapper chmod'ed it. An
-        /// EXISTING destination at a looser mode is the deterministic form
-        /// (the test never touches the process-wide umask): SQLite reuses
-        /// the inode, so before the fix it stayed 0644.
+        /// OQ20 (ADR-0012 item 210): a backup never overwrites a file. Until
+        /// 1.9.0 an existing destination was written over (and tightened to
+        /// 0600, issue #459 item 4); it is refused now, by name, and left
+        /// exactly as it was, dry run included.
         #[test]
-        fn the_backup_file_is_0600_even_over_a_world_readable_destination() {
+        fn an_existing_backup_file_is_refused_and_left_as_it_was() {
             let (_tmp, paths) = temp_home_with_a_key();
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
-            fs::write(&dest, b"").unwrap();
+            fs::write(&dest, b"an older backup").unwrap();
             fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
 
+            for dry_run in [true, false] {
+                let err = db_backup(&paths, dest.to_str().unwrap(), false, dry_run, false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!("{} exists: name another file", dest.display())),
+                    "dry_run={dry_run}: {err}"
+                );
+            }
+            assert_eq!(fs::read(&dest).unwrap(), b"an older backup");
+            assert_eq!(mode_of(&dest), 0o644, "not touched at all");
+
+            // A dangling symlink is a file there too.
+            let link = dest_tmp.path().join("link.db");
+            std::os::unix::fs::symlink(dest_tmp.path().join("nowhere"), &link).unwrap();
+            let err = db_backup(&paths, link.to_str().unwrap(), false, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("exists: name another file"), "{err}");
+            assert!(!dest_tmp.path().join("nowhere").exists());
+        }
+
+        /// ...and with `--include-keys`, neither is the keys directory
+        /// beside it.
+        #[test]
+        fn an_existing_keys_directory_is_refused_with_include_keys() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+            fs::create_dir(dest_tmp.path().join("backup.keys")).unwrap();
+
+            let err = db_backup(&paths, dest.to_str().unwrap(), true, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("backup.keys exists"), "{err}");
+            assert!(!dest.exists(), "nothing was written");
+            // Without the flag the keys directory is not the backup's.
             db_backup(&paths, dest.to_str().unwrap(), false, false, false)
                 .unwrap()
                 .expect("a real backup");
-
-            assert_eq!(mode_of(&dest), 0o600, "the catalog copy must be private");
-            drop(crate::db::open(&dest).unwrap());
+            assert!(dest.exists());
         }
 
-        /// ...and a NEW destination is private too, with the private-key
+        /// OQ20: a directory gets `tapectl-YYYYmmddTHHMMSSZ.db`, the
+        /// scheduled backup's name; a file path is itself.
+        #[test]
+        fn a_directory_gets_the_scheduled_backups_dated_name() {
+            use chrono::TimeZone;
+            let dir = TempDir::new().unwrap();
+            let at = chrono::Utc.with_ymd_and_hms(2026, 11, 4, 10, 30, 5).unwrap();
+            assert_eq!(
+                backup_file(dir.path(), at),
+                dir.path().join("tapectl-20261104T103005Z.db")
+            );
+            let file = dir.path().join("mine.db");
+            assert_eq!(backup_file(&file, at), file);
+
+            let (_tmp, paths) = temp_home_with_a_key();
+            let report = db_backup(&paths, dir.path().to_str().unwrap(), true, false, false)
+                .unwrap()
+                .expect("a real backup");
+            let name = report.file.file_name().unwrap().to_str().unwrap().to_owned();
+            assert_eq!(report.file.parent(), Some(dir.path()));
+            assert!(
+                name.len() == "tapectl-YYYYmmddTHHMMSSZ.db".len()
+                    && name.starts_with("tapectl-")
+                    && name.ends_with("Z.db"),
+                "{name}"
+            );
+            assert!(report.file.is_file());
+            assert_eq!(mode_of(&report.file), 0o600);
+            assert_eq!(
+                report.keys_dir.as_deref(),
+                Some(report.file.with_extension("keys").as_path())
+            );
+        }
+
+        /// Issue #459 item 4: `db backup X` wrote X at the process umask
+        /// (0644 under the usual 022), the whole catalog readable by every
+        /// local user. The file is created 0600, with the private-key
         /// directory beside it 0700 (it already was: `copy_dir_all`).
         #[test]
         fn a_new_backup_file_is_0600_and_so_is_its_key_directory_0700() {

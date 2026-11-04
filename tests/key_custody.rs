@@ -516,22 +516,41 @@ fn db_backup_refuses_a_destination_that_is_its_own_keys_directory() {
     assert!(!dest.exists(), "the refusal must not have written anything");
 }
 
-/// `--to /mnt/usb` — a directory, the natural thing to type — used to come
-/// back as `unable to open database file`. Refused with the file name to use.
+/// `db backup /mnt/usb` — a directory, the natural thing to type — came back
+/// as `unable to open database file` (#350), then as a refusal naming a file
+/// to use. From 1.9.0 (ADR-0012 item 210, OQ20) a directory gets the
+/// scheduled backup's dated name, `tapectl-YYYYmmddTHHMMSSZ.db`, which the
+/// output names; and a file that exists is refused, never overwritten.
 #[test]
-fn db_backup_refuses_a_directory_as_the_destination_and_suggests_a_file() {
+fn db_backup_into_a_directory_writes_the_dated_file_and_never_overwrites() {
     let home = init_home();
     let h = home.path();
     let usb = h.join("usb");
     std::fs::create_dir(&usb).unwrap();
-    let err = refused(h, &["db", "backup", usb.to_str().unwrap()]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&ok(
+        h,
+        &["--json", "db", "backup", usb.to_str().unwrap()],
+    )))
+    .unwrap();
+    let written: Vec<std::path::PathBuf> = std::fs::read_dir(&usb)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(written.len(), 1, "one file: {written:?}");
+    let name = written[0].file_name().unwrap().to_str().unwrap();
     assert!(
-        err.contains("is a directory") && err.contains(usb.join("tapectl.db").to_str().unwrap()),
+        name.starts_with("tapectl-")
+            && name.ends_with("Z.db")
+            && name.len() == "tapectl-YYYYmmddTHHMMSSZ.db".len(),
+        "{name}"
+    );
+    assert_eq!(json["backup"], written[0].to_str().unwrap(), "{json}");
+
+    let before = std::fs::read(&written[0]).unwrap();
+    let err = refused(h, &["db", "backup", written[0].to_str().unwrap()]);
+    assert!(
+        err.contains(&format!("{} exists: name another file", written[0].display())),
         "{err}"
     );
-    assert_eq!(
-        std::fs::read_dir(&usb).unwrap().count(),
-        0,
-        "nothing written"
-    );
+    assert_eq!(std::fs::read(&written[0]).unwrap(), before, "not overwritten");
 }
