@@ -1075,7 +1075,18 @@ fn cartridge_erase_command(
 ) -> Result<()> {
     use crate::volume::erase::{self, EraseOptions, EraseOutcome};
     let device = crate::cli::write_device(config, device)?;
-    let report = erase::cartridge_erase(
+    // ADR-0012 item 216: the facts, once, before a refusal or the consent
+    // they rest on. Under `--json` on stderr: stdout is the report alone.
+    let mut show = |facts: &[String]| {
+        for line in facts {
+            if json_output {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+    };
+    let report = erase::cartridge_erase_showing(
         conn,
         config,
         &device,
@@ -1089,6 +1100,7 @@ fn cartridge_erase_command(
             dry_run,
             block_size: crate::cli::volume::DEFAULT_BLOCK_SIZE,
         },
+        &mut show,
     )?;
     for w in &report.warnings {
         eprintln!("{w}");
@@ -1102,8 +1114,13 @@ fn cartridge_erase_command(
         println!("{v}");
         return Ok(());
     }
-    for line in report.lines() {
-        println!("{line}");
+    // A dry run and a tape with nothing to erase showed no facts on the way:
+    // they are printed here, with the verdict. An erase showed them before
+    // its consent, so they are not repeated after the reopen.
+    if report.outcome != EraseOutcome::Erased {
+        for line in report.lines() {
+            println!("{line}");
+        }
     }
     match report.outcome {
         EraseOutcome::NothingToErase => println!("nothing erased."),
@@ -1117,7 +1134,7 @@ fn cartridge_erase_command(
         }
         EraseOutcome::Erased => {
             println!(
-                "{} erase done; read back: {}; chip serial {}",
+                "{} erase done; read back: {}; {}",
                 report.mode,
                 match report.medium_after {
                     Some(erase::MediumKind::Blank) => "blank",
@@ -1127,8 +1144,8 @@ fn cartridge_erase_command(
                 report
                     .chip_serial_after
                     .as_deref()
-                    .map(|s| format!("{s} (unchanged)"))
-                    .unwrap_or_else(|| "(none reported)".to_string())
+                    .map(|s| format!("chip serial unchanged ({s})"))
+                    .unwrap_or_else(|| "chip serial (none reported)".to_string())
             );
             if let Some(r) = &report.recorded {
                 if let Some(c) = &r.cartridge {

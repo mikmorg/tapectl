@@ -18,11 +18,20 @@
 //!    catalog has not given up ([`coverage::given_up`]: anything but
 //!    `retired`/`erased`) is refused, naming `volume retire` — the only way to
 //!    give one up. A tape and catalog that disagree about which cartridge a
-//!    volume is on are refused too. `--dry-run` stops here.
+//!    volume is on are refused too. Every fact is gathered before any of
+//!    these refusals, so the facts are complete when they are shown.
+//!    `--dry-run` stops here.
 //! 3. **Consent** is the label just read from File 0, typed (for a tape
 //!    tapectl did not write, the chip serial): at a terminal, or as
 //!    `--confirm-label`, which must equal it. `--yes` never gives it
-//!    ([`crate::cli::consent::confirm_typed`]).
+//!    ([`crate::cli::consent::confirm_typed`]). The prompt names whose
+//!    volume the tape holds ([`EraseReport::consent_action`]).
+//!
+//! The facts ([`EraseReport::lines`]) are shown once, through the caller's
+//! `show` ([`cartridge_erase_showing`]), before any refusal from step 2 on
+//! and before consent is asked, whether or not stdin is a terminal (ADR-0012
+//! item 216). A dry run and a tape with nothing to erase return them in the
+//! report instead, for the caller to print with its verdict.
 //!    No erase runs without a chip serial read in step 1: nothing else
 //!    proves afterwards which cartridge was erased, or records it.
 //! 4. **Erase.** The drive is reopened read-write; File 0 is read again and
@@ -268,27 +277,83 @@ impl EraseReport {
         }
         out
     }
+
+    /// What consent is asked for, naming whose volume the tape holds as the
+    /// facts say (ADR-0012 item 216): `short ERASE the tape in <device>
+    /// (UPG-1, another catalog's volume)`.
+    pub fn consent_action(&self) -> String {
+        format!(
+            "{} ERASE the tape in {} ({})",
+            self.mode,
+            self.device,
+            self.whose()
+        )
+    }
+
+    /// Whose volume the tape holds: this catalog's (found by File 0's uuid,
+    /// with its status), another catalog's (a uuid this catalog does not
+    /// know), or what the medium is when it holds no tapectl volume.
+    fn whose(&self) -> String {
+        let file0 = self.file0.as_ref();
+        let label = file0.and_then(|f| f.label.as_deref());
+        match (self.medium, label) {
+            (MediumKind::Tapectl, Some(label)) => {
+                match self.catalog_volumes.iter().find(|v| v.matched_by == "uuid") {
+                    Some(v) if v.label == label => {
+                        format!("{label}, this catalog's {} volume", v.status)
+                    }
+                    Some(v) => format!(
+                        "{label}, this catalog's {} volume \"{}\"",
+                        v.status, v.label
+                    ),
+                    None if file0.and_then(|f| f.uuid.as_ref()).is_some() => {
+                        format!("{label}, another catalog's volume")
+                    }
+                    None => format!("{label}, {}", self.medium.describe()),
+                }
+            }
+            (kind, _) => kind.describe().to_string(),
+        }
+    }
 }
 
 /// `tapectl cartridge erase` on `device`, the production seams: the drive's
-/// own chip, the real contact.
+/// own chip, the real contact. The facts are shown nowhere: the caller
+/// prints the report. [`cartridge_erase_showing`] is the command's.
 pub fn cartridge_erase(
     conn: &Connection,
     config: &Config,
     device: &str,
     opts: EraseOptions<'_>,
 ) -> Result<EraseReport> {
+    cartridge_erase_showing(conn, config, device, opts, &mut |_| {})
+}
+
+/// [`cartridge_erase`], with `show` given the facts ([`EraseReport::lines`])
+/// once, at the point they must be seen: before a refusal from the catalog
+/// cross-check on, and before consent is asked (ADR-0012 item 216). A dry
+/// run, or a tape with nothing to erase, does not call it: the report it
+/// returns carries the facts.
+pub fn cartridge_erase_showing(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    opts: EraseOptions<'_>,
+    show: &mut dyn FnMut(&[String]),
+) -> Result<EraseReport> {
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
     let sg = backend.device_sg.clone();
     let mut chip = || media_detect::detect(device, &sg);
     let mut contact = ContactSlot::empty();
-    let r = erase_with(conn, config, device, opts, &mut contact, &mut chip);
+    let r = erase_with_showing(conn, config, device, opts, &mut contact, &mut chip, show);
     contact.finish_result(r)
 }
 
 /// [`cartridge_erase`] with the chip and the contact's test seams injected.
 /// The store is opened through `TapeStore::open`/`open_read`, which a test
-/// replaces with an in-memory tape (`store::injected`).
+/// replaces with an in-memory tape (`store::injected`). The facts are shown
+/// nowhere; the write path's tests drive the erase through it.
+#[cfg(test)]
 pub(crate) fn erase_with<'c>(
     conn: &'c Connection,
     config: &Config,
@@ -296,6 +361,19 @@ pub(crate) fn erase_with<'c>(
     opts: EraseOptions<'_>,
     contact: &mut ContactSlot<'c>,
     chip: &mut dyn FnMut() -> Detected,
+) -> Result<EraseReport> {
+    erase_with_showing(conn, config, device, opts, contact, chip, &mut |_| {})
+}
+
+/// [`erase_with`], the facts given to `show` ([`cartridge_erase_showing`]).
+pub(crate) fn erase_with_showing<'c>(
+    conn: &'c Connection,
+    config: &Config,
+    device: &str,
+    opts: EraseOptions<'_>,
+    contact: &mut ContactSlot<'c>,
+    chip: &mut dyn FnMut() -> Detected,
+    show: &mut dyn FnMut(&[String]),
 ) -> Result<EraseReport> {
     // STRICT, as every write path (ADR-0010): an erase writes.
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
@@ -326,7 +404,7 @@ pub(crate) fn erase_with<'c>(
         &before.capture,
     );
 
-    let r = erase_in_contact(conn, device, opts, drive_gen, &before, chip, guard);
+    let r = erase_in_contact(conn, device, opts, drive_gen, &before, chip, guard, show);
 
     // One post-command sweep, on every outcome the contact saw (ADR-0013's
     // 2026-09-23 evening amendment). Best-effort.
@@ -501,7 +579,8 @@ struct CrossChecked {
 }
 
 /// Step 2: the catalog, by File 0's uuid and by the chip serial. Read-only;
-/// every refusal here leaves the tape untouched.
+/// every refusal here leaves the tape untouched. Every fact is in `report`
+/// before the first refusal, so the facts shown with a refusal are whole.
 fn cross_check(
     conn: &Connection,
     device: &str,
@@ -512,27 +591,29 @@ fn cross_check(
     // operator claim — through the one lookup `volume init` uses; it refuses
     // an ambiguous claim itself.
     let cartridge = binding::lookup_cartridge(conn, serial, None)?.row;
-    if let (None, Some(s)) = (&cartridge, serial) {
-        // The cartridge will be registered under its serial in step 6; a row
-        // already wearing that serial as its BARCODE would collide there,
-        // after the tape is erased. Refuse now, with the remedies
-        // `register_from_chip` names.
-        if binding::select_cartridge(conn, "barcode", s)?.is_some() {
-            return Err(TapectlError::Other(format!(
+    // The cartridge will be registered under its serial in step 6; a row
+    // already wearing that serial as its BARCODE would collide there, after
+    // the tape is erased. Refused below, with the remedies
+    // `register_from_chip` names.
+    let barcode_collision = match (&cartridge, serial) {
+        (None, Some(s)) if binding::select_cartridge(conn, "barcode", s)?.is_some() => {
+            Some(TapectlError::Other(format!(
                 "cartridge erase refused: the chip reports serial {s}, which no cartridge \
                  carries as its serial, but a cartridge is registered under the BARCODE \
                  \"{s}\". tapectl cannot tell whether it is this cartridge. If it is: \
                  `tapectl cartridge edit {s} --serial {s}`, then erase. If it is not: \
                  `tapectl cartridge relabel {s} <new-barcode>`. Nothing was written."
-            )));
+            )))
         }
-    }
+        _ => None,
+    };
     report.catalog_cartridge = cartridge.as_ref().map(|c| CatalogCartridge {
         barcode: c.barcode.clone(),
         status: c.status.clone(),
     });
 
     let mut volumes: Vec<CatalogVolume> = Vec::new();
+    let mut contradiction: Option<TapectlError> = None;
     let file0_uuid = report.file0.as_ref().and_then(|f| f.uuid.clone());
     if let Some(uuid) = &file0_uuid {
         let row = conn
@@ -566,7 +647,7 @@ fn cross_check(
                 .optional()?;
             if let (Some((barcode, Some(recorded))), Some(loaded)) = (&mounted_on, serial) {
                 if recorded != loaded {
-                    return Err(TapectlError::Other(format!(
+                    contradiction = Some(TapectlError::Other(format!(
                         "cartridge erase refused: File 0 names volume \"{}\" (uuid {uuid}), \
                          which the catalog has on cartridge {barcode} (serial {recorded}), \
                          but the chip in {device} reports serial {loaded}. The tape and the \
@@ -629,6 +710,11 @@ fn cross_check(
     }
     report.catalog_volumes = volumes.clone();
 
+    // The refusals, in the order they have always had, now that every fact
+    // is in the report.
+    if let Some(refusal) = barcode_collision.or(contradiction) {
+        return Err(refusal);
+    }
     for v in &volumes {
         if !coverage::is_given_up(conn, v.id)? {
             let copy = if coverage::counts_as_copy(conn, &v.label)? {
@@ -658,6 +744,7 @@ fn cross_check(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn erase_in_contact(
     conn: &Connection,
     device: &str,
@@ -666,6 +753,7 @@ fn erase_in_contact(
     before: &Detected,
     chip: &mut dyn FnMut() -> Detected,
     guard: &crate::tape::contact::ContactGuard<'_>,
+    show: &mut dyn FnMut(&[String]),
 ) -> Result<EraseReport> {
     let serial = before.mam.serial.as_deref();
 
@@ -707,7 +795,15 @@ fn erase_in_contact(
     }
 
     // ── 2. cross-check the catalog ──
-    let checked = cross_check(conn, device, &mut report, serial)?;
+    // From here every refusal follows the facts it rests on, shown once
+    // (ADR-0012 item 216), whether or not stdin is a terminal.
+    let checked = match cross_check(conn, device, &mut report, serial) {
+        Ok(checked) => checked,
+        Err(e) => {
+            show(&report.lines());
+            return Err(e);
+        }
+    };
     // Without the chip serial nothing proves afterwards that the cartridge
     // erased is the one identified, and nothing records it by serial (item
     // 51), so no erase runs. A dry run still reports what the tape is, with
@@ -724,6 +820,7 @@ fn erase_in_contact(
         report.outcome = EraseOutcome::WouldErase;
         return Ok(report);
     }
+    show(&report.lines());
     let Some(serial) = serial else {
         return Err(TapectlError::Other(format!(
             "cartridge erase refused: the chip serial of the cartridge in {device} could not \
@@ -738,16 +835,12 @@ fn erase_in_contact(
 
     // ── 3. consent: the word read from the tape, typed ──
     // File 0's label, else the chip serial — always one, the serial now read.
+    // The facts were shown above, so the consent gate shows none of its own.
     let word = report
         .confirm_label
         .clone()
         .unwrap_or_else(|| serial.to_string());
-    let action = format!(
-        "{} ERASE the tape in {device} ({})",
-        opts.mode.as_str(),
-        report.medium.describe()
-    );
-    crate::cli::consent::confirm_typed(&action, &report.lines(), &word, opts.confirm_label)?;
+    crate::cli::consent::confirm_typed(&report.consent_action(), &[], &word, opts.confirm_label)?;
 
     // ── 4. erase ──
     let mut store = TapeStore::open(device, opts.block_size, 0)?;
@@ -1177,6 +1270,17 @@ mod tests {
         serials: &[Option<&str>],
         life_written_mib: Option<i64>,
     ) -> Result<EraseReport> {
+        run_showing(conn, fake, o, serials, life_written_mib).0
+    }
+
+    /// [`run_with`], with every block of facts the erase showed, in order.
+    fn run_showing(
+        conn: &Connection,
+        fake: &FakeTape,
+        o: EraseOptions<'_>,
+        serials: &[Option<&str>],
+        life_written_mib: Option<i64>,
+    ) -> (Result<EraseReport>, Vec<Vec<String>>) {
         let _drive = InjectedDrive::install(fake);
         let mut reads: std::collections::VecDeque<Option<&str>> = serials.iter().copied().collect();
         let mut last = serials[0];
@@ -1195,8 +1299,17 @@ mod tests {
             model: Some("Ultrium 6-SCSI".into()),
             firmware_rev: Some("35GD".into()),
         });
-        let r = erase_with(conn, &config, DEVICE, o, &mut slot, &mut chip);
-        slot.finish_result(r)
+        let mut shown: Vec<Vec<String>> = Vec::new();
+        let r = erase_with_showing(
+            conn,
+            &config,
+            DEVICE,
+            o,
+            &mut slot,
+            &mut chip,
+            &mut |facts| shown.push(facts.to_vec()),
+        );
+        (slot.finish_result(r), shown)
     }
 
     fn exit_code(e: TapectlError) -> i32 {
@@ -2003,5 +2116,121 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("BARCODE"), "{err}");
         assert!(writes(&fake).is_empty());
+    }
+
+    /// ADR-0012 item 216: the facts come once, BEFORE the refusal they
+    /// explain, on piped stdin (a test's stdin is never a terminal) — never
+    /// folded into the refusal after it. The same for a refusal from the
+    /// catalog cross-check, with or without `--dry-run`; and an erase that
+    /// goes ahead shows them once, before its consent.
+    #[test]
+    fn the_facts_come_once_before_the_refusal_on_piped_stdin() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = sealed_tape("L6-0001");
+        let (r, shown) = run_showing(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, false),
+            &[Some(SERIAL)],
+            None,
+        );
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("non-interactive session"), "{err}");
+        assert_eq!(shown.len(), 1, "once: {shown:?}");
+        assert!(
+            shown[0].iter().any(|l| l.contains("File 0 label: L6-0001")),
+            "{shown:?}"
+        );
+        assert!(
+            !err.contains("chip serial:") && !err.contains("File 0 label:"),
+            "the facts precede the refusal, not follow it inside: {err}"
+        );
+
+        // A refusal from the cross-check: the catalog's own line is there.
+        let conn = crate::db::open_memory().unwrap();
+        add_volume(&conn, "L6-0001", UUID, "sealed");
+        for dry_run in [true, false] {
+            let (r, shown) = run_showing(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, Some("L6-0001"), dry_run),
+                &[Some(SERIAL)],
+                None,
+            );
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("tapectl volume retire L6-0001"), "{err}");
+            assert_eq!(shown.len(), 1, "dry run {dry_run}: {shown:?}");
+            assert!(
+                shown[0]
+                    .iter()
+                    .any(|l| l.contains("catalog:      volume L6-0001 — sealed")),
+                "dry run {dry_run}: {shown:?}"
+            );
+        }
+
+        // Going ahead: once, before the consent. A dry run that passes shows
+        // nothing here: its report is what the command prints.
+        let conn = crate::db::open_memory().unwrap();
+        let (r, shown) = run_showing(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, true),
+            &[Some(SERIAL)],
+            None,
+        );
+        assert_eq!(r.unwrap().outcome, EraseOutcome::WouldErase);
+        assert!(shown.is_empty(), "{shown:?}");
+        let (r, shown) = run_showing(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some("L6-0001"), false),
+            &[Some(SERIAL)],
+            None,
+        );
+        assert_eq!(r.unwrap().outcome, EraseOutcome::Erased);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+    }
+
+    /// ADR-0012 item 216: the consent names whose volume the tape holds, as
+    /// the facts say — another catalog's (a uuid this catalog does not
+    /// know), this catalog's own (given up, with its status), or no volume
+    /// at all.
+    #[test]
+    fn the_consent_names_whose_volume_the_tape_holds() {
+        let consent = |conn: &Connection, fake: &FakeTape| {
+            run(
+                conn,
+                fake,
+                opts(EraseMode::Short, None, false),
+                &[Some(SERIAL)],
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        let conn = crate::db::open_memory().unwrap();
+        let err = consent(&conn, &sealed_tape("UPG-1"));
+        assert!(
+            err.starts_with(&format!(
+                "short ERASE the tape in {DEVICE} (UPG-1, another catalog's volume) refused"
+            )),
+            "{err}"
+        );
+
+        let conn = crate::db::open_memory().unwrap();
+        let c = add_cartridge(&conn, "L6-0001", SERIAL, "pending_erase");
+        let v = add_volume(&conn, "L6-0001", UUID, "retired");
+        mount(&conn, c, v);
+        let err = consent(&conn, &sealed_tape("L6-0001"));
+        assert!(
+            err.contains("(L6-0001, this catalog's retired volume)"),
+            "{err}"
+        );
+
+        let conn = crate::db::open_memory().unwrap();
+        let foreign = FakeTape::with_files(vec![pad(b"tar archive, not ours".to_vec())], BS);
+        let err = consent(&conn, &foreign);
+        assert!(err.contains("(not written by tapectl)"), "{err}");
+        assert!(err.contains(&format!("--confirm-label {SERIAL}")), "{err}");
     }
 }

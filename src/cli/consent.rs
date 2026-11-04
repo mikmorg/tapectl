@@ -185,7 +185,7 @@ pub(crate) fn confirm_typed_with(
     for fact in facts {
         eprintln!("{fact}");
     }
-    eprint!("{action} — type {expected} to proceed: ");
+    eprint!("{action} — type {expected} to erase it: ");
     let _ = std::io::stderr().flush();
     let input = read_answer()?;
     if input.trim() == expected {
