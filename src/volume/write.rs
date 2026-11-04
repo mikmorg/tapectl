@@ -27813,14 +27813,14 @@ mod tests {
                     );
                     assert!(
                         out.contains(&format!(
-                            "  stage set {id}: slice(s) 1-2 released, each now has its copies \
+                            "  stage set {id}: slices 1-2 released, each now has its copies \
                              (the set spans cartridges and is released slice by slice)"
                         )),
                         "{out:?}"
                     );
                     assert!(
                         out.iter().any(|l| l.starts_with(&format!(
-                            "  stage set {id} kept in part: slice(s) 3 are short of copies"
+                            "  stage set {id} kept in part: slice 3 is short of copies"
                         ))),
                         "{out:?}"
                     );

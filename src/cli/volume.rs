@@ -1359,17 +1359,26 @@ fn slice_release_lines(r: &crate::staging::clean::CleanReport) -> Vec<String> {
     use crate::staging::clean::describe_slice_numbers;
     let released = r.slices_released.iter().map(|(id, slices)| {
         format!(
-            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
+            "  stage set {id}: {} {} released, each now has its copies (the set spans \
              cartridges and is released slice by slice)",
+            if slices.len() == 1 { "slice" } else { "slices" },
             describe_slice_numbers(slices)
         )
     });
     let short = r.slices_short.iter().map(|(id, slices)| {
         format!(
-            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
-             span; `tapectl volume write <LABEL>` onto another cartridge of the same generation \
-             writes them",
-            describe_slice_numbers(slices)
+            "  stage set {id} kept in part: {} {} {} short of copies and {} its span; \
+             `tapectl volume write <LABEL>` onto another cartridge of the same generation writes \
+             {}",
+            if slices.len() == 1 { "slice" } else { "slices" },
+            describe_slice_numbers(slices),
+            if slices.len() == 1 { "is" } else { "are" },
+            if slices.len() == 1 {
+                "continues"
+            } else {
+                "continue"
+            },
+            if slices.len() == 1 { "it" } else { "them" }
         )
     });
     released.chain(short).collect()
