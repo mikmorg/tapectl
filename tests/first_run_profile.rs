@@ -381,6 +381,159 @@ fn step_7_names_the_staging_parent_the_account_cannot_traverse() {
     assert!(out.contains(&format!("staging at {s}")), "{out}");
 }
 
+// ---------------------------------------------------------------- step 8
+
+/// Step 8 alone on `home`, with `/dev/null` as the drive: `drive add` writes a
+/// device it cannot find a sg node for (a warning, never a refusal), and the
+/// drive's facts (sysfs, `mt status`) are unreadable, which the step says.
+fn step8(rig: &Rig, profile: &Path, home: &Path) -> Output {
+    let path = sudo_stub_path(rig);
+    rig.command(&[
+        "--profile",
+        profile.to_str().unwrap(),
+        "--auto",
+        "--from",
+        "8",
+        "--to",
+        "8",
+        "--tapectl",
+        env!("CARGO_BIN_EXE_tapectl"),
+        "--home",
+        home.to_str().unwrap(),
+        "--device",
+        "/dev/null",
+        "--generation",
+        "LTO-6",
+    ])
+    .env("PATH", path)
+    .output()
+    .expect("spawn first-run.sh")
+}
+
+fn initialised_home(rig: &Rig) -> PathBuf {
+    let home = rig.p("tapectl-home");
+    tapectl_at(
+        rig,
+        &home,
+        &["init", "--operator", "fr-tester", "--no-escrow"],
+    );
+    home
+}
+
+/// The uncommented `post_warning_bytes` lines of a config.
+fn post_warning_lines(cfg: &str) -> Vec<&str> {
+    cfg.lines()
+        .filter(|l| l.trim_start().starts_with("post_warning_bytes"))
+        .collect()
+}
+
+/// ADR-0012 item 200: the profile's `POST_WARNING_BYTES` becomes the drive's
+/// `post_warning_bytes` right after `drive add`. A re-run finds the drive
+/// already configured and the value already there, says so and changes no
+/// byte; a profile that says otherwise is refused, naming both values, and the
+/// file is left as it was. Without the variable, a drive that has the key is
+/// only reported.
+#[test]
+fn step_8_sets_post_warning_bytes_from_the_profile_and_never_replaces_it() {
+    let rig = Rig::new();
+    let home = initialised_home(&rig);
+    let cfg = home.join("config.toml");
+    let profile = rig.profile("p.profile", "POST_WARNING_BYTES=99008M\n");
+
+    let out = ok(&step8(&rig, &profile, &home));
+    assert!(out.contains("$ tc drive add --name lto6"), "{out}");
+    let set = out
+        .find("$ tc config set backends.lto[lto6].post_warning_bytes 99008M")
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        out.find("$ tc drive add").unwrap() < set,
+        "set after the drive is added: {out}"
+    );
+    assert!(
+        out.contains("drive lto6: post_warning_bytes = 99008M (the profile's POST_WARNING_BYTES)"),
+        "{out}"
+    );
+    let written = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(
+        post_warning_lines(&written),
+        vec!["post_warning_bytes = \"99008M\""],
+        "{written}"
+    );
+
+    // The re-run: the drive exists, the value is the profile's.
+    let out = ok(&step8(&rig, &profile, &home));
+    assert!(
+        out.contains("a [[backends.lto]] entry already exists"),
+        "{out}"
+    );
+    assert!(
+        out.contains("drive lto6: post_warning_bytes = 99008M already, as the profile says"),
+        "{out}"
+    );
+    assert!(!out.contains("config set"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), written);
+
+    // A profile that disagrees with the drive: refused, nothing written.
+    let other = rig.profile("other.profile", "POST_WARNING_BYTES=50000M\n");
+    let o = step8(&rig, &other, &home);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
+    assert!(
+        err.contains(
+            "drive lto6's post_warning_bytes is 99008M, and the profile's POST_WARNING_BYTES is 50000M"
+        ) && err.contains("never replaces")
+            && err.contains("config set 'backends.lto[lto6].post_warning_bytes' 50000M"),
+        "{err}"
+    );
+    assert!(!out.contains("config set"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), written);
+
+    // No POST_WARNING_BYTES: the drive's value is reported, not the notice.
+    let none = rig.profile("none.profile", "OPERATOR=fr-tester\n");
+    let out = ok(&step8(&rig, &none, &home));
+    assert!(
+        out.contains(
+            "drive lto6: post_warning_bytes = 99008M (already set; the profile sets no POST_WARNING_BYTES)"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("has no post_warning_bytes"), "{out}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), written);
+}
+
+/// ADR-0012 item 200: without `POST_WARNING_BYTES`, step 8 says once what a
+/// drive without `post_warning_bytes` loses (planning past the fill ceiling,
+/// item 113; the slice cap, item 100) and where to read about measuring it,
+/// and sets nothing. A re-run says it again, once, and still sets nothing.
+#[test]
+fn step_8_without_post_warning_bytes_says_once_what_is_lost() {
+    let rig = Rig::new();
+    let home = initialised_home(&rig);
+    let cfg = home.join("config.toml");
+    let profile = rig.profile("p.profile", "OPERATOR=fr-tester\n");
+    for run in ["first", "re-run"] {
+        let out = ok(&step8(&rig, &profile, &home));
+        assert_eq!(
+            out.matches("has no post_warning_bytes").count(),
+            1,
+            "{run}: {out}"
+        );
+        assert!(
+            out.contains(
+                "drive lto6 has no post_warning_bytes (the profile sets no POST_WARNING_BYTES)"
+            ) && out.contains("fill ceiling")
+                && out.contains("item 113")
+                && out.contains("slice cap")
+                && out.contains("item 100")
+                && out.contains("docs/lto-profiling.md"),
+            "{run}: {out}"
+        );
+        assert!(!out.contains("config set"), "{run}: {out}");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(post_warning_lines(&written).is_empty(), "{run}: {written}");
+    }
+}
+
 // ---------------------------------------------------------------- step 12
 
 fn stub(dir: &Path, name: &str, body: &str) {

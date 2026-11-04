@@ -17,7 +17,8 @@
 #       under --auto only with --mint-escrow), or adopts ESCROW_PUBLIC_KEY;
 #       with ADOPT_KEYS_FROM, the operator adopts its existing key instead of minting
 #    8  register the drive as a backend, by-id path, generation from the
-#       drive's INQUIRY product id (never from the loaded cartridge)
+#       drive's INQUIRY product id (never from the loaded cartridge), and its
+#       post_warning_bytes from the profile's POST_WARNING_BYTES
 #    9  the Heir Kit — generate, print, seal, two failure domains
 #   10  a shelf location for cartridges
 #   11  tenants and units: who owns which paths; the service user is granted read by ACL;
@@ -86,6 +87,9 @@ VERIFY_INTERVAL_DAYS="" # step 7: [defaults] verify_interval_days, the full-read
                        # and per volume (#453, #454; ADR-0012 items 66-67); empty = leave the config's value
 # CONTENDER_PROCESSES=(…) step 7: [host_check] contender_processes, the WHOLE list (the built-in one is
 #                        cargo rustc docker Runner.Worker; repeat it when adding). Unset = leave the config's value.
+POST_WARNING_BYTES=""  # step 8: the drive's post_warning_bytes, its room past the early warning as scripts/lto-profile.sh
+                       # measured it (decimal, e.g. 99008M; ADR-0012 item 200). Set when the drive has none; a drive that
+                       # already says something else is refused, never overwritten. Empty = step 8 says what is lost.
 DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
 SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<user>)
 LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
@@ -119,7 +123,7 @@ PROFILE_VARS=(
   DEVICE SG DGEN OPERATOR ESCROW_PUBLIC_KEY ADOPT_KEYS_FROM STAGING_DIR STAGING_JOBS
   VERIFY_INTERVAL_DAYS CONTENDER_PROCESSES OPS_GROUP KIT_OUT LOCATIONS LOCATION
   TENANTS TENANT UNIT_PATH COLLECTIONS TEST_BARCODE LABEL CONTENDER_UNITS
-  TAPE_NICE TAPE_IONICE BACKUP_DIR
+  TAPE_NICE TAPE_IONICE BACKUP_DIR POST_WARNING_BYTES
 )
 # The profile is sourced BEFORE the flags are parsed, so every flag overrides it.
 # --profile none runs with no profile at all (ADR-0012 item 187).
@@ -757,6 +761,56 @@ staging_ready() {
   as_svc test -d "$dir" || die "the staging directory $dir is not a directory"
   if ! { as_svc test -w "$dir" && as_svc test -x "$dir"; }; then
     die "$who cannot write the staging directory $dir ($(stat -c '%A %U:%G' "$dir" 2>/dev/null || echo 'mode unreadable')); every directory above it lets $who through. Grant $who write on it, then re-run with --from 7:  sudo setfacl -m u:$who:rwx $dir"
+  fi
+}
+# drive_setting BY VALUE: the configured drive whose name (BY=name) or tape
+# node (BY=device; VALUE is the node its device_tape resolves to) is VALUE, as
+# "NAME<US>PWB", PWB being its post_warning_bytes or empty when it has none;
+# nothing when no drive is. Read from `config show --json`, the file as tapectl
+# loads it. Fails when that cannot be read.
+drive_setting() {
+  local j
+  j="$(tc config show --json 2>/dev/null)" || return 1
+  printf '%s' "$j" | python3 -c 'import json, os, sys
+by, want = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+for b in (d.get("backends") or {}).get("lto") or []:
+    name = b.get("name", "")
+    if (name == want) if by == "name" else (os.path.realpath(b.get("device_tape", "")) == want):
+        v = b.get("post_warning_bytes")
+        print("%s\x1f%s" % (name, "" if v is None else v))
+        break' "$1" "$2"
+}
+# drive_post_warning BY VALUE (ADR-0012 item 200): the profile's
+# POST_WARNING_BYTES onto that drive's post_warning_bytes, the same on a first
+# run and a re-run. Set when the drive has none; left, and said, when it already
+# says the same; never replaced: a drive that says something else is refused,
+# naming both values and both ways on. Without POST_WARNING_BYTES, a drive that
+# has no value gets the notice of what that loses, once, here.
+drive_post_warning() {
+  local hit name cur
+  hit="$(drive_setting "$1" "$2")" \
+    || die "could not read the configured drives ($OP_CMD config show --json failed; $OP_CMD config check says why)"
+  if [ -z "$hit" ]; then
+    [ "$1" = device ] || die "config.toml has no drive named $2 ($OP_CMD config show)"
+    note "no configured drive's device_tape is $2, so its post_warning_bytes is left alone"
+    return 0
+  fi
+  name="${hit%%$'\x1f'*}"; cur="${hit#*$'\x1f'}"
+  if [ -z "$POST_WARNING_BYTES" ]; then
+    if [ -n "$cur" ]; then
+      ok "drive $name: post_warning_bytes = $cur (already set; the profile sets no POST_WARNING_BYTES)"
+    else
+      note "drive $name has no post_warning_bytes (the profile sets no POST_WARNING_BYTES). Without it, a write's plan stops at the fill ceiling instead of reaching the cartridge's nominal capacity (ADR-0012 item 113), and no slice cap keeps a slice and the seal inside the drive's room past its early warning (item 100). Measure the drive with scripts/lto-profile.sh and set the key: docs/lto-profiling.md"
+    fi
+  elif [ -z "$cur" ]; then
+    run tc config set "backends.lto[$name].post_warning_bytes" "$POST_WARNING_BYTES" \
+      || die "could not set drive $name's post_warning_bytes to POST_WARNING_BYTES=$POST_WARNING_BYTES (the refusal above)"
+    ok "drive $name: post_warning_bytes = $POST_WARNING_BYTES (the profile's POST_WARNING_BYTES)"
+  elif [ "$cur" = "$POST_WARNING_BYTES" ]; then
+    ok "drive $name: post_warning_bytes = $cur already, as the profile says"
+  else
+    die "drive $name's post_warning_bytes is $cur, and the profile's POST_WARNING_BYTES is $POST_WARNING_BYTES: this script never replaces a value the drive already has. To take the profile's: $OP_CMD config set 'backends.lto[$name].post_warning_bytes' $POST_WARNING_BYTES; to keep $cur, set POST_WARNING_BYTES=$cur in the profile. Then re-run with --from 8"
   fi
 }
 skip_if() { [ "$FROM" -gt "$STEP" ] && { note "skipped (--from $FROM)"; return 0; }; return 1; }
@@ -1720,10 +1774,11 @@ if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then
     note "config's device_tape ($CFG_TAPE) is not the drive you chose ($DEVICE -> $NST); fix it with \`$OP_CMD config set 'backends.lto[NAME].device_tape' $DEVICE\` (NAME is the block's name), or re-run step 6 with the configured drive"
   fi
   run tc config check || note "config check reported something — read it (an sg/tape pairing warning here becomes a refusal at the write)"
+  drive_post_warning device "$NST"
 else
   derive_nodes
 explain <<'EOF'
-`drive add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010).
+`drive add` appends a [[backends.lto]] table to config.toml with the by-id tape path and the sg node, so volume write knows where to write and the health checks know where to ask. You declare what the DRIVE is — its own generation — and nothing about the tapes you will feed it: each cartridge's generation is read from its density code when the volume is initialised, and that is what fixes the tape's capacity. So one LTO-6 drive handles LTO-5 and LTO-6 cartridges with nothing to change between them, and media the drive cannot write is refused before the tape is touched (ADR-0010). Then the profile's POST_WARNING_BYTES, the room the drive has past its early warning as scripts/lto-profile.sh measured it, becomes the drive's post_warning_bytes (ADR-0012 item 200).
 EOF
   [ -n "$DEVICE" ] || die "no device chosen — run with --from 6"
   ask BNAME "backend name" "lto6"
@@ -1736,11 +1791,13 @@ EOF
   #
   # The drive's identity comes from its own INQUIRY product id. sysfs first:
   # world-readable, opens no device node, needs no sg permission for the
-  # service user, and identical for mhvtl and the real drive.
-  DRIVE_MODEL="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/model" 2>/dev/null | sed 's/[[:space:]]*$//')"
-  DRIVE_VENDOR="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/vendor" 2>/dev/null | sed 's/[[:space:]]*$//')"
+  # service user, and identical for mhvtl and the real drive. Each read ends in
+  # `|| true`: under pipefail a failed read ended the script here without a word
+  # (#506's shape), where the code below already says it is unreadable.
+  DRIVE_MODEL="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/model" 2>/dev/null | sed 's/[[:space:]]*$//' || true)"
+  DRIVE_VENDOR="$(as_svc cat "/sys/class/scsi_tape/$NSTN/device/vendor" 2>/dev/null | sed 's/[[:space:]]*$//' || true)"
   if [ -z "$DRIVE_MODEL" ] && command -v sg_inq >/dev/null 2>&1 && [ -n "$SG" ]; then
-    DRIVE_MODEL="$(as_svc sg_inq "$SG" 2>/dev/null | sed -n 's/^ *Product identification: *//p' | head -1 | sed 's/[[:space:]]*$//')"
+    DRIVE_MODEL="$(as_svc sg_inq "$SG" 2>/dev/null | sed -n 's/^ *Product identification: *//p' | head -1 | sed 's/[[:space:]]*$//' || true)"
   fi
   DRIVE_GEN=""
   if [ -n "$DRIVE_MODEL" ]; then
@@ -1767,7 +1824,7 @@ EOF
 
   # The loaded medium's density is a CROSS-CHECK, evaluated after DGEN is
   # final. It never feeds the default (ADR-0010) and never changes DGEN.
-  MEDIUM_GEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1)"
+  MEDIUM_GEN="$(as_svc mt -f "$DEVICE" status 2>/dev/null | sed -n 's/.*Density code 0x[0-9a-fA-F]* (\([^)]*\)).*/\1/p' | head -1 || true)"
   if [ -z "$MEDIUM_GEN" ]; then
     note "no cartridge loaded or density unreadable — nothing to cross-check"
   else
@@ -1786,6 +1843,7 @@ EOF
   # through sysfs every time the config loads, so an /dev/sgN renumbering never matters.
   run tc drive add --name "$BNAME" --device-tape "$DEVICE" --generation "$DGEN"
   run tc config check || true
+  drive_post_warning name "$BNAME"
 fi
 }
 
