@@ -54,6 +54,11 @@ fn normalize(s: &str) -> String {
 fn commands_with_help() -> Vec<(String, String)> {
     fn walk(cmd: &clap::Command, path: &[String], out: &mut Vec<(String, String)>) {
         for sub in cmd.get_subcommands() {
+            // A hidden command is a stub of a spelling 1.9.0 removed: it
+            // has no page (`examples/gen_man.rs` skips it too).
+            if sub.is_hide_set() {
+                continue;
+            }
             let mut p = path.to_vec();
             p.push(sub.get_name().to_string());
 
