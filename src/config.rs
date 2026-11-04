@@ -3573,9 +3573,7 @@ mod tests {
             let cfg = load_text(&room_config(
                 Some(&format!("40{suffix}")),
                 &format!("1{suffix}"),
-                &format!(
-                    "enospc_buffer = \"2{suffix}\"\ncapacity_override = \"3000{suffix}\"\n"
-                ),
+                &format!("enospc_buffer = \"2{suffix}\"\ncapacity_override = \"3000{suffix}\"\n"),
             ))
             .unwrap();
             let b = &cfg.backends.lto[0];

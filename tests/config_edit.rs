@@ -985,7 +985,10 @@ fn the_existing_key_forms_work_beside_the_new_ones() {
             "99008M",
         ],
     );
-    ok(h, &["config", "set", "backends.lto[0].enospc_buffer", "64M"]);
+    ok(
+        h,
+        &["config", "set", "backends.lto[0].enospc_buffer", "64M"],
+    );
     let shown: serde_json::Value =
         serde_json::from_slice(&ok(h, &["--json", "config", "show"]).stdout).unwrap();
     let drive = &shown["backends"]["lto"][0];
@@ -1006,11 +1009,22 @@ fn the_existing_key_forms_work_beside_the_new_ones() {
     let out = run(h, &["config", "get", "post_warning_bytes"]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     let said = text(&out);
-    assert!(said.contains("backends.lto[drive-a].post_warning_bytes"), "{said}");
-    assert!(said.contains("backends.lto[drive-b].post_warning_bytes"), "{said}");
+    assert!(
+        said.contains("backends.lto[drive-a].post_warning_bytes"),
+        "{said}"
+    );
+    assert!(
+        said.contains("backends.lto[drive-b].post_warning_bytes"),
+        "{said}"
+    );
     ok(
         h,
-        &["config", "set", "backends.lto[drive-b].post_warning_bytes", "40G"],
+        &[
+            "config",
+            "set",
+            "backends.lto[drive-b].post_warning_bytes",
+            "40G",
+        ],
     );
     assert_eq!(
         get_json(h, "backends.lto[drive-b].post_warning_bytes")["value"],
@@ -1092,7 +1106,11 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
     let home = home();
     let h = home.path();
     let out = ok(h, &["config", "check"]);
-    assert!(stdout(&out).starts_with("config: valid\n"), "{}", text(&out));
+    assert!(
+        stdout(&out).starts_with("config: valid\n"),
+        "{}",
+        text(&out)
+    );
     let n = notes(&out);
     assert!(
         n.iter()
@@ -1102,7 +1120,14 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
     let json: serde_json::Value =
         serde_json::from_slice(&ok(h, &["--json", "config", "check"]).stdout).unwrap();
     assert_eq!(json["valid"], true, "{json}");
-    for key in ["problems", "tape_devices", "staging", "dar", "defaults", "ops"] {
+    for key in [
+        "problems",
+        "tape_devices",
+        "staging",
+        "dar",
+        "defaults",
+        "ops",
+    ] {
         assert!(json.get(key).is_some(), "{key} is kept: {json}");
     }
     assert!(
@@ -1129,7 +1154,11 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
     // A collection whose root does not exist, for a tenant that does not.
     with_collection(h, "movies", "/nonexistent/tapectl-config-edit/movies");
     let out = ok(h, &["config", "check"]);
-    assert!(stdout(&out).starts_with("config: valid\n"), "{}", text(&out));
+    assert!(
+        stdout(&out).starts_with("config: valid\n"),
+        "{}",
+        text(&out)
+    );
     let n = notes(&out);
     assert!(
         n.iter()

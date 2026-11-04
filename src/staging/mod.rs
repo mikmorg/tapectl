@@ -2839,10 +2839,7 @@ mod parse_size_to_bytes_tests {
             parse_size_to_bytes("1G").unwrap(),
             parse_size_to_bytes("1GiB").unwrap()
         );
-        assert_eq!(
-            parse_size_to_bytes("99008M").unwrap(),
-            99_008 * 1024 * 1024
-        );
+        assert_eq!(parse_size_to_bytes("99008M").unwrap(), 99_008 * 1024 * 1024);
         assert!(parse_size_to_bytes("1GiBB").is_err());
         assert!(parse_size_to_bytes("1Gi").is_err());
     }

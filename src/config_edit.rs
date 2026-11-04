@@ -709,7 +709,9 @@ fn resolve_key(root: &Table, key: &str) -> Result<Vec<Seg>> {
     let mut segs = parse_key(key)?;
     if let [only] = segs.as_slice() {
         let root_fields = table_fields("", Shape::Table);
-        if only.select.is_none() && !root_fields.contains(&only.key) && !root.contains_key(&only.key)
+        if only.select.is_none()
+            && !root_fields.contains(&only.key)
+            && !root.contains_key(&only.key)
         {
             return resolve_bare(root, &only.key);
         }
@@ -804,10 +806,7 @@ fn resolve_bare(root: &Table, name: &str) -> Result<Vec<Seg>> {
     }
     match candidates.len() {
         1 => Ok(candidates.remove(0)),
-        0 => Err(no_entries(
-            empty_list.as_deref().unwrap_or_default(),
-            name,
-        )),
+        0 => Err(no_entries(empty_list.as_deref().unwrap_or_default(), name)),
         _ => Err(TapectlError::Config(format!(
             "{name} is ambiguous: it is {} keys in this file, so name one: {}",
             candidates.len(),
@@ -1039,7 +1038,9 @@ fn plain_problems(
     let file = path.display().to_string();
     let strip = |p: &str| -> String {
         let p = p.strip_prefix("configuration error: ").unwrap_or(p);
-        p.strip_prefix(&format!("{file}: ")).unwrap_or(p).to_string()
+        p.strip_prefix(&format!("{file}: "))
+            .unwrap_or(p)
+            .to_string()
     };
     let new = |p: &String| before.valid || !before.problems.contains(p);
     let mut out: Vec<String> = Vec::new();
@@ -2001,7 +2002,9 @@ pub fn get(original: &str, effective: &crate::config::Config, key: &str) -> Resu
         Known::Table(fields) => {
             let plain = names.join(".");
             return Err(TapectlError::Config(
-                if shape_of(&plain) == Some(Shape::List) && segs.last().is_some_and(|s| s.select.is_none()) {
+                if shape_of(&plain) == Some(Shape::List)
+                    && segs.last().is_some_and(|s| s.select.is_none())
+                {
                     format!(
                         "{shown} is a list of tables: get a key of one entry, e.g. \
                          {shown}[<name>].{}",
@@ -2119,7 +2122,11 @@ pub fn toml_text_of(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => Value::from(s.as_str()).to_string().trim().to_string(),
         serde_json::Value::Array(items) => format!(
             "[{}]",
-            items.iter().map(toml_text_of).collect::<Vec<_>>().join(", ")
+            items
+                .iter()
+                .map(toml_text_of)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         serde_json::Value::Object(map) => {
             if map.is_empty() {
@@ -2593,7 +2600,10 @@ mod tests {
         ] {
             assert!(keys.iter().any(|x| x == k), "{k} missing from {keys:?}");
         }
-        assert!(!keys.iter().any(|x| x == "backends.lto"), "a table is not a value");
+        assert!(
+            !keys.iter().any(|x| x == "backends.lto"),
+            "a table is not a value"
+        );
     }
 
     #[test]
@@ -2623,8 +2633,14 @@ mod tests {
         let err = resolved(&two_drives(), "post_warning_bytes")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("backends.lto[lto6].post_warning_bytes"), "{err}");
-        assert!(err.contains("backends.lto[spare].post_warning_bytes"), "{err}");
+        assert!(
+            err.contains("backends.lto[lto6].post_warning_bytes"),
+            "{err}"
+        );
+        assert!(
+            err.contains("backends.lto[spare].post_warning_bytes"),
+            "{err}"
+        );
         // None: the drive is what is missing.
         let err = resolved("", "post_warning_bytes").unwrap_err().to_string();
         assert!(err.contains("no drive is configured"), "{err}");
@@ -2808,7 +2824,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("did you mean defaults.global_excludes?"), "{err}");
+        assert!(
+            err.contains("did you mean defaults.global_excludes?"),
+            "{err}"
+        );
         let err = plan(
             original,
             &p(),
@@ -2834,7 +2853,8 @@ mod tests {
     /// last through the sysfs derivation, faked under a temp dir.
     #[test]
     fn get_names_where_each_value_comes_from() {
-        let text = format!("[defaults]\nmin_copies = 3\n\n{ONE_DRIVE}post_warning_bytes = \"99008M\"\n");
+        let text =
+            format!("[defaults]\nmin_copies = 3\n\n{ONE_DRIVE}post_warning_bytes = \"99008M\"\n");
         let cfg = effective(&text);
 
         let got = get(&text, &cfg, "defaults.min_copies").unwrap();
@@ -2889,13 +2909,17 @@ mod tests {
         let err = get(ONE_DRIVE, &cfg, "defaults").unwrap_err().to_string();
         assert!(err.contains("is a table"), "{err}");
         assert!(err.contains("defaults.slice_size"), "{err}");
-        let err = get(ONE_DRIVE, &cfg, "backends.lto").unwrap_err().to_string();
+        let err = get(ONE_DRIVE, &cfg, "backends.lto")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("list of tables"), "{err}");
         let err = get(ONE_DRIVE, &cfg, "defaults.slice_sizee")
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("defaults.slice_sizee is not a config key — did you mean defaults.slice_size?"),
+            err.contains(
+                "defaults.slice_sizee is not a config key — did you mean defaults.slice_size?"
+            ),
             "{err}"
         );
         let err = get(ONE_DRIVE, &cfg, "backends.lto[lto6].post_warning_byte")
@@ -2917,7 +2941,10 @@ mod tests {
             (serde_json::json!("1G"), "\"1G\""),
             (serde_json::json!(0.97), "0.97"),
             (serde_json::json!(true), "true"),
-            (serde_json::json!(["*.tmp", "*.bak"]), "[\"*.tmp\", \"*.bak\"]"),
+            (
+                serde_json::json!(["*.tmp", "*.bak"]),
+                "[\"*.tmp\", \"*.bak\"]",
+            ),
             (serde_json::json!({"offsite": 2}), "{ offsite = 2 }"),
         ] {
             assert_eq!(toml_text_of(&v), want);
