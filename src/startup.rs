@@ -34,7 +34,11 @@
 //! archive is written:
 //!
 //! - **Never as root** (euid 0): root acting on the service home would leave
-//!   root-owned files in it. The pointer is not even read.
+//!   root-owned files in it. The pointer is not even read. And since root
+//!   would otherwise open `/root/.tapectl`, an archive nobody chose, root is
+//!   refused outright on a host that has a pointer unless `--home` or
+//!   `TAPECTL_HOME` names the home ([`root_refusal`], ADR-0012 item 213):
+//!   the service user's commands go through `tapectl-op`.
 //! - **A pointer that is present but wrong is an error naming the file** — a
 //!   relative path, an empty file, a target that is missing or not a
 //!   directory, a file that cannot be read. Falling through to
@@ -83,6 +87,80 @@ pub struct Startup {
     /// is surprising and a notice on the invocation that got it right is
     /// just noise.
     pub ambiguous_config_home: Option<PathBuf>,
+
+    /// Which rule chose the home (ADR-0012 item 213): `status`, `config
+    /// check` and the "not initialized" error name it.
+    pub source: HomeSource,
+
+    /// The system home pointer's file when one is present (a stat, never a
+    /// read), whether or not it chose the home: an installed host's home is
+    /// not made with `tapectl init`, so the "not initialized" error offers
+    /// `init` only where there is none.
+    pub pointer_file: Option<PathBuf>,
+
+    /// Whether a non-empty `TAPECTL_HOME` was set, whatever outranked it.
+    pub tapectl_home_set: bool,
+}
+
+/// The rule that chose an invocation's home, one per rung of the precedence
+/// in the module doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeSource {
+    /// `--home`.
+    HomeFlag,
+    /// `TAPECTL_HOME`.
+    TapectlHomeEnv,
+    /// `--config` alone: its file's directory.
+    ConfigFlag,
+    /// This account's `~/.tapectl`, which existed.
+    OwnHome,
+    /// The system home pointer, at this path.
+    Pointer(PathBuf),
+    /// `~/.tapectl` because nothing else named a home: it did not exist, and
+    /// no pointer named another (or, as root, none was read).
+    Default,
+}
+
+impl HomeSource {
+    /// Why this home, in a few words: `home: <path> (<why>)`.
+    pub fn describe(&self) -> String {
+        match self {
+            HomeSource::HomeFlag => "named by --home".to_string(),
+            HomeSource::TapectlHomeEnv => "named by TAPECTL_HOME".to_string(),
+            HomeSource::ConfigFlag => "the directory of --config".to_string(),
+            HomeSource::OwnHome => "this account's ~/.tapectl".to_string(),
+            HomeSource::Pointer(file) => {
+                format!("named by the home pointer {}", file.display())
+            }
+            HomeSource::Default => {
+                "~/.tapectl, the default: nothing named another home".to_string()
+            }
+        }
+    }
+
+    /// The `--json` spelling (`home_source`).
+    pub fn key(&self) -> &'static str {
+        match self {
+            HomeSource::HomeFlag => "home_flag",
+            HomeSource::TapectlHomeEnv => "tapectl_home",
+            HomeSource::ConfigFlag => "config_flag",
+            HomeSource::OwnHome => "own_home",
+            HomeSource::Pointer(_) => "pointer",
+            HomeSource::Default => "default",
+        }
+    }
+}
+
+impl Startup {
+    /// `home: <path> (<why>)`, the line `status` and `config check` begin
+    /// with.
+    pub fn home_line(&self) -> String {
+        format!(
+            "home: {} ({})",
+            self.paths.home.display(),
+            self.source.describe()
+        )
+    }
 }
 
 /// Where the system-wide home pointer lives unless `TAPECTL_HOME_POINTER`
@@ -148,55 +226,195 @@ pub fn resolve_from(
     home_env: Option<&OsStr>,
     pointer: Option<&HomePointer>,
 ) -> Result<Startup> {
+    // Facts the messages need whatever rule wins: a stat of the pointer
+    // file (never a read, so a broken pointer still cannot break what
+    // outranks it) and whether TAPECTL_HOME was set.
+    let pointer_file = pointer.map(|p| p.path.clone()).filter(|p| exists(p));
+    let tapectl_home_set = tapectl_home_env.is_some_and(|v| !v.is_empty());
+    let startup =
+        |paths: TapectlPaths, ambiguous_config_home: Option<PathBuf>, source: HomeSource| Startup {
+            paths,
+            ambiguous_config_home,
+            source,
+            pointer_file: pointer_file.clone(),
+            tapectl_home_set,
+        };
+
     // --home wins outright, and is checked BEFORE the environment: an
     // explicit flag must not be blocked by a broken `TAPECTL_HOME` it
     // overrides anyway.
-    let named_home: Option<PathBuf> = match home_flag {
+    let named_home: Option<(PathBuf, HomeSource)> = match home_flag {
         Some("") => return Err(empty_path_error("--home")),
-        Some(home) => Some(PathBuf::from(home)),
-        None => tapectl_home_from_env(tapectl_home_env)?,
+        Some(home) => Some((PathBuf::from(home), HomeSource::HomeFlag)),
+        None => {
+            tapectl_home_from_env(tapectl_home_env)?.map(|home| (home, HomeSource::TapectlHomeEnv))
+        }
     };
 
-    if let Some(home) = named_home {
+    if let Some((home, source)) = named_home {
         let mut paths = TapectlPaths::new(home);
         if let Some(config_path) = config_flag {
             // Both given: --home selects the archive, --config selects the
             // file within it. Unambiguous, so no notice.
             paths.config_file = PathBuf::from(non_empty_config(config_path)?);
         }
-        return Ok(Startup {
-            paths,
-            ambiguous_config_home: None,
-        });
+        return Ok(startup(paths, None, source));
     }
 
     if let Some(config_path) = config_flag {
         let home = config_home(non_empty_config(config_path)?);
-        return Ok(Startup {
-            paths: TapectlPaths::new(home.clone()),
-            ambiguous_config_home: Some(home),
-        });
+        return Ok(startup(
+            TapectlPaths::new(home.clone()),
+            Some(home),
+            HomeSource::ConfigFlag,
+        ));
     }
 
     // Nothing named a home. An account that already has a `~/.tapectl` keeps
     // it (the service user, a developer, every harness that sets HOME); only
     // an account with none of its own is sent to the system pointer.
+    let own_home_exists = || config::default_home_from(home_env).is_some_and(|d| exists(&d));
     if let Some(pointer) = pointer.filter(|p| p.euid != 0) {
-        let own_home_exists = config::default_home_from(home_env).is_some_and(|d| exists(&d));
-        if !own_home_exists {
+        if !own_home_exists() {
             if let Some(home) = read_home_pointer(&pointer.path)? {
-                return Ok(Startup {
-                    paths: TapectlPaths::new(home),
-                    ambiguous_config_home: None,
-                });
+                return Ok(startup(
+                    TapectlPaths::new(home),
+                    None,
+                    HomeSource::Pointer(pointer.path.clone()),
+                ));
             }
         }
     }
 
-    Ok(Startup {
-        paths: TapectlPaths::new(default_home(home_env)?),
-        ambiguous_config_home: None,
-    })
+    let home = default_home(home_env)?;
+    let source = if own_home_exists() {
+        HomeSource::OwnHome
+    } else {
+        HomeSource::Default
+    };
+    Ok(startup(TapectlPaths::new(home), None, source))
+}
+
+/// The refusal for root on a host with a home pointer (ADR-0012 item 213,
+/// the 1.9.0 coordinator's OQ10), or `None`. Root is refused only when the
+/// pointer file is present and neither `--home` nor a non-empty
+/// `TAPECTL_HOME` names the home: as root the pointer is never read (item
+/// 62), so such a command would open `/root/.tapectl`, an archive nobody
+/// chose, instead of the service user's. `main` asks before resolving the
+/// home, for every command but `host check` (`--help`, `--version` and
+/// `completions` never reach it).
+pub fn root_refusal(
+    euid: u32,
+    pointer_file: &Path,
+    home_flag: Option<&str>,
+    tapectl_home_env: Option<&OsStr>,
+) -> Option<String> {
+    let named = home_flag.is_some() || tapectl_home_env.is_some_and(|v| !v.is_empty());
+    if euid != 0 || named || !exists(pointer_file) {
+        return None;
+    }
+    // Named when it can be read; the refusal stands either way.
+    let home = std::fs::read_to_string(pointer_file)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && !t.contains('\n'))
+        .map(|t| format!(" ({t})"))
+        .unwrap_or_default();
+    Some(format!(
+        "refusing to run as root: the home pointer {} names this host's tapectl home{home}, \
+         which belongs to the service user, and as root tapectl would open /root/.tapectl \
+         instead. Run it as the service user: tapectl-op <command>, e.g. `tapectl-op status`. \
+         To act on a home as root on purpose, name it with --home <dir> or TAPECTL_HOME.",
+        pointer_file.display()
+    ))
+}
+
+/// [`root_refusal`] for this process: its euid, `TAPECTL_HOME_POINTER` and
+/// `TAPECTL_HOME`.
+pub fn root_refusal_now(home_flag: Option<&str>) -> Option<String> {
+    root_refusal(
+        nix::unistd::geteuid().as_raw(),
+        &pointer_path_from_env(std::env::var_os("TAPECTL_HOME_POINTER").as_deref()),
+        home_flag,
+        std::env::var_os("TAPECTL_HOME").as_deref(),
+    )
+}
+
+/// The "not initialized" error (ADR-0012 item 213): the path looked at, the
+/// rule that chose it, and `tapectl init` only where this looks like a new
+/// archive — no home pointer on the host and no `TAPECTL_HOME`. Where one
+/// is set, the archive is meant to exist already, and an `init` would make a
+/// second one beside it.
+pub fn not_initialized_message(startup: &Startup) -> String {
+    let home = &startup.paths.home;
+    let db = &startup.paths.db_file;
+    // An account that cannot see into the home is told so, not that there is
+    // no archive there.
+    if let Err(e) = std::fs::symlink_metadata(db) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return format!(
+                "cannot reach the catalog {} ({}): permission denied. The home belongs to \
+                 another account: run the command as that account (`tapectl-op <command>` \
+                 runs it as the service user), or, as a member of its [ops] group, use \
+                 `tapectl status`.",
+                db.display(),
+                startup.source.describe()
+            );
+        }
+    }
+    let rule = match &startup.source {
+        HomeSource::HomeFlag => "--home named it".to_string(),
+        HomeSource::TapectlHomeEnv => "TAPECTL_HOME named it".to_string(),
+        HomeSource::ConfigFlag => {
+            "it is the directory of --config (--config alone moves the whole home)".to_string()
+        }
+        HomeSource::OwnHome => format!(
+            "it is this account's ~/.tapectl, which exists{}",
+            match &startup.pointer_file {
+                Some(p) => format!(
+                    " and so outranks the home pointer {}: remove the empty ~/.tapectl to use \
+                     the home the pointer names",
+                    p.display()
+                ),
+                None => String::new(),
+            }
+        ),
+        HomeSource::Pointer(p) => format!("the home pointer {} named it", p.display()),
+        HomeSource::Default => {
+            "nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no \
+             home pointer), so it is ~/.tapectl"
+                .to_string()
+        }
+    };
+    let mut msg = format!(
+        "tapectl is not initialized at {}: there is no catalog {} there. The home was chosen \
+         because {rule}.",
+        home.display(),
+        db.display()
+    );
+    if startup.source == HomeSource::TapectlHomeEnv {
+        msg.push_str(
+            " TAPECTL_HOME is set, so the archive is meant to be there already: check that it \
+             names the directory holding tapectl.db.",
+        );
+    } else if let (Some(p), false) = (&startup.pointer_file, startup.source == HomeSource::OwnHome)
+    {
+        msg.push_str(&format!(
+            " This host has a home pointer ({}), so its archive is meant to exist already: \
+             check the pointer, or run the command as the service user (`tapectl-op \
+             <command>`).",
+            p.display()
+        ));
+    } else if startup.pointer_file.is_none() && !startup.tapectl_home_set {
+        let init = match &startup.source {
+            HomeSource::HomeFlag | HomeSource::ConfigFlag => {
+                format!("`tapectl --home {} init`", home.display())
+            }
+            _ => "`tapectl init`".to_string(),
+        };
+        msg.push_str(&format!(" To start a new archive there: {init}."));
+    }
+    msg
 }
 
 /// Whether something is at `path`. Only a definite "not there" is false: a
@@ -1377,6 +1595,195 @@ mod tests {
             pointer_path_from_env(Some(OsStr::new("/tmp/x/home"))),
             PathBuf::from("/tmp/x/home")
         );
+    }
+
+    // ---- the home's source, root, and "not initialized" (ADR-0012 item 213) ----
+
+    /// Every rung of the precedence names itself, so `status`, `config
+    /// check` and the "not initialized" error can say why this home.
+    #[test]
+    fn each_rule_names_its_source() {
+        let fx = Pointer::new();
+        let ptr = fx.good();
+        let env = os("/mnt/from-env");
+        let own = fx.home_with_own();
+        let none = fx.home_without_own();
+        let rows: Vec<(
+            Option<&str>,
+            Option<&str>,
+            Option<&OsStr>,
+            &OsStr,
+            HomeSource,
+        )> = vec![
+            (
+                Some("/mnt/flag"),
+                None,
+                None,
+                none.as_os_str(),
+                HomeSource::HomeFlag,
+            ),
+            (
+                Some("/mnt/flag"),
+                None,
+                Some(env.as_os_str()),
+                none.as_os_str(),
+                HomeSource::HomeFlag,
+            ),
+            (
+                None,
+                None,
+                Some(env.as_os_str()),
+                none.as_os_str(),
+                HomeSource::TapectlHomeEnv,
+            ),
+            (
+                None,
+                Some("/mnt/cfg/config.toml"),
+                None,
+                none.as_os_str(),
+                HomeSource::ConfigFlag,
+            ),
+            (None, None, None, own.as_os_str(), HomeSource::OwnHome),
+            (
+                None,
+                None,
+                None,
+                none.as_os_str(),
+                HomeSource::Pointer(ptr.path.clone()),
+            ),
+        ];
+        for (home_flag, config_flag, env_home, home_env, want) in rows {
+            let r =
+                resolve_from(home_flag, config_flag, env_home, Some(home_env), Some(&ptr)).unwrap();
+            assert_eq!(r.source, want, "{home_flag:?}/{config_flag:?}/{env_home:?}");
+        }
+        // No pointer file and no ~/.tapectl: the default, where init makes one.
+        let r = resolve_from(None, None, None, Some(&none), Some(&fx.absent(1000))).unwrap();
+        assert_eq!(r.source, HomeSource::Default);
+        assert_eq!(r.pointer_file, None);
+        // The pointer file is recorded whatever chose the home.
+        let r = resolve_from(Some("/mnt/flag"), None, None, Some(&none), Some(&ptr)).unwrap();
+        assert_eq!(r.pointer_file.as_deref(), Some(ptr.path.as_path()));
+    }
+
+    /// The line `status` and `config check` print names the home and why.
+    #[test]
+    fn the_home_line_names_the_path_and_the_rule() {
+        let fx = Pointer::new();
+        let ptr = fx.good();
+        let none = fx.home_without_own();
+        let r = resolve_from(None, None, None, Some(&none), Some(&ptr)).unwrap();
+        let line = r.home_line();
+        assert!(
+            line.starts_with(&format!("home: {} (", fx.svc().display())),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("the home pointer {}", ptr.path.display())),
+            "{line}"
+        );
+        let env = os("/mnt/e");
+        let r = resolve_from(None, None, Some(&env), Some(&none), None).unwrap();
+        assert_eq!(r.home_line(), "home: /mnt/e (named by TAPECTL_HOME)");
+        let r = resolve_from(Some("/mnt/f"), None, None, Some(&none), None).unwrap();
+        assert_eq!(r.home_line(), "home: /mnt/f (named by --home)");
+        assert_eq!(r.source.key(), "home_flag");
+    }
+
+    /// OQ10: root is refused only with a pointer file present and neither
+    /// `--home` nor a non-empty `TAPECTL_HOME`; it names `tapectl-op`.
+    #[test]
+    fn root_is_refused_beside_a_pointer_unless_the_home_is_named() {
+        let fx = Pointer::new();
+        let ptr = fx.good().path;
+        let absent = fx.absent(0).path;
+        let env = os("/mnt/e");
+        let empty = os("");
+        let refused = root_refusal(0, &ptr, None, None).expect("root beside a pointer");
+        assert!(refused.contains("tapectl-op"), "{refused}");
+        assert!(refused.contains(&ptr.display().to_string()), "{refused}");
+        assert!(
+            refused.contains(&fx.svc().display().to_string()),
+            "names the home: {refused}"
+        );
+        assert!(refused.contains("--home"), "{refused}");
+        // An empty TAPECTL_HOME is an unset one.
+        assert!(root_refusal(0, &ptr, None, Some(&empty)).is_some());
+        // Named: not refused.
+        assert_eq!(root_refusal(0, &ptr, Some("/srv/h"), None), None);
+        assert_eq!(root_refusal(0, &ptr, None, Some(&env)), None);
+        // No pointer, or not root: not refused.
+        assert_eq!(root_refusal(0, &absent, None, None), None);
+        assert_eq!(root_refusal(1000, &ptr, None, None), None);
+        // A pointer root cannot parse still refuses (it is not read for the home).
+        let broken = fx.file("relative\n", 0).path;
+        assert!(root_refusal(0, &broken, None, None).is_some());
+    }
+
+    fn not_initialized(
+        home_flag: Option<&str>,
+        env: Option<&OsStr>,
+        home_env: &OsStr,
+        pointer: Option<&HomePointer>,
+    ) -> String {
+        not_initialized_message(
+            &resolve_from(home_flag, None, env, Some(home_env), pointer).unwrap(),
+        )
+    }
+
+    /// Item 213: the error names the path and the rule, and offers `init`
+    /// only where there is no pointer and no `TAPECTL_HOME`.
+    #[test]
+    fn not_initialized_names_the_path_and_rule_and_offers_init_only_for_a_new_archive() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        let absent = fx.absent(1000);
+
+        // A new archive: the default ~/.tapectl, no pointer.
+        let msg = not_initialized(None, None, &none, Some(&absent));
+        assert!(msg.contains("not initialized"), "{msg}");
+        assert!(
+            msg.contains(&fx.fresh_default().display().to_string()),
+            "{msg}"
+        );
+        assert!(msg.contains("nothing named a home"), "{msg}");
+        assert!(msg.contains("`tapectl init`"), "{msg}");
+
+        // --home, no pointer: init offered with the same --home.
+        let msg = not_initialized(Some("/mnt/new"), None, &none, Some(&absent));
+        assert!(msg.contains("--home named it"), "{msg}");
+        assert!(msg.contains("`tapectl --home /mnt/new init`"), "{msg}");
+
+        // TAPECTL_HOME: the archive should exist; no init.
+        let env = os("/mnt/env-home");
+        let msg = not_initialized(None, Some(&env), &none, Some(&absent));
+        assert!(msg.contains("/mnt/env-home"), "{msg}");
+        assert!(msg.contains("TAPECTL_HOME named it"), "{msg}");
+        assert!(!msg.contains("init`"), "{msg}");
+
+        // A home pointer on the host (here it names an empty directory): no init.
+        let empty_home = fx.dir.path().join("empty-home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        let ptr = fx.file(empty_home.to_str().unwrap(), 1000);
+        let msg = not_initialized(None, None, &none, Some(&ptr));
+        assert!(msg.contains(&empty_home.display().to_string()), "{msg}");
+        assert!(
+            msg.contains(&format!("the home pointer {} named it", ptr.path.display())),
+            "{msg}"
+        );
+        assert!(msg.contains("tapectl-op"), "{msg}");
+        assert!(!msg.contains("init`"), "{msg}");
+
+        // --home on a host with a pointer: still no init.
+        let msg = not_initialized(Some("/mnt/typo"), None, &none, Some(&ptr));
+        assert!(msg.contains("--home named it"), "{msg}");
+        assert!(!msg.contains("init`"), "{msg}");
+
+        // An empty ~/.tapectl beside a pointer: it outranks the pointer, said so.
+        let own = fx.home_with_own();
+        let msg = not_initialized(None, None, &own, Some(&ptr));
+        assert!(msg.contains("outranks the home pointer"), "{msg}");
+        assert!(!msg.contains("init`"), "{msg}");
     }
 
     // ---- peek_logging_config ----
