@@ -213,10 +213,9 @@ fn dry_run_writes_nothing() {
         &[
             "config",
             "add",
-            "collections",
+            "archive_sets",
             "name=m",
-            "root=/m",
-            "tenant=t",
+            "min_copies=2",
             "--dry-run",
         ][..],
     ] {
@@ -230,10 +229,27 @@ fn dry_run_writes_nothing() {
     }
 }
 
+/// A collection's table, as `collection add` writes it, appended by hand
+/// so the tests of `config`'s per-key edits need no real root.
+fn with_collection(home: &Path, name: &str, root: &str) {
+    let cfg = config_path(home);
+    let original = read(home);
+    std::fs::write(
+        &cfg,
+        format!("{original}\n[[collections]]\nname = \"{name}\"\nroot = \"{root}\"\ntenant = \"family\"\n"),
+    )
+    .unwrap();
+}
+
+/// ADR-0012 item 206: a whole collection is added by `collection add` and
+/// removed by `collection remove`; `config add collections` and `config
+/// remove 'collections[NAME]'` are refused by name (exit 2), pointing at
+/// them, and the file does not move. Every key of one collection is still
+/// `config`'s to edit.
 #[test]
-fn a_collection_is_added_edited_and_removed_by_name() {
+fn a_whole_collection_is_refused_by_name_and_its_keys_are_config_s() {
     let home = home();
-    ok(
+    let out = refused(
         home.path(),
         &[
             "config",
@@ -244,41 +260,46 @@ fn a_collection_is_added_edited_and_removed_by_name() {
             "tenant=family",
         ],
     );
-    let after = read(home.path());
-    assert!(after.contains("[[collections]]\nname = \"movies\"\nroot = \"/srv/media/movies\"\ntenant = \"family\"\n"), "{after}");
-    assert!(after.contains("# operator note"), "{after}");
+    assert!(out.contains("exit=Some(2)"), "{out}");
+    assert!(
+        out.contains("use `tapectl collection add NAME ROOT --tenant TENANT`"),
+        "{out}"
+    );
+
+    with_collection(home.path(), "movies", "/srv/media/movies");
     config_check_passes(home.path());
+    for key in ["collections[movies]", "collections[0]"] {
+        let out = refused(home.path(), &["config", "remove", key]);
+        assert!(out.contains("exit=Some(2)"), "{out}");
+        assert!(
+            out.contains("use `tapectl collection remove NAME`"),
+            "{out}"
+        );
+    }
 
     ok(
         home.path(),
         &["config", "set", "collections[movies].unit_depth", "2"],
     );
     assert!(read(home.path()).contains("unit_depth = 2\n"));
-
-    // A second collection with the same name could not be addressed.
-    refused(
+    ok(
+        home.path(),
+        &["config", "add", "collections[movies].exclude", "loose.txt"],
+    );
+    assert!(read(home.path()).contains("exclude = [\"loose.txt\"]"));
+    ok(
         home.path(),
         &[
             "config",
-            "add",
-            "collections",
-            "name=movies",
-            "root=/x",
-            "tenant=t",
+            "remove",
+            "collections[movies].exclude",
+            "loose.txt",
         ],
     );
-    // An unknown field in a new table is refused by name.
+    // An unknown key in a collection is refused by name.
     let out = refused(
         home.path(),
-        &[
-            "config",
-            "add",
-            "collections",
-            "name=tv",
-            "root=/x",
-            "tenant=t",
-            "depth=2",
-        ],
+        &["config", "set", "collections[movies].depth", "2"],
     );
     assert!(out.contains("depth"), "{out}");
     // A required field cannot be removed.
@@ -287,22 +308,47 @@ fn a_collection_is_added_edited_and_removed_by_name() {
         &["config", "remove", "collections[movies].root"],
     );
     assert!(out.contains("root"), "{out}");
-    // A name that looks like a number stays a string.
+    let after = read(home.path());
+    assert!(after.contains("# operator note"), "{after}");
+    config_check_passes(home.path());
+}
+
+/// `collection add` writes the table with the comments kept and a name that
+/// looks like a number as a string, and `collection remove` takes it out
+/// again, the comments still kept.
+#[test]
+fn collection_add_and_remove_edit_the_file_in_place() {
+    let home = home();
+    ok(home.path(), &["tenant", "add", "family"]);
+    let root = TempDir::new().unwrap();
+    let root_str = root.path().canonicalize().unwrap().display().to_string();
     ok(
         home.path(),
         &[
-            "config",
+            "collection",
             "add",
-            "collections",
-            "name=2024",
-            "root=/srv/2024",
-            "tenant=family",
+            "2024",
+            &root_str,
+            "--tenant",
+            "family",
+            "--unit-depth",
+            "2",
+            "--exclude",
+            "*.partial",
         ],
     );
-    assert!(read(home.path()).contains("name = \"2024\""));
+    let after = read(home.path());
+    assert!(
+        after.contains(&format!(
+            "[[collections]]\nname = \"2024\"\nroot = \"{root_str}\"\ntenant = \"family\"\n\
+             unit_depth = 2\nexclude = [\"*.partial\"]\n"
+        )),
+        "{after}"
+    );
+    assert!(after.contains("# operator note"), "{after}");
+    config_check_passes(home.path());
 
-    ok(home.path(), &["config", "remove", "collections[movies]"]);
-    ok(home.path(), &["config", "remove", "collections[0]"]);
+    ok(home.path(), &["collection", "remove", "2024"]);
     let after = read(home.path());
     assert!(!after.contains("[[collections]]"), "{after}");
     assert!(after.contains("# operator note"), "{after}");
@@ -335,7 +381,7 @@ fn a_list_value_takes_and_gives_up_elements() {
 fn removing_a_key_that_is_not_in_the_file_is_refused() {
     let home = home();
     refused(home.path(), &["config", "remove", "defaults.no_such_key"]);
-    refused(home.path(), &["config", "remove", "collections[nope]"]);
+    refused(home.path(), &["config", "remove", "collections[nope].root"]);
 }
 
 #[test]
@@ -635,7 +681,8 @@ fn removing_a_table_keeps_init_s_drive_example() {
 }
 
 /// The same for the last entry of a list of tables written at the end of
-/// the file, below init's commented examples.
+/// the file, below init's commented examples, as `collection remove` takes
+/// it out (ADR-0012 item 206).
 #[test]
 fn removing_the_last_collection_keeps_the_comments_above_it() {
     let home = home();
@@ -646,7 +693,7 @@ fn removing_the_last_collection_keeps_the_comments_above_it() {
     std::fs::write(&cfg, format!("{original}{entry}")).unwrap();
     config_check_passes(home.path());
 
-    ok(home.path(), &["config", "remove", "collections[movies]"]);
+    ok(home.path(), &["collection", "remove", "movies"]);
     let after = read(home.path());
     assert!(after.contains("Tape drive. Uncomment and edit"), "{after}");
     assert!(after.contains("# [host_check]"), "{after}");
@@ -740,17 +787,7 @@ fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
 #[test]
 fn set_of_a_collections_snapshot_hook_commands() {
     let home = home();
-    ok(
-        home.path(),
-        &[
-            "config",
-            "add",
-            "collections",
-            "name=movies",
-            "root=/srv/media/movies",
-            "tenant=family",
-        ],
-    );
+    with_collection(home.path(), "movies", "/srv/media/movies");
     let out = refused(
         home.path(),
         &[

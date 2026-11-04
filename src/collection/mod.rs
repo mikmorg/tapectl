@@ -14,6 +14,7 @@
 //! stands), and best-fit-decreasing packing (§7 — alphabetical next-fit
 //! preserves the name-ordered "tape spine"; issue #456).
 
+pub mod access;
 pub mod batch;
 pub mod fingerprint;
 pub mod hook;
@@ -66,6 +67,105 @@ pub fn canonical_root(lib: &CollectionConfig) -> Result<String> {
         })
 }
 
+/// The command that configures a collection, as every "none is configured"
+/// line names it (ADR-0012 item 206).
+pub const ADD_ONE: &str = "add one with `tapectl collection add NAME ROOT --tenant TENANT`";
+
+/// How bad one problem a `collection sync|status|plan` meets is (ADR-0012
+/// item 212, the 1.9.0 coordinator's OQ6). The command exits with the worst
+/// it saw, 0 when it saw none, and every collection is processed whatever
+/// another's problems are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Exit 1: the command did its work around it — an entry outside every
+    /// unit, a folder refused (an invalid name, among others), a unit
+    /// marked missing.
+    Warning,
+    /// Exit 2: a root that is not absolute or does not exist, a tenant or
+    /// archive set the catalog does not know, permission denied, a dotfile
+    /// that could not be written.
+    Error,
+}
+
+impl Severity {
+    /// The exit code for the worst of `seen`: 0 for none.
+    pub fn exit_code(seen: impl IntoIterator<Item = Severity>) -> i32 {
+        match seen.into_iter().max() {
+            None => crate::error::EXIT_SUCCESS,
+            Some(Severity::Warning) => crate::error::EXIT_WARNING,
+            Some(Severity::Error) => crate::error::EXIT_ERROR,
+        }
+    }
+}
+
+/// What makes a configured collection unusable as a whole (ADR-0012 item
+/// 220): a root that is not absolute, or does not exist or cannot be
+/// read; a tenant or an archive set the catalog does not know. Empty when
+/// it is usable. Each is an error of that collection alone: `collection
+/// sync|status|plan` report it under the collection's name and go on to
+/// the next. Read-only; at most two statements.
+pub fn collection_problems(
+    conn: &rusqlite::Connection,
+    lib: &CollectionConfig,
+) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    if !std::path::Path::new(&lib.root).is_absolute() {
+        problems.push(format!(
+            "root \"{}\" is not an absolute path; fix it with: tapectl config set \
+             'collections[{}].root' /ABSOLUTE/PATH",
+            lib.root, lib.name
+        ));
+    } else if let Err(e) = std::fs::canonicalize(&lib.root) {
+        problems.push(format!(
+            "root \"{}\" does not exist or cannot be read: {e}",
+            lib.root
+        ));
+    }
+    if crate::db::queries::get_tenant_by_name(conn, &lib.tenant)?.is_none() {
+        problems.push(format!(
+            "tenant \"{}\" does not exist (`tapectl tenant list` names the tenants); fix it \
+             with: tapectl config set 'collections[{}].tenant' TENANT",
+            lib.tenant, lib.name
+        ));
+    }
+    if let Err(e) = crate::db::queries::resolve_archive_set(conn, lib.archive_set.as_deref()) {
+        problems.push(e.to_string());
+    }
+    Ok(problems)
+}
+
+/// A collection name: one segment, under the unit-name rule, since it
+/// begins every unit name the collection registers (`"{name}/{folder}"`).
+pub fn validate_collection_name(name: &str) -> Result<()> {
+    let refuse = |why: String| {
+        Err(TapectlError::Other(format!(
+            "invalid collection name \"{name}\": {why}"
+        )))
+    };
+    if name.contains('/') {
+        return refuse("it is one segment, with no /".to_string());
+    }
+    if let Err(e) = crate::naming::validate_unit_name(name) {
+        return refuse(format!(
+            "it begins every unit name the collection registers, so it follows the unit-name \
+             rule ({e})"
+        ));
+    }
+    Ok(())
+}
+
+/// Two collection roots overlap when either is the other or lies inside it.
+/// Each is compared canonical when it resolves, as given otherwise.
+pub fn roots_overlap(a: &str, b: &str) -> bool {
+    let canon = |p: &str| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.trim_end_matches('/').to_string())
+    };
+    let (a, b) = (canon(a), canon(b));
+    is_under_root(&a, &b) || is_under_root(&b, &a)
+}
+
 /// Look up a configured collection by name — the one CLI surface (`collection
 /// run`) that isn't spec'd in §11 as operating over every configured
 /// collection at once, since executing a batch inherently targets one collection
@@ -88,11 +188,9 @@ pub fn collection_to_run<'a>(
     match (name, config.collections.as_slice()) {
         (Some(name), _) => find_collection(config, name),
         (None, [only]) => Ok(only),
-        (None, []) => Err(TapectlError::Other(
-            "no collection is configured, so there is none to run ([[collections]] in \
-             config.toml)"
-                .to_string(),
-        )),
+        (None, []) => Err(TapectlError::Other(format!(
+            "no collection is configured, so there is none to run; {ADD_ONE}"
+        ))),
         (None, several) => Err(TapectlError::Other(format!(
             "{} collections are configured: name the one to run, `tapectl collection run \
              NAME`, NAME one of {}",

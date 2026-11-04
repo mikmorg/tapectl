@@ -133,8 +133,13 @@ const TABLE: &[(&[&str], Verdict)] = &[
     ),
     (&["catalog", "search"], Verdict::ReadOnly),
     (&["catalog", "stats"], Verdict::ReadOnly),
+    // ADR-0012 item 206: `--dry-run` makes every check and writes no byte
+    // of config.toml (tests/dry_run_global.rs).
+    (&["collection", "add"], Verdict::Honours),
     // collection: fixed by issue #230, predating this branch.
     (&["collection", "plan"], Verdict::ReadOnly),
+    // ADR-0012 item 206: as `collection add` (tests/dry_run_global.rs).
+    (&["collection", "remove"], Verdict::Honours),
     (&["collection", "run"], Verdict::Honours),
     (&["collection", "status"], Verdict::ReadOnly),
     (&["collection", "sync"], Verdict::Honours),

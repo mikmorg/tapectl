@@ -3,11 +3,15 @@
 //! resolving moved/renamed ones by dotfile uuid (exactly as
 //! `unit::discovery` already does), and marking vanished ones `missing` —
 //! never deleting or retiring; those stay operator acts.
+//!
+//! A dry run makes every check the real run makes and stops short of each
+//! write (ADR-0012 item 220), so the two report the same thing: what would
+//! be created, what would be refused, and what is pending after.
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
-use tracing::warn;
+use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::config::{CollectionConfig, Config, TapectlPaths};
@@ -15,12 +19,32 @@ use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
 use crate::unit::dotfile;
 
+use super::fingerprint::PathOverlay;
+use super::Severity;
+
+/// One thing `collection sync` could not do: a folder it did not register
+/// or resolve, or a problem with the collection as a whole, which stops its
+/// sync before any folder is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProblem {
+    pub severity: Severity,
+    /// The folder, for a folder's problem; `None` for the collection's.
+    pub folder: Option<String>,
+    /// What went wrong and what to do; a folder's begins with its path.
+    pub message: String,
+}
+
 /// Outcome of one `collection sync` run.
 #[derive(Debug, Default, Clone)]
 pub struct SyncReport {
     /// Newly registered units (fresh directories, or orphaned dotfiles the
-    /// DB didn't know about yet).
+    /// DB didn't know about yet): rows actually inserted, or in a dry run
+    /// the ones the real run would insert.
     pub created: usize,
+    /// Units registered before 1.9.0 whose dotfile was never written,
+    /// completed now: the dotfile is written with the row's own uuid
+    /// (ADR-0012 item 220). Never counted in `created`.
+    pub completed: usize,
     /// Existing units whose recorded path was updated (moved/renamed,
     /// resolved by dotfile uuid).
     pub moved: usize,
@@ -28,17 +52,20 @@ pub struct SyncReport {
     pub reactivated: usize,
     /// Existing `active` units whose directory is now gone.
     pub missing: usize,
-    /// Units needing archival work: no snapshot at all yet.
-    pub pending: usize,
-    /// Units needing archival work: a snapshot exists but is stale.
+    /// The units `missing` counts: `(unit name, the folder that is gone)`.
+    pub missing_units: Vec<(String, String)>,
+    /// Pending in its first form (CONTEXT.md, Never Archived): no snapshot
+    /// at all. A dry run counts here every unit it would create, as the
+    /// real run, which registers them first, does.
+    pub never_archived: usize,
+    /// Pending in its second form: a snapshot exists but is stale.
     pub dirty: usize,
     /// Units refused during step 3's pending/dirty detection because their
     /// own dotfile could not be parsed (ADR-0012's 2026-09-22 amendment,
-    /// issue #285) — distinct from `errors` (step 1's per-directory
-    /// registration failures, an existing and unrelated mechanism): never
-    /// counted in `pending`/`dirty`, and never archived.
-    /// `cli::collection::cmd_sync` must report these and exit non-zero when
-    /// non-empty.
+    /// issue #285) — distinct from `problems` (step 1's per-directory
+    /// registration failures): never counted in `never_archived`/`dirty`,
+    /// and never archived. `cli::collection::cmd_sync` must report these
+    /// and exit non-zero when non-empty.
     pub refused: Vec<super::fingerprint::RefusedUnit>,
     /// Entries under the root that belong to no unit (issue #382): loose
     /// files and symlinks down to `unit_depth`, and a symlinked directory
@@ -47,18 +74,45 @@ pub struct SyncReport {
     pub outside: Vec<super::outside::OutsideEntry>,
     /// Known units under the root owned by another tenant than the
     /// collection's configured `tenant` (#383): `(unit name, its tenant)`.
-    /// A warning, never a refusal and never a change: the catalog keeps
-    /// the owner it has (a collection's `tenant` names who new units go to).
-    /// `cli::collection::cmd_sync` prints them.
+    /// A warning line, never a refusal and never a change: the catalog
+    /// keeps the owner it has (a collection's `tenant` names who new units
+    /// go to). It leaves the exit status as it is.
     pub tenant_differs: Vec<(String, String)>,
+    /// Folders not registered or resolved, and the collection's own
+    /// problems, each with its severity.
+    pub problems: Vec<SyncProblem>,
+}
+
+impl SyncReport {
+    /// Pending as CONTEXT.md means it: never archived or dirty.
+    pub fn pending(&self) -> usize {
+        self.never_archived + self.dirty
+    }
+
+    /// The folders this sync refused: the `M` of `would create N; M
+    /// refused`.
+    pub fn refused_folders(&self) -> usize {
+        self.problems.iter().filter(|p| p.folder.is_some()).count()
+    }
+
+    /// Every severity this sync saw: its problems', and a warning each for
+    /// a unit refused, an entry outside every unit and a unit marked
+    /// missing (ADR-0012 item 212; the coordinator's OQ6).
+    pub fn severities(&self) -> Vec<Severity> {
+        let mut seen: Vec<Severity> = self.problems.iter().map(|p| p.severity).collect();
+        if !self.refused.is_empty() || !self.outside.is_empty() || self.missing > 0 {
+            seen.push(Severity::Warning);
+        }
+        seen
+    }
 }
 
 /// Sync one collection with BUILT-IN defaults (`Config::default()`) plus the
 /// given `global_excludes` -- see `sync_collection_with_config`, which this
-/// wraps. Kept for callers that hold no operator config (tests); a command
-/// that has the operator's `Config` must call `sync_collection_with_config`,
-/// or `[defaults] checksum_mode` is silently ignored for every unit this
-/// registers (issue #347).
+/// wraps, beside every problem's message. Kept for callers that hold no
+/// operator config (tests); a command that has the operator's `Config` must
+/// call `sync_collection_with_config`, or `[defaults] checksum_mode` is
+/// silently ignored for every unit this registers (issue #347).
 pub fn sync_collection(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -68,17 +122,25 @@ pub fn sync_collection(
 ) -> Result<(SyncReport, Vec<String>)> {
     let mut config = Config::default();
     config.defaults.global_excludes = global_excludes.to_vec();
-    sync_collection_with_config(conn, &config, lib, dry_run)
+    let report = sync_collection_with_config(conn, &config, lib, dry_run)?;
+    let messages = report.problems.iter().map(|p| p.message.clone()).collect();
+    Ok((report, messages))
 }
 
 /// Sync one collection. `dry_run` computes and reports every count above
-/// without mutating anything (no DB writes, no dotfile writes, no `unit
-/// init` calls) — the same detection logic runs either way; only the
-/// mutation step is gated per finding.
+/// without mutating anything (no DB writes, no dotfile writes) — the same
+/// checks run either way, the registration checks included, and only the
+/// writes are gated, so a dry run refuses what the real run refuses
+/// (ADR-0012 item 220). A dry run cannot know what the real run's write
+/// would meet, so it asks the kernel whether this user may write each
+/// folder it would write a dotfile into.
 ///
-/// Errors from individual directories (e.g. a dotfile naming an unknown
-/// tenant) are collected rather than aborting the whole sync, same spirit
-/// as `unit::discovery::discover`.
+/// A collection whose root, tenant or archive set is wrong
+/// (`collection::collection_problems`) is not walked at all: its problems
+/// are returned as errors and every count stays 0. A problem with one
+/// folder is that folder's ([`SyncProblem`]), and the rest still sync.
+/// An `Err` is left for what says nothing about any one collection (the
+/// catalog failing).
 ///
 /// `config` supplies two things. `config.defaults.global_excludes` (issue
 /// #49) reaches step 3's `pending_units_for_collection` call so this sync's
@@ -93,16 +155,27 @@ pub fn sync_collection_with_config(
     config: &Config,
     lib: &CollectionConfig,
     dry_run: bool,
-) -> Result<(SyncReport, Vec<String>)> {
+) -> Result<SyncReport> {
     let global_excludes = &config.defaults.global_excludes;
     let mut report = SyncReport::default();
-    let mut errors = Vec::new();
 
-    let root = match super::canonical_root(lib) {
-        Ok(r) => r,
-        Err(e) => {
-            errors.push(e.to_string());
-            return Ok((report, errors));
+    let problems = super::collection_problems(conn, lib)?;
+    let root = match problems.is_empty() {
+        true => super::canonical_root(lib).map_err(|e| vec![e.to_string()]),
+        false => Err(problems),
+    };
+    let root = match root {
+        Ok(root) => root,
+        Err(problems) => {
+            report.problems = problems
+                .into_iter()
+                .map(|message| SyncProblem {
+                    severity: Severity::Error,
+                    folder: None,
+                    message,
+                })
+                .collect();
+            return Ok(report);
         }
     };
     let root_path = PathBuf::from(&root);
@@ -111,8 +184,11 @@ pub fn sync_collection_with_config(
     // existing directory. This MUST run before step 2 (vanished-detection)
     // — a moved unit's new location is found and its `current_path` updated
     // here, so step 2 (which re-reads `current_path` fresh from the DB)
-    // sees the new, existing path and never flags it as vanished.
-    let dirs = candidate_unit_dirs(&root_path, lib);
+    // sees the new, existing path and never flags it as vanished. A dry run
+    // records each move and reactivation in `overlay` instead, so steps 2
+    // and 3 see what the real run would.
+    let (dirs, unreadable) = candidate_unit_dirs(&root_path, lib);
+    report.problems.extend(unreadable);
     // ADR-0012, 2026-10-07 item 24 (#378): two directories in this walk
     // carrying one uuid, neither of them the unit's recorded directory, are
     // each refused before either is resolved (`identity::refused_groups`). A
@@ -130,30 +206,48 @@ pub fn sync_collection_with_config(
     } else {
         Default::default()
     };
+    let mut overlay = PathOverlay::default();
     for dir in dirs {
         if let Some((uuid, group)) = duplicated.iter().find(|(_, g)| g.contains(&dir)) {
-            errors.push(format!(
-                "{}: {}",
-                dir.display(),
-                crate::unit::identity::duplicate_uuid_refusal(uuid, group)
+            report.problems.push(folder_problem(
+                &dir,
+                Severity::Warning,
+                crate::unit::identity::duplicate_uuid_refusal(uuid, group),
             ));
             continue;
         }
-        if let Err(e) = sync_one_directory(conn, config, lib, &root, &dir, dry_run, &mut report) {
-            errors.push(format!("{}: {e}", dir.display()));
+        let mut sync = DirSync {
+            conn,
+            config,
+            lib,
+            root: &root,
+            dry_run,
+            report: &mut report,
+            overlay: &mut overlay,
+        };
+        if let Err(problem) = sync.one_directory(&dir) {
+            report.problems.push(problem);
         }
     }
 
     // Step 2: vanished-detection. Only `active` units under this root whose
     // recorded directory no longer exists flip to `missing` — `tape_only`
-    // and `retired` are deliberate operator states this never touches.
+    // and `retired` are deliberate operator states this never touches. A
+    // unit step 1 found moved is not gone, though a dry run has not
+    // repointed its row.
     let tracked = super::units_under_root(conn, &root)?;
     for unit in tracked.iter().filter(|u| u.status == "active") {
+        if overlay.moved.contains_key(&unit.id) {
+            continue;
+        }
         let Some(path) = unit.current_path.as_deref() else {
             continue;
         };
         if !Path::new(path).is_dir() {
             report.missing += 1;
+            report
+                .missing_units
+                .push((unit.name.clone(), path.to_string()));
             if !dry_run {
                 conn.execute(
                     "UPDATE units SET status = 'missing' WHERE id = ?1",
@@ -170,21 +264,26 @@ pub fn sync_collection_with_config(
                     "missing",
                     Some(unit.tenant_id),
                 )?;
-                warn!(unit = %unit.name, path, "collection sync: directory vanished, marked missing");
+                // `cli::collection` prints the operator's line for it.
+                debug!(unit = %unit.name, path, "collection sync: directory vanished, marked missing");
             }
         }
     }
 
-    // Step 3: pending-work detection, over the current DB state (in
-    // dry-run mode this is the PRE-sync state, since nothing above was
-    // actually written — newly-would-be-created units correctly don't
-    // appear here yet, they're already counted via `report.created`).
-    let scan = super::fingerprint::pending_units_for_collection(conn, lib, global_excludes)?;
+    // Step 3: pending-work detection, over the catalog as the real run
+    // leaves it: a dry run reads it through `overlay` (its moves and
+    // reactivations), and counts every unit it would create as never
+    // archived, as the real run registers them before this step.
+    let scan =
+        super::fingerprint::pending_units_with_overlay(conn, lib, global_excludes, &overlay)?;
     for p in &scan.pending {
         match p.reason {
-            super::fingerprint::PendingReason::New => report.pending += 1,
+            super::fingerprint::PendingReason::New => report.never_archived += 1,
             super::fingerprint::PendingReason::Dirty => report.dirty += 1,
         }
+    }
+    if dry_run {
+        report.never_archived += report.created;
     }
     report.refused = scan.refused;
 
@@ -193,7 +292,51 @@ pub fn sync_collection_with_config(
     // it. Read-only, so a dry run reports it the same.
     report.outside = super::outside::entries_outside_units(&root_path, lib);
 
-    Ok((report, errors))
+    Ok(report)
+}
+
+/// A folder's problem, its message led by the folder's path.
+fn folder_problem(dir: &Path, severity: Severity, why: impl std::fmt::Display) -> SyncProblem {
+    SyncProblem {
+        severity,
+        folder: Some(dir.display().to_string()),
+        message: format!("{}: {why}", dir.display()),
+    }
+}
+
+/// How bad a failure registering one folder is (OQ6): an error when the
+/// fix is outside the folder's own name and contents (permission, a tenant
+/// or archive set the catalog does not know, the catalog itself), a warning
+/// for the rest (a name, a nesting, a dotfile that does not parse, a copy).
+fn severity_of(e: &TapectlError) -> Severity {
+    match e {
+        TapectlError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            Severity::Error
+        }
+        TapectlError::TenantNotFound(_)
+        | TapectlError::Database(_)
+        | TapectlError::CatalogBusy(_) => Severity::Error,
+        _ => Severity::Warning,
+    }
+}
+
+/// Whether this process (its effective ids) may `mode` the path.
+fn may(path: &Path, mode: nix::unistd::AccessFlags) -> std::result::Result<(), std::io::Error> {
+    nix::unistd::faccessat(None, path, mode, nix::fcntl::AtFlags::AT_EACCESS)
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))
+}
+
+/// The refusal for a folder this user cannot read, with the grant.
+fn unreadable(dir: &Path, cause: &std::io::Error) -> SyncProblem {
+    let user = crate::unit::effective_user_name();
+    folder_problem(
+        dir,
+        Severity::Error,
+        format!(
+            "cannot read it as user {user}: {cause}; grant it: sudo setfacl -R -m u:{user}:rX {}",
+            crate::unit::shell_word(&dir.display().to_string())
+        ),
+    )
 }
 
 /// Directories at exactly `unit_depth` below `root`, excluding any that
@@ -203,20 +346,43 @@ pub fn sync_collection_with_config(
 /// exclude, a plain pattern against the candidate's own name, and a
 /// directory pattern (`name/`) against the candidate and every directory
 /// between it and the root, so the whole subtree is excluded.
-fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> Vec<PathBuf> {
+///
+/// Beside them, each directory down to that depth this user may not read,
+/// an error naming the grant (ADR-0012 item 220): a folder the walk cannot
+/// enter hides every unit under it.
+fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> (Vec<PathBuf>, Vec<SyncProblem>) {
     let depth = lib.unit_depth.max(1);
     let excludes = crate::staging::exclude::Excludes::new(root, &lib.exclude);
 
-    WalkDir::new(root)
+    let mut dirs = Vec::new();
+    let mut unreadable_dirs = Vec::new();
+    for entry in WalkDir::new(root)
         .follow_links(false)
         .min_depth(depth)
         .max_depth(depth)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_dir())
-        .filter(|e| !excludes.excludes_unit_dir(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .collect()
+    {
+        match entry {
+            Ok(e) => {
+                if e.file_type().is_dir() && !excludes.excludes_unit_dir(e.path()) {
+                    dirs.push(e.path().to_path_buf());
+                }
+            }
+            Err(err) => {
+                let Some(path) = err.path().map(Path::to_path_buf) else {
+                    continue;
+                };
+                // A directory removed mid-walk is not this run's to report.
+                if let Some(io) = err.io_error() {
+                    if io.kind() == std::io::ErrorKind::PermissionDenied
+                        && !excludes.excludes_unit_dir(&path)
+                    {
+                        unreadable_dirs.push(unreadable(&path, io));
+                    }
+                }
+            }
+        }
+    }
+    (dirs, unreadable_dirs)
 }
 
 /// The unit name collection sync assigns: `"{collection}/{path relative to
@@ -229,239 +395,419 @@ fn collection_unit_name(lib: &CollectionConfig, root: &str, abs_str: &str) -> St
     format!("{}/{}", lib.name, rel)
 }
 
-fn sync_one_directory(
-    conn: &Connection,
-    config: &Config,
-    lib: &CollectionConfig,
-    root: &str,
-    dir: &Path,
+/// One step-1 pass over a folder, and what it shares with the walk.
+struct DirSync<'a> {
+    conn: &'a Connection,
+    config: &'a Config,
+    lib: &'a CollectionConfig,
+    root: &'a str,
     dry_run: bool,
-    report: &mut SyncReport,
-) -> Result<()> {
-    let abs = std::fs::canonicalize(dir).map_err(|e| TapectlError::Other(e.to_string()))?;
-    let abs_str = abs.to_string_lossy().to_string();
+    report: &'a mut SyncReport,
+    overlay: &'a mut PathOverlay,
+}
 
-    if lib.dotfiles {
-        let dotfile_path = abs.join(".tapectl-unit.toml");
+impl DirSync<'_> {
+    fn one_directory(&mut self, dir: &Path) -> std::result::Result<(), SyncProblem> {
+        let fail = |e: TapectlError| folder_problem(dir, severity_of(&e), e);
+        let abs = std::fs::canonicalize(dir).map_err(|e| fail(TapectlError::Io(e)))?;
+        let abs_str = abs.to_string_lossy().to_string();
+        // Every unit is read whole at its snapshot; a folder this user cannot
+        // enter is refused now, with the grant, not registered to fail there.
+        if let Err(cause) = may(
+            &abs,
+            nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::X_OK,
+        ) {
+            return Err(unreadable(dir, &cause));
+        }
+
+        if !self.lib.dotfiles {
+            // Path-keyed identity: no dotfile, ever — read-only sources trade
+            // away rename robustness for zero on-disk footprint (§11).
+            return match queries::get_unit_by_path(self.conn, &abs_str).map_err(fail)? {
+                Some(existing) => self.resolve_existing(&existing, &abs_str).map_err(fail),
+                None => {
+                    let name = self.checked_name(dir, &abs_str)?;
+                    let new =
+                        plan_path_keyed_unit(self.conn, self.config, self.lib, &name, &abs_str)
+                            .map_err(fail)?;
+                    if !self.dry_run {
+                        write_path_keyed_unit(self.conn, &new).map_err(fail)?;
+                    }
+                    self.report.created += 1;
+                    Ok(())
+                }
+            };
+        }
+
+        let dotfile_path = abs.join(dotfile::UNIT_DOTFILE);
         if dotfile_path.exists() {
-            let df = dotfile::read_dotfile(&dotfile_path)?;
-            match queries::get_unit_by_uuid(conn, &df.uuid)? {
+            let df = dotfile::read_dotfile(&dotfile_path).map_err(fail)?;
+            return match queries::get_unit_by_uuid(self.conn, &df.uuid).map_err(fail)? {
                 Some(existing) => {
                     // ADR-0012, 2026-10-07 item 24 (#378): a copy, not a move.
                     if let Some(refusal) = crate::unit::identity::copy_refusal(&existing, &abs_str)
                     {
-                        return Err(TapectlError::Other(refusal));
+                        return Err(folder_problem(dir, Severity::Warning, refusal));
                     }
-                    resolve_existing(conn, lib, &existing, &abs_str, dry_run, report)
+                    self.resolve_existing(&existing, &abs_str).map_err(fail)
                 }
                 None => {
                     // Dotfile on disk, DB doesn't know it yet — adopt it
                     // verbatim (mirrors `unit::discovery`'s own "not found"
                     // branch) rather than minting a second uuid.
-                    if !dry_run {
-                        adopt_dotfile(conn, config, &df, &abs_str)?;
+                    let adoption = plan_adoption(self.conn, self.config, &df, &abs_str)
+                        .map_err(|(severity, why)| folder_problem(dir, severity, why))?;
+                    if !self.dry_run {
+                        write_adoption(self.conn, &df, &abs_str, &adoption).map_err(fail)?;
                     }
-                    report.created += 1;
+                    self.report.created += 1;
                     Ok(())
                 }
+            };
+        }
+
+        // ADR-0012 item 220: a row at exactly this folder with no dotfile is
+        // a unit a dotfile write left half-registered before 1.9.0. It is
+        // completed with the row's own identity, never called nested in
+        // itself.
+        if let Some(stuck) = queries::get_unit_by_path(self.conn, &abs_str).map_err(fail)? {
+            if self.dry_run {
+                self.writable(dir, &abs_str)?;
+            } else {
+                crate::unit::complete_registration(self.conn, &stuck)
+                    .map_err(|e| self.unwritable(dir, &e))?;
             }
+            self.report.completed += 1;
+            return self.resolve_existing(&stuck, &abs_str).map_err(fail);
+        }
+
+        // A fresh directory.
+        let name = self.checked_name(dir, &abs_str)?;
+        let new = crate::unit::plan_new_unit(
+            self.conn,
+            self.config,
+            &abs_str,
+            &self.lib.tenant,
+            Some(&name),
+            &[],
+            self.lib.archive_set.as_deref(),
+        )
+        .map_err(fail)?;
+        if self.dry_run {
+            self.writable(dir, &abs_str)?;
         } else {
-            // No unit row can exist for a path with no dotfile under
-            // dotfiles=true (`init_unit` always writes one) — a fresh
-            // directory.
-            if !dry_run {
-                let name = collection_unit_name(lib, root, &abs_str);
-                crate::unit::init_unit_with_config(
+            match crate::unit::write_new_unit(self.conn, &new) {
+                Ok(_) => {}
+                Err(crate::unit::RegisterError::Catalog(e)) => return Err(fail(e)),
+                Err(crate::unit::RegisterError::Dotfile(e)) => return Err(self.unwritable(dir, &e)),
+            }
+        }
+        self.report.created += 1;
+        Ok(())
+    }
+
+    /// The name this folder would be registered under, refused (a warning,
+    /// in a dry run as in the real one) when it is not a valid unit name,
+    /// with the two ways out.
+    fn checked_name(&self, dir: &Path, abs_str: &str) -> std::result::Result<String, SyncProblem> {
+        let name = collection_unit_name(self.lib, self.root, abs_str);
+        crate::naming::validate_unit_name(&name).map_err(|e| {
+            let folder = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            folder_problem(
+                dir,
+                Severity::Warning,
+                format!(
+                    "{e} — rename the folder, or exclude it: tapectl config add \
+                     'collections[{}].exclude' {}",
+                    self.lib.name,
+                    crate::unit::shell_word(&folder)
+                ),
+            )
+        })?;
+        Ok(name)
+    }
+
+    /// A dry run's stand-in for writing the dotfile: whether this user may.
+    fn writable(&self, dir: &Path, abs_str: &str) -> std::result::Result<(), SyncProblem> {
+        may(
+            Path::new(abs_str),
+            nix::unistd::AccessFlags::W_OK | nix::unistd::AccessFlags::X_OK,
+        )
+        .map_err(|cause| {
+            self.unwritable(
+                dir,
+                &crate::unit::DotfileUnwritable {
+                    dir: abs_str.to_string(),
+                    cause: TapectlError::Io(cause),
+                },
+            )
+        })
+    }
+
+    /// A dotfile that could not be written: the grant, and the collection's
+    /// other way out (ADR-0012 item 220).
+    fn unwritable(&self, dir: &Path, e: &crate::unit::DotfileUnwritable) -> SyncProblem {
+        folder_problem(
+            dir,
+            Severity::Error,
+            format!(
+                "{}; or, for a source tapectl must not write, set the collection's dotfiles = \
+                 false: tapectl config set 'collections[{}].dotfiles' false",
+                e.describe(),
+                self.lib.name
+            ),
+        )
+    }
+
+    /// A directory resolved to an already-known unit (by uuid or by path):
+    /// update its recorded path if it moved, and reactivate it if it was
+    /// previously `missing` and has now reappeared. A unit owned by another
+    /// tenant than the collection's is named in `tenant_differs` (#383), and
+    /// keeps its owner. Each move and reactivation is also put in the
+    /// overlay, which is how a dry run's later steps see it.
+    fn resolve_existing(
+        &mut self,
+        existing: &crate::db::models::Unit,
+        abs_str: &str,
+    ) -> Result<()> {
+        let conn = self.conn;
+        let owner: String = conn.query_row(
+            "SELECT name FROM tenants WHERE id = ?1",
+            params![existing.tenant_id],
+            |r| r.get(0),
+        )?;
+        if owner != self.lib.tenant {
+            // `cli::collection` prints the operator's line for it.
+            debug!(
+                unit = %existing.name,
+                tenant = %owner,
+                collection_tenant = %self.lib.tenant,
+                "collection sync: a known unit is owned by another tenant than the collection's"
+            );
+            self.report
+                .tenant_differs
+                .push((existing.name.clone(), owner));
+        }
+
+        if existing.current_path.as_deref() != Some(abs_str) {
+            self.report.moved += 1;
+            self.overlay.moved.insert(existing.id, abs_str.to_string());
+            if !self.dry_run {
+                queries::update_unit_path(conn, existing.id, abs_str)?;
+                events::log_field_change(
                     conn,
-                    config,
-                    &abs_str,
-                    &lib.tenant,
-                    Some(&name),
-                    &[],
-                    lib.archive_set.as_deref(),
+                    "unit",
+                    existing.id,
+                    &existing.name,
+                    "collection_sync_path_update",
+                    "current_path",
+                    existing.current_path.as_deref(),
+                    abs_str,
+                    Some(existing.tenant_id),
                 )?;
             }
-            report.created += 1;
-            Ok(())
         }
-    } else {
-        // Path-keyed identity: no dotfile, ever — read-only sources trade
-        // away rename robustness for zero on-disk footprint (§11).
-        match queries::get_unit_by_path(conn, &abs_str)? {
-            Some(existing) => resolve_existing(conn, lib, &existing, &abs_str, dry_run, report),
-            None => {
-                if !dry_run {
-                    insert_path_keyed_unit(conn, config, lib, root, &abs_str)?;
-                }
-                report.created += 1;
-                Ok(())
+
+        if existing.status == "missing" {
+            self.report.reactivated += 1;
+            self.overlay.reactivated.insert(existing.id);
+            if !self.dry_run {
+                conn.execute(
+                    "UPDATE units SET status = 'active' WHERE id = ?1",
+                    params![existing.id],
+                )?;
+                events::log_field_change(
+                    conn,
+                    "unit",
+                    existing.id,
+                    &existing.name,
+                    "collection_sync_reactivated",
+                    "status",
+                    Some("missing"),
+                    "active",
+                    Some(existing.tenant_id),
+                )?;
             }
         }
+        Ok(())
     }
 }
 
-/// A directory resolved to an already-known unit (by uuid or by path):
-/// update its recorded path if it moved, and reactivate it if it was
-/// previously `missing` and has now reappeared. A unit owned by another
-/// tenant than the collection's is named in `tenant_differs` (#383), and
-/// keeps its owner.
-fn resolve_existing(
+/// What adopting a dotfile the catalog does not know resolves to, before
+/// anything is written.
+struct Adoption {
+    tenant_id: i64,
+    archive_set_id: Option<i64>,
+    checksum_mode: String,
+}
+
+/// Every check adopting `df` makes (a dry run's as well as the real run's):
+/// its tenant and archive set must exist (errors), its name must be free
+/// and its policy resolvable (warnings).
+fn plan_adoption(
     conn: &Connection,
-    lib: &CollectionConfig,
-    existing: &crate::db::models::Unit,
-    abs_str: &str,
-    dry_run: bool,
-    report: &mut SyncReport,
-) -> Result<()> {
-    let owner: String = conn.query_row(
-        "SELECT name FROM tenants WHERE id = ?1",
-        params![existing.tenant_id],
-        |r| r.get(0),
-    )?;
-    if owner != lib.tenant {
-        warn!(
-            unit = %existing.name,
-            tenant = %owner,
-            collection_tenant = %lib.tenant,
-            "collection sync: a known unit is owned by another tenant than the collection's"
-        );
-        report.tenant_differs.push((existing.name.clone(), owner));
+    config: &Config,
+    df: &dotfile::UnitDotfile,
+    dir_path: &str,
+) -> std::result::Result<Adoption, (Severity, String)> {
+    let catalog = |e: TapectlError| (severity_of(&e), e.to_string());
+    let tenant = queries::get_tenant_by_name(conn, &df.tenant)
+        .map_err(catalog)?
+        .ok_or_else(|| {
+            (
+                Severity::Error,
+                format!(
+                    "its {} names tenant \"{}\", which does not exist",
+                    dotfile::UNIT_DOTFILE,
+                    df.tenant
+                ),
+            )
+        })?;
+    // Resolve `df.archive_set` exactly as `unit::discovery::sync_discovered_unit`
+    // does (issue #48 item 3). Both functions adopt a pre-existing dotfile for a
+    // unit not yet in the DB, from the same field — so if only one of them read
+    // it, `unit discover` and `collection sync` would silently disagree about
+    // the same unit's policy depending on which command happened to register it.
+    // A dotfile naming a deleted or hand-edited archive set is refused here, as
+    // a per-unit failure, not a fatal scan.
+    let archive_set_id = queries::resolve_archive_set(conn, df.archive_set.as_deref())
+        .map_err(|e| (Severity::Error, e.to_string()))?;
+    if queries::get_unit_by_name(conn, &df.name)
+        .map_err(catalog)?
+        .is_some()
+    {
+        return Err(catalog(TapectlError::UnitAlreadyExists(df.name.clone())));
     }
-
-    if existing.current_path.as_deref() != Some(abs_str) {
-        report.moved += 1;
-        if !dry_run {
-            queries::update_unit_path(conn, existing.id, abs_str)?;
-            events::log_field_change(
-                conn,
-                "unit",
-                existing.id,
-                &existing.name,
-                "collection_sync_path_update",
-                "current_path",
-                existing.current_path.as_deref(),
-                abs_str,
-                Some(existing.tenant_id),
-            )?;
-        }
-    }
-
-    if existing.status == "missing" {
-        report.reactivated += 1;
-        if !dry_run {
-            conn.execute(
-                "UPDATE units SET status = 'active' WHERE id = ?1",
-                params![existing.id],
-            )?;
-            events::log_field_change(
-                conn,
-                "unit",
-                existing.id,
-                &existing.name,
-                "collection_sync_reactivated",
-                "status",
-                Some("missing"),
-                "active",
-                Some(existing.tenant_id),
-            )?;
-        }
-    }
-    Ok(())
+    // Issue #347: the resolved policy's mode, exactly as `unit discover`'s
+    // adoption resolves it -- the dotfile's own when it sets one.
+    let checksum_mode =
+        crate::unit::creation_checksum_mode(conn, config, &df.name, archive_set_id, dir_path)
+            .map_err(catalog)?;
+    Ok(Adoption {
+        tenant_id: tenant.id,
+        archive_set_id,
+        checksum_mode,
+    })
 }
 
 /// Register a unit whose dotfile already existed on disk but wasn't in the
 /// DB yet — mirrors `unit::discovery::sync_discovered_unit`'s "not found"
-/// branch: trust the dotfile's own recorded identity verbatim.
+/// branch: trust the dotfile's own recorded identity verbatim. One change.
+fn write_adoption(
+    conn: &Connection,
+    df: &dotfile::UnitDotfile,
+    dir_path: &str,
+    adoption: &Adoption,
+) -> Result<()> {
+    crate::unit::atomically(conn, || {
+        let unit_id = queries::insert_unit(
+            conn,
+            &df.uuid,
+            &df.name,
+            adoption.tenant_id,
+            adoption.archive_set_id,
+            dir_path,
+            &adoption.checksum_mode,
+            true,
+        )?;
+        events::log_created(conn, "unit", unit_id, &df.name, Some(adoption.tenant_id))?;
+        for tag in &df.tags {
+            queries::add_tag_to_unit(conn, unit_id, tag)?;
+        }
+        // #493 (ADR-0012 item 148): registration with the source present
+        // freezes the adopted dotfile's own `[policy.copies_at]`, from the
+        // copy of it already read, so a unit adopted and then lost keeps its
+        // targets.
+        crate::policy::store_frozen_copies_at(
+            conn,
+            unit_id,
+            &df.name,
+            adoption.tenant_id,
+            None,
+            df.copies_at.as_ref(),
+        )?;
+        Ok(())
+    })
+}
+
+/// [`plan_adoption`] then [`write_adoption`], for a caller that holds a
+/// dotfile and wants it registered.
+#[cfg(test)]
 fn adopt_dotfile(
     conn: &Connection,
     config: &Config,
     df: &dotfile::UnitDotfile,
     dir_path: &str,
 ) -> Result<()> {
-    let tenant = queries::get_tenant_by_name(conn, &df.tenant)?
-        .ok_or_else(|| TapectlError::TenantNotFound(df.tenant.clone()))?;
-    // Resolve `df.archive_set` exactly as `unit::discovery::sync_discovered_unit`
-    // does (issue #48 item 3). Both functions adopt a pre-existing dotfile for a
-    // unit not yet in the DB, from the same field — so if only one of them read
-    // it, `unit discover` and `collection sync` would silently disagree about
-    // the same unit's policy depending on which command happened to register it.
-    // A dotfile naming a deleted or hand-edited archive set surfaces as `Err`
-    // here, which the caller treats as a per-unit failure, not a fatal scan.
-    let archive_set_id = queries::resolve_archive_set(conn, df.archive_set.as_deref())?;
-    // Issue #347: the resolved policy's mode, exactly as `unit discover`'s
-    // adoption resolves it -- the dotfile's own when it sets one.
-    let checksum_mode =
-        crate::unit::creation_checksum_mode(conn, config, &df.name, archive_set_id, dir_path)?;
-
-    let unit_id = queries::insert_unit(
-        conn,
-        &df.uuid,
-        &df.name,
-        tenant.id,
-        archive_set_id,
-        dir_path,
-        &checksum_mode,
-        true,
-    )?;
-    events::log_created(conn, "unit", unit_id, &df.name, Some(tenant.id))?;
-    for tag in &df.tags {
-        queries::add_tag_to_unit(conn, unit_id, tag)?;
-    }
-    // #493 (ADR-0012 item 148): registration with the source present freezes
-    // the adopted dotfile's own `[policy.copies_at]`, from the copy of it
-    // already read, so a unit adopted and then lost keeps its targets.
-    crate::policy::store_frozen_copies_at(
-        conn,
-        unit_id,
-        &df.name,
-        tenant.id,
-        None,
-        df.copies_at.as_ref(),
-    )?;
-    Ok(())
+    let adoption =
+        plan_adoption(conn, config, df, dir_path).map_err(|(_, why)| TapectlError::Other(why))?;
+    write_adoption(conn, df, dir_path, &adoption)
 }
 
-/// Register a unit with no dotfile at all (`dotfiles = false`): path-keyed
-/// identity. Skips with a clear error on a name collision rather than a raw
-/// `UNIQUE` violation, mirroring `unit::init_bulk`'s per-directory
-/// skip-and-report.
-fn insert_path_keyed_unit(
+/// A path-keyed unit about to be registered (`dotfiles = false`).
+struct PathKeyedUnit {
+    name: String,
+    path: String,
+    tenant_id: i64,
+    archive_set_id: Option<i64>,
+    checksum_mode: String,
+}
+
+/// Every check registering a unit with no dotfile at all (`dotfiles =
+/// false`, path-keyed identity) makes. Skips with a clear error on a name
+/// collision rather than a raw `UNIQUE` violation, mirroring
+/// `unit::init_bulk`'s per-directory skip-and-report. `name` is already
+/// validated (`DirSync::checked_name`), as the dotfile branch's is.
+fn plan_path_keyed_unit(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
-    root: &str,
+    name: &str,
     abs_str: &str,
-) -> Result<()> {
+) -> Result<PathKeyedUnit> {
     let tenant = crate::tenant::require_tenant(conn, &lib.tenant)?;
-    let name = collection_unit_name(lib, root, abs_str);
-    if queries::get_unit_by_name(conn, &name)?.is_some() {
-        return Err(TapectlError::UnitAlreadyExists(name));
+    if queries::get_unit_by_name(conn, name)?.is_some() {
+        return Err(TapectlError::UnitAlreadyExists(name.to_string()));
     }
-    let uuid = uuid::Uuid::new_v4().to_string();
     // Path-keyed units have no dotfile to read an archive set from, but the
-    // `CollectionConfig` itself carries one — and `sync_one_directory`'s
-    // dotfile-backed path already passes `lib.archive_set` through to
-    // `init_unit`. Resolving it here too keeps both branches of the same
+    // `CollectionConfig` itself carries one — and the dotfile-backed branch
+    // of the same `collection sync` already passes `lib.archive_set` through
+    // to `init_unit`. Resolving it here too keeps both branches of the same
     // `collection sync` agreeing about the collection's own configured
     // policy, rather than silently depending on `dotfiles = true/false`.
     let archive_set_id = queries::resolve_archive_set(conn, lib.archive_set.as_deref())?;
     // Issue #347: the same resolved mode `init_unit_with_config` gives the
     // dotfile-backed branch.
     let checksum_mode =
-        crate::unit::creation_checksum_mode(conn, config, &name, archive_set_id, abs_str)?;
-
-    let unit_id = queries::insert_unit(
-        conn,
-        &uuid,
-        &name,
-        tenant.id,
+        crate::unit::creation_checksum_mode(conn, config, name, archive_set_id, abs_str)?;
+    Ok(PathKeyedUnit {
+        name: name.to_string(),
+        path: abs_str.to_string(),
+        tenant_id: tenant.id,
         archive_set_id,
-        abs_str,
-        &checksum_mode,
-        true,
-    )?;
-    events::log_created(conn, "unit", unit_id, &name, Some(tenant.id))?;
-    Ok(())
+        checksum_mode,
+    })
+}
+
+fn write_path_keyed_unit(conn: &Connection, new: &PathKeyedUnit) -> Result<()> {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    crate::unit::atomically(conn, || {
+        let unit_id = queries::insert_unit(
+            conn,
+            &uuid,
+            &new.name,
+            new.tenant_id,
+            new.archive_set_id,
+            &new.path,
+            &new.checksum_mode,
+            true,
+        )?;
+        events::log_created(conn, "unit", unit_id, &new.name, Some(new.tenant_id))?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]

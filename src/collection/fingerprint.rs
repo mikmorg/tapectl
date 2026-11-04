@@ -33,6 +33,7 @@
 //! for the dependency-direction reasoning). `classify` here stays the
 //! "walk, then compare" convenience wrapper every *Dirty* caller uses.
 
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -46,10 +47,10 @@ use crate::unit::content_match::{self, FileStamp};
 
 pub use crate::unit::content_match::FingerprintDiff;
 
-/// Why a unit is pending.
+/// Why a unit is pending (CONTEXT.md: Pending is either form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingReason {
-    /// No snapshot exists at all — never archived.
+    /// No snapshot exists at all — Never Archived.
     New,
     /// A snapshot exists, but the current on-disk fingerprint no longer
     /// matches its recorded one (files added/removed/changed).
@@ -291,10 +292,48 @@ pub fn pending_units_for_collection(
     lib: &CollectionConfig,
     global_excludes: &[String],
 ) -> Result<PendingScan> {
+    pending_units_with_overlay(conn, lib, global_excludes, &PathOverlay::default())
+}
+
+/// The moves and reactivations a `collection sync` found, as the catalog
+/// will record them (ADR-0012 item 220). A dry run records none in the
+/// catalog, so its pending scan reads the catalog through this instead and
+/// counts what the real run, which has recorded them, counts.
+#[derive(Debug, Default, Clone)]
+pub struct PathOverlay {
+    /// A unit's new folder, by unit id.
+    pub moved: HashMap<i64, String>,
+    /// Units `missing` in the catalog whose folder is back.
+    pub reactivated: HashSet<i64>,
+}
+
+/// [`pending_units_for_collection`], over the catalog with `overlay`'s moves
+/// and reactivations applied. The same statements: one listing of the
+/// units, then each unit's own.
+pub fn pending_units_with_overlay(
+    conn: &Connection,
+    lib: &CollectionConfig,
+    global_excludes: &[String],
+    overlay: &PathOverlay,
+) -> Result<PendingScan> {
     let root = super::canonical_root(lib)?;
-    let units = super::units_under_root(conn, &root)?;
+    let units = crate::db::queries::list_units(conn, None, None)?
+        .into_iter()
+        .filter_map(|mut u| {
+            if let Some(path) = overlay.moved.get(&u.id) {
+                u.current_path = Some(path.clone());
+            }
+            if overlay.reactivated.contains(&u.id) {
+                u.status = "active".to_string();
+            }
+            let under = u
+                .current_path
+                .as_deref()
+                .is_some_and(|p| super::is_under_root(p, &root));
+            under.then_some(u)
+        });
     let mut scan = PendingScan::default();
-    for unit in units.into_iter().filter(|u| u.status == "active") {
+    for unit in units.filter(|u| u.status == "active") {
         let Some(path) = unit.current_path.as_deref() else {
             continue;
         };

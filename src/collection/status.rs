@@ -1,5 +1,8 @@
-//! `collection status` (`docs/design/v2-open-questions.md` §11): pending /
-//! dirty / missing / under-copied counts.
+//! `collection status` (`docs/design/v2-open-questions.md` §11): pending
+//! (never archived and dirty) / missing / under-copied counts. The staged
+//! count and the collection's own problems are read beside this by
+//! `cli::collection`, once per command: this is the per-unit scan, and its
+//! cost is pinned per unit (`tests/catalog_budget.rs`).
 
 use rusqlite::Connection;
 
@@ -11,10 +14,11 @@ use super::fingerprint::{PendingReason, RefusedUnit};
 /// One collection's readiness snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct CollectionStatus {
-    /// Units with no snapshot at all yet.
-    pub pending: usize,
-    /// Units with a snapshot, but whose on-disk fingerprint has since
-    /// changed.
+    /// Pending in its first form (CONTEXT.md, Never Archived): units with
+    /// no snapshot at all yet.
+    pub never_archived: usize,
+    /// Pending in its second form: units with a snapshot, but whose
+    /// on-disk fingerprint has since changed.
     pub dirty: usize,
     /// Units whose directory has vanished (`collection sync` sets this; never
     /// auto-deleted or retired).
@@ -24,7 +28,7 @@ pub struct CollectionStatus {
     pub under_copied: usize,
     /// Units refused during pending/dirty detection because their own
     /// dotfile could not be parsed (ADR-0012's 2026-09-22 amendment, issue
-    /// #285) — never counted in `pending`/`dirty`, and never archived.
+    /// #285) — never counted in `never_archived`/`dirty`, and never archived.
     /// `cli::collection::cmd_status` must report these and exit non-zero
     /// when non-empty.
     pub refused: Vec<RefusedUnit>,
@@ -32,6 +36,14 @@ pub struct CollectionStatus {
     /// `collection::outside`. Never archived; `cli::collection::cmd_status`
     /// names them and exits non-zero.
     pub outside: Vec<super::outside::OutsideEntry>,
+}
+
+impl CollectionStatus {
+    /// Pending as CONTEXT.md means it: never archived or dirty (ADR-0012
+    /// item 207).
+    pub fn pending(&self) -> usize {
+        self.never_archived + self.dirty
+    }
 }
 
 /// Compute one collection's status.
@@ -49,7 +61,7 @@ pub fn status_for_collection(
     )?;
     for p in &scan.pending {
         match p.reason {
-            PendingReason::New => status.pending += 1,
+            PendingReason::New => status.never_archived += 1,
             PendingReason::Dirty => status.dirty += 1,
         }
     }
@@ -122,7 +134,11 @@ mod tests {
 
         let config = Config::default();
         let status = status_for_collection(&conn, &config, &lib).unwrap();
-        assert_eq!(status.pending, 1, "freshly synced unit has no snapshot yet");
+        assert_eq!(
+            status.never_archived, 1,
+            "freshly synced unit has no snapshot yet"
+        );
+        assert_eq!(status.pending(), 1);
         assert_eq!(status.dirty, 0);
         assert_eq!(status.missing, 0);
         assert_eq!(
@@ -163,7 +179,8 @@ mod tests {
         let status = status_for_collection(&conn, &config, &lib).unwrap();
         assert_eq!(status.missing, 1);
         assert_eq!(
-            status.pending, 0,
+            status.pending(),
+            0,
             "a missing unit's vanished directory must not be walked for pending-detection"
         );
     }

@@ -997,6 +997,79 @@ fn backend_add_dry_run_does_not_touch_config_file() {
     assert_eq!(before, after, "--dry-run modified config.toml");
 }
 
+/// `collection add` and `collection remove` (ADR-0012 item 206):
+/// `config.toml` is byte-for-byte unchanged, no unit is registered and no
+/// dotfile written, though the dry run of `add` shows the sync it previews
+/// and both name what they would do.
+#[test]
+fn collection_add_and_remove_dry_runs_change_nothing() {
+    let home = TempDir::new().unwrap();
+    ok(home.path(), &["init"]);
+    ok(home.path(), &["tenant", "add", "media"]);
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+    let root_str = root.path().canonicalize().unwrap().display().to_string();
+    let cfg_path = home.path().join(".tapectl").join("config.toml");
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+    let out = ok(
+        home.path(),
+        &[
+            "collection",
+            "add",
+            "photos",
+            &root_str,
+            "--tenant",
+            "media",
+            "--dry-run",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("would add collection \"photos\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("would create 1; 0 refused"), "{stdout}");
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "collection add --dry-run modified config.toml"
+    );
+
+    // Positive control: the real add writes the table.
+    ok(
+        home.path(),
+        &[
+            "collection",
+            "add",
+            "photos",
+            &root_str,
+            "--tenant",
+            "media",
+        ],
+    );
+    let added = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(added.contains("[[collections]]"), "{added}");
+
+    let out = ok(
+        home.path(),
+        &["--dry-run", "collection", "remove", "photos"],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("would remove collection \"photos\""),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        added,
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "collection remove --dry-run modified config.toml"
+    );
+    let conn = db(home.path());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM units"), 0);
+    assert!(!root.path().join("alpha/.tapectl-unit.toml").exists());
+}
+
 /// `unit tag`: the tag set must not change.
 #[test]
 fn unit_tag_dry_run_changes_nothing() {

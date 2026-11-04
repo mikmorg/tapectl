@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use clap::Subcommand;
 use rusqlite::Connection;
 
@@ -33,17 +35,93 @@ const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 
 #[derive(Subcommand, Debug)]
 pub enum CollectionCommands {
+    /// Add a collection: a folder whose subfolders are each a unit of one
+    /// tenant
+    ///
+    /// ROOT must be an absolute path to a directory that exists, neither
+    /// inside another collection's root nor holding one. The tenant and the
+    /// archive set must exist. The user tapectl runs as (the service user,
+    /// under tapectl-op) must be able to read the whole tree and, unless
+    /// --no-dotfiles, write a .tapectl-unit.toml into each unit folder; when
+    /// it cannot, the setfacl lines that grant it are printed and nothing
+    /// is added, since it cannot grant them itself. Then the
+    /// [[collections]] table is written into config.toml, its comments
+    /// kept, and the sync dry run is shown: `tapectl collection sync`
+    /// registers the units.
+    ///
+    /// Exit status: 0 = added (with --dry-run: it would be); 2 = refused,
+    /// nothing written.
+    Add {
+        /// The collection's name. It begins every unit name the collection
+        /// registers: NAME/FOLDER
+        name: String,
+        /// The folder to walk: an absolute path
+        root: String,
+        /// The tenant the collection's units are registered under
+        #[arg(long)]
+        tenant: String,
+        /// How deep the unit folders are: 1 = ROOT's own subfolders, 2 =
+        /// theirs (show/season)
+        #[arg(long, default_value = "1")]
+        unit_depth: usize,
+        /// A folder or file name to leave out, as a glob (repeat it for
+        /// several), e.g. '*.partial'
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// The archive set the collection's units are registered in
+        #[arg(long)]
+        archive_set: Option<String>,
+        /// Write no .tapectl-unit.toml: each unit is known by its path, for
+        /// a source tapectl must not write. A renamed folder then reads as a
+        /// new unit, and the old one as missing
+        #[arg(long)]
+        no_dotfiles: bool,
+    },
+
+    /// Take a collection out of config.toml; its units stay registered and
+    /// untouched
+    ///
+    /// No sync walks its root after this, so none of its units is marked
+    /// missing for it. They stay ordinary units, with their versions,
+    /// copies and staged sets: `tapectl unit list` names them.
+    Remove {
+        /// The collection's name
+        name: String,
+    },
+
     /// Sync every configured collection: register new unit folders, resolve
     /// moved/renamed ones by dotfile uuid, mark vanished ones `missing`
     /// (never deleted or retired — those are operator acts).
+    ///
+    /// A unit registered before 1.9.0 whose .tapectl-unit.toml was never
+    /// written is completed: the file is written with the unit's own
+    /// identity. A dry run makes every check the real run makes, so it
+    /// refuses what the real run would.
+    ///
+    /// Exit status: 0 = clean; 1 = warnings (a folder refused, an entry
+    /// outside every unit, a unit marked missing); 2 = errors (a root that
+    /// is not absolute or does not exist, a tenant or archive set that does
+    /// not exist, permission denied, a .tapectl-unit.toml that could not be
+    /// written). Every collection is synced whatever another's problems;
+    /// the status is the worst seen.
     Sync {
         /// Report what would change without mutating anything.
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
 
-    /// Show pending/dirty/missing/under-copied counts for every configured
-    /// collection.
+    /// Show each configured collection's pending, staged, under-copied and
+    /// missing units
+    ///
+    /// Pending is a unit never archived or dirty (changed since its last
+    /// version); staged is a version waiting in staging for a copy it is
+    /// still owed, which `volume write` writes.
+    ///
+    /// Exit status: 0 = clean; 1 = warnings (a unit refused, an entry
+    /// outside every unit, a unit missing); 2 = errors (a root that is not
+    /// absolute or does not exist, a tenant or archive set that does not
+    /// exist). Every collection is shown whatever another's problems; the
+    /// status is the worst seen.
     Status,
 
     /// Show the batch plan (alphabetical next-fit, §7) for every
@@ -54,6 +132,13 @@ pub enum CollectionCommands {
     /// spans onto the next cartridge. It is refused when it is larger than
     /// the staging area, or, on a drive that does not declare
     /// `post_warning_bytes`, larger than the room under the fill ceiling.
+    ///
+    /// The units already staged and still owed a copy are listed after the
+    /// batches, with the command that writes them.
+    ///
+    /// Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a
+    /// collection's root, tenant or archive set, or no drive to plan
+    /// against). Every collection is planned whatever another's problems.
     Plan {
         /// Copies to plan for — informational only (batches don't change;
         /// this scales the printed cartridge-count estimate).
@@ -207,6 +292,33 @@ pub fn run(
     assume_yes: bool,
 ) -> Result<i32> {
     match command {
+        CollectionCommands::Add {
+            name,
+            root,
+            tenant,
+            unit_depth,
+            exclude,
+            archive_set,
+            no_dotfiles,
+        } => cmd_add(
+            conn,
+            paths,
+            config,
+            &NewCollection {
+                name,
+                root,
+                tenant,
+                unit_depth: *unit_depth,
+                exclude,
+                archive_set: archive_set.as_deref(),
+                dotfiles: !*no_dotfiles,
+            },
+            json_output,
+            global_dry_run,
+        ),
+        CollectionCommands::Remove { name } => {
+            cmd_remove(conn, paths, config, name, json_output, global_dry_run)
+        }
         // `Sync` declares its OWN `--dry-run` as well. The two are OR-ed,
         // but NOT because the global one was being dropped here: both args
         // carry the clap id `dry_run`, so clap propagates the global value
@@ -290,11 +402,14 @@ fn shortfalls<'a>(
     Ok(out)
 }
 
-fn no_libraries_configured(json_output: bool) {
+/// With no collection configured, `sync`, `status` and `plan` print an
+/// empty list under `--json`, the shape they print for several (ADR-0012
+/// item 220), and otherwise name the command that adds one.
+fn no_collections(json_output: bool) {
     if json_output {
-        println!("{}", serde_json::json!({"collections": []}));
+        crate::render::print_json(&serde_json::json!([]));
     } else {
-        println!("no collections configured — add a [[collections]] block to config.toml");
+        println!("no collection is configured; {}", collection::ADD_ONE);
     }
 }
 
@@ -353,9 +468,10 @@ fn outside_json(outside: &[OutsideEntry]) -> Vec<serde_json::Value> {
 }
 
 /// Plain-text report for `outside` (issue #382), shared by `sync` and
-/// `status`: a count, then each entry by its path under the root. Nothing
-/// when there is none, so a clean collection reads as before.
-fn print_outside_plain(outside: &[OutsideEntry]) {
+/// `status`: a count, then each entry by its path under the root, then the
+/// two ways out (ADR-0012 item 220). Nothing when there is none, so a clean
+/// collection reads as before.
+fn print_outside_plain(collection: &str, outside: &[OutsideEntry]) {
     let n = outside.len();
     match n {
         0 => return,
@@ -369,122 +485,553 @@ fn print_outside_plain(outside: &[OutsideEntry]) {
     for e in outside {
         println!("    {} ({})", e.path, e.kind.label());
     }
+    println!(
+        "    move each into a unit folder, or exclude it: tapectl config add \
+         'collections[{collection}].exclude' PATTERN"
+    );
+}
+
+/// `3 pending (2 never archived, 1 dirty)`: Pending as CONTEXT.md means it,
+/// with its two forms beside it, a form that is zero left out (and the
+/// parentheses with both). Always present, `0 pending` included, so the
+/// line keeps its shape (ADR-0012 item 207).
+fn pending_phrase(never_archived: usize, dirty: usize) -> String {
+    let forms: Vec<String> = [(never_archived, "never archived"), (dirty, "dirty")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, form)| format!("{n} {form}"))
+        .collect();
+    match forms.is_empty() {
+        true => format!("{} pending", never_archived + dirty),
+        false => format!("{} pending ({})", never_archived + dirty, forms.join(", ")),
+    }
+}
+
+/// ` · 3 staged, awaiting a write`, or nothing when no unit is.
+fn staged_phrase(staged: usize) -> String {
+    match staged {
+        0 => String::new(),
+        n => format!(" · {n} staged, awaiting a write"),
+    }
+}
+
+/// `collection status`'s line for one collection (ADR-0012 item 207):
+/// `3 pending (2 never archived, 1 dirty) · 3 staged, awaiting a write · 3
+/// under-copied · 1 missing`, each part after the first left out at zero.
+fn status_line(name: &str, s: &collection::status::CollectionStatus, staged: usize) -> String {
+    let mut line = format!(
+        "collection \"{name}\": {}{}",
+        pending_phrase(s.never_archived, s.dirty),
+        staged_phrase(staged)
+    );
+    if s.under_copied > 0 {
+        line.push_str(&format!(" · {} under-copied", s.under_copied));
+    }
+    if s.missing > 0 {
+        line.push_str(&format!(" · {} missing", s.missing));
+    }
+    line
+}
+
+/// The unit names with a stage set held in staging that is still owed a
+/// copy: Staged in CONTEXT.md's sense, and `stage list --owing`'s rows (the
+/// one selection, `cli::stage::stage_set_rows`), read once per command.
+fn owing_units(conn: &Connection, config: &Config) -> Result<HashSet<String>> {
+    Ok(
+        crate::cli::stage::stage_set_rows(conn, config, crate::cli::stage::Shown::Held)?
+            .into_iter()
+            .filter(|row| row.owing)
+            .map(|row| row.unit)
+            .collect(),
+    )
+}
+
+/// The units of the collection whose canonical root is `root` that
+/// `owing` names, in name order.
+fn staged_under(conn: &Connection, root: &str, owing: &HashSet<String>) -> Result<Vec<String>> {
+    let mut names: Vec<String> = collection::units_under_root(conn, root)?
+        .into_iter()
+        .map(|u| u.name)
+        .filter(|name| owing.contains(name))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// The line for a collection that could not be read at all: one per
+/// problem, under its name.
+fn print_collection_errors(name: &str, errors: &[String]) {
+    for e in errors {
+        println!(
+            "collection \"{name}\": {}: {e}",
+            crate::render::verdict("error")
+        );
+    }
+}
+
+/// `collection sync`'s JSON object for one collection: the same keys
+/// whatever happened, the counts `null` when its own problems stopped it.
+fn sync_json(
+    name: &str,
+    r: &collection::sync::SyncReport,
+    staged: Option<usize>,
+    dry_run: bool,
+) -> serde_json::Value {
+    use collection::Severity;
+    let stopped = r.problems.iter().any(|p| p.folder.is_none());
+    let count = |n: usize| (!stopped).then_some(n);
+    let messages = |severity: Severity| {
+        r.problems
+            .iter()
+            .filter(|p| p.severity == severity)
+            .map(|p| p.message.clone())
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({
+        "collection": name,
+        "dry_run": dry_run,
+        "created": count(r.created),
+        "completed": count(r.completed),
+        "refused_folders": count(r.refused_folders()),
+        "moved": count(r.moved),
+        "reactivated": count(r.reactivated),
+        "missing": count(r.missing),
+        "missing_units": r.missing_units.iter().map(|(unit, path)| {
+            serde_json::json!({"unit": unit, "path": path})
+        }).collect::<Vec<_>>(),
+        // ADR-0012 item 207: pending as CONTEXT.md means it, and its forms.
+        "pending": count(r.pending()),
+        "never_archived": count(r.never_archived),
+        "dirty": count(r.dirty),
+        "staged": staged,
+        "errors": messages(Severity::Error),
+        "warnings": messages(Severity::Warning),
+        "refused": refused_json(&r.refused),
+        "outside": outside_json(&r.outside),
+        "tenant_differs": r.tenant_differs.iter().map(|(unit, tenant)| {
+            serde_json::json!({"unit": unit, "tenant": tenant})
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// `collection sync`'s text for one collection: `would create N; M
+/// refused` in a dry run, `N created; M refused` in a real one (ADR-0012
+/// item 220), then each problem, warning and entry outside every unit.
+fn print_sync_plain(
+    lib: &crate::config::CollectionConfig,
+    r: &collection::sync::SyncReport,
+    staged: usize,
+    dry_run: bool,
+) {
+    use collection::Severity;
+    let name = &lib.name;
+    if r.problems.iter().any(|p| p.folder.is_none()) {
+        let errors: Vec<String> = r.problems.iter().map(|p| p.message.clone()).collect();
+        print_collection_errors(name, &errors);
+        return;
+    }
+    let (mode, created) = match dry_run {
+        true => (" (dry run)", format!("would create {}", r.created)),
+        false => ("", format!("{} created", r.created)),
+    };
+    let completed = match r.completed {
+        0 => String::new(),
+        n => format!(", {n} completed"),
+    };
+    println!(
+        "collection \"{name}\"{mode}: {created}{completed}; {} refused · {} moved, {} reactivated, \
+         {} missing · {}{}",
+        r.refused_folders(),
+        r.moved,
+        r.reactivated,
+        r.missing,
+        pending_phrase(r.never_archived, r.dirty),
+        staged_phrase(staged),
+    );
+    if r.completed > 0 {
+        println!(
+            "  completed: {} registered before 1.9.0 without their {}; {} with each unit's own \
+             identity",
+            crate::render::plural(r.completed as i64, "unit", "units"),
+            crate::unit::dotfile::UNIT_DOTFILE,
+            if dry_run {
+                "it would be written"
+            } else {
+                "written now"
+            },
+        );
+    }
+    for p in &r.problems {
+        let word = match p.severity {
+            Severity::Error => "error",
+            Severity::Warning => "refused",
+        };
+        println!("  {}: {}", crate::render::verdict(word), p.message);
+    }
+    for (unit, tenant) in &r.tenant_differs {
+        println!(
+            "  {}: unit \"{unit}\" is owned by tenant \"{tenant}\", not the collection's \"{}\"; \
+             it keeps its owner (new units go to \"{}\")",
+            crate::render::verdict("warning"),
+            lib.tenant,
+            lib.tenant
+        );
+    }
+    for (unit, path) in &r.missing_units {
+        println!(
+            "  {}: unit \"{unit}\": its folder {path} is gone; {} missing (never deleted)",
+            crate::render::verdict("warning"),
+            if dry_run {
+                "it would be marked"
+            } else {
+                "marked"
+            },
+        );
+    }
+    print_refused_plain(&r.refused);
+    print_outside_plain(name, &r.outside);
 }
 
 fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool) -> Result<i32> {
     if config.collections.is_empty() {
-        no_libraries_configured(json_output);
+        no_collections(json_output);
         return Ok(crate::error::EXIT_SUCCESS);
     }
 
+    let owing = owing_units(conn, config)?;
     let mut rows = Vec::new();
-    let mut any_refused = false;
+    let mut seen = Vec::new();
     for lib in &config.collections {
-        let (report, errors) =
-            collection::sync::sync_collection_with_config(conn, config, lib, dry_run)?;
-        // Issue #337: a directory step 1 could not register -- an
-        // UNREGISTERED unit whose dotfile does not parse, or any other
-        // registration failure -- is a unit that will never be archived,
-        // exactly like a refused registered one (ADR-0012, 2026-09-22:
-        // "refused, and the command exits non-zero"). Printed as `error:`
-        // lines below; counted here so the exit code says so too.
-        // Issue #382: content no unit holds is never archived either.
-        any_refused |=
-            !report.refused.is_empty() || !errors.is_empty() || !report.outside.is_empty();
-        rows.push((lib.name.clone(), report, errors));
+        // Issue #337, #382 and ADR-0012 item 220: every unit a sync could
+        // not register, every entry no unit holds and every unit marked
+        // missing is never archived, so each makes the exit status say so;
+        // each collection's own problems are its own (OQ6).
+        let report = collection::sync::sync_collection_with_config(conn, config, lib, dry_run)?;
+        seen.extend(report.severities());
+        let staged = match report.problems.iter().any(|p| p.folder.is_none()) {
+            true => None,
+            false => Some(staged_under(conn, &collection::canonical_root(lib)?, &owing)?.len()),
+        };
+        rows.push((lib, report, staged));
     }
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, r, errors)| {
-                serde_json::json!({
-                    "collection": name,
-                    "dry_run": dry_run,
-                    "created": r.created,
-                    "moved": r.moved,
-                    "reactivated": r.reactivated,
-                    "missing": r.missing,
-                    "pending": r.pending,
-                    "dirty": r.dirty,
-                    "errors": errors,
-                    "refused": refused_json(&r.refused),
-                    "outside": outside_json(&r.outside),
-                    "tenant_differs": r.tenant_differs.iter().map(|(unit, tenant)| {
-                        serde_json::json!({"unit": unit, "tenant": tenant})
-                    }).collect::<Vec<_>>(),
-                })
-            })
+            .map(|(lib, r, staged)| sync_json(&lib.name, r, *staged, dry_run))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else {
-        for (name, r, errors) in &rows {
-            let mode = if dry_run { " (dry-run)" } else { "" };
-            println!(
-                "collection \"{name}\"{mode}: {} created, {} moved, {} reactivated, \
-                 {} missing, {} pending, {} dirty",
-                r.created, r.moved, r.reactivated, r.missing, r.pending, r.dirty
-            );
-            for e in errors {
-                println!("  error: {e}");
-            }
-            if let Some(lib) = config.collections.iter().find(|l| &l.name == name) {
-                for (unit, tenant) in &r.tenant_differs {
-                    println!(
-                        "  warning: unit \"{unit}\" is owned by tenant \"{tenant}\", not the \
-                         collection's \"{}\"; it keeps its owner (new units go to \"{}\")",
-                        lib.tenant, lib.tenant
-                    );
-                }
-            }
-            print_refused_plain(&r.refused);
-            print_outside_plain(&r.outside);
+        for (lib, r, staged) in &rows {
+            print_sync_plain(lib, r, staged.unwrap_or(0), dry_run);
         }
     }
-    Ok(refused_exit_code(any_refused))
+    Ok(collection::Severity::exit_code(seen))
+}
+
+/// One collection's `collection status`: its scan, or the problems that
+/// stopped it.
+struct StatusRow<'a> {
+    name: &'a str,
+    status: Option<collection::status::CollectionStatus>,
+    staged: usize,
+    errors: Vec<String>,
 }
 
 fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i32> {
+    use collection::Severity;
     if config.collections.is_empty() {
-        no_libraries_configured(json_output);
+        no_collections(json_output);
         return Ok(crate::error::EXIT_SUCCESS);
     }
 
+    let owing = owing_units(conn, config)?;
     let mut rows = Vec::new();
-    let mut any_refused = false;
+    let mut seen = Vec::new();
     for lib in &config.collections {
+        // ADR-0012 item 220: a missing root or an unknown tenant is this
+        // collection's error, said as one, and the next is still shown.
+        let errors = collection::collection_problems(conn, lib)?;
+        if !errors.is_empty() {
+            seen.push(Severity::Error);
+            rows.push(StatusRow {
+                name: &lib.name,
+                status: None,
+                staged: 0,
+                errors,
+            });
+            continue;
+        }
         let status = collection::status::status_for_collection(conn, config, lib)?;
-        any_refused |= !status.refused.is_empty() || !status.outside.is_empty();
-        rows.push((lib.name.clone(), status));
+        if !status.refused.is_empty() || !status.outside.is_empty() || status.missing > 0 {
+            seen.push(Severity::Warning);
+        }
+        let staged = staged_under(conn, &collection::canonical_root(lib)?, &owing)?.len();
+        rows.push(StatusRow {
+            name: &lib.name,
+            status: Some(status),
+            staged,
+            errors: Vec::new(),
+        });
     }
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, s)| {
+            .map(|row| {
+                let s = row.status.as_ref();
                 serde_json::json!({
-                    "collection": name,
-                    "pending": s.pending,
-                    "dirty": s.dirty,
-                    "missing": s.missing,
-                    "under_copied": s.under_copied,
-                    "refused": refused_json(&s.refused),
-                    "outside": outside_json(&s.outside),
+                    "collection": row.name,
+                    // ADR-0012 item 207: pending as CONTEXT.md means it, its
+                    // two forms, and the staged units awaiting a write.
+                    "pending": s.map(|s| s.pending()),
+                    "never_archived": s.map(|s| s.never_archived),
+                    "dirty": s.map(|s| s.dirty),
+                    "staged": s.map(|_| row.staged),
+                    "missing": s.map(|s| s.missing),
+                    "under_copied": s.map(|s| s.under_copied),
+                    "refused": s.map(|s| refused_json(&s.refused)).unwrap_or_default(),
+                    "outside": s.map(|s| outside_json(&s.outside)).unwrap_or_default(),
+                    "errors": row.errors,
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else {
-        for (name, s) in &rows {
-            println!(
-                "collection \"{name}\": {} pending, {} dirty, {} missing, {} under-copied",
-                s.pending, s.dirty, s.missing, s.under_copied
-            );
-            print_refused_plain(&s.refused);
-            print_outside_plain(&s.outside);
+        for row in &rows {
+            match &row.status {
+                None => print_collection_errors(row.name, &row.errors),
+                Some(s) => {
+                    println!("{}", status_line(row.name, s, row.staged));
+                    print_refused_plain(&s.refused);
+                    print_outside_plain(row.name, &s.outside);
+                }
+            }
         }
     }
-    Ok(refused_exit_code(any_refused))
+    Ok(Severity::exit_code(seen))
+}
+
+/// `collection add`'s arguments.
+struct NewCollection<'a> {
+    name: &'a str,
+    root: &'a str,
+    tenant: &'a str,
+    unit_depth: usize,
+    exclude: &'a [String],
+    archive_set: Option<&'a str>,
+    dotfiles: bool,
+}
+
+impl NewCollection<'_> {
+    fn config(&self) -> crate::config::CollectionConfig {
+        crate::config::CollectionConfig {
+            name: self.name.to_string(),
+            root: self.root.to_string(),
+            tenant: self.tenant.to_string(),
+            unit_depth: self.unit_depth,
+            exclude: self.exclude.to_vec(),
+            archive_set: self.archive_set.map(str::to_string),
+            dotfiles: self.dotfiles,
+            snapshot_command: None,
+            release_command: None,
+        }
+    }
+
+    /// The `[[collections]]` table, as the `field=value` list
+    /// `config_edit::plan_collection_add` takes: each value TOML text, so a
+    /// name such as `2024` stays a string. A key at its default is left
+    /// out, as an operator writing the table would.
+    fn fields(&self) -> Vec<String> {
+        let q = |v: &str| toml_edit::Value::from(v).to_string().trim().to_string();
+        let mut fields = vec![
+            format!("name={}", q(self.name)),
+            format!("root={}", q(self.root)),
+            format!("tenant={}", q(self.tenant)),
+        ];
+        if self.unit_depth != 1 {
+            fields.push(format!("unit_depth={}", self.unit_depth));
+        }
+        if !self.exclude.is_empty() {
+            let list: toml_edit::Array = self.exclude.iter().map(String::as_str).collect();
+            fields.push(format!("exclude={}", list.to_string().trim()));
+        }
+        if let Some(set) = self.archive_set {
+            fields.push(format!("archive_set={}", q(set)));
+        }
+        if !self.dotfiles {
+            fields.push("dotfiles=false".to_string());
+        }
+        fields
+    }
+}
+
+/// `collection add` (ADR-0012 item 206): refuse what would make the
+/// collection unusable, check the access the user tapectl runs as needs
+/// (`collection::access`), write the table, then show the sync dry run.
+fn cmd_add(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    new: &NewCollection<'_>,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<i32> {
+    let refuse = |why: String| Err(TapectlError::Other(why));
+    collection::validate_collection_name(new.name)?;
+    if config.collections.iter().any(|c| c.name == new.name) {
+        return refuse(format!(
+            "a collection named \"{}\" is already configured in {}; choose another name",
+            new.name,
+            paths.config_file.display()
+        ));
+    }
+    if !std::path::Path::new(new.root).is_absolute() {
+        return refuse(format!(
+            "ROOT \"{}\" is not an absolute path: give the whole path, from /",
+            new.root
+        ));
+    }
+    let canonical = std::fs::canonicalize(new.root).map_err(|e| {
+        TapectlError::Other(format!(
+            "ROOT \"{}\" does not exist or cannot be reached: {e}",
+            new.root
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return refuse(format!("ROOT \"{}\" is not a directory", new.root));
+    }
+    if new.unit_depth == 0 {
+        return refuse(
+            "--unit-depth 0 would make ROOT itself the unit: give 1 for its subfolders, 2 for \
+             theirs"
+                .to_string(),
+        );
+    }
+    if crate::db::queries::get_tenant_by_name(conn, new.tenant)?.is_none() {
+        return refuse(format!(
+            "tenant \"{}\" does not exist: `tapectl tenant list` names the tenants, and \
+             `tapectl tenant add NAME` adds one",
+            new.tenant
+        ));
+    }
+    crate::db::queries::resolve_archive_set(conn, new.archive_set)?;
+    if let Some(other) = config
+        .collections
+        .iter()
+        .find(|c| collection::roots_overlap(new.root, &c.root))
+    {
+        return refuse(format!(
+            "ROOT \"{}\" overlaps collection \"{}\" (root \"{}\"): a folder would belong to two \
+             collections. Give a root outside it, and holding none",
+            new.root, other.name, other.root
+        ));
+    }
+    let lib = new.config();
+    let access = collection::access::check(&canonical, &lib);
+    if let Some(grant) = access.grant() {
+        return refuse(grant);
+    }
+
+    let file = &paths.config_file;
+    let original = std::fs::read_to_string(file)?;
+    let planned = crate::config_edit::plan_collection_add(&original, file, new.fields())?;
+    for w in &planned.warnings {
+        eprintln!("{w}");
+    }
+    if !dry_run {
+        crate::config_edit::replace_file(file, &original, &planned.new_text)?;
+    }
+
+    // The sync this collection would get now: nothing is registered by it.
+    let mut with = config.clone();
+    with.collections.push(lib.clone());
+    let preview = collection::sync::sync_collection_with_config(conn, &with, &lib, true)?;
+    if json_output {
+        crate::render::print_json(&serde_json::json!({
+            "collection": new.name,
+            "file": file.display().to_string(),
+            "added": !dry_run,
+            "dry_run": dry_run,
+            "table": planned.json["table"],
+            "sync_preview": sync_json(new.name, &preview, Some(0), true),
+        }));
+    } else {
+        let what = format!(
+            "collection \"{}\" (root {}, tenant {}, a unit per folder {} below the root{})",
+            new.name,
+            new.root,
+            new.tenant,
+            crate::render::plural(new.unit_depth as i64, "level", "levels"),
+            if new.dotfiles {
+                ""
+            } else {
+                ", known by path: no dotfiles"
+            },
+        );
+        match dry_run {
+            true => println!(
+                "would add {what} to {} (DRY RUN — no changes made)",
+                file.display()
+            ),
+            false => println!("added {what} to {}", file.display()),
+        }
+        println!("its sync, as `tapectl collection sync` would run it now:");
+        print_sync_plain(&lib, &preview, 0, true);
+    }
+    Ok(crate::error::EXIT_SUCCESS)
+}
+
+/// `collection remove` (ADR-0012 item 206, the coordinator's OQ23): the
+/// table goes, and the collection's units stay registered and untouched. No
+/// sync walks the root after this, so none of them is ever marked missing
+/// for it; `collection status`, which shows the configured collections,
+/// says nothing of them, and `unit list` and `audit` go on showing them as
+/// the ordinary units they are.
+fn cmd_remove(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    name: &str,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<i32> {
+    let lib = collection::find_collection(config, name)?;
+    let root = collection::canonical_root(lib)
+        .unwrap_or_else(|_| lib.root.trim_end_matches('/').to_string());
+    let units = collection::units_under_root(conn, &root)?.len();
+
+    let file = &paths.config_file;
+    let original = std::fs::read_to_string(file)?;
+    let planned = crate::config_edit::plan_collection_remove(&original, file, name)?;
+    if !dry_run {
+        crate::config_edit::replace_file(file, &original, &planned.new_text)?;
+    }
+    if json_output {
+        crate::render::print_json(&serde_json::json!({
+            "collection": name,
+            "file": file.display().to_string(),
+            "removed": !dry_run,
+            "dry_run": dry_run,
+            "units_kept": units,
+        }));
+    } else {
+        let kept = crate::render::plural(units as i64, "unit", "units");
+        match dry_run {
+            true => println!(
+                "would remove collection \"{name}\" from {}; its {kept} would stay registered \
+                 and untouched (DRY RUN — no changes made)",
+                file.display()
+            ),
+            false => println!(
+                "removed collection \"{name}\" from {}; its {kept} stay registered and \
+                 untouched (`tapectl unit list` names them), and no sync walks {} now",
+                file.display(),
+                lib.root
+            ),
+        }
+    }
+    Ok(crate::error::EXIT_SUCCESS)
 }
 
 /// `collection plan`'s `largest_unit` JSON object, or `null` when nothing is
@@ -608,14 +1155,28 @@ fn cmd_plan(
     policy_aware: bool,
     json_output: bool,
 ) -> Result<i32> {
+    use collection::Severity;
     if config.collections.is_empty() {
-        no_libraries_configured(json_output);
+        no_collections(json_output);
         return Ok(crate::error::EXIT_SUCCESS);
     }
+    // No drive to plan against is no collection's problem: refused here,
+    // before any collection is read, as each plan below would refuse it.
+    crate::config::resolve_lto_backend(config, device)?;
 
+    let owing = owing_units(conn, config)?;
     let mut rows = Vec::new();
-    let mut any_refused = false;
+    let mut broken: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut seen = Vec::new();
     for lib in &config.collections {
+        // ADR-0012 item 220: a collection's own problems are its error, and
+        // the next is still planned.
+        let errors = collection::collection_problems(conn, lib)?;
+        if !errors.is_empty() {
+            seen.push(Severity::Error);
+            broken.push((&lib.name, errors));
+            continue;
+        }
         let (packed, tape) = collection::plan::plan_for_collection_with_budget(
             conn,
             config,
@@ -624,11 +1185,16 @@ fn cmd_plan(
             device,
             policy_aware,
         )?;
-        any_refused |= !packed.refused.is_empty();
+        if !packed.refused.is_empty() {
+            seen.push(Severity::Warning);
+        }
         // Issue #456: the largest unit beside the tape, so ADR-0012 item 69's
         // trigger (a unit above a tenth of a cartridge) is visible.
         let largest = collection::plan::largest_unit(&packed.batches, &tape);
-        rows.push((lib.name.clone(), packed, largest, tape));
+        // ADR-0012 item 207: the staged units, which no batch holds, and the
+        // write they wait for.
+        let staged = staged_under(conn, &collection::canonical_root(lib)?, &owing)?;
+        rows.push((lib.name.clone(), packed, largest, tape, staged));
     }
     // `--policy-aware` (issue #144): what each prioritised unit falls short
     // of, printed beside it so the order explains itself.
@@ -636,16 +1202,16 @@ fn cmd_plan(
         shortfalls(
             conn,
             config,
-            rows.iter().flat_map(|(_, p, _, _)| p.batches.iter()),
+            rows.iter().flat_map(|(_, p, _, _, _)| p.batches.iter()),
         )?
     } else {
         std::collections::HashMap::new()
     };
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows
+        let mut json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, packed, largest, tape)| {
+            .map(|(name, packed, largest, tape, staged)| {
                 let batches = &packed.batches;
                 let refused = &packed.refused;
                 let batch_json: Vec<serde_json::Value> = batches
@@ -688,12 +1254,33 @@ fn cmd_plan(
                     // figure unless the drive declares post_warning_bytes).
                     "fill_bytes": tape.bytes,
                     "packing_bytes": tape.packing_bytes(),
+                    // ADR-0012 item 207.
+                    "staged": staged,
+                    "write_staged": (!staged.is_empty()).then_some(WRITE_STAGED),
+                    "errors": Vec::<String>::new(),
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        // A collection its problems stopped: the same keys, nothing planned.
+        json.extend(broken.iter().map(|(name, errors)| {
+            serde_json::json!({
+                "collection": name,
+                "copies": copies,
+                "policy_aware": policy_aware,
+                "batches": null,
+                "cartridges_needed": null,
+                "largest_unit": null,
+                "refused": [],
+                "fill_bytes": null,
+                "packing_bytes": null,
+                "staged": [],
+                "write_staged": null,
+                "errors": errors,
+            })
+        }));
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else {
-        for (name, packed, largest, tape) in &rows {
+        for (name, packed, largest, tape, staged) in &rows {
             let (batches, refused) = (&packed.batches, &packed.refused);
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
@@ -738,10 +1325,26 @@ fn cmd_plan(
             // reporting whenever a collection's ENTIRE pending set was
             // refused, which is exactly the case that most needs it.
             print_refused_plain(refused);
+            if !staged.is_empty() {
+                println!(
+                    "  staged, awaiting a write: {}: {}",
+                    crate::render::plural(staged.len() as i64, "unit", "units"),
+                    staged.join(", ")
+                );
+                println!("    write them: {WRITE_STAGED}");
+            }
+        }
+        for (name, errors) in &broken {
+            print_collection_errors(name, errors);
         }
     }
-    Ok(refused_exit_code(any_refused))
+    Ok(Severity::exit_code(seen))
 }
+
+/// The command that writes what is staged (ADR-0012 item 207): the
+/// one-command copy `volume write`'s help gives, onto a new cartridge.
+const WRITE_STAGED: &str =
+    "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>";
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
@@ -1138,8 +1741,8 @@ pattern = ["*.tmp"]
         // refusal.
         let status = collection::status::status_for_collection(&conn, &config, &lib).unwrap();
         assert_eq!(
-            status.pending, 2,
-            "alpha and gamma must still be counted pending"
+            status.never_archived, 2,
+            "alpha and gamma must still be counted pending, never archived"
         );
         assert_eq!(status.refused.len(), 1);
         assert_eq!(status.refused[0].unit_name, "testlib/beta");
@@ -1279,7 +1882,7 @@ pattern = ["*.tmp"]
 
         let mut config = Config::default();
         config.collections.push(lib.clone());
-        let (report, _) =
+        let report =
             collection::sync::sync_collection_with_config(&conn, &config, &lib, true).unwrap();
         assert_eq!(report.outside.len(), 2);
 

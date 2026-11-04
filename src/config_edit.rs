@@ -92,7 +92,73 @@ pub struct Planned {
 /// Plan `edit` against `original`, the text of the config file at `path`.
 /// Pure but for the filesystem probes validation makes (a backend's device
 /// canonicalization, as [`crate::config::Config::load`] makes them): nothing is written.
+///
+/// A whole collection is not added or removed here (ADR-0012 item 206):
+/// `config add collections` and `config remove 'collections[NAME]'` are
+/// refused by name, pointing at `collection add` (which checks the root, the
+/// tenant and the access first) and `collection remove`, which edit the file
+/// through [`plan_collection_add`] and [`plan_collection_remove`]. A key of
+/// one collection (`collections[movies].exclude`) is edited here as any
+/// other.
 pub fn plan(original: &str, path: &Path, edit: &Edit) -> Result<Planned> {
+    let segs = parse_key(edit.key())?;
+    if let Some(refusal) = whole_collection_refusal(edit, &segs) {
+        return Err(TapectlError::Other(refusal));
+    }
+    plan_parsed(original, path, edit, segs)
+}
+
+/// `[[collections]]` table for `fields` (`field=value`, each value TOML
+/// text, as `config add` takes them), appended: `collection add`'s write.
+/// Checked and laid out as any `config add`.
+pub fn plan_collection_add(original: &str, path: &Path, fields: Vec<String>) -> Result<Planned> {
+    let edit = Edit::Add {
+        key: COLLECTIONS.to_string(),
+        values: fields,
+    };
+    let segs = parse_key(edit.key())?;
+    plan_parsed(original, path, &edit, segs)
+}
+
+/// The `[[collections]]` table named `name`, taken out with the comments
+/// above it kept: `collection remove`'s write.
+pub fn plan_collection_remove(original: &str, path: &Path, name: &str) -> Result<Planned> {
+    let edit = Edit::Remove {
+        key: format!("{COLLECTIONS}[{name}]"),
+        values: Vec::new(),
+    };
+    let segs = parse_key(edit.key())?;
+    plan_parsed(original, path, &edit, segs)
+}
+
+const COLLECTIONS: &str = "collections";
+
+/// The refusal for an edit of a whole collection, or `None`. Only the
+/// list itself and its entries: a key inside one entry is not refused.
+fn whole_collection_refusal(edit: &Edit, segs: &[Seg]) -> Option<String> {
+    let [only] = segs else {
+        return None;
+    };
+    if only.key != COLLECTIONS {
+        return None;
+    }
+    match edit {
+        Edit::Add { .. } if only.select.is_none() => Some(
+            "`tapectl config add collections` is refused since 1.9.0: use `tapectl collection \
+             add NAME ROOT --tenant TENANT`, which checks the root, the tenant and the access \
+             before it writes the table"
+                .to_string(),
+        ),
+        Edit::Remove { .. } => Some(format!(
+            "`tapectl config remove '{}'` is refused since 1.9.0: use `tapectl collection \
+             remove NAME`, which keeps the collection's units registered and untouched",
+            edit.key()
+        )),
+        _ => None,
+    }
+}
+
+fn plan_parsed(original: &str, path: &Path, edit: &Edit, segs: Vec<Seg>) -> Result<Planned> {
     let doc: DocumentMut = original.parse().map_err(|e| {
         TapectlError::Config(format!(
             "{} is not valid TOML, so it cannot be edited in place — fix it by hand \
@@ -100,7 +166,6 @@ pub fn plan(original: &str, path: &Path, edit: &Edit) -> Result<Planned> {
             path.display()
         ))
     })?;
-    let segs = parse_key(edit.key())?;
     let before = check_text(original, path);
     if !matches!(edit, Edit::Remove { .. }) {
         refuse_under_unknown(&before, path, edit, &segs)?;
@@ -1451,7 +1516,12 @@ mod tests {
         let head = "[defaults]\nslice_size = \"1G\"\n\n# drive notes, kept\n";
         let original =
             format!("{head}[[collections]]\nname = \"m\"\nroot = \"/x\"\ntenant = \"t\"\n");
-        assert_eq!(remove(&original, "collections[m]"), head);
+        assert_eq!(
+            plan_collection_remove(&original, &p(), "m")
+                .unwrap()
+                .new_text,
+            head
+        );
     }
 
     #[test]
@@ -1460,9 +1530,75 @@ mod tests {
                         [[collections]]\nname = \"a\"\nroot = \"/a\"\ntenant = \"t\"\n\n\
                         [[collections]]\nname = \"b\"\nroot = \"/b\"\ntenant = \"t\"\n";
         assert_eq!(
-            remove(original, "collections[a]"),
+            plan_collection_remove(original, &p(), "a")
+                .unwrap()
+                .new_text,
             "[defaults]\nslice_size = \"1G\"\n\n# first, kept\n\n\
              [[collections]]\nname = \"b\"\nroot = \"/b\"\ntenant = \"t\"\n"
+        );
+    }
+
+    /// ADR-0012 item 206: a whole collection is added and removed by
+    /// `collection add` and `collection remove`, never by `config add` or
+    /// `config remove`, which refuse naming them; a key of one collection
+    /// is still `config`'s to edit, and `collection add`'s own write goes
+    /// through.
+    #[test]
+    fn a_whole_collection_is_refused_by_name_and_its_keys_are_not() {
+        let original = "[defaults]\nslice_size = \"1G\"\n\n\
+                        [[collections]]\nname = \"a\"\nroot = \"/a\"\ntenant = \"t\"\n";
+        let add = Edit::Add {
+            key: "collections".into(),
+            values: vec!["name=b".into(), "root=/b".into(), "tenant=t".into()],
+        };
+        let err = plan(original, &p(), &add).unwrap_err().to_string();
+        assert!(
+            err.contains("tapectl collection add NAME ROOT --tenant TENANT"),
+            "{err}"
+        );
+        for key in ["collections[a]", "collections[0]", "collections"] {
+            let remove = Edit::Remove {
+                key: key.into(),
+                values: Vec::new(),
+            };
+            let err = plan(original, &p(), &remove).unwrap_err().to_string();
+            assert!(
+                err.contains("tapectl collection remove NAME"),
+                "{key}: {err}"
+            );
+        }
+
+        // A key of one collection is config's.
+        let exclude = Edit::Add {
+            key: "collections[a].exclude".into(),
+            values: vec!["loose.txt".into()],
+        };
+        let after = plan(original, &p(), &exclude).unwrap().new_text;
+        assert!(after.contains("exclude = [\"loose.txt\"]"), "{after}");
+        let depth = Edit::Set {
+            key: "collections[a].unit_depth".into(),
+            value: "2".into(),
+        };
+        assert!(plan(original, &p(), &depth)
+            .unwrap()
+            .new_text
+            .contains("unit_depth = 2"));
+
+        // `collection add`'s own write.
+        let after = plan_collection_add(
+            original,
+            &p(),
+            vec![
+                "name=\"2024\"".into(),
+                "root=\"/b\"".into(),
+                "tenant=\"t\"".into(),
+            ],
+        )
+        .unwrap()
+        .new_text;
+        assert!(
+            after.ends_with("[[collections]]\nname = \"2024\"\nroot = \"/b\"\ntenant = \"t\"\n"),
+            "{after}"
         );
     }
 

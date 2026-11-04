@@ -420,15 +420,17 @@ pub enum ConfigCommands {
     },
     /// Add a table to a list of tables, or values to a list
     ///
-    /// For a list of tables (`collections`, `archive_sets`, `backends.lto`)
-    /// each VALUE is one `field=value` of the new table:
-    /// `config add collections name=movies root=/srv/media/movies tenant=family`.
-    /// Its name must not already be taken. A drive added as `backends.lto`
-    /// gets the checks `drive add` makes. For a list value
-    /// (`defaults.global_excludes`), each VALUE is appended. Checked and
-    /// written as `config set` is.
+    /// For a list of tables (`archive_sets`, `backends.lto`) each VALUE is
+    /// one `field=value` of the new table:
+    /// `config add backends.lto name=lto6 device_tape=/dev/tape/by-id/X
+    /// generation=LTO-6`. Its name must not already be taken. A drive added
+    /// as `backends.lto` gets the checks `drive add` makes. A collection is
+    /// added with `collection add`, which checks its root, tenant and access
+    /// first; `config add collections` is refused. For a list value
+    /// (`defaults.global_excludes`, `collections[movies].exclude`), each
+    /// VALUE is appended. Checked and written as `config set` is.
     Add {
-        /// The list, e.g. collections or defaults.global_excludes
+        /// The list, e.g. defaults.global_excludes
         key: String,
         /// field=value pairs for a table, or the values to append (after
         /// `--` when one begins with `-`)
@@ -438,9 +440,10 @@ pub enum ConfigCommands {
     /// Remove a key, an entry of a list of tables, or values from a list
     ///
     /// `config remove defaults.slice_size` removes the key, so its default
-    /// applies; `config remove collections[movies]` removes that table;
+    /// applies; `config remove 'backends.lto[lto6]'` removes that table;
     /// `config remove defaults.global_excludes '*.bak'` removes that value.
-    /// A whole list of tables is removed one entry at a time. Checked and
+    /// A whole list of tables is removed one entry at a time; a collection
+    /// is removed with `collection remove`, which keeps its units. Checked and
     /// written as `config set` is: removing a required key is refused. On a
     /// file that already fails to load, an edit that adds no problem goes
     /// through and names the problems left, so a broken file can be repaired
