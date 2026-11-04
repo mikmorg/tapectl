@@ -8,6 +8,16 @@ heir holding only a key envelope.
 
 ### Truth & reconciliation
 
+**Catalog**:
+tapectl's own record of everything it manages: units and their versions, stage
+sets, volumes, cartridges, locations, tenants and every event. It is what a
+backup of tapectl copies, and what a rebuild reconstructs from tape when it is
+lost. The tape is the truth about what a tape holds; the catalog is the truth
+about everything else.
+_Avoid_: database (the storage it happens to use), catalogue (dar's own listing
+of the files in one archive, spelled that way on purpose), index (the
+cross-volume index each tape carries)
+
 **Claim**:
 A catalog row asserting something about a tape's contents (e.g., "slice 7 of
 stage_set S lives at position 12 on L6-0001"). Claims are not truth; they are
@@ -62,7 +72,7 @@ out-of-date
 ### Writing
 
 **Layout**:
-The complete enumeration of every file a volume will hold — ID thunk and front
+The complete enumeration of every file a volume will hold — File 0 and the front
 index through the data slices and seal marker, with positions, sizes, and
 checksums. A value, constructed and validated before the first byte is written;
 all on-tape metadata is generated from it.
@@ -168,6 +178,14 @@ Slices and age-encrypted, recorded with each slice's size and hash. It is
 staged once and written unchanged to every volume that carries a copy, which is
 why copies are identical content.
 _Avoid_: archive set (a policy grouping), backup set
+
+**Staged**:
+A Version whose Stage set waits in staging for a Copy it is still owed. It is
+not Pending: its snapshot exists, so the work left is a write, not a walk. It
+stays staged until it has every Copy it is owed, and only then is its staging
+let go, unit by unit, whatever the other units written beside it still owe.
+_Avoid_: pending (the unit-level parent of Never Archived and Dirty), queued,
+unwritten (a staged version may already have some of its copies)
 
 **Slice**:
 A fixed-size byte range of a stage set's dar archive (dar's own word, its `-s`;
@@ -283,6 +301,28 @@ _Avoid_: escrow package, key envelope (one component, not the kit)
 
 ### Sourcing
 
+**Tenant**:
+Whom a unit's data belongs to. Each tenant has its own keys, and its units are
+encrypted so that only those keys, and the Escrow Recipient, can read them;
+nothing about a tenant's content is readable on tape without one. The operator
+is a tenant too.
+_Avoid_: user (the account a command runs as), account, customer
+
+**Unit**:
+A directory archived as one whole, belonging to one tenant: it is snapshotted,
+staged and written as one thing, and never split by hand. It knows itself by an
+identity kept in a small file inside the directory, so it survives being moved
+or renamed; a unit whose directory may not be written to is known by its path
+instead.
+_Avoid_: folder (the unit is the directory under tapectl's care, not any
+directory), dataset, item
+
+**Snapshot**:
+The record of what a unit holds at one moment, every path with its size and
+type, taken by walking the unit's directory. One is made only when the content
+changed since the last, so every snapshot is a Version.
+_Avoid_: backup, scan
+
 **Collection**:
 A configured source root whose child directories at a fixed depth each become
 one unit, bound to a single tenant and one policy. It is a factory and batch
@@ -339,9 +379,44 @@ _Avoid_: barcode (a label, below), id, sticker
 
 **Barcode**:
 The human-readable label on a cartridge — a sticker, applied or replaced at
-the operator's convenience and never an identity. A cartridge registered from
-its chip wears its serial as a placeholder Barcode until it is relabelled.
+the operator's convenience and never an identity. A cartridge with no Barcode
+yet takes the label of the first volume written on it, the operator's own
+practice of naming the sticker after the tape, unless another is given; until
+then it wears its chip serial as a placeholder.
 _Avoid_: serial, identifier, cartridge name
+
+**Cartridge**:
+The physical tape, known for life by its Cartridge Identity. It carries at most
+one live volume at a time; erased, it can carry another, so one cartridge may
+hold a series of volumes over its life.
+_Avoid_: tape (fine in prose, but not as the name of the tracked thing), volume
+(the content, not the medium), media
+
+**Volume**:
+What one write session put on a cartridge, named by its label (such as
+`L6-0001`): from File 0 through the seal, self-describing, and immutable once
+sealed. A volume is content; the cartridge is the medium it sits on.
+_Avoid_: tape (ambiguous between the two), archive, cartridge
+
+**File 0**:
+The first file on every volume: its label, its identity, the tapectl that wrote
+it and where the cartridge's identity came from. tapectl reads it before it
+trusts anything else on a tape, and every consent to overwrite one rests on it.
+_Avoid_: ID thunk outside the format documents (the same file, by its format
+name), header, label (the volume's name, which File 0 carries)
+
+**Drive**:
+A tape drive tapectl reads and writes through. A drive declares the one
+generation it is; what it may write or read follows from that and the
+cartridge's own Generation.
+_Avoid_: backend (implementation jargon, as for **Store**), device (the
+operating system's node for a drive, not the drive)
+
+**Location**:
+A named place where Copies are kept: a shelf, an offsite box, a warehouse. A
+Copy is at a location when its tape is shelved there or a deposit of it is
+there, and Copy targets are counted per location.
+_Avoid_: site, place (in prose only), vault
 
 **Store**:
 A first-class implementation of the storage interface, selected by a
