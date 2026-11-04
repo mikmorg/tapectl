@@ -1,5 +1,6 @@
 //! Releasing staged data once the copies written satisfy policy — the ONE
-//! place that decision lives (issue #440).
+//! place that decision lives (issue #440; per unit since 1.9.0, ADR-0012
+//! item 217).
 //!
 //! `clean_staging` stays policy-free (ADR-0012's #244 amendment): it knows
 //! which stage sets are safe to delete (a completed write, and every other
@@ -12,11 +13,16 @@
 //! after a quick confirm too, and a failed release is a warning, never a
 //! failed write).
 //!
-//! The rule is all-or-nothing over the units given, as `collection run` has
-//! always had it: stage once, write N times (`v2-open-questions.md` §11)
-//! means the next copy must find the same staged content this one wrote, so
-//! one short unit keeps every unit's staging. `stage clean` is the
-//! per-unit tool — it releases the covered units and retains the short ones.
+//! **The rule is per unit** (ADR-0012 item 217, amending #440's
+//! all-or-nothing): every unit judged whose copy floor
+//! ([`copy_floor`]) AND every `copies_at` target ([`short_of_copies_at`])
+//! are met is released, and every unit still short of either stays staged,
+//! named with why. It is the per-unit split `stage clean` already makes,
+//! run after each write. Twin copies stay twins without a rule of their
+//! own: when copies 1 and 2 carry the same units, every one of them is
+//! short until copy 2, and covered after it. On mhvtl the all-or-nothing
+//! rule wrote two covered units a third time, held back by a third unit
+//! that was short.
 //!
 //! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
 //! stage set planned past where its tape sealed short. It never counts as a
@@ -29,10 +35,9 @@
 //! 121 and 129) is released slice by slice instead, each slice once its
 //! copies meet the set's copy floor, and independently of every other unit
 //! the write judges (coordinator ruling X15): tape 1's slices need not wait
-//! for tape 3, nor for another unit's next copy. The all-or-nothing rule
-//! above is unchanged for the sets with no `range` row; a unit whose staged
-//! data is only sets holding a range is left out of it
-//! ([`release_if_covered`] says why).
+//! for tape 3, nor for another unit's next copy. A unit whose staged data is
+//! only sets holding a range is not judged whole ([`release_if_covered`]
+//! says why).
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -47,31 +52,34 @@ use crate::staging::clean::{
     staged_sets_holding_a_range, CleanReport, CleanScope, ReleaseBlocker,
 };
 
-/// One unit's copy count against its own resolved `min_copies`, computed
-/// AFTER the write(s) landed. Only reported when the release did NOT happen
-/// (see [`ReleaseOutcome::under_copied`]).
+/// One unit's copy count against its copy floor, and the `copies_at`
+/// targets it is still short of, computed AFTER the write(s) landed. Only
+/// reported for a unit whose staging was kept (see
+/// [`ReleaseOutcome::under_copied`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyProgress {
     pub unit_name: String,
     pub copies: i64,
-    /// The copy floor: the resolved `min_copies`, times the tape-only
-    /// multiplier for a tape-only unit ([`copy_floor`]).
+    /// The copy floor: the resolved `copy_floor_base` (the larger of
+    /// `min_copies` and the `copies_at` sum), times the tape-only multiplier
+    /// for a tape-only unit ([`copy_floor`]). Named `copy_floor` in JSON.
     pub min_copies: i64,
     /// `" (tape-only 3x)"` when the multiplier raised the floor, empty
     /// otherwise ([`tape_only_note`]), so [`CopyProgress::describe`] never
     /// shows a number the policy alone does not explain.
     pub floor_note: String,
-    /// Under [`Hold::EveryLocation`] (`--keep-staging-for-locations`, #493,
-    /// ADR-0012 item 154): the per-location targets of its unit still unmet
-    /// ([`short_of_copies_at`]). Always empty under [`Hold::CopyFloor`].
+    /// The per-location targets of its unit still unmet
+    /// ([`short_of_copies_at`]; #493, ADR-0012 items 149 and 217), in name
+    /// order. Empty when every target is met or the unit has none, and
+    /// always under [`Hold::CopyFloor`].
     pub short_at: Vec<LocationShort>,
 }
 
 impl CopyProgress {
-    /// `unit alpha has 1 copy, needs 2` — why a release was refused; with
-    /// its unmet per-location targets after it when a release held for them
-    /// (#493): `unit alpha has 2 copies, its floor 2; still needed: 0 copies
-    /// at required location offsite, needs 1`.
+    /// `unit alpha has 1 copy, needs 2` — why its staging was kept; with
+    /// its unmet per-location targets after it (#493, ADR-0012 item 217):
+    /// `unit alpha has 2 copies, its floor 2; still needed: 0 copies at
+    /// required location offsite, needs 1`.
     pub fn describe(&self) -> String {
         let noun = if self.copies == 1 { "copy" } else { "copies" };
         let mut text = if self.copies < self.min_copies || self.short_at.is_empty() {
@@ -95,88 +103,99 @@ impl CopyProgress {
     }
 }
 
-/// What a release after a write waits for (#493, ADR-0012 item 154).
+/// What a release after a write waits for, per unit (ADR-0012 items 154
+/// and 217).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Hold {
-    /// The copy floor, as since #440: staging is released once every unit
-    /// judged meets its floor.
+    /// The default since 1.9.0 (ADR-0012 item 217): a unit is released once
+    /// its copy floor AND every per-location target of its `copies_at` map
+    /// are met. A spanning set's slices are released by the floor alone, one
+    /// by one ([`release_ranges`]).
     #[default]
+    CopyTargets,
+    /// The copy floor alone: 1.7.1's default (ADR-0012 item 154) and `stage
+    /// clean`'s rule. No production caller asks for it since item 217; it is
+    /// kept so the default is one line ([`release_if_covered`], and
+    /// `cli::volume`'s `StagingKeep::Release`).
     CopyFloor,
-    /// `--keep-staging-for-locations`: also every per-location target of
-    /// each unit (its `copies_at` map, [`short_of_copies_at`]), so the next
-    /// location's copy reuses this staging instead of staging again.
+    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): as
+    /// [`Hold::CopyTargets`] for the units judged whole, and a unit short of
+    /// a per-location target also keeps every slice of a set that spans
+    /// cartridges, since there is no per-slice per-location count to release
+    /// them by.
     EveryLocation,
 }
 
 /// What [`release_if_covered`] decided and did.
 #[derive(Debug)]
 pub struct ReleaseOutcome {
-    /// `Some` when staging was released (every unit the whole-set rule
-    /// judges now meets its own resolved `min_copies`); `None` when it was
-    /// deliberately retained. Only the stage sets with no `range` row: a set
-    /// holding one is released slice by slice, in `slices`.
+    /// `Some` when `clean_staging` ran: over every unit given when none was
+    /// short, otherwise over the covered units alone (ADR-0012 item 217).
+    /// `None` when no unit judged whole was covered, so nothing was asked of
+    /// it. Only the stage sets with no `range` row: a set holding one is
+    /// released slice by slice, in `slices`.
     pub cleaned: Option<CleanReport>,
-    /// Non-empty exactly when `cleaned` is `None`: which units are still
-    /// short, and by how much.
+    /// The units judged whole that were covered and had a stage set
+    /// released by this call, by name, in the order given.
+    pub released_units: Vec<String>,
+    /// The units judged whole that are still short of their floor or of a
+    /// per-location target, and by how much: their staging was kept.
     pub under_copied: Vec<CopyProgress>,
     /// The per-slice release of the stage sets that hold a range (1.7.0,
-    /// issue #478; ADR-0012 item 129), made whatever `cleaned` says (ruling
-    /// X15): the slices released (`slices_released`, their files counted in
-    /// `files_removed`/`bytes_freed`, a failed unlink in `stranded`), a set
-    /// whose last slice went (`sets_cleaned`), and the slices still short of
-    /// copies (`slices_short`). Its counts are never also in `cleaned`.
+    /// issue #478; ADR-0012 item 129), made whatever the units judged whole
+    /// decided (ruling X15): the slices released (`slices_released`, their
+    /// files counted in `files_removed`/`bytes_freed`, a failed unlink in
+    /// `stranded`), a set whose last slice went (`sets_cleaned`), and the
+    /// slices still short of copies (`slices_short`). Its counts are never
+    /// also in `cleaned`.
     pub slices: CleanReport,
 }
 
-/// Releases the staged data of `unit_ids` only when every one of those units
-/// now meets its own resolved `min_copies`; otherwise retains it all and
-/// says which units are short.
+/// Releases the staged data of each of `unit_ids` whose copy floor and
+/// every per-location target are now met, and keeps the staged data of each
+/// unit still short of either, saying which and why (ADR-0012 item 217,
+/// [`Hold::CopyTargets`]).
 ///
-/// The release itself is `clean_staging(force = false, CleanScope::Units)`,
-/// so its own guard still applies and is what keeps a set that has no
-/// completed write — or any write that is neither `completed` nor `cut` —
-/// staged. This
-/// function adds the policy question that guard cannot answer (issue #229's
-/// second half): after one copy of a unit whose `min_copies` is 2, the
-/// guard passes vacuously (one `writes` row, `completed`) and would release
-/// the only cheap route to the second copy.
+/// The release itself is `clean_staging(force = false, CleanScope::Units)`
+/// over the covered units, so its own guard still applies and is what keeps
+/// a set that has no completed write — or any write that is neither
+/// `completed` nor `cut` — staged. This function adds the policy question
+/// that guard cannot answer (issue #229's second half): after one copy of a
+/// unit whose floor is 2, the guard passes vacuously (one `writes` row,
+/// `completed`) and would release the only cheap route to the second copy.
 ///
 /// Issue #248: `clean_staging`'s eligibility SQL has no batch/unit predicate
 /// of its own, so `CleanScope::Whole` here would release EVERY eligible
-/// `'staged'` set in the database the moment this gate passed — including a
-/// different unit that is still short. `CleanScope::Units(unit_ids)`
-/// narrows the release to exactly the units the gate looked at.
+/// `'staged'` set in the database — including a different unit that is still
+/// short. `CleanScope::Units` narrows the release to units this gate judged
+/// covered. With nothing short the scope is every unit given, the call 1.8
+/// made; with every unit judged whole short, `clean_staging` is not called.
 ///
 /// **Sets that hold a range** (1.7.0, issue #478; ADR-0012 items 85 and
 /// 129; ruling X15). `clean_staging` never releases one without `force`: its
 /// slices are on different volumes. Each such `'staged'` set of `unit_ids`
 /// is released slice by slice ([`release_ranges`]), against its own unit's
-/// copy floor and whatever the gate below decides, into
+/// copy floor and whatever the units judged whole do, into
 /// [`ReleaseOutcome::slices`]. A unit whose staged data here is only such
-/// sets is left out of the gate: its version is not `current` until every
-/// slice is on a sealed volume (item 128), so the unit reads 0 copies for
-/// the whole span, and judging it would keep the staging of every whole
-/// unit written beside it until the span ended. Every other unit is judged
-/// all or nothing as before, so for a write with no range this is 1.6.0's
-/// release exactly.
+/// sets is not judged whole: its version is not `current` until every slice
+/// is on a sealed volume (item 128), so the unit reads 0 copies for the
+/// whole span, and naming it short would say nothing its slices do not.
 pub fn release_if_covered(
     conn: &Connection,
     config: &Config,
     unit_ids: &[i64],
 ) -> Result<ReleaseOutcome> {
-    release_if_covered_holding(conn, config, unit_ids, Hold::CopyFloor)
+    release_if_covered_holding(conn, config, unit_ids, Hold::CopyTargets)
 }
 
-/// [`release_if_covered`], waiting for `hold` (#493, ADR-0012 item 154).
-/// [`Hold::CopyFloor`] is that function exactly. Under
-/// [`Hold::EveryLocation`] a unit is also short while any per-location
-/// target of its unit is unmet ([`short_of_copies_at`], its current
-/// coverage: the write just promoted the version it wrote): a unit the
-/// whole-set gate judges keeps every unit's staging then, as a unit short of
-/// its floor does, and is reported with the locations
-/// ([`CopyProgress::short_at`]); a unit whose staged data is sets that hold
-/// a range keeps all of its slices, since there is no per-slice
-/// per-location count to release them by.
+/// [`release_if_covered`], waiting for `hold` (#493, ADR-0012 items 154 and
+/// 217). Each unit judged whole is released or kept on its own: short of
+/// its floor, or (unless [`Hold::CopyFloor`]) of a per-location target of
+/// its current coverage (the write just promoted the version it wrote),
+/// it keeps its staging and is reported with what it lacks
+/// ([`CopyProgress`]); covered, it is released whatever the others do.
+/// Under [`Hold::EveryLocation`] a unit short of a target also keeps every
+/// slice of its sets that hold a range.
 pub fn release_if_covered_holding(
     conn: &Connection,
     config: &Config,
@@ -184,57 +203,72 @@ pub fn release_if_covered_holding(
     hold: Hold,
 ) -> Result<ReleaseOutcome> {
     let gate_ids = units_judged_whole(conn, unit_ids)?;
-    let mut under_copied = under_copied_units(conn, config, &gate_ids)?;
+    let mut under_copied = Vec::new();
+    let mut kept_ids: Vec<i64> = Vec::new();
     let mut held_for_locations: Vec<i64> = Vec::new();
-    if hold == Hold::EveryLocation {
-        for &unit_id in unit_ids {
-            let (unit, resolved) = unit_and_policy(conn, config, unit_id)?;
-            let short = short_of_copies_at(
+    for &unit_id in unit_ids {
+        let whole = gate_ids.contains(&unit_id);
+        // A unit judged only by its slices needs no judgement here unless
+        // its slices wait for its targets too.
+        if !whole && hold != Hold::EveryLocation {
+            continue;
+        }
+        let (unit, resolved) = unit_and_policy(conn, config, unit_id)?;
+        let short_at = match hold {
+            Hold::CopyFloor => Vec::new(),
+            Hold::CopyTargets | Hold::EveryLocation => short_of_copies_at(
                 conn,
                 config,
                 NamedScope::Unit(unit_id),
                 &resolved,
                 &unit.status,
                 None,
-            )?;
-            if short.is_empty() {
-                continue;
-            }
+            )?,
+        };
+        if hold == Hold::EveryLocation && !short_at.is_empty() {
             held_for_locations.push(unit_id);
-            if !gate_ids.contains(&unit_id) {
-                continue;
-            }
-            match under_copied.iter_mut().find(|p| p.unit_name == unit.name) {
-                Some(p) => p.short_at = short,
-                None => {
-                    let copies: i64 = conn.query_row(
-                        &format!(
-                            "SELECT {}",
-                            copy_count_expr(&CoverageQuery::current_unit("?1"))
-                        ),
-                        params![unit_id],
-                        |row| row.get(0),
-                    )?;
-                    under_copied.push(CopyProgress {
-                        unit_name: unit.name.clone(),
-                        copies,
-                        min_copies: copy_floor(config, resolved.copy_floor_base(), &unit.status),
-                        floor_note: tape_only_note(config, &unit.status),
-                        short_at: short,
-                    });
-                }
-            }
+        }
+        if !whole {
+            continue;
+        }
+        let copies: i64 = conn.query_row(
+            &format!(
+                "SELECT {}",
+                copy_count_expr(&CoverageQuery::current_unit("?1"))
+            ),
+            params![unit_id],
+            |row| row.get(0),
+        )?;
+        let floor = copy_floor(config, resolved.copy_floor_base(), &unit.status);
+        if copies < floor || !short_at.is_empty() {
+            kept_ids.push(unit_id);
+            under_copied.push(CopyProgress {
+                unit_name: unit.name.clone(),
+                copies,
+                min_copies: floor,
+                floor_note: tape_only_note(config, &unit.status),
+                short_at,
+            });
         }
     }
-    let cleaned = if under_copied.is_empty() {
-        Some(clean_staging(
-            conn,
-            config,
-            false,
-            CleanScope::Units(unit_ids),
-        )?)
+    let covered: Vec<i64> = gate_ids
+        .iter()
+        .copied()
+        .filter(|id| !kept_ids.contains(id))
+        .collect();
+    // With nothing short, the scope 1.8 gave: every unit judged. Otherwise
+    // the covered units alone, and nothing at all when none is.
+    let scope: &[i64] = if kept_ids.is_empty() {
+        unit_ids
     } else {
-        None
+        &covered
+    };
+    let (cleaned, released_units) = if scope.is_empty() && !kept_ids.is_empty() {
+        (None, Vec::new())
+    } else {
+        let before = staged_whole_sets(conn, &covered)?;
+        let report = clean_staging(conn, config, false, CleanScope::Units(scope))?;
+        (Some(report), units_released(conn, &before)?)
     };
     let released: Vec<i64> = unit_ids
         .iter()
@@ -244,9 +278,65 @@ pub fn release_if_covered_holding(
     let slices = release_ranges(conn, config, CleanScope::Units(&released))?;
     Ok(ReleaseOutcome {
         cleaned,
+        released_units,
         under_copied,
         slices,
     })
+}
+
+/// The `'staged'` stage sets of `unit_ids` that hold no `range` row, with
+/// their unit's name, in `unit_ids` order: what a whole-set release of those
+/// units may clean. One statement.
+fn staged_whole_sets(conn: &Connection, unit_ids: &[i64]) -> Result<Vec<(i64, i64, String)>> {
+    if unit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=unit_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT ss.id, u.id, u.name FROM stage_sets ss
+           JOIN snapshots sn ON sn.id = ss.snapshot_id
+           JOIN units u ON u.id = sn.unit_id
+          WHERE ss.status = 'staged' AND u.id IN ({placeholders})
+            AND NOT EXISTS (SELECT 1 FROM writes w
+                             WHERE w.stage_set_id = ss.id AND w.status = 'range')
+          ORDER BY ss.id"
+    ))?;
+    let mut rows = stmt
+        .query_map(rusqlite::params_from_iter(unit_ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.sort_by_key(|(set, unit, _)| {
+        (
+            unit_ids.iter().position(|u| u == unit).unwrap_or(usize::MAX),
+            *set,
+        )
+    });
+    Ok(rows)
+}
+
+/// The names of the units, in `before`'s order and once each, one of whose
+/// sets in `before` ([`staged_whole_sets`], read before the release) reads
+/// `cleaned` now: the units this release freed. One statement per set.
+fn units_released(conn: &Connection, before: &[(i64, i64, String)]) -> Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for (set, _, name) in before {
+        if names.contains(name) {
+            continue;
+        }
+        let status: String = conn.query_row(
+            "SELECT status FROM stage_sets WHERE id = ?1",
+            params![set],
+            |r| r.get(0),
+        )?;
+        if status == "cleaned" {
+            names.push(name.clone());
+        }
+    }
+    Ok(names)
 }
 
 /// `unit_id`'s row and resolved policy, refusing an id the catalog lost.
@@ -758,11 +848,11 @@ mod tests {
         assert!(s.file.exists(), "the next copy reuses these bytes");
     }
 
-    /// Two units on one write, one short: the staging of NEITHER is released
-    /// and only the short one is named — stage once, write N times, so the
-    /// next copy finds the same content this one wrote.
+    /// Two units on one write, one short: the covered one is released and
+    /// the short one is kept and named (ADR-0012 item 217, amending #440's
+    /// all-or-nothing). Undone, alpha's staging would wait for beta.
     #[test]
-    fn a_short_unit_keeps_the_staging_of_every_unit_judged_with_it() {
+    fn a_short_unit_keeps_only_its_own_staging() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path(), 2);
@@ -774,13 +864,14 @@ mod tests {
 
         let out = release_if_covered(&conn, &config, &[alpha, beta]).unwrap();
 
-        assert!(out.cleaned.is_none());
         let named: Vec<_> = out.under_copied.iter().map(|p| p.describe()).collect();
         assert_eq!(named, ["unit testlib/beta has 1 copy, needs 2"]);
-        assert!(
-            a.file.exists() && b.file.exists(),
-            "the covered unit's staging waits for the short one"
-        );
+        assert_eq!(out.released_units, ["testlib/alpha"]);
+        assert_eq!(out.cleaned.expect("alpha is covered").sets_cleaned, 1);
+        assert!(!a.file.exists(), "the covered unit does not wait for the short one");
+        assert_eq!(stage_set_status(&conn, a.stage_set_id), "cleaned");
+        assert!(b.file.exists(), "the next copy reuses beta's staged bytes");
+        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
     }
 
     /// A unit is as covered as its least-covered live version (ADR-0012):
@@ -928,12 +1019,15 @@ mod tests {
         assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
     }
 
-    /// The default is unchanged (ADR-0012 item 154): released at the copy
-    /// floor whatever a per-location target says, by `release_if_covered`
-    /// and by its `Hold::CopyFloor` form alike.
+    /// ADR-0012 item 217: the default release waits for every `copies_at`
+    /// target as well as the floor, so a unit at its floor whose targets are
+    /// unmet keeps its staging and says where it is short, by
+    /// `release_if_covered` and its `Hold::CopyTargets` form alike. The
+    /// control is `Hold::CopyFloor`, 1.7.1's default (item 154), which
+    /// releases the same unit at its floor.
     #[test]
-    fn the_default_release_is_the_copy_floor_whatever_the_targets_say() {
-        for holding in [false, true] {
+    fn the_default_release_waits_for_every_copies_at_target() {
+        for hold in [None, Some(Hold::CopyTargets), Some(Hold::CopyFloor)] {
             let conn = db::open_memory().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let config = config(dir.path(), 2);
@@ -943,13 +1037,34 @@ mod tests {
             for label in &s.volumes {
                 shelve(&conn, label, "home");
             }
-            let out = if holding {
-                release_if_covered_holding(&conn, &config, &[alpha], Hold::CopyFloor).unwrap()
-            } else {
-                release_if_covered(&conn, &config, &[alpha]).unwrap()
+            let out = match hold {
+                None => release_if_covered(&conn, &config, &[alpha]).unwrap(),
+                Some(h) => release_if_covered_holding(&conn, &config, &[alpha], h).unwrap(),
             };
+            if hold == Some(Hold::CopyFloor) {
+                assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+                assert_eq!(out.cleaned.expect("at the floor").sets_cleaned, 1);
+                assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+                continue;
+            }
+            assert!(out.cleaned.is_none(), "{hold:?}: held for offsite");
+            assert!(out.released_units.is_empty());
+            assert_eq!(
+                out.under_copied
+                    .iter()
+                    .map(|p| p.describe())
+                    .collect::<Vec<_>>(),
+                ["unit testlib/alpha has 2 copies, its floor 2; still needed: 0 copies at \
+                  required location offsite, needs 1"],
+                "{hold:?}"
+            );
+            assert!(s.file.exists(), "{hold:?}");
+
+            add_write(&conn, &s, "V-offsite", "sealed", "completed");
+            shelve(&conn, "V-offsite", "offsite");
+            let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
             assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
-            assert_eq!(out.cleaned.expect("at the floor").sets_cleaned, 1);
+            assert_eq!(out.released_units, ["testlib/alpha"]);
             assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
         }
     }
@@ -1074,14 +1189,14 @@ mod tests {
         assert!(v2.file.exists());
     }
 
-    /// `collection run` judges a batch together (all or nothing). A batch
-    /// whose write sealed short holds a unit with no copy at all -- its only
-    /// version was cut, so it has no `current` snapshot and reads 0, never
-    /// NULL -- and so the staging of every unit in the batch is kept, the
-    /// cut one named. `volume write` judges only the units it completed on
-    /// the volume (`unit_ids_written_to`), which leaves the cut one out.
+    /// A batch whose write sealed short holds a unit with no copy at all --
+    /// its only version was cut, so it has no `current` snapshot and reads
+    /// 0, never NULL. Judged together, per unit (ADR-0012 item 217): the
+    /// written unit is released and the cut one keeps its staging, named.
+    /// `volume write` judges only the units it completed on the volume
+    /// (`unit_ids_written_to`), which leaves the cut one out.
     #[test]
-    fn a_cut_unit_judged_with_a_written_one_keeps_the_staging_of_both() {
+    fn a_cut_unit_judged_with_a_written_one_keeps_only_its_own_staging() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path(), 1);
@@ -1100,7 +1215,6 @@ mod tests {
 
         let out = release_if_covered(&conn, &config, &[alpha, beta]).unwrap();
 
-        assert!(out.cleaned.is_none());
         assert_eq!(
             out.under_copied
                 .iter()
@@ -1108,18 +1222,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["unit testlib/beta has 0 copies, needs 1"]
         );
-        assert!(a.file.exists() && b.file.exists());
+        assert_eq!(out.released_units, ["testlib/alpha"]);
+        assert!(!a.file.exists());
+        assert!(b.file.exists(), "the cut unit's staging stays");
+        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
 
         assert_eq!(
             unit_ids_written_to(&conn, "V-SHORT").unwrap(),
             [alpha],
             "the cut unit is not one the short-sealed volume was written for"
         );
-        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
-        assert_eq!(out.cleaned.expect("alpha is covered").sets_cleaned, 1);
-        assert!(!a.file.exists());
-        assert!(b.file.exists(), "the cut unit's staging stays");
-        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
     }
 
     // --- `range` (1.7.0, issue #478; ADR-0012 items 121, 127-129) ---
@@ -1228,9 +1340,8 @@ mod tests {
 
     /// Ruling X15: a spanning set's slices are released by their own copy
     /// counts whatever the other units of the same write do. Beta, written
-    /// whole beside the span, is short (tape-only at 3x), so the
-    /// all-or-nothing gate keeps beta's staging; alpha's covered slices go
-    /// anyway.
+    /// whole beside the span, is short (tape-only at 3x), so beta keeps its
+    /// staging; alpha's covered slices go anyway.
     #[test]
     fn a_spanning_sets_slices_are_released_whatever_the_other_units_do() {
         let conn = db::open_memory().unwrap();
@@ -1253,7 +1364,7 @@ mod tests {
         let ids = unit_ids_written_to(&conn, "V-T1").unwrap();
         assert_eq!(ids, [alpha, beta]);
         let out = release_if_covered(&conn, &config, &ids).unwrap();
-        assert!(out.cleaned.is_none(), "beta keeps the whole-set staging");
+        assert!(out.cleaned.is_none(), "beta, the one unit judged whole, is short");
         assert_eq!(
             out.under_copied
                 .iter()
@@ -1403,5 +1514,192 @@ mod tests {
         range_on(&conn, &a, "V-T1", 1..=2);
         cut_from(&conn, &b, "V-T1", 9);
         assert_eq!(unit_ids_written_to(&conn, "V-T1").unwrap(), [alpha]);
+    }
+
+    // --- per unit (ADR-0012 item 217) ---
+
+    /// The brief's first shape: two units after copy 2, one covered and one
+    /// at its floor but short of a per-location target. By default only the
+    /// covered one is released; the other is kept and says where it is
+    /// short. Undone (all or nothing), alpha would wait for beta's offsite
+    /// copy; with the targets left out of the default (item 154's floor
+    /// alone), beta would be released too.
+    #[test]
+    fn after_copy_two_only_the_unit_whose_targets_are_met_is_released() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        two_targets(&conn, beta);
+        let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+        for (label, place) in [("V-1", "home"), ("V-2", "home")] {
+            add_write(&conn, &a, label, "sealed", "completed");
+            add_write(&conn, &b, label, "sealed", "completed");
+            shelve(&conn, label, place);
+        }
+
+        let ids = unit_ids_written_to(&conn, "V-2").unwrap();
+        assert_eq!(ids, [alpha, beta]);
+        let out = release_if_covered(&conn, &config, &ids).unwrap();
+
+        assert_eq!(out.released_units, ["testlib/alpha"]);
+        assert_eq!(
+            out.under_copied
+                .iter()
+                .map(|p| p.describe())
+                .collect::<Vec<_>>(),
+            ["unit testlib/beta has 2 copies, its floor 2; still needed: 0 copies at \
+              required location offsite, needs 1"]
+        );
+        assert_eq!(stage_set_status(&conn, a.stage_set_id), "cleaned");
+        assert!(!a.file.exists());
+        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
+        assert!(b.file.exists());
+    }
+
+    /// Twins are emergent (ADR-0012 item 217, OQ14): the same units written
+    /// to copies 1 and 2 are all short after copy 1 and all kept, and after
+    /// copy 2 the two whose floor is 2 are released together, because each
+    /// is covered, not because they are linked. A third unit on both tapes
+    /// whose floor is higher (tape-only at 2x: 4) stays, which is what tells
+    /// this rule from all or nothing: undone, the twins would wait for it.
+    #[test]
+    fn twins_are_released_together_after_copy_two_and_a_short_third_unit_stays() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path(), 2);
+        config.compaction.tape_only_safety_multiplier = 2;
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let gamma = unit(&conn, t, "testlib/gamma");
+        conn.execute(
+            "UPDATE units SET status = 'tape_only' WHERE id = ?1",
+            params![gamma],
+        )
+        .unwrap();
+        let sets: Vec<Staged> = [alpha, beta, gamma]
+            .iter()
+            .map(|&u| staged_version(&conn, u, 1, "current", dir.path(), 0))
+            .collect();
+
+        for s in &sets {
+            add_write(&conn, s, "V-COPY1", "sealed", "completed");
+        }
+        let out = release_if_covered(&conn, &config, &unit_ids_written_to(&conn, "V-COPY1").unwrap())
+            .unwrap();
+        assert!(out.cleaned.is_none() && out.released_units.is_empty());
+        assert_eq!(
+            out.under_copied
+                .iter()
+                .map(|p| p.describe())
+                .collect::<Vec<_>>(),
+            [
+                "unit testlib/alpha has 1 copy, needs 2",
+                "unit testlib/beta has 1 copy, needs 2",
+                "unit testlib/gamma has 1 copy, needs 4 (tape-only 2x)",
+            ]
+        );
+        assert!(sets.iter().all(|s| s.file.exists()), "every twin is short until copy 2");
+
+        for s in &sets {
+            add_write(&conn, s, "V-COPY2", "sealed", "completed");
+        }
+        let out = release_if_covered(&conn, &config, &unit_ids_written_to(&conn, "V-COPY2").unwrap())
+            .unwrap();
+        assert_eq!(out.released_units, ["testlib/alpha", "testlib/beta"]);
+        assert_eq!(out.cleaned.expect("the twins are covered").sets_cleaned, 2);
+        assert_eq!(
+            out.under_copied
+                .iter()
+                .map(|p| p.describe())
+                .collect::<Vec<_>>(),
+            ["unit testlib/gamma has 2 copies, needs 4 (tape-only 2x)"]
+        );
+        assert_eq!(
+            sets.iter().map(|s| s.file.exists()).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    /// `--keep-staging-for-locations` (item 154) is per unit too: the unit
+    /// whose every target is met is released beside the one still short.
+    #[test]
+    fn keep_staging_for_locations_holds_each_unit_on_its_own() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        two_targets(&conn, alpha);
+        conn.execute(
+            "UPDATE units SET copies_at_frozen = '{\"home\":1,\"offsite\":1}' WHERE id = ?1",
+            params![beta],
+        )
+        .unwrap();
+        let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+        for (label, place) in [("V-1", "home"), ("V-2", "offsite")] {
+            add_write(&conn, &a, label, "sealed", "completed");
+            shelve(&conn, label, place);
+        }
+        add_write(&conn, &b, "V-2", "sealed", "completed");
+        add_write(&conn, &b, "V-3", "sealed", "completed");
+        shelve(&conn, "V-3", "offsite");
+
+        let out =
+            release_if_covered_holding(&conn, &config, &[alpha, beta], Hold::EveryLocation)
+                .unwrap();
+
+        assert_eq!(out.released_units, ["testlib/alpha"]);
+        assert_eq!(out.under_copied.len(), 1, "{:?}", out.under_copied);
+        assert_eq!(out.under_copied[0].unit_name, "testlib/beta");
+        assert_eq!(out.under_copied[0].short_at[0].location, "home");
+        assert!(!a.file.exists() && b.file.exists());
+    }
+
+    /// The per-slice release of a span keeps its meaning (item 129, OQ14):
+    /// by default a set that holds a range releases each slice at the floor,
+    /// whatever its unit's per-location targets say; under
+    /// `--keep-staging-for-locations` a unit short of a target keeps every
+    /// slice. Tape 1 holds slices 1-2 as a range, tape 2 the whole set, both
+    /// at home; the unit's targets are one copy at home and one at offsite.
+    #[test]
+    fn a_span_releases_by_the_floor_unless_its_slices_wait_for_locations() {
+        for hold in [Hold::CopyTargets, Hold::EveryLocation] {
+            let conn = db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = config(dir.path(), 2);
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            two_targets(&conn, alpha);
+            let (s, files) = staged_span(&conn, alpha, 1, "staged", dir.path(), 4);
+            range_on(&conn, &s, "V-T1", 1..=2);
+            add_write(&conn, &s, "V-T2", "sealed", "completed");
+            shelve(&conn, "V-T1", "home");
+            shelve(&conn, "V-T2", "home");
+            conn.execute(
+                "UPDATE snapshots SET status = 'current' WHERE id = ?1",
+                params![s.snapshot_id],
+            )
+            .unwrap();
+
+            let out = release_if_covered_holding(&conn, &config, &[alpha], hold).unwrap();
+
+            assert!(out.under_copied.is_empty(), "a span is not judged whole");
+            if hold == Hold::CopyTargets {
+                assert_eq!(
+                    out.slices.slices_released,
+                    vec![(s.stage_set_id, vec![1, 2])]
+                );
+                assert_eq!(files_exist(&files), [false, false, true, true]);
+            } else {
+                assert!(out.slices.slices_released.is_empty(), "{:?}", out.slices);
+                assert_eq!(files_exist(&files), [true; 4]);
+            }
+        }
     }
 }

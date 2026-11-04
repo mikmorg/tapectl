@@ -1541,13 +1541,24 @@ fn cmd_run(
                 "after_tail": at.after_tail,
                 "units_staged": report.units_staged,
                 "copies_written": report.copies_written,
-                "staging_released": report.cleaned.is_some(),
+                // ADR-0012 item 217: per unit. True when no unit of the batch
+                // kept its staging (the release did not fail); the units
+                // released beside a kept one are `units_released`.
+                "staging_released": report.release_warning.is_none() && report.under_copied.is_empty(),
                 "stage_sets_released": sets_released,
+                "units_released": report.released_units,
                 "held_by_pending_rewrite": report.cleaned.as_ref().map_or(0, |c| c.held_by_pending_rewrite.len()),
                 "under_copied": report.under_copied.iter().map(|p| serde_json::json!({
                     "unit": p.unit_name,
                     "copies": p.copies,
-                    "min_copies": p.min_copies,
+                    // OQ5: the copy floor, named for what it is.
+                    "copy_floor": p.min_copies,
+                    // Additive (item 217): the per-location targets unmet.
+                    "short_locations": p.short_at.iter().map(|l| serde_json::json!({
+                        "location": l.location,
+                        "copies": l.copies,
+                        "target": l.target,
+                    })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
                 // #478 (ADR-0012 item 129): slices released on their own from
                 // sets that span cartridges, and those still short of copies.
@@ -1563,51 +1574,39 @@ fn cmd_run(
                 "refused": refused_json(refused),
             })
         );
-    } else if let Some(warning) = &report.release_warning {
-        // ADR-0012 2026-10-07 item 33: the copies are sealed and confirmed,
-        // so a failed release is a warning and the run exits as before.
-        println!(
-            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} \
-             copy/copies written; staging NOT released",
-            report.units_staged, report.copies_written,
-        );
-        eprintln!("{warning}");
     } else {
-        match &report.cleaned {
-            Some(cleaned) => {
-                println!(
-                    "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
-                     written, {} stage set(s) released",
-                    report.units_staged, report.copies_written, sets_released,
-                );
-                // Issue #483: a pending `volume rewrite` holds its staged
-                // slices; say why a set was not released.
-                for (id, hold) in &cleaned.held_by_pending_rewrite {
-                    println!("  {}", hold.describe(*id));
-                }
-            }
-            None => {
-                println!(
-                    "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} \
-                     copy/copies written; staging RETAINED — not every unit meets its policy's \
-                     copy requirement yet:",
-                    report.units_staged, report.copies_written,
-                );
-                for p in &report.under_copied {
-                    println!(
-                        "    {}: {}/{} copies — swap in the next cartridge and run \
-                         `tapectl volume write <label>` to write another",
-                        p.unit_name, p.copies, p.min_copies,
-                    );
-                }
+        println!(
+            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} written \
+             to \"{destination}\"",
+            report.units_staged,
+            crate::render::plural(report.copies_written as i64, "copy", "copies"),
+        );
+        // The release block `volume write` prints (ADR-0012 items 216 and
+        // 217): the units released, the units kept and why, the slices of a
+        // set that spans cartridges. Its stranded files were named above.
+        let release = match report.release_warning {
+            // Item 33: the copies are sealed and confirmed, so a failed
+            // release is a warning and the run exits as before.
+            Some(warning) => crate::cli::volume::StagingRelease::Failed(warning),
+            None => crate::cli::volume::StagingRelease::of_outcome(
+                crate::staging::release::ReleaseOutcome {
+                    cleaned: report.cleaned,
+                    released_units: report.released_units,
+                    under_copied: report.under_copied,
+                    slices: report.slices,
+                },
+                crate::staging::release::Hold::CopyTargets,
+            ),
+        };
+        let (out, err) = crate::cli::volume::render_staging_release(destination, &release);
+        for line in out {
+            println!("{line}");
+        }
+        if let crate::cli::volume::StagingRelease::Failed(_) = release {
+            for line in err {
+                eprintln!("{line}");
             }
         }
-        // #478 (ADR-0012 item 129): a set that spans cartridges is released
-        // slice by slice, whatever the whole-set release decided.
-        print!(
-            "{}",
-            crate::cli::staging::slice_release_notice(&report.slices)
-        );
     }
     Ok(exit_code)
 }
@@ -2209,6 +2208,7 @@ mod checksum_mode_tests {
             units_staged: 2,
             copies_written: 1,
             cleaned: Some(whole),
+            released_units: Vec::new(),
             under_copied: Vec::new(),
             slices,
             release_warning: None,

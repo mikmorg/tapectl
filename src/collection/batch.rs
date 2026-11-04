@@ -66,12 +66,16 @@ pub struct BatchExecutionReport {
     /// "staged" here.
     pub units_staged: usize,
     pub copies_written: usize,
-    /// `Some` when staging was released this call (every unit in the batch
-    /// now meets its own resolved `min_copies`); `None` when it was
-    /// deliberately retained — see [`crate::staging::release`].
+    /// The whole-set release of the batch's covered units (ADR-0012 item
+    /// 217, per unit): `Some` when it ran — over every unit of the batch
+    /// when none was short, else over the covered ones — and `None` when no
+    /// unit of the batch was covered. See [`crate::staging::release`].
     pub cleaned: Option<CleanReport>,
-    /// Non-empty exactly when `cleaned` is `None`: which units are still
-    /// short, and by how much.
+    /// The units of the batch whose staging this release freed, by name, in
+    /// batch order.
+    pub released_units: Vec<String>,
+    /// The units of the batch still short of their copy floor or of a
+    /// per-location target, and by how much: their staging was kept.
     pub under_copied: Vec<CopyProgress>,
     /// The per-slice release of the batch's stage sets that hold a range
     /// (1.7.0, #478; ADR-0012 item 129), made whatever `cleaned` says: per
@@ -85,8 +89,8 @@ pub struct BatchExecutionReport {
     /// confirmed (a catalog error): the warning naming the unfinished step
     /// and `tapectl stage clean`, which finishes it. The copies stand, so
     /// the run exits as if the release had been retained (ADR-0012
-    /// 2026-10-07 item 33); `cleaned` is `None`, `under_copied` empty and
-    /// `slices` empty.
+    /// 2026-10-07 item 33); `cleaned` is `None`, `released_units` and
+    /// `under_copied` empty and `slices` empty.
     pub release_warning: Option<String>,
     /// The snapshot of the collection root this run's snapshot and stage read
     /// in place of the live one, when the collection has a `snapshot_command`
@@ -120,9 +124,11 @@ pub struct BatchExecutionReport {
 /// unresolved session — see its own doc comment).
 ///
 /// Release (the last step) calls the existing GC guard
-/// (`staging::clean::clean_staging`, non-force) — but **only when every unit
-/// in this batch already has enough eligible copies to satisfy its own
-/// resolved `min_copies`** ([`crate::staging::release::release_if_covered`]).
+/// (`staging::clean::clean_staging`, non-force) — but **only for the units
+/// of this batch that already have enough eligible copies to meet their
+/// copy floor and every per-location target**
+/// ([`crate::staging::release::release_if_covered`]; per unit since
+/// ADR-0012 item 217).
 /// This gate did not exist before issue #229 and its absence was a real defect, not a
 /// theoretical one: `copy_labels` is now always exactly one label (`collection
 /// run` refuses more, `docs/adr/0012-...md`'s 2026-09-17 amendment), so this
@@ -137,16 +143,16 @@ pub struct BatchExecutionReport {
 /// second, leaving nothing for the `tapectl volume write <label2>` this
 /// module's caller (`cli::collection::cmd_run`) now tells the operator to
 /// run next. So this function computes each unit's post-write copy count
-/// itself and only calls `clean_staging` when none are still short — and
-/// even then, scopes that call to exactly this batch's own units
+/// itself and only hands `clean_staging` the units that are covered — and
+/// so scopes that call to this batch's own units at most
 /// (`staging::clean::CleanScope::Units`, via [`batch_unit_ids`], issue
 /// #248): `clean_staging`'s own eligibility SQL has no notion of "batch" at
 /// all, so passing `CleanScope::Whole` here (as `tapectl stage clean`
 /// deliberately still does) would release every eligible stage_set in the
 /// WHOLE database the instant this batch's own gate passed — including a
-/// different batch's unit that is still below its own `min_copies`. A
-/// still-short batch retains ALL of its own staging (not merely the short
-/// units'), by design — see [`crate::staging::release`].
+/// different batch's unit that is still below its own floor. A short unit
+/// of the batch keeps its own staging and no other's (ADR-0012 item 217,
+/// amending #440's all-or-nothing) — see [`crate::staging::release`].
 ///
 /// The gate-and-release decision itself lives in [`release_if_covered`]
 /// (extracted from this function, issue #284): `volume_write` above has no
@@ -232,6 +238,7 @@ pub fn execute_batch(
         units_staged: staged.units_staged,
         copies_written: copy_labels.len(),
         cleaned: released.cleaned,
+        released_units: released.released_units,
         under_copied: released.under_copied,
         slices: released.slices,
         release_warning,
@@ -437,6 +444,7 @@ fn release_after_copies(
             );
             let nothing = ReleaseOutcome {
                 cleaned: None,
+                released_units: Vec::new(),
                 under_copied: Vec::new(),
                 slices: CleanReport::default(),
             };
@@ -454,8 +462,9 @@ fn release_after_copies(
 /// this tail instead of calling it, so a revert of the scope back to
 /// `CleanScope::Whole` would have gone undetected.
 ///
-/// The rule itself — release only when every unit now meets its own resolved
-/// `min_copies`, scoped to exactly those units (issues #229, #248) — lives in
+/// The rule itself — release each unit that now meets its copy floor and
+/// every per-location target, scoped to exactly those units (issues #229,
+/// #248; ADR-0012 item 217) — lives in
 /// [`crate::staging::release::release_if_covered`] since issue #440, shared
 /// with `volume write` and `volume resume`; this only names the batch's units
 /// for it, in `batch.units` order. [`execute_batch`]'s doc comment says why
@@ -1012,14 +1021,13 @@ mod tests {
         );
     }
 
-    /// Issue #440, the pin taken BEFORE the release rule was lifted out of
-    /// this module: the batch's release is all-or-nothing. Two units in one
-    /// batch, `alpha` covered (2/2) and `beta` short (1/2): NEITHER is
-    /// released and only `beta` is named. Stage once, write N times (§11) —
-    /// a copy two that finds only `beta` staged would not carry the same
-    /// content as copy one.
+    /// ADR-0012 item 217 (amending #440's all-or-nothing, which this test
+    /// pinned until 1.9.0): two units in one batch, `alpha` covered (2/2)
+    /// and `beta` short (1/2). `alpha` is released and named; `beta` keeps
+    /// its staging and is named with its shortfall. On mhvtl the old rule
+    /// wrote two covered units a third time behind one short unit.
     #[test]
-    fn a_batch_with_one_short_unit_releases_none_of_its_units() {
+    fn a_batch_with_one_short_unit_releases_its_covered_units() {
         let conn = db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
@@ -1060,10 +1068,12 @@ mod tests {
 
         let ReleaseOutcome {
             cleaned,
+            released_units,
             under_copied,
             ..
         } = release_if_covered(&conn, &config, &batch).unwrap();
-        assert!(cleaned.is_none(), "one short unit keeps the whole batch");
+        assert_eq!(cleaned.expect("alpha is covered").sets_cleaned, 1);
+        assert_eq!(released_units, ["testlib/alpha"]);
         assert_eq!(under_copied.len(), 1, "{under_copied:?}");
         assert_eq!(
             (
@@ -1074,8 +1084,12 @@ mod tests {
             ("testlib/beta", 1, 2)
         );
         assert!(
-            alpha_file.exists() && beta_file.exists(),
-            "neither unit's staged bytes are released while any unit of the batch is short"
+            !alpha_file.exists(),
+            "the covered unit does not wait for the short one"
+        );
+        assert!(
+            beta_file.exists(),
+            "the short unit keeps its staged bytes for the next copy"
         );
     }
 

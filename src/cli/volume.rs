@@ -937,23 +937,30 @@ fn returned_to_service_json(cleared: bool, counts_as_copy: bool) -> bool {
 }
 
 /// What `volume write` / `volume resume` did about staging once the copy
-/// was sealed and confirmed (issue #440).
+/// was sealed and confirmed (issue #440; per unit since ADR-0012 item 217).
 #[derive(Debug)]
 pub enum StagingRelease {
     /// `--keep-staging`: nothing was looked at, nothing released.
     Kept,
-    /// Every unit written now meets its resolved `min_copies`: the report of
-    /// the release (which may count zero sets when none was eligible), the
-    /// per-slice release of the sets that hold a range absorbed into it
-    /// (#478: `slices_released`, `slices_short`).
+    /// Every unit written now meets its copy floor and every per-location
+    /// target: the report of the release (which may count zero sets when
+    /// none was eligible), the per-slice release of the sets that hold a
+    /// range absorbed into it (#478: `slices_released`, `slices_short`).
     Released(crate::staging::clean::CleanReport),
-    /// At least one unit written is still short: staging was kept, and these
-    /// are the units that keep it. `slices` is the per-slice release of the
-    /// stage sets that hold a range (#478, ADR-0012 item 129), made whatever
-    /// the whole-set gate decided (X15): it may have released slices.
+    /// At least one unit written is still short: its staging was kept, and
+    /// `units` are the units that keep theirs, with why. Every other unit
+    /// written was judged on its own (ADR-0012 item 217): `released` names
+    /// those whose staging went, and `cleaned` is that release (`None` when
+    /// no unit was covered). `slices` is the per-slice release of the stage
+    /// sets that hold a range (#478, ADR-0012 item 129), made whatever the
+    /// units judged whole did (X15): it may have released slices. `hold` is
+    /// what the release waited for.
     Retained {
         units: Vec<crate::staging::release::CopyProgress>,
         slices: crate::staging::clean::CleanReport,
+        released: Vec<String>,
+        cleaned: Option<crate::staging::clean::CleanReport>,
+        hold: crate::staging::release::Hold,
     },
     /// The volume has no unit with a completed write: nothing to judge.
     NothingWritten,
@@ -962,21 +969,51 @@ pub enum StagingRelease {
     Failed(String),
 }
 
+impl StagingRelease {
+    /// The release's verdict from [`crate::staging::release::release_if_covered_holding`]'s
+    /// outcome under `hold`: [`StagingRelease::Released`] when no unit judged
+    /// whole was kept, else [`StagingRelease::Retained`]. Shared by `volume
+    /// write`, `volume resume` and `collection run`.
+    pub(crate) fn of_outcome(
+        o: crate::staging::release::ReleaseOutcome,
+        hold: crate::staging::release::Hold,
+    ) -> StagingRelease {
+        if o.under_copied.is_empty() {
+            // #478: the per-slice release is reported with the whole-set
+            // one, never dropped (its stranded paths are the operator's only
+            // notice of files no later `stage clean` can find, issue #108).
+            let mut cleaned = o.cleaned.unwrap_or_default();
+            cleaned.absorb(o.slices);
+            StagingRelease::Released(cleaned)
+        } else {
+            StagingRelease::Retained {
+                units: o.under_copied,
+                slices: o.slices,
+                released: o.released_units,
+                cleaned: o.cleaned,
+                hold,
+            }
+        }
+    }
+}
+
 /// What a write keeps of its staging once it is sealed and confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagingKeep {
-    /// The default: released once every unit written meets its copy floor
-    /// (issue #440).
+    /// The default: each unit written is released once it meets its copy
+    /// floor and every per-location target (ADR-0012 item 217).
     Release,
     /// `--keep-staging`: everything kept.
     All,
-    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): released
-    /// once every unit written also meets every per-location target.
+    /// `--keep-staging-for-locations` (#493, ADR-0012 item 154): as the
+    /// default for the units written whole, and a unit short of a
+    /// per-location target also keeps every slice of a set that spans
+    /// cartridges.
     UntilEveryLocation,
 }
 
 /// `--keep-staging` as a flag: `true` keeps everything, `false` releases by
-/// the copy floor (`volume resume`, and every caller before #493).
+/// the default rule (`volume resume`, and every caller before #493).
 impl From<bool> for StagingKeep {
     fn from(keep_staging: bool) -> Self {
         if keep_staging {
@@ -988,8 +1025,10 @@ impl From<bool> for StagingKeep {
 }
 
 /// The release step of `volume write` / `volume resume`, run only after the
-/// write returned `Ok` — sealed and confirmed, quick or full. The rule is
-/// the one `collection run` applies, through the same function
+/// write returned `Ok` — sealed and confirmed, quick or full — and after the
+/// tape was moved, if a move was asked: the per-location targets it judges
+/// count a tape where it now sits (ADR-0012 item 217). The rule is the one
+/// `collection run` applies, through the same function
 /// ([`crate::staging::release::release_if_covered`]), over the units the
 /// volume now holds a completed write of. Never fails the write: an error
 /// becomes [`StagingRelease::Failed`], the warning naming the step and
@@ -1000,10 +1039,12 @@ pub fn release_staging_after_write(
     label: &str,
     keep_staging: impl Into<StagingKeep>,
 ) -> StagingRelease {
+    use crate::staging::release::Hold;
     let hold = match keep_staging.into() {
         StagingKeep::All => return StagingRelease::Kept,
-        StagingKeep::Release => crate::staging::release::Hold::CopyFloor,
-        StagingKeep::UntilEveryLocation => crate::staging::release::Hold::EveryLocation,
+        // ADR-0012 item 217's default; `Hold::CopyFloor` is item 154's.
+        StagingKeep::Release => Hold::CopyTargets,
+        StagingKeep::UntilEveryLocation => Hold::EveryLocation,
     };
     let outcome = crate::staging::release::unit_ids_written_to(conn, label).and_then(|ids| {
         if ids.is_empty() {
@@ -1014,19 +1055,7 @@ pub fn release_staging_after_write(
     });
     match outcome {
         Ok(None) => StagingRelease::NothingWritten,
-        // #478: the per-slice release is reported with the whole-set one,
-        // never dropped (its stranded paths are the operator's only notice
-        // of files no later `stage clean` can find, issue #108).
-        Ok(Some(o)) => match o.cleaned {
-            Some(mut cleaned) => {
-                cleaned.absorb(o.slices);
-                StagingRelease::Released(cleaned)
-            }
-            None => StagingRelease::Retained {
-                units: o.under_copied,
-                slices: o.slices,
-            },
-        },
+        Ok(Some(o)) => StagingRelease::of_outcome(o, hold),
         Err(e) => StagingRelease::Failed(crate::error::unfinished_after_seal(
             label,
             "releasing staging",
@@ -1039,18 +1068,34 @@ pub fn release_staging_after_write(
 /// `base` with the release's keys added (issue #440), the names
 /// `collection run --json` already uses where they mean the same thing.
 /// Always present so a scripted consumer never branches on whether a key
-/// exists: `staging_released`, `stage_sets_released`, `bytes_freed`,
-/// `under_copied` (empty unless a unit kept the staging), `keep_staging`
-/// and `release_warning` (null unless the release failed).
+/// exists: `staging_released` (true when no unit written kept its staging),
+/// `stage_sets_released` and `bytes_freed` (whatever was released, a
+/// partial release included), `units_released` (by name; additive, ADR-0012
+/// item 217), `under_copied` (the units that kept their staging, each with
+/// its `copy_floor`, empty unless one did), `keep_staging` and
+/// `release_warning` (null unless the release failed).
 pub(crate) fn staging_release_json(
     mut base: serde_json::Value,
     release: &StagingRelease,
 ) -> serde_json::Value {
     let (released, sets, bytes) = match release {
         StagingRelease::Released(c) => (true, c.sets_cleaned, c.bytes_freed),
-        // #478: slices released while the whole-set release kept the rest.
-        StagingRelease::Retained { slices, .. } => (false, 0, slices.bytes_freed),
+        // #478: slices released while the whole-set release kept the rest;
+        // item 217: and the units released beside the kept ones.
+        StagingRelease::Retained {
+            slices, cleaned, ..
+        } => (
+            false,
+            cleaned.as_ref().map_or(0, |c| c.sets_cleaned) + slices.sets_cleaned,
+            cleaned.as_ref().map_or(0, |c| c.bytes_freed) + slices.bytes_freed,
+        ),
         _ => (false, 0, 0),
+    };
+    let units_released: Vec<&str> = match release {
+        StagingRelease::Retained { released, .. } => {
+            released.iter().map(String::as_str).collect()
+        }
+        _ => Vec::new(),
     };
     let under: Vec<serde_json::Value> = match release {
         StagingRelease::Retained { units, .. } => units
@@ -1059,9 +1104,10 @@ pub(crate) fn staging_release_json(
                 serde_json::json!({
                     "unit": p.unit_name,
                     "copies": p.copies,
-                    "min_copies": p.min_copies,
-                    // #493, additive: with `--keep-staging-for-locations`,
-                    // the per-location targets still unmet; empty otherwise.
+                    // OQ5: the copy floor, named for what it is.
+                    "copy_floor": p.min_copies,
+                    // #493, additive: the per-location targets still unmet
+                    // (ADR-0012 item 217: by default too); empty otherwise.
                     "short_locations": p.short_at.iter().map(|l| serde_json::json!({
                         "location": l.location,
                         "copies": l.copies,
@@ -1092,6 +1138,7 @@ pub(crate) fn staging_release_json(
         obj.insert("staging_released".into(), released.into());
         obj.insert("stage_sets_released".into(), sets.into());
         obj.insert("bytes_freed".into(), bytes.into());
+        obj.insert("units_released".into(), units_released.into());
         obj.insert("under_copied".into(), under.into());
         obj.insert("slices_released".into(), slices_released);
         obj.insert("slices_short".into(), slices_short);
@@ -1174,29 +1221,57 @@ pub(crate) fn render_staging_release(
                 .to_string(),
         ),
         StagingRelease::NothingWritten => {}
-        StagingRelease::Retained { units, slices } => {
-            // #493 (ADR-0012 item 154): held for a per-location target.
-            let for_locations = units.iter().any(|p| !p.short_at.is_empty());
-            out.push(if for_locations {
-                "staging kept (--keep-staging-for-locations): not every unit written has its \
-                 policy's copies, at every location its targets name, yet, and the next copy \
-                 reuses these staged slices:"
-                    .to_string()
+        StagingRelease::Retained {
+            units,
+            slices,
+            released,
+            cleaned,
+            hold,
+        } => {
+            // ADR-0012 item 217: one block, per unit — the units released,
+            // then the units kept, each with why.
+            if !released.is_empty() {
+                let (sets, bytes) = cleaned
+                    .as_ref()
+                    .map_or((0, 0), |c| (c.sets_cleaned, c.bytes_freed));
+                out.push(format!(
+                    "staging released for {} whose copies are met: {} ({} stage set(s), {} \
+                     freed)",
+                    crate::render::plural(released.len() as i64, "unit", "units"),
+                    released.join(", "),
+                    sets,
+                    crate::util::format_bytes_binary(bytes),
+                ));
+            }
+            let flag = if *hold == crate::staging::release::Hold::EveryLocation {
+                " (--keep-staging-for-locations)"
             } else {
-                "staging kept: not every unit written has its policy's copies yet, and the next \
-                 copy reuses these staged slices:"
-                    .to_string()
-            });
+                ""
+            };
+            out.push(format!(
+                "staging kept{flag} for {} still short of {}; the next copy reuses {} staged \
+                 slices:",
+                crate::render::plural(units.len() as i64, "unit", "units"),
+                if units.len() == 1 {
+                    "its policy"
+                } else {
+                    "their policy"
+                },
+                if units.len() == 1 { "its" } else { "their" },
+            ));
             out.extend(units.iter().map(|p| format!("  {}", p.describe())));
-            out.push(if for_locations {
-                "  write the next copy with `tapectl volume write <label> --for-location \
-                 <location>`; `tapectl stage clean` releases the units that are covered"
-                    .to_string()
-            } else {
-                "  write another copy with `tapectl volume write <label>`; `tapectl stage \
-                 clean` releases the units that are covered"
-                    .to_string()
-            });
+            if let Some(c) = cleaned {
+                for (id, labels) in &c.held_by_live_session {
+                    out.push(format!(
+                        "  stage set {id} kept: a live session is using it on volume(s) {}",
+                        labels.join(", ")
+                    ));
+                }
+                for (id, hold) in &c.held_by_pending_rewrite {
+                    out.push(format!("  {}", hold.describe(*id)));
+                }
+                err.extend(stranded_lines(label, &c.stranded));
+            }
             out.extend(slice_release_lines(slices));
             err.extend(stranded_lines(label, &slices.stranded));
         }
@@ -1718,11 +1793,15 @@ struct WriteDone {
 /// the cartridge had been swapped in between, and that is exactly the case
 /// the write's own File 0 check exists to refuse.
 ///
-/// The staging release runs before the move. Neither depends on the other —
-/// the release counts copies (`policy::coverage::copy_count_expr` has no
-/// location term) and the move changes only where the cartridge sits — so
-/// the order is for the operator: the move's warning, which carries the
-/// command that finishes it, is then the last thing printed.
+/// The move runs before the staging release (ADR-0012 item 217): the release
+/// waits for each unit's per-location targets too, and a tape written for a
+/// place counts there only once it has been moved there (item 150), so
+/// judged before the move the unit would read short at the very place this
+/// command sends it. A move that fails leaves the tape where it was, and the
+/// release then judges it there: the stricter answer. The printing keeps
+/// the release lines before the move's, so the move's warning, which
+/// carries the command that finishes it, comes last but for the next
+/// command.
 fn write_and_follow(
     conn: &Connection,
     config: &Config,
@@ -1763,8 +1842,8 @@ fn write_and_follow(
     // cannot answer is an empty answer, never a failed write: the copy
     // stands (ADR-0012 2026-10-07 item 33).
     let ending = write::recorded_ending(conn, req.label).unwrap_or_default();
-    let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
     let moved = move_after_write(conn, req.label, req.move_to);
+    let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
     Ok(WriteDone {
         loaded: req.loaded,
         initialized,
@@ -1912,8 +1991,9 @@ pub(crate) struct ResumeDone {
 }
 
 /// What follows a resume that returned `Ok` — sealed and confirmed: the
-/// staging release, then the move, exactly as [`write_and_follow`] does
-/// them after a write, from what the resume decided to keep
+/// move, then the staging release, exactly as [`write_and_follow`] does
+/// them after a write (the release judges the tape where it now sits,
+/// ADR-0012 item 217), from what the resume decided to keep
 /// ([`write::PostSeal`]). Neither step can fail the resume: the copy stands.
 pub(crate) fn follow_resume(
     conn: &Connection,
@@ -1928,8 +2008,8 @@ pub(crate) fn follow_resume(
     } else {
         StagingKeep::Release
     };
-    let release = release_staging_after_write(conn, config, label, keep);
     let moved = move_after_write(conn, label, post_seal.move_to.as_deref());
+    let release = release_staging_after_write(conn, config, label, keep);
     ResumeDone {
         post_seal,
         release,
@@ -5596,9 +5676,56 @@ mod tests {
             assert_eq!(
                 json["under_copied"],
                 serde_json::json!([{
-                    "unit": "testlib/alpha", "copies": 1, "min_copies": 2, "short_locations": []
+                    "unit": "testlib/alpha", "copies": 1, "copy_floor": 2, "short_locations": []
                 }])
             );
+            assert_eq!(json["units_released"], serde_json::json!([]));
+        }
+
+        /// ADR-0012 item 217: one write, two units, one covered and one
+        /// short. The covered one is released and named, the short one kept
+        /// with why, in one block; `--json` says the same. Undone (all or
+        /// nothing), alpha's file would still be on disk and no line would
+        /// name it released.
+        #[test]
+        fn the_covered_unit_is_released_beside_the_short_one_and_both_are_named() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = config(dir.path(), 2);
+            let t = tenant(&conn);
+            let alpha = unit(&conn, t, "testlib/alpha");
+            let beta = unit(&conn, t, "testlib/beta");
+            let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+            let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+            add_write(&conn, &a, "V-0", "sealed", "completed");
+            add_write(&conn, &a, "V-NEW", "sealed", "completed");
+            add_write(&conn, &b, "V-NEW", "sealed", "completed");
+
+            let release = release_staging_after_write(&conn, &config, "V-NEW", false);
+
+            assert!(!a.file.exists() && b.file.exists(), "{release:?}");
+            let (out, err) = render_staging_release("V-NEW", &release);
+            assert!(err.is_empty(), "{err:?}");
+            assert_eq!(out.len(), 3, "{out:#?}");
+            assert!(
+                out[0].starts_with(
+                    "staging released for 1 unit whose copies are met: testlib/alpha (1 stage \
+                     set(s), "
+                ),
+                "{out:#?}"
+            );
+            assert_eq!(
+                out[1],
+                "staging kept for 1 unit still short of its policy; the next copy reuses its \
+                 staged slices:"
+            );
+            assert_eq!(out[2], "  unit testlib/beta has 1 copy, needs 2");
+            let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
+            assert_eq!(json["staging_released"], false, "a unit kept its staging");
+            assert_eq!(json["units_released"], serde_json::json!(["testlib/alpha"]));
+            assert_eq!(json["stage_sets_released"], 1);
+            assert!(json["bytes_freed"].as_i64().unwrap() > 0);
+            assert_eq!(json["under_copied"][0]["unit"], "testlib/beta");
         }
 
         /// `--keep-staging`: covered, and kept anyway. The positive control
@@ -5762,7 +5889,8 @@ mod tests {
         /// inconclusive outcome returns at that `?` — and `--keep-staging`
         /// reaches it. For `volume write` that sequence lives in
         /// `write_and_follow` (issue #438): the init, then the write, and
-        /// only behind the write's `?` the release and the `--move-to` move.
+        /// only behind the write's `?` the `--move-to` move and the release
+        /// (in that order since ADR-0012 item 217).
         #[test]
         fn both_arms_release_only_after_the_write_returns_ok() {
             const SRC: &str = include_str!("volume.rs");
@@ -5811,9 +5939,11 @@ mod tests {
                 release > question && moved > question,
                 "the release and the move must come after the write's `?`, not before it"
             );
+            // ADR-0012 item 217: the release waits for per-location targets,
+            // and the tape counts at its new place only once moved there.
             assert!(
-                release < moved,
-                "the staging release runs before the move, whose warning is printed last"
+                moved < release,
+                "the move runs before the staging release, which judges the tape where it sits"
             );
             assert_eq!(seq.matches("release_staging_after_write(").count(), 1);
             assert_eq!(seq.matches("move_after_write(").count(), 1);
@@ -5860,8 +5990,8 @@ mod tests {
                 .find("move_after_write(conn, label, post_seal.move_to.as_deref())")
                 .expect("the move is the one the resume kept or was told");
             assert!(
-                release < moved,
-                "the release runs before the move, as after a write"
+                moved < release,
+                "the move runs before the release, as after a write (ADR-0012 item 217)"
             );
             assert_eq!(seq.matches("release_staging_after_write(").count(), 1);
             assert_eq!(seq.matches("move_after_write(").count(), 1);
