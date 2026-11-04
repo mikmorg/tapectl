@@ -13,7 +13,7 @@ tapectl key [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`generate`](#tapectl-key-generate) — Generate a new keypair for a tenant, or the permanent escrow recipient with --escrow (ADR-0005)
-- [`list`](#tapectl-key-list) — List keys for a tenant
+- [`list`](#tapectl-key-list) — List keys: every tenant's, or one tenant's with --tenant
 - [`export`](#tapectl-key-export) — Export a public key to stdout
 - [`rotate`](#tapectl-key-rotate) — Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself
 - [`import`](#tapectl-key-import) — Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005)
@@ -37,15 +37,15 @@ tapectl key generate [OPTIONS]
 
 ### tapectl key list
 
-List keys for a tenant
+List keys: every tenant's, or one tenant's with --tenant
 
 ```text
-tapectl key list [OPTIONS] --tenant <TENANT>
+tapectl key list [OPTIONS]
 ```
 
 **Options**
 
-- `--tenant <TENANT>` *(required)* — Tenant name
+- `--tenant <TENANT>` — List only this tenant's keys. Without it every tenant's keys are listed, with a Tenant column (deleted tenants are left out, as `tenant list` leaves them out; name one to see its keys)
 
 ### tapectl key export
 

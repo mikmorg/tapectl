@@ -38,4 +38,4 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fINAME\fR>
-Unit name
+Unit name(s). Each unit is walked and reported on its own: one that fails does not stop the others, and the command then exits with an error naming every unit that failed

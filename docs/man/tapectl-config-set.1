@@ -8,7 +8,7 @@ tapectl\-config\-set \- Set one key in config.toml, keeping its comments and lay
 .SH DESCRIPTION
 Set one key in config.toml, keeping its comments and layout
 .PP
-KEY is a dotted path as `config check` prints it: `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry of a list of tables is selected by its name or its position from 0: `collections[movies].unit_depth`, `backends.lto[0].enospc_buffer`. A missing table is created.
+KEY is a dotted path as `config check` prints it: `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry of a list of tables is selected by its name or its position from 0: `collections[movies].unit_depth`, `backends.lto[0].enospc_buffer`. A missing table is created. A bare key resolves to the one key of that name (`post_warning_bytes` with one drive), and a list of tables with one entry needs no selector (`backends.lto.enospc_buffer`).
 .PP
 VALUE is tried as a TOML number, boolean or array first, and as a string when that does not load; quote it as TOML (`\*(Aq"3"\*(Aq`) to force a string. The edited file is checked as every command loads it before it is written: an unknown key or a bad value is refused by name and the file is left exactly as it was. The file is replaced atomically.
 .SH OPTIONS

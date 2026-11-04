@@ -65,7 +65,7 @@ tapectl cartridge info [OPTIONS] <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 ### tapectl cartridge move
 
@@ -79,7 +79,7 @@ tapectl cartridge move [OPTIONS] --to <TO> <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 **Options**
 
@@ -101,7 +101,7 @@ tapectl cartridge retire [OPTIONS] <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 **Options**
 
@@ -144,7 +144,7 @@ tapectl cartridge mark-erased [OPTIONS] <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 **Options**
 
@@ -164,7 +164,7 @@ tapectl cartridge edit [OPTIONS] <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 **Options**
 
@@ -175,7 +175,7 @@ tapectl cartridge edit [OPTIONS] <CARTRIDGE>
 
 Correct a cartridge's barcode label
 
-ADR-0012: a cartridge's identity is its chip serial; the barcode is a relabelable sticker. This is a Tier 1 label correction under ADR-0008, not a destructive act — no prompt, no `--force`, no status gate — and it is the remedy `volume init`'s auto-register refuses with when the loaded medium's serial collides with an already-registered barcode.
+ADR-0012: a cartridge's identity is its chip serial; the barcode is a relabelable sticker. `volume init` gives a cartridge its first barcode (its first volume's label, or `--barcode`; item 219); this changes it afterwards. This is a Tier 1 label correction under ADR-0008, not a destructive act — no prompt, no `--force`, no status gate — and it is the remedy `volume init`'s auto-register refuses with when the loaded medium's serial collides with an already-registered barcode.
 
 ```text
 tapectl cartridge relabel [OPTIONS] <CARTRIDGE> <NEW_BARCODE>
@@ -183,7 +183,7 @@ tapectl cartridge relabel [OPTIONS] <CARTRIDGE> <NEW_BARCODE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Current barcode
+- `<CARTRIDGE>` — The cartridge: its current barcode, or the serial its chip reports
 - `<NEW_BARCODE>` — New barcode
 
 ### tapectl cartridge unretire
@@ -200,7 +200,7 @@ tapectl cartridge unretire [OPTIONS] <CARTRIDGE>
 
 **Arguments**
 
-- `<CARTRIDGE>` — Barcode
+- `<CARTRIDGE>` — The cartridge: its barcode, or the serial its chip reports
 
 ### tapectl cartridge journal
 
@@ -216,7 +216,7 @@ tapectl cartridge journal [OPTIONS] [CARTRIDGE]
 
 **Arguments**
 
-- `[CARTRIDGE]` — Barcode of a registered cartridge
+- `[CARTRIDGE]` — A registered cartridge: its barcode, or the serial its chip reports
 
 **Options**
 

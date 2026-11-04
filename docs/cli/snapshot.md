@@ -24,12 +24,12 @@ tapectl snapshot [OPTIONS] <COMMAND>
 Create a snapshot (fast directory walk + manifest)
 
 ```text
-tapectl snapshot create [OPTIONS] <NAME>
+tapectl snapshot create [OPTIONS] <NAME>...
 ```
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — Unit name(s). Each unit is walked and reported on its own: one that fails does not stop the others, and the command then exits with an error naming every unit that failed
 
 ### tapectl snapshot list
 

@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-config-get 1  "tapectl-config-get " 
+.SH NAME
+tapectl\-config\-get \- Print one key\*(Aqs value in force, and where it comes from
+.SH SYNOPSIS
+\fBtapectl config get\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> 
+.SH DESCRIPTION
+Print one key\*(Aqs value in force, and where it comes from
+.PP
+The source is config.toml, a default (the key is not in the file), or derived (a drive\*(Aqs device_sg, from its device_tape). KEY is spelled as for `config set`, and a bare key resolves to the one key of that name: `post_warning_bytes` is `backends.lto[lto6].post_warning_bytes` when one drive is configured, and with one drive `backends.lto.KEY` names its key too. A key that could be several is refused naming each, and a misspelt one names the key meant. `\-\-json` gives `key`, `value` (null when nothing sets it) and `source` (`config.toml`, `default` or `derived`).
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIKEY\fR>
+The key, e.g. defaults.slice_size or post_warning_bytes

@@ -37,7 +37,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`tenant delete`](tenant.md#tapectl-tenant-delete) | Delete a tenant (soft delete) |
 | [`key`](key.md) | Manage encryption keys |
 | &nbsp;&nbsp;[`key generate`](key.md#tapectl-key-generate) | Generate a new keypair for a tenant, or the permanent escrow recipient with --escrow (ADR-0005) |
-| &nbsp;&nbsp;[`key list`](key.md#tapectl-key-list) | List keys for a tenant |
+| &nbsp;&nbsp;[`key list`](key.md#tapectl-key-list) | List keys: every tenant's, or one tenant's with --tenant |
 | &nbsp;&nbsp;[`key export`](key.md#tapectl-key-export) | Export a public key to stdout |
 | &nbsp;&nbsp;[`key rotate`](key.md#tapectl-key-rotate) | Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself |
 | &nbsp;&nbsp;[`key import`](key.md#tapectl-key-import) | Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005) |
@@ -79,7 +79,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`volume resume`](volume.md#tapectl-volume-resume) | Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them |
 | &nbsp;&nbsp;[`volume abort`](volume.md#tapectl-volume-abort) | Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own |
 | &nbsp;&nbsp;[`volume verify`](volume.md#tapectl-volume-verify) | Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing) |
-| &nbsp;&nbsp;[`volume identify`](volume.md#tapectl-volume-identify) | Identify a tape (read ID thunk) |
+| &nbsp;&nbsp;[`volume identify`](volume.md#tapectl-volume-identify) | Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it |
 | &nbsp;&nbsp;[`volume move`](volume.md#tapectl-volume-move) | Move a volume to a location |
 | &nbsp;&nbsp;[`volume retire`](volume.md#tapectl-volume-retire) | Retire a volume (with impact analysis) |
 | &nbsp;&nbsp;[`volume read-slices`](volume.md#tapectl-volume-read-slices) | Read encrypted slices from a volume into staging (then use `volume write` to write them) |
@@ -160,6 +160,7 @@ Accepted by every command, before or after the subcommand.
 | [`config`](config.md) | Configuration management |
 | &nbsp;&nbsp;[`config show`](config.md#tapectl-config-show) | Show current configuration |
 | &nbsp;&nbsp;[`config check`](config.md#tapectl-config-check) | Check configuration validity |
+| &nbsp;&nbsp;[`config get`](config.md#tapectl-config-get) | Print one key's value in force, and where it comes from |
 | &nbsp;&nbsp;[`config set`](config.md#tapectl-config-set) | Set one key in config.toml, keeping its comments and layout |
 | &nbsp;&nbsp;[`config add`](config.md#tapectl-config-add) | Add a table to a list of tables, or values to a list |
 | &nbsp;&nbsp;[`config remove`](config.md#tapectl-config-remove) | Remove a key, an entry of a list of tables, or values from a list |

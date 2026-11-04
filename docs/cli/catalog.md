@@ -76,12 +76,12 @@ tapectl catalog stats [OPTIONS]
 Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 
 ```text
-tapectl catalog rebuild [OPTIONS] --key <FILE>
+tapectl catalog rebuild [OPTIONS] --from-volume --key <FILE>
 ```
 
 **Options**
 
-- `--from-volume` — Rebuild from a sealed tape volume. The only source today; named rather than implied so a later `--from-export` is additive
+- `--from-volume` *(required)* — Rebuild from a sealed tape volume. Required: the only source today, named rather than implied so a later `--from-export` is additive
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured.
   
     There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read-only dump this command writes what it reads into the catalog — a silent wrong-device default would file one tape's contents under another's. The sole configured drive's `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by-id/`.

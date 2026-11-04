@@ -4,13 +4,13 @@
 .SH NAME
 tapectl\-catalog\-rebuild \- Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 .SH SYNOPSIS
-\fBtapectl catalog rebuild\fR [\fB\-\-from\-volume\fR] [\fB\-\-json\fR] [\fB\-\-device\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] <\fB\-\-key\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-label\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-tenant\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl catalog rebuild\fR <\fB\-\-from\-volume\fR> [\fB\-\-json\fR] [\fB\-\-device\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] <\fB\-\-key\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-label\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-tenant\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 .SH OPTIONS
 .TP
 \fB\-\-from\-volume\fR
-Rebuild from a sealed tape volume. The only source today; named rather than implied so a later `\-\-from\-export` is additive
+Rebuild from a sealed tape volume. Required: the only source today, named rather than implied so a later `\-\-from\-export` is additive
 .TP
 \fB\-\-json\fR
 Output in JSON format

@@ -30,7 +30,7 @@ tapectl db backup [OPTIONS] <PATH>
 
 **Arguments**
 
-- `<PATH>` — The backup file to write. Its directory must already exist
+- `<PATH>` — The backup file to write, or a directory to write `tapectl-YYYYmmddTHHMMSSZ.db` into (the scheduled backup's name). An existing file is refused, never overwritten. The directory must already exist
 
 **Options**
 

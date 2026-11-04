@@ -8,7 +8,7 @@ tapectl\-cartridge\-relabel \- Correct a cartridge\*(Aqs barcode label
 .SH DESCRIPTION
 Correct a cartridge\*(Aqs barcode label
 .PP
-ADR\-0012: a cartridge\*(Aqs identity is its chip serial; the barcode is a relabelable sticker. This is a Tier 1 label correction under ADR\-0008, not a destructive act — no prompt, no `\-\-force`, no status gate — and it is the remedy `volume init`\*(Aqs auto\-register refuses with when the loaded medium\*(Aqs serial collides with an already\-registered barcode.
+ADR\-0012: a cartridge\*(Aqs identity is its chip serial; the barcode is a relabelable sticker. `volume init` gives a cartridge its first barcode (its first volume\*(Aqs label, or `\-\-barcode`; item 219); this changes it afterwards. This is a Tier 1 label correction under ADR\-0008, not a destructive act — no prompt, no `\-\-force`, no status gate — and it is the remedy `volume init`\*(Aqs auto\-register refuses with when the loaded medium\*(Aqs serial collides with an already\-registered barcode.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -40,7 +40,7 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fICARTRIDGE\fR>
-Current barcode
+The cartridge: its current barcode, or the serial its chip reports
 .TP
 <\fINEW_BARCODE\fR>
 New barcode

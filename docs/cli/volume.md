@@ -17,7 +17,7 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`resume`](#tapectl-volume-resume) — Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
 - [`abort`](#tapectl-volume-abort) — Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
 - [`verify`](#tapectl-volume-verify) — Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing)
-- [`identify`](#tapectl-volume-identify) — Identify a tape (read ID thunk)
+- [`identify`](#tapectl-volume-identify) — Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
 - [`move`](#tapectl-volume-move) — Move a volume to a location
 - [`retire`](#tapectl-volume-retire) — Retire a volume (with impact analysis)
 - [`read-slices`](#tapectl-volume-read-slices) — Read encrypted slices from a volume into staging (then use `volume write` to write them)
@@ -49,13 +49,14 @@ tapectl volume init [OPTIONS] <LABEL>
 **Options**
 
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--force` — Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `--force` when the tape is PROVEN blank (ADR-0012 2026-10-15 item 57): the chip's lifetime totals read 0 MiB written, or this catalog's own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR-0003): retire its volume, erase the tape in the drive (`mt erase`, or `mt weof 1` at the start) and run `cartridge mark-erased` first for that case. Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010)
+- `--force` — Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `--force` when the tape is PROVEN blank (ADR-0012 2026-10-15 item 57): the chip's lifetime totals read 0 MiB written, or this catalog's own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR-0003): this catalog's own sealed volume is a copy to eject, not a blank; a sealed tape this catalog does not hold, or holds retired, is erased first with `tapectl cartridge erase` (ADR-0012 item 216). Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010)
 - `--generation <GENERATION>` — Declare the loaded medium's generation (e.g. LTO-6, LTO-7-M8).
   
     Normally unnecessary and normally ignored: ADR-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver's density register), and a detected code is a fact about the tape that this flag cannot override — a `--generation` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
-- `--cartridge <CARTRIDGE>` — Bind this volume to an already-registered cartridge by barcode.
+- `--cartridge <CARTRIDGE>` — Bind this volume to an already-registered cartridge: its barcode, or the serial its chip reports.
   
-    Normally unnecessary: `volume init` matches the loaded medium's MAM serial to `cartridges.serial_number`, and auto-registers a cartridge (barcode = that serial) when nothing matches. Use this to attach the volume to a cartridge YOU labelled — the barcode on the physical sticker — instead. A serial match wins over this flag, since the serial was read off the medium.
+    Normally unnecessary: `volume init` matches the loaded medium's chip serial to a registered cartridge, and registers the cartridge itself when nothing matches. Use this for a cartridge registered by hand before it was ever loaded, or on a drive that reports no chip serial, where it names the cartridge. A serial match wins over this flag, since the serial was read off the medium.
+- `--barcode <BARCODE>` — The barcode on the cartridge's sticker, for a cartridge this init registers or one still wearing its chip serial as a placeholder barcode. Without it such a cartridge takes the volume's label as its barcode (ADR-0012 item 219), the usual practice: the same text on the sticker and on the tape. A cartridge that already has a barcode keeps it, and a different `--barcode` is refused (change a sticker with `tapectl cartridge relabel`). The chip serial stays the cartridge's identity either way
 
 ### tapectl volume write
 
@@ -84,7 +85,8 @@ tapectl volume write [OPTIONS] [LABEL]
 - `--loaded` — Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog's volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `--init`
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--force` — See `volume init --force` — same override, same limits. With `--init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write's own File 0 check
-- `--init` — Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. Only `--force` is taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59
+- `--init` — Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. `--force` and `--barcode` are taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59
+- `--barcode <BARCODE>` — With `--init`: the barcode on the cartridge's sticker, as `volume init --barcode` takes it. Without it a cartridge being registered takes the volume's label (ADR-0012 item 219)
 - `--move-to <LOCATION>` — Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> --to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0
 - `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005). Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
@@ -171,7 +173,9 @@ tapectl volume verify [OPTIONS] [LABEL]
 
 ### tapectl volume identify
 
-Identify a tape (read ID thunk)
+Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
+
+With `--json`, one object: File 0's `label` and `uuid` (and its text as `file0`), the catalog's `status`, `condition` and `location` for that volume (null when it has none of that uuid), the `cartridge` (the chip `serial` read now, the catalog's `barcode` for it, and the identity File 0 records), the `sealed` facts the catalog records, and the `note` and `contradiction`. A tape that contradicts the catalog still exits non-zero.
 
 ```text
 tapectl volume identify [OPTIONS]

@@ -2,11 +2,13 @@
 .el .ds Aq '
 .TH tapectl-volume-identify 1  "tapectl-volume-identify " 
 .SH NAME
-tapectl\-volume\-identify \- Identify a tape (read ID thunk)
+tapectl\-volume\-identify \- Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
 .SH SYNOPSIS
 \fBtapectl volume identify\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Identify a tape (read ID thunk)
+Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
+.PP
+With `\-\-json`, one object: File 0\*(Aqs `label` and `uuid` (and its text as `file0`), the catalog\*(Aqs `status`, `condition` and `location` for that volume (null when it has none of that uuid), the `cartridge` (the chip `serial` read now, the catalog\*(Aqs `barcode` for it, and the identity File 0 records), the `sealed` facts the catalog records, and the `note` and `contradiction`. A tape that contradicts the catalog still exits non\-zero.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
