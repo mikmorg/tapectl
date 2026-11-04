@@ -6188,7 +6188,16 @@ mod tests {
             // And nowhere else in the library: `collection run`, `quick-archive`
             // and `volume compact*` reach `volume_write` directly and have
             // their own release step, so a release inside it would double up.
-            let write_rs = include_str!("../volume/write.rs");
+            // Its production code only: its tests may build a catalog with
+            // the release module's fixtures (the copy summary's does).
+            let write_rs = include_str!("../volume/write.rs")
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap();
+            assert!(
+                write_rs.contains("pub fn volume_write("),
+                "positive control: the split kept volume::write's production code"
+            );
             assert!(
                 !write_rs.contains("staging::release"),
                 "volume::write must not release staging itself"
