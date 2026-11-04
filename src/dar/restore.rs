@@ -5,16 +5,24 @@ use tracing::warn;
 use crate::error::{Result, TapectlError};
 
 /// `-O` (`--comparison-field`, ignore-owner) exists precisely because a
-/// non-root restore cannot set stored ownership. Warn the operator, so a
+/// non-root restore cannot set stored ownership. Tell the operator, so a
 /// restore that silently lands everything under the invoking user rather
 /// than the archived owners does not go unnoticed (issue #51).
+///
+/// One plain line on stderr, once a process (ADR-0012 item 220): it was a
+/// tracing `WARN` with a timestamp and a module path, printed once a unit,
+/// so a `restore volume` of many units repeated it for each.
 fn warn_if_non_root() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
     if !nix::unistd::geteuid().is_root() {
-        warn!(
-            "restoring as a non-root user: restored files will be owned by \
-             the invoking user, not their archived owners"
-        );
+        ONCE.call_once(|| eprintln!("{}", non_root_line()));
     }
+}
+
+/// The line [`warn_if_non_root`] prints.
+fn non_root_line() -> &'static str {
+    "note: restoring as a non-root user, so the restored files are owned by you, not \
+     by the owners the archive recorded"
 }
 
 /// dar's marker, on stdout, for a file it declined to overwrite.
