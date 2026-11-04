@@ -515,7 +515,9 @@ impl HomeScreen {
         if !pending.is_empty() {
             next.push(match self.pending_collections.first() {
                 Some((_, collection)) => {
-                    format!("tapectl collection run {collection} --label <LABEL>")
+                    format!(
+                        "tapectl collection run {collection} --label <NEW-LABEL> --init --full-confirm --move-to <a short location>"
+                    )
                 }
                 None => format!("tapectl snapshot create {}", some_names(&pending)),
             });
@@ -1486,7 +1488,7 @@ mod tests {
                 s.never_archived = vec!["movies/x".into()];
                 s.pending_collections = vec![("movies/x".into(), "movies".into())];
             }),
-            ["tapectl collection run movies --label <LABEL>"]
+            ["tapectl collection run movies --label <NEW-LABEL> --init --full-confirm --move-to <a short location>"]
         );
         // Several interrupted sessions: the first, and the others named.
         assert_eq!(
