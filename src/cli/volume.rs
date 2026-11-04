@@ -963,7 +963,9 @@ pub enum StagingRelease {
         units: Vec<crate::staging::release::CopyProgress>,
         slices: crate::staging::clean::CleanReport,
         released: Vec<String>,
-        cleaned: Option<crate::staging::clean::CleanReport>,
+        /// Boxed: two `CleanReport`s side by side would make every variant
+        /// as large as this one.
+        cleaned: Option<Box<crate::staging::clean::CleanReport>>,
         hold: crate::staging::release::Hold,
     },
     /// The volume has no unit with a completed write: nothing to judge.
@@ -994,7 +996,7 @@ impl StagingRelease {
                 units: o.under_copied,
                 slices: o.slices,
                 released: o.released_units,
-                cleaned: o.cleaned,
+                cleaned: o.cleaned.map(Box::new),
                 hold,
             }
         }
