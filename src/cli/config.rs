@@ -332,6 +332,13 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // `config show` prints the file, which names the key only when it was set
     // or written by `init`; this is the one place `--json` states the value in
     // force outright, and the human report's last line states it too.
+    // ADR-0012 item 214: what a config that loads still lacks, reported at
+    // exit 0 — a missing drive, a drive without its measured post-warning
+    // room, a collection that cannot run.
+    let notes = loaded
+        .map(|cfg| check_notes(paths.db_file.exists().then_some(conn), cfg))
+        .unwrap_or_default();
+
     let verify_interval_days = loaded.map(|cfg| cfg.defaults.verify_interval_days);
     let defaults_json = loaded.map(|cfg| {
         serde_json::json!({
@@ -356,6 +363,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             host_check.as_ref(),
             &ops_lines,
             defaults_json,
+            &notes,
         );
     } else {
         print_human(
@@ -375,6 +383,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             host_check.as_ref(),
             &ops_lines,
             verify_interval_days,
+            &notes,
         );
     }
 
@@ -431,6 +440,7 @@ fn print_json(
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
     ops_lines: &[String],
     defaults_json: Option<serde_json::Value>,
+    notes: &[String],
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
         .iter()
@@ -576,6 +586,7 @@ fn print_json(
             })),
             "ops": ops_lines,
             "defaults": defaults_json,
+            "notes": notes,
         })
     );
 }
@@ -598,6 +609,7 @@ fn print_human(
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
     ops_lines: &[String],
     verify_interval_days: Option<i64>,
+    notes: &[String],
 ) {
     if report.valid {
         println!("config: valid");
@@ -711,6 +723,60 @@ fn print_human(
              own interval overrides this for its units)"
         );
     }
+    for note in notes {
+        println!("note: {note}");
+    }
+}
+
+/// `config check`'s notes on a config that loads (ADR-0012 item 214): each
+/// is something it lacks that a later command will meet, and none touches
+/// the exit code. No drive (every write refuses); a drive without its
+/// measured `post_warning_bytes` (what that costs, and what measures it);
+/// a collection whose root, tenant or archive set is not there
+/// ([`crate::collection::collection_problems`], which needs the catalog:
+/// `conn` is `None` without one, and the collections go unchecked).
+pub(crate) fn check_notes(conn: Option<&Connection>, cfg: &crate::config::Config) -> Vec<String> {
+    let mut notes = Vec::new();
+    if cfg.backends.lto.is_empty() {
+        notes.push(
+            "no drive is configured, so every write refuses: add it with `tapectl drive add \
+             --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`"
+                .to_string(),
+        );
+    }
+    for b in cfg
+        .backends
+        .lto
+        .iter()
+        .filter(|b| b.post_warning_bytes.is_none())
+    {
+        notes.push(format!(
+            "drive \"{name}\" has no post_warning_bytes, so a write's plan stops at the fill \
+             ceiling ({ceiling}% of the cartridge) instead of using the room past the drive's \
+             early warning (ADR-0012 item 113), and no slice cap keeps a slice and the seal \
+             inside that room (item 100). scripts/lto-profile.sh measures it \
+             (docs/lto-profiling.md); then `tapectl config set \
+             'backends.lto[{name}].post_warning_bytes' <measured>`",
+            name = b.name,
+            ceiling = (b.fill_ceiling * 100.0).round(),
+        ));
+    }
+    if let Some(conn) = conn {
+        for lib in &cfg.collections {
+            match crate::collection::collection_problems(conn, lib) {
+                Ok(problems) => notes.extend(
+                    problems
+                        .into_iter()
+                        .map(|p| format!("collection \"{}\" cannot run: {p}", lib.name)),
+                ),
+                Err(e) => notes.push(format!(
+                    "collection \"{}\" could not be checked against the catalog: {e}",
+                    lib.name
+                )),
+            }
+        }
+    }
+    notes
 }
 
 /// `config check`'s lines on the `[ops] group` (issue #393): what the group
