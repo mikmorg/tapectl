@@ -3449,6 +3449,36 @@ fn a_closed_stdout_pipe_does_not_panic() {
     );
 }
 
+/// ADR-0012 item 220: `tapectl completions zsh | head -3` panicked with exit
+/// 101 — `clap_complete` `expect`s its own writes, and they went straight to
+/// stdout, around `tapectl::output`. A pipe already closed when the first
+/// byte is written is the deterministic form of `head` having gone. The
+/// open-pipe run is the positive control: the script is really generated.
+#[test]
+fn completions_into_a_closed_pipe_exit_0() {
+    let home = TempDir::new().unwrap();
+    let run = |closed: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tapectl"));
+        cmd.args(["completions", "zsh"])
+            .env("HOME", home.path())
+            .env_remove("TAPECTL_HOME");
+        if closed {
+            cmd.stdout(closed_pipe());
+        }
+        cmd.output().expect("spawn tapectl")
+    };
+    let open = run(false);
+    assert_eq!(open.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&open.stdout).starts_with("#compdef tapectl"),
+        "positive control: the zsh script is generated"
+    );
+    let closed = run(true);
+    let stderr = String::from_utf8_lossy(&closed.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(closed.status.code(), Some(0), "stderr: {stderr}");
+}
+
 /// The stderr twin: an error reported to a closed stderr still exits with
 /// the error's own code (the one it gives with stderr open), not a panic's
 /// 101.

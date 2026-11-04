@@ -289,7 +289,13 @@ fn run(
 
     if let Commands::Completions { shell } = cli.command {
         let mut cmd = <Cli as clap::CommandFactory>::command();
-        clap_complete::generate(shell, &mut cmd, "tapectl", &mut std::io::stdout());
+        // ADR-0012 item 220: `clap_complete` `expect`s its own writes, so
+        // given stdout itself `completions zsh | head -3` panicked (exit 101)
+        // once `head` had gone. Generated into memory, written once through
+        // the closed-pipe-tolerant writer.
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut cmd, "tapectl", &mut script);
+        tapectl::output::stdout_bytes(&script);
         return Ok(());
     }
 

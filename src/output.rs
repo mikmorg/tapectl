@@ -43,6 +43,21 @@ pub fn stderr(args: fmt::Arguments<'_>, newline: bool) {
     finish("stderr", write(&mut err, args, newline));
 }
 
+/// Bytes rendered whole by another library to stdout, a closed pipe ignored
+/// (ADR-0012 item 220). `clap_complete` `expect`s each of its own writes, so
+/// handing it stdout made `tapectl completions zsh | head -3` panic (exit
+/// 101) once `head` had gone; the script is generated into memory and
+/// written here instead.
+pub fn stdout_bytes(bytes: &[u8]) {
+    let mut out = io::stdout().lock();
+    finish("stdout", write_all_flushed(&mut out, bytes));
+}
+
+fn write_all_flushed(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    w.write_all(bytes)?;
+    w.flush()
+}
+
 fn write(w: &mut impl Write, args: fmt::Arguments<'_>, newline: bool) -> io::Result<()> {
     w.write_fmt(args)?;
     if newline {
@@ -97,6 +112,17 @@ mod tests {
             "stdout",
             write(&mut ClosedPipe, format_args!("x {}", 1), true),
         );
+    }
+
+    #[test]
+    fn bytes_to_a_closed_pipe_are_dropped() {
+        finish("stdout", write_all_flushed(&mut ClosedPipe, b"#compdef x\n"));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn bytes_to_a_full_disk_still_panic() {
+        finish("stdout", write_all_flushed(&mut Full, b"#compdef x\n"));
     }
 
     #[test]
