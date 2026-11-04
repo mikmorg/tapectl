@@ -5096,8 +5096,29 @@ pub(crate) fn collect_health_best_effort(
         Ok(bk) => collect_and_record_health(
             conn, bk, volume_id, contact_id, None, operation, trigger, probe,
         ),
-        Err(unattributed) => warn!("{unattributed}"),
+        Err(unattributed) => note_unattributed(operation, &unattributed),
     }
+}
+
+/// Say that a contact's drive matched no configured `[[backends.lto]]`
+/// entry (ADR-0012 item 220): a warning only where a write needs the
+/// drive's config — a write, resume, init, erase or eject — and a debug
+/// line on the read and heir paths (`restore`, `catalog rebuild`, `volume
+/// read-slices`, `volume verify`), which run with no config by design (the
+/// DR machine with keys and no `drive add`, ADR-0005). An heir saw it twice,
+/// as a raw tracing line, on a restore that needed nothing from it.
+fn note_unattributed(reading: health::Reading, unattributed: &str) {
+    if unattributed_is_debug(reading) {
+        tracing::debug!("{unattributed}");
+    } else {
+        warn!("{unattributed}");
+    }
+}
+
+/// Whether a contact of this reading kind runs with no drive config by
+/// design: the read and heir paths ([`note_unattributed`]).
+fn unattributed_is_debug(reading: health::Reading) -> bool {
+    matches!(reading, health::Reading::Restore | health::Reading::Verify)
 }
 
 /// Where a health collection's hardware answers come from. The default —
@@ -6835,7 +6856,8 @@ fn close_verify_contact(
             },
         ),
         Err(unattributed) => {
-            warn!("{unattributed}");
+            // ADR-0012 item 220: a read path; the note below says it once.
+            note_unattributed(health::Reading::Verify, &unattributed);
             if let Ok(report) = r.as_mut() {
                 report.drive_health_note = Some(format!(
                     "no [[backends.lto]] entry configured for device {}; drive health \
@@ -12682,6 +12704,40 @@ mod tests {
             post_warning_bytes: None,
         });
         config
+    }
+
+    /// ADR-0012 item 220: a drive that matched no configured
+    /// `[[backends.lto]]` entry is a warning only where a write needs the
+    /// drive's config, and a debug line on the read and heir paths, which
+    /// run without one by design. Spelled out kind by kind, and pinned on
+    /// the two sites that report it, so neither goes back to `warn!` alone.
+    #[test]
+    fn an_unattributed_drive_warns_only_where_a_write_needs_its_config() {
+        use crate::tape::health::Reading;
+        for (reading, debug) in [
+            (Reading::Write, false),
+            (Reading::Resume, false),
+            (Reading::Init, false),
+            (Reading::Erase, false),
+            (Reading::Eject, false),
+            (Reading::Restore, true),
+            (Reading::Verify, true),
+        ] {
+            assert_eq!(unattributed_is_debug(reading), debug, "{reading:?}");
+        }
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.contains("fn collect_health_best_effort(")
+                && !prod.contains("warn!(\"{unattributed}\");\n            if let Ok(report)")
+                && !prod.contains("Err(unattributed) => warn!("),
+            "a site reports the unattributed drive with warn! whatever the path"
+        );
+        assert_eq!(
+            prod.matches("note_unattributed(").count(),
+            3,
+            "the definition and its two sites: collect_health_best_effort and the verify seam"
+        );
     }
 
     /// Issue #313: `--device` spelled BY-ID — the form `CLAUDE.md` tells the
