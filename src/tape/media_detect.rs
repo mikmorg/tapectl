@@ -1276,7 +1276,9 @@ mod tests {
         let probe = "crate::tape::media_detect::ensure_medium_loaded(device)?;";
         let drive = "crate::tape::media_detect::detect(device";
         for f in [
-            "fn volume_init_contacted<'c>(",
+            // ADR-0012 item 219: init's body, which `volume_init_contacted`
+            // (test-only) delegates to.
+            "fn volume_init_contacted_barcoded<'c>(",
             "fn volume_write_contacted<'c>(",
             "fn volume_resume_contacted<'c>(",
             // ADR-0012, 2026-09-29 later: resume's lost-write adoption.

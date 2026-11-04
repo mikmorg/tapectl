@@ -25163,19 +25163,23 @@ mod tests {
                 prod.len() < SRC.len(),
                 "positive control: production half separated"
             );
-            for (outer, inner) in ["init", "write", "resume"]
-                .map(|path| {
-                    (
-                        format!("fn volume_{path}_contacted"),
-                        format!("fn volume_{path}_in_contact"),
-                    )
-                })
-                .into_iter()
+            // `volume init`'s contact is held by `volume_init_contacted_barcoded`
+            // (ADR-0012 item 219 added `--barcode`); `volume_init_contacted`
+            // is a test-only delegate to it, judged below on its own.
+            for (outer, inner) in [
+                (
+                    "fn volume_init_contacted_barcoded<'c>(",
+                    "fn volume_init_in_contact",
+                ),
+                ("fn volume_write_contacted", "fn volume_write_in_contact"),
+                ("fn volume_resume_contacted", "fn volume_resume_in_contact"),
                 // #360: resume's lost-write adoption is its own contact.
-                .chain([(
-                    "fn volume_resume_adopt_lost_contacted".to_string(),
-                    "fn adopt_lost_in_contact".to_string(),
-                )])
+                (
+                    "fn volume_resume_adopt_lost_contacted",
+                    "fn adopt_lost_in_contact",
+                ),
+            ]
+            .map(|(outer, inner)| (outer.to_string(), inner.to_string()))
             {
                 let body_of = |f: &str| -> &str {
                     let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
@@ -25207,6 +25211,19 @@ mod tests {
                      sweep here is either a double or one that an early exit skips"
                 );
             }
+            // The test-only delegate only delegates: no sweep of its own (a
+            // second one per contact), and it reaches the body above.
+            let delegate = "fn volume_init_contacted<'c>(";
+            let start = prod
+                .find(delegate)
+                .unwrap_or_else(|| panic!("no {delegate}"));
+            let end = prod[start..].find("\n}\n").unwrap() + start;
+            let body = &prod[start..end];
+            assert!(
+                body.contains("volume_init_contacted_barcoded(")
+                    && !body.contains("collect_health_best_effort("),
+                "{delegate} must delegate to the body and sweep nothing: {body}"
+            );
         }
 
         /// `volume write` and `volume resume` cannot be driven without a tape
