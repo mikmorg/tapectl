@@ -154,6 +154,14 @@ pub struct Config {
     /// table) keeps the home private to the user tapectl runs as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<OpsConfig>,
+
+    /// The file this config was read from, when it was read from one
+    /// ([`Config::load`], [`Config::from_text`]): what an error that sends
+    /// the operator to the file names (ADR-0012 item 214: the missing-drive
+    /// error names the real config path). Never in the file: `serde(skip)`,
+    /// so neither read nor written.
+    #[serde(skip)]
+    pub source_file: Option<PathBuf>,
 }
 
 /// `[health]` (issue #421, ADR-0012 2026-10-06 item 12). Advisory: a finding
@@ -1508,6 +1516,7 @@ impl Config {
         // Issue #431: a backend without `device_sg` gets the node the kernel
         // binds to its `device_tape`, before any reader sees the config.
         config.fill_derived_sg_nodes();
+        config.source_file = Some(path.to_path_buf());
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;
         config.validate_ranges(path)?;
@@ -2067,6 +2076,8 @@ pub const LTO_BACKEND_EXAMPLE: &str = r#"
 # device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"
 # generation = "LTO-6"
 # device_sg = "/dev/sg1"   # optional: derived from device_tape when absent
+# Optional: the room past the drive's early warning, as scripts/lto-profile.sh measures it.
+# post_warning_bytes = "99008M"   # measured, never guessed; without it no plan passes the fill ceiling
 "#;
 
 /// Error for "tape was asked for, but no drive is configured".
@@ -2074,22 +2085,29 @@ pub const LTO_BACKEND_EXAMPLE: &str = r#"
 /// Shared by every site that resolves a tape backend so they cannot drift.
 /// The bare string this replaced ("no LTO backend configured") stated a fact
 /// and left the user to guess the file, the section name and its fields —
-/// which is most of `init`'s first-run cliff (#124).
-/// `paths` is optional only because two call sites do not carry it; the
-/// literal fallback is the documented default home.
-pub fn no_lto_backend_error(paths: Option<&TapectlPaths>) -> TapectlError {
-    let file = paths.map_or_else(
-        // Honest about the uncertainty: home resolution also honours --home and
-        // TAPECTL_HOME, which are not reachable from here.
-        || "your tapectl config (by default ~/.tapectl/config.toml)".to_string(),
-        |p| p.config_file.display().to_string(),
-    );
+/// which is most of `init`'s first-run cliff (#124). It names the command
+/// that adds a drive and the config file in use (ADR-0012 item 214):
+/// `config_file` is the config's [`Config::source_file`], absent only for a
+/// config built in memory, when the documented default stands in for it.
+pub fn no_lto_backend_error(config_file: Option<&Path>) -> TapectlError {
     TapectlError::Config(format!(
-        "no LTO drive configured — tapectl does not know what tape drive to use.\n\n\
-         Add a [[backends.lto]] section to {file}:\n{}\n\n\
-         `tapectl init` leaves a commented-out example there to uncomment.",
-        LTO_BACKEND_EXAMPLE.trim_end(),
+        "no LTO drive configured — tapectl does not know what tape drive to use. Add it \
+         with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst \
+         --generation LTO-6` (`ls -l /dev/tape/by-id/` lists the drives), which writes \
+         its [[backends.lto]] table to {}; the commented example `tapectl init` left \
+         there is the same table by hand",
+        config_file_named(config_file)
     ))
+}
+
+/// `config_file` for a message, or the documented default when a config
+/// built in memory has none. Honest about the uncertainty: home resolution
+/// also honours --home and TAPECTL_HOME, which are not reachable from here.
+fn config_file_named(config_file: Option<&Path>) -> String {
+    config_file.map_or_else(
+        || "your tapectl config (by default ~/.tapectl/config.toml)".to_string(),
+        |p| p.display().to_string(),
+    )
 }
 
 /// If `content` (raw, unparsed config TOML) still carries a key with a
@@ -2542,7 +2560,7 @@ fn resolve_lto_backend_unchecked<'a>(
             });
     }
     match config.backends.lto.len() {
-        0 => Err(no_lto_backend_error(None)),
+        0 => Err(no_lto_backend_error(config.source_file.as_deref())),
         1 => Ok(&config.backends.lto[0]),
         _ => {
             let names: Vec<&str> = config
@@ -2612,9 +2630,11 @@ fn resolve_device_unchecked<'a>(
         return Ok((dev.to_string(), backend));
     }
     match config.backends.lto.len() {
-        0 => Err(TapectlError::Config(
-            "no drive configured and no --device given".to_string(),
-        )),
+        0 => Err(TapectlError::Config(format!(
+            "no drive configured in {} and no --device given: name the drive with \
+             --device /dev/tape/by-id/<drive>-nst, or add it with `tapectl drive add`",
+            config_file_named(config.source_file.as_deref())
+        ))),
         1 => {
             let b = &config.backends.lto[0];
             Ok((b.device_tape.clone(), Some(b)))
@@ -3220,6 +3240,17 @@ mod tests {
         assert!(!b.name.is_empty());
         assert!(b.device_tape.starts_with("/dev/"));
         assert!(b.device_sg.starts_with("/dev/"));
+        // ADR-0012 item 214: the template carries post_warning_bytes, and
+        // it reads as the measured room it is (decimal, home2's spelling).
+        assert_eq!(
+            b.post_warning_room_bytes().unwrap(),
+            Some(99_008_000_000),
+            "{uncommented}"
+        );
+        assert!(
+            LTO_BACKEND_EXAMPLE.contains("scripts/lto-profile.sh"),
+            "the line says what measures it"
+        );
         // ADR-0010: the example declares a generation, not a capacity — it
         // must survive the same parser `config check`/`Config::load` uses.
         assert!(
@@ -4127,6 +4158,38 @@ mod tests {
         let config = Config::default();
         let err = resolve_lto_backend(&config, None).unwrap_err();
         assert!(err.to_string().contains("no LTO drive configured"));
+    }
+
+    /// ADR-0012 item 214: the missing-drive error names the config file in
+    /// use (the one the config was loaded from, wherever the home is) and
+    /// the command that adds a drive; so does the read path's, which asks
+    /// for --device first.
+    #[test]
+    fn the_missing_drive_errors_name_the_real_config_file_and_drive_add() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("elsewhere").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[defaults]\nslice_size = \"1G\"\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.source_file.as_deref(), Some(path.as_path()));
+
+        let write = resolve_lto_backend(&config, None).unwrap_err().to_string();
+        assert!(write.contains("no LTO drive configured"), "{write}");
+        assert!(write.contains(&path.display().to_string()), "{write}");
+        assert!(write.contains("`tapectl drive add --name"), "{write}");
+        assert!(!write.contains("~/.tapectl"), "{write}");
+
+        let read = resolve_device(&config, None).unwrap_err().to_string();
+        assert!(read.contains("no drive configured"), "{read}");
+        assert!(read.contains(&path.display().to_string()), "{read}");
+        assert!(read.contains("--device"), "{read}");
+        assert!(read.contains("`tapectl drive add`"), "{read}");
+
+        // Built in memory, it says where the file is by default.
+        let bare = resolve_lto_backend(&Config::default(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(bare.contains("~/.tapectl/config.toml"), "{bare}");
     }
 
     #[test]
