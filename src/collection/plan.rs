@@ -823,6 +823,18 @@ fn riding_stage_set_ids(conn: &Connection) -> Result<Vec<i64>> {
 /// no drive has touched anything yet. `destination_budget` has no business
 /// asking that question, so it has no reason to share the query that asks
 /// it.
+/// The refusal for a destination label no volume carries (ADR-0012 item
+/// 216): most often a fresh cartridge not yet initialized, so it says how.
+/// It keeps `volume not found`, which scripts route on, and suggests no
+/// near label: the next label is near the last one by design.
+fn uninitialized_destination(label: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "volume not found: {label} — a destination volume must already be initialized: \
+         load a blank cartridge, run `tapectl volume init {label}`, then run this command \
+         again"
+    ))
+}
+
 pub fn destination_budget(
     conn: &Connection,
     config: &Config,
@@ -849,7 +861,7 @@ pub fn destination_budget(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
-            .ok_or_else(|| TapectlError::VolumeNotFound(label.clone()))?;
+            .ok_or_else(|| uninitialized_destination(label))?;
 
         // ADR-0012 (issue #224): refuse a non-write-target label HERE,
         // before a single unit is staged — the same two-part guard
@@ -1484,7 +1496,7 @@ mod tests {
     /// never reaches `pending_units_for_collection`, let alone
     /// `batch::execute_batch`'s staging loop. Asserting `snapshots` is
     /// untouched is the check that actually proves it, since a
-    /// `VolumeNotFound` returned only after staging would still look like a
+    /// not-found refusal returned only after staging would still look like a
     /// correct error to a test that just matched on the error variant.
     #[test]
     fn run_refuses_an_unknown_destination_label_before_staging() {
@@ -1504,7 +1516,7 @@ mod tests {
         // the budget were ever resolved AFTER `batches_for_budget` ran
         // (i.e. the bug this issue fixes, reintroduced), this oversized
         // unit would surface as the "exceed the per-tape budget" error
-        // instead of `VolumeNotFound`, and the `matches!` below would catch
+        // instead of the not-found refusal, and the assertion below would catch
         // that regression.
         std::fs::write(dir.join("f.dat"), vec![0u8; 20 * 1024 * 1024]).unwrap();
         let lib = CollectionConfig {
@@ -1536,9 +1548,13 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(
-            matches!(&err, TapectlError::VolumeNotFound(l) if l == "nonexistent"),
-            "{err}"
+        // ADR-0012 item 216: the label is not initialized yet — said so,
+        // with the init that makes it, and `volume not found` kept.
+        assert_eq!(
+            err.to_string(),
+            "volume not found: nonexistent — a destination volume must already be \
+             initialized: load a blank cartridge, run `tapectl volume init nonexistent`, \
+             then run this command again"
         );
 
         let after: i64 = conn
