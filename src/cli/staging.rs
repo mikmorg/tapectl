@@ -411,14 +411,15 @@ pub fn clean(
                     "resume": hold.resume_command(),
                 })).collect::<Vec<_>>(),
                 // Issue #262: units whose staged bytes were
-                // retained because they have not met their
-                // resolved min_copies. Always present (empty when
-                // nothing was retained) so a scripted consumer
-                // never has to branch on whether the key exists.
+                // retained because they have not met their copy
+                // floor. Always present (empty when nothing was
+                // retained) so a scripted consumer never has to
+                // branch on whether the key exists. OQ5 (1.9.0): the
+                // floor is `copy_floor`, named for what it is.
                 "retained": retained.iter().map(|u| serde_json::json!({
                     "unit": u.unit_name,
                     "copies": u.copies,
-                    "min_copies": u.min_copies,
+                    "copy_floor": u.min_copies,
                 })).collect::<Vec<_>>(),
                 // #478 (ADR-0012 item 129): slices released on their
                 // own from sets that span cartridges, and those

@@ -2732,7 +2732,7 @@ fn staging_clean_json_retained_report_is_one_parseable_document() {
     assert!(
         retained
             .iter()
-            .any(|u| u["unit"] == "unit-PM244-JSON" && u["copies"] == 1 && u["min_copies"] == 2),
+            .any(|u| u["unit"] == "unit-PM244-JSON" && u["copies"] == 1 && u["copy_floor"] == 2),
         "expected unit-PM244-JSON at 1/2 copies: {retained:?}"
     );
 }
