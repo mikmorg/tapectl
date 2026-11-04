@@ -355,6 +355,32 @@ fn status_and_config_check_name_the_home_and_why() {
     );
 }
 
+/// Item 213, "the home is always named": first, even when the session logs
+/// cannot be read and `status` stops there.
+#[test]
+fn status_names_the_home_even_when_the_logs_cannot_be_read() {
+    let tmp = TempDir::new().unwrap();
+    // A file where the logs directory should be: read_dir fails.
+    std::fs::write(tmp.path().join("logs"), "x").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(tmp.path())
+        .arg("status")
+        .env_remove("TAPECTL_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("home: {} (named by --home)\n", tmp.path().display())
+    );
+    assert!(
+        stderr(&out).contains("cannot read the session logs"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// ADR-0012 item 213: "not initialized" names the path and the rule, and
 /// offers `tapectl init` only for a new archive, never on a host with a
 /// home pointer.

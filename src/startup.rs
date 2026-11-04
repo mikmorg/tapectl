@@ -1599,6 +1599,15 @@ mod tests {
 
     // ---- the home's source, root, and "not initialized" (ADR-0012 item 213) ----
 
+    /// `--home`, `--config`, `TAPECTL_HOME`, `HOME`, and the source expected.
+    type SourceRow<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a OsStr>,
+        &'a OsStr,
+        HomeSource,
+    );
+
     /// Every rung of the precedence names itself, so `status`, `config
     /// check` and the "not initialized" error can say why this home.
     #[test]
@@ -1608,13 +1617,7 @@ mod tests {
         let env = os("/mnt/from-env");
         let own = fx.home_with_own();
         let none = fx.home_without_own();
-        let rows: Vec<(
-            Option<&str>,
-            Option<&str>,
-            Option<&OsStr>,
-            &OsStr,
-            HomeSource,
-        )> = vec![
+        let rows: Vec<SourceRow<'_>> = vec![
             (
                 Some("/mnt/flag"),
                 None,

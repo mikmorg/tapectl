@@ -916,6 +916,11 @@ pub fn overview_json(
 /// `tapectl status`: its exit code (OQ6).
 pub fn run(startup: &Startup, last: usize, json_output: bool) -> Result<i32> {
     let logs_dir = &startup.paths.logs_dir;
+    // The home is named first, whatever follows: even when the session logs
+    // cannot be read (an account outside the `[ops] group`).
+    if !json_output {
+        println!("{}", startup.home_line());
+    }
     // A home with no logs directory yet has run no session; any other
     // failure to read it is said as before.
     let sessions = match std::fs::symlink_metadata(logs_dir) {
@@ -927,8 +932,7 @@ pub fn run(startup: &Startup, last: usize, json_output: bool) -> Result<i32> {
         crate::render::print_json(&overview_json(startup, &sessions, &overview));
     } else {
         print!(
-            "{}\n{}{}",
-            startup.home_line(),
+            "{}{}",
             render(logs_dir, &sessions),
             render_overview(&overview)
         );
