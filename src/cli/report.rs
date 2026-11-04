@@ -3377,12 +3377,13 @@ fn capacity_totals(conn: &Connection) -> Result<(i64, i64, i64)> {
     Ok(conn.query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
 }
 
-/// `report capacity --per-volume`'s table (ADR-0012 item 212): written is a
-/// data size (binary), the capacity a cartridge's (decimal), as
+/// `report capacity --per-volume`'s table (ADR-0012 item 212): Used is
+/// what is written of the capacity, the written figure a data size (binary)
+/// and the capacity a cartridge's (decimal), as
 /// `util::format_capacity_progress` says them.
 fn capacity_table(rows: &[(String, i64, i64, String)], width: Option<usize>) -> String {
     crate::render::table_with(
-        &["volume", "status", "written of capacity"],
+        &["volume", "status", "used"],
         rows.iter()
             .map(|(label, cap, written, status)| {
                 vec![
@@ -5155,6 +5156,47 @@ mod tests {
                 run(&conn, &config, &command, json).unwrap_or_else(|e| panic!("{command:?}: {e}"));
             }
         }
+    }
+
+    /// ADR-0012 item 212: `report capacity --per-volume` and `report age`
+    /// are render-kit tables: borderless, one header case, the written
+    /// figure binary and the capacity decimal, times in UTC.
+    #[test]
+    fn capacity_and_age_are_borderless_tables() {
+        let t = capacity_table(
+            &[(
+                "L6-0001".to_string(),
+                2_500_000_000_000,
+                1_073_741_824,
+                "sealed".to_string(),
+            )],
+            None,
+        );
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["Volume", "Status", "Used"],
+            "{t}"
+        );
+        assert!(
+            lines[1].contains("1.0 GiB") && lines[1].contains("2.50 TB"),
+            "{t}"
+        );
+        let t = age_table(
+            &[(
+                "photos".to_string(),
+                3,
+                "current".to_string(),
+                "2026-11-04 10:30:59".to_string(),
+            )],
+            None,
+        );
+        assert!(t.lines().next().unwrap().starts_with("Unit"), "{t}");
+        assert!(
+            t.contains("v3") && t.contains("2026-11-04 10:30 UTC"),
+            "{t}"
+        );
+        assert!(!t.contains('|') && !t.contains('+'), "{t}");
     }
 
     #[test]
