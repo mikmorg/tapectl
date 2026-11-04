@@ -854,7 +854,7 @@ fn collection_run_picks_the_only_collection_and_takes_one_label() {
     );
     let text = stdout(&out);
     for says in [
-        "collection \"photos\" batch 0: 1 unit(s) would be staged",
+        "collection \"photos\" batch 0: 1 unit would be staged",
         "photos/alpha",
         "L1, initialized first on the blank cartridge in the drive (--init)",
     ] {

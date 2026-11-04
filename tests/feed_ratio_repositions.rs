@@ -161,7 +161,7 @@ fn report_events_shows_the_repositions_beside_the_feed_ratio() {
     };
     assert_eq!(
         line("L6-OLD"),
-        "  2026-10-14 09:00:00 volume/L6-OLD write_feed_ratio.native_per_data_byte: \
+        "  2026-10-14 09:00 UTC volume/L6-OLD write_feed_ratio.native_per_data_byte: \
          (none) \u{2192} 1.5050, repositions per 100 MB: 5"
     );
     assert!(
@@ -172,7 +172,7 @@ fn report_events_shows_the_repositions_beside_the_feed_ratio() {
     // before #488.
     assert_eq!(
         line("L6-IBM"),
-        "  2026-10-14 11:00:00 volume/L6-IBM write_feed_ratio.native_per_data_byte: \
+        "  2026-10-14 11:00 UTC volume/L6-IBM write_feed_ratio.native_per_data_byte: \
          (none) \u{2192} 1.5050"
     );
 
@@ -211,7 +211,7 @@ fn report_health_and_volume_info_show_it_too() {
     let health = stdout(home.path(), &["report", "health"]);
     assert!(
         health.contains("L6-OLD: 1.5050 (above 1.05")
-            && health.contains("), repositions per 100 MB: 5, 2026-10-14 09:00:00"),
+            && health.contains("), repositions per 100 MB: 5, 2026-10-14 09:00 UTC"),
         "{health}"
     );
     let info = stdout(home.path(), &["volume", "info", "L6-NEW"]);

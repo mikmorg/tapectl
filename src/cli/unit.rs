@@ -8,56 +8,63 @@ use crate::error::{Result, TapectlError};
 
 #[derive(Subcommand, Debug)]
 pub enum UnitCommands {
-    /// Initialize a directory as an archival unit
+    /// Register a directory as a unit
+    ///
+    /// Writes a .tapectl-unit.toml into the directory, which carries the
+    /// unit's identity, so a renamed or moved folder is still the same unit.
     Init {
-        /// Path to directory
+        /// The directory
         path: String,
-        /// Tenant name
+        /// The tenant the unit belongs to
         #[arg(long)]
         tenant: String,
-        /// Override auto-generated name
+        /// The unit's name (default: made from the directory's name)
         #[arg(long)]
         name: Option<String>,
-        /// Tags to apply
+        /// A tag to give the unit (repeat it for several)
         #[arg(long, short)]
         tag: Vec<String>,
-        /// Archive set name
+        /// The archive set whose policy the unit follows
         #[arg(long)]
         archive_set: Option<String>,
     },
 
-    /// Bulk-initialize subdirectories as units
+    /// Register each subdirectory of a directory as a unit
+    ///
+    /// Each is registered as `unit init` registers it; one that cannot be is
+    /// skipped and named, and the others are registered.
     InitBulk {
-        /// Parent directory to scan
+        /// The directory whose subdirectories become units
         path: String,
-        /// Tenant name
+        /// The tenant the units belong to
         #[arg(long)]
         tenant: String,
-        /// Tags to apply to all
+        /// A tag to give every unit (repeat it for several)
         #[arg(long, short)]
         tag: Vec<String>,
     },
 
-    /// List units
+    /// List the units, with their tenant, path and tags
     List {
-        /// Filter by tenant name
+        /// Only this tenant's units
         #[arg(long)]
         tenant: Option<String>,
-        /// Filter by status (active, tape_only, missing)
+        /// Only the units of this status (active, tape_only, missing)
         #[arg(long)]
         status: Option<String>,
-        /// Filter by tag
+        /// Only the units with this tag
         #[arg(long, short)]
         tag: Option<String>,
     },
 
     /// Show a unit's details, or with --dirty whether it changed
     Info {
-        /// Unit name or path
+        /// The unit's name, or its directory
         name: String,
-        /// Show dirty/clean/new status via an on-disk fingerprint scan
-        /// (checksum_mode-aware — see `unit init`'s checksum_mode) instead
-        /// of the usual detail view
+        /// Whether it changed since its last snapshot, instead of its details
+        ///
+        /// Clean, dirty (with the files added, removed and modified) or never
+        /// archived, from a scan of its directory by its checksum mode.
         #[arg(long)]
         dirty: bool,
     },
@@ -73,65 +80,78 @@ pub enum UnitCommands {
     /// sha256 sums. They stay encrypted, so the copy is as safe to carry as
     /// a tape.
     Export {
-        /// Unit name
+        /// The unit
         #[arg(value_name = "UNIT")]
         unit: String,
-        /// Destination directory
+        /// The directory to copy the slices into
         #[arg(long, value_name = "DIR")]
         to: String,
     },
 
-    /// Add/remove tags
+    /// Add or remove a unit's tags
+    ///
+    /// The tags are written to the catalog and to the unit's
+    /// .tapectl-unit.toml; neither mints a new version.
     Tag {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Tags to add
+        /// A tag to add (repeat it for several)
         #[arg(long)]
         add: Vec<String>,
-        /// Tags to remove
+        /// A tag to remove (repeat it for several)
         #[arg(long)]
         remove: Vec<String>,
     },
 
     /// Rename a unit
     Rename {
-        /// Current name
+        /// The unit's current name
         current: String,
-        /// New name
+        /// Its new name
         new: String,
     },
 
-    /// Scan watch_roots for .tapectl-unit.toml dotfiles
+    /// Register the units whose .tapectl-unit.toml is under a watch root
+    ///
+    /// Scans `[discovery] watch_roots` for unit dotfiles: a new one is
+    /// registered, a moved one updated, and the rest left unchanged.
     Discover,
 
-    /// Check file integrity against the newest staged version's checksums
+    /// Check a unit's files against the newest staged version's checksums
     ///
     /// A file whose content differs at its recorded size is CHANGED when its
     /// modified time moved since the snapshot (an edit, which `snapshot
     /// create` archives) and BITROT when it did not; with no modified time
-    /// recorded it cannot tell, and counts the file with BITROT. Exits 0
-    /// when every file matches and 1 when a file is BITROT, MISSING or a
-    /// SIZE_MISMATCH.
+    /// recorded it cannot tell, and counts the file with BITROT.
+    ///
+    /// Exit status: 0 = every file matches; 1 = a file is BITROT, MISSING or
+    /// a SIZE_MISMATCH; 2 = an error.
     CheckIntegrity {
-        /// Unit name
+        /// The unit
         name: String,
     },
 
-    /// Mark unit as tape-only (local data can be deleted)
+    /// Mark a unit tape-only: its tapes are all there is, its source may go
+    ///
+    /// Refused while the unit is short of its copies or locations, or dirty,
+    /// unless confirmed (--force, --yes, or a terminal's prompt); a unit
+    /// that was never archived is refused whatever the flags.
     MarkTapeOnly {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Confirm in advance, as the global --yes does: mark the unit even
+        /// Mark it though it is short of copies or locations, or dirty
+        ///
+        /// Confirms in advance, as the global --yes does: mark the unit even
         /// though it is short of its copy floor (the larger of its policy's
         /// min_copies and the sum of its copies_at targets), the copy target
         /// at each location of its copies_at map (an archive set's
         /// required_locations counts as one copy at each name), both times
         /// [compaction] tape_only_safety_multiplier, the tape-only floor, or
         /// the [defaults] min_locations count of places (never multiplied),
-        /// or is dirty (changed since its last snapshot). Without either flag a
-        /// terminal asks, and a non-interactive run refuses, naming each
-        /// shortfall. A unit that was never archived is refused whatever
-        /// the flags (ADR-0008 Tier 3)
+        /// or is dirty (changed since its last snapshot). Without either flag
+        /// a terminal asks, and a non-interactive run refuses, naming each
+        /// shortfall. It never overrides the refusal of a unit that was never
+        /// archived.
         #[arg(long)]
         force: bool,
     },

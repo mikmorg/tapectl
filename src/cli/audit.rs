@@ -71,15 +71,17 @@ fn render(
             .map(|f| finding_json(f, "violation"))
             .chain(warnings.iter().map(|f| finding_json(f, "warning")))
             .collect();
+        // Pretty, as every --json document (ADR-0012 item 212).
+        let doc = serde_json::json!({
+            "exit_code": exit_code,
+            "violations": violations.len(),
+            "warnings": warnings.len(),
+            "findings": findings,
+        });
         let _ = writeln!(
             out,
             "{}",
-            serde_json::json!({
-                "exit_code": exit_code,
-                "violations": violations.len(),
-                "warnings": warnings.len(),
-                "findings": findings,
-            })
+            serde_json::to_string_pretty(&doc).expect("a JSON value renders")
         );
         return out;
     }
@@ -114,9 +116,9 @@ fn render(
     }
     let _ = writeln!(
         out,
-        "audit: {} violations, {} warnings (exit {})",
-        violations.len(),
-        warnings.len(),
+        "audit: {}, {} (exit {})",
+        crate::render::plural(violations.len() as i64, "violation", "violations"),
+        crate::render::plural(warnings.len() as i64, "warning", "warnings"),
         exit_code,
     );
     if found && !action_plan {
@@ -956,7 +958,8 @@ fn check_warehouse_copies(
                 unit: unit.name.clone(),
                 check: "warehouse_copies".into(),
                 message: format!(
-                    "has {deposits} warehouse deposit(s), needs {}",
+                    "has {}, needs {}",
+                    crate::render::plural(deposits, "warehouse deposit", "warehouse deposits"),
                     resolved.warehouse_copies
                 ),
                 action: "copy the volume's bytes out by the documented external procedure, then: tapectl volume deposit add <LABEL> --to <warehouse-location>"
@@ -1038,9 +1041,14 @@ fn check_location_presence(
             unit: unit.name.clone(),
             check: "location_presence".into(),
             message: format!(
-                "no copy at required location(s) {} (policy requires {requires}; copies are in \
-                 {location_count} location(s))",
+                "no copy at required {} {} (policy requires {requires}; copies are in {})",
+                if missing.len() == 1 {
+                    "location"
+                } else {
+                    "locations"
+                },
                 missing.join(", "),
+                crate::render::plural(location_count, "location", "locations"),
             ),
             action: additional_copy_action(ctx.conn, unit, &dest)?,
         });
@@ -1630,7 +1638,12 @@ fn check_encryption(
                 unit: unit.name.clone(),
                 check: "encryption".into(),
                 message: format!(
-                    "{unencrypted_count} unencrypted stage set(s) on tape, policy requires encryption"
+                    "{} on tape, policy requires encryption",
+                    crate::render::plural(
+                        unencrypted_count,
+                        "unencrypted stage set",
+                        "unencrypted stage sets"
+                    )
                 ),
                 action: restage_action(ctx.conn, unit, &versions, "", resolved)?,
             });
@@ -1727,11 +1740,16 @@ fn escrow_identity_findings(conn: &Connection, escrow: Option<&str>) -> Result<V
         unit: "archive".into(),
         check: "escrow_identity_mismatch".into(),
         message: format!(
-            "{} stage set(s) the current escrow key cannot open all name a recipient \
+            "{} the current escrow key cannot open {} a recipient \
              this catalog does not recognise: {} — if this machine was rebuilt after \
              a disaster, that is probably the original escrow key, and the current \
              identity is a replacement `init` created",
-            uncovered.len(),
+            crate::render::plural(uncovered.len() as i64, "stage set", "stage sets"),
+            if uncovered.len() == 1 {
+                "names"
+            } else {
+                "all name"
+            },
             candidates.join(", "),
         ),
         action: format!(
@@ -1772,8 +1790,13 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             unit: "archive".into(),
             check: "escrow_kit_missing".into(),
             message: format!(
-                "{sealed_total} sealed volume(s) exist but no heir kit has ever been \
-                 generated — nothing off-site can decrypt them"
+                "{} but no heir kit has ever been generated — nothing off-site can decrypt {}",
+                if sealed_total == 1 {
+                    "1 sealed volume exists".to_string()
+                } else {
+                    format!("{sealed_total} sealed volumes exist")
+                },
+                if sealed_total == 1 { "it" } else { "them" },
             ),
             action: "tapectl key escrow-kit <DIR>".to_string(),
         }]);
@@ -1840,21 +1863,32 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     // snapshot taken at generation time, does not list them. Saying the kit
     // "misses" new tapes tells an heir not to try the one key that works.
     let mut reasons: Vec<String> = Vec::new();
+    // The kit's time as every message says one (ADR-0012 item 212): in UTC.
+    let last_kit = crate::render::table_time(&last_kit);
     if stale_count > 0 {
+        let (n, them, those) = match stale_count {
+            1 => ("1 volume was".to_string(), "it", "that tape"),
+            n => (format!("{n} volumes were"), "them", "those tapes"),
+        };
         reasons.push(format!(
-            "{stale_count} volume(s) were sealed after the last heir kit ({last_kit}): \
-             the kit's escrow secret still opens them (it is a recipient of every tape), \
-             but the kit's encrypted catalog (catalog.db.age) does not list them — \
-             regenerate the kit, or rebuild the catalog from those tapes with \
+            "{n} sealed after the last heir kit ({last_kit}): \
+             the kit's escrow secret still opens {them} (it is a recipient of every tape), \
+             but the kit's encrypted catalog (catalog.db.age) does not list {them} — \
+             regenerate the kit, or rebuild the catalog from {those} with \
              `tapectl catalog rebuild --from-volume`"
         ));
     }
     if moved_count > 0 {
         reasons.push(format!(
-            "{moved_count} volume(s) were moved to another place after the last heir kit \
+            "{} moved to another place after the last heir kit \
              ({last_kit}): the cover sheet's list of places and the locations inside \
              catalog.db.age still show the old ones — regenerate the kit, reprint \
-             COVER.txt and correct its \"Tapes are at\" box"
+             COVER.txt and correct its \"Tapes are at\" box",
+            if moved_count == 1 {
+                "1 volume was".to_string()
+            } else {
+                format!("{moved_count} volumes were")
+            }
         ));
     }
     if reasons.is_empty() {
@@ -2115,8 +2149,9 @@ fn volume_verify_age_findings(
             check: "volume_verify_age".into(),
             message: format!(
                 "volume \"{label}\" ({cartridge}, {at}) was last read back in full on \
-                 {last_full}{age}: past the {days}-day verify interval of the unit on it \
+                 {}{age}: past the {days}-day verify interval of the unit on it \
                  with the shortest one, whatever the unit's other copies show",
+                crate::render::table_time(&last_full),
                 cartridge = barcode.map_or("no cartridge recorded".to_string(), |b| format!(
                     "cartridge {b}"
                 )),
@@ -2263,38 +2298,39 @@ fn short_seal_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     Ok(rows
         .into_iter()
         .map(|(check, label, ended_after, writes, last)| {
+            let writes = crate::render::plural(writes, "write", "writes");
             let message = match check.as_str() {
                 "cut_without_ending" => format!(
-                    "volume \"{label}\" has {writes} write(s) recorded `cut` but no \
+                    "volume \"{label}\" has {writes} recorded `cut` but no \
                      `ended_after`: a cut row exists only on a volume that sealed short, so this \
                      catalog does not say where that tape ended"
                 ),
                 "completed_past_ending" => format!(
-                    "volume \"{label}\" ended after tape file {}, but {writes} write(s) on it \
+                    "volume \"{label}\" ended after tape file {}, but {writes} on it \
                      recorded `completed` have a slice past that (up to file {}): those units \
                      are not on this tape whole, yet they count as copies",
                     ended_after.unwrap_or_default(),
                     last.unwrap_or_default()
                 ),
                 "range_without_may_span" => format!(
-                    "volume \"{label}\" has {writes} write(s) recorded `range` with `may_span` \
+                    "volume \"{label}\" has {writes} recorded `range` with `may_span` \
                      unset: only a write planned as spannable is ever a range, and the schema \
                      refuses this row, so the catalog was edited around it"
                 ),
                 "range_written_past_ending" => format!(
-                    "volume \"{label}\" ended after tape file {}, but {writes} range write(s) on \
+                    "volume \"{label}\" ended after tape file {}, but {writes} recorded `range` on \
                      it record a slice `written` past that (up to file {}): those slices are not \
                      on this tape, yet they count as copies of those slices",
                     ended_after.unwrap_or_default(),
                     last.unwrap_or_default()
                 ),
                 "range_not_one_run" => format!(
-                    "volume \"{label}\" has {writes} range write(s) whose `written` slices are \
+                    "volume \"{label}\" has {writes} recorded `range` whose `written` slices are \
                      not one unbroken run: a volume holds at most one unbroken range of a stage \
                      set, so this catalog does not say which slices the tape holds"
                 ),
                 _ => format!(
-                    "volume \"{label}\" has {writes} write(s) recorded `range` with no slice \
+                    "volume \"{label}\" has {writes} recorded `range` with no slice \
                      `written`: a range is the slices the tape holds, and a write whose tape \
                      holds none of its set is `cut`"
                 ),
@@ -2474,12 +2510,22 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 unit: span.unit.clone(),
                 check: "span_in_progress".into(),
                 message: format!(
-                    "v{} is a span still in progress: slice(s) {} of {} are on no sealed \
+                    "v{} is a span still in progress: {} {} of {} {} on no sealed \
                      volume yet, and {holders}. The version stays `staged`, and counts no \
                      copy, until every slice is on a sealed volume",
                     span.version,
+                    if span.missing.len() == 1 {
+                        "slice"
+                    } else {
+                        "slices"
+                    },
                     slice_runs(&span.missing),
                     span.slices,
+                    if span.missing.len() == 1 {
+                        "is"
+                    } else {
+                        "are"
+                    },
                 ),
                 // The next write plans the slices the span still owes first
                 // (layout-session.md, "The plan order").
@@ -3268,13 +3314,15 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
+            let kit_date = crate::render::table_time(&kit_date);
+            assert!(kit_date.ends_with(" UTC"), "{kit_date}");
             assert_eq!(
                 *message,
                 format!(
-                    "1 volume(s) were sealed after the last heir kit ({kit_date}): the kit's \
-                     escrow secret still opens them (it is a recipient of every tape), but the \
-                     kit's encrypted catalog (catalog.db.age) does not list them — regenerate \
-                     the kit, or rebuild the catalog from those tapes with `tapectl catalog \
+                    "1 volume was sealed after the last heir kit ({kit_date}): the kit's \
+                     escrow secret still opens it (it is a recipient of every tape), but the \
+                     kit's encrypted catalog (catalog.db.age) does not list it — regenerate \
+                     the kit, or rebuild the catalog from that tape with `tapectl catalog \
                      rebuild --from-volume`"
                 )
             );
@@ -3376,7 +3424,7 @@ mod tests {
             assert!(
                 findings[0]
                     .message
-                    .starts_with("1 volume(s) were moved to another place after the last heir kit"),
+                    .starts_with("1 volume was moved to another place after the last heir kit"),
                 "one volume moved, counted once for its volume and cartridge events: {}",
                 findings[0].message
             );
@@ -3398,7 +3446,7 @@ mod tests {
             crate::cli::location::move_cartridge(&conn, "BC-MOVE3", "offsite", false).unwrap();
             let findings = escrow_kit_findings(&conn).unwrap();
             assert_eq!(findings.len(), 1, "{findings:?}");
-            assert!(findings[0].message.starts_with("1 volume(s) were moved"));
+            assert!(findings[0].message.starts_with("1 volume was moved"));
 
             // And on its own: a cartridge event with no volume event beside it.
             conn.execute("DELETE FROM events WHERE entity_type = 'volume'", [])
@@ -3471,9 +3519,9 @@ mod tests {
             let findings = escrow_kit_findings(&conn).unwrap();
             assert_eq!(findings.len(), 1, "one check, one finding: {findings:?}");
             let message = &findings[0].message;
-            assert!(message.starts_with("1 volume(s) were sealed after the last heir kit"));
+            assert!(message.starts_with("1 volume was sealed after the last heir kit"));
             assert!(
-                message.contains("; and 1 volume(s) were moved to another place"),
+                message.contains("; and 1 volume was moved to another place"),
                 "{message}"
             );
         }
@@ -3664,7 +3712,7 @@ mod tests {
                 .find(|f| f.check == "warehouse_copies")
                 .unwrap_or_else(|| panic!("expected a warehouse_copies finding: {violations:?}"));
             assert!(
-                f.message.contains("has 1 warehouse deposit(s), needs 2"),
+                f.message.contains("has 1 warehouse deposit, needs 2"),
                 "{}",
                 f.message
             );
@@ -4524,7 +4572,7 @@ mod tests {
         assert_eq!(parsed["findings"].as_array().unwrap().len(), 2);
 
         assert!(
-            !out.contains("audit: 1 violations"),
+            !out.contains("audit: 1 violation"),
             "the human-readable summary line must not appear in JSON mode, got: {out}"
         );
     }
@@ -4543,7 +4591,7 @@ mod tests {
             "got: {out}"
         );
         assert!(
-            out.contains("audit: 1 violations, 1 warnings (exit 2)"),
+            out.contains("audit: 1 violation, 1 warning (exit 2)"),
             "got: {out}"
         );
         assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
@@ -4808,7 +4856,11 @@ mod tests {
             let f = findings(&conn, "age1new");
             assert_eq!(f.len(), 1, "{f:?}");
             assert_eq!(f[0].check, "escrow_identity_mismatch");
-            assert!(f[0].message.contains("2 stage set(s)"), "{}", f[0].message);
+            assert!(
+                f[0].message.contains("2 stage sets the current escrow key cannot open all name"),
+                "{}",
+                f[0].message
+            );
             assert!(f[0].message.contains("age1old"), "{}", f[0].message);
             assert!(
                 !f[0].message.contains("age1alice"),
@@ -4851,7 +4903,11 @@ mod tests {
             );
             let f = findings(&conn, "age1new");
             assert_eq!(f.len(), 1, "{f:?}");
-            assert!(f[0].message.contains("1 stage set(s)"), "{}", f[0].message);
+            assert!(
+                f[0].message.contains("1 stage set the current escrow key cannot open names"),
+                "{}",
+                f[0].message
+            );
         }
 
         #[test]
@@ -4991,8 +5047,8 @@ mod tests {
             );
             assert_eq!(
                 findings[0].message,
-                "no copy at required location(s) offsite (policy requires home-rack, offsite; \
-                 copies are in 2 location(s))"
+                "no copy at required location offsite (policy requires home-rack, offsite; \
+                 copies are in 2 locations)"
             );
             assert!(
                 findings[0]
@@ -5160,8 +5216,8 @@ mod tests {
             assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
                 findings[0].message,
-                "no copy at required location(s) garage (policy requires 1 at garage, \
-                 2 at offsite; copies are in 2 location(s))"
+                "no copy at required location garage (policy requires 1 at garage, \
+                 2 at offsite; copies are in 2 locations)"
             );
             assert!(
                 findings[0]
@@ -6940,7 +6996,7 @@ mod tests {
             assert_eq!(found[0].check, "cut_without_ending");
             assert_eq!(found[0].unit, format!("volume:{LABEL}"));
             assert!(
-                found[0].message.contains("2 write(s) recorded `cut`"),
+                found[0].message.contains("2 writes recorded `cut`"),
                 "{}",
                 found[0].message
             );
@@ -7161,7 +7217,7 @@ mod tests {
             assert_eq!(found[0].unit, "span");
             assert_eq!(
                 found[0].message,
-                "v1 is a span still in progress: slice(s) 3-6 of 6 are on no sealed volume \
+                "v1 is a span still in progress: slices 3-6 of 6 are on no sealed volume \
                  yet, and SPAN-1 (slices 1-2) holds the rest. The version stays `staged`, and \
                  counts no copy, until every slice is on a sealed volume"
             );

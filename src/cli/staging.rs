@@ -7,34 +7,34 @@ use crate::staging::clean;
 /// What `stage clean` releases: its flags.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct CleanArgs {
-    /// Clean all staged sets, not just those with completed writes;
-    /// also releases a unit's staged data that a bare `stage clean`
-    /// would otherwise retain for being below its copy floor (the
-    /// larger of its policy's min_copies and the sum of its copies_at
-    /// targets, times the tape-only multiplier for a tape-only unit)
+    /// Release unwritten sets and units below their copy floor too
+    ///
+    /// Releases every staged set in scope, not just those with completed
+    /// writes, and a unit's staged data that a bare `stage clean` would
+    /// retain for being below its copy floor (the larger of its policy's
+    /// min_copies and the sum of its copies_at targets, times the tape-only
+    /// multiplier for a tape-only unit). It never releases a set a live
+    /// write session or a pending `volume rewrite` is using.
     #[arg(long)]
     pub force: bool,
 
-    /// Narrow which staged sets are considered for release to this
-    /// unit (repeatable). Without `--force`, the same
-    /// copy-floor split still applies within the named unit(s): one
-    /// below its own copy floor keeps its staged bytes
-    /// retained (pass `--force` to release it too, exactly as for the
-    /// whole-archive form). A `'failed'` stage_set is always swept
-    /// regardless of this scope -- see `CleanScope::Units`'s own
-    /// contract in `src/staging/clean.rs`. An unknown unit name is an
-    /// error, not a silent no-op.
+    /// Only this unit's staged sets (repeat it for several)
+    ///
+    /// Without `--force`, the same copy-floor split still applies within
+    /// the named units: one below its own copy floor keeps its staged bytes
+    /// (pass `--force` to release it too, exactly as for the whole-archive
+    /// form). A failed stage set is always swept, whatever the scope. An
+    /// unknown unit name is an error, not a silent no-op.
     #[arg(long = "unit")]
     pub unit: Vec<String>,
 
-    /// Narrow release further, to just this snapshot version within
-    /// the single unit named by `--unit`. Requires
-    /// exactly one `--unit`; zero or more than one is a usage error
-    /// naming the constraint, never a silent widening back to
-    /// unit-level scope. Exists so a `--force` release meant for one
-    /// under-written version of a unit can never also release a
-    /// DIFFERENT, still-unwritten version of that same unit -- see
-    /// `CleanScope::UnitVersion`'s contract in `src/staging/clean.rs`.
+    /// Only this version of the one unit `--unit` names
+    ///
+    /// Requires exactly one `--unit`; zero or more than one is a usage
+    /// error naming the constraint, never a silent widening back to the
+    /// whole unit. So a `--force` release meant for one under-written
+    /// version of a unit can never also release a DIFFERENT, still-unwritten
+    /// version of that same unit.
     #[arg(long = "version")]
     pub version: Option<i64>,
 }
@@ -183,13 +183,21 @@ fn release_scope(ids: &[i64], version: Option<i64>) -> clean::CleanScope<'_> {
 /// human-readable report and the JSON `"retained"` array. Factored out so a
 /// test can assert on the exact wording without scraping `println!` output.
 fn retention_notice(under_copied: &[UnderCopiedUnit]) -> String {
-    let mut msg = format!(
-        "retained {} unit(s) below their policy's copy floor -- not cleaned; \
-         releasing them now would discard the only cheap route to the copy \
-         their own policy requires. Pass --force to release \
-         them too:\n",
-        under_copied.len()
-    );
+    // A real plural (ADR-0012 item 212), the pronouns with it.
+    let mut msg = if under_copied.len() == 1 {
+        "retained 1 unit below its policy's copy floor -- not cleaned; releasing it now \
+         would discard the only cheap route to the copy its own policy requires. Pass \
+         --force to release it too:\n"
+            .to_string()
+    } else {
+        format!(
+            "retained {} units below their policy's copy floor -- not cleaned; \
+             releasing them now would discard the only cheap route to the copy \
+             their own policy requires. Pass --force to release \
+             them too:\n",
+            under_copied.len()
+        )
+    };
     for u in under_copied {
         msg.push_str(&format!(
             "  {}: {}/{} copies\n",
@@ -215,18 +223,23 @@ pub(crate) fn slice_release_notice(report: &clean::CleanReport) -> String {
     let mut msg = String::new();
     for (id, slices) in &report.slices_released {
         msg.push_str(&format!(
-            "  stage set {id}: slice(s) {} released, each now has its copies (the set spans \
+            "  stage set {id}: {} released, {} now has its copies (the set spans \
              cartridges and is released slice by slice)\n",
-            clean::describe_slice_numbers(slices)
+            crate::cli::stage::slices_words(slices),
+            if slices.len() == 1 { "it" } else { "each" },
         ));
     }
     for (id, slices) in &report.slices_short {
+        let one = slices.len() == 1;
         msg.push_str(&format!(
-            "  stage set {id} kept in part: slice(s) {} are short of copies and continue its \
+            "  stage set {id} kept in part: {} {} short of copies and {} its \
              span; `tapectl volume write <LABEL>` onto another cartridge of the same \
-             generation writes them (--force would leave the ranges already on tape unable \
+             generation writes {} (--force would leave the ranges already on tape unable \
              to be continued)\n",
-            clean::describe_slice_numbers(slices)
+            crate::cli::stage::slices_words(slices),
+            if one { "is" } else { "are" },
+            if one { "continues" } else { "continue" },
+            if one { "it" } else { "them" },
         ));
     }
     msg
@@ -374,9 +387,7 @@ pub fn clean(
     }
     clean::reclaim_session_dirs_and_lockfiles(conn, config, &paths.db_file, *force, &mut report)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "sets_cleaned": report.sets_cleaned,
                 "files_removed": report.files_removed,
                 "bytes_freed": report.bytes_freed,
@@ -426,26 +437,32 @@ pub fn clean(
                 // still short of copies. Always present.
                 "slices_released": slice_runs_json(&report.slices_released),
                 "slices_short": slice_runs_json(&report.slices_short),
-            })
-        );
+        }));
     } else {
         println!(
-            "cleaned {} stage set(s), {} files removed, {} freed",
-            report.sets_cleaned,
-            report.files_removed,
+            "cleaned {}, {} removed, {} freed",
+            crate::render::plural(report.sets_cleaned as i64, "stage set", "stage sets"),
+            crate::render::plural(report.files_removed as i64, "file", "files"),
             crate::util::format_bytes_binary(report.bytes_freed),
         );
         println!(
-            "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed; \
-             {} leftovers of killed runs removed",
+            "  sessions: {} reclaimed, {} retained, {} orphaned; {} reclaimed; {} of killed \
+             runs removed",
             report.session_dirs_reclaimed,
             report.session_dirs_retained,
             report.session_dirs_orphaned,
-            report.lockfiles_reclaimed,
-            report.home_leftovers_reclaimed,
+            crate::render::plural(report.lockfiles_reclaimed as i64, "lockfile", "lockfiles"),
+            crate::render::plural(
+                report.home_leftovers_reclaimed as i64,
+                "leftover",
+                "leftovers"
+            ),
         );
         if report.errors > 0 {
-            println!("  {} errors", report.errors);
+            println!(
+                "  {}",
+                crate::render::plural(report.errors as i64, "error", "errors")
+            );
         }
         // Issue #402: a sealed tape whose aborted session can still
         // be counted — its frozen layout stays until then.
@@ -460,8 +477,9 @@ pub fn clean(
         // a fact, not a judgement, so `--force` does not reach it.
         for (id, labels) in &report.held_by_live_session {
             println!(
-                "  stage set {id} kept: a live session is using it on volume(s) {} \
+                "  stage set {id} kept: a live session is using it on {} {} \
                  (`--force` does not apply; run this again once it has finished)",
+                if labels.len() == 1 { "volume" } else { "volumes" },
                 labels.join(", ")
             );
         }
@@ -476,11 +494,16 @@ pub fn clean(
         // notice, which is why it names every path rather than
         // reporting a count.
         if !report.stranded.is_empty() {
+            let one = report.stranded.len() == 1;
             println!(
-                "  {} file(s) could NOT be removed and are now stranded permanently —",
-                report.stranded.len()
+                "  {} could NOT be removed and {} now stranded permanently —",
+                crate::render::plural(report.stranded.len() as i64, "file", "files"),
+                if one { "is" } else { "are" },
             );
-            println!("  no future `stage clean` can find them. Remove by hand:");
+            println!(
+                "  no future `stage clean` can find {}. Remove by hand:",
+                if one { "it" } else { "them" }
+            );
             for p in &report.stranded {
                 println!("    {}", p.display());
             }
@@ -682,7 +705,8 @@ mod tests {
         // #493 (ADR-0012 item 149): the floor is the larger of min_copies and
         // the copies_at sum, so the notice names the floor, not min_copies.
         assert!(
-            msg.contains("below their policy's copy floor") && !msg.contains("min_copies"),
+            msg.contains("retained 1 unit below its policy's copy floor")
+                && !msg.contains("min_copies"),
             "{msg}"
         );
     }
@@ -1323,14 +1347,14 @@ mod tests {
         let notice = slice_release_notice(&report);
         assert!(
             notice.contains(&format!(
-                "stage set {}: slice(s) 1-2 released",
+                "stage set {}: slices 1-2 released",
                 span.stage_set_id
             )),
             "{notice}"
         );
         assert!(
             notice.contains(&format!(
-                "stage set {} kept in part: slice(s) 3 are short of copies",
+                "stage set {} kept in part: slice 3 is short of copies",
                 span.stage_set_id
             )) && notice.contains("`tapectl volume write <LABEL>`"),
             "{notice}"

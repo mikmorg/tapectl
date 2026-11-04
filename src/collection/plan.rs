@@ -437,14 +437,17 @@ fn oversized_refusal(
         };
     let never_batched = |units: &[&selector::OversizedUnit]| {
         format!(
-            "{} unit(s) exceed the per-tape budget and can never be \
+            "{} the per-tape budget and can never be \
              batched (a unit that does not allow spanning is never split across tapes; \
              ADR-0012): {}. The limit: {limit}. To let a unit span cartridges, set \
              `allow_spanning = true` in the [policy] of its .tapectl-unit.toml, in its archive \
              set or in [defaults]; a span is written only by a drive whose `[[backends.lto]]` \
              entry declares `post_warning_bytes`. `--fill-ceiling` raises the ceiling only up \
              to the whole cartridge",
-            units.len(),
+            match units.len() {
+                1 => "1 unit exceeds".to_string(),
+                n => format!("{n} units exceed"),
+            },
             units
                 .iter()
                 .map(|o| o.to_string())
@@ -457,8 +460,8 @@ fn oversized_refusal(
     };
     let mut msg = format!(
         "collection \"{collection}\": {}; write it first (`tapectl volume write {}`), then run \
-         the collection again onto an empty initialised volume. {} pending unit(s) fit an \
-         empty tape but not beside the staged data: {}. The limit: {limit}",
+         the collection again onto an empty initialised volume. {} an empty tape but not \
+         beside the staged data: {}. The limit: {limit}",
         if b.packing_bytes() == 0 {
             "staged data already fills this tape".to_string()
         } else {
@@ -469,7 +472,10 @@ fn oversized_refusal(
             )
         },
         b.binding_label,
-        blocked.len(),
+        match blocked.len() {
+            1 => "1 pending unit fits".to_string(),
+            n => format!("{n} pending units fit"),
+        },
         blocked
             .iter()
             .map(|o| format!("\"{}\" ({})", o.name, dec(o.padded_bytes)))
@@ -2869,12 +2875,12 @@ compression = "bogus"
             "{msg}"
         );
         assert!(
-            msg.contains("1 unit(s) exceed the per-tape budget and can never be batched")
+            msg.contains("1 unit exceeds the per-tape budget and can never be batched")
                 && msg.contains("testlib/huge"),
             "{msg}"
         );
         assert!(
-            msg.contains("1 pending unit(s) fit an empty tape")
+            msg.contains("1 pending unit fits an empty tape")
                 && msg.contains("\"testlib/alpha\""),
             "{msg}"
         );

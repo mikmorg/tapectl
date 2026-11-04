@@ -8,67 +8,87 @@ use crate::staging;
 
 #[derive(Subcommand, Debug)]
 pub enum SnapshotCommands {
-    /// Create a snapshot (fast directory walk + manifest)
+    /// Record what each unit holds now: a new version when its content changed
+    ///
+    /// Walks each unit's directory and hashes its files; a unit unchanged
+    /// since its newest version is reported and gets none. Each unit is
+    /// walked and reported on its own: one that fails does not stop the
+    /// others. Under --json, an array of one object per unit, printed only
+    /// when every unit was snapshotted.
+    ///
+    /// Exit status: 0 = every unit snapshotted (or unchanged); 2 = a unit
+    /// failed, each named, the others snapshotted.
     Create {
-        /// Unit name(s). Each unit is walked and reported on its own: one
-        /// that fails does not stop the others, and the command then exits
-        /// with an error naming every unit that failed
+        /// The units to snapshot
         #[arg(required = true, value_name = "NAME")]
         name: Vec<String>,
         // Q41: the flag that snapshots every dirty unit goes here once the
         // CTO has named it (OQ22).
     },
 
-    /// List snapshots
+    /// List the snapshots, newest version first
     List {
-        /// Filter by unit name
+        /// Only this unit's snapshots
         #[arg(long)]
         unit: Option<String>,
-        /// Filter by status (created, staged, current, reclaimable, purged)
+        /// Only the snapshots of this status
+        ///
+        /// One of created, staged, current, reclaimable, purged.
         #[arg(long)]
         status: Option<String>,
     },
 
-    /// Compare two snapshot versions of a unit
+    /// Show the files added, removed and changed between two versions
     Diff {
-        /// Unit name
+        /// The unit
         name: String,
-        /// First version number
+        /// The first version
         #[arg(long)]
         v1: i64,
-        /// Second version number
+        /// The second version
         #[arg(long)]
         v2: i64,
     },
 
-    /// Delete an unwritten snapshot
+    /// Delete a snapshot no tape holds
+    ///
+    /// Refused for a version on tape (a completed write or a range), and for
+    /// one with staged data unless --force.
     Delete {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Snapshot version to delete
+        /// The version to delete
         #[arg(long)]
         version: i64,
-        /// Force delete even if staged (but not written)
+        /// Delete it though it is staged: its staged data goes too
+        ///
+        /// Never deletes a version on tape.
         #[arg(long)]
         force: bool,
     },
 
-    /// Purge a reclaimable snapshot (remove DB records)
+    /// Remove a reclaimable snapshot's catalog records
     Purge {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Snapshot version
+        /// The version, which must be reclaimable
         #[arg(long)]
         version: i64,
     },
 
-    /// Mark a snapshot as reclaimable (with enforced preconditions)
+    /// Mark a superseded version reclaimable, so compaction may drop it
+    ///
+    /// Refused while the version superseding it is short of its copy floor
+    /// or a copy target, unless confirmed (--force, --yes, or a terminal's
+    /// prompt); a version no current version supersedes only with --force.
     MarkReclaimable {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Snapshot version
+        /// The version to mark
         #[arg(long)]
         version: i64,
+        /// Mark it though its successor is short, or nothing supersedes it
+        ///
         /// Confirm in advance, as the global --yes does: mark the version
         /// even though the version superseding it is short of its copy floor
         /// (the larger of its policy's min_copies and the sum of its
@@ -190,10 +210,10 @@ fn create_one(conn: &Connection, config: &Config, name: &str) -> Result<Created>
     });
     let line = if outcome.minted {
         format!(
-            "snapshot created: {} v{} ({} files, {})",
+            "snapshot created: {} v{} ({}, {})",
             name,
             outcome.version,
-            file_count.unwrap_or(0),
+            crate::render::plural(file_count.unwrap_or(0), "file", "files"),
             crate::util::format_bytes_binary(total_size.unwrap_or(0)),
         )
     } else {

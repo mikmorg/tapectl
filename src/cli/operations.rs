@@ -56,10 +56,7 @@ pub fn snapshot_purge(
     tx.commit()?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"unit": unit_name, "version": version, "status": "purged"})
-        );
+        crate::render::print_json(&serde_json::json!({"unit": unit_name, "version": version, "status": "purged"}));
     } else {
         println!("snapshot {unit_name} v{version} purged");
     }
@@ -403,7 +400,7 @@ fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
 pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<i32> {
     let report = check_integrity(conn, unit_name)?;
     if json_output {
-        println!("{}", integrity_json(&report));
+        crate::render::print_json(&integrity_json(&report));
     } else {
         print!("{}", render_integrity(&report));
     }
@@ -486,7 +483,7 @@ pub fn volume_retire(
                 "at_risk_units": at_risk,
             });
             obj["dry_run"] = serde_json::json!(true);
-            println!("{obj}");
+            crate::render::print_json(&obj);
         } else {
             print_retire_impact(label, &status, &condition, &impacts, &at_risk);
             println!("\n  DRY RUN — no changes made.");
@@ -501,10 +498,7 @@ pub fn volume_retire(
     // `force`, so `assume_yes` is not even in scope for this decision.
     if let Err(e) = refuse_last_eligible_copy(conn, &action, label, &impacts) {
         if json_output {
-            println!(
-                "{}",
-                retire_refusal_json(label, &impacts, &at_risk, &e.to_string())
-            );
+            crate::render::print_json(&retire_refusal_json(label, &impacts, &at_risk, &e.to_string()));
         } else {
             // Impact analysis only -- it already carries the per-version
             // "REFUSED" line. The floor's own text is long, and `main`'s
@@ -551,10 +545,7 @@ pub fn volume_retire(
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
             let reason = e.to_string();
             if json_output {
-                println!(
-                    "{}",
-                    retire_refusal_json(label, &impacts, &at_risk, &reason)
-                );
+                crate::render::print_json(&retire_refusal_json(label, &impacts, &at_risk, &reason));
             } else {
                 // Impact analysis only, same as the Tier-3 path above: the
                 // refusal now carries its facts (`cli::consent`), and
@@ -566,10 +557,7 @@ pub fn volume_retire(
     }
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)})
-        );
+        crate::render::print_json(&serde_json::json!({"volume": label, "affected_units": retire_impacts_json(&impacts)}));
     } else {
         print_retire_impact(label, &status, &condition, &impacts, &at_risk);
     }
@@ -1191,9 +1179,11 @@ pub(crate) fn below_policy_facts(
             }
             if version.copies_after < needed_copies {
                 facts.push(format!(
-                    "unit \"{}\" v{} would be left with {} copy/copies, below its policy of \
+                    "unit \"{}\" v{} would be left with {}, below its policy of \
                      {needed_copies}{note}",
-                    impact.unit_name, version.version, version.copies_after
+                    impact.unit_name,
+                    version.version,
+                    crate::render::plural(version.copies_after, "copy", "copies")
                 ));
             }
             // Each version this act consumes coverage from, with the volume
@@ -1212,10 +1202,11 @@ pub(crate) fn below_policy_facts(
             let missing = coverage::locations_without_a_copy(&short);
             if !missing.is_empty() {
                 facts.push(format!(
-                    "unit \"{}\" v{} would be left with no copy at required location(s) {} \
+                    "unit \"{}\" v{} would be left with no copy at required {} {} \
                      (policy requires {requires})",
                     impact.unit_name,
                     version.version,
+                    if missing.len() == 1 { "location" } else { "locations" },
                     missing.join(", ")
                 ));
             }
@@ -1240,9 +1231,12 @@ pub(crate) fn below_policy_facts(
                 Some(version.volume_id),
             )? {
                 facts.push(format!(
-                    "unit \"{}\" v{} would be left in {} location(s), below the {} that \
+                    "unit \"{}\" v{} would be left in {}, below the {} that \
                      [defaults] min_locations requires of a tape-only unit",
-                    impact.unit_name, version.version, places.places, places.floor
+                    impact.unit_name,
+                    version.version,
+                    crate::render::plural(places.places, "location", "locations"),
+                    places.floor
                 ));
             }
         }
@@ -1348,8 +1342,10 @@ fn print_retire_impact(
             ""
         };
         println!(
-            "    {} [{}]: {} other copy/copies{warning}",
-            impact.unit_name, impact.unit_status, impact.other_copies
+            "    {} [{}]: {}{warning}",
+            impact.unit_name,
+            impact.unit_status,
+            crate::render::plural(impact.other_copies, "other copy", "other copies")
         );
         // ADR-0008 Tier 3 (issue #147): name the versions this volume is
         // the LAST eligible copy of. In `--dry-run` this is the whole
@@ -1376,8 +1372,8 @@ fn print_retire_impact(
     }
     if !at_risk.is_empty() {
         println!(
-            "\n  WARNING: {} unit(s) will have ZERO copies after retirement!",
-            at_risk.len()
+            "\n  WARNING: {} will have ZERO copies after retirement!",
+            crate::render::plural(at_risk.len() as i64, "unit", "units")
         );
         println!("  Consider writing additional copies before retiring.");
     }
@@ -1449,12 +1445,9 @@ pub fn cartridge_retire(
 
     if status == "retired_permanent" {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "barcode": barcode, "status": status, "changed": false,
-                })
-            );
+                }));
         } else {
             println!("cartridge \"{barcode}\" is already retired_permanent; nothing to do");
         }
@@ -1530,17 +1523,14 @@ pub fn cartridge_retire(
 
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "barcode": barcode,
                     "status": status,
                     "volumes_to_retire": volume_labels,
                     "affected_units": retire_impacts_json(&merged),
                     "at_risk_units": at_risk,
                     "dry_run": true,
-                })
-            );
+                }));
         } else {
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
             println!("\n  DRY RUN — no changes made.");
@@ -1557,17 +1547,14 @@ pub fn cartridge_retire(
         if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
             let reason_text = e.to_string();
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
+                crate::render::print_json(&serde_json::json!({
                         "barcode": barcode,
                         "status": status,
                         "affected_units": retire_impacts_json(&merged),
                         "at_risk_units": at_risk,
                         "consent": "refused",
                         "reason": reason_text,
-                    })
-                );
+                    }));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `volume_retire`.
@@ -1610,17 +1597,14 @@ pub fn cartridge_retire(
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
         let reason_text = e.to_string();
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "barcode": barcode,
                     "status": status,
                     "affected_units": retire_impacts_json(&merged),
                     "at_risk_units": at_risk,
                     "consent": "refused",
                     "reason": reason_text,
-                })
-            );
+                }));
         } else {
             // Impact analysis only; see `volume_retire`.
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
@@ -1689,17 +1673,14 @@ pub fn cartridge_retire(
     tx.commit()?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "barcode": barcode,
                 "status": "retired_permanent",
                 "volumes_retired": volume_labels,
                 "affected_units": retire_impacts_json(&merged),
                 "at_risk_units": at_risk,
                 "changed": true,
-            })
-        );
+            }));
     } else {
         print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
         println!("  Cartridge \"{barcode}\" retired permanently.");
@@ -1737,8 +1718,10 @@ fn print_cartridge_retire_impact(
             ""
         };
         println!(
-            "    {} [{}]: {} other copy/copies{warning}",
-            impact.unit_name, impact.unit_status, impact.other_copies
+            "    {} [{}]: {}{warning}",
+            impact.unit_name,
+            impact.unit_status,
+            crate::render::plural(impact.other_copies, "other copy", "other copies")
         );
         // ADR-0008 Tier 3 (issue #147): name the versions this cartridge
         // carries the last eligible copy of, same as `volume retire`.
@@ -1761,8 +1744,8 @@ fn print_cartridge_retire_impact(
     }
     if !at_risk.is_empty() {
         println!(
-            "\n  WARNING: {} unit(s) will have ZERO copies after this retirement!",
-            at_risk.len()
+            "\n  WARNING: {} will have ZERO copies after this retirement!",
+            crate::render::plural(at_risk.len() as i64, "unit", "units")
         );
     }
 }
@@ -1819,8 +1802,10 @@ fn print_mark_erased_impact(
             ""
         };
         println!(
-            "    {} [{}]: {} other copy/copies{warning}",
-            impact.unit_name, impact.unit_status, impact.other_copies
+            "    {} [{}]: {}{warning}",
+            impact.unit_name,
+            impact.unit_status,
+            crate::render::plural(impact.other_copies, "other copy", "other copies")
         );
         // ADR-0008 Tier 3 (issue #147, #289): name the versions this
         // cartridge holds the last eligible copy of, same as
@@ -1844,8 +1829,8 @@ fn print_mark_erased_impact(
     }
     if !at_risk.is_empty() {
         println!(
-            "\n  WARNING: {} unit(s) will have ZERO copies after this!",
-            at_risk.len()
+            "\n  WARNING: {} will have ZERO copies after this!",
+            crate::render::plural(at_risk.len() as i64, "unit", "units")
         );
     }
 }
@@ -2016,7 +2001,7 @@ pub fn cartridge_mark_erased(
                 "at_risk_units": at_risk,
             });
             obj["dry_run"] = serde_json::json!(true);
-            println!("{obj}");
+            crate::render::print_json(&obj);
         } else {
             println!("would mark cartridge \"{barcode}\" erased (currently: {status})");
             for label in &volume_labels {
@@ -2052,17 +2037,14 @@ pub fn cartridge_mark_erased(
         if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
             let reason = e.to_string();
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
+                crate::render::print_json(&serde_json::json!({
                         "barcode": barcode,
                         "status": status,
                         "affected_units": retire_impacts_json(&merged),
                         "at_risk_units": at_risk,
                         "consent": "refused",
                         "reason": reason,
-                    })
-                );
+                    }));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `cartridge_retire`.
@@ -2081,13 +2063,10 @@ pub fn cartridge_mark_erased(
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
             let reason = e.to_string();
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
+                crate::render::print_json(&serde_json::json!({
                         "barcode": barcode, "status": status,
                         "consent": "refused", "reason": reason,
-                    })
-                );
+                    }));
             }
             return Err(e);
         }
@@ -2099,12 +2078,9 @@ pub fn cartridge_mark_erased(
     tx.commit()?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "barcode": barcode, "status": "available", "volumes_erased": volume_labels,
-            })
-        );
+            }));
     } else {
         println!("cartridge \"{barcode}\" marked as erased (available for reuse)");
         for label in &volume_labels {
@@ -2512,9 +2488,7 @@ pub fn cartridge_unretire(
 
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "barcode": barcode,
                     "status": status,
                     "restored_status": restored_cartridge_status,
@@ -2523,8 +2497,7 @@ pub fn cartridge_unretire(
                     "volumes_not_restored": volumes_not_restored,
                     "volumes_quarantine_recovered": volumes_quarantine_recovered,
                     "dry_run": true,
-                })
-            );
+                }));
         } else {
             println!("cartridge \"{barcode}\" would be unretired");
             println!("  status: retired_permanent -> {restored_cartridge_status}");
@@ -2620,9 +2593,7 @@ pub fn cartridge_unretire(
     tx.commit()?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "barcode": barcode,
                 "status": restored_cartridge_status,
                 "cartridge_event_found": cartridge_event_found,
@@ -2630,8 +2601,7 @@ pub fn cartridge_unretire(
                 "volumes_not_restored": volumes_not_restored,
                 "volumes_quarantine_recovered": volumes_quarantine_recovered,
                 "changed": true,
-            })
-        );
+            }));
     } else {
         println!(
             "cartridge \"{barcode}\" unretired: retired_permanent -> {restored_cartridge_status}"
@@ -2923,7 +2893,12 @@ pub fn unit_mark_tape_only(
     }
     if !missing_locations.is_empty() {
         facts.push(format!(
-            "insufficient locations: no copy at required location(s) {} (policy requires {})",
+            "insufficient locations: no copy at required {} {} (policy requires {})",
+            if missing_locations.len() == 1 {
+                "location"
+            } else {
+                "locations"
+            },
             missing_locations.join(", "),
             crate::policy::coverage::describe_targets(&policy.copies_at)
         ));
@@ -2989,9 +2964,7 @@ pub fn unit_mark_tape_only(
                 "note": t.describe(),
             })
         });
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "unit": unit_name,
                 "status": "tape_only",
                 "copies": copy_count,
@@ -2999,11 +2972,12 @@ pub fn unit_mark_tape_only(
                 "evidence": evidence_json,
                 "evidence_summary": evidence_summary,
                 "thinnest_current_version": thinnest_json,
-            })
-        );
+            }));
     } else {
         println!(
-            "unit \"{unit_name}\" marked tape-only ({copy_count} copies, {location_count} locations)"
+            "unit \"{unit_name}\" marked tape-only ({}, {})",
+            crate::render::plural(copy_count, "copy", "copies"),
+            crate::render::plural(location_count, "location", "locations"),
         );
         if let Some(t) = &thinnest_version {
             println!("  {}", t.describe());
@@ -3074,18 +3048,15 @@ pub fn export_unit(
     if dry_run {
         let total: i64 = slices.iter().map(|(_, _, size, _)| size).sum();
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "unit": unit_name, "slices": slices.len(), "total_bytes": total,
                     "destination": dest_dir, "dry_run": true,
-                })
-            );
+                }));
         } else {
             println!(
-                "would export {} slices ({}) from \"{unit_name}\" to {dest_dir} (DRY RUN — \
+                "would export {} ({}) from \"{unit_name}\" to {dest_dir} (DRY RUN — \
                  no changes made)",
-                slices.len(),
+                crate::render::plural(slices.len() as i64, "slice", "slices"),
                 crate::util::format_bytes_binary(total),
             );
         }
@@ -3190,14 +3161,11 @@ pub fn export_unit(
     fs::write(Path::new(dest_dir).join("RECOVERY.md"), &recovery)?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"unit": unit_name, "slices": slices.len(), "total_bytes": total, "destination": dest_dir})
-        );
+        crate::render::print_json(&serde_json::json!({"unit": unit_name, "slices": slices.len(), "total_bytes": total, "destination": dest_dir}));
     } else {
         println!(
-            "exported {} slices ({}) to {}",
-            slices.len(),
+            "exported {} ({}) to {}",
+            crate::render::plural(slices.len() as i64, "slice", "slices"),
             crate::util::format_bytes_binary(total),
             dest_dir,
         );
@@ -3248,15 +3216,18 @@ pub(crate) fn snapshot_on_tape_refusal(
     Ok(match (completed, ranges) {
         (0, 0) => None,
         (n, 0) => Some(format!(
-            "snapshot v{version} has {n} completed write(s) — cannot delete"
+            "snapshot v{version} has {} — cannot delete",
+            crate::render::plural(n, "completed write", "completed writes")
         )),
         (0, r) => Some(format!(
-            "snapshot v{version} has {r} range write(s): a run of its slices is on tape, part \
-             of a version across tapes — cannot delete"
+            "snapshot v{version} has {}: a run of its slices is on tape, part of a version \
+             across tapes — cannot delete",
+            crate::render::plural(r, "range write", "range writes")
         )),
         (n, r) => Some(format!(
-            "snapshot v{version} has {n} completed write(s) and {r} range write(s) — cannot \
-             delete"
+            "snapshot v{version} has {} and {} — cannot delete",
+            crate::render::plural(n, "completed write", "completed writes"),
+            crate::render::plural(r, "range write", "range writes")
         )),
     })
 }
@@ -3499,15 +3470,12 @@ pub fn snapshot_delete(
     }
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "unit": unit_name,
                 "version": version,
                 "deleted": true,
                 "warnings": warnings,
-            })
-        );
+            }));
     } else {
         println!("snapshot {unit_name} v{version} deleted (was: {status})");
     }
@@ -3605,10 +3573,7 @@ pub fn snapshot_mark_reclaimable(
     )?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"unit": unit_name, "version": version, "status": "reclaimable"})
-        );
+        crate::render::print_json(&serde_json::json!({"unit": unit_name, "version": version, "status": "reclaimable"}));
     } else {
         println!("snapshot {unit_name} v{version} marked reclaimable (was: {status})");
     }
@@ -3670,14 +3635,11 @@ pub fn snapshot_diff(
     }
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
                 "unit": unit_name, "v1": v1, "v2": v2,
                 "added": added.len(), "removed": removed.len(),
                 "modified": modified.len(), "unchanged": unchanged,
-            })
-        );
+            }));
     } else {
         println!("diff {} v{v1} → v{v2}:", unit_name);
         for (path, size) in &added {
@@ -3870,13 +3832,10 @@ pub fn db_backup(
     if dry_run {
         let keys_dir = (include_keys && paths.keys_dir.exists()).then_some(&keys_backup);
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "backup": dest, "keys_included": include_keys,
                     "keys_dir": keys_dir, "dry_run": true,
-                })
-            );
+                }));
         } else if let Some(keys_dir) = keys_dir {
             println!(
                 "would back up database to {dest} and private keys to {}/ (DRY RUN — no \
@@ -3981,12 +3940,9 @@ pub fn db_import(
 
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "source": import_path, "destination": dest_display, "dry_run": true,
-                })
-            );
+                }));
         } else {
             println!(
                 "would import {import_path} over the live database at {dest_display} — no changes made"
@@ -4003,12 +3959,9 @@ pub fn db_import(
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
         let reason = e.to_string();
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "source": import_path, "consent": "refused", "reason": reason,
-                })
-            );
+                }));
         }
         return Err(e);
     }
@@ -4018,10 +3971,7 @@ pub fn db_import(
     copy_database_in_one_step(&src_conn, &mut dst_conn)?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"source": import_path, "status": "imported"})
-        );
+        crate::render::print_json(&serde_json::json!({"source": import_path, "status": "imported"}));
     } else {
         println!("database imported from {import_path}");
     }
@@ -4463,13 +4413,10 @@ pub fn volume_import(
     }
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
+            crate::render::print_json(&serde_json::json!({
                     "label": label, "generation": canonical_generation,
                     "capacity_bytes": cap_bytes, "dry_run": true,
-                })
-            );
+                }));
         } else {
             println!(
                 "would import volume \"{label}\" ({canonical_generation}, {capacity_display}) \
@@ -4493,10 +4440,7 @@ pub fn volume_import(
     let vol_id = conn.last_insert_rowid();
     crate::db::events::log_created(conn, "volume", vol_id, label, None)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"id": vol_id, "label": label, "status": "imported"})
-        );
+        crate::render::print_json(&serde_json::json!({"id": vol_id, "label": label, "status": "imported"}));
     } else {
         println!(
             "volume \"{label}\" imported (id={vol_id}, {canonical_generation}, {capacity_display})"
@@ -4677,10 +4621,7 @@ pub fn quick_archive(
         assume_yes,
     )?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"})
-        );
+        crate::render::print_json(&serde_json::json!({"unit": unit_name, "volume": volume, "status": "completed"}));
     } else {
         println!("quick-archive complete: \"{unit_name}\" written to \"{volume}\"");
     }
@@ -5780,7 +5721,7 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains(
-                    "insufficient locations: no copy at required location(s) offsite \
+                    "insufficient locations: no copy at required location offsite \
                      (policy requires home, offsite)"
                 ),
                 "{msg}"
@@ -5808,7 +5749,7 @@ mod tests {
             let msg = refused(&conn);
             assert!(
                 msg.contains(
-                    "insufficient locations: no copy at required location(s) offsite \
+                    "insufficient locations: no copy at required location offsite \
                      (policy requires home, offsite)"
                 ),
                 "the positive control, the set's names: {msg}"
@@ -7140,7 +7081,7 @@ mod tests {
                 .to_string();
             assert!(
                 msg.contains(
-                    "would be left with 2 copy/copies, below its policy of 6 (tape-only 3x)"
+                    "would be left with 2 copies, below its policy of 6 (tape-only 3x)"
                 ),
                 "{msg}"
             );
@@ -7226,7 +7167,7 @@ mod tests {
             // the old "N location(s), below its policy of 2" count.
             assert!(
                 msg.contains(
-                    "no copy at required location(s) home, offsite \
+                    "no copy at required locations home, offsite \
                      (policy requires home, offsite)"
                 ),
                 "the required locations, listed plainly: {msg}"
@@ -7263,7 +7204,7 @@ mod tests {
                 .expect_err("below both floors must gate")
                 .to_string();
             assert!(
-                msg.contains("copy/copies, below its policy of 6 (tape-only 3x)"),
+                msg.contains("copies, below its policy of 6 (tape-only 3x)"),
                 "{msg}"
             );
             // Issue #463 rewrote the location facts from a count of places
@@ -7271,7 +7212,7 @@ mod tests {
             // the item-46 pin survives on both: neither is multiplied.
             let named = msg
                 .lines()
-                .find(|l| l.contains("no copy at required location(s)"))
+                .find(|l| l.contains("no copy at required location"))
                 .unwrap_or_else(|| panic!("no by-name location fact: {msg}"));
             assert!(
                 named.contains("home, offsite (policy requires home, offsite)"),
@@ -7283,7 +7224,8 @@ mod tests {
                 .find(|l| l.contains("[defaults] min_locations"))
                 .unwrap_or_else(|| panic!("no place-floor fact: {msg}"));
             assert!(
-                floor.contains("location(s), below the 2 that [defaults] min_locations"),
+                floor.contains("location, below the 2 that [defaults] min_locations")
+                    || floor.contains("locations, below the 2 that [defaults] min_locations"),
                 "the floor is min_locations as set, never 2 x 3: {floor}"
             );
             assert!(!floor.contains("3x"), "{floor}");
@@ -7357,7 +7299,7 @@ mod tests {
             assert_eq!(facts.len(), 1, "{facts:?}");
             assert_eq!(
                 facts[0],
-                "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                "unit \"unitA\" v1 would be left with no copy at required location \
                  offsite (policy requires home, offsite)"
             );
 
@@ -7419,7 +7361,7 @@ mod tests {
             assert_eq!(
                 facts_for(&conn, &config, "L6-HOME"),
                 vec![
-                    "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                    "unit \"unitA\" v1 would be left with no copy at required location \
                      home (policy requires home, offsite)"
                         .to_string()
                 ],
@@ -7435,7 +7377,7 @@ mod tests {
             assert_eq!(
                 facts_for(&conn, &config, "COPY-0"),
                 vec![
-                    "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                    "unit \"unitA\" v1 would be left with no copy at required location \
                      garage (policy requires garage, offsite)"
                         .to_string()
                 ]
@@ -7480,7 +7422,7 @@ mod tests {
                     // #493 (ADR-0012 item 149): the two names are a copy each
                     // in the map, so the floor is max(1, 2) x 3 = 6, which
                     // the 3 copies left are below.
-                    "unit \"unitA\" v1 would be left with 3 copy/copies, below its policy of \
+                    "unit \"unitA\" v1 would be left with 3 copies, below its policy of \
                      6 (tape-only 3x)"
                         .to_string(),
                     "unit \"unitA\" v1 would be left with 1 copy at required location home, \
@@ -7517,7 +7459,7 @@ mod tests {
             assert_eq!(
                 facts,
                 vec![
-                    "unit \"unitA\" v1 would be left in 1 location(s), below the 2 that \
+                    "unit \"unitA\" v1 would be left in 1 location, below the 2 that \
                      [defaults] min_locations requires of a tape-only unit"
                         .to_string()
                 ]
@@ -10384,7 +10326,7 @@ mod tests {
 
         let err = snapshot_delete(&conn, "unit1", 1, true, false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("v1 has 1 range write(s)"), "{msg}");
+        assert!(msg.contains("v1 has 1 range write:"), "{msg}");
         assert!(msg.contains("cannot delete"), "{msg}");
 
         let paths = crate::config::TapectlPaths::new(tmp.path().to_path_buf());

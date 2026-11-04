@@ -3154,7 +3154,7 @@ step_span_retire_floors() {
     cat "$w/t2-unconsented.out"
     [ "$rc" -ne 0 ] || { echo "retiring tape 2 needed no consent"; return 1; }
     sp_has "$w/t2-unconsented.out" "refused: non-interactive session with no confirmation given" \
-        "unit \"sb-span\" v1 would be left with 1 copy/copies, below its policy of 2" || return 1
+        "unit \"sb-span\" v1 would be left with 1 copy, below its policy of 2" || return 1
     [ "$(sp_a_status SPA-0002)" = sealed ] || { echo "the refused retire changed tape 2"; return 1; }
     SPA --yes volume retire SPA-0002 >"$w/t2.out" 2>&1 || { cat "$w/t2.out"; echo "retiring tape 2 with --yes failed"; return 1; }
     [ "$(sp_a_status SPA-0002)" = retired ] || { echo "tape 2 is not retired"; return 1; }

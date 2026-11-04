@@ -35,10 +35,10 @@ const DEFAULT_BLOCK_SIZE: usize = 512 * 1024;
 
 #[derive(Subcommand, Debug)]
 pub enum CollectionCommands {
-    /// Add a collection: a folder whose subfolders are each a unit of one
-    /// tenant
+    /// Add a collection: a folder whose subfolders are each a unit
     ///
-    /// ROOT must be an absolute path to a directory that exists, neither
+    /// Each unit folder becomes a unit of one tenant. ROOT must be an
+    /// absolute path to a directory that exists, neither
     /// inside another collection's root nor holding one. The tenant and the
     /// archive set must exist. The user tapectl runs as (the service user,
     /// under tapectl-op) must be able to read the whole tree and, unless
@@ -51,47 +51,52 @@ pub enum CollectionCommands {
     ///
     /// Exit status: 0 = added (with --dry-run: it would be); 2 = refused,
     /// nothing written.
+    #[command(after_long_help = COLLECTION_ADD_EXAMPLES)]
     Add {
-        /// The collection's name. It begins every unit name the collection
-        /// registers: NAME/FOLDER
+        /// The collection's name, which begins each unit's name: NAME/FOLDER
         name: String,
         /// The folder to walk: an absolute path
         root: String,
         /// The tenant the collection's units are registered under
         #[arg(long)]
         tenant: String,
-        /// How deep the unit folders are: 1 = ROOT's own subfolders, 2 =
-        /// theirs (show/season)
+        /// How deep the unit folders are: 1 = ROOT's subfolders, 2 = theirs
+        ///
+        /// 2 is for a ROOT/show/season layout, where each season is a unit.
         #[arg(long, default_value = "1")]
         unit_depth: usize,
-        /// A folder or file name to leave out, as a glob (repeat it for
-        /// several), e.g. '*.partial'
+        /// A folder or file name to leave out, as a glob, e.g. '*.partial'
+        ///
+        /// Repeat it for several.
         #[arg(long)]
         exclude: Vec<String>,
         /// The archive set the collection's units are registered in
         #[arg(long)]
         archive_set: Option<String>,
-        /// Write no .tapectl-unit.toml: each unit is known by its path, for
-        /// a source tapectl must not write. A renamed folder then reads as a
-        /// new unit, and the old one as missing
+        /// Write no .tapectl-unit.toml: each unit is known by its path
+        ///
+        /// For a source tapectl must not write. A renamed folder then reads
+        /// as a new unit, and the old one as missing.
         #[arg(long)]
         no_dotfiles: bool,
     },
 
-    /// Take a collection out of config.toml; its units stay registered and
-    /// untouched
+    /// Take a collection out of config.toml; its units stay registered
     ///
-    /// No sync walks its root after this, so none of its units is marked
-    /// missing for it. They stay ordinary units, with their versions,
-    /// copies and staged sets: `tapectl unit list` names them.
+    /// Its units stay untouched: no sync walks its root after this, so none
+    /// of them is marked missing for it. They stay ordinary units, with
+    /// their versions, copies and staged sets: `tapectl unit list` names
+    /// them.
     Remove {
         /// The collection's name
         name: String,
     },
 
-    /// Sync every configured collection: register new unit folders, resolve
-    /// moved/renamed ones by dotfile uuid, mark vanished ones `missing`
-    /// (never deleted or retired — those are operator acts).
+    /// Sync every collection: register new unit folders, follow moved ones
+    ///
+    /// Registers each new unit folder, resolves a moved or renamed one by
+    /// its dotfile's uuid, and marks a vanished one `missing` (never deleted
+    /// or retired: those are operator acts).
     ///
     /// A unit registered before 1.9.0 whose .tapectl-unit.toml was never
     /// written is completed: the file is written with the unit's own
@@ -105,13 +110,12 @@ pub enum CollectionCommands {
     /// written). Every collection is synced whatever another's problems;
     /// the status is the worst seen.
     Sync {
-        /// Report what would change without mutating anything.
+        /// Report what would change without changing anything
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
 
-    /// Show each configured collection's pending, staged, under-copied and
-    /// missing units
+    /// Show each collection's pending, staged, under-copied and missing units
     ///
     /// Pending is a unit never archived or dirty (changed since its last
     /// version); staged is a version waiting in staging for a copy it is
@@ -124,10 +128,11 @@ pub enum CollectionCommands {
     /// status is the worst seen.
     Status,
 
-    /// Show the batch plan (alphabetical next-fit, §7) for every
-    /// configured collection's pending units.
+    /// Show how each collection's pending units pack into tapes
     ///
-    /// A unit that allows spanning (`allow_spanning`) is not held to one
+    /// The units are packed in name order, each tape filled until the next
+    /// unit does not fit (next-fit): each batch is one tape's worth. A unit
+    /// that allows spanning (`allow_spanning`) is not held to one
     /// tape: it goes last in its batch, and the plan names the unit that
     /// spans onto the next cartridge. It is refused when it is larger than
     /// the staging area, or, on a drive that does not declare
@@ -146,46 +151,48 @@ pub enum CollectionCommands {
     /// configured nor `--generation` given). Every collection is planned
     /// whatever another's problems.
     Plan {
-        /// Copies to plan for — informational only (batches don't change;
-        /// this scales the printed cartridge-count estimate).
+        /// How many copies to count cartridges for (the batches stay the same)
         #[arg(long, default_value = "2")]
         copies: i64,
-        /// Plan against this media generation rather than the drive's own
-        /// (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6
-        /// drive will write. No cartridge need be loaded, and with no drive
-        /// configured the plan takes a drive's defaults (the 97% fill
-        /// ceiling, the 50M end-of-tape reserve).
+        /// Plan for tapes of this generation (LTO-5, LTO-6) instead of the drive's
+        ///
+        /// E.g. sizing batches for LTO-5 stock that an LTO-6 drive will
+        /// write. No cartridge need be loaded, and with no drive configured
+        /// the plan takes a drive's defaults (the 97% fill ceiling, the 50M
+        /// end-of-tape reserve).
         #[arg(long)]
         generation: Option<String>,
-        /// Which configured drive to plan against, by its device path. Only
-        /// needed when more than one `[[backends.lto]]` is configured —
-        /// without it, planning errored outright on a multi-drive config
-        /// rather than asking.
+        /// The configured drive to plan against, by its device path
+        ///
+        /// Only needed when more than one `[[backends.lto]]` is configured.
         #[arg(long)]
         device: Option<String>,
-        /// Fill each tape to at most this fraction of its capacity, for this
-        /// command only: `0.99` or `99%`. Overrides the drive's
-        /// `fill_ceiling` (default 97%, ADR-0012).
+        /// Fill each tape to at most this fraction: `0.99` or `99%`
+        ///
+        /// For this command only. Overrides the drive's `fill_ceiling`
+        /// (default 97%).
         #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
         fill_ceiling: Option<f64>,
-        /// Pack first the units a write would help: those whose audit
-        /// finds too few copies or a required location with no copy (a
-        /// never-archived unit always does). Each group stays in name order.
-        /// Batch numbers then follow this order, so give `collection run`
-        /// the same flag to run the batch reviewed here.
+        /// Pack first the units a write would help (too few copies or places)
+        ///
+        /// Those whose audit finds too few copies or a required location
+        /// with no copy (a never-archived unit always does). Each group stays
+        /// in name order. Batch numbers then follow this order, so give
+        /// `collection run` the same flag to run the batch reviewed here.
         #[arg(long)]
         policy_aware: bool,
     },
 
-    /// Execute one batch: stage every unit in it once, write one session to
-    /// the destination label, then release the staging of each unit that
-    /// copy brings to its copy floor (the larger of its policy's
-    /// `min_copies` and the sum of its `copies_at` targets); a unit still
-    /// short keeps its staging for the further copies (ADR-0012 item 217).
-    /// Ends with what the copy holds and the next copy's command. Targets a
-    /// single collection (unlike `sync`/`status`/`plan`, which sweep every
-    /// configured collection) since a batch write is a real, one-shot tape
-    /// action.
+    /// Stage one batch of a collection and write it to one tape
+    ///
+    /// Stages every unit in the batch once, writes one session to the
+    /// destination label, then releases the staging of each unit that copy
+    /// brings to its copy floor (the larger of its policy's `min_copies` and
+    /// the sum of its `copies_at` targets); a unit still short keeps its
+    /// staging for the further copies. Ends with what the copy holds and the
+    /// next copy's command. Runs one collection (unlike `sync`, `status` and
+    /// `plan`, which sweep every configured collection), since a batch write
+    /// is a real, one-shot tape action.
     ///
     /// A unit that spans cartridges is released slice by slice, each slice
     /// once it has its copies, and the run names the slices released and the
@@ -203,16 +210,19 @@ pub enum CollectionCommands {
     /// interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and
     /// confirmed); 1 when every copy sealed but a unit was refused for its
     /// dotfile; 75 when the catalog was busy before anything was written.
+    #[command(after_long_help = COLLECTION_RUN_EXAMPLES)]
     Run {
-        /// The collection to run. Defaults to the only configured
-        /// collection; with several configured, name one.
+        /// The collection to run (default: the only one configured)
+        ///
+        /// With several configured, name one.
         #[arg(value_name = "NAME")]
         collection: Option<String>,
-        /// Which batch to execute (0 = first). Numbered against THIS run's
-        /// own budget — the destination `--label` volumes' recorded
-        /// capacity, not the drive's generation. This matches
-        /// `collection plan`'s ordering only when `plan` was run
-        /// (`--generation <GEN>`) for the generation those volumes were
+        /// Which batch to run (0 = the first)
+        ///
+        /// Numbered against THIS run's own budget — the destination
+        /// volume's recorded capacity, not the drive's generation. This
+        /// matches `collection plan`'s numbering only when `plan` was run
+        /// (`--generation <GEN>`) for the generation that volume was
         /// actually initialised as; otherwise the batch reviewed in `plan`
         /// is not necessarily batch N here.
         #[arg(long, default_value = "0")]
@@ -221,46 +231,84 @@ pub enum CollectionCommands {
         // ADR-0012 item 210); its help is the flag's own.
         #[command(flatten)]
         label: RunLabel,
-        /// Initialize the destination first: `volume init LABEL` on the
-        /// blank cartridge in the drive, as `volume write --init` runs it (a
-        /// cartridge with no barcode takes the label as its barcode). The
-        /// batch is then packed against the capacity the init records. If
-        /// the run stops after the init, the volume stays initialized and
-        /// the run says what to run next
+        /// Initialize the destination first, on the blank cartridge in the drive
+        ///
+        /// `volume init LABEL`, as `volume write --init` runs it (a cartridge
+        /// with no barcode takes the label as its barcode). The batch is then
+        /// packed against the capacity the init records. If the run stops
+        /// after the init, the volume stays initialized and the run says what
+        /// to run next.
         #[arg(long)]
         init: bool,
-        /// Once the copy is sealed and confirmed, move the tape (the volume
-        /// and its cartridge) to this location, as `volume write --move-to`
-        /// does. A location that does not exist is refused before anything
-        /// is staged
+        /// Once sealed and confirmed, move the tape to this location
+        ///
+        /// The volume and its cartridge, as `volume write --move-to` moves
+        /// them. A location that does not exist is refused before anything
+        /// is staged.
         #[arg(long, value_name = "LOCATION")]
         move_to: Option<String>,
-        /// Tape device (by-id path). Defaults to the only configured drive;
-        /// required when more than one is configured.
+        /// The tape drive, by its by-id path
+        ///
+        /// Defaults to the only configured drive; required when more than
+        /// one is configured.
         #[arg(long)]
         device: Option<String>,
-        /// See `volume write --prewrite-hash`: full-hash every staged slice
-        /// before the tape moves, for every copy this run writes.
+        /// Hash every staged slice in full before the tape moves
+        ///
+        /// As `volume write --prewrite-hash`, for every copy this run writes.
         #[arg(long)]
         prewrite_hash: bool,
-        /// Fill each tape to at most this fraction of its capacity, for this
-        /// command only: `0.99` or `99%`. Overrides the drive's
-        /// `fill_ceiling` (default 97%, ADR-0012).
+        /// Fill each tape to at most this fraction: `0.99` or `99%`
+        ///
+        /// For this command only. Overrides the drive's `fill_ceiling`
+        /// (default 97%).
         #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
         fill_ceiling: Option<f64>,
-        /// How many of the batch's units to stage at once (1 to 16), as
-        /// `stage create --jobs`. Defaults to `[staging] jobs`, itself 1.
+        /// How many units to stage at once (1 to 16; default `[staging] jobs`)
+        ///
+        /// As `stage create --jobs`; `[staging] jobs` is itself 1 by default.
         #[arg(long)]
         jobs: Option<usize>,
         #[command(flatten)]
         confirm: RunConfirmArgs,
-        /// Number the batches as `collection plan --policy-aware` does: the
-        /// units a write would help (too few copies, a required location
+        /// Number the batches as `collection plan --policy-aware` does
+        ///
+        /// The units a write would help (too few copies, a required location
         /// with no copy) are packed first.
         #[arg(long)]
         policy_aware: bool,
     },
 }
+
+/// `collection add --help`'s EXAMPLES (ADR-0012 item 211, OQ16).
+const COLLECTION_ADD_EXAMPLES: &str = "\
+EXAMPLES:
+  One folder per unit, each a unit of the tenant family:
+    tapectl collection add photos /srv/photos --tenant family
+
+  A show/season layout, each season a unit, partial downloads left out:
+    tapectl collection add tv /srv/tv --tenant family --unit-depth 2 --exclude '*.partial'
+
+  See what it would add first:
+    tapectl collection add photos /srv/photos --tenant family --dry-run
+
+  Then register the units:
+    tapectl collection sync";
+
+/// `collection run --help`'s EXAMPLES (ADR-0012 item 211, OQ16).
+const COLLECTION_RUN_EXAMPLES: &str = "\
+EXAMPLES:
+  See the batches first:
+    tapectl collection plan
+
+  The first copy of batch 0, onto the blank cartridge in the drive, then to its shelf:
+    tapectl collection run photos --label L6-0001 --init --full-confirm --move-to home
+
+  The second copy of what that run staged, on the next blank cartridge:
+    tapectl volume write L6-0002 --init --full-confirm --move-to offsite
+
+  The next batch (batch 0 again: the units written are no longer pending):
+    tapectl collection run photos --label L6-0003 --init --full-confirm --move-to home";
 
 /// `collection run --label`: the destination volume, exactly one (ADR-0012
 /// item 210). A second `--label` is a usage error, from clap, naming the
@@ -342,10 +390,7 @@ impl clap::Args for RunLabel {
                 .value_name("LABEL")
                 .required(true)
                 .action(clap::ArgAction::Append)
-                .help(
-                    "Destination volume label: one, since a run writes one copy. Already \
-                     initialized on its own cartridge, or initialized first with --init",
-                )
+                .help("The destination volume: one, since a run writes one copy")
                 .long_help(
                     "Destination volume label: exactly one, since a run writes one copy. \
                      tapectl drives no changer, so a second copy needs a human to swap \
@@ -366,14 +411,16 @@ impl clap::Args for RunLabel {
 /// `collection run`'s readback choice (ADR-0012 2026-10-07 item 31).
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct RunConfirmArgs {
-    /// See `volume write --full-confirm`: read every copy this run writes
-    /// back in full after sealing it.
+    /// Read every copy this run writes back in full after sealing it
+    ///
+    /// As `volume write --full-confirm`.
     #[arg(long, conflicts_with = "full_confirm_first")]
     pub full_confirm: bool,
-    /// Read the run's first copy back in full after sealing it and confirm
-    /// the others quickly: the one full readback to have before the run
-    /// releases staging. A run writes one copy today, so this reads back the
-    /// same copy `--full-confirm` does.
+    /// Read the run's first copy back in full, the others quickly
+    ///
+    /// The one full readback to have before the run releases staging. A run
+    /// writes one copy today, so this reads back the same copy
+    /// `--full-confirm` does.
     #[arg(long)]
     pub full_confirm_first: bool,
 }
@@ -1283,9 +1330,10 @@ fn stranded_warning(label: &str, stranded: &[&std::path::Path]) -> Option<String
         return None;
     }
     let mut msg = format!(
-        "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} staged \
-         file(s) could NOT be removed and no later `stage clean` can find them. Remove by hand:",
-        stranded.len()
+        "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, but {} could \
+         NOT be removed and no later `stage clean` can find {}. Remove by hand:",
+        crate::render::plural(stranded.len() as i64, "staged file", "staged files"),
+        if stranded.len() == 1 { "it" } else { "them" },
     );
     for p in stranded {
         msg.push_str(&format!("\n  {}", p.display()));
@@ -1434,7 +1482,10 @@ fn cmd_plan(
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
             } else {
-                println!("collection \"{name}\" plan ({copies} copy/copies):");
+                println!(
+                    "collection \"{name}\" plan ({}):",
+                    crate::render::plural(copies, "copy", "copies")
+                );
                 // ADR-0012 item 113: printed only when the drive declares
                 // post_warning_bytes; every other line is as before.
                 if tape.plan_bound_bytes.is_some() {
@@ -1442,8 +1493,8 @@ fn cmd_plan(
                 }
                 for (i, b) in batches.iter().enumerate() {
                     println!(
-                        "  batch {i}: {} units, {} raw, {} on-tape (padded)",
-                        b.units.len(),
+                        "  batch {i}: {}, {} raw, {} on-tape (padded)",
+                        crate::render::plural(b.units.len() as i64, "unit", "units"),
                         crate::util::format_bytes_binary(b.total_bytes as i64),
                         crate::util::format_bytes_binary(b.padded_bytes as i64),
                     );
@@ -1458,9 +1509,10 @@ fn cmd_plan(
                     }
                 }
                 println!(
-                    "  {} batch(es) x {copies} copy/copies = {} cartridge(s) needed",
-                    batches.len(),
-                    batches.len() as i64 * copies,
+                    "  {} x {} = {} needed",
+                    crate::render::plural(batches.len() as i64, "batch", "batches"),
+                    crate::render::plural(copies, "copy", "copies"),
+                    crate::render::plural(batches.len() as i64 * copies, "cartridge", "cartridges"),
                 );
                 if batches.iter().any(|b| packed.placement(b).spans.is_some()) {
                     println!("  {SPAN_COUNT_CAVEAT}");
@@ -1692,8 +1744,9 @@ fn refuse_existing_destination(conn: &Connection, label: &str) -> Result<()> {
 /// A batch index past the batches a plan found.
 fn no_such_batch(collection: &str, batch: usize, batches: usize, nothing: &str) -> TapectlError {
     TapectlError::Other(format!(
-        "collection \"{collection}\": batch {batch} does not exist ({batches} batch(es) \
-         currently pending — run `collection plan` to see them).{nothing}"
+        "collection \"{collection}\": batch {batch} does not exist ({} currently pending — \
+         run `collection plan` to see them).{nothing}",
+        crate::render::plural(batches as i64, "batch", "batches")
     ))
 }
 
@@ -1787,22 +1840,22 @@ fn print_dry_run(d: &DryRun<'_>, json_output: bool) {
             "nothing staged"
         };
         println!(
-            "collection \"{name}\" batch {}: {} unit(s) would be staged and written to 1 \
-             destination (DRY RUN — {nothing}, no tape written)",
+            "collection \"{name}\" batch {}: {} would be staged and written to 1 destination \
+             (DRY RUN — {nothing}, no tape written)",
             d.batch_idx,
-            d.batch.units.len(),
+            crate::render::plural(d.batch.units.len() as i64, "unit", "units"),
         );
         for u in d.batch.unit_names() {
             println!("    {u}");
         }
         if d.req.init {
             println!(
-                "  destination(s): {}, initialized first on the blank cartridge in the drive \
+                "  destination: {}, initialized first on the blank cartridge in the drive \
                  (--init)",
                 d.req.label
             );
         } else {
-            println!("  destination(s): {}", d.req.label);
+            println!("  destination: {}", d.req.label);
         }
         if let Some(to) = d.req.move_to {
             println!(
@@ -2027,12 +2080,12 @@ fn run_batch(
         });
         // `--move-to`'s keys, `volume write --json`'s own.
         crate::cli::volume::insert_move_json(&mut doc, &report.moved);
-        println!("{doc}");
+        crate::render::print_json(&doc);
     } else {
         println!(
-            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} written \
-             to \"{destination}\"",
-            report.units_staged,
+            "collection \"{collection_name}\" batch {batch_idx}: {} staged, {} written to \
+             \"{destination}\"",
+            crate::render::plural(report.units_staged as i64, "unit", "units"),
             crate::render::plural(report.copies_written as i64, "copy", "copies"),
         );
         if let Some(summary) = &summary {
@@ -2643,8 +2696,8 @@ mod checksum_mode_tests {
         };
         assert_eq!(
             crate::cli::staging::slice_release_notice(&report),
-            "  stage set 7: slice(s) 1-3 released, each now has its copies (the set spans \
-             cartridges and is released slice by slice)\n  stage set 7 kept in part: slice(s) \
+            "  stage set 7: slices 1-3 released, each now has its copies (the set spans \
+             cartridges and is released slice by slice)\n  stage set 7 kept in part: slices \
              4-5 are short of copies and continue its span; `tapectl volume write <LABEL>` \
              onto another cartridge of the same generation writes them (--force would leave \
              the ranges already on tape unable to be continued)\n"
@@ -2693,7 +2746,7 @@ mod checksum_mode_tests {
         assert!(
             warning.starts_with(
                 "warning: volume \"L6-0003\" is sealed and confirmed and counts as a copy, but 2 \
-                 staged file(s) could NOT be removed"
+                 staged files could NOT be removed and no later `stage clean` can find them"
             ),
             "{warning}"
         );

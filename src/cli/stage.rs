@@ -8,16 +8,26 @@ use crate::staging;
 
 #[derive(Subcommand, Debug)]
 pub enum StageCommands {
-    /// Create staged slices (validate → dar → encrypt → checksums)
+    /// Archive and encrypt each unit's newest snapshot into staging
     ///
-    /// Several units may be named; `--jobs` stages that many at once.
+    /// Each unit's sources are hashed as dar reads them once, and dar's
+    /// archive is cut into slices and age-encrypted in memory: no plaintext
+    /// reaches staging. Several units
+    /// may be named; `--jobs` stages that many at once. Every name is checked
+    /// before any unit is staged. Under --json, an array of one object per
+    /// unit, printed only when every unit was staged.
+    ///
+    /// Exit status: 0 = every unit staged; 2 = a unit failed or was refused
+    /// (the error names each unit staged, failed and not started).
     Create {
-        /// Unit name(s). Each unit's latest unstaged snapshot is staged
-        /// (or `--version`'s, with one unit). Every name is checked before
-        /// any unit is staged.
+        /// The units to stage: each one's newest unstaged snapshot
+        ///
+        /// With one unit, `--version` stages that version instead.
         #[arg(required = true, value_name = "NAME")]
         name: Vec<String>,
 
+        /// Stage this version again, after `stage clean` released it
+        ///
         /// Re-stage a specific snapshot version instead of the latest
         /// unstaged one — for when `tapectl stage clean --unit <name>
         /// --version <N>` already released that stage set's slices and
@@ -35,8 +45,9 @@ pub enum StageCommands {
         #[arg(long)]
         version: Option<i64>,
 
-        /// How many units to stage at once (1 to 16). Defaults to
-        /// `[staging] jobs`, itself 1 by default. The largest units start
+        /// How many units to stage at once (1 to 16; default `[staging] jobs`)
+        ///
+        /// `[staging] jobs` is itself 1 by default. The largest units start
         /// first, each stage prints a line as it starts and ends, and once one
         /// fails no further unit is started. Fewer run when the host's
         /// available memory cannot hold that many (each keeps up to 128 MiB
@@ -67,20 +78,21 @@ pub enum StageCommands {
     /// prints the plan and stages nothing. A warehouse location is refused:
     /// a copy there is a recorded deposit (`volume deposit add`).
     ForLocation {
-        /// The location the volume will be kept at (a registered location,
-        /// not a warehouse).
+        /// Where the volume will be kept: a registered location, not a warehouse
         #[arg(value_name = "LOCATION")]
         location: String,
-        /// The volume to fill: `volume init` done, nothing written yet.
+        /// The volume to fill: initialized, nothing written yet
         #[arg(long, value_name = "LABEL")]
         volume: String,
-        /// How many units to stage at once (1 to 16), as `stage create
-        /// --jobs`. Defaults to `[staging] jobs`.
+        /// How many units to stage at once (1 to 16; default `[staging] jobs`)
+        ///
+        /// As `stage create --jobs`.
         #[arg(long)]
         jobs: Option<usize>,
-        /// The drive whose fill ceiling and end-of-tape reserve size the
-        /// volume's room (no drive is touched). Defaults to the only
-        /// configured drive; required when more than one is configured.
+        /// The drive whose fill ceiling and reserve size the volume's room
+        ///
+        /// No drive is touched. Defaults to the only configured drive;
+        /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
     },
@@ -98,8 +110,9 @@ pub enum StageCommands {
     /// to do. Below the table: a staged set that is not whole on disk, and
     /// one that spans cartridges and is released slice by slice.
     List {
-        /// Only the stage sets of this status (staging, staged, failed,
-        /// cleaned), held or not
+        /// Only the stage sets of this status, held or not
+        ///
+        /// One of staging, staged, failed, cleaned.
         #[arg(long)]
         status: Option<String>,
         /// Only the staged sets that still owe a copy
@@ -119,11 +132,11 @@ pub enum StageCommands {
     /// always swept.
     Clean(crate::cli::staging::CleanArgs),
 
-    /// Show details for a stage set
+    /// Show a version's newest stage set: its dar, sizes and slices
     Info {
-        /// Unit name
+        /// The unit
         name: String,
-        /// Snapshot version
+        /// The version
         #[arg(long)]
         version: i64,
     },
@@ -736,9 +749,9 @@ pub fn run(
                 }));
                 if !json_output {
                     println!(
-                        "staged: {} ({} slices, {} dar, {} encrypted)",
+                        "staged: {} ({}, {} dar, {} encrypted)",
                         unit_name,
-                        num_slices.unwrap_or(0),
+                        crate::render::plural(num_slices.unwrap_or(0), "slice", "slices"),
                         crate::util::format_bytes_binary(total_dar.unwrap_or(0)),
                         crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
                     );

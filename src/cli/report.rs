@@ -18,6 +18,7 @@ pub enum ReportCommands {
     /// multiplier for a tape-only unit), or when its policy will not resolve.
     /// The places its copies are in are counted and shown, not judged:
     /// `report needs` judges each location, and `audit` judges everything.
+    #[command(after_long_help = EXIT_REPORT)]
     FireRisk,
     /// Each unit's copy target, copies and shortfall at every location
     ///
@@ -30,6 +31,7 @@ pub enum ReportCommands {
     /// With `--location`, only that location, and each unit's need there:
     /// group 1 when its target there is unmet, group 2 when it is short of
     /// its copy floor with no target there and no copy there yet.
+    #[command(after_long_help = EXIT_REPORT_LOCATION)]
     Needs {
         /// Only this location, with each unit's need there
         #[arg(long)]
@@ -38,59 +40,81 @@ pub enum ReportCommands {
         #[arg(long)]
         all: bool,
     },
-    /// Copy count distribution per unit
+    /// Each unit's copies and locations, and the tapes holding it
+    ///
+    /// The copies are its least-covered current version's; the tapes are
+    /// every tape holding any current version of it (one marked `*` is not
+    /// sealed and does not count). A tape holding only some of a version's
+    /// slices says which, and a tape the escrow key cannot open is named.
+    #[command(after_long_help = EXIT_REPORT_UNIT)]
     Copies {
-        /// Filter to specific unit
+        /// Only this unit
         #[arg(long)]
         unit: Option<String>,
     },
-    /// Tape-only unit status
+    /// Each tape-only unit's copies and locations
+    #[command(after_long_help = EXIT_REPORT_UNIT)]
     TapeOnly {
-        /// Filter to specific unit
+        /// Only this unit
         #[arg(long)]
         unit: Option<String>,
     },
-    /// Units with changes since last snapshot
+    /// Units that changed since their last snapshot, or were never archived
+    #[command(after_long_help = EXIT_REPORT_UNIT)]
     Dirty {
-        /// Filter to specific unit
+        /// Only this unit
         #[arg(long)]
         unit: Option<String>,
     },
     /// Removed in 1.9.0: `stage list --owing` (ADR-0012 item 209)
     #[command(hide = true, disable_help_flag = true)]
     Pending(crate::cli::renamed::Removed),
-    /// Verification recency
+    /// Each volume's verifications, oldest evidence first
+    ///
+    /// Every verification session of every volume holding data, a volume
+    /// never verified first, then the oldest readback; with the most recent
+    /// failure's positions, and the sealed volumes no full readback has read.
+    #[command(after_long_help = EXIT_REPORT_VOLUME)]
     VerifyStatus {
-        /// Filter to specific volume
+        /// Only this volume, whatever its status
         #[arg(long)]
         volume: Option<String>,
     },
-    /// Drive error trends, and drive cleanings
+    /// Drive error trends, TapeAlerts, feed ratios and drive cleanings
+    ///
+    /// The last 50 health readings, newest first, after every TapeAlert ever
+    /// raised, each cartridge's corrected read errors per GiB verify over
+    /// verify, the drives' cleanings, and each write's feed ratio.
+    #[command(after_long_help = EXIT_REPORT_VOLUME)]
     Health {
-        /// Filter to specific volume
+        /// Only this volume's readings and feed ratios
         #[arg(long)]
         volume: Option<String>,
     },
     /// Every cartridge's health, worst first, and why
+    #[command(after_long_help = EXIT_REPORT)]
     CartridgeHealth,
-    /// Volume capacity utilization
+    /// What the volumes in service hold against their capacity
+    #[command(after_long_help = EXIT_REPORT)]
     Capacity {
-        /// Per-volume breakdown
+        /// One row per volume, initialized ones too
         #[arg(long)]
         per_volume: bool,
     },
-    /// Snapshot age distribution
+    /// Each unit's current snapshot and when it was made, oldest first
+    #[command(after_long_help = EXIT_REPORT_UNIT)]
     Age {
-        /// Filter to specific unit
+        /// Only this unit
         #[arg(long)]
         unit: Option<String>,
     },
-    /// Audit trail browsing
+    /// The catalog's events, newest first (the last 100)
+    #[command(after_long_help = EXIT_REPORT)]
     Events {
-        /// Filter by entity type
+        /// Only events about this kind of entity, e.g. volume, cartridge or unit
         #[arg(long)]
         entity: Option<String>,
-        /// Limit to last N days
+        /// Only the last N days
         #[arg(long)]
         days: Option<i64>,
     },
@@ -100,16 +124,19 @@ pub enum ReportCommands {
     /// one destination tape, largest reclaim first, and says how to compact
     /// each group (`volume rewrite` for one volume, in place; `--with-staged`
     /// to carry the others onto its cartridge).
+    #[command(after_long_help = EXIT_REPORT)]
     CompactionCandidates {
         /// Group the candidates by what fits one destination tape
         #[arg(long)]
         plan: bool,
-        /// Plan for destination tapes of this generation (e.g. LTO-6, LTO-7)
-        /// instead of the drive's own. Only with --plan.
+        /// Plan for tapes of this generation (LTO-6, LTO-7) instead of the drive's
+        ///
+        /// Only with --plan.
         #[arg(long, requires = "plan")]
         generation: Option<String>,
     },
     /// Superseded snapshot versions that could be marked reclaimable
+    #[command(after_long_help = EXIT_REPORT)]
     Reclaimable,
     /// Removed in 1.9.0: `report reclaimable` (ADR-0012 item 209)
     #[command(hide = true, disable_help_flag = true)]
@@ -121,8 +148,24 @@ pub enum ReportCommands {
     /// (its phases, dar's report, its source check), and the hours between,
     /// with the total. A failed stage restarts its unit from the beginning
     /// (ADR-0012 item 91), so this is the time it cost.
+    #[command(after_long_help = EXIT_REPORT)]
     FailedStages,
 }
+
+/// The exit status every report states (ADR-0012 item 212).
+const EXIT_REPORT: &str = "Exit status: 0 = shown (an empty report included); 2 = an error.";
+/// [`EXIT_REPORT`] for a report that takes `--unit`.
+const EXIT_REPORT_UNIT: &str =
+    "Exit status: 0 = shown (an empty report included); 2 = an error, a --unit that names no \
+     unit included.";
+/// [`EXIT_REPORT`] for a report that takes `--volume`.
+const EXIT_REPORT_VOLUME: &str =
+    "Exit status: 0 = shown (an empty report included); 2 = an error, a --volume that names no \
+     volume included.";
+/// [`EXIT_REPORT`] for `report needs`.
+const EXIT_REPORT_LOCATION: &str =
+    "Exit status: 0 = shown (an empty report included); 2 = an error, a --location that names \
+     no location included.";
 
 pub fn run(
     conn: &Connection,
@@ -231,7 +274,7 @@ fn report_reclaimable(conn: &Connection, config: &Config, json_output: bool) -> 
     let summary = reclaimable_summary(&found);
 
     if json_output {
-        println!("{summary}");
+        crate::render::print_json(&summary);
     } else if found.is_empty() {
         println!("reclaimable: nothing to release (no unit has more than one current snapshot)");
     } else {
@@ -428,8 +471,19 @@ pub(crate) fn failed_stage_rows(conn: &Connection) -> Result<Vec<FailedStage>> {
 /// that are known.
 fn failed_stages_json(rows: &[FailedStage]) -> serde_json::Value {
     let total: f64 = rows.iter().filter_map(|r| r.hours_lost).sum();
+    // Times in RFC 3339 with `Z` (ADR-0012 item 212); the rows keep the
+    // stored values, which `hours_lost` was computed from.
+    let shown: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).expect("a failed stage serializes");
+            v["started"] = crate::render::json_time(&r.started).into();
+            v["failed"] = r.failed.as_deref().map(crate::render::json_time).into();
+            v
+        })
+        .collect();
     serde_json::json!({
-        "failed_stages": rows,
+        "failed_stages": shown,
         "count": rows.len(),
         "total_hours_lost": total,
         "without_recorded_end": rows.iter().filter(|r| r.hours_lost.is_none()).count(),
@@ -441,16 +495,24 @@ fn failed_stages_lines(rows: &[FailedStage]) -> Vec<String> {
         return vec!["no failed stages recorded".to_string()];
     }
     let mut lines = vec![format!("failed stages ({}):", rows.len())];
+    let t = crate::render::table_time;
     for r in rows {
         lines.push(match (&r.failed, r.hours_lost) {
             (Some(failed), Some(hours)) => format!(
                 "  {} v{} (stage set {}): started {}, failed {}: {hours:.1} hours lost",
-                r.unit, r.version, r.stage_set_id, r.started, failed
+                r.unit,
+                r.version,
+                r.stage_set_id,
+                t(&r.started),
+                t(failed)
             ),
             _ => format!(
                 "  {} v{} (stage set {}): started {}, no end recorded (the process stopped \
                  before it could record one): hours lost unknown",
-                r.unit, r.version, r.stage_set_id, r.started
+                r.unit,
+                r.version,
+                r.stage_set_id,
+                t(&r.started)
             ),
         });
     }
@@ -460,7 +522,8 @@ fn failed_stages_lines(rows: &[FailedStage]) -> Vec<String> {
         format!("total: {total:.1} hours lost")
     } else {
         format!(
-            "total: {total:.1} hours lost, not counting {unknown} stage(s) with no end recorded"
+            "total: {total:.1} hours lost, not counting {} with no end recorded",
+            crate::render::plural(unknown as i64, "stage", "stages")
         )
     });
     lines
@@ -470,10 +533,7 @@ fn failed_stages_lines(rows: &[FailedStage]) -> Vec<String> {
 fn report_failed_stages(conn: &Connection, json_output: bool) -> Result<()> {
     let rows = failed_stage_rows(conn)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&failed_stages_json(&rows)).unwrap()
-        );
+        crate::render::print_json(&failed_stages_json(&rows));
     } else {
         for line in failed_stages_lines(&rows) {
             println!("{line}");
@@ -823,11 +883,14 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
     let at_risk = fire_risk_rows(conn, config)?;
 
     if json_output {
-        println!("{}", fire_risk_json(&at_risk));
+        crate::render::print_json(&fire_risk_json(&at_risk));
     } else if at_risk.is_empty() {
         println!("fire-risk: every unit has the copies its copy floor asks for");
     } else {
-        println!("FIRE RISK: {} unit(s) at risk", at_risk.len());
+        println!(
+            "FIRE RISK: {} at risk",
+            crate::render::plural(at_risk.len() as i64, "unit", "units")
+        );
         for r in &at_risk {
             match &r.risk {
                 // Named separately from a copy shortfall because it is a
@@ -835,12 +898,11 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                 // to be wrong with this unit's coverage — the tool cannot
                 // tell either way, which is strictly worse.
                 FireRisk::PolicyUnresolvable(e) => println!(
-                    "  {}: {} copies{}, {} locations — POLICY UNRESOLVABLE, \
-                     coverage NOT checked ({e})",
+                    "  {}: {}{}, {} — POLICY UNRESOLVABLE, coverage NOT checked ({e})",
                     r.unit,
-                    r.copies,
+                    crate::render::plural(r.copies, "copy", "copies"),
                     warehouse_note(r.deposits),
-                    r.locations,
+                    crate::render::plural(r.locations, "location", "locations"),
                 ),
                 other => {
                     let severity = if *other == FireRisk::NoCopies {
@@ -849,11 +911,11 @@ fn report_fire_risk(conn: &Connection, config: &Config, json_output: bool) -> Re
                         "below its copy floor"
                     };
                     println!(
-                        "  {}: {} copies{}, {} locations — {severity} (needs {})",
+                        "  {}: {}{}, {} — {severity} (needs {})",
                         r.unit,
-                        r.copies,
+                        crate::render::plural(r.copies, "copy", "copies"),
                         warehouse_note(r.deposits),
-                        r.locations,
+                        crate::render::plural(r.locations, "location", "locations"),
                         r.copy_floor
                             .map(|m| m.to_string())
                             .unwrap_or_else(|| "?".into()),
@@ -1046,9 +1108,10 @@ fn needs_text_lines(rows: &[NeedsRow], location: Option<&str>) -> Vec<String> {
         });
         return lines;
     }
+    let units = crate::render::plural(rows.len() as i64, "unit", "units");
     lines.push(match location {
-        Some(x) => format!("needs at {x} ({} unit(s)):", rows.len()),
-        None => format!("needs per location ({} unit(s)):", rows.len()),
+        Some(x) => format!("needs at {x} ({units}):"),
+        None => format!("needs per location ({units}):"),
     });
     for r in rows {
         let Some(floor) = r.floor else {
@@ -1156,10 +1219,7 @@ fn report_needs(
     let rows = needs_rows(conn, config, location, all)?;
     let location = location.map(str::trim);
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&needs_json(&rows, location)).unwrap()
-        );
+        crate::render::print_json(&needs_json(&rows, location));
     } else {
         for line in needs_text_lines(&rows, location) {
             println!("{line}");
@@ -1384,7 +1444,7 @@ fn report_copies(conn: &Connection, unit_filter: Option<&str>, json_output: bool
                                    "ranges": held_as_ranges})
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else {
         for (name, copies, locs, vols, deposits, not_eligible) in &rows {
             // The COUNT and the LIST answer different questions, and since
@@ -1555,15 +1615,17 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
                  "locations": locs, "warehouse_deposits": deposits})
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else if rows.is_empty() {
         println!("no tape-only units");
     } else {
         println!("tape-only units:");
         for (name, copies, locs, deposits) in &rows {
             println!(
-                "  {name}: {copies} copies{}, {locs} locations",
-                warehouse_note(*deposits)
+                "  {name}: {}{}, {}",
+                crate::render::plural(*copies, "copy", "copies"),
+                warehouse_note(*deposits),
+                crate::render::plural(*locs, "location", "locations"),
             );
         }
     }
@@ -1686,8 +1748,8 @@ fn report_dirty(
     } else {
         let dirty_count = rows.iter().filter(|r| r.state == "dirty").count();
         println!(
-            "dirty scan: {dirty_count} of {} active unit(s) dirty",
-            rows.len()
+            "dirty scan: {dirty_count} of {} dirty",
+            crate::render::plural(rows.len() as i64, "active unit", "active units")
         );
         for r in &rows {
             match r.state {
@@ -1854,8 +1916,12 @@ fn verify_status_row_text(row: &VerifyStatusRow) -> String {
          check: {write_check}",
         vtype.as_deref().unwrap_or("?"),
         outcome.as_deref().unwrap_or("?"),
-        started.as_deref().unwrap_or("?"),
-        completed.as_deref().unwrap_or("(not completed)"),
+        started
+            .as_deref()
+            .map_or_else(|| "?".to_string(), crate::render::table_time),
+        completed
+            .as_deref()
+            .map_or_else(|| "(not completed)".to_string(), crate::render::table_time),
         checked.unwrap_or(0),
         passed.unwrap_or(0),
         failed.unwrap_or(0),
@@ -1879,19 +1945,65 @@ fn write_check_words(write_lbp: Option<&str>, note: Option<&str>) -> String {
 
 fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
     let (label, vtype, outcome, completed, checked, passed, failed, started, lbp, note) = row;
+    // Times in RFC 3339 with `Z` (ADR-0012 item 212); first-run's sealed
+    // re-entry takes the latest `completed`, which sorts the same.
     serde_json::json!({
         "volume": label,
         "never_verified": outcome.is_none(),
         "type": vtype,
         "outcome": outcome,
-        "started": started,
-        "completed": completed,
+        "started": started.as_deref().map(crate::render::json_time),
+        "completed": completed.as_deref().map(crate::render::json_time),
         "checked": checked,
         "passed": passed,
         "failed": failed,
         "write_lbp": lbp,
         "write_lbp_note": note
     })
+}
+
+/// `report verify-status --json`: the rows, with `no_full_verify` on each
+/// and the latest failure's positions on the session it belongs to.
+fn verify_status_json(
+    rows: &[VerifyStatusRow],
+    latest_failure: Option<&LatestFailure>,
+    unverified: &[String],
+) -> serde_json::Value {
+    let mut json: Vec<serde_json::Value> = rows.iter().map(verify_status_row_json).collect();
+    // The top level stays the ARRAY it has always been — a consumer that
+    // iterates it keeps working — and the detail rides on each element
+    // of it, attached to the session it belongs to.
+    for row in json.iter_mut() {
+        let named = row
+            .get("volume")
+            .and_then(|v| v.as_str())
+            .is_some_and(|label| unverified.iter().any(|u| u == label));
+        row["no_full_verify"] = serde_json::json!(named);
+    }
+    if let Some(failure) = latest_failure {
+        // `completed` is rendered (RFC 3339), so the failure's stored
+        // time is rendered the same way before they are compared.
+        let failed_at = failure
+            .completed_at
+            .as_deref()
+            .map(crate::render::json_time);
+        for row in json.iter_mut() {
+            let is_the_one = row.get("volume").and_then(|v| v.as_str()) == Some(&failure.label)
+                && row.get("completed").and_then(|v| v.as_str()) == failed_at.as_deref();
+            if is_the_one {
+                row["failing_positions"] = serde_json::json!(failure
+                    .failures
+                    .iter()
+                    .map(|f| serde_json::json!({
+                        "position": f.position,
+                        "result": f.result,
+                        "notes": f.notes,
+                    }))
+                    .collect::<Vec<_>>());
+            }
+        }
+    }
+    serde_json::Value::Array(json)
 }
 
 fn report_verify_status(
@@ -1911,37 +2023,11 @@ fn report_verify_status(
     let unverified = crate::policy::evidence::sealed_without_full_verify(conn, volume_filter)?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(verify_status_row_json).collect();
-        // The top level stays the ARRAY it has always been — a consumer that
-        // iterates it keeps working — and the detail rides on each element
-        // of it, attached to the session it belongs to.
-        let mut json = json;
-        for row in json.iter_mut() {
-            let named = row
-                .get("volume")
-                .and_then(|v| v.as_str())
-                .is_some_and(|label| unverified.iter().any(|u| u == label));
-            row["no_full_verify"] = serde_json::json!(named);
-        }
-        if let Some(failure) = &latest_failure {
-            for row in json.iter_mut() {
-                let is_the_one = row.get("volume").and_then(|v| v.as_str()) == Some(&failure.label)
-                    && row.get("completed").and_then(|v| v.as_str())
-                        == failure.completed_at.as_deref();
-                if is_the_one {
-                    row["failing_positions"] = serde_json::json!(failure
-                        .failures
-                        .iter()
-                        .map(|f| serde_json::json!({
-                            "position": f.position,
-                            "result": f.result,
-                            "notes": f.notes,
-                        }))
-                        .collect::<Vec<_>>());
-                }
-            }
-        }
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&verify_status_json(
+            &rows,
+            latest_failure.as_ref(),
+            &unverified,
+        ));
     } else if rows.is_empty() {
         // Now driven FROM volumes (issue #293), this fires only when no
         // volume matches at all (an empty catalog: a `--volume` label with
@@ -1957,7 +2043,10 @@ fn report_verify_status(
             println!(
                 "\n  most recent failure — {} at {}:",
                 failure.label,
-                failure.completed_at.as_deref().unwrap_or("?")
+                failure
+                    .completed_at
+                    .as_deref()
+                    .map_or_else(|| "?".to_string(), crate::render::table_time)
             );
             if failure.failures.is_empty() {
                 // Honest about the gap rather than silent: a failure at a
@@ -2174,7 +2263,7 @@ pub(crate) fn health_json(rows: &[HealthRow]) -> serde_json::Value {
                 serde_json::json!({
                     "volume": r.volume,
                     "operation": r.operation,
-                    "at": r.logged_at,
+                    "at": crate::render::json_time(&r.logged_at),
                     "bytes": r.bytes,
                     "corrected": r.corrected,
                     "uncorrected": r.uncorrected,
@@ -2207,11 +2296,7 @@ fn report_health(
     let rows = health_rows(conn, volume_filter)?;
     if json_output {
         let factor = config.health().read_error_rise_factor;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report_health_json(conn, &rows, factor, volume_filter)?)
-                .unwrap()
-        );
+        crate::render::print_json(&report_health_json(conn, &rows, factor, volume_filter)?);
         return Ok(());
     }
     // Issue #340: before the listing, whatever `--volume` says and however
@@ -2269,10 +2354,7 @@ fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool
     use crate::tape::cartridge_health;
     let fleet = cartridge_health::fleet(conn, config.health().read_error_rise_factor)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&cartridge_health::fleet_json(&fleet)).unwrap()
-        );
+        crate::render::print_json(&cartridge_health::fleet_json(&fleet));
         return Ok(());
     }
     if fleet.cartridges.is_empty() {
@@ -2319,7 +2401,7 @@ pub(crate) fn report_health_json(
                 .iter()
                 .map(|p| {
                     serde_json::json!({
-                        "at": p.at,
+                        "at": crate::render::json_time(&p.at),
                         "volume": p.volume,
                         "drive_serial": p.drive_serial,
                         "gib_read": p.gib_read,
@@ -2425,7 +2507,9 @@ pub(crate) enum FeedVerdict {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct FeedRatioRow {
     pub(crate) volume: String,
-    /// When the event was recorded (`events.timestamp`, UTC).
+    /// When the event was recorded (`events.timestamp`, UTC). RFC 3339 with
+    /// `Z` in the JSON (ADR-0012 item 212).
+    #[serde(serialize_with = "serialize_json_time")]
     pub(crate) at: String,
     pub(crate) ratio: f64,
     pub(crate) threshold: f64,
@@ -2464,6 +2548,14 @@ pub(crate) struct FeedRatioRow {
     /// on every other verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cause: Option<crate::tape::feed_ratio::Cause>,
+}
+
+/// A stored time as JSON says it: RFC 3339 with `Z` (ADR-0012 item 212).
+fn serialize_json_time<S: serde::Serializer>(
+    t: &str,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&crate::render::json_time(t))
 }
 
 /// Where a write's repositions figure was read from (issue #488).
@@ -2751,7 +2843,7 @@ pub(crate) fn feed_ratio_block(rows: &[FeedRatioRow]) -> Vec<String> {
             r.verdict_text(),
             repositions_clause(r.repositions_per_100mb),
             corrections_clause(r.corrections, r.corrections_per_gib),
-            r.at
+            crate::render::table_time(&r.at)
         ));
     }
     out
@@ -2817,14 +2909,17 @@ fn health_line(
     // because unlike them it is actionable without a baseline or a trend.
     // "-" is not-recorded (pre-009 row); 0 is recorded-and-clean.
     let alert_note = match tape_alerts {
-        Some(n) if n > 0 => format!("  ** {n} TAPE ALERT(S) — named above, with what each asks **"),
+        Some(1) => "  ** 1 TAPE ALERT — named above, with what it asks **".to_string(),
+        Some(n) if n > 1 => {
+            format!("  ** {n} TAPE ALERTS — named above, with what each asks **")
+        }
         _ => String::new(),
     };
 
     format!(
         "  {label} {}: {} — uncorrected={} corrected_total={} corrected_no_delay={} ecc_invocations={} alerts={}{}",
         operation.unwrap_or("?"),
-        logged_at,
+        crate::render::table_time(logged_at),
         // NULL is "not recorded" here too (issue #317's rule): `-`, never 0.
         uncorrected
             .map(|n| n.to_string())
@@ -3217,7 +3312,7 @@ pub(crate) fn tape_alert_sighting_json(s: &TapeAlertSighting) -> serde_json::Val
     serde_json::json!({
         "contact_id": s.contact_id,
         "operation": s.operation,
-        "at": s.at,
+        "at": crate::render::json_time(&s.at),
         "drive_serial": s.drive_serial,
         "cartridge": s.cartridge_barcode,
         "flags": s.flags.iter().map(|(code, name)| serde_json::json!({
@@ -3282,6 +3377,25 @@ fn capacity_totals(conn: &Connection) -> Result<(i64, i64, i64)> {
     Ok(conn.query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
 }
 
+/// `report capacity --per-volume`'s table (ADR-0012 item 212): written is a
+/// data size (binary), the capacity a cartridge's (decimal), as
+/// `util::format_capacity_progress` says them.
+fn capacity_table(rows: &[(String, i64, i64, String)], width: Option<usize>) -> String {
+    crate::render::table_with(
+        &["volume", "status", "written of capacity"],
+        rows.iter()
+            .map(|(label, cap, written, status)| {
+                vec![
+                    label.clone(),
+                    status.clone(),
+                    crate::util::format_capacity_progress(*written, *cap),
+                ]
+            })
+            .collect(),
+        width,
+    )
+}
+
 fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Result<()> {
     if per_volume {
         let rows = per_volume_capacity_rows(conn)?;
@@ -3290,7 +3404,7 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
             let json: Vec<serde_json::Value> = rows.iter().map(|(label, cap, written, status)| {
                 serde_json::json!({"volume": label, "capacity": cap, "written": written, "status": status})
             }).collect();
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            crate::render::print_json(&serde_json::Value::Array(json));
         } else {
             // Issue #204: `cap` (`volumes.capacity_bytes`) is decimal by
             // ADR-0012 ruling and stored decimal — dividing it by 1024^3
@@ -3299,32 +3413,42 @@ fn report_capacity(conn: &Connection, per_volume: bool, json_output: bool) -> Re
             // `format_capacity_progress` keeps `written` (a measured data
             // size) binary and `cap` (a marketed capacity) decimal, per the
             // shared, tested helper.
-            for (label, cap, written, status) in &rows {
-                println!(
-                    "  {label} [{status}]: {}",
-                    crate::util::format_capacity_progress(*written, *cap)
-                );
-            }
+            println!("{}", capacity_table(&rows, crate::render::terminal_width()));
         }
     } else {
         let (total_cap, total_written, vol_count) = capacity_totals(conn)?;
 
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "volumes": vol_count, "total_capacity": total_cap, "total_written": total_written,
-                })
-            );
+            crate::render::print_json(&serde_json::json!({
+                "volumes": vol_count, "total_capacity": total_cap, "total_written": total_written,
+            }));
         } else {
             println!(
-                "capacity: {} volumes, {}",
-                vol_count,
+                "capacity: {}, {}",
+                crate::render::plural(vol_count, "volume", "volumes"),
                 crate::util::format_capacity_progress(total_written, total_cap)
             );
         }
     }
     Ok(())
+}
+
+/// `report age`'s table (ADR-0012 item 212): each current snapshot and when
+/// it was made, in UTC.
+fn age_table(rows: &[(String, i64, String, String)], width: Option<usize>) -> String {
+    crate::render::table_with(
+        &["unit", "version", "created"],
+        rows.iter()
+            .map(|(name, ver, _status, created)| {
+                vec![
+                    name.clone(),
+                    format!("v{ver}"),
+                    crate::render::table_time(created),
+                ]
+            })
+            .collect(),
+        width,
+    )
 }
 
 fn report_age(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -> Result<()> {
@@ -3353,16 +3477,15 @@ fn report_age(conn: &Connection, unit_filter: Option<&str>, json_output: bool) -
 
     if json_output {
         let json: Vec<serde_json::Value> = rows.iter().map(|(name, ver, status, created)| {
-            serde_json::json!({"unit": name, "version": ver, "status": status, "created_at": created})
+            serde_json::json!({"unit": name, "version": ver, "status": status,
+                               "created_at": crate::render::json_time(created)})
         }).collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else if rows.is_empty() {
         println!("no current snapshots");
     } else {
-        println!("current snapshot ages (oldest first):");
-        for (name, ver, _status, created) in &rows {
-            println!("  {name} v{ver}: {created}");
-        }
+        println!("current snapshots, oldest first:");
+        println!("{}", age_table(&rows, crate::render::terminal_width()));
     }
     Ok(())
 }
@@ -3426,7 +3549,10 @@ fn event_line(
             (Some(v), None) | (None, Some(v)) => format!(": {v}"),
         },
     };
-    format!("{ts} {etype}/{label_str} {action}{field_str}{change}")
+    format!(
+        "{} {etype}/{label_str} {action}{field_str}{change}",
+        crate::render::table_time(ts)
+    )
 }
 
 fn report_events(
@@ -3500,7 +3626,7 @@ fn report_events(
                 serde_json::from_str::<serde_json::Value>(d)
                     .unwrap_or_else(|_| serde_json::Value::String(d.to_string()))
             });
-            let mut v = serde_json::json!({"timestamp": ts, "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new, "details": details});
+            let mut v = serde_json::json!({"timestamp": crate::render::json_time(ts), "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new, "details": details});
             // Additive, and only where there is a figure: `details` stays the
             // row as stored, so a decoded figure sits beside it.
             if let Some((n, from)) = wear {
@@ -3509,7 +3635,7 @@ fn report_events(
             }
             v
         }).collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else if rows.is_empty() {
         println!("no events found");
     } else {
@@ -3657,7 +3783,7 @@ fn report_compaction_candidates(
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&serde_json::Value::Array(json));
     } else {
         let mut flagged = 0;
         for r in &rows {
@@ -3876,10 +4002,7 @@ fn report_compaction_plan(
     let budget = planner_budget(config, generation)?;
     let plan = plan_compaction(plan_candidates(conn, config)?, budget.bytes);
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&compaction_plan_json(&plan, &budget)).unwrap()
-        );
+        crate::render::print_json(&compaction_plan_json(&plan, &budget));
     } else {
         for line in compaction_plan_lines(&plan, &budget) {
             println!("{line}");
@@ -4084,6 +4207,25 @@ mod tests {
             assert_eq!(failure.failures.len(), 1);
             assert_eq!(failure.failures[0].position, "7");
             assert_eq!(failure.failures[0].result, "failed_checksum");
+
+            // `--json` attaches them to the failed session, its `completed`
+            // in RFC 3339 and the failure's stored time compared alike
+            // (ADR-0012 item 212): a mismatch would drop the detail silently.
+            let rows = verify_status_rows(&conn, None).unwrap();
+            let json = verify_status_json(&rows, Some(&failure), &[]);
+            let failed: Vec<&serde_json::Value> = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r.get("failing_positions").is_some())
+                .collect();
+            assert_eq!(failed.len(), 1, "{json}");
+            assert_eq!(failed[0]["volume"], "VOL-A", "{json}");
+            assert_eq!(failed[0]["failing_positions"][0]["position"], "7", "{json}");
+            assert!(
+                failed[0]["completed"].as_str().unwrap().ends_with('Z'),
+                "{json}"
+            );
         }
 
         #[test]
@@ -4208,7 +4350,7 @@ mod tests {
                 !t.contains("never verified"),
                 "a verified volume must not be labelled never verified: {t}"
             );
-            for needle in ["AAA-VERIFIED", "full", "passed", "2020-01-01T00:00:00Z"] {
+            for needle in ["AAA-VERIFIED", "full", "passed", "2020-01-01 00:00 UTC"] {
                 assert!(
                     t.contains(needle),
                     "the verified line must carry its evidence ({needle}): {t}"
@@ -4230,14 +4372,15 @@ mod tests {
             .unwrap();
             let rows = verify_status_rows(&conn, Some("VOL-T")).unwrap();
             let t = verify_status_row_text(&rows[0]);
+            // In UTC in the text and RFC 3339 in the JSON (ADR-0012 item 212).
             assert!(
-                t.contains("started 2026-10-01 08:14:57")
-                    && t.contains("completed 2026-10-01 18:06:17"),
+                t.contains("started 2026-10-01 08:14 UTC")
+                    && t.contains("completed 2026-10-01 18:06 UTC"),
                 "both times, each labelled: {t}"
             );
             let json = verify_status_row_json(&rows[0]);
-            assert_eq!(json["started"], "2026-10-01 08:14:57");
-            assert_eq!(json["completed"], "2026-10-01 18:06:17");
+            assert_eq!(json["started"], "2026-10-01T08:14:57Z");
+            assert_eq!(json["completed"], "2026-10-01T18:06:17Z");
         }
 
         /// #388 (ADR-0012 item 165): every row says whether the drive
@@ -5933,7 +6076,7 @@ Read error counter page  [0x3]
             );
             assert_eq!(
                 line,
-                "  LTO6-0001 write: 2026-09-10 01:00:00 — uncorrected=0 corrected_total=0 \
+                "  LTO6-0001 write: 2026-09-10 01:00 UTC — uncorrected=0 corrected_total=0 \
                  corrected_no_delay=875 ecc_invocations=305674 alerts=0"
             );
         }
@@ -5954,7 +6097,7 @@ Read error counter page  [0x3]
             );
             assert_eq!(
                 line,
-                "  LTO6-0001 verify: 2026-01-01 00:00:00 — uncorrected=0 corrected_total=2 \
+                "  LTO6-0001 verify: 2026-01-01 00:00 UTC — uncorrected=0 corrected_total=2 \
                  corrected_no_delay=n/a ecc_invocations=n/a alerts=-"
             );
         }
@@ -6570,7 +6713,7 @@ Read error counter page  [0x3]
             Some("bank"),
         );
         assert_eq!(
-            line, "2026-09-16 12:00:00 cartridge/A001L6 moved.location: home \u{2192} bank",
+            line, "2026-09-16 12:00 UTC cartridge/A001L6 moved.location: home \u{2192} bank",
             "a reader must be able to see what the location changed from, \
              which is the whole point of ADR-0012's names-on-both-sides rule"
         );
@@ -6609,7 +6752,7 @@ Read error counter page  [0x3]
             None,
             None,
         );
-        assert_eq!(line, "2026-09-16 12:00:00 volume/VOL-A created");
+        assert_eq!(line, "2026-09-16 12:00 UTC volume/VOL-A created");
     }
 
     // ---- issue #236 finding 4: a bare payload (no `field`) is not a
@@ -6634,7 +6777,7 @@ Read error counter page  [0x3]
             None,
         );
         assert_eq!(
-            line, "2026-09-16 12:00:00 cartridge/A001L6 displaced: L6-0004",
+            line, "2026-09-16 12:00 UTC cartridge/A001L6 displaced: L6-0004",
             "a fieldless old_value is a payload, not a transition's dangling \
              other half: {line}"
         );
@@ -6660,7 +6803,7 @@ Read error counter page  [0x3]
         );
         assert_eq!(
             line,
-            "2026-09-16 12:00:00 volume/L6-0004 write_aborted: operator abandoned the \
+            "2026-09-16 12:00 UTC volume/L6-0004 write_aborted: operator abandoned the \
              unfinished write session (`volume abort`)"
         );
         assert!(!line.contains("(none)"), "{line}");
@@ -6685,7 +6828,7 @@ Read error counter page  [0x3]
         );
         assert_eq!(
             line,
-            "2026-09-16 12:00:00 volume/L6-0004 write_quarantined: checksum mismatch at \
+            "2026-09-16 12:00 UTC volume/L6-0004 write_quarantined: checksum mismatch at \
              position 12"
         );
         assert!(
@@ -6711,7 +6854,7 @@ Read error counter page  [0x3]
             Some("active"),
         );
         assert_eq!(
-            line, "2026-09-16 12:00:00 unit/photos tagged.status: (none) \u{2192} active",
+            line, "2026-09-16 12:00 UTC unit/photos tagged.status: (none) \u{2192} active",
             "a NAMED field change with an absent old side is a real transition: {line}"
         );
     }
@@ -7034,7 +7177,7 @@ Read error counter page  [0x3]
                 !block[1].contains("A quiet host while the tape runs"),
                 "{block:#?}"
             );
-            assert!(block[1].ends_with(", 2026-10-14 10:00:00"), "{block:#?}");
+            assert!(block[1].ends_with(", 2026-10-14 10:00 UTC"), "{block:#?}");
             assert!(
                 block[2].starts_with("     V-VIRT: 16.0000 (above 1.05, not judged: warning suppressed (capacity_override)"),
                 "{block:#?}"
@@ -7064,7 +7207,7 @@ Read error counter page  [0x3]
                 rows[1],
                 serde_json::json!({
                     "volume": "V-BAD",
-                    "at": "2026-10-14 10:00:00",
+                    "at": "2026-10-14T10:00:00Z",
                     "ratio": 1.505,
                     "threshold": 1.05,
                     "verdict": "above_threshold",
@@ -7846,22 +7989,22 @@ Read error counter page  [0x3]
                 [
                     "failed stages (3):".to_string(),
                     format!(
-                        "  photos v1 (stage set {}): started 2026-10-01 10:00:00, failed \
-                         2026-10-01 12:30:00: 2.5 hours lost",
+                        "  photos v1 (stage set {}): started 2026-10-01 10:00 UTC, failed \
+                         2026-10-01 12:30 UTC: 2.5 hours lost",
                         ids[0]
                     ),
                     format!(
-                        "  photos v1 (stage set {}): started 2026-10-02 09:00:00, failed \
-                         2026-10-02 10:00:00: 1.0 hours lost",
+                        "  photos v1 (stage set {}): started 2026-10-02 09:00 UTC, failed \
+                         2026-10-02 10:00 UTC: 1.0 hours lost",
                         ids[1]
                     ),
                     format!(
-                        "  photos v1 (stage set {}): started 2026-10-03 08:00:00, no end \
+                        "  photos v1 (stage set {}): started 2026-10-03 08:00 UTC, no end \
                          recorded (the process stopped before it could record one): hours \
                          lost unknown",
                         ids[2]
                     ),
-                    "total: 3.5 hours lost, not counting 1 stage(s) with no end recorded"
+                    "total: 3.5 hours lost, not counting 1 stage with no end recorded"
                         .to_string(),
                 ]
             );
@@ -7873,8 +8016,10 @@ Read error counter page  [0x3]
             let first = &json["failed_stages"][0];
             assert_eq!(first["unit"], "photos");
             assert_eq!(first["version"], 1);
-            assert_eq!(first["started"], "2026-10-01 10:00:00");
-            assert_eq!(first["failed"], "2026-10-01 12:30:00");
+            // RFC 3339 with `Z` in the JSON (ADR-0012 item 212).
+            assert_eq!(first["started"], "2026-10-01T10:00:00Z");
+            assert_eq!(first["failed"], "2026-10-01T12:30:00Z");
+            assert!(json["failed_stages"][2]["failed"].is_null());
             assert_eq!(first["hours_lost"], 2.5);
             assert!(json["failed_stages"][2]["hours_lost"].is_null());
         }
@@ -7968,7 +8113,7 @@ Read error counter page  [0x3]
             assert_eq!(
                 needs_text_lines(&rows, None),
                 [
-                    "needs per location (2 unit(s)):",
+                    "needs per location (2 units):",
                     "  docs (active): 0 of 2 copies, 2 short",
                     "    glacier: no target, 0 copies",
                     "    home: no target, 0 copies",
@@ -7984,7 +8129,7 @@ Read error counter page  [0x3]
             assert_eq!(
                 needs_text_lines(&rows, Some("offsite")),
                 [
-                    "needs at offsite (2 unit(s)):",
+                    "needs at offsite (2 units):",
                     "  docs (active): no target, 0 copies here; 0 of 2 copies, 2 short \
                      — group 2: short of its copy floor, no target and no copy here",
                     "  photos (active): target 2, 0 copies here, 2 short; 2 of 3 copies, \

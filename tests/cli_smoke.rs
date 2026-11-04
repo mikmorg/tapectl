@@ -2376,19 +2376,19 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
 
     let readings = serde_json::json!([
         {
-            "volume": "V-FULL", "operation": "write", "at": "2026-09-22 03:00:00",
+            "volume": "V-FULL", "operation": "write", "at": "2026-09-22T03:00:00Z",
             "bytes": 4096, "corrected": 2, "uncorrected": 1, "tape_alerts": 0,
             "corrected_no_delay": null, "ecc_invocations": null,
             "drive_serial": "SER-A", "cartridge_barcode": "CART01"
         },
         {
-            "volume": null, "operation": "verify", "at": "2026-09-22 02:00:00",
+            "volume": null, "operation": "verify", "at": "2026-09-22T02:00:00Z",
             "bytes": null, "corrected": null, "uncorrected": 0, "tape_alerts": null,
             "corrected_no_delay": null, "ecc_invocations": null,
             "drive_serial": "SER-B", "cartridge_barcode": null
         },
         {
-            "volume": "V-OLD", "operation": "write", "at": "2026-09-22 01:00:00",
+            "volume": "V-OLD", "operation": "write", "at": "2026-09-22T01:00:00Z",
             "bytes": 1024, "corrected": 0, "uncorrected": 0, "tape_alerts": null,
             "corrected_no_delay": null, "ecc_invocations": null,
             "drive_serial": null, "cartridge_barcode": null
@@ -3438,4 +3438,136 @@ fn audit_warns_verify_age_at_the_defaults_interval_with_no_archive_set() {
             .contains("not verified within 30 days"),
         "{found:?}"
     );
+}
+
+/// ADR-0012 item 212, 1.9.0 Wave 6 (6C): the source and report tables are
+/// render-kit tables (borderless, one header case, times in UTC), the JSON
+/// keys W3-C left are renamed (OQ5), and an unknown `--volume` or `--unit`
+/// is an error (exit 2), never an empty report.
+#[test]
+fn source_and_report_tables_and_json_keys_after_the_output_sweep() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let ok = |args: &[&str]| {
+        let out = run_tapectl(h, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let json = |args: &[&str]| -> serde_json::Value {
+        let mut all = vec!["--json"];
+        all.extend_from_slice(args);
+        serde_json::from_str(&ok(&all)).unwrap_or_else(|e| panic!("{args:?}: one JSON ({e})"))
+    };
+    let words = |line: &str| line.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+    let borderless = |t: &str| !t.contains('|') && !t.contains('+') && !t.contains("--");
+    ok(&["init"]);
+    ok(&["tenant", "add", "acme"]);
+    let src = TempDir::new().unwrap();
+    for u in ["alpha", "beta"] {
+        let d = src.path().join(u);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f.txt"), u).unwrap();
+        ok(&[
+            "unit",
+            "init",
+            d.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            u,
+        ]);
+    }
+    ok(&["snapshot", "create", "alpha"]);
+
+    // unit list: the render kit's table.
+    let t = ok(&["unit", "list"]);
+    assert_eq!(
+        words(t.lines().next().unwrap()),
+        ["Name", "Status", "Tenant", "Path", "Tags"],
+        "{t}"
+    );
+    assert!(borderless(&t), "{t}");
+    // unit list --json: the tenant by name (OQ5), times RFC 3339.
+    let units = json(&["unit", "list"]);
+    assert_eq!(units[0]["tenant"], "acme", "{units}");
+    assert!(units[0].get("tenant_id").is_none(), "{units}");
+    assert!(
+        units[0]["created_at"].as_str().unwrap().ends_with('Z'),
+        "{units}"
+    );
+
+    // snapshot list: the table, its time in UTC; the JSON's in RFC 3339.
+    let t = ok(&["snapshot", "list"]);
+    assert_eq!(
+        words(t.lines().next().unwrap()),
+        ["Id", "Unit", "Version", "Status", "Files", "Size", "Created"],
+        "{t}"
+    );
+    assert!(t.lines().nth(1).unwrap().ends_with(" UTC"), "{t}");
+    assert!(t.contains("v1") && borderless(&t), "{t}");
+    let snaps = json(&["snapshot", "list"]);
+    assert!(
+        snaps[0]["created_at"].as_str().unwrap().ends_with('Z'),
+        "{snaps}"
+    );
+
+    // report age: a table, in UTC.
+    let t = ok(&["report", "age"]);
+    assert!(t.contains("Unit") && t.contains("Created"), "{t}");
+    assert!(t.contains("alpha") && t.contains(" UTC"), "{t}");
+
+    // report dirty --json: a never-archived unit says so (beta has no
+    // snapshot), never "new".
+    let dirty = json(&["report", "dirty"]);
+    let beta = dirty
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["unit"] == "beta")
+        .unwrap_or_else(|| panic!("{dirty}"));
+    assert_eq!(beta["state"], "never_archived", "{dirty}");
+
+    // report needs --json: the copy floor's one name.
+    let needs = json(&["report", "needs", "--all"]);
+    let row = &needs["units"][0];
+    assert!(row.get("copy_floor").is_some(), "{needs}");
+    assert!(row.get("floor").is_none(), "{needs}");
+
+    // report reclaimable --json: the count named for the command.
+    let rec = json(&["report", "reclaimable"]);
+    assert_eq!(rec["reclaimable"], 0, "{rec}");
+    assert!(rec.get("supersedable").is_none(), "{rec}");
+
+    // An unknown --volume or --unit: exit 2, naming it; never a report.
+    for args in [
+        &["report", "verify-status", "--volume", "nope"][..],
+        &["report", "health", "--volume", "nope"],
+        &["snapshot", "list", "--unit", "nope"],
+        &["report", "age", "--unit", "nope"],
+    ] {
+        for as_json in [false, true] {
+            let mut all: Vec<&str> = if as_json { vec!["--json"] } else { vec![] };
+            all.extend_from_slice(args);
+            let out = run_tapectl(h, &all);
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.status.code(), Some(2), "{all:?}: {said}");
+            assert!(said.contains("nope"), "{all:?}: {said}");
+            if as_json {
+                assert_one_document_or_none(&out.stdout);
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+                    "{all:?}: no report printed: {said}"
+                );
+            }
+        }
+    }
 }
