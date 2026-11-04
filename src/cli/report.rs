@@ -187,6 +187,27 @@ fn require_known_unit(conn: &Connection, unit_filter: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// A `--volume` that names no volume is an error, never an empty report
+/// (ADR-0012 item 212), as [`require_known_unit`] is for `--unit`:
+/// `report verify-status --volume nope` said "no volumes found" and `report
+/// health --volume nope` listed nothing, both exiting 0. `VolumeNotFound`
+/// exits 2 and names the volumes it might have meant.
+fn require_known_volume(conn: &Connection, volume_filter: Option<&str>) -> Result<()> {
+    if let Some(label) = volume_filter {
+        let known: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM volumes WHERE label = ?1)",
+            [label],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(crate::error::TapectlError::VolumeNotFound(
+                label.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Issue #90 (as re-scoped): superseded versions accumulate silently
 /// because `snapshot mark-reclaimable` is a manual step nothing prompts.
 /// This is the prompt.
@@ -306,7 +327,9 @@ fn reclaimable_summary(found: &[crate::policy::reclaimable::Candidate]) -> serde
     }
 
     serde_json::json!({
-        "supersedable": rows.len(),
+        // Named for the command (`report reclaimable`, ADR-0012 item 209):
+        // how many candidates are listed, releasable or blocked.
+        "reclaimable": rows.len(),
         "releasable": releasable,
         "total_freeable_bytes": total_freeable,
         "candidates": rows,
@@ -1093,7 +1116,7 @@ fn needs_text_lines(rows: &[NeedsRow], location: Option<&str>) -> Vec<String> {
 }
 
 /// `report needs --json`, separate from the printing so a test pins it.
-/// `floor` is null and `policy_unresolvable` the reason when a unit's policy
+/// `copy_floor` is null and `policy_unresolvable` the reason when a unit's policy
 /// would not resolve; `group` is item 158's (1, 2 or null) with `--location`,
 /// null without it.
 fn needs_json(rows: &[NeedsRow], location: Option<&str>) -> serde_json::Value {
@@ -1104,8 +1127,10 @@ fn needs_json(rows: &[NeedsRow], location: Option<&str>) -> serde_json::Value {
                 "unit": r.unit,
                 "status": r.status,
                 "copies": r.copies,
-                "floor": r.floor,
-                "floor_short": r.floor_short(),
+                // The copy floor's name everywhere in JSON (OQ5, ADR-0012
+                // item 208), as `fire_risk_json` and `stage list` carry it.
+                "copy_floor": r.floor,
+                "copy_floor_short": r.floor_short(),
                 "multiplier": r.multiplier,
                 "locations": r.locations.iter().map(|l| serde_json::json!({
                     "location": l.location,
@@ -1622,6 +1647,29 @@ pub(crate) fn dirty_rows(
     Ok(rows)
 }
 
+/// A [`DirtyRow::state`] as `report dirty --json` spells it: CONTEXT.md's
+/// "Never Archived" is `never_archived` (ADR-0012 items 208 and 212), never
+/// "new". The row keeps `"new"`: `status` sorts its home screen by it.
+fn dirty_state_json(state: &str) -> &str {
+    match state {
+        "new" => "never_archived",
+        other => other,
+    }
+}
+
+/// `report dirty --json`: one object per unit, an array.
+fn dirty_json(rows: &[DirtyRow]) -> serde_json::Value {
+    rows.iter()
+        .map(|r| {
+            serde_json::json!({
+                "unit": r.name, "state": dirty_state_json(r.state),
+                "added": r.added, "removed": r.removed, "modified": r.modified,
+                "error": r.error,
+            })
+        })
+        .collect()
+}
+
 fn report_dirty(
     conn: &Connection,
     unit_filter: Option<&str>,
@@ -1632,17 +1680,7 @@ fn report_dirty(
     let rows = dirty_rows(conn, unit_filter, global_excludes)?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "unit": r.name, "state": r.state,
-                    "added": r.added, "removed": r.removed, "modified": r.modified,
-                    "error": r.error,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        crate::render::print_json(&dirty_json(&rows));
     } else if rows.is_empty() {
         println!("no active units");
     } else {
@@ -1655,7 +1693,7 @@ fn report_dirty(
             match r.state {
                 "clean" => println!("  {}: clean", r.name),
                 // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item
-                // 208). The JSON `state` value keeps its spelling.
+                // 208), here and in the JSON (`dirty_state_json`).
                 "new" => println!("  {}: never archived", r.name),
                 "unreadable" => println!(
                     "  {}: UNREADABLE — dirty scan could not run ({})",
@@ -1861,6 +1899,7 @@ fn report_verify_status(
     volume_filter: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
+    require_known_volume(conn, volume_filter)?;
     let rows = verify_status_rows(conn, volume_filter)?;
 
     // Issue #142: the aggregate above says HOW MANY slices failed and never
@@ -1905,10 +1944,10 @@ fn report_verify_status(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         // Now driven FROM volumes (issue #293), this fires only when no
-        // volume matches at all (an empty catalog, or a `--volume` label
-        // with no such volume) — never merely because none has been
-        // verified, since a never-verified volume produces a row of its
-        // own and no longer hides behind this message.
+        // volume matches at all (an empty catalog: a `--volume` label with
+        // no such volume is refused above, ADR-0012 item 212) — never merely
+        // because none has been verified, since a never-verified volume
+        // produces a row of its own and no longer hides behind this message.
         println!("no volumes found");
     } else {
         for row in &rows {
@@ -2164,6 +2203,7 @@ fn report_health(
     volume_filter: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
+    require_known_volume(conn, volume_filter)?;
     let rows = health_rows(conn, volume_filter)?;
     if json_output {
         let factor = config.health().read_error_rise_factor;
@@ -4899,6 +4939,75 @@ mod tests {
         }
     }
 
+    /// ADR-0012 items 208 and 212 (OQ5): the JSON says `never_archived`,
+    /// never "new"; the row keeps "new", which `status` sorts by.
+    #[test]
+    fn dirty_json_names_a_never_archived_unit_so() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+        let mut rows = dirty_rows(&conn, None, &[]).unwrap();
+        rows[0].state = "new";
+        let json = dirty_json(&rows);
+        assert_eq!(json[0]["state"], "never_archived", "{json}");
+        assert_eq!(rows[0].state, "new", "the row keeps its value");
+        let states: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["state"].as_str().unwrap())
+            .collect();
+        assert!(!states.contains(&"new"), "{json}");
+        assert!(states.contains(&"clean") || states.contains(&"dirty"), "{json}");
+    }
+
+    /// ADR-0012 item 212: a `--volume` naming no volume is an error (exit 2,
+    /// `VolumeNotFound`), never an empty report, in both reports that take
+    /// one; a volume that exists but has nothing recorded still runs.
+    #[test]
+    fn verify_status_and_health_refuse_a_volume_that_does_not_exist() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status)
+             VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 1000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let config = Config::default();
+        let nope = Some("nope".to_string());
+        for command in [
+            ReportCommands::VerifyStatus {
+                volume: nope.clone(),
+            },
+            ReportCommands::Health {
+                volume: nope.clone(),
+            },
+        ] {
+            for json in [false, true] {
+                let err = run(&conn, &config, &command, json)
+                    .expect_err(&format!("{command:?} --json={json} must refuse"));
+                assert!(
+                    matches!(err, crate::error::TapectlError::VolumeNotFound(ref l) if l == "nope"),
+                    "{command:?}: {err}"
+                );
+            }
+        }
+        let known = Some("L6-0001".to_string());
+        for command in [
+            ReportCommands::VerifyStatus {
+                volume: known.clone(),
+            },
+            ReportCommands::Health {
+                volume: known.clone(),
+            },
+        ] {
+            for json in [false, true] {
+                run(&conn, &config, &command, json).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+            }
+        }
+    }
+
     #[test]
     fn report_dirty_runs_end_to_end_in_both_output_modes() {
         let root = TempDir::new().unwrap();
@@ -5149,7 +5258,9 @@ mod tests {
         fn a_releasable_candidate_is_counted_and_summed() {
             let (conn, _unit) = setup("rep-sup-ok", 2, "sealed", "active");
             let s = summary_for(&conn);
-            assert_eq!(s["supersedable"], 1);
+            assert_eq!(s["reclaimable"], 1);
+            // ADR-0012 item 209: the count is named for the command.
+            assert!(s.get("supersedable").is_none(), "{s}");
             assert_eq!(s["releasable"], 1);
             assert_eq!(s["total_freeable_bytes"], 1000);
             let row = &s["candidates"][0];
@@ -5171,7 +5282,7 @@ mod tests {
         fn a_blocked_candidate_reports_its_reason_and_bytes_but_is_not_summed() {
             let (conn, _unit) = setup("rep-sup-blocked", 2, "quarantined", "active");
             let s = summary_for(&conn);
-            assert_eq!(s["supersedable"], 1);
+            assert_eq!(s["reclaimable"], 1);
             assert_eq!(s["releasable"], 0);
             assert_eq!(
                 s["total_freeable_bytes"], 0,
@@ -7935,8 +8046,8 @@ Read error counter page  [0x3]
             assert_eq!(
                 *photos,
                 serde_json::json!({
-                    "unit": "photos", "status": "active", "copies": 2, "floor": 2,
-                    "floor_short": 0, "multiplier": 1,
+                    "unit": "photos", "status": "active", "copies": 2, "copy_floor": 2,
+                    "copy_floor_short": 0, "multiplier": 1,
                     "locations": [
                         {"location": "offsite", "target": 1, "copies": 0, "short": 1}
                     ],
@@ -7944,7 +8055,9 @@ Read error counter page  [0x3]
                 })
             );
             assert_eq!(json["units"][0]["group"], 2);
-            assert_eq!(json["units"][0]["floor_short"], 2);
+            assert_eq!(json["units"][0]["copy_floor_short"], 2);
+            // OQ5: the copy floor's one name; the old key is gone.
+            assert!(json["units"][0].get("floor").is_none());
 
             let rows = needs_rows(&conn, &config, None, false).unwrap();
             let json = needs_json(&rows, None);

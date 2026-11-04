@@ -909,14 +909,17 @@ fn check_copy_count(
     let needed = policy::coverage::copy_floor(ctx.config, resolved.copy_floor_base(), &unit.status);
 
     if copy_count < needed {
+        // A real plural (ADR-0012 item 212): "has 1 copy", "has 2 copies".
         let mut message = format!(
-            "has {copy_count} copies, needs {needed}{}",
+            "has {}, needs {needed}{}",
+            crate::render::plural(copy_count, "copy", "copies"),
             policy::coverage::tape_only_note(ctx.config, &unit.status)
         );
         // ADR-0012 item 220: a unit no tape holds a current version of is
         // reported here once, saying why, rather than here and again as
         // `no_archive`. Asked only at zero copies, so a covered unit pays
-        // nothing for it. The `has N copies` start stays: scripts read it.
+        // nothing for it. The `has N copy`/`has N copies` start stays:
+        // scripts read it.
         if copy_count == 0 {
             if let Some(unwritten) = Unwritten::of(ctx.conn, unit)? {
                 message.push_str(&format!(": {}", unwritten.describe()));

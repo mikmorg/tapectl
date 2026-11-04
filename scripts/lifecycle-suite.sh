@@ -3693,7 +3693,7 @@ import json, os, re, sys
 d = json.load(open(sys.argv[1]))
 for f in (d.get("findings") or []):
     if f.get("check") == "copy_count" and f.get("unit") == os.environ["U"]:
-        m = re.search(r"has (\d+) copies", f.get("message", ""))
+        m = re.search(r"has (\d+) cop(?:y|ies)\b", f.get("message", ""))
         print(m.group(1) if m else "unparsed"); break
 else:
     print("none")
