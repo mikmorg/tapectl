@@ -106,6 +106,13 @@ pub enum UnitCommands {
     Discover,
 
     /// Check file integrity against the newest staged version's checksums
+    ///
+    /// A file whose content differs at its recorded size is CHANGED when its
+    /// modified time moved since the snapshot (an edit, which `snapshot
+    /// create` archives) and BITROT when it did not; with no modified time
+    /// recorded it cannot tell, and counts the file with BITROT. Exits 0
+    /// when every file matches and 1 when a file is BITROT, MISSING or a
+    /// SIZE_MISMATCH.
     CheckIntegrity {
         /// Unit name
         name: String,

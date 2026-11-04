@@ -3479,6 +3479,47 @@ fn completions_into_a_closed_pipe_exit_0() {
     assert_eq!(closed.status.code(), Some(0), "stderr: {stderr}");
 }
 
+/// ADR-0012 item 220: `unit check-integrity` exited 0 whatever it found.
+/// Through the binary (main's Unit arm): 0 on a clean source, 1 once a
+/// staged file is missing.
+#[test]
+fn unit_check_integrity_exits_1_when_a_staged_file_is_missing() {
+    let home = TempDir::new().unwrap();
+    let staging = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    std::fs::write(source.path().join("a.txt"), b"alpha").unwrap();
+    std::fs::write(source.path().join("b.txt"), b"bravo").unwrap();
+    let unit = prepare_home_for_staging(home.path(), source.path(), staging.path());
+    let staged = run_tapectl(home.path(), &["stage", "create", &unit]);
+    assert!(
+        staged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+
+    let clean = run_tapectl(home.path(), &["unit", "check-integrity", &unit]);
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "positive control, a clean source: {}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+
+    std::fs::remove_file(source.path().join("b.txt")).unwrap();
+    let out = run_tapectl(
+        home.path(),
+        &["--json", "unit", "check-integrity", &unit],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!((v["missing"].clone(), v["ok"].clone()), (1.into(), 1.into()), "{v}");
+}
+
 /// ADR-0012 item 210: `snapshot create` takes several units. Each is walked
 /// and reported on its own; one that fails (here a unit that does not
 /// exist) stops none of the others, and the command then exits with an
