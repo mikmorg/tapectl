@@ -190,7 +190,7 @@ impl ReadSlicesCommand {
     pub fn command(&self) -> String {
         format!(
             "tapectl volume read-slices {} --from {} --version {}",
-            self.from, self.unit, self.version
+            self.unit, self.from, self.version
         )
     }
 }

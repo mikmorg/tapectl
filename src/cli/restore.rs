@@ -157,18 +157,8 @@ pub enum RestoreCommands {
     File {
         #[command(flatten)]
         unit: UnitArg,
-        /// File path within the unit, relative to its root, as `catalog
-        /// list` prints it. Checked against the catalog's file list for the
-        /// version before the tape is touched; a directory is refused
-        #[arg(
-            value_name = "PATH",
-            required_unless_present = "file",
-            conflicts_with = "file"
-        )]
-        path: Option<String>,
-        /// The file, as a flag: the same as PATH
-        #[arg(long, value_name = "PATH")]
-        file: Option<String>,
+        #[command(flatten)]
+        file: FileArg,
         /// Volume label. Without it the loaded tape names itself: File 0 is
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
@@ -252,15 +242,13 @@ pub enum RestoreCommands {
 
 /// The unit a restore reads: the positional UNIT, or `--unit UNIT`, the
 /// spelling every tape's File 1 prints and an heir may type on any restore
-/// (ADR-0012 items 203 and 210). Exactly one of the two.
+/// (ADR-0012 items 203 and 210). Exactly one of the two, which the usage
+/// line shows as `<UNIT|--unit <UNIT>>`.
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
+#[group(required = true, multiple = false)]
 pub struct UnitArg {
     /// Unit name
-    #[arg(
-        value_name = "UNIT",
-        required_unless_present = "unit",
-        conflicts_with = "unit"
-    )]
+    #[arg(value_name = "UNIT")]
     name: Option<String>,
     /// The unit, as a flag: the same as UNIT
     #[arg(long = "unit", value_name = "UNIT")]
@@ -286,11 +274,27 @@ impl From<&str> for UnitArg {
     }
 }
 
-impl RestoreCommands {
-    /// `restore file`'s file, however it was given (PATH or `--file`).
-    fn file_path(path: &Option<String>, file: &Option<String>) -> String {
-        path.clone()
-            .or_else(|| file.clone())
+/// `restore file`'s file: the positional PATH after the unit, or `--file
+/// PATH` (OQ2). Exactly one of the two.
+#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
+#[group(required = true, multiple = false)]
+pub struct FileArg {
+    /// File path within the unit, relative to its root, as `catalog list`
+    /// prints it. Checked against the catalog's file list for the version
+    /// before the tape is touched; a directory is refused
+    #[arg(value_name = "PATH")]
+    path: Option<String>,
+    /// The file, as a flag: the same as PATH
+    #[arg(long = "file", value_name = "PATH")]
+    file: Option<String>,
+}
+
+impl FileArg {
+    /// The file named, however it was given.
+    pub fn path(&self) -> &str {
+        self.path
+            .as_deref()
+            .or(self.file.as_deref())
             .expect("clap requires PATH or --file")
     }
 }
@@ -406,7 +410,6 @@ pub fn run(
         }
 
         RestoreCommands::File {
-            path,
             file,
             unit,
             from,
@@ -422,7 +425,7 @@ pub fn run(
             // unit` does.
             let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             let unit = unit.name();
-            let file = &RestoreCommands::file_path(path, file);
+            let file = file.path();
             // Issue #241: unlike `restore unit`, this has no preview. The
             // catalog check of `--file` runs before any tape contact (issue
             // #406), but proving the entry is really in the archive still

@@ -6525,7 +6525,7 @@ mod tests {
             assert!(msg.contains("Finish the span first"), "{msg}");
             assert!(
                 !msg.contains("Make another copy first")
-                    && !msg.contains("volume read-slices")
+                    && !msg.contains("tapectl volume read-slices")
                     && !msg.contains("stage create"),
                 "a current version's recipe is not a span's: {msg}"
             );
