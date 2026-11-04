@@ -128,7 +128,8 @@ pub fn plan_collection_remove(original: &str, path: &Path, name: &str) -> Result
         values: Vec::new(),
     };
     // Selected by name, never parsed: `collections[2024]` would read as the
-    // position 2024, and a collection may be named 2024.
+    // position 2024, and a table written by hand may be named 2024 (`collection
+    // add` refuses such a name).
     let segs = vec![Seg {
         key: COLLECTIONS.to_string(),
         select: Some(Selector::Name(name.to_string())),

@@ -313,9 +313,9 @@ fn a_whole_collection_is_refused_by_name_and_its_keys_are_config_s() {
     config_check_passes(home.path());
 }
 
-/// `collection add` writes the table with the comments kept and a name that
-/// looks like a number as a string, and `collection remove` takes it out
-/// again, the comments still kept.
+/// `collection add` writes the table with the comments kept and its keys
+/// typed (a name as a string, a depth as a number), and `collection remove`
+/// takes it out again, the comments still kept.
 #[test]
 fn collection_add_and_remove_edit_the_file_in_place() {
     let home = home();
@@ -327,7 +327,7 @@ fn collection_add_and_remove_edit_the_file_in_place() {
         &[
             "collection",
             "add",
-            "2024",
+            "photos-2024",
             &root_str,
             "--tenant",
             "family",
@@ -340,7 +340,7 @@ fn collection_add_and_remove_edit_the_file_in_place() {
     let after = read(home.path());
     assert!(
         after.contains(&format!(
-            "[[collections]]\nname = \"2024\"\nroot = \"{root_str}\"\ntenant = \"family\"\n\
+            "[[collections]]\nname = \"photos-2024\"\nroot = \"{root_str}\"\ntenant = \"family\"\n\
              unit_depth = 2\nexclude = [\"*.partial\"]\n"
         )),
         "{after}"
@@ -348,7 +348,7 @@ fn collection_add_and_remove_edit_the_file_in_place() {
     assert!(after.contains("# operator note"), "{after}");
     config_check_passes(home.path());
 
-    ok(home.path(), &["collection", "remove", "2024"]);
+    ok(home.path(), &["collection", "remove", "photos-2024"]);
     let after = read(home.path());
     assert!(!after.contains("[[collections]]"), "{after}");
     assert!(after.contains("# operator note"), "{after}");

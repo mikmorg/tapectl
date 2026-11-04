@@ -145,6 +145,12 @@ pub fn validate_collection_name(name: &str) -> Result<()> {
     if name.contains('/') {
         return refuse("it is one segment, with no /".to_string());
     }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        return refuse(format!(
+            "a name of digits alone reads as a position in `tapectl config set \
+             'collections[{name}].KEY'`; give it a letter, e.g. photos-{name}"
+        ));
+    }
     if let Err(e) = crate::naming::validate_unit_name(name) {
         return refuse(format!(
             "it begins every unit name the collection registers, so it follows the unit-name \
@@ -253,6 +259,21 @@ mod tests {
         let none = with_collections(&[]);
         let err = collection_to_run(&none, None).unwrap_err().to_string();
         assert!(err.contains("no collection is configured"), "{err}");
+    }
+
+    /// A collection name is one unit-name segment, and not digits alone,
+    /// which `config set 'collections[N].KEY'` reads as a position.
+    #[test]
+    fn a_collection_name_is_one_segment_and_not_digits_alone() {
+        assert!(validate_collection_name("photos-2024").is_ok());
+        for (bad, says) in [
+            ("2024", "reads as a position"),
+            ("a/b", "one segment"),
+            ("my photos", "unit-name rule"),
+        ] {
+            let err = validate_collection_name(bad).unwrap_err().to_string();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
     }
 
     #[test]

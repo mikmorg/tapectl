@@ -239,6 +239,10 @@ fn collection_add_refuses_each_unusable_collection() {
             "invalid collection name \"my photos\"",
         ),
         (
+            vec!["2024", &elsewhere, "--tenant", "media"],
+            "reads as a position",
+        ),
+        (
             vec!["photos", &elsewhere, "--tenant", "media"],
             "already configured",
         ),
