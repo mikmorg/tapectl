@@ -108,7 +108,9 @@ A write the CATALOG lost (it was restored from a backup taken after `volume init
 
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re-confirm path above is about.
 
-Once the resumed volume is sealed and confirmed, staging is released or kept exactly as `volume write` does it (`--keep-staging` opts out).
+Once the resumed volume is sealed and confirmed, staging is released or kept exactly as `volume write` does it (`--keep-staging` opts out), and the volume is moved as `volume write --move-to` moves it.
+
+The write that began the session recorded what it asked for once its tape is sealed: `--full-confirm`, `--move-to`, `--for-location`'s move, `--keep-staging` and `--keep-staging-for-locations`. A resume keeps all of it, and says so before it touches the drive; the flags given here add to it. A full confirm is never downgraded to a quick one, and a `--move-to` naming another place than the recorded one is refused naming both. A session written before tapectl 1.9.0 recorded nothing, and the resume does what its own flags say.
 
 Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 
@@ -125,8 +127,9 @@ tapectl volume resume [OPTIONS] [LABEL]
 - `--loaded` — Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog's volumes with an interrupted write session, a re-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
-- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR-0012 item 186)
+- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the confirm the interrupted write asked for: the full readback when it had `--full-confirm`, else the quick confirm, which leaves the readback to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR-0012 item 186)
 - `--keep-staging` — See `volume write --keep-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
+- `--move-to <LOCATION>` — Move the volume, with its cartridge, to this location once it is sealed and confirmed, as `volume write --move-to` does. The interrupted write's own `--move-to` or `--for-location` is kept without this flag; naming another place here is refused, naming both. The location is checked before the drive is touched
 
 ### tapectl volume abort
 

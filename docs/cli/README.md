@@ -54,8 +54,10 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`unit check-integrity`](unit.md#tapectl-unit-check-integrity) | Check file integrity against the newest staged version's checksums |
 | &nbsp;&nbsp;[`unit mark-tape-only`](unit.md#tapectl-unit-mark-tape-only) | Mark unit as tape-only (local data can be deleted) |
 | [`collection`](collection.md) | Manage media collections (folder=unit factory + batch tape driver) |
+| &nbsp;&nbsp;[`collection add`](collection.md#tapectl-collection-add) | Add a collection: a folder whose subfolders are each a unit of one tenant |
+| &nbsp;&nbsp;[`collection remove`](collection.md#tapectl-collection-remove) | Take a collection out of config.toml; its units stay registered and untouched |
 | &nbsp;&nbsp;[`collection sync`](collection.md#tapectl-collection-sync) | Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts) |
-| &nbsp;&nbsp;[`collection status`](collection.md#tapectl-collection-status) | Show pending/dirty/missing/under-copied counts for every configured collection |
+| &nbsp;&nbsp;[`collection status`](collection.md#tapectl-collection-status) | Show each configured collection's pending, staged, under-copied and missing units |
 | &nbsp;&nbsp;[`collection plan`](collection.md#tapectl-collection-plan) | Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units |
 | &nbsp;&nbsp;[`collection run`](collection.md#tapectl-collection-run) | Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already meets every unit's copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets) — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action |
 | [`snapshot`](snapshot.md) | Manage snapshots |

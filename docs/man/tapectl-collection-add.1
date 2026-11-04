@@ -1,0 +1,63 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-collection-add 1  "tapectl-collection-add " 
+.SH NAME
+tapectl\-collection\-add \- Add a collection: a folder whose subfolders are each a unit of one tenant
+.SH SYNOPSIS
+\fBtapectl collection add\fR [\fB\-\-json\fR] <\fB\-\-tenant\fR> [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-unit\-depth\fR] [\fB\-\-exclude\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-archive\-set\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-no\-dotfiles\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> <\fIROOT\fR> 
+.SH DESCRIPTION
+Add a collection: a folder whose subfolders are each a unit of one tenant
+.PP
+ROOT must be an absolute path to a directory that exists, neither inside another collection\*(Aqs root nor holding one. The tenant and the archive set must exist. The user tapectl runs as (the service user, under tapectl\-op) must be able to read the whole tree and, unless \-\-no\-dotfiles, write a .tapectl\-unit.toml into each unit folder; when it cannot, the setfacl lines that grant it are printed and nothing is added, since it cannot grant them itself. Then the [[collections]] table is written into config.toml, its comments kept, and the sync dry run is shown: `tapectl collection sync` registers the units.
+.PP
+Exit status: 0 = added (with \-\-dry\-run: it would be); 2 = refused, nothing written.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-tenant\fR \fI<TENANT>\fR
+The tenant the collection\*(Aqs units are registered under
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-\-unit\-depth\fR \fI<UNIT_DEPTH>\fR [default: 1]
+How deep the unit folders are: 1 = ROOT\*(Aqs own subfolders, 2 = theirs (show/season)
+.TP
+\fB\-\-exclude\fR \fI<EXCLUDE>\fR
+A folder or file name to leave out, as a glob (repeat it for several), e.g. \*(Aq*.partial\*(Aq
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-archive\-set\fR \fI<ARCHIVE_SET>\fR
+The archive set the collection\*(Aqs units are registered in
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-no\-dotfiles\fR
+Write no .tapectl\-unit.toml: each unit is known by its path, for a source tapectl must not write. A renamed folder then reads as a new unit, and the old one as missing
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fINAME\fR>
+The collection\*(Aqs name. It begins every unit name the collection registers: NAME/FOLDER
+.TP
+<\fIROOT\fR>
+The folder to walk: an absolute path

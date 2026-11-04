@@ -12,14 +12,59 @@ tapectl collection [OPTIONS] <COMMAND>
 
 **Subcommands**
 
+- [`add`](#tapectl-collection-add) — Add a collection: a folder whose subfolders are each a unit of one tenant
+- [`remove`](#tapectl-collection-remove) — Take a collection out of config.toml; its units stay registered and untouched
 - [`sync`](#tapectl-collection-sync) — Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
-- [`status`](#tapectl-collection-status) — Show pending/dirty/missing/under-copied counts for every configured collection
+- [`status`](#tapectl-collection-status) — Show each configured collection's pending, staged, under-copied and missing units
 - [`plan`](#tapectl-collection-plan) — Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units
 - [`run`](#tapectl-collection-run) — Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already meets every unit's copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets) — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action
 
+### tapectl collection add
+
+Add a collection: a folder whose subfolders are each a unit of one tenant
+
+ROOT must be an absolute path to a directory that exists, neither inside another collection's root nor holding one. The tenant and the archive set must exist. The user tapectl runs as (the service user, under tapectl-op) must be able to read the whole tree and, unless --no-dotfiles, write a .tapectl-unit.toml into each unit folder; when it cannot, the setfacl lines that grant it are printed and nothing is added, since it cannot grant them itself. Then the [[collections]] table is written into config.toml, its comments kept, and the sync dry run is shown: `tapectl collection sync` registers the units.
+
+Exit status: 0 = added (with --dry-run: it would be); 2 = refused, nothing written.
+
+```text
+tapectl collection add [OPTIONS] --tenant <TENANT> <NAME> <ROOT>
+```
+
+**Arguments**
+
+- `<NAME>` — The collection's name. It begins every unit name the collection registers: NAME/FOLDER
+- `<ROOT>` — The folder to walk: an absolute path
+
+**Options**
+
+- `--tenant <TENANT>` *(required)* — The tenant the collection's units are registered under
+- `--unit-depth <UNIT_DEPTH>` *(default: `1`)* — How deep the unit folders are: 1 = ROOT's own subfolders, 2 = theirs (show/season)
+- `--exclude <EXCLUDE>` — A folder or file name to leave out, as a glob (repeat it for several), e.g. '*.partial'
+- `--archive-set <ARCHIVE_SET>` — The archive set the collection's units are registered in
+- `--no-dotfiles` — Write no .tapectl-unit.toml: each unit is known by its path, for a source tapectl must not write. A renamed folder then reads as a new unit, and the old one as missing
+
+### tapectl collection remove
+
+Take a collection out of config.toml; its units stay registered and untouched
+
+No sync walks its root after this, so none of its units is marked missing for it. They stay ordinary units, with their versions, copies and staged sets: `tapectl unit list` names them.
+
+```text
+tapectl collection remove [OPTIONS] <NAME>
+```
+
+**Arguments**
+
+- `<NAME>` — The collection's name
+
 ### tapectl collection sync
 
-Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
+Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts).
+
+A unit registered before 1.9.0 whose .tapectl-unit.toml was never written is completed: the file is written with the unit's own identity. A dry run makes every check the real run makes, so it refuses what the real run would.
+
+Exit status: 0 = clean; 1 = warnings (a folder refused, an entry outside every unit, a unit marked missing); 2 = errors (a root that is not absolute or does not exist, a tenant or archive set that does not exist, permission denied, a .tapectl-unit.toml that could not be written). Every collection is synced whatever another's problems; the status is the worst seen.
 
 ```text
 tapectl collection sync [OPTIONS]
@@ -31,7 +76,11 @@ tapectl collection sync [OPTIONS]
 
 ### tapectl collection status
 
-Show pending/dirty/missing/under-copied counts for every configured collection
+Show each configured collection's pending, staged, under-copied and missing units
+
+Pending is a unit never archived or dirty (changed since its last version); staged is a version waiting in staging for a copy it is still owed, which `volume write` writes.
+
+Exit status: 0 = clean; 1 = warnings (a unit refused, an entry outside every unit, a unit missing); 2 = errors (a root that is not absolute or does not exist, a tenant or archive set that does not exist). Every collection is shown whatever another's problems; the status is the worst seen.
 
 ```text
 tapectl collection status [OPTIONS]
@@ -42,6 +91,10 @@ tapectl collection status [OPTIONS]
 Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units.
 
 A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes last in its batch, and the plan names the unit that spans onto the next cartridge. It is refused when it is larger than the staging area, or, on a drive that does not declare `post_warning_bytes`, larger than the room under the fill ceiling.
+
+The units already staged and still owed a copy are listed after the batches, with the command that writes them.
+
+Exit status: 0 = clean; 1 = a unit refused; 2 = errors (a collection's root, tenant or archive set, or no drive to plan against). Every collection is planned whatever another's problems.
 
 ```text
 tapectl collection plan [OPTIONS]

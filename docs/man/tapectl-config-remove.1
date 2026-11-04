@@ -8,7 +8,7 @@ tapectl\-config\-remove \- Remove a key, an entry of a list of tables, or values
 .SH DESCRIPTION
 Remove a key, an entry of a list of tables, or values from a list
 .PP
-`config remove defaults.slice_size` removes the key, so its default applies; `config remove collections[movies]` removes that table; `config remove defaults.global_excludes \*(Aq*.bak\*(Aq` removes that value. A whole list of tables is removed one entry at a time. Checked and written as `config set` is: removing a required key is refused. On a file that already fails to load, an edit that adds no problem goes through and names the problems left, so a broken file can be repaired one key at a time.
+`config remove defaults.slice_size` removes the key, so its default applies; `config remove \*(Aqbackends.lto[lto6]\*(Aq` removes that table; `config remove defaults.global_excludes \*(Aq*.bak\*(Aq` removes that value. A whole list of tables is removed one entry at a time; a collection is removed with `collection remove`, which keeps its units. Checked and written as `config set` is: removing a required key is refused. On a file that already fails to load, an edit that adds no problem goes through and names the problems left, so a broken file can be repaired one key at a time.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

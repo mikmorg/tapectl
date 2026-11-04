@@ -6,7 +6,11 @@ tapectl\-collection\-sync \- Sync every configured collection: register new unit
 .SH SYNOPSIS
 \fBtapectl collection sync\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
+Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts).
+.PP
+A unit registered before 1.9.0 whose .tapectl\-unit.toml was never written is completed: the file is written with the unit\*(Aqs own identity. A dry run makes every check the real run makes, so it refuses what the real run would.
+.PP
+Exit status: 0 = clean; 1 = warnings (a folder refused, an entry outside every unit, a unit marked missing); 2 = errors (a root that is not absolute or does not exist, a tenant or archive set that does not exist, permission denied, a .tapectl\-unit.toml that could not be written). Every collection is synced whatever another\*(Aqs problems; the status is the worst seen.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

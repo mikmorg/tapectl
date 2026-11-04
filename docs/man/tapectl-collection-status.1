@@ -2,11 +2,15 @@
 .el .ds Aq '
 .TH tapectl-collection-status 1  "tapectl-collection-status " 
 .SH NAME
-tapectl\-collection\-status \- Show pending/dirty/missing/under\-copied counts for every configured collection
+tapectl\-collection\-status \- Show each configured collection\*(Aqs pending, staged, under\-copied and missing units
 .SH SYNOPSIS
 \fBtapectl collection status\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Show pending/dirty/missing/under\-copied counts for every configured collection
+Show each configured collection\*(Aqs pending, staged, under\-copied and missing units
+.PP
+Pending is a unit never archived or dirty (changed since its last version); staged is a version waiting in staging for a copy it is still owed, which `volume write` writes.
+.PP
+Exit status: 0 = clean; 1 = warnings (a unit refused, an entry outside every unit, a unit missing); 2 = errors (a root that is not absolute or does not exist, a tenant or archive set that does not exist). Every collection is shown whatever another\*(Aqs problems; the status is the worst seen.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

@@ -38,11 +38,17 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .SH SUBCOMMANDS
 .TP
+tapectl\-collection\-add(1)
+Add a collection: a folder whose subfolders are each a unit of one tenant
+.TP
+tapectl\-collection\-remove(1)
+Take a collection out of config.toml; its units stay registered and untouched
+.TP
 tapectl\-collection\-sync(1)
 Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
 .TP
 tapectl\-collection\-status(1)
-Show pending/dirty/missing/under\-copied counts for every configured collection
+Show each configured collection\*(Aqs pending, staged, under\-copied and missing units
 .TP
 tapectl\-collection\-plan(1)
 Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units
