@@ -166,3 +166,53 @@ fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
         "a refused poll records no contact"
     );
 }
+
+/// ADR-0012 item 219: `drive add` reads the drive's generation from the
+/// attached drive, so `--generation` is needed only when no drive is attached
+/// at the node (here, a path that does not exist): left out, the add is
+/// refused naming the flag, and the config is not touched; given, the drive is
+/// added as before.
+#[test]
+fn drive_add_without_generation_for_a_detached_drive_names_the_flag() {
+    const DETACHED: &str = "/nonexistent/tapectl-drive-poll-test/nst-detached-219";
+    let home = TempDir::new().unwrap();
+    ok(&run(home.path(), &["init"]), "init");
+    let config = home.path().join(".tapectl/config.toml");
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let out = run(
+        home.path(),
+        &["drive", "add", "--name", "lto0", "--device-tape", DETACHED],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("no drive is attached") && stderr.contains("--generation"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "a refused add leaves the config as it was"
+    );
+
+    ok(
+        &run(
+            home.path(),
+            &[
+                "drive",
+                "add",
+                "--name",
+                "lto0",
+                "--device-tape",
+                DETACHED,
+                "--generation",
+                "LTO-6",
+            ],
+        ),
+        "drive add with --generation",
+    );
+    assert!(std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("generation = \"LTO-6\""));
+}

@@ -256,7 +256,14 @@ pub fn parse_sg_logs_identity_header(raw: &str) -> Option<DriveIdentity> {
 /// `sg_inq` all just leave fields `None`, and a `DriveIdentity` with no
 /// serial records no row ([`upsert`]).
 pub fn read_identity(backend: &LtoBackendConfig) -> DriveIdentity {
-    let dir = sysfs_device_dir(&backend.device_tape);
+    read_identity_at(&backend.device_tape, Some(&backend.device_sg))
+}
+
+/// [`read_identity`] for a drive named by its nodes alone — `drive add`,
+/// which has no backend yet (ADR-0012 item 219). `device_sg` is only the
+/// serial's fallback route; `None` (or empty) skips it.
+pub fn read_identity_at(device_tape: &str, device_sg: Option<&str>) -> DriveIdentity {
+    let dir = sysfs_device_dir(device_tape);
     let mut identity = dir
         .as_deref()
         .and_then(read_sysfs_triple)
@@ -269,12 +276,55 @@ pub fn read_identity(backend: &LtoBackendConfig) -> DriveIdentity {
         .and_then(parse_vpd_page80)
         .or_else(|| {
             // No sg node to ask (issue #431: undeclared and underivable).
-            Some(&backend.device_sg)
+            device_sg
                 .filter(|sg| !sg.is_empty())
-                .and_then(|sg| read_sg_inq_serial(sg))
+                .and_then(read_sg_inq_serial)
         });
 
     identity
+}
+
+/// The identity of the drive ATTACHED at `device_tape`, for `drive add`
+/// (ADR-0012 item 219): `None` when the node does not exist on this machine.
+///
+/// The existence check is the point. [`sysfs_device_dir`] falls back to the
+/// path's own basename, harmless where a configured backend names its own
+/// drive and wrong here, where it would SELECT one: a misspelled or detached
+/// `.../nst3` would read the real `nst3`'s model and declare the wrong
+/// drive's generation ([`derive_sg_for`]'s reasoning). Read from sysfs, the
+/// kernel's record of the drive's INQUIRY: no SCSI command is sent.
+pub fn attached_identity(device_tape: &str) -> Option<DriveIdentity> {
+    if !Path::new(device_tape).exists() {
+        return None;
+    }
+    Some(read_identity_at(device_tape, None))
+}
+
+/// The LTO generation a drive's INQUIRY product string (its model) names
+/// (ADR-0012 item 219), for `drive add`. `None` for a model tapectl does not
+/// know, which then needs `--generation`.
+///
+/// - HP: `Ultrium N-SCSI` (the real LTO-6 is `Ultrium 6-SCSI`);
+/// - IBM: `ULT3580-TDN` (full height) and `ULT3580-HHN` (half height), and
+///   the `ULTRIUM-TDN`/`ULTRIUM-HHN` spelling older and OEM drives give;
+/// - mhvtl emulates these (`ULT3580-TD8`, `ULT3580-TD6`, `Ultrium 5-SCSI`).
+///
+/// Case and the SCSI field's space padding are ignored. N must be a
+/// generation tapectl knows (LTO-1 to LTO-10).
+pub fn generation_from_model(model: &str) -> Option<crate::media::Generation> {
+    let model = model.trim().to_ascii_uppercase();
+    let digits = if let Some(rest) = model.strip_prefix("ULTRIUM ") {
+        rest.strip_suffix("-SCSI")?
+    } else {
+        ["ULT3580-TD", "ULT3580-HH", "ULTRIUM-TD", "ULTRIUM-HH"]
+            .iter()
+            .find_map(|prefix| model.strip_prefix(prefix))?
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    crate::media::Generation::parse(&format!("LTO-{n}"))
 }
 
 /// The kernel's sysfs directory for the tape node `device_tape` names.
@@ -582,6 +632,63 @@ mod tests {
     /// The older mhvtl capture, whose first line IS the identity header (no
     /// recorded shell echo) — the shape a real `raw_log` has.
     const PAGE_02_NO_ECHO: &str = include_str!("../../tests/fixtures/sg_logs/page_0x02.txt");
+
+    /// ADR-0012 item 219: `drive add` reads the generation from the model
+    /// string, every spelling the brief names, the recorded drives' among
+    /// them; anything else is unknown (and needs `--generation`).
+    #[test]
+    fn the_generation_is_read_from_each_known_model_string() {
+        use crate::media::Generation;
+        for (model, want) in [
+            ("Ultrium 6-SCSI", Generation::Lto6),
+            ("Ultrium 6-SCSI    ", Generation::Lto6),
+            ("ULTRIUM 8-SCSI", Generation::Lto8),
+            ("Ultrium 5-SCSI", Generation::Lto5),
+            ("ULT3580-TD8", Generation::Lto8),
+            ("ULT3580-TD8     ", Generation::Lto8),
+            ("ULT3580-TD6", Generation::Lto6),
+            ("ULT3580-HH7", Generation::Lto7),
+            ("ULT3580-HH9", Generation::Lto9),
+            ("ULTRIUM-TD3", Generation::Lto3),
+            ("ULTRIUM-HH6", Generation::Lto6),
+            ("ult3580-td10", Generation::Lto10),
+        ] {
+            assert_eq!(generation_from_model(model), Some(want), "{model:?}");
+        }
+        for model in [
+            "",
+            "SDLT600",
+            "Ultrium 6",
+            "Ultrium -SCSI",
+            "Ultrium 11-SCSI",
+            "ULT3580-TD",
+            "ULT3580-TD8X",
+            "ULT3592-TD8",
+            "LTO-6 HH",
+            "VIRTUAL-TAPE",
+        ] {
+            assert_eq!(generation_from_model(model), None, "{model:?}");
+        }
+        // The recorded drives: the mhvtl capture's sysfs model, the real HP's
+        // sg_logs header.
+        let mhvtl = parse_sysfs_triple(SYSFS).unwrap().model.unwrap();
+        assert_eq!(generation_from_model(&mhvtl), Some(Generation::Lto8));
+        let hp = parse_sg_logs_identity_header(HP_PAGE_02)
+            .unwrap()
+            .model
+            .unwrap();
+        assert_eq!(generation_from_model(&hp), Some(Generation::Lto6));
+    }
+
+    /// A node that does not exist identifies no drive: never another
+    /// drive's sysfs entry by its basename.
+    #[test]
+    fn a_tape_node_that_does_not_exist_is_no_attached_drive() {
+        assert_eq!(
+            attached_identity("/nonexistent/tapectl-drive-add-test/nst0"),
+            None
+        );
+    }
 
     /// Decode the one-line hex the `vpd_pg80` fixture is stored as (it was
     /// captured with `xxd -p`). Test-only: production reads the raw bytes.

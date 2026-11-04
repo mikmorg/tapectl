@@ -67,8 +67,15 @@ pub enum DriveCommands {
         /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
         /// drive declares only what it can write; the medium's actual
         /// generation is detected at `volume init`, not declared here).
+        ///
+        /// Read from the attached drive's model when left out (ADR-0012 item
+        /// 219): HP `Ultrium N-SCSI`, IBM `ULT3580-TDN` and `ULT3580-HHN`,
+        /// as the kernel records them; no command is sent to the drive.
+        /// Needed when the drive is not attached or its model is not one
+        /// tapectl knows. Given for an attached drive, it must agree with the
+        /// model.
         #[arg(long)]
-        generation: String,
+        generation: Option<String>,
         /// Capacity override — for virtual drives (mhvtl) and test
         /// harnesses only. A real drive's capacity follows the loaded
         /// cartridge's detected generation (ADR-0010); leave this unset.
@@ -278,6 +285,91 @@ pub enum CleaningCartridgeCommands {
     },
 }
 
+/// The generation `drive add` writes, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedGeneration {
+    /// As given, or the canonical form read from the drive; `drive add`'s
+    /// own validation canonicalises and checks it.
+    pub generation: String,
+    /// The line saying it was read from the attached drive's model, when it
+    /// was.
+    pub read_from: Option<String>,
+}
+
+/// `drive add`'s generation (ADR-0012 item 219): `--generation` when given,
+/// else read from the attached drive's model
+/// ([`drive_identity::generation_from_model`]). `attached` is the drive's
+/// identity, `None` when no drive is attached at `device_tape`.
+///
+/// - A model tapectl knows, and no `--generation`: that generation.
+/// - `--generation` naming a drive generation the model contradicts: refused,
+///   naming both, since the flag or the node is wrong and tapectl cannot
+///   tell which.
+/// - No drive attached, or a model tapectl does not know: `--generation` is
+///   needed, and its absence is refused naming it.
+///
+/// Pure, so each case is testable without a drive.
+pub fn drive_generation(
+    device_tape: &str,
+    declared: Option<&str>,
+    attached: Option<&DriveIdentity>,
+) -> Result<AddedGeneration> {
+    let model = attached.and_then(|d| d.model.as_deref());
+    let read = model.and_then(drive_identity::generation_from_model);
+    let described = |model: &str| match attached.and_then(|d| d.vendor.as_deref()) {
+        Some(vendor) => format!("{vendor} {model}"),
+        None => model.to_string(),
+    };
+    match (declared, read, model) {
+        (Some(declared), Some(read), Some(model)) => {
+            // Only a value `drive add` would accept is compared: anything
+            // else is refused by its own validation, with its own words.
+            let parsed = crate::config::validate_drive_generation(declared)
+                .ok()
+                .and_then(|_| crate::media::Generation::parse(declared));
+            if parsed.is_some_and(|g| g != read) {
+                return Err(TapectlError::Other(format!(
+                    "--generation {declared} contradicts the drive attached at {device_tape}: \
+                     its model, {}, is an {read} drive. A drive declares the generation it \
+                     is; leave --generation out to take the drive's, or check that \
+                     --device-tape names the drive you mean.",
+                    described(model)
+                )));
+            }
+            Ok(AddedGeneration {
+                generation: declared.to_string(),
+                read_from: None,
+            })
+        }
+        (Some(declared), _, _) => Ok(AddedGeneration {
+            generation: declared.to_string(),
+            read_from: None,
+        }),
+        (None, Some(read), Some(model)) => Ok(AddedGeneration {
+            generation: read.as_str().to_string(),
+            read_from: Some(format!(
+                "generation {read}, read from the drive attached at {device_tape} (model {})",
+                described(model)
+            )),
+        }),
+        (None, _, Some(model)) => Err(TapectlError::Other(format!(
+            "drive add: the drive attached at {device_tape} reports the model {}, which is \
+             not one tapectl reads a generation from. Give the generation it writes: \
+             --generation LTO-N.",
+            described(model)
+        ))),
+        (None, _, None) if attached.is_some() => Err(TapectlError::Other(format!(
+            "drive add: the drive attached at {device_tape} gave no model to read its \
+             generation from. Give the generation it writes: --generation LTO-N."
+        ))),
+        (None, _, None) => Err(TapectlError::Other(format!(
+            "drive add: no drive is attached at {device_tape} on this machine to read its \
+             generation from. Give the generation it writes: --generation LTO-N (a drive may \
+             be added before it is attached)."
+        ))),
+    }
+}
+
 /// Exit 1: the reading was recorded and the drive reported a problem.
 pub const EXIT_DRIVE_REPORTED_PROBLEM: i32 = 1;
 
@@ -304,12 +396,17 @@ pub fn run(
             capacity_override,
             enospc_buffer,
         } => {
+            let attached = drive_identity::attached_identity(device_tape);
+            let added = drive_generation(device_tape, generation.as_deref(), attached.as_ref())?;
+            if let Some(read) = &added.read_from {
+                eprintln!("{read}");
+            }
             crate::cli::backend::add(
                 paths,
                 name,
                 device_tape,
                 device_sg.as_deref(),
-                generation,
+                &added.generation,
                 capacity_override.as_deref(),
                 enospc_buffer.as_deref(),
                 json_output,
@@ -1691,7 +1788,11 @@ pub fn eject(
         .as_deref()
         .and_then(|serial| cartridge_facts(conn, serial));
     let what = match (&report.cartridge, &report.chip_serial) {
-        (Some(c), Some(serial)) => format!("cartridge {} (chip {serial})", c.barcode),
+        // ADR-0012 item 219: the volume it carries, by name.
+        (Some(c), Some(serial)) => match volumes_named(c) {
+            Some(volumes) => format!("cartridge {} (chip {serial}; {volumes})", c.barcode),
+            None => format!("cartridge {} (chip {serial})", c.barcode),
+        },
         (None, Some(serial)) => {
             format!("a cartridge whose chip serial {serial} is not registered in this catalog")
         }
@@ -1857,19 +1958,51 @@ fn render_eject(report: &EjectReport, json_output: bool) {
     }
 }
 
+/// `volume L6-0001`, or `volumes L6-0001, L6-0002`: the volumes with an open
+/// mount on the cartridge, for the eject's line; `None` when it carries none.
+fn volumes_named(c: &CartridgeFacts) -> Option<String> {
+    match c.volumes.as_slice() {
+        [] => None,
+        [one] => Some(format!("volume {}", one.label)),
+        many => Some(format!(
+            "volumes {}",
+            many.iter()
+                .map(|v| v.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Where the ejected cartridge belongs (ADR-0012 item 219): the place the
+/// catalog records for it and its volumes (ADR-0011 keeps the two together),
+/// or that it has none, with the command that records one.
+fn belongs_line(c: &CartridgeFacts) -> String {
+    let what = match c.volumes.as_slice() {
+        [one] => one.label.clone(),
+        _ => format!("cartridge {}", c.barcode),
+    };
+    match c.location.as_deref() {
+        Some(at) => format!(
+            "  {what} belongs at {at}: take it there. Its volumes stay bound to the \
+             cartridge; if it is going elsewhere: tapectl cartridge move {} --to <location>",
+            c.barcode
+        ),
+        None => format!(
+            "  {what} has no recorded place: say where it goes with tapectl cartridge move {} \
+             --to <location>. Its volumes stay bound to the cartridge.",
+            c.barcode
+        ),
+    }
+}
+
 /// The human form of an eject.
 pub fn eject_text(report: &EjectReport) -> String {
     use std::fmt::Write;
     let mut out = format!("{}\n", report.message);
     if report.outcome == EjectOutcome::Ejected {
         if let Some(c) = &report.cartridge {
-            let _ = writeln!(
-                out,
-                "  it is recorded at {}; its volumes stay bound to it. If it is going \
-                 elsewhere: tapectl cartridge move {} --to <location>",
-                c.location.as_deref().unwrap_or("(no place)"),
-                c.barcode
-            );
+            let _ = writeln!(out, "{}", belongs_line(c));
         }
         if let Some(cid) = report.contact_id {
             let _ = writeln!(out, "  recorded as contact {cid} (tapectl cartridge info)");
@@ -3213,6 +3346,139 @@ mod tests {
             text.contains("ejected cartridge CART01L6") && text.contains("cartridge move CART01L6"),
             "{text}"
         );
+        // ADR-0012 item 219: the volume it unloads, and where it belongs.
+        assert!(
+            text.contains("ejected cartridge CART01L6 (chip EW7VWMVKF6; volume L6-0001)"),
+            "{text}"
+        );
+        assert!(text.contains("L6-0001 has no recorded place"), "{text}");
+    }
+
+    fn drive_with_model(vendor: &str, model: &str) -> DriveIdentity {
+        DriveIdentity {
+            serial: Some("HUJ808A5L4".into()),
+            vendor: Some(vendor.into()),
+            model: Some(model.into()),
+            firmware_rev: None,
+        }
+    }
+
+    /// ADR-0012 item 219: `drive add` reads the generation from an attached
+    /// drive's model and needs `--generation` only when it cannot.
+    #[test]
+    fn drive_add_reads_the_generation_from_the_attached_drive() {
+        const NODE: &str = "/dev/tape/by-id/scsi-HUJ808A5L4-nst";
+        let hp = drive_with_model("HP", "Ultrium 6-SCSI");
+        let got = drive_generation(NODE, None, Some(&hp)).unwrap();
+        assert_eq!(got.generation, "LTO-6");
+        assert!(
+            got.read_from.as_deref().is_some_and(
+                |l| l.contains("read from the drive") && l.contains("HP Ultrium 6-SCSI")
+            ),
+            "{got:?}"
+        );
+        let td8 = drive_with_model("IBM", "ULT3580-TD8");
+        assert_eq!(
+            drive_generation(NODE, None, Some(&td8)).unwrap().generation,
+            "LTO-8"
+        );
+
+        // Given and agreeing: taken as given, said nothing about.
+        let got = drive_generation(NODE, Some("lto6"), Some(&hp)).unwrap();
+        assert_eq!((got.generation.as_str(), got.read_from), ("lto6", None));
+    }
+
+    /// The contradiction refuses naming both; an unknown model or no drive
+    /// needs `--generation`, which is then taken as given.
+    #[test]
+    fn drive_add_refuses_a_contradiction_and_needs_the_flag_for_an_unknown_drive() {
+        const NODE: &str = "/dev/nst0";
+        let hp = drive_with_model("HP", "Ultrium 6-SCSI");
+        let err = drive_generation(NODE, Some("LTO-5"), Some(&hp))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--generation LTO-5 contradicts")
+                && err.contains("HP Ultrium 6-SCSI")
+                && err.contains("LTO-6"),
+            "{err}"
+        );
+        // A value drive add refuses for its own reasons is left to it.
+        assert_eq!(
+            drive_generation(NODE, Some("LTO-7-M8"), Some(&hp))
+                .unwrap()
+                .generation,
+            "LTO-7-M8"
+        );
+
+        let odd = drive_with_model("QUANTUM", "SDLT600");
+        let err = drive_generation(NODE, None, Some(&odd))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("QUANTUM SDLT600") && err.contains("--generation"),
+            "{err}"
+        );
+        assert_eq!(
+            drive_generation(NODE, Some("LTO-6"), Some(&odd))
+                .unwrap()
+                .generation,
+            "LTO-6"
+        );
+
+        let err = drive_generation(NODE, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("no drive is attached") && err.contains("--generation"),
+            "{err}"
+        );
+        assert_eq!(
+            drive_generation(NODE, Some("LTO-6"), None)
+                .unwrap()
+                .generation,
+            "LTO-6"
+        );
+        let blank = DriveIdentity::default();
+        let err = drive_generation(NODE, None, Some(&blank))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gave no model"), "{err}");
+    }
+
+    /// ADR-0012 item 219: `drive eject` names the volume it unloads and the
+    /// place the catalog records for it.
+    #[test]
+    fn the_eject_names_the_volume_and_where_it_belongs() {
+        let mut c = CartridgeFacts {
+            barcode: "L6-0001".into(),
+            status: "in_use".into(),
+            media_type: "LTO-6".into(),
+            location: Some("offsite".into()),
+            volumes: vec![VolumeFacts {
+                label: "L6-0001".into(),
+                status: "sealed".into(),
+            }],
+        };
+        assert_eq!(volumes_named(&c).as_deref(), Some("volume L6-0001"));
+        let line = belongs_line(&c);
+        assert!(
+            line.contains("L6-0001 belongs at offsite: take it there"),
+            "{line}"
+        );
+        assert!(
+            line.contains("tapectl cartridge move L6-0001 --to"),
+            "{line}"
+        );
+        c.volumes.push(VolumeFacts {
+            label: "L6-0009".into(),
+            status: "initialized".into(),
+        });
+        assert_eq!(
+            volumes_named(&c).as_deref(),
+            Some("volumes L6-0001, L6-0009")
+        );
+        assert!(belongs_line(&c).contains("cartridge L6-0001 belongs at offsite"));
+        c.volumes.clear();
+        assert_eq!(volumes_named(&c), None);
     }
 
     /// An eject with the backend in the config, so its post-command sweep
