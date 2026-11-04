@@ -2585,8 +2585,9 @@ rr_volinit_volh_on_reused_cartridge_succeeds() {
 
 scenario_retire_and_reuse() {
     check rr.setup bootstrap_archive_v1 VOL-A
-    # The barcode is whatever `volume init` bound (the MAM medium serial when
-    # one is readable), NOT the changer's VolumeTag - ADR-0010.
+    # The barcode is whatever `volume init` bound (a cartridge it registers
+    # takes the volume's label, ADR-0012 item 219; the MAM medium serial stays
+    # its identity), NOT the changer's VolumeTag - ADR-0010.
     if [ "$DRY_RUN" = 1 ]; then
         RR_VOLA_BARCODE="$LOADED_TAG"
     else
