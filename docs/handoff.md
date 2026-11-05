@@ -779,10 +779,14 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
 
 7. **Copy 1.** Tell the coordinator first, about 15 minutes ahead, so vm-desk1's builds hold and
    home2 stays quiet while the drive writes (item 202).
-   Load L6-0001 and run:
+   Load L6-0001 and run it with the drive-poll timer stopped: the upgrade installed the timers
+   again, and step 13 does not stop the poll (only step 12's rehearsal does, item
+   190), so a daily poll could reach for the drive mid-write:
 
    ```bash
+   sudo systemctl stop tapectl-drive-poll.timer
    scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13 --label L6-0001 --location home2-rack
+   sudo systemctl start tapectl-drive-poll.timer
    ```
 
    - Step 13 snapshots every keepsake unit, stages them (two at a time, `STAGING_JOBS`), shows
@@ -834,7 +838,9 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
     - delete the old state: `sudo rm -rf /srv/archive_meta/tapectl/.tapectl-old /srv/local_backup/tapectl-old /var/backups/tapectl-old`;
     - delete `~/heir-kit`, the stray kit from (f);
     - delete the rollback binaries `/usr/local/bin/tapectl-1.5.0` ((h)'s) and
-      `/usr/local/bin/tapectl-1.8.0` (step 0's): no catalog either of them wrote remains;
+      `/usr/local/bin/tapectl-1.8.0` (step 0's): no catalog either of them wrote remains.
+      Keep `/usr/local/bin/tapectl-1.8.1`, the 1.9.0 upgrade's rollback, until 1.9.0 has run a
+      while: 1.9.0 has no migration, so 1.8.1 still opens this catalog;
     - give `parents` and `family` their new key files, since the old ones open only the erased tapes;
     - with a new escrow identity, destroy the old paper.
 

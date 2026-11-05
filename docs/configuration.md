@@ -166,10 +166,8 @@ file beside it.
   error: configuration error: config set defaults.slice_size refused (~/.tapectl/config.toml is unchanged): defaults.slice_size = configuration error: "2X" is not a valid size: a number with an optional unit, such as 2500G, 500M, 512MiB or a bare byte count (K, M, G and T are binary here)
   ```
 
-  `slice_size` is the exception: its value goes to dar as it is written, and dar
-  reads only a whole number with `K`, `M`, `G` or `T`. Write it so (`1G`, `512M`):
-  `1.5G` or `512MiB` passes `config check` and `config set`, and then every
-  `stage create` fails at dar (`dar could not write a slice template at -s 512MiB`).
+  `slice_size` takes every one of these forms: tapectl hands dar the byte count,
+  so `1.5G` and `512MiB` cut slices of exactly that size.
 
 **Adding array tables by hand.** Append `[[archive_sets]]`, `[[collections]]` and
 `[[backends.lto]]` tables to the end of the file. A `config.toml` written by this
@@ -1190,7 +1188,7 @@ home: /srv/tapectl (named by TAPECTL_HOME)
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
-note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`
+note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
 defaults: verify_interval_days = 365 (`audit` warns when a unit has gone longer without a passing full `volume verify`; an archive set that names its own interval overrides this for its units)
 ```
 

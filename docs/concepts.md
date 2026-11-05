@@ -669,7 +669,7 @@ VIOLATIONS (4):
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
 ACTION PLAN (2 fixes):
-  fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
+  fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
 audit: 4 violations, 1 warning (exit 2)
 ```

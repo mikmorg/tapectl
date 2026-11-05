@@ -268,7 +268,7 @@ home: ~/.tapectl (this account's ~/.tapectl)
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
-note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`
+note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
 defaults: verify_interval_days = 365 (`audit` warns when a unit has gone longer without a passing full `volume verify`; an archive set that names its own interval overrides this for its units)
 ```
 
@@ -533,7 +533,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, … bytes, sha256 … (named on the sheet)
+  tapectl-1.9.0    the program that made this kit, …, sha256 … (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -1925,7 +1925,7 @@ when the drive declares `post_warning_bytes`):
 
 ```text
 $ tapectl stage for-location offsite --volume L6-0007 --dry-run
-stage for-location offsite --volume L6-0007: 3 unit(s), 1.5 MiB, against the volume's 2.21 TiB under its fill ceiling (dry run: nothing was snapshotted or staged)
+stage for-location offsite --volume L6-0007: 3 units, 1.5 MiB, against the volume's 2.21 TiB under its fill ceiling (dry run: nothing was snapshotted or staged)
   "family/letters" (new version): group 1: 0 of its target 2 at offsite, 0 copies in all; 512.0 KiB — to snapshot and stage (never archived)
   "family/photos" (new version): group 2: 0 of its copy floor 2, none at offsite; 512.0 KiB — to snapshot and stage (never archived)
   "media/music" (new version): group 2: 0 of its copy floor 2, none at offsite; 512.0 KiB — to snapshot and stage (never archived)
@@ -2130,7 +2130,7 @@ VIOLATIONS (4):
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
 ACTION PLAN (2 fixes):
-  fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
+  fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
 audit: 4 violations, 1 warning (exit 2)
 ```
@@ -2144,7 +2144,7 @@ a unit whose staging is gone gets the `volume read-slices` that brings it back.
 map, an archive set's `required_locations` counted as one copy at each name),
 by name, with where its copies actually are: a missing place reads
 `no copy at required location offsite (policy requires home-rack, offsite; copies are in 1 location)`,
-and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A target
+and its fix ends in `--move-to offsite`. A target
 above one names its count: `has 1 copy at required location offsite, needs 2
 (policy requires 1 at home-rack, 2 at offsite)`. A `required_locations` name that
 is not a registered location counts as missing; a `copies_at` name that is not one
@@ -3296,7 +3296,7 @@ judged: the copies, and the copies at each named location — two at `offsite` a
 Tier-2 consent as `mark-tape-only`: a terminal asks, `--force` or `--yes`
 confirms in advance, and a session with no terminal and neither flag refuses,
 naming it (for example
-`superseding v2 has no copy at required location(s) offsite (policy requires home-rack, offsite)`).
+`superseding v2 has no copy at required location offsite (policy requires home-rack, offsite)`).
 
 `--force` accepts a shortfall; it does not skip the check. When a superseding
 version exists, the unit's policy is resolved before any coverage is checked,

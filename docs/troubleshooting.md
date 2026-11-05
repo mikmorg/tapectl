@@ -572,9 +572,9 @@ See [configuration.md](configuration.md#archive_sets).
 
 ```text
 error: configuration error: no LTO drive configured — tapectl does not know what tape drive to use. Add it with
-`tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6` (`ls -l
-/dev/tape/by-id/` lists the drives), which writes its [[backends.lto]] table to ~/.tapectl/config.toml; the
-commented example `tapectl init` left there is the same table by hand
+`tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst` (`ls -l /dev/tape/by-id/` lists
+the drives; the generation is read from its model), which writes its [[backends.lto]] table to
+~/.tapectl/config.toml; the commented example `tapectl init` left there is the same table by hand
 ```
 
 Every write path (`volume init`, `volume write`, `volume resume`,
@@ -1125,7 +1125,7 @@ With compression on, the bracket reads `(less if its data may compress
 (compression = "<algorithm>"))`. When other stages are running at the same time
 (`stage create --jobs`, `collection run --jobs`, or another `stage create`),
 what they may still write is not free for this unit, and the free figure says so:
-`… 40.0 GiB free (12.5 GiB of it may still be written by 2 other stage(s) running
+`… 40.0 GiB free (12.5 GiB of it may still be written by 2 other stages running
 now), and staging it needs …`.
 
 A terminal is asked `stage unit "<unit>" — proceed? [y/N]`. A non-interactive
@@ -3480,7 +3480,7 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 |---|---|---|---|
 | `copy_count` | violation | `has <n> copies, needs <m>` (`has 1 copy` for one); at 0 copies with no current version on tape, it ends with what there is instead: `: never archived`, `: never written to tape (v<n> snapshotted, not yet staged)`, `(v<n> staged, awaiting a write)` or `(v<n> was staged, and its staging released unwritten)` | Fewer sealed, in-service copies of the unit's current Version than its copy floor (the larger of its `min_copies` and its `copies_at` sum). A unit is as covered as its least-covered live Version. From 1.7.0 a Version held across cartridges is as covered as its least-covered slice: a tape holding a range of it counts only together with tapes holding its other slices (ADR-0012 item 127). For a tape-only unit `<m>` is the copy floor times `[compaction] tape_only_safety_multiplier`, and the message ends `(tape-only <k>x)` (ADR-0012, 2026-10-12). From 1.9.0 a unit no tape holds yet is reported here once, worded as above, and `no_archive` stays quiet. Fix: write another volume. For a unit never written, the `fix:` line is the one copy loop, `tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>`, after a `snapshot create` and `stage create` where nothing is staged; for a further copy it is `volume init` then `volume write`, and it re-stages or `read-slices` first when the staged data is gone. |
 | `location_presence` | violation | `no copy at required location <name> (policy requires <list>; copies are in <n> locations)` (`locations <names>` for several) | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. For a tape-only unit each named location needs `[compaction] tape_only_safety_multiplier` copies; one short of it reads `has <n> copy at required location <name>, needs <m> (tape-only <m>x) (policy requires <list>)`. |
-| `location_count` | violation | `has copies in <n> location(s), needs <m> ([defaults] min_locations)` | A tape-only unit's current Version sits in fewer distinct places than `[defaults] min_locations` (the fewest across its current Versions; a recorded warehouse deposit is a place; the multiplier never raises it, so there is no `(tape-only Nx)` note). Fix: write another copy, or move one to a place that holds none, as the `fix:` line spells out; it ends `&& tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>`. |
+| `location_count` | violation | `has copies in <n> locations, needs <m> ([defaults] min_locations)` | A tape-only unit's current Version sits in fewer distinct places than `[defaults] min_locations` (the fewest across its current Versions; a recorded warehouse deposit is a place; the multiplier never raises it, so there is no `(tape-only Nx)` note). Fix: write another copy, or move one to a place that holds none, as the `fix:` line spells out; it ends `&& tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>`. |
 | `warehouse_copies` | violation | `has <n> warehouse deposits, needs <m>` | The policy asks for cold-cloud deposits (`warehouse_copies > 0`). Fix: the deposit procedure in the [operator guide](operator-guide.md#warehouse-copies-cold-cloud), then `volume deposit add`. |
 | `encryption` | violation | `<n> unencrypted stage sets on tape, policy requires encryption` | Something on tape was written unencrypted (only possible with data from very old versions). Fix: re-stage and rewrite, as the `fix:` line spells out. |
 | `policy_unresolvable` | violation | `policy could not be resolved (<why>); copy_count/location_presence/verify_age/encryption checks were SKIPPED for this unit` | The unit's policy chain (dotfile > archive set > `[defaults]`) is broken, so **no** check ran for it. The `fix:` line names the layer at fault: the unit's `.tapectl-unit.toml`, its archive set, or `[defaults]`. |

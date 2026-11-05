@@ -140,7 +140,7 @@ home: ~/.tapectl (this account's ~/.tapectl)
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
-note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`
+note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
 defaults: verify_interval_days = 365 (`audit` warns when a unit has gone longer without a passing full `volume verify`; an archive set that names its own interval overrides this for its units)
 ```
 
@@ -477,7 +477,7 @@ VIOLATIONS (4):
 WARNINGS (1):
   [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
 ACTION PLAN (2 fixes):
-  fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
+  fix: tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
   fix: tapectl key escrow-kit <DIR> — for archive
 audit: 4 violations, 1 warning (exit 2)
 ```
@@ -485,8 +485,8 @@ audit: 4 violations, 1 warning (exit 2)
 Without `--action-plan`, `audit` prints the findings and points at it. One copy is
 not enough. The staged slices are still on disk (each unit keeps its staging until a
 write brings it to its copy floor, and this is the first of two copies), so the second
-copy is just another cartridge, and the same one command as the first: the fix's
-`volume init` and `volume write` are what `volume write --init` runs. With L8-0001 out
+copy is just another cartridge, and the same one command as the first, the one the
+fix names. With L8-0001 out
 of the drive and on its shelf, load a second **blank** one: `--init` refuses any tape
 that already carries a volume label, and on a sealed tape `--force` does not change
 that.
@@ -645,7 +645,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, … bytes, sha256 … (named on the sheet)
+  tapectl-1.9.0    the program that made this kit, …, sha256 … (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)

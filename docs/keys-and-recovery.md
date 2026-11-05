@@ -454,7 +454,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
+  tapectl-1.9.0    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
