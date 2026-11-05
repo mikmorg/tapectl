@@ -644,7 +644,7 @@ write path checks the pairing against the kernel's own binding and refuses on
 a proven mismatch:
 
 ```text
-error: configuration error: refusing to resolve an LTO backend for a write: backend "<name>": device_sg =
+error: configuration error: refusing to resolve an LTO drive for a write: drive "<name>": device_sg =
 <configured> is not the drive device_tape = <device> names — the kernel binds that tape node to <bound>. Its
 cartridge chip (MAM) and log pages would be read from a different device (/dev/sgN numbering moves across
 reboots). Set device_sg = "<bound>" in this [[backends.lto]] entry, or remove the device_sg line and tapectl
@@ -674,7 +674,7 @@ With no `device_sg` line, tapectl derives the node from `device_tape`. Where the
 kernel names no node for it, a drive command refuses by name:
 
 ```text
-backend "<name>": device_sg is not set and cannot be derived from device_tape = <path> — …
+drive "<name>": device_sg is not set and cannot be derived from device_tape = <path> — …
 ```
 
 The rest of the message says why: the path does not exist on this machine (is the
