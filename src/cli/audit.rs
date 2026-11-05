@@ -695,16 +695,15 @@ impl<'a> Dest<'a> {
         }
     }
 
-    /// The end of a recipe that initialises `label` and writes it: the move
-    /// to the named place, if any, then the note.
-    fn move_step(&self, label: &str) -> String {
-        match self.location {
-            Some(location) => format!(
-                " && tapectl volume move {label} --to {location}{}",
-                self.note
-            ),
-            None => self.note.to_string(),
-        }
+    /// The one copy loop (ADR-0012 item 218) onto a second cartridge for a
+    /// unit that has a copy already: init, write, full readback and the
+    /// move to the named place in one command, then the note.
+    fn write_other(&self) -> String {
+        format!(
+            "tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to {}{}",
+            self.location.unwrap_or("<location>"),
+            self.note
+        )
     }
 
     /// The one-command copy of everything staged onto a new cartridge
@@ -776,11 +775,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, dest: &Dest<'_>) -> Re
         ));
     }
 
-    steps.push("tapectl volume init <OTHER-LABEL>".to_string());
-    steps.push(format!(
-        "tapectl volume write <OTHER-LABEL>{}",
-        dest.move_step("<OTHER-LABEL>")
-    ));
+    steps.push(dest.write_other());
     let mut action = steps.join(" && ");
 
     if !stuck.is_empty() {
@@ -879,8 +874,7 @@ fn restage_action(
     for v in versions {
         steps.push(format!("tapectl stage create {} --version {v}", unit.name));
     }
-    steps.push("tapectl volume init <OTHER-LABEL>".to_string());
-    steps.push(format!("tapectl volume write <OTHER-LABEL>{extra}"));
+    steps.push(format!("{}{extra}", Dest::ANYWHERE.write_other()));
     let mut action = steps.join(" && ");
 
     if any_live && under_copied {
@@ -1539,9 +1533,9 @@ fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> 
                     row.modified.len(),
                 ),
                 action: format!(
-                    "tapectl snapshot create {0} && tapectl stage create {0} && \
-                     tapectl volume init <LABEL> && tapectl volume write <LABEL>",
-                    unit.name
+                    "tapectl snapshot create {0} && tapectl stage create {0} && {1}",
+                    unit.name,
+                    Dest::ANYWHERE.write_new()
                 ),
             });
         } else if row.state == "unreadable" {
@@ -2490,8 +2484,9 @@ fn span_in_progress_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
                 ),
                 // The next write plans the slices the span still owes first
                 // (layout-session.md, "The plan order").
-                action: "load a fresh cartridge and run tapectl volume write <LABEL>: it writes \
-                         the slices the span still owes first"
+                action: "load a fresh cartridge and run tapectl volume write <NEW-LABEL> --init \
+                         --full-confirm --move-to <location>: it writes the slices the span \
+                         still owes first"
                     .to_string(),
             }
         })
@@ -2824,7 +2819,7 @@ mod tests {
         assert_eq!(
             finding.action,
             "tapectl volume read-slices photos --from photos-cleaned-SEALED --version 1 && \
-             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
+             tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>",
             "got: {}",
             finding.action
         );
@@ -2855,7 +2850,7 @@ mod tests {
 
         assert_eq!(
             finding.action,
-            "tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
+            "tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>",
             "got: {}",
             finding.action
         );
@@ -3963,7 +3958,7 @@ mod tests {
             assert_eq!(
                 warnings[0].action,
                 "tapectl snapshot create dirty_unit && tapectl stage create dirty_unit && \
-                 tapectl volume init <LABEL> && tapectl volume write <LABEL>"
+                 tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>"
             );
         }
 
@@ -4350,7 +4345,7 @@ mod tests {
             action,
             "tapectl stage clean --unit reels --version 1 --force && \
              tapectl stage create reels --version 1 && \
-             tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> \
+             tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location> \
              (\"reels\" is below its policy's copy floor of 2, so a bare clean would \
              retain its staged bytes -- --force releases them here because the write below \
              creates the required copy)"
@@ -5016,7 +5011,7 @@ mod tests {
             assert!(
                 findings[0]
                     .action
-                    .ends_with("tapectl volume move <OTHER-LABEL> --to offsite"),
+                    .ends_with("--init --full-confirm --move-to offsite"),
                 "the remedy must say where the new copy goes: {}",
                 findings[0].action
             );
@@ -5069,7 +5064,7 @@ mod tests {
             assert!(
                 findings[0]
                     .action
-                    .ends_with("tapectl volume move <OTHER-LABEL> --to home-rack"),
+                    .ends_with("--init --full-confirm --move-to home-rack"),
                 "{}",
                 findings[0].action
             );
@@ -5185,7 +5180,7 @@ mod tests {
             assert!(
                 findings[0]
                     .action
-                    .ends_with("tapectl volume move <OTHER-LABEL> --to garage"),
+                    .ends_with("--init --full-confirm --move-to garage"),
                 "{}",
                 findings[0].action
             );
@@ -5205,7 +5200,7 @@ mod tests {
             );
             assert!(findings[0]
                 .action
-                .ends_with("tapectl volume move <OTHER-LABEL> --to offsite"));
+                .ends_with("--init --full-confirm --move-to offsite"));
 
             // `home-rack`'s copy is not what meets the map: retired, the map
             // is still met once `offsite` holds two.
@@ -5282,7 +5277,7 @@ mod tests {
             assert_eq!(found.len(), 1, "{found:?}");
             assert_eq!(
                 found[0].message,
-                "has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+                "has copies in 1 location, needs 2 ([defaults] min_locations)"
             );
             assert!(
                 !found[0].message.contains("tape-only"),
@@ -5318,7 +5313,7 @@ mod tests {
             assert_eq!(found.len(), 1, "{found:?}");
             assert_eq!(
                 found[0].message,
-                "has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+                "has copies in 1 location, needs 2 ([defaults] min_locations)"
             );
 
             spread_to_two_places(&conn);
@@ -5363,7 +5358,7 @@ mod tests {
             assert_eq!(found.len(), 1, "{found:?}");
             assert_eq!(
                 found[0].message,
-                "has copies in 2 location(s), needs 3 ([defaults] min_locations)"
+                "has copies in 2 locations, needs 3 ([defaults] min_locations)"
             );
         }
 
@@ -5376,7 +5371,7 @@ mod tests {
             assert!(
                 found[0]
                     .action
-                    .ends_with("tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>"),
+                    .ends_with("--init --full-confirm --move-to <OTHER-LOCATION>"),
                 "{}",
                 found[0].action
             );
@@ -7185,7 +7180,9 @@ mod tests {
                  counts no copy, until every slice is on a sealed volume"
             );
             assert!(
-                found[0].action.contains("tapectl volume write <LABEL>"),
+                found[0]
+                    .action
+                    .contains("tapectl volume write <NEW-LABEL> --init --full-confirm"),
                 "{}",
                 found[0].action
             );

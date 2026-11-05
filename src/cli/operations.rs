@@ -972,8 +972,9 @@ pub(crate) fn refuse_last_eligible_copy(
     // Three shapes, because the honest instruction differs and a single
     // hedged paragraph would make the operator work out which half applies
     // to them mid-incident.
+    // The one copy loop (ADR-0012 item 218): init, write and full readback.
     let write_tail =
-        "    tapectl volume init <OTHER-LABEL>\n    tapectl volume write <OTHER-LABEL>";
+        "    tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>";
     let on_disk_branch = match (restage.is_empty(), already_staged.is_empty()) {
         // Nothing left in staging: re-stage from the source, if it is there.
         (false, true) => format!(
@@ -1024,8 +1025,8 @@ pub(crate) fn refuse_last_eligible_copy(
         format!(
             "Make another copy first, then re-run this:\n\
              {copy_out}\n    \
-             tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
-             tapectl volume write <OTHER-LABEL>\n\
+             tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>\n    \
+             (a blank or erased cartridge)\n\
              {on_disk_branch}\
              \n"
         )
@@ -1054,8 +1055,8 @@ pub(crate) fn refuse_last_eligible_copy(
              \"{volume_label}\" holds the only copy of some of {its} slices. The next write \
              takes the slices a span still owes first, from staging (it names the `volume \
              read-slices` command for a slice staging no longer has):\n    \
-             tapectl volume init <OTHER-LABEL>      (a blank or erased cartridge)\n    \
-             tapectl volume write <OTHER-LABEL>\n\
+             tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>\n    \
+             (a blank or erased cartridge)\n\
              then re-run this once every slice on this tape has a copy on another one. With a \
              copy floor of one copy, finishing the span leaves those slices on this tape \
              alone, and giving the version up is the way.\n\
@@ -6869,9 +6870,9 @@ mod tests {
             );
             crate::cli::operations::remedy_commands::assert_names_parsing_commands(
                 &msg,
-                &[("<OTHER-LABEL>", "SPAN-2")],
+                &[("<OTHER-LABEL>", "SPAN-2"), ("<location>", "offsite")],
                 &[
-                    "tapectl volume write SPAN-2",
+                    "tapectl volume write SPAN-2 --init --full-confirm --move-to offsite",
                     "tapectl snapshot mark-reclaimable span --version 1",
                     "tapectl volume verify SPAN-1",
                 ],
@@ -7041,8 +7042,7 @@ mod tests {
                 .to_string();
             for needle in [
                 "tapectl volume read-slices unitA --from L6-TEXT",
-                "tapectl volume init <OTHER-LABEL>",
-                "tapectl volume write <OTHER-LABEL>",
+                "tapectl volume write <OTHER-LABEL> --init --full-confirm --move-to <location>",
                 "tapectl stage create unitA --version 1",
                 "tapectl snapshot mark-reclaimable unitA --version 1",
                 "tapectl volume verify L6-TEXT",
@@ -8302,7 +8302,7 @@ mod tests {
             };
             assert_eq!(
                 reason,
-                "superseding v2 has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+                "superseding v2 has copies in 1 location, needs 2 ([defaults] min_locations)"
             );
 
             let err = snapshot_mark_reclaimable(&conn, &config, name, 1, false, false, false)
