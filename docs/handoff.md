@@ -684,62 +684,152 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
 
 **Paused here, for 1.9.0 (ruled 2026-11-04, ADR-0012 item 205).** Steps 0 to 6 are done
 (2026-11-02 and 2026-11-03; the run record). Copy 1 waits for 1.9.0, the CLI review's release
-(items 198-221). It also carries the scripts batch: #511, the staging diagnosis (item 199),
-`POST_WARNING_BYTES` (item 200) and keepsake out of `home2.profile` (item 204). Before step 7,
-in this order:
+(items 198-221; [releases/1.9.0.md](releases/1.9.0.md)). It also carries the scripts batch:
+#511, the staging diagnosis (item 199), `POST_WARNING_BYTES` (item 200) and keepsake out of
+`home2.profile` (item 204). Before step 7, in this order:
 
-- **Install 1.9.0 with `first-run.sh --upgrade`** on the new home, once `v1.9.0` is tagged,
-  rehearsing on EW7VWMVKF6 as step 0 did. It is a drive step: tell the coordinator first, who
-  sends the broker notice. The command is written here when 1.9.0 lands.
-- **Register keepsake** (item 204). In step 5, `first-run.sh`'s step 11 wrote keepsake's table
-  but its sync was declined, so the new catalog has no units, and step 13 writes only
-  registered ones:
+- **Install 1.9.0 with `first-run.sh --upgrade`** on the new home, once `v1.9.0` is tagged
+  (items 195, 205; `docs/install.md` §10), rehearsing on EW7VWMVKF6 as step 0 did. It is a drive
+  step: tell the coordinator first, who sends the broker notice. Load EW7VWMVKF6 first. The new
+  catalog has never seen it, so the rehearsal takes it. Step 1 uninstalled the timers and
+  `tapectl-op`, and nothing has installed them since, so this comes before any `tapectl-op`
+  line below: its step 6 installs them again, naming the new home.
 
   ```bash
-  sudo -u tapectl -H tapectl collection sync --dry-run   # 27 to create
-  sudo -u tapectl -H tapectl collection sync --yes
+  cd ~/devel/git/tapectl
+  git fetch --tags
+  git checkout v1.9.0
+  scripts/first-run.sh --profile contrib/hosts/home2.profile --upgrade
   ```
 
-- **Copies 1 and 2 run on one loop, `volume write … --full-confirm`** (item 218), with no
-  separate `volume verify --full`. 1.9.0 changes `first-run.sh` step 13 to match and gives a
-  cartridge its volume's label as its barcode (item 219). Steps 7 to 9 below are rewritten for
-  1.9.0's commands when it lands; until then they describe 1.8.1's.
+  In order, it:
+  - backs the new catalog up with 1.8.1 to `/srv/local_backup/tapectl/tapectl-pre-1.9.0.db`;
+  - keeps 1.8.1 as `/usr/local/bin/tapectl-1.8.1`;
+  - builds the release binary and installs it: a few minutes, and sudo asks once;
+  - opens the catalog with it: 1.9.0 has no migration, so the schema stays 41;
+  - runs step 14 (answer yes): the timers, `tapectl-op` naming the new home, and the bash
+    completion and man pages;
+  - stops at 1.9.0's "Upgrading" notes: press Enter;
+  - shows `status`, `audit` and `report failed-stages`;
+  - rehearses on EW7VWMVKF6. It reads the chip first (an empty drive is refused there, before
+    anything is asked), then you type its serial. The drive-poll timer is stopped for it and
+    started again;
+  - regenerates the Heir Kit in `~/tapectl-heir-kit` for the new catalog (answer yes);
+  - takes one backup with 1.9.0;
+  - lists what earlier runs left, by group, and removes a group only if you type `remove`. Keep
+    every group: step 10 below tidies once the new L6-0002 has read back in full. None of
+    the old state (i) keeps until then is in the list;
+  - prints the rollback.
+
+  If the rehearsal is red, stop and send the coordinator its output: 1.9.0 has no migration,
+  so `sudo cp -p /usr/local/bin/tapectl-1.8.1 /usr/local/bin/tapectl` puts 1.8.1 back over the
+  catalog as it is. Then check:
+
+  ```bash
+  git describe --tags                      # v1.9.0
+  tapectl --version                        # tapectl 1.9.0 (v1.9.0, <date>)
+  ls ~/.local/state/tapectl/rehearsal-ok-$(sha256sum /usr/local/bin/tapectl | cut -c1-16)
+  tapectl-op drive eject                   # the test cartridge out
+  ```
+
+- **Look at the new home.** The tenants are in the run record (step 5); the locations are not,
+  and step 13's write now refuses a `--move-to` place the catalog has no row for, before any
+  byte. Step 10 made both of the profile's `LOCATIONS`:
+
+  ```bash
+  tapectl-op status                                    # home: /srv/archive_meta/tapectl/home; units: 0 active
+  tapectl-op tenant list                               # mikmorg, parents, family
+  tapectl-op location list                             # home2-rack and offsite
+  tapectl-op config get post_warning_bytes             # "99008M", set in .../home/config.toml ((i) step 6)
+  tapectl-op config get 'collections[keepsake].root'   # "/srv/keepsake/original-data"
+  tapectl-op config get 'collections[keepsake].tenant' # "family"
+  ```
+
+  If `location list` lacks one, add it as step 10 would, with the profile's description:
+
+  ```bash
+  tapectl-op location add home2-rack -d "the shelf beside the LTO-6 in home2"
+  tapectl-op location add offsite -d "copy 2, away from home2"
+  ```
+
+- **Register keepsake** (item 204). Step 5's run of `first-run.sh` step 11 wrote keepsake's
+  `[[collections]]` table and its grants, but its sync was declined, so the new catalog has no
+  units, and step 13 writes only registered ones:
+
+  ```bash
+  tapectl-op collection sync --dry-run   # collection "keepsake" (dry run): would create 27; ...
+  tapectl-op collection sync
+  tapectl-op collection status           # collection "keepsake": 27 pending (27 never archived) ...
+  ```
+
+  Exit 1 is a warning (a folder refused for its name, an entry outside every unit): read it, it
+  stops nothing. Exit 2 is an error: fix what it names first. Only if the table is missing
+  (`config get` above says `is not set`, or `has no entry named "keepsake"`) add it, then sync:
+  `tapectl-op collection add keepsake /srv/keepsake/original-data --tenant family` (a unit per
+  folder one level down, the default). It checks the service user's access, prints any
+  `setfacl` line it lacks, and shows the sync's dry run. With the table there it refuses and
+  changes nothing: `error: a collection named "keepsake" is already configured in
+  /srv/archive_meta/tapectl/home/config.toml; choose another name` (exit 2).
+
+- **Copies 1 and 2 run on one loop** (item 218): `first-run.sh` step 13 writes with
+  `volume write … --full-confirm --move-to`, whose readback of every file is the tape's first
+  full verify, so there is no separate `volume verify --full`. A cartridge registered at its
+  `volume init` takes the volume's label as its barcode (item 219), so there is no
+  `cartridge relabel` either.
 
 7. **Copy 1.** Tell the coordinator first, about 15 minutes ahead, so vm-desk1's builds hold and
    home2 stays quiet while the drive writes (item 202).
-   Load L6-0001 and run `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13`.
-   - Step 13's `volume init` refuses the sealed volume on the tape and offers `cartridge erase`,
-     as in (c), "L6-0001 at its volume init". The dry run shows File 0's label `L6-0001`,
-     written by tapectl 1.1.0, and `catalog: knows neither this volume nor this cartridge`.
-     Type `L6-0001`.
-   - Step 13 then writes, runs `volume verify L6-0001 --full`, audits, moves the tape to
-     `home2-rack` and regenerates the kit. Step 14 installs the timers and `tapectl-op`, each
-     naming the new home (`install-systemd.sh --tapectl-home`).
-8. **Copy 2,** with the drive-poll timer stopped. Load L6-0002:
+   Load L6-0001 and run:
+
+   ```bash
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13 --label L6-0001 --location home2-rack
+   ```
+
+   - Step 13 snapshots every keepsake unit, stages them (two at a time, `STAGING_JOBS`), shows
+     `stage list` and `volume plan`, checks the host is quiet, and asks you to type `L6-0001`
+     before it writes.
+   - Its `volume init` refuses the sealed volume on the tape and offers `cartridge erase`, as in
+     (c), "L6-0001 at its volume init". The dry run shows File 0's label `L6-0001`, written by
+     tapectl 1.1.0, and `catalog: knows neither this volume nor this cartridge`. Type `L6-0001`.
+     The erase registers the cartridge by its chip serial, and the `volume init` after it gives
+     the cartridge the volume's label as its barcode (`its barcode is now L6-0001, the volume's
+     label`). The sticker already says L6-0001.
+   - Step 13 then writes, seals and reads every file back in one session, and the write ends
+     with `sealed and confirmed: <N> units, <N> slices, <size>; full readback passed` and moves
+     the tape to `home2-rack`. Every unit stays staged: one copy is short of the copy floor of
+     two. Step 13 then audits (copy-count findings are expected with one copy) and regenerates
+     the Heir Kit, and step 14 finds the timers and `tapectl-op` unchanged and prints the next
+     copy's command.
+8. **Copy 2,** with the drive-poll timer stopped. Tell the coordinator first again, as for
+   copy 1 (item 202). Eject L6-0001 (`tapectl-op drive eject`) and load L6-0002:
 
    ```bash
    sudo systemctl stop tapectl-drive-poll.timer
-   tapectl-op cartridge erase --dry-run      # File 0: L6-0002, tapectl 1.1.0; the catalog knows neither
-   tapectl-op cartridge erase                # type L6-0002
-   tapectl-op volume write L6-0002 --init --full-confirm --move-to offsite
+   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 13 --label L6-0002 --location offsite
    sudo systemctl start tapectl-drive-poll.timer
    ```
 
-   This write completes the copy policy, so it releases staging.
+   - Step 13 notes `1 volume(s) already in the catalog`: answer yes to writing another tape.
+     Each unit's snapshot finds it unchanged, and staging skips it as already staged.
+   - Its `volume init` refuses the old sealed volume and offers the erase, as for copy 1: the dry
+     run shows File 0's label `L6-0002`, written by tapectl 1.1.0. Type `L6-0002`. If the
+     refusal instead names a sealed volume of THIS catalog, L6-0001 is still in the drive: the
+     step stops and erases nothing. Eject it, load L6-0002 and run the same command again.
+   - This write completes the copy policy, so it releases each unit's staging.
 9. **Finish.**
 
    ```bash
    tapectl-op audit                          # keepsake: 2 copies, 2 places
+   tapectl-op cartridge list                 # L6-0001 and L6-0002, each with its chip serial
    sudo systemctl start tapectl-backup.service
-   scripts/first-run.sh --profile contrib/hosts/home2.profile --from 9 --to 9   # yes, regenerate
    ```
 
-   Reprint `COVER.txt` and replace the one in each envelope. The handwritten secret stays
+   Copy 2's step 13 regenerated the Heir Kit in `~/tapectl-heir-kit` with both tapes in its
+   catalog. Print its `COVER.txt` and replace the one in each envelope, with the new
+   `catalog.db.age` and `tapectl-1.9.0` on the media. The handwritten secret stays
    (or, with a new escrow identity, goes in beside the new sheet). A new identity also goes
    into the local profile for the next rebuild:
    `echo "ESCROW_PUBLIC_KEY=$(sudo grep -m1 '^age1' /srv/archive_meta/tapectl/home/keys/mikmorg-escrow.age.pub)" > ~/.config/tapectl/home2.local.profile`.
-   Each erase registered its cartridge with the chip serial as a placeholder barcode;
-   `tapectl-op cartridge relabel <serial> L6-0001` (and `L6-0002`) names the sticker.
 10. **Tidy, once the new L6-0002 has read back in full:**
     - delete the old state: `sudo rm -rf /srv/archive_meta/tapectl/.tapectl-old /srv/local_backup/tapectl-old /var/backups/tapectl-old`;
     - delete `~/heir-kit`, the stray kit from (f);
