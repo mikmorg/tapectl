@@ -62,9 +62,7 @@ fn write_subcommand_pages(
         let qualified_name: &'static str = Box::leak(full.clone().into_boxed_str());
         let qualified = sub.clone().name(qualified_name);
 
-        let mut buf = Vec::new();
-        Man::new(qualified).render(&mut buf)?;
-        fs::write(&page_path, &buf)?;
+        fs::write(&page_path, render_page(qualified, false)?)?;
         println!("wrote {}", page_path.display());
 
         // Recurse into this subcommand's own children. Walk `sub`, not the
@@ -72,6 +70,57 @@ fn write_subcommand_pages(
         write_subcommand_pages(sub, &full, out_dir)?;
     }
     Ok(())
+}
+
+/// `Man::render`, with a command's `after_long_help` titled for what it is
+/// (clap_mangen calls it EXTRA): an `Examples:` block is EXAMPLES, its lines
+/// kept as typed, and the top page's `Exit status:` paragraph is EXIT
+/// STATUS, followed by the CLI's one exit-code table
+/// (`tapectl::error::EXIT_CODE_TABLE`, ADR-0012 item 212).
+fn render_page(cmd: clap::Command, top: bool) -> std::io::Result<Vec<u8>> {
+    let examples = cmd
+        .get_after_long_help()
+        .is_some_and(|t| t.to_string().starts_with("Examples:"));
+    let mut buf = Vec::new();
+    Man::new(cmd).render(&mut buf)?;
+    let page = String::from_utf8(buf).expect("clap_mangen writes UTF-8");
+    const EXTRA: &str = "\n.SH EXTRA\n";
+    let Some(at) = page.find(EXTRA) else {
+        return Ok(page.into_bytes());
+    };
+    let body_start = at + EXTRA.len();
+    let end = page[body_start..]
+        .find("\n.SH ")
+        .map_or(page.len(), |e| body_start + e + 1);
+    let body = &page[body_start..end];
+    let section = if examples {
+        let lines: Vec<&str> = body.lines().filter(|l| l.trim() != "Examples:").collect();
+        format!(".SH EXAMPLES\n.nf\n{}\n.fi\n", lines.join("\n"))
+    } else if top {
+        let mut table = String::new();
+        for row in tapectl::error::EXIT_CODE_TABLE {
+            table.push_str(&format!(
+                ".TP\n\\fB{}\\fR\n{} ({})\n",
+                row.code,
+                roff_text(row.meaning),
+                roff_text(row.commands)
+            ));
+        }
+        format!(".SH \"EXIT STATUS\"\n{body}{table}")
+    } else {
+        format!(".SH EXTRA\n{body}")
+    };
+    Ok(format!("{}{section}{}", &page[..at + 1], &page[end..]).into_bytes())
+}
+
+/// `text` for a roff text line: backslashes and hyphens escaped, and a
+/// leading `.` or `'` kept from reading as a request.
+fn roff_text(text: &str) -> String {
+    let escaped = text.replace('\\', "\\e").replace('-', "\\-");
+    match escaped.chars().next() {
+        Some('.' | '\'') => format!("\\&{escaped}"),
+        _ => escaped,
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -89,9 +138,7 @@ fn main() -> std::io::Result<()> {
 
     // Top-level page.
     let top = out_dir.join("tapectl.1");
-    let mut buf = Vec::new();
-    Man::new(cmd.clone()).render(&mut buf)?;
-    fs::write(&top, &buf)?;
+    fs::write(&top, render_page(cmd.clone(), true)?)?;
     println!("wrote {}", top.display());
 
     write_subcommand_pages(&cmd, "tapectl", &out_dir)?;

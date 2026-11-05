@@ -356,6 +356,12 @@ fn unreadable(dir: &Path, e: &std::io::Error) -> TapectlError {
     ))
 }
 
+/// A session's time as the human screen shows times (item 212: one format,
+/// labelled UTC), `?` when the log did not say.
+fn shown_time(at: Option<&str>) -> String {
+    at.map_or_else(|| "?".to_string(), crate::render::table_time)
+}
+
 /// The human rendering.
 pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
     let mut out = format!("session logs: {}\n", logs_dir.display());
@@ -371,7 +377,7 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
             "running: {} (pid {}), started {}\n",
             s.command.as_deref().unwrap_or("?"),
             s.pid.map_or("?".to_string(), |p| p.to_string()),
-            s.started_at.as_deref().unwrap_or("?"),
+            shown_time(s.started_at.as_deref()),
         ));
         if s.state == State::ProcessNotVisible {
             out.push_str(
@@ -385,12 +391,12 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
         if let Some(p) = &s.progress {
             out.push_str(&format!(
                 "  progress: {p} (at {})\n",
-                s.progress_at.as_deref().unwrap_or("?")
+                shown_time(s.progress_at.as_deref())
             ));
         }
         out.push_str(&format!(
             "  last log line at {}\n  log:      {}\n",
-            s.last_line_at.as_deref().unwrap_or("?"),
+            shown_time(s.last_line_at.as_deref()),
             s.log
         ));
     }
@@ -410,7 +416,9 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
         };
         out.push_str(&format!(
             "  {}  {}  — {}\n",
-            s.started_at.as_deref().unwrap_or(&s.session),
+            s.started_at
+                .as_deref()
+                .map_or_else(|| s.session.clone(), crate::render::table_time),
             s.command.as_deref().unwrap_or("?"),
             outcome
         ));

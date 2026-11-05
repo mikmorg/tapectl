@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::config::Config;
 use crate::db::events;
@@ -156,55 +156,64 @@ fn check_registered_locations(conn: &Connection, field: &str, names: &[String]) 
 #[derive(Args, Debug, Default, Clone)]
 pub struct PolicyArgs {
     /// Minimum copy count
-    #[arg(long)]
+    #[arg(long, value_name = "N")]
     pub min_copies: Option<i64>,
-    /// Required locations (comma-separated); each must be a registered
-    /// location (`tapectl location add`)
-    #[arg(long)]
+    /// Required locations, comma-separated
+    ///
+    /// Each must be a registered location (`tapectl location add`).
+    #[arg(long, value_name = "LIST")]
     pub required_locations: Option<String>,
-    /// Encryption enabled
-    #[arg(long)]
+    /// Encryption enabled (true/false)
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub encrypt: Option<bool>,
     /// Compression mode
-    #[arg(long)]
+    #[arg(long, value_name = "MODE")]
     pub compression: Option<String>,
     /// Checksum mode
-    #[arg(long)]
+    #[arg(long, value_name = "MODE")]
     pub checksum_mode: Option<String>,
-    /// Slice size (e.g., "1G", the default)
-    #[arg(long)]
+    /// Slice size, e.g. "1G" (the default)
+    #[arg(long, value_name = "SIZE")]
     pub slice_size: Option<String>,
     /// Verify interval in days
-    #[arg(long)]
+    #[arg(long, value_name = "DAYS")]
     pub verify_interval_days: Option<i64>,
-    /// Warehouse copies expected (ADR-0006). Never set means "defer to the
-    /// system default".
-    #[arg(long)]
+    /// Warehouse copies expected (ADR-0006)
+    ///
+    /// Never set means "defer to the system default".
+    #[arg(long, value_name = "N")]
     pub warehouse_copies: Option<i64>,
-    /// Keep extended attributes, and the POSIX ACLs stored as them
-    /// (true/false; false drops them all)
-    #[arg(long)]
+    /// Keep extended attributes (true/false)
+    ///
+    /// And the POSIX ACLs stored as them; false drops them all.
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_xattrs: Option<bool>,
-    /// Keep POSIX ACLs (true/false). No effect of its own: ACLs follow
-    /// --preserve-xattrs
-    #[arg(long)]
+    /// Keep POSIX ACLs (true/false; with --preserve-xattrs)
+    ///
+    /// No effect of its own: ACLs are kept or dropped with the extended
+    /// attributes they are stored as.
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_acls: Option<bool>,
-    /// Keep filesystem-specific attributes such as chattr flags (true/false)
-    #[arg(long)]
+    /// Keep filesystem attributes, chattr flags (true/false)
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_fsa: Option<bool>,
-    /// Treat a metadata-only change as making a unit dirty (true/false).
-    /// Not read yet: dirty detection compares path, size and mtime only
-    #[arg(long)]
+    /// A metadata change makes a unit dirty (true/false)
+    ///
+    /// Not read yet: dirty detection compares path, size and mtime only.
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub dirty_on_metadata_change: Option<bool>,
-    /// Let this set's units span tapes by their slices (true/false; from
-    /// tapectl 1.7.0). Never set means "defer to [defaults]", which is off
-    #[arg(long)]
+    /// Units may span tapes by their slices (true/false)
+    ///
+    /// From tapectl 1.7.0. Never set means "defer to [defaults]", which is
+    /// off.
+    #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub allow_spanning: Option<bool>,
-    /// Copies each unit should hold at a location, as NAME=N (repeatable,
-    /// e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a
+    /// Copies at a location, NAME=N (repeatable)
+    ///
+    /// E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a
     /// registered location. Replaces the set's whole map. A unit's dotfile
     /// [policy.copies_at] replaces it in turn; never set means "defer to
-    /// [defaults]"
+    /// [defaults]".
     #[arg(long, value_name = "NAME=N")]
     pub copies_at: Vec<String>,
     /// Description
@@ -239,8 +248,9 @@ pub enum ArchiveSetCommands {
         name: String,
     },
 
-    /// Sync archive sets from config.toml (writes only the keys each
-    /// [[archive_sets]] table names)
+    /// Sync archive sets from config.toml's [[archive_sets]] tables
+    ///
+    /// Writes only the keys each [[archive_sets]] table names.
     Sync,
 }
 
@@ -821,7 +831,10 @@ fn info_text(info: &ArchiveSetInfo) -> String {
     ));
     out.push_str(&format!("  Copies at:        {}\n", text(&info.copies_at)));
     out.push_str(&format!("  Units using:      {}\n", info.unit_count));
-    out.push_str(&format!("  Created:          {}\n", info.created));
+    out.push_str(&format!(
+        "  Created:          {}\n",
+        crate::render::table_time(&info.created)
+    ));
     out.push_str(&format!("  Updated:          {}\n", info.updated));
     out
 }
@@ -855,7 +868,7 @@ pub fn run(
                     )));
                 }
                 if json_output {
-                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                    crate::render::print_json(&serde_json::json!({"name": name, "dry_run": true}));
                 } else {
                     println!("would create archive set \"{name}\" (DRY RUN — no changes made)");
                 }
@@ -866,7 +879,7 @@ pub fn run(
             events::log_created(conn, "archive_set", id, name, None)?;
 
             if json_output {
-                println!("{}", serde_json::json!({"id": id, "name": name}));
+                crate::render::print_json(&serde_json::json!({"id": id, "name": name}));
             } else {
                 println!("archive set \"{name}\" created (id={id})");
             }
@@ -897,7 +910,7 @@ pub fn run(
             // stops here rather than running any of the per-field UPDATEs.
             if dry_run {
                 if json_output {
-                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                    crate::render::print_json(&serde_json::json!({"name": name, "dry_run": true}));
                 } else {
                     println!("would edit archive set \"{name}\" (DRY RUN — no changes made)");
                 }
@@ -913,7 +926,7 @@ pub fn run(
             tx.commit()?;
 
             if json_output {
-                println!("{}", serde_json::json!({"name": name, "updated": true}));
+                crate::render::print_json(&serde_json::json!({"name": name, "updated": true}));
             } else {
                 println!("archive set \"{name}\" updated");
             }
@@ -940,21 +953,18 @@ pub fn run(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&archive_set_rows_to_json(&rows)).unwrap()
-                );
+                crate::render::print_json(&serde_json::json!(archive_set_rows_to_json(&rows)));
             } else if rows.is_empty() {
                 println!("no archive sets defined");
             } else {
-                println!("{}", Table::new(rows));
+                println!("{}", crate::render::table_of(&rows));
             }
         }
 
         ArchiveSetCommands::Info { name } => {
             let info = ArchiveSetInfo::load(conn, name)?;
             if json_output {
-                println!("{}", info_json(&info));
+                crate::render::print_json(&info_json(&info));
             } else {
                 print!("{}", info_text(&info));
             }
@@ -1045,12 +1055,9 @@ pub fn run(
             tx.commit()?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "created": created, "updated": updated, "unchanged": unchanged,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "created": created, "updated": updated, "unchanged": unchanged,
+                }));
             } else {
                 println!(
                     "sync: {created} created, {updated} updated, {unchanged} unchanged \

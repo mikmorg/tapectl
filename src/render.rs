@@ -84,6 +84,19 @@ pub fn table_with(header: &[&str], rows: Vec<Vec<String>>, width: Option<usize>)
         .join("\n")
 }
 
+/// [`table`] for rows of a `#[derive(Tabled)]` struct: its headers (as its
+/// `#[tabled(rename)]`s give them) and its fields, in its field order.
+pub fn table_of<T: tabled::Tabled>(rows: &[T]) -> String {
+    let header: Vec<String> = T::headers().into_iter().map(|h| h.into_owned()).collect();
+    let header: Vec<&str> = header.iter().map(String::as_str).collect();
+    table(
+        &header,
+        rows.iter()
+            .map(|r| r.fields().into_iter().map(|f| f.into_owned()).collect())
+            .collect(),
+    )
+}
+
 fn parse_time(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -192,6 +205,31 @@ pub fn json_time_opt_ser<S: serde::Serializer>(
     }
 }
 
+/// Every time in `value`, made RFC 3339 with `Z` ([`json_time`]): each
+/// string under a key ending `_at`, at any depth. For a command that prints
+/// catalog rows as JSON (item 212: times in JSON are RFC 3339 with `Z`); the
+/// stored values are unchanged (item 221).
+pub fn json_times(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                match v {
+                    Value::String(s) if key.ends_with("_at") => *s = json_time(s),
+                    _ => json_times(v),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(json_times),
+        _ => {}
+    }
+}
+
+/// `value` with its times made RFC 3339 with `Z` ([`json_times`]).
+pub fn timed(mut value: Value) -> Value {
+    json_times(&mut value);
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +311,22 @@ mod tests {
         assert!(color_on(true, Some(OsStr::new(""))));
         assert!(!color_on(true, Some(OsStr::new("1"))));
         assert!(!color_on(false, None));
+    }
+
+    #[test]
+    fn json_times_converts_every_at_key_and_nothing_else() {
+        let mut v = json!([{
+            "created_at": "2026-11-04 10:30:59",
+            "name": "2026-11-04 10:30:59",
+            "keys": [{"updated_at": "2026-11-04T12:30:00+02:00", "n": 3}],
+            "sealed_at": null,
+        }]);
+        json_times(&mut v);
+        assert_eq!(v[0]["created_at"], "2026-11-04T10:30:59Z");
+        assert_eq!(v[0]["name"], "2026-11-04 10:30:59", "not a time key");
+        assert_eq!(v[0]["keys"][0]["updated_at"], "2026-11-04T10:30:00Z");
+        assert_eq!(v[0]["keys"][0]["n"], 3);
+        assert!(v[0]["sealed_at"].is_null());
     }
 
     #[test]

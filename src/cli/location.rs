@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};
@@ -12,15 +12,24 @@ pub enum LocationCommands {
     Add {
         /// Location name (e.g., "home-rack", "parents-house")
         name: String,
-        /// Description. For a warehouse this is where the endpoint or
-        /// prefix goes (e.g. "s3://bucket/prefix") -- there is
-        /// deliberately no separate URI column.
+        /// Description; a warehouse's endpoint or prefix goes here
+        ///
+        /// For a warehouse this is where the endpoint or prefix goes (e.g.
+        /// "s3://bucket/prefix") -- there is deliberately no separate URI
+        /// column.
         #[arg(long, short)]
         description: Option<String>,
-        /// Kind of location (ADR-0006). A `shelf` holds physical
-        /// cartridges; a `warehouse` is cold cloud storage that can only
-        /// receive recorded deposits (`volume deposit add`).
-        #[arg(long, default_value = "shelf", value_parser = ["shelf", "warehouse"])]
+        /// Kind of location, shelf or warehouse
+        ///
+        /// ADR-0006. A `shelf` holds physical cartridges; a `warehouse` is
+        /// cold cloud storage that can only receive recorded deposits
+        /// (`volume deposit add`).
+        #[arg(
+            long,
+            default_value = "shelf",
+            value_parser = ["shelf", "warehouse"],
+            hide_possible_values = true
+        )]
         kind: String,
     },
     /// List locations
@@ -198,9 +207,8 @@ pub fn run(
             // before any write so the real path below is unchanged.
             if dry_run {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"name": name, "kind": kind, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"name": name, "kind": kind, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -217,9 +225,8 @@ pub fn run(
             let id = conn.last_insert_rowid();
             events::log_created(conn, "location", id, name, None)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"id": id, "name": name, "kind": kind})
+                crate::render::print_json(
+                    &serde_json::json!({"id": id, "name": name, "kind": kind}),
                 );
             } else {
                 println!("location \"{name}\" added (id={id}, kind={kind})");
@@ -233,14 +240,11 @@ pub fn run(
                 // lives -- there is deliberately no separate URI column.
                 // Omitting it cost the JSON consumer the one field that says
                 // where the bytes actually are.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&location_rows_to_json(&rows)).unwrap()
-                );
+                crate::render::print_json(&serde_json::json!(location_rows_to_json(&rows)));
             } else if rows.is_empty() {
                 println!("no locations defined");
             } else {
-                println!("{}", Table::new(rows));
+                println!("{}", crate::render::table_of(&rows));
             }
         }
         LocationCommands::Info { name } => {
@@ -291,8 +295,7 @@ pub fn run(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if json_output {
-                println!(
-                    "{}",
+                crate::render::print_json(&crate::render::timed(
                     serde_json::json!({"name": name, "kind": kind, "description": desc,
                                        "cartridges": cartridges.iter().map(|(barcode, status, serial, vol)|
                                            serde_json::json!({"barcode": barcode, "status": status,
@@ -304,15 +307,15 @@ pub fn run(
                                            serde_json::json!({"volume": label, "deposited_at": at,
                                                               "receipt": receipt,
                                                               "storage_class": class}))
-                                           .collect::<Vec<_>>()})
-                );
+                                           .collect::<Vec<_>>()}),
+                ));
             } else {
                 println!("Location: {name}");
                 println!("  Kind:        {kind}");
                 if let Some(d) = &desc {
                     println!("  Description: {d}");
                 }
-                println!("  Created:     {created}");
+                println!("  Created:     {}", crate::render::table_time(&created));
                 // ADR-0012: barcode is the label an operator reads off the
                 // shelf; the chip serial (the cartridge's actual identity)
                 // stays available in --json above rather than cluttering
@@ -388,9 +391,8 @@ pub fn run(
             // to work.
             if dry_run {
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"old": current, "new": new, "dry_run": true})
+                    crate::render::print_json(
+                        &serde_json::json!({"old": current, "new": new, "dry_run": true}),
                     );
                 } else {
                     println!(
@@ -435,48 +437,58 @@ pub fn run(
             // (issue #110's rule).
             let dotfiles = rename_in_dotfiles(conn, current, new)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "old": current, "new": new, "archive_sets": sets,
-                        "copies_at_archive_sets": targets.archive_sets,
-                        "copies_at_units": targets.units,
-                        "dotfiles_rewritten": dotfiles.rewritten,
-                        "dotfiles_failed": dotfiles.failed.iter()
-                            .map(|(path, why)| serde_json::json!({"path": path, "error": why}))
-                            .collect::<Vec<_>>(),
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "old": current, "new": new, "archive_sets": sets,
+                    "copies_at_archive_sets": targets.archive_sets,
+                    "copies_at_units": targets.units,
+                    "dotfiles_rewritten": dotfiles.rewritten,
+                    "dotfiles_failed": dotfiles.failed.iter()
+                        .map(|(path, why)| serde_json::json!({"path": path, "error": why}))
+                        .collect::<Vec<_>>(),
+                }));
             } else {
                 println!("location \"{current}\" renamed to \"{new}\"");
                 if !sets.is_empty() {
                     println!(
-                        "  archive set(s) {} now require \"{new}\". If config.toml's \
+                        "  {} {} now require \"{new}\". If config.toml's \
                          [[archive_sets]] name \"{current}\", change it there too, or \
                          `archive-set sync` will refuse the old name.",
+                        if sets.len() == 1 {
+                            "archive set"
+                        } else {
+                            "archive sets"
+                        },
                         sets.join(", ")
                     );
                 }
                 if !targets.archive_sets.is_empty() {
                     println!(
-                        "  archive set(s) {} now name \"{new}\" in copies_at. If \
+                        "  {} {} now name \"{new}\" in copies_at. If \
                          config.toml's [[archive_sets]] copies_at name \"{current}\", change \
                          it there too, or `archive-set sync` will refuse the old name.",
+                        if targets.archive_sets.len() == 1 {
+                            "archive set"
+                        } else {
+                            "archive sets"
+                        },
                         targets.archive_sets.join(", ")
                     );
                 }
                 if !targets.units.is_empty() {
                     println!(
-                        "  {} unit(s) whose frozen copy targets named \"{current}\" now name \
+                        "  {} whose frozen copy targets named \"{current}\" now name \
                          \"{new}\".",
-                        targets.units.len()
+                        crate::render::plural(targets.units.len() as i64, "unit", "units")
                     );
                 }
                 if !dotfiles.rewritten.is_empty() {
                     println!(
-                        "  {} unit dotfile(s) rewritten to name \"{new}\" in \
-                         [policy.copies_at].",
-                        dotfiles.rewritten.len()
+                        "  {} rewritten to name \"{new}\" in [policy.copies_at].",
+                        crate::render::plural(
+                            dotfiles.rewritten.len() as i64,
+                            "unit dotfile",
+                            "unit dotfiles"
+                        )
                     );
                 }
             }

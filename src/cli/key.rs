@@ -3,7 +3,7 @@ use std::path::Path;
 use clap::Subcommand;
 use rusqlite::Connection;
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::config::TapectlPaths;
 use crate::crypto::keys;
@@ -13,24 +13,29 @@ use crate::error::{Result, TapectlError};
 
 #[derive(Subcommand, Debug)]
 pub enum KeyCommands {
-    /// Generate a new keypair for a tenant, or the permanent escrow
-    /// recipient with --escrow (ADR-0005)
+    /// Generate a key pair for a tenant, or the escrow recipient
+    ///
+    /// With --escrow, the permanent escrow recipient (ADR-0005) instead of a
+    /// tenant's key.
     Generate {
         /// Tenant name (required unless --escrow)
         #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
         tenant: Option<String>,
-        /// Key alias (e.g., "primary", "backup", "2026") (required unless --escrow)
+        /// Key alias, e.g. "primary", "backup", "2026" (unless --escrow)
         #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
         alias: Option<String>,
-        /// Key type. Not with --escrow, which has none to set.
+        /// Key type (not with --escrow)
+        ///
+        /// --escrow has none to set.
         #[arg(long, default_value = "primary", conflicts_with = "escrow")]
         key_type: String,
         /// Description
         #[arg(long)]
         description: Option<String>,
-        /// Generate the permanent escrow recipient identity instead of a
-        /// per-tenant key (ADR-0005). Prints the secret exactly once, for
-        /// paper transcription — tapectl never stores it. Refuses if an
+        /// Generate the permanent escrow recipient instead of a tenant key
+        ///
+        /// ADR-0005. Prints the secret exactly once, for paper transcription
+        /// — tapectl never stores it. Refuses if an
         /// escrow identity is already registered; there is only ever one,
         /// for the life of the archive.
         #[arg(long)]
@@ -39,9 +44,11 @@ pub enum KeyCommands {
 
     /// List keys: every tenant's, or one tenant's with --tenant
     List {
-        /// List only this tenant's keys. Without it every tenant's keys
-        /// are listed, with a Tenant column (deleted tenants are left out,
-        /// as `tenant list` leaves them out; name one to see its keys)
+        /// List only this tenant's keys
+        ///
+        /// Without it every tenant's keys are listed, with a Tenant column
+        /// (deleted tenants are left out, as `tenant list` leaves them out;
+        /// name one to see its keys).
         #[arg(long)]
         tenant: Option<String>,
     },
@@ -52,17 +59,20 @@ pub enum KeyCommands {
         alias: String,
     },
 
-    /// Rotate keys for a tenant (deactivate old, generate new). Refuses
-    /// unless a permanent escrow recipient is registered (ADR-0005); never
-    /// deactivates or replaces the escrow key itself.
+    /// Rotate a tenant's keys: deactivate the old, generate new ones
+    ///
+    /// Refuses unless a permanent escrow recipient is registered (ADR-0005);
+    /// never deactivates or replaces the escrow key itself.
     Rotate {
         /// Tenant name
         #[arg(long)]
         tenant: String,
     },
 
-    /// Import a public key from a file, or adopt an existing one as the
-    /// permanent escrow recipient with --escrow (ADR-0005)
+    /// Import a public key, or adopt one as the escrow recipient
+    ///
+    /// A tenant's public key from a file, or with --escrow an existing key
+    /// adopted as the permanent escrow recipient (ADR-0005).
     Import {
         /// Tenant name (required unless --escrow)
         #[arg(long, required_unless_present = "escrow", conflicts_with = "escrow")]
@@ -74,19 +84,22 @@ pub enum KeyCommands {
             conflicts_with = "escrow"
         )]
         alias: Option<String>,
-        /// Path to public key file — or, with --escrow, either a path or
-        /// the literal age1... public key
+        /// Path to the public key file (with --escrow, or an age1… key)
         path: String,
-        /// Key type. Not with --escrow or --reactivate, which have none to
-        /// set: a reactivated key keeps the type it was registered with.
+        /// Key type (not with --escrow or --reactivate)
+        ///
+        /// --escrow and --reactivate have none to set: a reactivated key keeps
+        /// the type it was registered with.
         #[arg(long, default_value = "primary", conflicts_with_all = ["escrow", "reactivate"])]
         key_type: String,
         /// Adopt this public key as the permanent escrow recipient
-        /// (ADR-0005). Refuses if one is already registered.
+        ///
+        /// ADR-0005. Refuses if one is already registered.
         #[arg(long)]
         escrow: bool,
-        /// Make this public key a recipient of new writes again when the
-        /// catalog already has it for this tenant, deactivated (as `key
+        /// Make this deactivated key a recipient of new writes again
+        ///
+        /// When the catalog already has it for this tenant, deactivated (as `key
         /// rotate` leaves every key it replaces). The key keeps the alias it
         /// was registered under. Refuses for a key that is active, unknown,
         /// another tenant's, or the escrow identity.
@@ -94,10 +107,10 @@ pub enum KeyCommands {
         reactivate: bool,
     },
 
-    /// Generate the printed Heir Kit and the encrypted catalog bundle
-    /// (ADR-0005 / ADR-0009).
+    /// Write the Heir Kit: the cover sheet, its catalog and this tapectl
     ///
-    /// Writes four files: COVER.txt (the plain-text cover sheet — the
+    /// The printed Heir Kit and the encrypted catalog bundle (ADR-0005,
+    /// ADR-0009). Writes four files: COVER.txt (the plain-text cover sheet — the
     /// artifact with the decades-scale claim), escrow-kit.html (the same
     /// content with an inline QR, for printing), catalog.db.age (the
     /// whole catalog encrypted to the escrow recipient), and tapectl-VERSION
@@ -110,6 +123,12 @@ pub enum KeyCommands {
     /// independent failure domains is the operator's part, and the cover
     /// sheet states those requirements. Re-run after each production write
     /// session; `audit` warns when the kit has fallen behind the tapes.
+    #[command(after_long_help = "\
+Examples:
+  # After a write session: the kit again, to print and seal
+  tapectl key escrow-kit /mnt/usb/heir-kit
+  # Under the service user
+  tapectl-op key escrow-kit /srv/archive_meta/heir-kit")]
     EscrowKit {
         /// Directory to write the kit into (created if absent, mode 0700)
         #[arg(value_name = "DIR")]
@@ -191,14 +210,11 @@ pub fn run(
                 events::log_created(conn, "encryption_key", key_id, &full_alias, Some(t.id))?;
 
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "alias": full_alias,
-                            "fingerprint": kp.fingerprint,
-                            "public_key": kp.public_key,
-                        })
-                    );
+                    crate::render::print_json(&serde_json::json!({
+                        "alias": full_alias,
+                        "fingerprint": kp.fingerprint,
+                        "public_key": kp.public_key,
+                    }));
                 } else {
                     println!("key \"{full_alias}\" generated");
                     println!("  public:  {}", kp.public_key);
@@ -219,10 +235,7 @@ pub fn run(
                 }
             }
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&key_list_json(&listed)).unwrap()
-                );
+                crate::render::print_json(&serde_json::json!(key_list_json(&listed)));
             } else if listed.is_empty() {
                 println!("no keys found");
             } else {
@@ -237,10 +250,7 @@ pub fn run(
             if json_output {
                 let listed: Vec<(String, EncryptionKey)> =
                     key_list.into_iter().map(|k| (t.name.clone(), k)).collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&key_list_json(&listed)).unwrap()
-                );
+                crate::render::print_json(&serde_json::json!(key_list_json(&listed)));
             } else if key_list.is_empty() {
                 println!("no keys found for tenant \"{tenant}\"");
             } else {
@@ -260,10 +270,33 @@ pub fn run(
                             String::new()
                         },
                         fingerprint: truncate_fingerprint(&k.fingerprint),
-                        created_at: k.created_at,
+                        created_at: crate::render::table_time(&k.created_at),
                     })
                     .collect();
-                println!("{}", Table::new(rows));
+                // Item 212: borderless, aligned, one header case.
+                println!(
+                    "{}",
+                    crate::render::table(
+                        &[
+                            "alias",
+                            "type",
+                            "active",
+                            "escrow",
+                            "fingerprint",
+                            "created"
+                        ],
+                        rows.into_iter()
+                            .map(|r| vec![
+                                r.alias,
+                                r.key_type,
+                                r.is_active,
+                                r.escrow,
+                                r.fingerprint,
+                                r.created_at
+                            ])
+                            .collect(),
+                    )
+                );
             }
         }
         KeyCommands::Export { alias } => {
@@ -352,13 +385,10 @@ pub fn run(
             tx.commit()?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "tenant": tenant, "deactivated": deactivated,
-                        "new_primary": p_alias, "new_backup": b_alias,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "tenant": tenant, "deactivated": deactivated,
+                    "new_primary": p_alias, "new_backup": b_alias,
+                }));
             } else {
                 println!("rotated keys for \"{tenant}\": {deactivated} deactivated, 2 new keys generated");
             }
@@ -427,10 +457,9 @@ pub fn run(
                 };
                 if dry_run {
                     if json_output {
-                        println!(
-                            "{}",
-                            serde_json::json!({"alias": full_alias, "fingerprint": fingerprint,
-                                               "dry_run": true})
+                        crate::render::print_json(
+                            &serde_json::json!({"alias": full_alias, "fingerprint": fingerprint,
+                                               "dry_run": true}),
                         );
                     } else {
                         println!("would import key \"{full_alias}\" (DRY RUN — no changes made)");
@@ -454,13 +483,10 @@ pub fn run(
                 keys::save_public_key(&pub_path, &pub_key)?;
 
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "alias": full_alias,
-                            "fingerprint": fingerprint,
-                        })
-                    );
+                    crate::render::print_json(&serde_json::json!({
+                        "alias": full_alias,
+                        "fingerprint": fingerprint,
+                    }));
                 } else {
                     println!("key \"{full_alias}\" imported");
                 }
@@ -485,28 +511,30 @@ pub fn run(
                 std::path::Path::new(out),
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "out_dir": report.out_dir,
-                        "cover_txt": report.cover_txt,
-                        "html": report.html,
-                        "catalog_age": report.catalog_age,
-                        "tapectl_copy": report.tapectl_copy,
-                        "tapectl_sha256": report.tapectl_sha256,
-                        "tapectl_bytes": report.tapectl_bytes,
-                        "catalog_bytes": report.catalog_bytes,
-                        "sealed_volumes": report.sealed_volumes,
-                        "escrow_public_key": report.escrow_public_key,
-                    })
-                );
+                crate::render::print_json(&serde_json::json!({
+                    "out_dir": report.out_dir,
+                    "cover_txt": report.cover_txt,
+                    "html": report.html,
+                    "catalog_age": report.catalog_age,
+                    "tapectl_copy": report.tapectl_copy,
+                    "tapectl_sha256": report.tapectl_sha256,
+                    "tapectl_bytes": report.tapectl_bytes,
+                    "catalog_bytes": report.catalog_bytes,
+                    "sealed_volumes": report.sealed_volumes,
+                    "escrow_public_key": report.escrow_public_key,
+                }));
             } else {
                 println!("heir kit written to {}", report.out_dir.display());
                 println!("  COVER.txt        the printable cover sheet (print this)");
                 println!("  escrow-kit.html  same content with a QR, for a browser's print dialog");
                 println!(
-                    "  catalog.db.age   encrypted catalog, {} bytes, covering {} sealed volume(s)",
-                    report.catalog_bytes, report.sealed_volumes
+                    "  catalog.db.age   encrypted catalog, {}, covering {}",
+                    crate::progress::format_bytes(report.catalog_bytes as u64),
+                    crate::render::plural(
+                        report.sealed_volumes as i64,
+                        "sealed volume",
+                        "sealed volumes"
+                    )
                 );
                 println!(
                     "  {:<16} the program that made this kit, {} bytes, sha256 {} (named on the sheet)",
@@ -622,14 +650,11 @@ fn generate_escrow_key(
     print_escrow_secret_warning(&created.keypair.public_key, &created.keypair.secret_key);
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "alias": created.alias,
-                "escrow": true,
-                "public_key": created.keypair.public_key,
-            })
-        );
+        crate::render::print_json(&serde_json::json!({
+            "alias": created.alias,
+            "escrow": true,
+            "public_key": created.keypair.public_key,
+        }));
     }
     Ok(())
 }
@@ -717,14 +742,11 @@ fn import_escrow_key(
     let full_alias = format!("{}-escrow", operator.name);
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "alias": full_alias,
-                "escrow": true,
-                "public_key": pub_key,
-            })
-        );
+        crate::render::print_json(&serde_json::json!({
+            "alias": full_alias,
+            "escrow": true,
+            "public_key": pub_key,
+        }));
     } else {
         println!("escrow recipient \"{full_alias}\" registered (ADR-0005)");
         println!("  public: {pub_key}");
@@ -848,10 +870,9 @@ fn reactivate_imported_key(
     let alias = &existing.alias;
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
-                                   "reactivated": true, "dry_run": true})
+            crate::render::print_json(
+                &serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
+                                   "reactivated": true, "dry_run": true}),
             );
         } else {
             println!("would reactivate key \"{alias}\" (DRY RUN — no changes made)");
@@ -884,10 +905,9 @@ fn reactivate_imported_key(
     }
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
-                               "reactivated": true})
+        crate::render::print_json(
+            &serde_json::json!({"alias": alias, "fingerprint": existing.fingerprint,
+                               "reactivated": true}),
         );
     } else {
         println!(
@@ -984,18 +1004,24 @@ pub(crate) fn displayed_key_type(k: &EncryptionKey) -> &str {
 /// — the same label the table shows. `is_escrow` stays alongside it.
 /// `key list --json`: each key as `EncryptionKey` serializes it, with the
 /// displayed Type and the name of the tenant it belongs to (OQ21; with or
-/// without --tenant, one shape).
-fn key_list_json(keys: &[(String, EncryptionKey)]) -> serde_json::Value {
-    serde_json::Value::Array(
+/// without --tenant, one shape). The tenant is named, not numbered (OQ5:
+/// no `tenant_id`), and `created_at` is RFC 3339 with `Z` (item 212).
+pub(crate) fn key_list_json(keys: &[(String, EncryptionKey)]) -> serde_json::Value {
+    let mut doc = serde_json::Value::Array(
         keys.iter()
             .map(|(tenant, k)| {
                 let mut v = serde_json::to_value(k).expect("EncryptionKey serializes");
                 v["key_type"] = serde_json::json!(displayed_key_type(k));
                 v["tenant"] = serde_json::json!(tenant);
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("tenant_id");
+                }
                 v
             })
             .collect(),
-    )
+    );
+    crate::render::json_times(&mut doc);
+    doc
 }
 
 /// `key list` without --tenant: every tenant's keys, the tenant first.

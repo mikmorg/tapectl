@@ -74,9 +74,46 @@ fn render_index(cmd: &Command) -> String {
     );
     out.push_str("definitions it parses. For what to *do* with them, start at the\n");
     out.push_str("[documentation index](../README.md).\n\n");
-    out.push_str(
-        "## Global options\n\nAccepted by every command, before or after the subcommand.\n\n",
-    );
+    // The commands in the top-level help's groups and order (ADR-0012 item
+    // 211); a command in no group would be left out, which
+    // `tests/help_text.rs` rules out.
+    out.push_str("## Commands\n\n");
+    for (heading, names) in tapectl::cli::HELP_GROUPS {
+        let subs: Vec<&Command> = names
+            .iter()
+            .filter_map(|n| cmd.find_subcommand(n))
+            .filter(|s| s.get_name() != "help" && !s.is_hide_set())
+            .collect();
+        if subs.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "### {heading}\n\n| Command | What it does |\n|---|---|\n"
+        ));
+        for sub in subs {
+            let name = sub.get_name();
+            out.push_str(&format!(
+                "| [`{name}`]({name}.md) | {} |\n",
+                cell(&first_line(&text(sub.get_about())))
+            ));
+            for s2 in visible_subcommands(sub) {
+                let path = format!("tapectl {name} {}", s2.get_name());
+                out.push_str(&format!(
+                    "| &nbsp;&nbsp;[`{name} {}`]({name}.md#{}) | {} |\n",
+                    s2.get_name(),
+                    anchor(&path),
+                    cell(&first_line(&text(s2.get_about())))
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    // The global options under the heading the help gives them, after the
+    // commands' own (ADR-0012 item 211).
+    out.push_str(&format!(
+        "## {}\n\nAccepted by every command, before or after the subcommand.\n\n",
+        tapectl::cli::GLOBAL_OPTIONS
+    ));
     let globals: Vec<&Arg> = cmd
         .get_arguments()
         .filter(|a| a.is_global_set() && !a.is_hide_set() && !is_auto(a))
@@ -84,22 +121,27 @@ fn render_index(cmd: &Command) -> String {
     for a in &globals {
         out.push_str(&arg_item(a));
     }
-    out.push_str("\n## Commands\n\n| Command | What it does |\n|---|---|\n");
-    for sub in visible_subcommands(cmd) {
-        let name = sub.get_name();
+    out.push_str(&render_exit_codes());
+    out
+}
+
+/// The CLI's one exit-code table (ADR-0012 item 212), from
+/// `tapectl::error::EXIT_CODE_TABLE`: the reference renders the constant, so
+/// the table cannot drift from the codes the binary uses.
+pub fn render_exit_codes() -> String {
+    let mut out = String::from(
+        "\n## Exit codes\n\nEvery code tapectl exits with. A command's own `--help` names the codes it \
+         uses; under `--json` an error is one JSON document on stdout, \
+         `{\"error\": …, \"exit_code\": N}`, with the same code.\n\n\
+         | Exit | Meaning | Commands |\n|---|---|---|\n",
+    );
+    for row in tapectl::error::EXIT_CODE_TABLE {
         out.push_str(&format!(
-            "| [`{name}`]({name}.md) | {} |\n",
-            cell(&first_line(&text(sub.get_about())))
+            "| {} | {} | {} |\n",
+            row.code,
+            cell(row.meaning),
+            cell(row.commands)
         ));
-        for s2 in visible_subcommands(sub) {
-            let path = format!("tapectl {name} {}", s2.get_name());
-            out.push_str(&format!(
-                "| &nbsp;&nbsp;[`{name} {}`]({name}.md#{}) | {} |\n",
-                s2.get_name(),
-                anchor(&path),
-                cell(&first_line(&text(s2.get_about())))
-            ));
-        }
     }
     out
 }
@@ -171,9 +213,31 @@ fn render_command(out: &mut String, cmd: &Command, path: &str, depth: usize) {
         }
         out.push('\n');
     }
+    if let Some(examples) = examples(cmd) {
+        out.push_str("**Examples**\n\n```bash\n");
+        for line in examples {
+            out.push_str(&format!("{line}\n"));
+        }
+        out.push_str("```\n\n");
+    }
     for s in subs {
         render_command(out, s, &format!("{path} {}", s.get_name()), depth + 1);
     }
+}
+
+/// The lines of a command's EXAMPLES section (`after_long_help` that
+/// starts `Examples:`), unindented: comment lines and command lines, which
+/// the reference puts in a bash block that `scripts/check-docs.py` checks.
+pub fn examples(cmd: &Command) -> Option<Vec<String>> {
+    let after = text(cmd.get_after_long_help());
+    let body = after.strip_prefix("Examples:")?;
+    Some(
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 fn arg_item(a: &Arg) -> String {

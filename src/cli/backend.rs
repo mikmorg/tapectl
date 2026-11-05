@@ -218,12 +218,11 @@ pub(crate) fn add(
     // is harmless to have already printed it.
     if dry_run {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({"backend": name, "device_tape": device_tape,
+            crate::render::print_json(
+                &serde_json::json!({"drive": name, "device_tape": device_tape,
                                    "device_sg": device_sg,
                                    "device_sg_derived": derived_sg.as_ref().map(|n| n.display().to_string()),
-                                   "generation": generation, "dry_run": true})
+                                   "generation": generation, "dry_run": true}),
             );
         } else {
             println!(
@@ -238,12 +237,11 @@ pub(crate) fn add(
     crate::config_edit::replace_file(&paths.config_file, &original, &planned.new_text)?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"backend": name, "device_tape": device_tape,
+        crate::render::print_json(
+            &serde_json::json!({"drive": name, "device_tape": device_tape,
                                "device_sg": device_sg,
                                "device_sg_derived": derived_sg.as_ref().map(|n| n.display().to_string()),
-                               "generation": generation, "status": "added"})
+                               "generation": generation, "status": "added"}),
         );
     } else {
         println!(

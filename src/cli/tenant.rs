@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use rusqlite::Connection;
 use serde::Serialize;
-use tabled::{Table, Tabled};
+use tabled::Tabled;
 
 use crate::config::TapectlPaths;
 use crate::db::queries;
@@ -9,17 +9,20 @@ use crate::error::Result;
 
 #[derive(Subcommand, Debug)]
 pub enum TenantCommands {
-    /// Add a new tenant (mints a primary and a backup key pair, or adopts
-    /// an existing identity with --adopt-key)
+    /// Add a tenant, with a new key pair or an adopted one
+    ///
+    /// Mints a primary and a backup key pair, or adopts an existing identity
+    /// with --adopt-key.
     Add {
         /// Tenant name
         name: String,
         /// Description
         #[arg(long, short)]
         description: Option<String>,
-        /// Adopt this existing age identity file (the SECRET: one
-        /// AGE-SECRET-KEY-1… line; age-keygen's comment lines are kept) as
-        /// the tenant's primary key instead of minting a pair. It is stored
+        /// Adopt this age identity file as the tenant's primary key
+        ///
+        /// The SECRET: one AGE-SECRET-KEY-1… line (age-keygen's comment lines
+        /// are kept), used instead of minting a pair. It is stored
         /// byte for byte as keys/<name>-primary.age.key, mode 0600, and is
         /// the tenant's only key: nothing is minted. Refused: anything but
         /// one X25519 identity, a public key already registered, and the
@@ -77,6 +80,17 @@ struct TenantRow {
     description: String,
 }
 
+/// `tenant list`'s table: borderless, aligned, one header case (ADR-0012
+/// item 212).
+fn tenant_table(rows: Vec<TenantRow>) -> String {
+    crate::render::table(
+        &["name", "status", "operator", "created", "description"],
+        rows.into_iter()
+            .map(|r| vec![r.name, r.status, r.is_operator, r.created_at, r.description])
+            .collect(),
+    )
+}
+
 pub fn run(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -115,7 +129,7 @@ pub fn run(
                 }
                 crate::tenant::refuse_stray_key_files(paths, name, crate::tenant::MINTED_ALIASES)?;
                 if json_output {
-                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                    crate::render::print_json(&serde_json::json!({"name": name, "dry_run": true}));
                 } else {
                     println!(
                         "would create tenant \"{name}\" with primary and backup keys \
@@ -126,9 +140,8 @@ pub fn run(
             }
             let id = crate::tenant::add_tenant(conn, paths, name, description.as_deref(), false)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"id": id, "name": name, "status": "created"})
+                crate::render::print_json(
+                    &serde_json::json!({"id": id, "name": name, "status": "created"}),
                 );
             } else {
                 println!("tenant \"{name}\" created (id={id}) with primary and backup keys");
@@ -137,7 +150,10 @@ pub fn run(
         TenantCommands::List { all } => {
             let tenants = queries::list_tenants(conn, *all)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&tenants).unwrap());
+                // Item 212: times in JSON are RFC 3339 with `Z`.
+                let mut doc = serde_json::json!(tenants);
+                crate::render::json_times(&mut doc);
+                crate::render::print_json(&doc);
             } else if tenants.is_empty() {
                 println!("no tenants found");
             } else {
@@ -151,24 +167,27 @@ pub fn run(
                         } else {
                             "".into()
                         },
-                        created_at: t.created_at,
+                        created_at: crate::render::table_time(&t.created_at),
                         description: t.description.unwrap_or_default(),
                     })
                     .collect();
-                println!("{}", Table::new(rows));
+                println!("{}", tenant_table(rows));
             }
         }
         TenantCommands::Info { name } => {
             let tenant = crate::tenant::require_tenant(conn, name)?;
             let keys = queries::list_keys_for_tenant(conn, tenant.id)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "tenant": tenant,
-                        "keys": keys,
-                    })
-                );
+                // Item 212: the keys as `key list --json` gives them (the
+                // tenant by name), and times RFC 3339 with `Z`.
+                let listed: Vec<(String, crate::db::models::EncryptionKey)> =
+                    keys.into_iter().map(|k| (tenant.name.clone(), k)).collect();
+                let mut doc = serde_json::json!({
+                    "tenant": tenant,
+                    "keys": crate::cli::key::key_list_json(&listed),
+                });
+                crate::render::json_times(&mut doc);
+                crate::render::print_json(&doc);
             } else {
                 println!("Tenant: {}", tenant.name);
                 println!("  Status:      {}", tenant.status);
@@ -176,7 +195,10 @@ pub fn run(
                     "  Operator:    {}",
                     if tenant.is_operator { "yes" } else { "no" }
                 );
-                println!("  Created:     {}", tenant.created_at);
+                println!(
+                    "  Created:     {}",
+                    crate::render::table_time(&tenant.created_at)
+                );
                 if let Some(ref desc) = tenant.description {
                     println!("  Description: {desc}");
                 }
@@ -231,16 +253,14 @@ pub fn run(
                     |r| r.get(0),
                 )?;
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"from": source, "to": to,
+                    crate::render::print_json(&serde_json::json!({"from": source, "to": to,
                                            "units_moved": would_move, "dry_run": true,
-                                           "copies_unreadable_by_destination": unreadable})
-                    );
+                                           "copies_unreadable_by_destination": unreadable}));
                 } else {
                     println!(
-                        "would reassign {would_move} unit(s) from \"{source}\" to \"{to}\" \
-                         (DRY RUN — no changes made)"
+                        "would reassign {} from \"{source}\" to \"{to}\" \
+                         (DRY RUN — no changes made)",
+                        crate::render::plural(would_move, "unit", "units")
                     );
                     if let Some(note) = &unreadable_note {
                         println!("  {note}");
@@ -280,13 +300,15 @@ pub fn run(
                 crate::unit::retenant_dotfile(path.as_deref(), to);
             }
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"from": source, "to": to, "units_moved": moved,
-                                       "copies_unreadable_by_destination": unreadable})
+                crate::render::print_json(
+                    &serde_json::json!({"from": source, "to": to, "units_moved": moved,
+                                       "copies_unreadable_by_destination": unreadable}),
                 );
             } else {
-                println!("{moved} unit(s) reassigned from \"{source}\" to \"{to}\"");
+                println!(
+                    "{} reassigned from \"{source}\" to \"{to}\"",
+                    crate::render::plural(moved as i64, "unit", "units")
+                );
                 if let Some(note) = &unreadable_note {
                     println!("  {note}");
                 }
@@ -303,7 +325,7 @@ pub fn run(
                     return Err(crate::error::TapectlError::TenantHasActiveUnits);
                 }
                 if json_output {
-                    println!("{}", serde_json::json!({"name": name, "dry_run": true}));
+                    crate::render::print_json(&serde_json::json!({"name": name, "dry_run": true}));
                 } else {
                     println!("would delete tenant \"{name}\" (DRY RUN — no changes made)");
                 }
@@ -311,7 +333,7 @@ pub fn run(
             }
             crate::tenant::delete_tenant(conn, name)?;
             if json_output {
-                println!("{}", serde_json::json!({"name": name, "status": "deleted"}));
+                crate::render::print_json(&serde_json::json!({"name": name, "status": "deleted"}));
             } else {
                 println!("tenant \"{name}\" deleted");
             }
@@ -338,11 +360,8 @@ fn add_adopting(
     if dry_run {
         crate::tenant::plan_adoption(conn, paths, name, &identity, None)?;
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({"name": name, "dry_run": true,
-                                   "adopted_key": alias, "public_key": public})
-            );
+            crate::render::print_json(&serde_json::json!({"name": name, "dry_run": true,
+                                   "adopted_key": alias, "public_key": public}));
         } else {
             println!(
                 "would create tenant \"{name}\" adopting {} as \"{alias}\" ({public}); \
@@ -355,10 +374,9 @@ fn add_adopting(
     let id =
         crate::tenant::add_tenant_adopting(conn, paths, name, description, false, &identity, None)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"id": id, "name": name, "status": "created",
-                               "adopted_key": alias, "public_key": public})
+        crate::render::print_json(
+            &serde_json::json!({"id": id, "name": name, "status": "created",
+                               "adopted_key": alias, "public_key": public}),
         );
     } else {
         println!(

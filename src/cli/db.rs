@@ -55,12 +55,11 @@ pub fn run(
                 let size = crate::util::format_bytes_binary(report.db_bytes as i64);
                 let to = report.file.display();
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"backup": to.to_string(), "keys_included": include_keys,
+                    crate::render::print_json(
+                        &serde_json::json!({"backup": to.to_string(), "keys_included": include_keys,
                                            "keys_dir": report.keys_dir,
                                            "size_bytes": report.db_bytes,
-                                           "keys_bytes": report.keys_bytes})
+                                           "keys_bytes": report.keys_bytes}),
                     );
                 } else if let Some(keys_dir) = &report.keys_dir {
                     println!(
@@ -117,11 +116,11 @@ pub fn run(
                 if report.dry_run {
                     obj["dry_run"] = serde_json::json!(true);
                 }
-                println!("{obj}");
+                crate::render::print_json(&obj);
             } else if report.dry_run {
                 println!(
                     "fsck: integrity={}, issues={} (DRY RUN — would repair; no changes made)",
-                    if report.integrity_ok { "ok" } else { "FAIL" },
+                    crate::render::verdict(if report.integrity_ok { "ok" } else { "FAIL" }),
                     report.issues.len(),
                 );
                 for issue in &report.issues {
@@ -130,7 +129,7 @@ pub fn run(
             } else {
                 println!(
                     "fsck: integrity={}, issues={}, repaired={}",
-                    if report.integrity_ok { "ok" } else { "FAIL" },
+                    crate::render::verdict(if report.integrity_ok { "ok" } else { "FAIL" }),
                     report.issues.len(),
                     report.repaired,
                 );
@@ -201,9 +200,8 @@ pub fn run(
                                            "bytes_per_year": j.bytes_per_year})
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({"size_bytes": db_size, "tables": table_count,
+                crate::render::print_json(
+                    &serde_json::json!({"size_bytes": db_size, "tables": table_count,
                                        "pages": page_count,
                                        "size_method": sizes.method.as_str(),
                                        "table_sizes": tables,
@@ -211,7 +209,7 @@ pub fn run(
                                            "size_method": growth.method.as_str(),
                                            "trailing_days": crate::db::stats::GROWTH_WINDOW_DAYS,
                                            "window_days": growth.window_days,
-                                           "journals": journals}})
+                                           "journals": journals}}),
                 );
             } else {
                 println!(

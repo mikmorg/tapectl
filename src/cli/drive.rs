@@ -49,50 +49,62 @@ pub enum DriveCommands {
     /// generic node (the sg node, used for the cartridge chip and the
     /// drive's health pages) is derived from the tape node at every use, so
     /// it need not be given; --device-sg overrides the derivation.
+    #[command(after_long_help = "\
+Examples:
+  # Find the drive's by-id path first
+  ls -l /dev/tape/by-id/
+  # The generation is read from the drive's model
+  tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<DRIVE>-nst
+  # A model tapectl does not know names its generation
+  tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<DRIVE>-nst --generation LTO-6")]
     Add {
-        /// Name for this drive, used to select it later. Letters, digits,
-        /// dot, underscore and dash.
-        #[arg(long)]
+        /// Name for this drive, used to select it later
+        ///
+        /// Letters, digits, dot, underscore and dash.
+        #[arg(long, value_name = "NAME")]
         name: String,
         /// Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         device_tape: String,
-        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1.
+        /// SCSI generic node, e.g. /dev/sg1 (default: derived)
+        ///
+        /// Used for the drive's health pages and the cartridge chip.
         /// Optional: left out, tapectl derives it from --device-tape at use
         /// (the kernel names the pairing), so a /dev/sgN renumbering never
         /// matters. Given, it overrides the derivation, and a write still
         /// refuses a node the kernel proves is another drive's.
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         device_sg: Option<String>,
-        /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
-        /// drive declares only what it can write; the medium's actual
-        /// generation is detected at `volume init`, not declared here).
+        /// Generation it writes, e.g. LTO-6 (default: its model's)
         ///
+        /// ADR-0010: a drive declares only what it can write; the medium's
+        /// actual generation is detected at `volume init`, not declared here.
         /// Read from the attached drive's model when left out (ADR-0012 item
         /// 219): HP `Ultrium N-SCSI`, IBM `ULT3580-TDN` and `ULT3580-HHN`,
         /// as the kernel records them; no command is sent to the drive.
         /// Needed when the drive is not attached or its model is not one
         /// tapectl knows. Given for an attached drive, it must agree with the
         /// model.
-        #[arg(long)]
+        #[arg(long, value_name = "GEN")]
         generation: Option<String>,
-        /// Capacity override — for virtual drives (mhvtl) and test
-        /// harnesses only. A real drive's capacity follows the loaded
+        /// Capacity override, for mhvtl and tests only
+        ///
+        /// A real drive's capacity follows the loaded
         /// cartridge's detected generation (ADR-0010); leave this unset.
         /// Decimal, as printed on the cartridge (K=10^3 ... T=10^12;
         /// ADR-0012) — not the binary unit `enospc_buffer` uses.
-        #[arg(long)]
+        #[arg(long, value_name = "SIZE")]
         capacity_override: Option<String>,
         /// Headroom reserved before end-of-tape, e.g. 50M
-        #[arg(long)]
+        #[arg(long, value_name = "SIZE")]
         enospc_buffer: Option<String>,
     },
 
-    /// Read the drive's health pages (and the cartridge chip, when one is
-    /// loaded) and record them — read-only, through the SCSI generic node
-    /// only
+    /// Record the drive's health pages and chip, read-only, through sg only
     ///
-    /// Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the drive's
+    /// Reads the drive's health pages (and the cartridge chip, when one is
+    /// loaded) and records them, through the SCSI generic node only. Sends
+    /// LOG SENSE, READ ATTRIBUTE and INQUIRY to the drive's
     /// `device_sg`, and nothing else: it never opens the tape node, never
     /// moves the tape, never loads or ejects a cartridge. Every log page it
     /// reads is journalled verbatim as a contact of its own (`report
@@ -103,16 +115,20 @@ pub enum DriveCommands {
     /// Takes the drive lock without waiting: while a tapectl command has
     /// the drive, or another command is writing the catalog, it reads
     /// nothing and exits 75. It reads no page the catalog cannot record.
-    /// Exit 0: recorded, the drive reported nothing. Exit 1: recorded, and
-    /// the drive raised a TapeAlert or reported an unrecovered error
-    /// (named). Exit 2: no reading — the sg node could not be read, the
-    /// drive is not configured, or the catalog refuses writes — or a
-    /// reading the catalog could not record (named, and printed in full).
-    /// Run daily by `contrib/systemd/tapectl-drive-poll.timer`.
+    /// Run daily by the tapectl-drive-poll timer.
+    ///
+    /// Exit status: 0 = recorded, the drive reported nothing; 1 = recorded,
+    /// and the drive raised a TapeAlert or reported an unrecovered error
+    /// (named); 2 = no reading (the sg node could not be read, the drive is
+    /// not configured, or the catalog refuses writes) or a reading the
+    /// catalog could not record (named, and printed in full); 75 = a tapectl
+    /// command holds the drive, or another is writing the catalog.
     Poll {
-        /// The drive to poll, by its tape node path as configured
-        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
-        /// only configured drive. The tape node itself is never opened.
+        /// The drive to poll, by its tape node path (default: the only one)
+        ///
+        /// As configured (`[[backends.lto]].device_tape`; a by-id link).
+        /// Defaults to the only configured drive. The tape node itself is
+        /// never opened.
         #[arg(long)]
         device: Option<String>,
     },
@@ -142,21 +158,21 @@ pub enum DriveCommands {
     /// MTIOCGET clears the st driver's recovered-error count; the count it
     /// held is printed as `recovered_errors`.)
     ///
-    /// Exit 0: the probe ran, whatever it found — an empty drive, a held
-    /// drive and a cartridge the catalog does not know are all answers. Exit
-    /// 2: the tape node could not be read (no such drive, no permission) or
-    /// no drive is configured; with `--json` the report is still printed,
-    /// with the reason in it. There is no exit 1: it gives no health verdict
-    /// (`drive poll` does).
+    /// Exit status: 0 = the probe ran, whatever it found (an empty drive, a
+    /// held drive and a cartridge the catalog does not know are all
+    /// answers); 2 = the tape node could not be read (no such drive, no
+    /// permission) or no drive is configured; with `--json` the report is
+    /// still printed, with the reason in it. There is no exit 1: it gives no
+    /// health verdict (`drive poll` does).
     ///
     /// With `--json` the whole of stdout is one JSON object; warnings go to
     /// stderr.
     Status {
-        /// The drive to look at, by its tape node path as configured
-        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
-        /// only configured drive. A path no configured drive claims is looked at too,
-        /// without the cartridge chip unless the kernel binds a SCSI generic
-        /// node to it.
+        /// The drive to look at, by its tape node path (default: the only one)
+        ///
+        /// As configured (`[[backends.lto]].device_tape`; a by-id link). A
+        /// path no configured drive claims is looked at too, without the
+        /// cartridge chip unless the kernel binds a SCSI generic node to it.
         #[arg(long)]
         device: Option<String>,
     },
@@ -187,23 +203,24 @@ pub enum DriveCommands {
     /// no configured drive, `mt -f <device> offline` still works; the catalog is not
     /// told.
     ///
-    /// Exit 0: unloaded and recorded, or nothing to do because the drive was
-    /// already empty (no contact, no event: no cartridge was in the drive).
-    /// Exit 75: refused, a tapectl command or another process has the drive.
-    /// Exit 2: not unloaded — the tape node could not be read, a cartridge is
-    /// present and the drive is not ready (loading, or faulted), or the
-    /// unload failed (the contact is recorded as failed; there is no event).
     /// A catalog that cannot record the event after a good unload is a
     /// warning, not a failure.
+    ///
+    /// Exit status: 0 = unloaded and recorded, or nothing to do because the
+    /// drive was already empty (no contact, no event); 2 = not unloaded (the
+    /// tape node could not be read, a cartridge is present and the drive is
+    /// not ready, loading or faulted, or the unload failed: the contact is
+    /// recorded as failed and there is no event); 75 = refused, a tapectl
+    /// command or another process has the drive.
     ///
     /// `--dry-run` does everything up to the unload: it checks for a holder,
     /// reads the node and the chip, and reports what it would eject; it takes
     /// no lock, sends no unload and records nothing. With `--json` the whole
     /// of stdout is one JSON object.
     Eject {
-        /// The drive to eject from, by its tape node path as configured
-        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
-        /// only configured drive.
+        /// The drive to eject from, by its tape node path (default: the only one)
+        ///
+        /// As configured (`[[backends.lto]].device_tape`; a by-id link).
         #[arg(long)]
         device: Option<String>,
     },
@@ -227,26 +244,28 @@ pub enum DriveCommands {
     /// counted. Register a cleaning cartridge first with `drive
     /// cleaning-cartridge add`.
     ///
-    /// Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at
-    /// or past its rated life (a spent cartridge does not clean; replace it).
-    /// A cartridge near its rated life is a warning with exit 0. Exit 2: not
-    /// recorded — the drive gave no serial to record against, or the named
-    /// cartridge is not registered.
-    ///
     /// The chip read that identifies the cartridge in the drive is kept
     /// whole in the MAM journal (`cartridge journal`), against no contact.
     ///
     /// `--dry-run` reports what would be recorded and records nothing. With
     /// `--json` the whole of stdout is one JSON object.
+    ///
+    /// Exit status: 0 = recorded (a cartridge near its rated life is a
+    /// warning with exit 0); 1 = recorded, and the cleaning cartridge is at
+    /// or past its rated life (a spent cartridge does not clean; replace
+    /// it); 2 = not recorded, the drive gave no serial to record against or
+    /// the named cartridge is not registered.
     Cleaned {
-        /// The cleaning cartridge used, by the serial it was registered
-        /// under (`drive cleaning-cartridge add`).
+        /// The cleaning cartridge used, by its registered serial
+        ///
+        /// The serial it was registered under (`drive cleaning-cartridge
+        /// add`).
         #[arg(long)]
         cartridge: Option<String>,
 
-        /// The drive that was cleaned, by its tape node path as configured
-        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
-        /// only configured drive.
+        /// The drive cleaned, by its tape node (default: the only one)
+        ///
+        /// As configured (`[[backends.lto]].device_tape`; a by-id link).
         #[arg(long)]
         device: Option<String>,
     },
@@ -434,7 +453,9 @@ pub fn run(
                     backend.device_tape
                 );
                 if json_output {
-                    println!("{}", serde_json::json!({ "skipped": true, "reason": msg }));
+                    crate::render::print_json(
+                        &serde_json::json!({ "skipped": true, "reason": msg }),
+                    );
                 } else {
                     eprintln!("{msg}");
                 }
@@ -515,7 +536,7 @@ pub fn run(
             let conn = crate::db::open(&paths.db_file)?;
             let report = add_cleaning_cartridge(&conn, serial, *rated_uses, dry_run)?;
             if json_output {
-                println!("{}", serde_json::to_string(&report).unwrap_or_default());
+                crate::render::print_json(&serde_json::json!(report));
             } else {
                 println!("{}", report.message);
             }
@@ -539,10 +560,11 @@ pub fn exit_code(report: &PollReport) -> Result<i32> {
     }
     if report.pages_read == 0 {
         return Err(TapectlError::Other(format!(
-            "drive poll read no log page from {} ({} attempt(s) failed, each journalled in the \
+            "drive poll read no log page from {} ({} failed, each journalled in the \
              catalog's log-page journal). Is the service user in the group that owns the sg \
              node, and is device_sg this drive's?",
-            report.device_sg, report.pages_failed
+            report.device_sg,
+            crate::render::plural(report.pages_failed as i64, "attempt", "attempts")
         )));
     }
     Ok(if report.drive_reported_problem() {
@@ -570,18 +592,18 @@ fn render(
                 cleaning.map(|c| c.serial.clone()).into(),
             );
         }
-        println!("{v}");
+        crate::render::print_json(&v);
         return;
     }
     println!(
-        "drive {} ({}): {} log page(s) read, {} failed",
+        "drive {} ({}): {} read, {} failed",
         report.backend,
         report
             .drive_serial
             .as_deref()
             .map(|s| format!("serial {s}"))
             .unwrap_or_else(|| "no serial".into()),
-        report.pages_read,
+        crate::render::plural(report.pages_read as i64, "log page", "log pages"),
         report.pages_failed
     );
     match (&report.medium_serial, &report.cartridge) {
@@ -1291,7 +1313,15 @@ fn holder_line(h: &Holder) -> String {
 
 fn render_status(report: &StatusReport, json_output: bool) {
     if json_output {
-        println!("{}", serde_json::to_string(report).unwrap_or_default());
+        // Item 212: the catalog's time of the last contact, RFC 3339 `Z`.
+        let mut doc = serde_json::json!(report);
+        if let Some(at) = doc
+            .pointer_mut("/catalog/last_contact_on_device/at")
+            .filter(|at| at.is_string())
+        {
+            *at = serde_json::json!(crate::render::json_time(at.as_str().unwrap_or_default()));
+        }
+        crate::render::print_json(&doc);
         return;
     }
     print!("{}", status_text(report));
@@ -1421,7 +1451,8 @@ pub fn status_text(report: &StatusReport) -> String {
             if let Some(e) = n.recovered_errors.filter(|e| *e > 0) {
                 let _ = writeln!(
                     out,
-                    "  st recovered {e} error(s) since the previous status read (now cleared)"
+                    "  st recovered {} since the previous status read (now cleared)",
+                    crate::render::plural(e, "error", "errors")
                 );
             }
         }
@@ -1495,7 +1526,7 @@ pub fn status_text(report: &StatusReport) -> String {
                     .map(|g| format!(", {g}"))
                     .unwrap_or_default(),
                 m.load_count
-                    .map(|l| format!(", {l} load(s)"))
+                    .map(|l| format!(", {}", crate::render::plural(l, "load", "loads")))
                     .unwrap_or_default(),
                 m.manufacturer
                     .as_deref()
@@ -1543,7 +1574,7 @@ pub fn status_text(report: &StatusReport) -> String {
         let _ = writeln!(
             out,
             "  last contact on this drive (catalog record): {} — {}{}{}",
-            l.at,
+            crate::render::table_time(&l.at),
             l.operation,
             l.cartridge
                 .as_deref()
@@ -1945,7 +1976,7 @@ pub fn eject_exit_code(report: &EjectReport) -> i32 {
 
 fn render_eject(report: &EjectReport, json_output: bool) {
     if json_output {
-        println!("{}", serde_json::to_string(report).unwrap_or_default());
+        crate::render::print_json(&serde_json::json!(report));
         return;
     }
     let text = eject_text(report);
@@ -2259,7 +2290,7 @@ pub fn cleaned_exit_code(report: &CleanedReport) -> i32 {
 
 fn render_cleaned(report: &CleanedReport, json_output: bool) {
     if json_output {
-        println!("{}", serde_json::to_string(report).unwrap_or_default());
+        crate::render::print_json(&serde_json::json!(report));
         return;
     }
     print!("{}", cleaned_text(report));

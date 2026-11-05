@@ -296,7 +296,7 @@ pub enum Commands {
         /// name the operator after the account.
         #[arg(long)]
         operator: Option<String>,
-        /// Do not create the permanent escrow recipient now
+        /// Do not create the escrow recipient now
         ///
         /// By default `init` generates it (ADR-0005) and prints its secret
         /// once. Use this only when you will adopt an existing escrow
@@ -304,14 +304,14 @@ pub enum Commands {
         /// tooling that register escrow separately.
         #[arg(long)]
         no_escrow: bool,
-        /// Adopt this escrow public key instead of minting a new identity
+        /// Adopt this escrow public key instead of minting one
         ///
         /// An age1… literal, or a path to a .pub file. The disaster-recovery
         /// form: a rebuilt machine adopts the original recipient from the heir
         /// kit's cover sheet so every tape's receipts keep matching.
         #[arg(long, value_name = "KEY_OR_FILE", conflicts_with = "no_escrow")]
         escrow_public_key: Option<String>,
-        /// Adopt this age identity file as the operator's primary key
+        /// Adopt this age identity file as the operator's key
         ///
         /// The SECRET, used instead of minting a pair, as `tenant add
         /// --adopt-key` does for a tenant: stored byte for byte as
@@ -1009,8 +1009,9 @@ mod tests {
                 };
                 let mut lines = script.lines().filter(|l| l.contains(&after));
                 if let [_, second] = parent {
+                    let seen = format!("__fish_seen_subcommand_from {second}");
                     lines.any(|l| {
-                        l.contains(&format!("__fish_seen_subcommand_from {second};"))
+                        (l.contains(&format!("{seen};")) || l.contains(&format!("{seen}\"")))
                             && l.contains(&format!("-a \"{name}\""))
                     })
                 } else {
@@ -1059,8 +1060,15 @@ mod tests {
                 clap_complete::generate(shell, &mut Cli::command(), "tapectl", &mut whole);
             }
             let whole = String::from_utf8(whole).unwrap();
-            for stub in [&["backend"][..], &["report", "pending"], &["staging", "clean"]] {
-                assert!(offers(shell, &whole, stub), "{shell}: the search misses {stub:?}");
+            for stub in [
+                &["backend"][..],
+                &["report", "pending"],
+                &["staging", "clean"],
+            ] {
+                assert!(
+                    offers(shell, &whole, stub),
+                    "{shell}: the search misses {stub:?}"
+                );
             }
             for path in live {
                 assert!(offers(shell, &script, path), "{shell} lacks {path:?}");

@@ -18,11 +18,15 @@ pub enum HostCommands {
     /// Reports the load average, available memory, memory and I/O pressure,
     /// and any contender process or systemd unit (`[host_check]` in
     /// config.toml), the same check `volume write` runs before it touches
-    /// the drive. Exit 0 when quiet, 1 when anything tripped. Never
-    /// refuses anything: it only reports.
+    /// the drive. Never refuses anything: it only reports.
+    ///
+    /// Exit status: 0 = the host is quiet; 1 = something tripped (each
+    /// `host check:` line names it); 2 = an error.
     Check {
-        /// Also check this systemd unit (repeatable), on top of
-        /// `[host_check] contender_units`, e.g. a CI runner's timer.
+        /// Also check this systemd unit (repeatable)
+        ///
+        /// On top of `[host_check] contender_units`, e.g. a CI runner's
+        /// timer.
         #[arg(long = "systemd-unit", value_name = "UNIT")]
         units: Vec<String>,
     },
@@ -45,7 +49,7 @@ pub fn run(config: Option<&Config>, command: &HostCommands, json_output: bool) -
             let snapshot = HostSnapshot::read_live(&all_units);
             let findings = assess(&snapshot, &cfg);
             if json_output {
-                println!("{}", render_json(&snapshot, &cfg, &findings));
+                crate::render::print_json(&render_json(&snapshot, &cfg, &findings));
             } else {
                 print!("{}", render_human(&snapshot, &cfg, &findings));
             }

@@ -51,7 +51,7 @@ pub fn run(
                 let val: toml::Value = toml_str
                     .parse()
                     .unwrap_or(toml::Value::String(toml_str.clone()));
-                println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                crate::render::print_json(&serde_json::json!(val));
             } else {
                 print!("{toml_str}");
             }
@@ -564,7 +564,7 @@ fn print_json(
         .iter()
         .map(|c| {
             serde_json::json!({
-                "backend": c.backend_name,
+                "drive": c.backend_name,
                 "device_tape": c.device_tape,
                 "device_tape_exists": c.device_tape_exists,
                 "device_sg": c.device_sg,
@@ -584,34 +584,31 @@ fn print_json(
             })
         })
         .collect();
-    println!(
-        "{}",
-        serde_json::json!({
-            "valid": report.valid,
-            "problems": report.problems,
-            "slice_cap_problems": report.slice_cap_problems,
-            "shadowing_dotfiles": shadowing_json,
-            "subsumed_policy_fields": subsumed_json,
-            "decorative_keys": decorative_json,
-            "unknown_keys": unknown_key_json,
-            "dar": dar_json,
-            "staging": staging_json,
-            "staging_space": staging_space_json,
-            "tape_devices": tape_devices_json,
-            "unsupported_compression": unsupported_compression_json,
-            "capacity_override_backends": capacity_override_hits,
-            "host_check": host_check.map(|(present, hc)| serde_json::json!({
-                "table_present": present,
-                "effective": hc,
-                "warnings": crate::host_check::long_process_name_warnings(hc),
-            })),
-            "ops": ops_lines,
-            "defaults": defaults_json,
-            "notes": notes,
-            "home": home.map(|h| h.paths.home.display().to_string()),
-            "home_source": home.map(|h| h.source.key()),
-        })
-    );
+    crate::render::print_json(&serde_json::json!({
+        "valid": report.valid,
+        "problems": report.problems,
+        "slice_cap_problems": report.slice_cap_problems,
+        "shadowing_dotfiles": shadowing_json,
+        "subsumed_policy_fields": subsumed_json,
+        "decorative_keys": decorative_json,
+        "unknown_keys": unknown_key_json,
+        "dar": dar_json,
+        "staging": staging_json,
+        "staging_space": staging_space_json,
+        "tape_devices": tape_devices_json,
+        "unsupported_compression": unsupported_compression_json,
+        "capacity_override_backends": capacity_override_hits,
+        "host_check": host_check.map(|(present, hc)| serde_json::json!({
+            "table_present": present,
+            "effective": hc,
+            "warnings": crate::host_check::long_process_name_warnings(hc),
+        })),
+        "ops": ops_lines,
+        "defaults": defaults_json,
+        "notes": notes,
+        "home": home.map(|h| h.paths.home.display().to_string()),
+        "home_source": home.map(|h| h.source.key()),
+    }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -671,7 +668,7 @@ fn print_human(
     }
     if !shadowing_hits.is_empty() {
         println!(
-            "  hint: remove the shadowing key(s) from each dotfile's [policy] table to defer to the archive set"
+            "  hint: remove the shadowing keys from each dotfile's [policy] table to defer to the archive set"
         );
     }
     for hit in unreadable_dotfiles {
@@ -871,8 +868,13 @@ pub(crate) fn describe_ops(
             .count();
         if private > 0 {
             lines.push(format!(
-                "ops: {private} older session log(s) are not readable by \"{name}\" (written \
-                 before the group was set); `tapectl status` names them unreadable"
+                "ops: {} not readable by \"{name}\" (written before the group was set); \
+                 `tapectl status` names them unreadable",
+                if private == 1 {
+                    "1 older session log is".to_string()
+                } else {
+                    format!("{private} older session logs are")
+                }
             ));
         }
     }

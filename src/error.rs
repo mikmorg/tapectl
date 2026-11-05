@@ -108,6 +108,99 @@ pub const EXIT_ERASE_INCOMPLETE: i32 = 4;
 /// See [`EXIT_ERASE_INCONCLUSIVE`]: the read-back contradicts the erase.
 pub const EXIT_ERASE_VERIFY_FAILED: i32 = 6;
 
+/// One row of the CLI's exit-code table: a code, what it means, and the
+/// commands that exit with it in that meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitCodeRow {
+    pub code: i32,
+    pub meaning: &'static str,
+    pub commands: &'static str,
+}
+
+const fn exit_row(code: i32, meaning: &'static str, commands: &'static str) -> ExitCodeRow {
+    ExitCodeRow {
+        code,
+        meaning,
+        commands,
+    }
+}
+
+/// Every exit code tapectl exits with, in one table (ADR-0012 item 212): the
+/// CLI reference renders it (`docs/cli/README.md`), and each command's own
+/// `--help` states the codes it uses. Built from the constants above, so a
+/// code cannot be renumbered here alone.
+pub const EXIT_CODE_TABLE: &[ExitCodeRow] = &[
+    exit_row(
+        EXIT_SUCCESS,
+        "done: the command did what it was asked, or what it checks is clean",
+        "every command",
+    ),
+    exit_row(
+        EXIT_WARNING,
+        "done, with warnings: the work stands and something deserves a look",
+        "`audit` (warnings only); `host check` (something tripped); `db fsck` (problems found, \
+         repaired or not); `collection sync`, `status`, `plan` and `run` (an entry outside any \
+         unit, a folder refused, a unit marked missing or refused); `drive poll` (a TapeAlert or \
+         an unrecovered error); `drive cleaned` (the cleaning cartridge at or past its rated \
+         life); `unit check-integrity` (a damaged or missing file)",
+    ),
+    exit_row(
+        EXIT_ERROR,
+        "an error, a usage error included: nothing was decided",
+        "every command, except the meanings below",
+    ),
+    exit_row(
+        EXIT_ERROR,
+        "a verdict, not an error: at least one violation (`audit`); the medium proven bad and \
+         the volume quarantined (`volume verify`); the configuration invalid (`config check`); \
+         the database's integrity broken (`db fsck`); the catalog unreadable (`status`)",
+        "`audit`, `volume verify`, `config check`, `db fsck`, `status`",
+    ),
+    exit_row(
+        EXIT_ERROR,
+        "refused, the medium untouched",
+        "the commands that write a tape (`volume write`, `volume resume`, `volume rewrite`, \
+         `volume compact-write`, `volume compact`, `collection run`, `quick-archive`) and \
+         `cartridge erase`",
+    ),
+    exit_row(
+        EXIT_VERIFY_INCONCLUSIVE,
+        "inconclusive: no verdict about the medium, which is untouched; every error of \
+         `volume verify`, a usage error after `verify` included",
+        "`volume verify`; the commands that write a tape (sealed, the confirm inconclusive); \
+         `cartridge erase` (erased, the read-back inconclusive)",
+    ),
+    exit_row(
+        EXIT_WRITE_INTERRUPTED,
+        "interrupted: `volume resume` continues the session (`cartridge erase`: the erase \
+         failed part-way, run it again)",
+        "the commands that write a tape, `cartridge erase`",
+    ),
+    exit_row(
+        EXIT_WRITE_ABORTED,
+        "aborted: the session cannot resume, write the label again",
+        "the commands that write a tape",
+    ),
+    exit_row(
+        EXIT_WRITE_MEDIUM_BAD,
+        "the medium proven bad: the volume is quarantined (`cartridge erase`: the read-back \
+         contradicts the erase)",
+        "the commands that write a tape, `cartridge erase`",
+    ),
+    exit_row(
+        EXIT_AUDIT_ERROR,
+        "no verdict: the audit stopped on an error, a usage error after `audit` included",
+        "`audit`",
+    ),
+    exit_row(
+        EXIT_CATALOG_BUSY,
+        "busy: another tapectl process held the catalog (or the drive) too long; nothing \
+         changed, run it again",
+        "every command that opens the catalog, except `volume verify` (3); `drive poll` and \
+         `drive eject` when a command holds the drive",
+    ),
+];
+
 /// How a write-family command ended, ordered from best to worst — the
 /// order `collection run` reports "the worst outcome among its copies" by
 /// (6 > 5 > 4 > 3 > 2 > 0, ADR-0012 2026-10-07 item 20). A busy catalog
