@@ -39,9 +39,11 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.8.1 (tagged `v1.8.1`, 2026-11-01) is the current release. It is young: in real
+tapectl 1.9.0 is the current release. It is young: in real
 use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
-have been exercised only in a virtual tape library (mhvtl).
+have been exercised only in a virtual tape library (mhvtl). 1.9.0 renamed some commands
+and flags (`stage list` for `staging status`, `drive add` for `backend add`, …): an old
+spelling is refused by name, naming the new one ([release notes](docs/releases/1.9.0.md)).
 
 The newest features each passed an acceptance run on a real HP LTO-6 drive before their
 release was tagged: the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and
@@ -96,11 +98,11 @@ tapectl unit init-bulk /media/family/photos --tenant family
 
 tapectl snapshot create family/photos/2019-italy         # fast: what is there
 tapectl stage create family/photos/2019-italy            # dar + sha256 + age, into staging
-tapectl volume init L6-0001                              # reads the cartridge's chip
-tapectl volume write L6-0001 --full-confirm --move-to home-rack   # plan, write, seal, read it all back, shelve
+tapectl volume write L6-0001 --init --full-confirm --move-to home-rack   # init, plan, write, seal, read it all back, shelve
 
-tapectl audit --action-plan                              # "has 1 copies, needs 2" — and the fix
-tapectl restore unit --unit family/photos/2019-italy --from L6-0001 --to /tmp/restore
+tapectl status                                           # where things stand, and the next command
+tapectl audit --action-plan                              # "has 1 copy, needs 2" — and the fix
+tapectl restore unit family/photos/2019-italy --from L6-0001 --to /tmp/restore
 ```
 
 The [walkthrough](docs/walkthrough.md) runs a complete session like this — two tapes,
