@@ -9,134 +9,61 @@ tapectl\-archive\-set\-edit \- Edit an existing archive set (flags left out are 
 Edit an existing archive set (flags left out are left unchanged)
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
-\fB\-\-min\-copies\fR \fI<MIN_COPIES>\fR
+\fB\-\-min\-copies\fR \fI<N>\fR
 Minimum copy count
 .TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
-\fB\-\-required\-locations\fR \fI<REQUIRED_LOCATIONS>\fR
-Required locations (comma\-separated); each must be a registered location (`tapectl location add`)
-.TP
-\fB\-\-encrypt\fR \fI<ENCRYPT>\fR
-Encryption enabled
-.br
+\fB\-\-required\-locations\fR \fI<LIST>\fR
+Required locations, comma\-separated
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+Each must be a registered location (`tapectl location add`).
 .TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+\fB\-\-encrypt\fR \fI<BOOL>\fR
+Encryption enabled (true/false)
 .TP
-\fB\-\-compression\fR \fI<COMPRESSION>\fR
+\fB\-\-compression\fR \fI<MODE>\fR
 Compression mode
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-\-checksum\-mode\fR \fI<CHECKSUM_MODE>\fR
+\fB\-\-checksum\-mode\fR \fI<MODE>\fR
 Checksum mode
 .TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+\fB\-\-slice\-size\fR \fI<SIZE>\fR
+Slice size, e.g. "1G" (the default)
 .TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-slice\-size\fR \fI<SLICE_SIZE>\fR
-Slice size (e.g., "1G", the default)
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-\-verify\-interval\-days\fR \fI<VERIFY_INTERVAL_DAYS>\fR
+\fB\-\-verify\-interval\-days\fR \fI<DAYS>\fR
 Verify interval in days
 .TP
-\fB\-\-warehouse\-copies\fR \fI<WAREHOUSE_COPIES>\fR
-Warehouse copies expected (ADR\-0006). Never set means "defer to the system default"
-.TP
-\fB\-\-preserve\-xattrs\fR \fI<PRESERVE_XATTRS>\fR
-Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
-.br
+\fB\-\-warehouse\-copies\fR \fI<N>\fR
+Warehouse copies expected (ADR\-0006)
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+Never set means "defer to the system default".
 .TP
-\fB\-\-preserve\-acls\fR \fI<PRESERVE_ACLS>\fR
-Keep POSIX ACLs (true/false). No effect of its own: ACLs follow \-\-preserve\-xattrs
-.br
+\fB\-\-preserve\-xattrs\fR \fI<BOOL>\fR
+Keep extended attributes (true/false)
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+And the POSIX ACLs stored as them; false drops them all.
 .TP
-\fB\-\-preserve\-fsa\fR \fI<PRESERVE_FSA>\fR
-Keep filesystem\-specific attributes such as chattr flags (true/false)
-.br
+\fB\-\-preserve\-acls\fR \fI<BOOL>\fR
+Keep POSIX ACLs (true/false; with \-\-preserve\-xattrs)
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
 .TP
-\fB\-\-dirty\-on\-metadata\-change\fR \fI<DIRTY_ON_METADATA_CHANGE>\fR
-Treat a metadata\-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
-.br
-
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+\fB\-\-preserve\-fsa\fR \fI<BOOL>\fR
+Keep filesystem attributes, chattr flags (true/false)
 .TP
-\fB\-\-allow\-spanning\fR \fI<ALLOW_SPANNING>\fR
-Let this set\*(Aqs units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
-.br
+\fB\-\-dirty\-on\-metadata\-change\fR \fI<BOOL>\fR
+A metadata change makes a unit dirty (true/false)
 
-.br
-\fIPossible values:\fR
-.RS 14
-.IP \(bu 2
-true
-.IP \(bu 2
-false
-.RE
+Not read yet: dirty detection compares path, size and mtime only.
+.TP
+\fB\-\-allow\-spanning\fR \fI<BOOL>\fR
+Units may span tapes by their slices (true/false)
+
+From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
 .TP
 \fB\-\-copies\-at\fR \fI<NAME=N>\fR
-Copies each unit should hold at a location, as NAME=N (repeatable, e.g. \-\-copies\-at home=1 \-\-copies\-at offsite=1); each NAME must be a registered location. Replaces the set\*(Aqs whole map. A unit\*(Aqs dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]"
+Copies at a location, NAME=N (repeatable)
+
+E.g. \-\-copies\-at home=1 \-\-copies\-at offsite=1; each NAME must be a registered location. Replaces the set\*(Aqs whole map. A unit\*(Aqs dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]".
 .TP
 \fB\-d\fR, \fB\-\-description\fR \fI<DESCRIPTION>\fR
 Description
@@ -146,3 +73,41 @@ Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fINAME\fR>
 Archive set name
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

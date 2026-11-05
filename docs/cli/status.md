@@ -4,9 +4,9 @@
 
 [All commands](README.md)
 
-The home screen: the home and why it was chosen, what is running, the units by state, the volumes due a verify, and the next commands
+The home screen: the home, what is running, units by state, next steps
 
-The home is named with the rule that chose it (see --home). What is running and how the last sessions ended come from the session logs: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Then, from the catalog, the units by state (pending: never archived or dirty; staged, awaiting a write; under-copied, below their copy floor), the volumes due a verify (no full readback, or past the verify_interval_days of a unit on them), and at most three next commands: an interrupted write to resume, pending units, staged or under-copied units, a volume to verify.
+The home and why it was chosen, what is running, the units by state, the volumes due a verify, and the next commands. The home is named with the rule that chose it (see --home). What is running and how the last sessions ended come from the session logs: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Then, from the catalog, the units by state (pending: never archived or dirty; staged, awaiting a write; under-copied, below their copy floor), the volumes due a verify (no full readback, or past the verify_interval_days of a unit on them), and at most three next commands: an interrupted write to resume, pending units, staged or under-copied units, a volume to verify.
 
 An account in the home's `[ops] group` reads the session logs but not the catalog: it is shown the home and the sessions, and is told that the overview needs the service user (`tapectl-op status`).
 
@@ -18,5 +18,18 @@ tapectl status [OPTIONS]
 
 **Options**
 
-- `--last <LAST>` *(default: `5`)* — How many finished sessions to show, newest first (running ones are always shown)
+- `--last <LAST>` *(default: `5`)* — How many finished sessions to show, newest first
+  
+    Running sessions are always shown.
+
+**Examples**
+
+```bash
+# Where things stand, and the next command
+tapectl status
+# The same as one JSON document; `next` holds the next commands
+tapectl --json status
+# From an operator account, the service user's whole view
+tapectl-op status
+```
 

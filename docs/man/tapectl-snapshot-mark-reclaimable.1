@@ -2,48 +2,63 @@
 .el .ds Aq '
 .TH tapectl-snapshot-mark-reclaimable 1  "tapectl-snapshot-mark-reclaimable " 
 .SH NAME
-tapectl\-snapshot\-mark\-reclaimable \- Mark a snapshot as reclaimable (with enforced preconditions)
+tapectl\-snapshot\-mark\-reclaimable \- Mark a superseded version reclaimable, so compaction may drop it
 .SH SYNOPSIS
 \fBtapectl snapshot mark\-reclaimable\fR [\fB\-\-json\fR] <\fB\-\-version\fR> [\fB\-\-force\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
-Mark a snapshot as reclaimable (with enforced preconditions)
+Mark a superseded version reclaimable, so compaction may drop it
+.PP
+Refused while the version superseding it is short of its copy floor or a copy target, unless confirmed (\-\-force, \-\-yes, or a terminal\*(Aqs prompt); a version no current version supersedes only with \-\-force.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-version\fR \fI<VERSION>\fR
-Snapshot version
+The version to mark
 .TP
 \fB\-\-force\fR
+Mark it though its successor is short, or nothing supersedes it
+
 Confirm in advance, as the global \-\-yes does: mark the version even though the version superseding it is short of its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets) or of a copy target at a location of its copies_at map (an archive set\*(Aqs required_locations counts as one copy at each name); for a tape\-only unit, the multiplied floors. Without either flag a terminal asks, and a non\-interactive run refuses, naming the shortfall. Only \-\-force (not \-\-yes, not a prompt) marks a version no current version supersedes — that releases the unit\*(Aqs only current version
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fINAME\fR>
-Unit name
+The unit
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

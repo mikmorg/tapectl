@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-Database operations
+Back up, check, export and inspect the catalog database
 
 ```text
 tapectl db [OPTIONS] <COMMAND>
@@ -30,15 +30,30 @@ tapectl db backup [OPTIONS] <PATH>
 
 **Arguments**
 
-- `<PATH>` — The backup file to write, or a directory to write `tapectl-YYYYmmddTHHMMSSZ.db` into (the scheduled backup's name). An existing file is refused, never overwritten. The directory must already exist
+- `<PATH>` — The backup file to write, or a directory for a dated one
+  
+    A directory gets `tapectl-YYYYmmddTHHMMSSZ.db` (the scheduled backup's name) and must already exist. An existing file is refused, never overwritten.
 
 **Options**
 
-- `--include-keys` — Also copy the private key directory, into a directory beside the backup named for it with its extension replaced by `.keys` (`db backup /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...)
+- `--include-keys` — Also copy the private key directory, beside the backup
+  
+    Into a directory beside the backup named for it with its extension replaced by `.keys` (`db backup /mnt/usb/tapectl.db` copies the keys to `/mnt/usb/tapectl.keys/`). Off by default — the database alone is the common backup case. Private key material copied this way must be treated as secret wherever the destination ends up (USB stick, network share, cloud-synced folder, ...).
+
+**Examples**
+
+```bash
+# A dated file in a directory on another disk
+tapectl db backup /mnt/backup/
+# A file of your naming, and the private keys beside it (secret)
+tapectl db backup /mnt/usb/tapectl.db --include-keys
+```
 
 ### tapectl db fsck
 
 Check database integrity
+
+Exit status: 0 = clean; 1 = problems found, repaired or not; 2 = the database's integrity is broken (or an error).
 
 ```text
 tapectl db fsck [OPTIONS]
@@ -46,7 +61,9 @@ tapectl db fsck [OPTIONS]
 
 **Options**
 
-- `--repair` — Delete rows whose foreign-key parent is missing, closing the graph in one transaction (children first, in effect); logged
+- `--repair` — Delete rows whose foreign-key parent is missing
+  
+    Closes the graph in one transaction (children first, in effect); logged.
 
 ### tapectl db export
 

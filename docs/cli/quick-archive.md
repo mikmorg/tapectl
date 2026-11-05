@@ -21,9 +21,13 @@ tapectl quick-archive [OPTIONS] --tenant <TENANT> --volume <VOLUME> <PATH>
 **Options**
 
 - `--tenant <TENANT>` *(required)* — Tenant name
-- `--volume <VOLUME>` *(required)* — Label of an ALREADY-INITIALIZED volume to write to. Create it with `tapectl volume init LABEL --device ...`; quick-archive does not
+- `--volume <VOLUME>` *(required)* — Label of an already initialized volume to write to
+  
+    Create it with `tapectl volume init LABEL --device ...`; quick-archive does not.
 - `-t, --tag <TAG>` — Tags
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--device <DEVICE>` — Tape device (by-id path; default: the only configured drive)
+  
+    Required when more than one drive is configured.
 - `--prewrite-hash` — See `volume write --prewrite-hash`
 - `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this command's write only
 - `--full-confirm` — See `volume write --full-confirm`

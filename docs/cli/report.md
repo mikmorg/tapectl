@@ -14,15 +14,15 @@ tapectl report [OPTIONS] <COMMAND>
 
 - [`fire-risk`](#tapectl-report-fire-risk) — Units below their copy floor, judged by copies only
 - [`needs`](#tapectl-report-needs) — Each unit's copy target, copies and shortfall at every location
-- [`copies`](#tapectl-report-copies) — Copy count distribution per unit
-- [`tape-only`](#tapectl-report-tape-only) — Tape-only unit status
-- [`dirty`](#tapectl-report-dirty) — Units with changes since last snapshot
-- [`verify-status`](#tapectl-report-verify-status) — Verification recency
-- [`health`](#tapectl-report-health) — Drive error trends, and drive cleanings
+- [`copies`](#tapectl-report-copies) — Each unit's copies and locations, and the tapes holding it
+- [`tape-only`](#tapectl-report-tape-only) — Each tape-only unit's copies and locations
+- [`dirty`](#tapectl-report-dirty) — Units that changed since their last snapshot, or were never archived
+- [`verify-status`](#tapectl-report-verify-status) — Each volume's verifications, oldest evidence first
+- [`health`](#tapectl-report-health) — Drive error trends, TapeAlerts, feed ratios and drive cleanings
 - [`cartridge-health`](#tapectl-report-cartridge-health) — Every cartridge's health, worst first, and why
-- [`capacity`](#tapectl-report-capacity) — Volume capacity utilization
-- [`age`](#tapectl-report-age) — Snapshot age distribution
-- [`events`](#tapectl-report-events) — Audit trail browsing
+- [`capacity`](#tapectl-report-capacity) — What the volumes in service hold against their capacity
+- [`age`](#tapectl-report-age) — Each unit's current snapshot and when it was made, oldest first
+- [`events`](#tapectl-report-events) — The catalog's events, newest first (the last 100)
 - [`compaction-candidates`](#tapectl-report-compaction-candidates) — Volumes flagged for compaction
 - [`reclaimable`](#tapectl-report-reclaimable) — Superseded snapshot versions that could be marked reclaimable
 - [`failed-stages`](#tapectl-report-failed-stages) — Stage attempts that failed, and the hours each lost
@@ -56,7 +56,9 @@ tapectl report needs [OPTIONS]
 
 ### tapectl report copies
 
-Copy count distribution per unit
+Each unit's copies and locations, and the tapes holding it
+
+The copies are its least-covered current version's; the tapes are every tape holding any current version of it (one marked `*` is not sealed and does not count). A tape holding only some of a version's slices says which, and a tape the escrow key cannot open is named.
 
 ```text
 tapectl report copies [OPTIONS]
@@ -64,11 +66,11 @@ tapectl report copies [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Filter to specific unit
+- `--unit <UNIT>` — Only this unit
 
 ### tapectl report tape-only
 
-Tape-only unit status
+Each tape-only unit's copies and locations
 
 ```text
 tapectl report tape-only [OPTIONS]
@@ -76,11 +78,11 @@ tapectl report tape-only [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Filter to specific unit
+- `--unit <UNIT>` — Only this unit
 
 ### tapectl report dirty
 
-Units with changes since last snapshot
+Units that changed since their last snapshot, or were never archived
 
 ```text
 tapectl report dirty [OPTIONS]
@@ -88,11 +90,13 @@ tapectl report dirty [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Filter to specific unit
+- `--unit <UNIT>` — Only this unit
 
 ### tapectl report verify-status
 
-Verification recency
+Each volume's verifications, oldest evidence first
+
+Every verification session of every volume holding data, a volume never verified first, then the oldest readback; with the most recent failure's positions, and the sealed volumes no full readback has read.
 
 ```text
 tapectl report verify-status [OPTIONS]
@@ -100,11 +104,13 @@ tapectl report verify-status [OPTIONS]
 
 **Options**
 
-- `--volume <VOLUME>` — Filter to specific volume
+- `--volume <VOLUME>` — Only this volume, whatever its status
 
 ### tapectl report health
 
-Drive error trends, and drive cleanings
+Drive error trends, TapeAlerts, feed ratios and drive cleanings
+
+The last 50 health readings, newest first, after every TapeAlert ever raised, each cartridge's corrected read errors per GiB verify over verify, the drives' cleanings, and each write's feed ratio.
 
 ```text
 tapectl report health [OPTIONS]
@@ -112,7 +118,7 @@ tapectl report health [OPTIONS]
 
 **Options**
 
-- `--volume <VOLUME>` — Filter to specific volume
+- `--volume <VOLUME>` — Only this volume's readings and feed ratios
 
 ### tapectl report cartridge-health
 
@@ -124,7 +130,7 @@ tapectl report cartridge-health [OPTIONS]
 
 ### tapectl report capacity
 
-Volume capacity utilization
+What the volumes in service hold against their capacity
 
 ```text
 tapectl report capacity [OPTIONS]
@@ -132,11 +138,11 @@ tapectl report capacity [OPTIONS]
 
 **Options**
 
-- `--per-volume` — Per-volume breakdown
+- `--per-volume` — One row per volume, initialized ones too
 
 ### tapectl report age
 
-Snapshot age distribution
+Each unit's current snapshot and when it was made, oldest first
 
 ```text
 tapectl report age [OPTIONS]
@@ -144,11 +150,11 @@ tapectl report age [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Filter to specific unit
+- `--unit <UNIT>` — Only this unit
 
 ### tapectl report events
 
-Audit trail browsing
+The catalog's events, newest first (the last 100)
 
 ```text
 tapectl report events [OPTIONS]
@@ -156,8 +162,8 @@ tapectl report events [OPTIONS]
 
 **Options**
 
-- `--entity <ENTITY>` — Filter by entity type
-- `--days <DAYS>` — Limit to last N days
+- `--entity <ENTITY>` — Only events about this kind of entity, e.g. volume, cartridge or unit
+- `--days <DAYS>` — Only the last N days
 
 ### tapectl report compaction-candidates
 
@@ -172,7 +178,9 @@ tapectl report compaction-candidates [OPTIONS]
 **Options**
 
 - `--plan` — Group the candidates by what fits one destination tape
-- `--generation <GENERATION>` — Plan for destination tapes of this generation (e.g. LTO-6, LTO-7) instead of the drive's own. Only with --plan
+- `--generation <GENERATION>` — Plan for tapes of this generation (LTO-6, LTO-7) instead of the drive's
+  
+    Only with --plan.
 
 ### tapectl report reclaimable
 

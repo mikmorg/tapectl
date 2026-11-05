@@ -11,52 +11,78 @@ Add an LTO tape drive to the config
 Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls \-l /dev/tape/by\-id/`. Prefer the by\-id path: /dev/nstN numbering is not stable across reboots. The SCSI generic node (the sg node, used for the cartridge chip and the drive\*(Aqs health pages) is derived from the tape node at every use, so it need not be given; \-\-device\-sg overrides the derivation.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-name\fR \fI<NAME>\fR
-Name for this drive, used to select it later. Letters, digits, dot, underscore and dash
+Name for this drive, used to select it later
+
+Letters, digits, dot, underscore and dash.
 .TP
-\fB\-\-device\-tape\fR \fI<DEVICE_TAPE>\fR
+\fB\-\-device\-tape\fR \fI<PATH>\fR
 Tape device node, e.g. /dev/tape/by\-id/scsi\-XXXX\-nst
 .TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+\fB\-\-device\-sg\fR \fI<PATH>\fR
+SCSI generic node, e.g. /dev/sg1 (default: derived)
+
+Used for the drive\*(Aqs health pages and the cartridge chip. Optional: left out, tapectl derives it from \-\-device\-tape at use (the kernel names the pairing), so a /dev/sgN renumbering never matters. Given, it overrides the derivation, and a write still refuses a node the kernel proves is another drive\*(Aqs.
 .TP
-\fB\-\-device\-sg\fR \fI<DEVICE_SG>\fR
-SCSI generic node used for health/MAM queries, e.g. /dev/sg1. Optional: left out, tapectl derives it from \-\-device\-tape at use (the kernel names the pairing), so a /dev/sgN renumbering never matters. Given, it overrides the derivation, and a write still refuses a node the kernel proves is another drive\*(Aqs
+\fB\-\-generation\fR \fI<GEN>\fR
+Generation it writes, e.g. LTO\-6 (default: its model\*(Aqs)
+
+ADR\-0010: a drive declares only what it can write; the medium\*(Aqs actual generation is detected at `volume init`, not declared here. Read from the attached drive\*(Aqs model when left out (ADR\-0012 item 219): HP `Ultrium N\-SCSI`, IBM `ULT3580\-TDN` and `ULT3580\-HHN`, as the kernel records them; no command is sent to the drive. Needed when the drive is not attached or its model is not one tapectl knows. Given for an attached drive, it must agree with the model.
+.TP
+\fB\-\-capacity\-override\fR \fI<SIZE>\fR
+Capacity override, for mhvtl and tests only
+
+A real drive\*(Aqs capacity follows the loaded cartridge\*(Aqs detected generation (ADR\-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `enospc_buffer` uses.
+.TP
+\fB\-\-enospc\-buffer\fR \fI<SIZE>\fR
+Headroom reserved before end\-of\-tape, e.g. 50M
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-\-generation\fR \fI<GENERATION>\fR
-Generation this drive natively writes, e.g. LTO\-6 (ADR\-0010: a drive declares only what it can write; the medium\*(Aqs actual generation is detected at `volume init`, not declared here).
+Debug tracing on stderr
 
-Read from the attached drive\*(Aqs model when left out (ADR\-0012 item 219): HP `Ultrium N\-SCSI`, IBM `ULT3580\-TDN` and `ULT3580\-HHN`, as the kernel records them; no command is sent to the drive. Needed when the drive is not attached or its model is not one tapectl knows. Given for an attached drive, it must agree with the model.
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-\-capacity\-override\fR \fI<CAPACITY_OVERRIDE>\fR
-Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive\*(Aqs capacity follows the loaded cartridge\*(Aqs detected generation (ADR\-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `enospc_buffer` uses
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Path to config file
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
-\fB\-\-enospc\-buffer\fR \fI<ENOSPC_BUFFER>\fR
-Headroom reserved before end\-of\-tape, e.g. 50M
-.TP
 \fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
 
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH EXAMPLES
+.nf
+  # Find the drive\*(Aqs by\-id path first
+  ls \-l /dev/tape/by\-id/
+  # The generation is read from the drive\*(Aqs model
+  tapectl drive add \-\-name lto6 \-\-device\-tape /dev/tape/by\-id/<DRIVE>\-nst
+  # A model tapectl does not know names its generation
+  tapectl drive add \-\-name lto6 \-\-device\-tape /dev/tape/by\-id/<DRIVE>\-nst \-\-generation LTO\-6
+.fi

@@ -17,16 +17,18 @@ tapectl cartridge [OPTIONS] <COMMAND>
 - [`info`](#tapectl-cartridge-info) — Show cartridge details
 - [`move`](#tapectl-cartridge-move) — Move a cartridge to a location, taking its volumes with it
 - [`retire`](#tapectl-cartridge-retire) — Retire a cartridge permanently — it must never be written again
-- [`erase`](#tapectl-cartridge-erase) — Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
+- [`erase`](#tapectl-cartridge-erase) — Erase the tape in the drive, then read it back to prove it
 - [`mark-erased`](#tapectl-cartridge-mark-erased) — Mark a cartridge as erased (available for reuse)
 - [`edit`](#tapectl-cartridge-edit) — Correct a registered cartridge's generation and/or its claimed serial
 - [`relabel`](#tapectl-cartridge-relabel) — Correct a cartridge's barcode label
-- [`unretire`](#tapectl-cartridge-unretire) — Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
+- [`unretire`](#tapectl-cartridge-unretire) — Reverse a `cartridge retire`: the medium is fit after all
 - [`journal`](#tapectl-cartridge-journal) — Show the MAM journal: every MAM read taken of a cartridge, verbatim
 
 ### tapectl cartridge register
 
 Register a physical cartridge
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge register [OPTIONS] --barcode <BARCODE> --generation <GENERATION>
@@ -36,8 +38,12 @@ tapectl cartridge register [OPTIONS] --barcode <BARCODE> --generation <GENERATIO
 
 - `--barcode <BARCODE>` *(required)* — Barcode label
 - `--generation <GENERATION>` *(required)* — Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
-- `--capacity <CAPACITY>` — Nominal capacity, e.g. "2500G". Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use. Defaults to the generation table's marketed figure (ADR-0010) when omitted — give this explicitly only when the physical cartridge really differs (a declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...)
-- `--serial <SERIAL>` — The medium serial you BELIEVE this cartridge carries, for pre-registering one that has not been loaded yet.
+- `--capacity <CAPACITY>` — Nominal capacity, e.g. "2500G".
+  
+    Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use. Defaults to the generation table's marketed figure (ADR-0010) when omitted — give this explicitly only when the physical cartridge really differs (a declared 40 TB LTO-10 cartridge, an mhvtl micro-tape, ...).
+- `--serial <SERIAL>` — The chip serial you believe this cartridge carries, for one not yet loaded.
+  
+    The medium serial you BELIEVE this cartridge carries, for pre-registering one that has not been loaded yet.
   
     ADR-0012 amendment (2026-09-16): this is an unconfirmed CLAIM, stored in `operator_serial` — never the chip's own report. `volume init` writes the confirmed identity (`serial_number`) itself, from a real MAM read, the first time this cartridge is loaded; no operator command ever writes that column. Correct a wrong claim with `cartridge edit --serial`.
 - `--notes <NOTES>` — Notes
@@ -46,18 +52,24 @@ tapectl cartridge register [OPTIONS] --barcode <BARCODE> --generation <GENERATIO
 
 List cartridges
 
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
+
 ```text
 tapectl cartridge list [OPTIONS]
 ```
 
 **Options**
 
-- `--status <STATUS>` — Filter by status (available, in_use, pending_erase, retired_permanent). `offsite` was removed by ADR-0011 -- a cartridge's place is a location now; use --location
+- `--status <STATUS>` — Filter by status (available, in_use, pending_erase, retired_permanent).
+  
+    `offsite` was removed by ADR-0011 -- a cartridge's place is a location now; use --location.
 - `--location <LOCATION>` — Filter by physical location name -- the sibling of `--status`
 
 ### tapectl cartridge info
 
 Show cartridge details
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge info [OPTIONS] <CARTRIDGE>
@@ -71,7 +83,9 @@ tapectl cartridge info [OPTIONS] <CARTRIDGE>
 
 Move a cartridge to a location, taking its volumes with it
 
-ADR-0011: a cartridge's PLACE is a location, not a status. This moves `cartridges.location_id` and the `location_id` of every volume currently on the cartridge, in one transaction, so the shelf and the catalog cannot disagree. `volume move` does the same from the other end.
+ADR-0011: a cartridge's PLACE is a location, not a status. This moves the cartridge and every volume currently on it, in one transaction, so the shelf and the catalog cannot disagree. `volume move` does the same from the other end.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge move [OPTIONS] --to <TO> <CARTRIDGE>
@@ -91,9 +105,11 @@ Retire a cartridge permanently — it must never be written again
 
 ADR-0011: for wear, read errors, or any judgement that the medium is no longer fit to hold data. This is NOT an erasure and NOT a location change: the bytes may still be readable, but nothing will ever write to this cartridge again, and `volume init` refuses to bind it. `cartridge unretire` is the way back — the operator saying they were wrong about the medium; `cartridge mark-erased` is a different statement, that the bytes are gone (ADR-0011, corrected 2026-09-14).
 
-ADR-0008 Tier 2: the coverage impact is displayed first, and consent is asked EVERY time — retiring a medium permanently is a declaration worth confirming even when no unit loses coverage by it, which is what `cartridge_retire` does deliberately. `--force`/`--yes` supplies that consent.
+ADR-0008 Tier 2: the coverage impact is displayed first, and consent is asked EVERY time — retiring a medium permanently is a declaration worth confirming even when no unit loses coverage by it. `--force`/`--yes` supplies that consent.
 
 This said consent was "required when a unit is left below its policy" until 2026-09-17, which read as "not required otherwise" — so a script retiring a fully-covered cartridge without `--yes` was refused by a non-interactive session for a reason the help denied.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge retire [OPTIONS] <CARTRIDGE>
@@ -106,11 +122,15 @@ tapectl cartridge retire [OPTIONS] <CARTRIDGE>
 **Options**
 
 - `--reason <REASON>` — Why (appended to the cartridge's notes, never overwriting them)
-- `--force` — Supply the ADR-0008 Tier-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier-3 refusal — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent
+- `--force` — Give the Tier-2 consent this command asks on every run; never the Tier-3 refusal.
+  
+    Supply the ADR-0008 Tier-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier-3 refusal — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it.
 
 ### tapectl cartridge erase
 
-Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
+Erase the tape in the drive, then read it back to prove it.
+
+It identifies the tape first, checks it against the catalog and asks for its label.
 
 ADR-0012 (2026-10-12, items 51 and 52), in order:
 
@@ -126,9 +146,26 @@ tapectl cartridge erase [OPTIONS]
 
 **Options**
 
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--long` — Erase the whole medium instead of writing a filemark at its start: hours on real LTO. For a cartridge that leaves your hands
-- `--confirm-label <LABEL>` — The label read from the tape's File 0 (for a tape tapectl did not write, its chip serial), for an unattended erase. It must equal what the tape says; `--dry-run` prints it
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--long` — Erase the whole medium instead of writing a filemark at its start: hours on real LTO.
+  
+    For a cartridge that leaves your hands.
+- `--confirm-label <LABEL>` — The label read from File 0 (or the chip serial), for an unattended erase.
+  
+    The label read from the tape's File 0 (for a tape tapectl did not write, its chip serial), for an unattended erase. It must equal what the tape says; `--dry-run` prints it.
+
+**Examples**
+
+```bash
+See what the loaded tape is and whether it may be erased, changing nothing:
+tapectl cartridge erase --dry-run
+Erase it, typing its label when asked:
+tapectl cartridge erase
+Erase unattended, giving the label File 0 shows:
+tapectl cartridge erase --confirm-label L6-0001
+```
 
 ### tapectl cartridge mark-erased
 
@@ -137,6 +174,8 @@ Mark a cartridge as erased (available for reuse)
 `tapectl cartridge erase` erases the tape in the drive, verifies it and records it in one command; this is the statement alone, for a tape erased some other way. Run it after erasing the tape in the drive: a long erase (`mt -f <device> erase`, hours on real LTO) or a filemark at its start (`mt -f <device> rewind; mt -f <device> weof 1`). Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
 
 Refused outright on a `retired_permanent` cartridge — no `--force`, no `--yes`, no exception (ADR-0011, corrected 2026-09-14): this command's own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge mark-erased [OPTIONS] <CARTRIDGE>
@@ -148,15 +187,19 @@ tapectl cartridge mark-erased [OPTIONS] <CARTRIDGE>
 
 **Options**
 
-- `--force` — Override the pending_erase lifecycle precondition (ADR-0008 Tier 2 — see cli::consent). Does NOT reach a `retired_permanent` cartridge — `cartridge unretire` is the way back. Does NOT reach the Tier-3 zero-copy floor either: if a mounted volume holds a unit's last eligible copy, marking the cartridge erased is refused, and no flag waives that
+- `--force` — Override the pending_erase precondition (an ADR-0008 Tier-2 consent).
+  
+    Does NOT reach a `retired_permanent` cartridge — `cartridge unretire` is the way back. Does NOT reach the Tier-3 zero-copy floor either: if a mounted volume holds a unit's last eligible copy, marking the cartridge erased is refused, and no flag waives that.
 
 ### tapectl cartridge edit
 
 Correct a registered cartridge's generation and/or its claimed serial
 
-ADR-0012, *Rulings recorded as consequences*: "`cartridge edit --generation` corrects a wrong generation (Tier 1: it is a fact correction, and the wrong-medium check at the next init still applies)." Tier 1 under ADR-0008 — no prompt, no `--force`, no `--yes`, and it applies to every status, `retired_permanent` included. This edits only the `cartridges` row: it never rewrites `volumes.media_type` or `volumes.capacity_bytes` (ADR-0010 decision 3 — capacity is decided once at init and stored on the volume).
+ADR-0012, *Rulings recorded as consequences*: "`cartridge edit --generation` corrects a wrong generation (Tier 1: it is a fact correction, and the wrong-medium check at the next init still applies)." Tier 1 under ADR-0008 — no prompt, no `--force`, no `--yes`, and it applies to every status, `retired_permanent` included. This edits only the cartridge's record: it never changes the generation or capacity of a volume on it (ADR-0010 decision 3: capacity is decided once at init and stored on the volume).
 
-`--serial` is a SEPARATE, independently gated correction (ADR-0012 amendment, 2026-09-16): gating is per-flag, not per-command, because `--generation` is a fact correction (Tier 1) while `--serial` is a claim about IDENTITY (Tier 2 — see `cli::consent`). It writes only `operator_serial`, never `serial_number`, which no operator command may ever touch. At least one of `--generation`/`--serial` must be given; both may be given in one call, and each is gated independently.
+`--serial` is a SEPARATE, independently gated correction (ADR-0012 amendment, 2026-09-16): gating is per-flag, not per-command, because `--generation` is a fact correction (Tier 1) while `--serial` is a claim about IDENTITY (Tier 2: it asks for consent). It writes only the claimed serial, never the chip-confirmed `serial_number`, which no operator command may ever touch. At least one of `--generation`/`--serial` must be given; both may be given in one call, and each is gated independently.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge edit [OPTIONS] <CARTRIDGE>
@@ -169,13 +212,17 @@ tapectl cartridge edit [OPTIONS] <CARTRIDGE>
 **Options**
 
 - `--generation <GENERATION>` — The cartridge's corrected generation (e.g. LTO-5, LTO-6, LTO-7-M8)
-- `--serial <SERIAL>` — Correct the OPERATOR-claimed serial (never the chip-confirmed one). Tier 2 under ADR-0008 — gated on consent (`cli::consent::confirm`), unlike `--generation` above
+- `--serial <SERIAL>` — Correct the OPERATOR-claimed serial (never the chip-confirmed one).
+  
+    Tier 2 under ADR-0008: it asks for consent (the global `--yes` gives it), unlike `--generation` above.
 
 ### tapectl cartridge relabel
 
 Correct a cartridge's barcode label
 
 ADR-0012: a cartridge's identity is its chip serial; the barcode is a relabelable sticker. `volume init` gives a cartridge its first barcode (its first volume's label, or `--barcode`; item 219); this changes it afterwards. This is a Tier 1 label correction under ADR-0008, not a destructive act — no prompt, no `--force`, no status gate — and it is the remedy `volume init`'s auto-register refuses with when the loaded medium's serial collides with an already-registered barcode.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge relabel [OPTIONS] <CARTRIDGE> <NEW_BARCODE>
@@ -188,11 +235,15 @@ tapectl cartridge relabel [OPTIONS] <CARTRIDGE> <NEW_BARCODE>
 
 ### tapectl cartridge unretire
 
-Reverse a `cartridge retire` — the operator saying they were wrong about the *medium*, not that its bytes are gone
+Reverse a `cartridge retire`: the medium is fit after all.
+
+The operator saying they were wrong about the *medium*, not that its bytes are gone.
 
 ADR-0012's consequences bullet: restores the cartridge, and any volumes retired with it, to the status recorded in the `events` audit trail from that retirement (`cartridge retire` already logs `old_value` there — no schema change needed). If that history is gone (a catalog rebuilt from tape since), the cartridge falls back to `available` and any volumes are left untouched — an honest partial restore beats a guessed status, and the command says so.
 
 Tier 1 under ADR-0008: a correction of a claim, not a destructive act — no prompt, no `--force`, no `--yes`. Refuses when the cartridge is not `retired_permanent`, naming its actual status. `cartridge mark-erased` is untouched by this command and remains the separate, irreversible statement that the bytes are gone (ADR-0011, corrected 2026-09-14).
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge unretire [OPTIONS] <CARTRIDGE>
@@ -206,9 +257,11 @@ tapectl cartridge unretire [OPTIONS] <CARTRIDGE>
 
 Show the MAM journal: every MAM read taken of a cartridge, verbatim
 
-ADR-0013: every `sg_read_attr` a recording command runs is kept whole — including the attributes tapectl does not parse, such as the medium's own ring of the last four drives that loaded it — because loading the cartridge overwrites them. The recording commands are every one that opens a contact (`volume init`, `write`, `resume`, `verify`, `identify`, `read-slices`, `compact`, `restore`, `catalog rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive cleaned` (against no contact). `drive status` records nothing, by design, and neither does any `--dry-run`: their reads are not here. Lists the rows, oldest first; `--raw <ID>` prints one row's tool output exactly as captured.
+ADR-0013: every `sg_read_attr` a recording command runs is kept whole — including the attributes tapectl does not parse, such as the medium's own ring of the last four drives that loaded it — because loading the cartridge overwrites them. The recording commands are every one that opens a contact (`volume init`, `write`, `resume`, `verify`, `identify`, `read-slices`, `compact`, `restore`, `catalog rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive cleaned` (against no contact). `drive status` records nothing, by design, and neither does any `--dry-run`: their reads are not here. Lists the rows, oldest first; `--raw <ROW>` prints one row's tool output exactly as captured.
 
 A cartridge's rows are found two ways: reads taken in a contact attributed to it, and reads whose chip serial is its confirmed serial — so a read taken before it was registered is found too. With neither a barcode nor `--serial`, every row is listed, including reads no cartridge could be named for. Read-only.
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl cartridge journal [OPTIONS] [CARTRIDGE]
@@ -220,6 +273,8 @@ tapectl cartridge journal [OPTIONS] [CARTRIDGE]
 
 **Options**
 
-- `--serial <SERIAL>` — Select by the medium serial the chip reported instead (for a cartridge that is not registered)
-- `--raw <ID>` — Print this journal row's raw `sg_read_attr` output, byte for byte
+- `--serial <SERIAL>` — Select by the medium serial the chip reported (for a cartridge not registered).
+  
+    Select by the medium serial the chip reported instead (for a cartridge that is not registered)
+- `--raw <ROW>` — Print this journal row's raw `sg_read_attr` output, byte for byte
 

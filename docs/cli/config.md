@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-Configuration management
+Show, check, read and edit config.toml
 
 ```text
 tapectl config [OPTIONS] <COMMAND>
@@ -13,7 +13,7 @@ tapectl config [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`show`](#tapectl-config-show) — Show current configuration
-- [`check`](#tapectl-config-check) — Check configuration validity
+- [`check`](#tapectl-config-check) — Check config.toml: whether every command can load it, and advice
 - [`get`](#tapectl-config-get) — Print one key's value in force, and where it comes from
 - [`set`](#tapectl-config-set) — Set one key in config.toml, keeping its comments and layout
 - [`add`](#tapectl-config-add) — Add a table to a list of tables, or values to a list
@@ -29,7 +29,11 @@ tapectl config show [OPTIONS]
 
 ### tapectl config check
 
-Check configuration validity
+Check config.toml: whether every command can load it, and advice
+
+Says whether every other command can load the file (`config: valid` or `config: INVALID`), names the home it checked and why that one, then gives advice that never changes the exit code.
+
+Exit status: 0 = the configuration is valid; 2 = it is invalid (or an error).
 
 ```text
 tapectl config check [OPTIONS]
@@ -49,6 +53,16 @@ tapectl config get [OPTIONS] <KEY>
 
 - `<KEY>` — The key, e.g. defaults.slice_size or post_warning_bytes
 
+**Examples**
+
+```bash
+tapectl config get defaults.slice_size
+# One drive configured: its key by the bare name
+tapectl config get post_warning_bytes
+# The same key, spelled in full, for a script
+tapectl --json config get 'backends.lto[lto6].post_warning_bytes'
+```
+
 ### tapectl config set
 
 Set one key in config.toml, keeping its comments and layout
@@ -66,6 +80,17 @@ tapectl config set [OPTIONS] <KEY> <VALUE>
 - `<KEY>` — The key, e.g. defaults.slice_size
 - `<VALUE>` — The value, e.g. 2G
 
+**Examples**
+
+```bash
+tapectl config set defaults.slice_size 2G
+tapectl config set defaults.verify_interval_days 365
+# One drive configured: its key by the bare name
+tapectl config set enospc_buffer 50M
+# An entry of a list of tables, by its name
+tapectl config set 'collections[movies].unit_depth' 2
+```
+
 ### tapectl config add
 
 Add a table to a list of tables, or values to a list
@@ -79,7 +104,9 @@ tapectl config add [OPTIONS] <KEY> <VALUES>...
 **Arguments**
 
 - `<KEY>` — The list, e.g. defaults.global_excludes
-- `<VALUES>` — field=value pairs for a table, or the values to append (after `--` when one begins with `-`)
+- `<VALUES>` — field=value pairs for a table, or the values to append
+  
+    After `--` when one begins with `-`.
 
 ### tapectl config remove
 
@@ -94,5 +121,7 @@ tapectl config remove [OPTIONS] <KEY> [VALUES]...
 **Arguments**
 
 - `<KEY>` — The key, table or list
-- `[VALUES]` — Values to remove from a list (none: remove KEY itself); after `--` when one begins with `-`
+- `[VALUES]` — Values to remove from a list (none: remove KEY itself)
+  
+    After `--` when one begins with `-`.
 

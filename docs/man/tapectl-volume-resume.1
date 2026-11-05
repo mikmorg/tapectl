@@ -2,11 +2,13 @@
 .el .ds Aq '
 .TH tapectl-volume-resume 1  "tapectl-volume-resume " 
 .SH NAME
-tapectl\-volume\-resume \- Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
+tapectl\-volume\-resume \- Resume an interrupted write session
 .SH SYNOPSIS
 \fBtapectl volume resume\fR [\fB\-\-json\fR] [\fB\-\-loaded\fR] [\fB\-\-device\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-full\-confirm\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-keep\-staging\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-move\-to\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
-Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
+Resume an interrupted write session.
+.PP
+Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 .PP
 An already\-sealed tape is RE\-CONFIRMED, not refused, when the tape itself proves it is this session\*(Aqs own: File 0\*(Aqs identity matches this volume, File 0\*(Aqs OWN recorded seal\-marker pointer equals this session\*(Aqs layout, and a real seal marker parses at that position. The seal is never written a second time. This is the path `volume write` sends you down when it says "run `tapectl volume resume <label>` to retry the confirm readback".
 .PP
@@ -25,53 +27,76 @@ The write that began the session recorded what it asked for once its tape is sea
 Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-loaded\fR
+Resume the loaded tape, named by its File 0.
+
 Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog\*(Aqs volumes with an interrupted write session, a re\-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-prewrite\-hash\fR
-See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every staged slice instead of size\-checking it. The session\*(Aqs frozen generated files are re\-hashed either way
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Full\-hash every staged slice while revalidating, as `volume write \-\-prewrite\-hash`.
+
+See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every staged slice instead of size\-checking it. The session\*(Aqs frozen generated files are re\-hashed either way.
 .TP
 \fB\-\-full\-confirm\fR
-See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the confirm the interrupted write asked for: the full readback when it had `\-\-full\-confirm`, else the quick confirm, which leaves the readback to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR\-0012 item 186)
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+Read every file back after the seal, as `volume write \-\-full\-confirm`.
+
+See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the confirm the interrupted write asked for: the full readback when it had `\-\-full\-confirm`, else the quick confirm, which leaves the readback to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR\-0012 item 186).
 .TP
 \fB\-\-keep\-staging\fR
-See `volume write \-\-keep\-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Keep every staged slice, as `volume write \-\-keep\-staging`.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+See `volume write \-\-keep\-staging`: the staged slices stay even when this resume completes the last copy the policy asks for.
 .TP
 \fB\-\-move\-to\fR \fI<LOCATION>\fR
-Move the volume, with its cartridge, to this location once it is sealed and confirmed, as `volume write \-\-move\-to` does. The interrupted write\*(Aqs own `\-\-move\-to` or `\-\-for\-location` is kept without this flag; naming another place here is refused, naming both. The location is checked before the drive is touched
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+Move the volume and its cartridge to this location once sealed and confirmed.
 
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+Move the volume, with its cartridge, to this location once it is sealed and confirmed, as `volume write \-\-move\-to` does. The interrupted write\*(Aqs own `\-\-move\-to` or `\-\-for\-location` is kept without this flag; naming another place here is refused, naming both. The location is checked before the drive is touched.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 [\fILABEL\fR]
 Volume label. Give it, or give `\-\-loaded` instead
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

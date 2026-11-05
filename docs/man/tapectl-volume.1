@@ -9,35 +9,46 @@ tapectl\-volume \- Manage volumes and tape operations
 Manage volumes and tape operations
 .SH OPTIONS
 .TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
 \fB\-\-json\fR
-Output in JSON format
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Path to config file
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
 
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)
 .SH SUBCOMMANDS
 .TP
 tapectl\-volume\-init(1)
@@ -47,16 +58,16 @@ tapectl\-volume\-write(1)
 Write staged data to volume
 .TP
 tapectl\-volume\-resume(1)
-Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
+Resume an interrupted write session
 .TP
 tapectl\-volume\-abort(1)
-Deliberately abandon a volume\*(Aqs unfinished write session: `docs/design/layout\-session.md`\*(Aqs Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
+Abandon a volume\*(Aqs unfinished write session for good
 .TP
 tapectl\-volume\-verify(1)
-Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
+Verify volume contents via the keyless chain walk (seal \-> front index \-> content)
 .TP
 tapectl\-volume\-identify(1)
-Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
+Identify the loaded tape: print its File 0 and what this catalog makes of it
 .TP
 tapectl\-volume\-move(1)
 Move a volume to a location
@@ -92,7 +103,7 @@ tapectl\-volume\-list(1)
 List every volume, most recently written first
 .TP
 tapectl\-volume\-info(1)
-The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
+The dossier for one volume: capacity, cartridge, place, units, writes, verifies
 .TP
 tapectl\-volume\-import(1)
 Record a pre\-existing volume in the catalog

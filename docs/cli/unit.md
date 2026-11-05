@@ -12,20 +12,22 @@ tapectl unit [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`init`](#tapectl-unit-init) — Initialize a directory as an archival unit
-- [`init-bulk`](#tapectl-unit-init-bulk) — Bulk-initialize subdirectories as units
-- [`list`](#tapectl-unit-list) — List units
+- [`init`](#tapectl-unit-init) — Register a directory as a unit
+- [`init-bulk`](#tapectl-unit-init-bulk) — Register each subdirectory of a directory as a unit
+- [`list`](#tapectl-unit-list) — List the units, with their tenant, path and tags
 - [`info`](#tapectl-unit-info) — Show a unit's details, or with --dirty whether it changed
 - [`export`](#tapectl-unit-export) — Copy a unit's staged slices, still encrypted, to a directory
-- [`tag`](#tapectl-unit-tag) — Add/remove tags
+- [`tag`](#tapectl-unit-tag) — Add or remove a unit's tags
 - [`rename`](#tapectl-unit-rename) — Rename a unit
-- [`discover`](#tapectl-unit-discover) — Scan watch_roots for .tapectl-unit.toml dotfiles
-- [`check-integrity`](#tapectl-unit-check-integrity) — Check file integrity against the newest staged version's checksums
-- [`mark-tape-only`](#tapectl-unit-mark-tape-only) — Mark unit as tape-only (local data can be deleted)
+- [`discover`](#tapectl-unit-discover) — Register the units whose .tapectl-unit.toml is under a watch root
+- [`check-integrity`](#tapectl-unit-check-integrity) — Check a unit's files against the newest staged version's checksums
+- [`mark-tape-only`](#tapectl-unit-mark-tape-only) — Mark a unit tape-only: its tapes are all there is, its source may go
 
 ### tapectl unit init
 
-Initialize a directory as an archival unit
+Register a directory as a unit
+
+Writes a .tapectl-unit.toml into the directory, which carries the unit's identity, so a renamed or moved folder is still the same unit.
 
 ```text
 tapectl unit init [OPTIONS] --tenant <TENANT> <PATH>
@@ -33,18 +35,20 @@ tapectl unit init [OPTIONS] --tenant <TENANT> <PATH>
 
 **Arguments**
 
-- `<PATH>` — Path to directory
+- `<PATH>` — The directory
 
 **Options**
 
-- `--tenant <TENANT>` *(required)* — Tenant name
-- `--name <NAME>` — Override auto-generated name
-- `-t, --tag <TAG>` — Tags to apply
-- `--archive-set <ARCHIVE_SET>` — Archive set name
+- `--tenant <TENANT>` *(required)* — The tenant the unit belongs to
+- `--name <NAME>` — The unit's name (default: made from the directory's name)
+- `-t, --tag <TAG>` — A tag to give the unit (repeat it for several)
+- `--archive-set <ARCHIVE_SET>` — The archive set whose policy the unit follows
 
 ### tapectl unit init-bulk
 
-Bulk-initialize subdirectories as units
+Register each subdirectory of a directory as a unit
+
+Each is registered as `unit init` registers it; one that cannot be is skipped and named, and the others are registered.
 
 ```text
 tapectl unit init-bulk [OPTIONS] --tenant <TENANT> <PATH>
@@ -52,16 +56,16 @@ tapectl unit init-bulk [OPTIONS] --tenant <TENANT> <PATH>
 
 **Arguments**
 
-- `<PATH>` — Parent directory to scan
+- `<PATH>` — The directory whose subdirectories become units
 
 **Options**
 
-- `--tenant <TENANT>` *(required)* — Tenant name
-- `-t, --tag <TAG>` — Tags to apply to all
+- `--tenant <TENANT>` *(required)* — The tenant the units belong to
+- `-t, --tag <TAG>` — A tag to give every unit (repeat it for several)
 
 ### tapectl unit list
 
-List units
+List the units, with their tenant, path and tags
 
 ```text
 tapectl unit list [OPTIONS]
@@ -69,9 +73,9 @@ tapectl unit list [OPTIONS]
 
 **Options**
 
-- `--tenant <TENANT>` — Filter by tenant name
-- `--status <STATUS>` — Filter by status (active, tape_only, missing)
-- `-t, --tag <TAG>` — Filter by tag
+- `--tenant <TENANT>` — Only this tenant's units
+- `--status <STATUS>` — Only the units of this status (active, tape_only, missing)
+- `-t, --tag <TAG>` — Only the units with this tag
 
 ### tapectl unit info
 
@@ -83,11 +87,13 @@ tapectl unit info [OPTIONS] <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name or path
+- `<NAME>` — The unit's name, or its directory
 
 **Options**
 
-- `--dirty` — Show dirty/clean/new status via an on-disk fingerprint scan (checksum_mode-aware — see `unit init`'s checksum_mode) instead of the usual detail view
+- `--dirty` — Whether it changed since its last snapshot, instead of its details
+  
+    Clean, dirty (with the files added, removed and modified) or never archived, from a scan of its directory by its checksum mode.
 
 ### tapectl unit export
 
@@ -101,15 +107,17 @@ tapectl unit export [OPTIONS] --to <DIR> <UNIT>
 
 **Arguments**
 
-- `<UNIT>` — Unit name
+- `<UNIT>` — The unit
 
 **Options**
 
-- `--to <DIR>` *(required)* — Destination directory
+- `--to <DIR>` *(required)* — The directory to copy the slices into
 
 ### tapectl unit tag
 
-Add/remove tags
+Add or remove a unit's tags
+
+The tags are written to the catalog and to the unit's .tapectl-unit.toml. A tag is not content: it mints no new version.
 
 ```text
 tapectl unit tag [OPTIONS] <NAME>
@@ -117,12 +125,12 @@ tapectl unit tag [OPTIONS] <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--add <ADD>` — Tags to add
-- `--remove <REMOVE>` — Tags to remove
+- `--add <ADD>` — A tag to add (repeat it for several)
+- `--remove <REMOVE>` — A tag to remove (repeat it for several)
 
 ### tapectl unit rename
 
@@ -134,12 +142,14 @@ tapectl unit rename [OPTIONS] <CURRENT> <NEW>
 
 **Arguments**
 
-- `<CURRENT>` — Current name
-- `<NEW>` — New name
+- `<CURRENT>` — The unit's current name
+- `<NEW>` — Its new name
 
 ### tapectl unit discover
 
-Scan watch_roots for .tapectl-unit.toml dotfiles
+Register the units whose .tapectl-unit.toml is under a watch root
+
+Scans `[discovery] watch_roots` for unit dotfiles: a new one is registered, a moved one updated, and the rest left unchanged.
 
 ```text
 tapectl unit discover [OPTIONS]
@@ -147,9 +157,11 @@ tapectl unit discover [OPTIONS]
 
 ### tapectl unit check-integrity
 
-Check file integrity against the newest staged version's checksums
+Check a unit's files against the newest staged version's checksums
 
-A file whose content differs at its recorded size is CHANGED when its modified time moved since the snapshot (an edit, which `snapshot create` archives) and BITROT when it did not; with no modified time recorded it cannot tell, and counts the file with BITROT. Exits 0 when every file matches and 1 when a file is BITROT, MISSING or a SIZE_MISMATCH.
+A file whose content differs at its recorded size is CHANGED when its modified time moved since the snapshot (an edit, which `snapshot create` archives) and BITROT when it did not; with no modified time recorded it cannot tell, and counts the file with BITROT.
+
+Exit status: 0 = every file matches; 1 = a file is BITROT, MISSING or a SIZE_MISMATCH; 2 = an error.
 
 ```text
 tapectl unit check-integrity [OPTIONS] <NAME>
@@ -157,11 +169,13 @@ tapectl unit check-integrity [OPTIONS] <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 ### tapectl unit mark-tape-only
 
-Mark unit as tape-only (local data can be deleted)
+Mark a unit tape-only: its tapes are all there is, its source may go
+
+Refused while the unit is short of its copies or locations, or dirty, unless confirmed (--force, --yes, or a terminal's prompt); a unit that was never archived is refused whatever the flags.
 
 ```text
 tapectl unit mark-tape-only [OPTIONS] <NAME>
@@ -169,9 +183,11 @@ tapectl unit mark-tape-only [OPTIONS] <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--force` — Confirm in advance, as the global --yes does: mark the unit even though it is short of its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets), the copy target at each location of its copies_at map (an archive set's required_locations counts as one copy at each name), both times [compaction] tape_only_safety_multiplier, the tape-only floor, or the [defaults] min_locations count of places (never multiplied), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non-interactive run refuses, naming each shortfall. A unit that was never archived is refused whatever the flags (ADR-0008 Tier 3)
+- `--force` — Mark it though it is short of copies or locations, or dirty
+  
+    Confirms in advance, as the global --yes does: mark the unit even though it is short of its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets), the copy target at each location of its copies_at map (an archive set's required_locations counts as one copy at each name), both times [compaction] tape_only_safety_multiplier, the tape-only floor, or the [defaults] min_locations count of places (never multiplied), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non-interactive run refuses, naming each shortfall. It never overrides the refusal of a unit that was never archived.
 

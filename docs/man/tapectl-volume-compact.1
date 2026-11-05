@@ -15,56 +15,75 @@ Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non
 Exit status: `volume write`\*(Aqs, for step 2\*(Aqs write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2: step 1 writes nothing. Step 3 refused for consent (no terminal, no \-\-yes) exits 0 with a warning naming `volume compact\-finish \-\-force`: the destination is sealed, confirmed and a full carry\-forward. Step 3 refused because content was not carried forward exits 2.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-to\fR \fI<TO>\fR
-Destination volume label (already initialised). With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from
+Destination volume label (already initialised).
+
+With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from.
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-allow\-missing\-escrow\fR
 See `volume write \-\-allow\-missing\-escrow`
 .TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
 \fB\-\-prewrite\-hash\fR
 See `volume write \-\-prewrite\-hash` (step 2\*(Aqs write)
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
 \fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
 See `volume write \-\-fill\-ceiling` (step 2\*(Aqs write)
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-full\-confirm\fR
 See `volume write \-\-full\-confirm` (step 2\*(Aqs write)
 .TP
 \fB\-\-force\fR
-See `volume compact\-finish \-\-force` — step 3\*(Aqs ADR\-0008 Tier\-2 gate. With this (or the global `\-\-yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+Waive step 3\*(Aqs Tier\-2 prompt, as `volume compact\-finish \-\-force`.
 
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+See `volume compact\-finish \-\-force`: step 3\*(Aqs ADR\-0008 Tier\-2 gate.
 
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+With this (or the global `\-\-yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fILABEL\fR>
 Source volume label
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

@@ -16,77 +16,127 @@ A further copy in one command (ADR\-0012 2026\-10\-15 item 59): `tapectl volume 
 .PP
 A unit that allows spanning (`allow_spanning`, ADR\-0012 item 82) may have its slices on more than one tape. The write lays out first the slices still owed of a span in progress, then whole units, then units that may span, last; the drive\*(Aqs early warning, not the plan, ends such a unit on the tape (items 84, 122 and 123), which needs the drive\*(Aqs `post_warning_bytes`. The write names each unit the tape holds as a range of slices, the whole units it leaves for the next tape (still staged), and, once a range completes a copy across tapes, the tapes to keep together (item 134). A span continues only onto a cartridge of the generation it began on (item 86).
 .PP
-Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re\-enters the confirm. 4 = interrupted part\-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
+Exit status (every command that writes a tape shares it): 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re\-enters the confirm. 4 = interrupted part\-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-loaded\fR
+Write the loaded tape, named by its File 0 (an initialized volume of this catalog).
+
 Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog\*(Aqs volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `\-\-init`
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-force\fR
-See `volume init \-\-force` — same override, same limits. With `\-\-init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write\*(Aqs own File 0 check
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Overwrite a tape whose File 0 names a DIFFERENT volume or is EMPTY; never a SEALED one.
+
+See `volume init \-\-force`: the same override, the same limits.
+
+With `\-\-init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write\*(Aqs own File 0 check.
 .TP
 \fB\-\-init\fR
-Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR\-0003 and ADR\-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. `\-\-force` and `\-\-barcode` are taken from `volume init`\*(Aqs flags; when a cartridge needs `\-\-generation` or `\-\-cartridge`, run `volume init` yourself first. ADR\-0012 2026\-10\-15 item 59
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+Initialise the loaded cartridge as this volume first, then write it.
+
+Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR\-0003 and ADR\-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. `\-\-force` and `\-\-barcode` are taken from `volume init`\*(Aqs flags; when a cartridge needs `\-\-generation` or `\-\-cartridge`, run `volume init` yourself first. ADR\-0012 2026\-10\-15 item 59.
 .TP
 \fB\-\-barcode\fR \fI<BARCODE>\fR
-With `\-\-init`: the barcode on the cartridge\*(Aqs sticker, as `volume init \-\-barcode` takes it. Without it a cartridge being registered takes the volume\*(Aqs label (ADR\-0012 item 219)
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+With \-\-init: the barcode on the cartridge\*(Aqs sticker (default: the volume\*(Aqs label).
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+With `\-\-init`: the barcode on the cartridge\*(Aqs sticker, as `volume init \-\-barcode` takes it. Without it a cartridge being registered takes the volume\*(Aqs label (ADR\-0012 item 219).
 .TP
 \fB\-\-move\-to\fR \fI<LOCATION>\fR
-Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> \-\-to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0
+Move the volume and its cartridge to this location once sealed and confirmed.
+
+Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> \-\-to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0.
 .TP
 \fB\-\-allow\-missing\-escrow\fR
-Seal slices that were staged before the escrow recipient existed (ADR\-0005). Only reachable for tapes copied forward via `read\-slices`/`compact\-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre\-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+Seal slices that were staged before the escrow recipient existed (ADR\-0005).
 
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+Only reachable for tapes copied forward via `read\-slices`/`compact\-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre\-escrow cartridge, knowing the copy stays unrecoverable by the escrow key.
 .TP
 \fB\-\-prewrite\-hash\fR
-Full\-hash every staged slice from disk before the tape moves (tri\-layer L1). Off by default (ADR\-0012, 2026\-09\-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
+Full\-hash every staged slice from disk before the tape moves (tri\-layer L1).
+
+Off by default (ADR\-0012, 2026\-09\-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch.
 .TP
 \fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
-Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012). The pre\-write check refuses a layout above the ceiling and names by how much
+Fill this volume to at most this fraction of its capacity (`0.99` or `99%`).
+
+Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012). The pre\-write check refuses a layout above the ceiling and names by how much.
 .TP
 \fB\-\-full\-confirm\fR
-After sealing, read every file back and hash it against the front index (tri\-layer L3, hours on a full cartridge). Off by default (ADR\-0012, 2026\-10\-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify\-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR\-0012 item 186)
+After sealing, read every file back and hash it (the tape\*(Aqs first full verify).
+
+After sealing, read every file back and hash it against the front index (tri\-layer L3, hours on a full cartridge). Off by default (ADR\-0012, 2026\-10\-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify\-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR\-0012 item 186).
 .TP
 \fB\-\-keep\-staging\fR
-Keep the staged slices after the write seals and confirms, even of the units that have reached their copy floor. Without this flag each such unit\*(Aqs staging is released then; release it later with `tapectl stage clean`
+Keep every staged slice after the write, even of units at their copy floor.
+
+Keep the staged slices after the write seals and confirms, even of the units that have reached their copy floor. Without this flag each such unit\*(Aqs staging is released then; release it later with `tapectl stage clean`.
 .TP
 \fB\-\-for\-location\fR \fI<LOCATION>\fR
-Write only the staged sets that still have need at this location (ADR\-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `\-\-move\-to LOCATION` does; a different `\-\-move\-to` is refused. Stage for it with `tapectl stage for\-location`. Without this flag the write takes every staged set
+Write only the staged sets still needed at this location, then move the tape there.
+
+Write only the staged sets that still have need at this location (ADR\-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `\-\-move\-to LOCATION` does; a different `\-\-move\-to` is refused. Stage for it with `tapectl stage for\-location`. Without this flag the write takes every staged set.
 .TP
 \fB\-\-keep\-staging\-for\-locations\fR
-Release each unit\*(Aqs staging only once every per\-location copy target of it is met, not at its copy floor (ADR\-0012 item 154), so the next location\*(Aqs copy reuses these staged slices instead of staging again; a unit that spans cartridges keeps every slice until then. Use it when staging has room; the output names the locations that still need each unit
+Keep each unit\*(Aqs staging until every per\-location copy target is met.
+
+Release each unit\*(Aqs staging only once every per\-location copy target of it is met, not at its copy floor (ADR\-0012 item 154), so the next location\*(Aqs copy reuses these staged slices instead of staging again; a unit that spans cartridges keeps every slice until then. Use it when staging has room; the output names the locations that still need each unit.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 [\fILABEL\fR]
-Volume label. A write names its volume: the label ties the data to the volume `volume init` consented to (ADR\-0003). Give it, or give `\-\-loaded` instead
+Volume label.
+
+A write names its volume: the label ties the data to the volume `volume init` consented to (ADR\-0003). Give it, or give `\-\-loaded` instead
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+.SH EXAMPLES
+.nf
+  Make a copy on the loaded blank cartridge, read it all back, move it offsite:
+    tapectl volume write L6\-0003 \-\-init \-\-full\-confirm \-\-move\-to offsite
+  Write to a volume already initialised with volume init:
+    tapectl volume write L6\-0003 \-\-full\-confirm
+  Write only what one location still needs, then move the tape there:
+    tapectl volume write L6\-0004 \-\-init \-\-full\-confirm \-\-for\-location vault
+.fi

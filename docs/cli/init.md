@@ -4,7 +4,9 @@
 
 [All commands](README.md)
 
-Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity)
+Make a new archive: catalog, config, operator tenant, keys, escrow
+
+Creates the database, config.toml, the operator tenant with its keys, and the permanent escrow recipient (ADR-0005), whose secret it prints once. --no-escrow skips the escrow recipient; --escrow-public-key adopts an existing one instead of minting a new identity. It ends with the next steps.
 
 ```text
 tapectl init [OPTIONS]
@@ -12,8 +14,16 @@ tapectl init [OPTIONS]
 
 **Options**
 
-- `--operator <OPERATOR>` — Name of the operator tenant. Defaults to the login name ($USER) — except under a system account (a uid below UID_MIN in /etc/login.defs, such as a `tapectl` service user), where it is required: `init` refuses rather than name the operator after the account
-- `--no-escrow` — Do NOT create the permanent escrow recipient (ADR-0005) at init. By default `init` generates it and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import --escrow` instead, or in tests/tooling that register escrow separately
-- `--escrow-public-key <KEY_OR_FILE>` — Register THIS existing escrow public key (an age1… literal, or a path to a .pub file) instead of minting a new identity — the disaster-recovery form: a rebuilt machine adopts the original recipient from the heir kit's cover sheet so every tape's receipts keep matching
-- `--operator-key <PATH>` — Adopt this existing age identity file (the SECRET) as the operator's primary key instead of minting a pair, as `tenant add --adopt-key` does for a tenant: stored byte for byte as keys/<operator>-primary.age.key, mode 0600, and nothing is minted. A path only, never a key on the command line. Refused before anything is created when it is not one X25519 identity, or when it is the secret of --escrow-public-key
+- `--operator <OPERATOR>` — Name of the operator tenant (default: the login name)
+  
+    Defaults to the login name ($USER), except under a system account (a uid below UID_MIN in /etc/login.defs, such as a `tapectl` service user), where it is required: `init` refuses rather than name the operator after the account.
+- `--no-escrow` — Do not create the escrow recipient now
+  
+    By default `init` generates it (ADR-0005) and prints its secret once. Use this only when you will adopt an existing escrow identity with `key import --escrow` instead, or in tests and tooling that register escrow separately.
+- `--escrow-public-key <KEY_OR_FILE>` — Adopt this escrow public key instead of minting one
+  
+    An age1… literal, or a path to a .pub file. The disaster-recovery form: a rebuilt machine adopts the original recipient from the heir kit's cover sheet so every tape's receipts keep matching.
+- `--operator-key <PATH>` — Adopt this age identity file as the operator's key
+  
+    The SECRET, used instead of minting a pair, as `tenant add --adopt-key` does for a tenant: stored byte for byte as keys/<operator>-primary.age.key, mode 0600, and nothing is minted. A path only, never a key on the command line. Refused before anything is created when it is not one X25519 identity, or when it is the secret of --escrow-public-key.
 

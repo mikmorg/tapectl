@@ -8,46 +8,61 @@ tapectl\-cartridge\-journal \- Show the MAM journal: every MAM read taken of a c
 .SH DESCRIPTION
 Show the MAM journal: every MAM read taken of a cartridge, verbatim
 .PP
-ADR\-0013: every `sg_read_attr` a recording command runs is kept whole — including the attributes tapectl does not parse, such as the medium\*(Aqs own ring of the last four drives that loaded it — because loading the cartridge overwrites them. The recording commands are every one that opens a contact (`volume init`, `write`, `resume`, `verify`, `identify`, `read\-slices`, `compact`, `restore`, `catalog rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive cleaned` (against no contact). `drive status` records nothing, by design, and neither does any `\-\-dry\-run`: their reads are not here. Lists the rows, oldest first; `\-\-raw <ID>` prints one row\*(Aqs tool output exactly as captured.
+ADR\-0013: every `sg_read_attr` a recording command runs is kept whole — including the attributes tapectl does not parse, such as the medium\*(Aqs own ring of the last four drives that loaded it — because loading the cartridge overwrites them. The recording commands are every one that opens a contact (`volume init`, `write`, `resume`, `verify`, `identify`, `read\-slices`, `compact`, `restore`, `catalog rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive cleaned` (against no contact). `drive status` records nothing, by design, and neither does any `\-\-dry\-run`: their reads are not here. Lists the rows, oldest first; `\-\-raw <ROW>` prints one row\*(Aqs tool output exactly as captured.
 .PP
 A cartridge\*(Aqs rows are found two ways: reads taken in a contact attributed to it, and reads whose chip serial is its confirmed serial — so a read taken before it was registered is found too. With neither a barcode nor `\-\-serial`, every row is listed, including reads no cartridge could be named for. Read\-only.
+.PP
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-serial\fR \fI<SERIAL>\fR
+Select by the medium serial the chip reported (for a cartridge not registered).
+
 Select by the medium serial the chip reported instead (for a cartridge that is not registered)
 .TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
-\fB\-\-raw\fR \fI<ID>\fR
+\fB\-\-raw\fR \fI<ROW>\fR
 Print this journal row\*(Aqs raw `sg_read_attr` output, byte for byte
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 [\fICARTRIDGE\fR]
 A registered cartridge: its barcode, or the serial its chip reports
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

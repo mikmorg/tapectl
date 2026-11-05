@@ -12,16 +12,18 @@ tapectl key [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`generate`](#tapectl-key-generate) — Generate a new keypair for a tenant, or the permanent escrow recipient with --escrow (ADR-0005)
+- [`generate`](#tapectl-key-generate) — Generate a key pair for a tenant, or the escrow recipient
 - [`list`](#tapectl-key-list) — List keys: every tenant's, or one tenant's with --tenant
 - [`export`](#tapectl-key-export) — Export a public key to stdout
-- [`rotate`](#tapectl-key-rotate) — Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself
-- [`import`](#tapectl-key-import) — Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005)
-- [`escrow-kit`](#tapectl-key-escrow-kit) — Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009)
+- [`rotate`](#tapectl-key-rotate) — Rotate a tenant's keys: deactivate the old, generate new ones
+- [`import`](#tapectl-key-import) — Import a public key, or adopt one as the escrow recipient
+- [`escrow-kit`](#tapectl-key-escrow-kit) — Write the Heir Kit: the cover sheet, its catalog and this tapectl
 
 ### tapectl key generate
 
-Generate a new keypair for a tenant, or the permanent escrow recipient with --escrow (ADR-0005)
+Generate a key pair for a tenant, or the escrow recipient
+
+With --escrow, the permanent escrow recipient (ADR-0005) instead of a tenant's key.
 
 ```text
 tapectl key generate [OPTIONS]
@@ -30,10 +32,14 @@ tapectl key generate [OPTIONS]
 **Options**
 
 - `--tenant <TENANT>` — Tenant name (required unless --escrow)
-- `--alias <ALIAS>` — Key alias (e.g., "primary", "backup", "2026") (required unless --escrow)
-- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type. Not with --escrow, which has none to set
+- `--alias <ALIAS>` — Key alias, e.g. "primary", "backup", "2026" (unless --escrow)
+- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type (not with --escrow)
+  
+    --escrow has none to set.
 - `--description <DESCRIPTION>` — Description
-- `--escrow` — Generate the permanent escrow recipient identity instead of a per-tenant key (ADR-0005). Prints the secret exactly once, for paper transcription — tapectl never stores it. Refuses if an escrow identity is already registered; there is only ever one, for the life of the archive
+- `--escrow` — Generate the permanent escrow recipient instead of a tenant key
+  
+    ADR-0005. Prints the secret exactly once, for paper transcription — tapectl never stores it. Refuses if an escrow identity is already registered; there is only ever one, for the life of the archive.
 
 ### tapectl key list
 
@@ -45,7 +51,9 @@ tapectl key list [OPTIONS]
 
 **Options**
 
-- `--tenant <TENANT>` — List only this tenant's keys. Without it every tenant's keys are listed, with a Tenant column (deleted tenants are left out, as `tenant list` leaves them out; name one to see its keys)
+- `--tenant <TENANT>` — List only this tenant's keys
+  
+    Without it every tenant's keys are listed, with a Tenant column (deleted tenants are left out, as `tenant list` leaves them out; name one to see its keys).
 
 ### tapectl key export
 
@@ -61,7 +69,9 @@ tapectl key export [OPTIONS] <ALIAS>
 
 ### tapectl key rotate
 
-Rotate keys for a tenant (deactivate old, generate new). Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself
+Rotate a tenant's keys: deactivate the old, generate new ones
+
+Refuses unless a permanent escrow recipient is registered (ADR-0005); never deactivates or replaces the escrow key itself.
 
 ```text
 tapectl key rotate [OPTIONS] --tenant <TENANT>
@@ -73,7 +83,9 @@ tapectl key rotate [OPTIONS] --tenant <TENANT>
 
 ### tapectl key import
 
-Import a public key from a file, or adopt an existing one as the permanent escrow recipient with --escrow (ADR-0005)
+Import a public key, or adopt one as the escrow recipient
+
+A tenant's public key from a file, or with --escrow an existing key adopted as the permanent escrow recipient (ADR-0005).
 
 ```text
 tapectl key import [OPTIONS] <PATH>
@@ -81,21 +93,27 @@ tapectl key import [OPTIONS] <PATH>
 
 **Arguments**
 
-- `<PATH>` — Path to public key file — or, with --escrow, either a path or the literal age1... public key
+- `<PATH>` — Path to the public key file (with --escrow, or an age1… key)
 
 **Options**
 
 - `--tenant <TENANT>` — Tenant name (required unless --escrow)
 - `--alias <ALIAS>` — Key alias (required unless --escrow or --reactivate)
-- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type. Not with --escrow or --reactivate, which have none to set: a reactivated key keeps the type it was registered with
-- `--escrow` — Adopt this public key as the permanent escrow recipient (ADR-0005). Refuses if one is already registered
-- `--reactivate` — Make this public key a recipient of new writes again when the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant's, or the escrow identity
+- `--key-type <KEY_TYPE>` *(default: `primary`)* — Key type (not with --escrow or --reactivate)
+  
+    --escrow and --reactivate have none to set: a reactivated key keeps the type it was registered with.
+- `--escrow` — Adopt this public key as the permanent escrow recipient
+  
+    ADR-0005. Refuses if one is already registered.
+- `--reactivate` — Make this deactivated key a recipient of new writes again
+  
+    When the catalog already has it for this tenant, deactivated (as `key rotate` leaves every key it replaces). The key keeps the alias it was registered under. Refuses for a key that is active, unknown, another tenant's, or the escrow identity.
 
 ### tapectl key escrow-kit
 
-Generate the printed Heir Kit and the encrypted catalog bundle (ADR-0005 / ADR-0009).
+Write the Heir Kit: the cover sheet, its catalog and this tapectl
 
-Writes four files: COVER.txt (the plain-text cover sheet — the artifact with the decades-scale claim), escrow-kit.html (the same content with an inline QR, for printing), catalog.db.age (the whole catalog encrypted to the escrow recipient), and tapectl-VERSION (a copy of this tapectl program, mode 0755, whose size and sha256 the cover sheet names, so the kit does not depend on a repository surviving).
+The printed Heir Kit and the encrypted catalog bundle (ADR-0005, ADR-0009). Writes four files: COVER.txt (the plain-text cover sheet — the artifact with the decades-scale claim), escrow-kit.html (the same content with an inline QR, for printing), catalog.db.age (the whole catalog encrypted to the escrow recipient), and tapectl-VERSION (a copy of this tapectl program, mode 0755, whose size and sha256 the cover sheet names, so the kit does not depend on a repository surviving).
 
 This command stops at the files. Printing them, sealing them into tamper-evident envelopes and distributing them across at least two independent failure domains is the operator's part, and the cover sheet states those requirements. Re-run after each production write session; `audit` warns when the kit has fallen behind the tapes.
 
@@ -106,4 +124,13 @@ tapectl key escrow-kit [OPTIONS] <DIR>
 **Arguments**
 
 - `<DIR>` — Directory to write the kit into (created if absent, mode 0700)
+
+**Examples**
+
+```bash
+# After a write session: the kit again, to print and seal
+tapectl key escrow-kit /mnt/usb/heir-kit
+# Under the service user
+tapectl-op key escrow-kit /srv/archive_meta/heir-kit
+```
 

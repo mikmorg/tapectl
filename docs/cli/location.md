@@ -31,8 +31,12 @@ tapectl location add [OPTIONS] <NAME>
 
 **Options**
 
-- `-d, --description <DESCRIPTION>` — Description. For a warehouse this is where the endpoint or prefix goes (e.g. "s3://bucket/prefix") -- there is deliberately no separate URI column
-- `--kind <KIND>` *(default: `shelf`; one of `shelf`, `warehouse`)* — Kind of location (ADR-0006). A `shelf` holds physical cartridges; a `warehouse` is cold cloud storage that can only receive recorded deposits (`volume deposit add`)
+- `-d, --description <DESCRIPTION>` — Description; a warehouse's endpoint or prefix goes here
+  
+    For a warehouse this is where the endpoint or prefix goes (e.g. "s3://bucket/prefix") -- there is deliberately no separate URI column.
+- `--kind <KIND>` *(default: `shelf`; one of `shelf`, `warehouse`)* — Kind of location, shelf or warehouse
+  
+    ADR-0006. A `shelf` holds physical cartridges; a `warehouse` is cold cloud storage that can only receive recorded deposits (`volume deposit add`).
 
 ### tapectl location list
 

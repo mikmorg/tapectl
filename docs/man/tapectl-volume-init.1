@@ -9,56 +9,77 @@ tapectl\-volume\-init \- Initialize a new volume (write ID thunk to tape)
 Initialize a new volume (write ID thunk to tape)
 .PP
 After the volume line, prints one line naming the medium the cartridge was taken for: its generation, the capacity stored on the volume (decimal) and what decided each, e.g. `medium: LTO\-5, 1.50 TB (the cartridge chip\*(Aqs medium density code 0x58)`. An LTO\-5 cartridge in an LTO\-6 drive is seen to be LTO\-5 here. `\-\-json` carries the same facts as a `medium` object.
+.PP
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-\-json\fR
-Output in JSON format
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-force\fR
-Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `\-\-force` when the tape is PROVEN blank (ADR\-0012 2026\-10\-15 item 57): the chip\*(Aqs lifetime totals read 0 MiB written, or this catalog\*(Aqs own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR\-0003): this catalog\*(Aqs own sealed volume is a copy to eject, not a blank; a sealed tape this catalog does not hold, or holds retired, is erased first with `tapectl cartridge erase` (ADR\-0012 item 216). Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010)
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Overwrite a tape whose File 0 names a DIFFERENT volume or is EMPTY; never a SEALED one.
+
+Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `\-\-force` when the tape is PROVEN blank (ADR\-0012 2026\-10\-15 item 57): the chip\*(Aqs lifetime totals read 0 MiB written, or this catalog\*(Aqs own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR\-0003): this catalog\*(Aqs own sealed volume is a copy to eject, not a blank; a sealed tape this catalog does not hold, or holds retired, is erased first with `tapectl cartridge erase` (ADR\-0012 item 216). Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR\-0010).
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Declare the loaded medium\*(Aqs generation (e.g. LTO\-6, LTO\-7\-M8).
 
 Normally unnecessary and normally ignored: ADR\-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver\*(Aqs density register), and a detected code is a fact about the tape that this flag cannot override — a `\-\-generation` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
 .TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
 \fB\-\-cartridge\fR \fI<CARTRIDGE>\fR
+Bind this volume to an already\-registered cartridge (barcode or chip serial).
+
 Bind this volume to an already\-registered cartridge: its barcode, or the serial its chip reports.
 
 Normally unnecessary: `volume init` matches the loaded medium\*(Aqs chip serial to a registered cartridge, and registers the cartridge itself when nothing matches. Use this for a cartridge registered by hand before it was ever loaded, or on a drive that reports no chip serial, where it names the cartridge. A serial match wins over this flag, since the serial was read off the medium.
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
 \fB\-\-barcode\fR \fI<BARCODE>\fR
-The barcode on the cartridge\*(Aqs sticker, for a cartridge this init registers or one still wearing its chip serial as a placeholder barcode. Without it such a cartridge takes the volume\*(Aqs label as its barcode (ADR\-0012 item 219), the usual practice: the same text on the sticker and on the tape. A cartridge that already has a barcode keeps it, and a different `\-\-barcode` is refused (change a sticker with `tapectl cartridge relabel`). The chip serial stays the cartridge\*(Aqs identity either way
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+The barcode on the cartridge\*(Aqs sticker (default: the volume\*(Aqs label).
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+The barcode on the cartridge\*(Aqs sticker, for a cartridge this init registers or one still wearing its chip serial as a placeholder barcode. Without it such a cartridge takes the volume\*(Aqs label as its barcode (ADR\-0012 item 219), the usual practice: the same text on the sticker and on the tape. A cartridge that already has a barcode keeps it, and a different `\-\-barcode` is refused (change a sticker with `tapectl cartridge relabel`). The chip serial stays the cartridge\*(Aqs identity either way.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fILABEL\fR>
 Volume label (e.g., L6\-0001)
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

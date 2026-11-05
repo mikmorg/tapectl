@@ -8,38 +8,53 @@ tapectl\-host\-check \- Is this host quiet enough to write a tape?
 .SH DESCRIPTION
 Is this host quiet enough to write a tape?
 .PP
-Reports the load average, available memory, memory and I/O pressure, and any contender process or systemd unit (`[host_check]` in config.toml), the same check `volume write` runs before it touches the drive. Exit 0 when quiet, 1 when anything tripped. Never refuses anything: it only reports.
+Reports the load average, available memory, memory and I/O pressure, and any contender process or systemd unit (`[host_check]` in config.toml), the same check `volume write` runs before it touches the drive. Never refuses anything: it only reports.
+.PP
+Exit status: 0 = the host is quiet; 1 = something tripped (each `host check:` line names it); 2 = an error.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-systemd\-unit\fR \fI<UNIT>\fR
-Also check this systemd unit (repeatable), on top of `[host_check] contender_units`, e.g. a CI runner\*(Aqs timer
+Also check this systemd unit (repeatable)
+
+On top of `[host_check] contender_units`, e.g. a CI runner\*(Aqs timer.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Path to config file
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
 
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -14,10 +14,10 @@ tapectl volume [OPTIONS] <COMMAND>
 
 - [`init`](#tapectl-volume-init) — Initialize a new volume (write ID thunk to tape)
 - [`write`](#tapectl-volume-write) — Write staged data to volume
-- [`resume`](#tapectl-volume-resume) — Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
-- [`abort`](#tapectl-volume-abort) — Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own
-- [`verify`](#tapectl-volume-verify) — Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing)
-- [`identify`](#tapectl-volume-identify) — Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
+- [`resume`](#tapectl-volume-resume) — Resume an interrupted write session
+- [`abort`](#tapectl-volume-abort) — Abandon a volume's unfinished write session for good
+- [`verify`](#tapectl-volume-verify) — Verify volume contents via the keyless chain walk (seal -> front index -> content)
+- [`identify`](#tapectl-volume-identify) — Identify the loaded tape: print its File 0 and what this catalog makes of it
 - [`move`](#tapectl-volume-move) — Move a volume to a location
 - [`retire`](#tapectl-volume-retire) — Retire a volume (with impact analysis)
 - [`read-slices`](#tapectl-volume-read-slices) — Read encrypted slices from a volume into staging (then use `volume write` to write them)
@@ -29,7 +29,7 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`rewrite`](#tapectl-volume-rewrite) — Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
 - [`deposit`](#tapectl-volume-deposit) — Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006)
 - [`list`](#tapectl-volume-list) — List every volume, most recently written first
-- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
+- [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, cartridge, place, units, writes, verifies
 - [`import`](#tapectl-volume-import) — Record a pre-existing volume in the catalog
 
 ### tapectl volume init
@@ -37,6 +37,8 @@ tapectl volume [OPTIONS] <COMMAND>
 Initialize a new volume (write ID thunk to tape)
 
 After the volume line, prints one line naming the medium the cartridge was taken for: its generation, the capacity stored on the volume (decimal) and what decided each, e.g. `medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)`. An LTO-5 cartridge in an LTO-6 drive is seen to be LTO-5 here. `--json` carries the same facts as a `medium` object.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume init [OPTIONS] <LABEL>
@@ -48,15 +50,23 @@ tapectl volume init [OPTIONS] <LABEL>
 
 **Options**
 
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--force` — Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `--force` when the tape is PROVEN blank (ADR-0012 2026-10-15 item 57): the chip's lifetime totals read 0 MiB written, or this catalog's own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR-0003): this catalog's own sealed volume is a copy to eject, not a blank; a sealed tape this catalog does not hold, or holds retired, is erased first with `tapectl cartridge erase` (ADR-0012 item 216). Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010)
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--force` — Overwrite a tape whose File 0 names a DIFFERENT volume or is EMPTY; never a SEALED one.
+  
+    Overwrite a cartridge whose File 0 already identifies a DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY (a filemark at the beginning of the tape). Refused by default — loading the wrong cartridge would otherwise silently overwrite it. An EMPTY or unreadable File 0 needs no `--force` when the tape is PROVEN blank (ADR-0012 2026-10-15 item 57): the chip's lifetime totals read 0 MiB written, or this catalog's own `cartridge erase` verified it blank and nothing has been written since; init prints which proof it used. Never overrides a cartridge that is already SEALED (ADR-0003): this catalog's own sealed volume is a copy to eject, not a blank; a sealed tape this catalog does not hold, or holds retired, is erased first with `tapectl cartridge erase` (ADR-0012 item 216). Never degauss an LTO cartridge: that destroys its servo tracks. It also never overrides the drive/media compatibility refusal, which is a physical fact rather than a risk judgement (ADR-0010).
 - `--generation <GENERATION>` — Declare the loaded medium's generation (e.g. LTO-6, LTO-7-M8).
   
     Normally unnecessary and normally ignored: ADR-0010 DETECTS the generation from the drive (MAM medium density code, else MAM format density code, else the st driver's density register), and a detected code is a fact about the tape that this flag cannot override — a `--generation` contradicting one is an error, not a hint. It is consulted only when no source reports a recognised code.
-- `--cartridge <CARTRIDGE>` — Bind this volume to an already-registered cartridge: its barcode, or the serial its chip reports.
+- `--cartridge <CARTRIDGE>` — Bind this volume to an already-registered cartridge (barcode or chip serial).
+  
+    Bind this volume to an already-registered cartridge: its barcode, or the serial its chip reports.
   
     Normally unnecessary: `volume init` matches the loaded medium's chip serial to a registered cartridge, and registers the cartridge itself when nothing matches. Use this for a cartridge registered by hand before it was ever loaded, or on a drive that reports no chip serial, where it names the cartridge. A serial match wins over this flag, since the serial was read off the medium.
-- `--barcode <BARCODE>` — The barcode on the cartridge's sticker, for a cartridge this init registers or one still wearing its chip serial as a placeholder barcode. Without it such a cartridge takes the volume's label as its barcode (ADR-0012 item 219), the usual practice: the same text on the sticker and on the tape. A cartridge that already has a barcode keeps it, and a different `--barcode` is refused (change a sticker with `tapectl cartridge relabel`). The chip serial stays the cartridge's identity either way
+- `--barcode <BARCODE>` — The barcode on the cartridge's sticker (default: the volume's label).
+  
+    The barcode on the cartridge's sticker, for a cartridge this init registers or one still wearing its chip serial as a placeholder barcode. Without it such a cartridge takes the volume's label as its barcode (ADR-0012 item 219), the usual practice: the same text on the sticker and on the tape. A cartridge that already has a barcode keeps it, and a different `--barcode` is refused (change a sticker with `tapectl cartridge relabel`). The chip serial stays the cartridge's identity either way.
 
 ### tapectl volume write
 
@@ -70,7 +80,7 @@ A further copy in one command (ADR-0012 2026-10-15 item 59): `tapectl volume wri
 
 A unit that allows spanning (`allow_spanning`, ADR-0012 item 82) may have its slices on more than one tape. The write lays out first the slices still owed of a span in progress, then whole units, then units that may span, last; the drive's early warning, not the plan, ends such a unit on the tape (items 84, 122 and 123), which needs the drive's `post_warning_bytes`. The write names each unit the tape holds as a range of slices, the whole units it leaves for the next tape (still staged), and, once a range completes a copy across tapes, the tapes to keep together (item 134). A span continues only onto a cartridge of the generation it began on (item 86).
 
-Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
+Exit status (every command that writes a tape shares it): 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 
 ```text
 tapectl volume write [OPTIONS] [LABEL]
@@ -78,27 +88,70 @@ tapectl volume write [OPTIONS] [LABEL]
 
 **Arguments**
 
-- `[LABEL]` — Volume label. A write names its volume: the label ties the data to the volume `volume init` consented to (ADR-0003). Give it, or give `--loaded` instead
+- `[LABEL]` — Volume label.
+  
+    A write names its volume: the label ties the data to the volume `volume init` consented to (ADR-0003). Give it, or give `--loaded` instead
 
 **Options**
 
-- `--loaded` — Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog's volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `--init`
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--force` — See `volume init --force` — same override, same limits. With `--init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write's own File 0 check
-- `--init` — Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. `--force` and `--barcode` are taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59
-- `--barcode <BARCODE>` — With `--init`: the barcode on the cartridge's sticker, as `volume init --barcode` takes it. Without it a cartridge being registered takes the volume's label (ADR-0012 item 219)
-- `--move-to <LOCATION>` — Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> --to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0
-- `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005). Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
-- `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
-- `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much
-- `--full-confirm` — After sealing, read every file back and hash it against the front index (tri-layer L3, hours on a full cartridge). Off by default (ADR-0012, 2026-10-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR-0012 item 186)
-- `--keep-staging` — Keep the staged slices after the write seals and confirms, even of the units that have reached their copy floor. Without this flag each such unit's staging is released then; release it later with `tapectl stage clean`
-- `--for-location <LOCATION>` — Write only the staged sets that still have need at this location (ADR-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `--move-to LOCATION` does; a different `--move-to` is refused. Stage for it with `tapectl stage for-location`. Without this flag the write takes every staged set
-- `--keep-staging-for-locations` — Release each unit's staging only once every per-location copy target of it is met, not at its copy floor (ADR-0012 item 154), so the next location's copy reuses these staged slices instead of staging again; a unit that spans cartridges keeps every slice until then. Use it when staging has room; the output names the locations that still need each unit
+- `--loaded` — Write the loaded tape, named by its File 0 (an initialized volume of this catalog).
+  
+    Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog's volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `--init`
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--force` — Overwrite a tape whose File 0 names a DIFFERENT volume or is EMPTY; never a SEALED one.
+  
+    See `volume init --force`: the same override, the same limits.
+  
+    With `--init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write's own File 0 check.
+- `--init` — Initialise the loaded cartridge as this volume first, then write it.
+  
+    Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. `--force` and `--barcode` are taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59.
+- `--barcode <BARCODE>` — With --init: the barcode on the cartridge's sticker (default: the volume's label).
+  
+    With `--init`: the barcode on the cartridge's sticker, as `volume init --barcode` takes it. Without it a cartridge being registered takes the volume's label (ADR-0012 item 219).
+- `--move-to <LOCATION>` — Move the volume and its cartridge to this location once sealed and confirmed.
+  
+    Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> --to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0.
+- `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005).
+  
+    Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key.
+- `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1).
+  
+    Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch.
+- `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity (`0.99` or `99%`).
+  
+    Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much.
+- `--full-confirm` — After sealing, read every file back and hash it (the tape's first full verify).
+  
+    After sealing, read every file back and hash it against the front index (tri-layer L3, hours on a full cartridge). Off by default (ADR-0012, 2026-10-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify-status` name it until `volume verify` runs one. A session in which the drive refused a write with Logical Block Protection armed confirms in full regardless, with or without this flag (ADR-0012 item 186).
+- `--keep-staging` — Keep every staged slice after the write, even of units at their copy floor.
+  
+    Keep the staged slices after the write seals and confirms, even of the units that have reached their copy floor. Without this flag each such unit's staging is released then; release it later with `tapectl stage clean`.
+- `--for-location <LOCATION>` — Write only the staged sets still needed at this location, then move the tape there.
+  
+    Write only the staged sets that still have need at this location (ADR-0012 item 151): a copy target there unmet, or short of the copy floor with no copy there yet, or a span whose earlier range is on a tape there. The other staged sets stay staged and are named. Once sealed and confirmed the volume is moved there, as `--move-to LOCATION` does; a different `--move-to` is refused. Stage for it with `tapectl stage for-location`. Without this flag the write takes every staged set.
+- `--keep-staging-for-locations` — Keep each unit's staging until every per-location copy target is met.
+  
+    Release each unit's staging only once every per-location copy target of it is met, not at its copy floor (ADR-0012 item 154), so the next location's copy reuses these staged slices instead of staging again; a unit that spans cartridges keeps every slice until then. Use it when staging has room; the output names the locations that still need each unit.
+
+**Examples**
+
+```bash
+Make a copy on the loaded blank cartridge, read it all back, move it offsite:
+tapectl volume write L6-0003 --init --full-confirm --move-to offsite
+Write to a volume already initialised with volume init:
+tapectl volume write L6-0003 --full-confirm
+Write only what one location still needs, then move the tape there:
+tapectl volume write L6-0004 --init --full-confirm --for-location vault
+```
 
 ### tapectl volume resume
 
-Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
+Resume an interrupted write session.
+
+Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 
 An already-sealed tape is RE-CONFIRMED, not refused, when the tape itself proves it is this session's own: File 0's identity matches this volume, File 0's OWN recorded seal-marker pointer equals this session's layout, and a real seal marker parses at that position. The seal is never written a second time. This is the path `volume write` sends you down when it says "run `tapectl volume resume <label>` to retry the confirm readback".
 
@@ -126,18 +179,34 @@ tapectl volume resume [OPTIONS] [LABEL]
 
 **Options**
 
-- `--loaded` — Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog's volumes with an interrupted write session, a re-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
-- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the confirm the interrupted write asked for: the full readback when it had `--full-confirm`, else the quick confirm, which leaves the readback to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR-0012 item 186)
-- `--keep-staging` — See `volume write --keep-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
-- `--move-to <LOCATION>` — Move the volume, with its cartridge, to this location once it is sealed and confirmed, as `volume write --move-to` does. The interrupted write's own `--move-to` or `--for-location` is kept without this flag; naming another place here is refused, naming both. The location is checked before the drive is touched
+- `--loaded` — Resume the loaded tape, named by its File 0.
+  
+    Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog's volumes with an interrupted write session, a re-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--prewrite-hash` — Full-hash every staged slice while revalidating, as `volume write --prewrite-hash`.
+  
+    See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way.
+- `--full-confirm` — Read every file back after the seal, as `volume write --full-confirm`.
+  
+    See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the confirm the interrupted write asked for: the full readback when it had `--full-confirm`, else the quick confirm, which leaves the readback to `volume verify`. A session in which the drive refused a write with Logical Block Protection armed, in any run, confirms in full regardless (ADR-0012 item 186).
+- `--keep-staging` — Keep every staged slice, as `volume write --keep-staging`.
+  
+    See `volume write --keep-staging`: the staged slices stay even when this resume completes the last copy the policy asks for.
+- `--move-to <LOCATION>` — Move the volume and its cartridge to this location once sealed and confirmed.
+  
+    Move the volume, with its cartridge, to this location once it is sealed and confirmed, as `volume write --move-to` does. The interrupted write's own `--move-to` or `--for-location` is kept without this flag; naming another place here is refused, naming both. The location is checked before the drive is touched.
 
 ### tapectl volume abort
 
-Deliberately abandon a volume's unfinished write session: `docs/design/layout-session.md`'s Aborted row, first clause. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
+Abandon a volume's unfinished write session for good.
+
+The session becomes ABORTED. Use this when a `volume resume` reports a revalidation failure you know to be permanent (the staged data is really gone), or to clear a `planned` session that was killed before anything was written. Nothing can tell a transient cause from a permanent one but you, which is why resume never decides this on its own.
 
 The tape is never contacted (hence no --device): the cartridge is left exactly as the session left it, and the staged files stay pinned until `stage clean --force` runs. The session becomes ABORTED: `volume resume` will not pick it up again unless its seal is recorded AND a clean full verify is recorded after the abort (ADR-0012, 2026-09-23), and a session aborted before its seal is never resumable. When the seal is recorded, keep staging if you intend to verify and resume: that re-confirm revalidates against the staged files, so releasing them forfeits it.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume abort [OPTIONS] <LABEL>
@@ -149,7 +218,9 @@ tapectl volume abort [OPTIONS] <LABEL>
 
 ### tapectl volume verify
 
-Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing).
+Verify volume contents via the keyless chain walk (seal -> front index -> content).
+
+Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing).
 
 A full verify that was stopped part-way CONTINUES when run again: files the volume's latest readback (this command's or a write's `--full-confirm`) already read back clean are not read again, as long as the front index on the tape is the one they were checked against.
 
@@ -163,19 +234,42 @@ tapectl volume verify [OPTIONS] [LABEL]
 
 **Arguments**
 
-- `[LABEL]` — Volume label. Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
+- `[LABEL]` — Volume label.
+  
+    Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
 
 **Options**
 
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--full` — Full integrity chain walk (default): hash every content file against the front index's ciphertext hashes
-- `--quick` — Quick navigable-only chain walk: seal binding + front index self-consistency, no per-file content hashing
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--full` — Full chain walk: hash every content file against the front index (the default).
+  
+    Full integrity chain walk (default): hash every content file against the front index's ciphertext hashes.
+- `--quick` — Quick chain walk: the seal binding and the front index only, no content hashing.
+  
+    Quick navigable-only chain walk: seal binding + front index self-consistency, no per-file content hashing.
+
+**Examples**
+
+```bash
+Read every file of a volume back (the periodic full verify):
+tapectl volume verify L6-0001
+Verify whatever tape is loaded, named by its File 0:
+tapectl volume verify
+Check only the seal and the front index:
+tapectl volume verify L6-0001 --quick
+```
 
 ### tapectl volume identify
 
-Identify the loaded tape: print its File 0, and say on stderr what this catalog makes of it
+Identify the loaded tape: print its File 0 and what this catalog makes of it.
+
+File 0 goes to stdout; what this catalog makes of the tape goes to stderr.
 
 With `--json`, one object: File 0's `label` and `uuid` (and its text as `file0`), the catalog's `status`, `condition` and `location` for that volume (null when it has none of that uuid), the `cartridge` (the chip `serial` read now, the catalog's `barcode` for it, and the identity File 0 records), the `sealed` facts the catalog records, and the `note` and `contradiction`. A tape that contradicts the catalog still exits non-zero.
+
+Exit status: 0 = File 0 read, and the catalog agrees or does not know the tape; 2 = the tape contradicts the catalog, or an error; 75 = the catalog was busy.
 
 ```text
 tapectl volume identify [OPTIONS]
@@ -183,11 +277,15 @@ tapectl volume identify [OPTIONS]
 
 **Options**
 
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
 
 ### tapectl volume move
 
 Move a volume to a location
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume move [OPTIONS] --to <TO> <LABEL>
@@ -205,6 +303,8 @@ tapectl volume move [OPTIONS] --to <TO> <LABEL>
 
 Retire a volume (with impact analysis)
 
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
+
 ```text
 tapectl volume retire [OPTIONS] <LABEL>
 ```
@@ -219,6 +319,8 @@ Read encrypted slices from a volume into staging (then use `volume write` to wri
 
 Reads the unit's slices off the loaded tape, checks each against its recorded hash, and records where it put them, so `volume write` can write them to another cartridge without the source directory. Every version of the unit on the volume is read except those marked reclaimable or purged; `--version` reads one version, whatever its state. The staging directory is checked for room before the first slice is read, and a read that does not finish removes what it wrote.
 
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
+
 ```text
 tapectl volume read-slices [OPTIONS] --from <LABEL> <UNIT>
 ```
@@ -230,12 +332,18 @@ tapectl volume read-slices [OPTIONS] --from <LABEL> <UNIT>
 **Options**
 
 - `--from <LABEL>` *(required)* — Source volume label
-- `--version <N>` — Read only this version of the unit (a reclaimable or purged version is read when named). Without it, every version on the volume except the reclaimable and purged ones is read
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--version <N>` — Read only this version of the unit (a reclaimable or purged version is read when named).
+  
+    Without it, every version on the volume except the reclaimable and purged ones is read.
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
 
 ### tapectl volume compact-read
 
 Read live encrypted slices from a volume to staging (compaction step 1)
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume compact-read [OPTIONS] <LABEL>
@@ -247,7 +355,9 @@ tapectl volume compact-read [OPTIONS] <LABEL>
 
 **Options**
 
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
 
 ### tapectl volume compact-write
 
@@ -262,8 +372,12 @@ tapectl volume compact-write [OPTIONS] --to <LABEL>
 **Options**
 
 - `--to <LABEL>` *(required)* — Destination volume label
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--allow-missing-escrow` — See `volume write --allow-missing-escrow`. A compaction whose source volume predates the escrow recipient needs this to proceed
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--allow-missing-escrow` — See `volume write --allow-missing-escrow`.
+  
+    A compaction whose source volume predates the escrow recipient needs this to proceed.
 - `--prewrite-hash` — See `volume write --prewrite-hash`
 - `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this write only
 - `--full-confirm` — See `volume write --full-confirm`
@@ -276,21 +390,35 @@ When a staged unit may span (`allow_spanning`), it also shows the order one writ
 
 A plan needs no drive: the tapes are estimated for `--generation`, or the configured drive's own generation, and the drive is never opened or probed, so it need not be attached. With neither, the plan is shown without the estimate. `volume init` decides each cartridge's real capacity.
 
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
+
 ```text
 tapectl volume plan [OPTIONS]
 ```
 
 **Options**
 
-- `--copies <COPIES>` — Number of copies to plan. Default: the largest copy floor among the staged units (each unit's `min_copies`, or the sum of its `copies_at` targets when that is larger), which the plan names
-- `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded, and with no drive configured the estimate takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve); this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on
-- `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
-- `--fill-ceiling <FILL_CEILING>` — Estimate at this fill ceiling instead of the drive's `fill_ceiling` (default 97%): `0.99` or `99%`
-- `--policy-aware` — List first the staged units a write would help: those whose audit finds too few copies or a required location with no copy, each with what it falls short of. `volume write` writes every staged set either way; this orders the listing only
+- `--copies <COPIES>` — Number of copies to plan.
+  
+    Default: the largest copy floor among the staged units (each unit's `min_copies`, or the sum of its `copies_at` targets when that is larger), which the plan names
+- `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own.
+  
+    Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded, and with no drive configured the estimate takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve); this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on.
+- `--device <DEVICE>` — Which configured drive to plan against, by its device path.
+  
+    Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking.
+- `--fill-ceiling <FILL_CEILING>` — Estimate at this fill ceiling (`0.99` or `99%`) instead of the drive's.
+  
+    Estimate at this fill ceiling instead of the drive's `fill_ceiling` (default 97%): `0.99` or `99%`.
+- `--policy-aware` — List first the staged units a write would help (too few copies, a missing place).
+  
+    List first the staged units a write would help: those whose audit finds too few copies or a required location with no copy, each with what it falls short of. `volume write` writes every staged set either way; this orders the listing only.
 
 ### tapectl volume compact-finish
 
 Retire source volume after compaction (compaction step 3)
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume compact-finish [OPTIONS] <LABEL>
@@ -302,7 +430,9 @@ tapectl volume compact-finish [OPTIONS] <LABEL>
 
 **Options**
 
-- `--force` — Waive the ADR-0008 Tier-2 prompt: proceed when the retirement leaves a live version below its policy but above zero. It defeats NEITHER Tier-3 refusal — a live slice with no copy on another volume, and the last eligible copy of a live version, each stop the retirement outright and no flag reaches them. See cli::consent
+- `--force` — Waive the Tier-2 prompt (a version left below its policy); never a Tier-3 refusal.
+  
+    Waive the ADR-0008 Tier-2 prompt: proceed when the retirement leaves a live version below its policy but above zero. It defeats NEITHER Tier-3 refusal — a live slice with no copy on another volume, and the last eligible copy of a live version, each stop the retirement outright and no flag reaches them.
 
 ### tapectl volume compact
 
@@ -324,13 +454,21 @@ tapectl volume compact [OPTIONS] <LABEL>
 
 **Options**
 
-- `--to <TO>` — Destination volume label (already initialised). With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--to <TO>` — Destination volume label (already initialised).
+  
+    With it, the pause after step 1 only asks you to swap cartridges and press Enter; without it, that pause also asks for the label. It never skips the swap: the destination is written through the same drive the source was read from.
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
 - `--prewrite-hash` — See `volume write --prewrite-hash` (step 2's write)
 - `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling` (step 2's write)
 - `--full-confirm` — See `volume write --full-confirm` (step 2's write)
-- `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
+- `--force` — Waive step 3's Tier-2 prompt, as `volume compact-finish --force`.
+  
+    See `volume compact-finish --force`: step 3's ADR-0008 Tier-2 gate.
+  
+    With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you.
 
 ### tapectl volume rewrite
 
@@ -362,14 +500,22 @@ tapectl volume rewrite [OPTIONS] [SOURCE]
 
 **Options**
 
-- `--label <NEW>` — The label of the NEW volume that will carry the slices on the same cartridge (not with --resume)
-- `--resume <NEW>` — Finish the rewrite that was to write NEW and stopped: erase, init and write from wherever the catalog says it stopped, then lift the hold on the staged slices once NEW has passed a full readback
-- `--only-copy-on-staging <SOURCE_LABEL>` — Consent, for an unattended run, to rewriting a volume that holds the only copy of some unit: the SOURCE volume's label, exactly. A different label refuses. `--yes` does not give this consent
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--label <NEW>` — The label of the NEW volume written on the same cartridge (not with --resume)
+- `--resume <NEW>` — Finish a rewrite that stopped, from wherever the catalog says it stopped.
+  
+    Finish the rewrite that was to write NEW and stopped: erase, init and write from wherever the catalog says it stopped, then lift the hold on the staged slices once NEW has passed a full readback
+- `--only-copy-on-staging <SOURCE_LABEL>` — Consent to rewriting a volume that holds a unit's only copy: the SOURCE label.
+  
+    Consent, for an unattended run, to rewriting a volume that holds the only copy of some unit: the SOURCE volume's label, exactly. A different label refuses. `--yes` does not give this consent.
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
 - `--prewrite-hash` — See `volume write --prewrite-hash`
 - `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this command only
-- `--with-staged` — Write whatever else is staged beside the rewrite's slices. Without it the new volume carries the rewrite's slices and nothing else
+- `--with-staged` — Write whatever else is staged beside the rewrite's slices.
+  
+    Without it the new volume carries the rewrite's slices and nothing else.
 - `--keep-staging` — Release nothing from staging after the full readback
 
 ### tapectl volume deposit
@@ -390,7 +536,9 @@ tapectl volume deposit [OPTIONS] <COMMAND>
 
 #### tapectl volume deposit add
 
-Record that a sealed volume's bytes now also exist at a warehouse
+Record that a sealed volume's bytes now also exist at a warehouse.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume deposit add [OPTIONS] --to <TO> <LABEL>
@@ -403,13 +551,17 @@ tapectl volume deposit add [OPTIONS] --to <TO> <LABEL>
 **Options**
 
 - `--to <TO>` *(required)* — Warehouse location name (must be a location of kind `warehouse`)
-- `--receipt <RECEIPT>` — The provider's receipt / object-version identifier, if it gave one. There is deliberately no checksum field: tapectl did not perform the copy, so a typed-in checksum would be a claim about a claim
+- `--receipt <RECEIPT>` — The provider's receipt / object-version identifier, if it gave one.
+  
+    There is deliberately no checksum field: tapectl did not perform the copy, so a typed-in checksum would be a claim about a claim.
 - `--storage-class <STORAGE_CLASS>` — Storage class the bytes were placed in (e.g. DEEP_ARCHIVE)
 - `--notes <NOTES>` — Free-text note
 
 #### tapectl volume deposit list
 
 List recorded deposits
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl volume deposit list [OPTIONS]
@@ -424,6 +576,8 @@ tapectl volume deposit list [OPTIONS]
 Un-record a deposit whose bytes are gone from the warehouse.
 
 ADR-0006 names the reason this must exist: "a warehouse copy dies weeks after payment stops". A lapsed bill or a provider lifecycle rule deletes the object without telling tapectl, and a deposit row that outlives its bytes keeps counting as a copy at exactly the gates that decide whether local data may be deleted.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl volume deposit remove [OPTIONS] --from <FROM> <LABEL>
@@ -445,19 +599,25 @@ Catalog-only: never opens a drive. Every status is shown by default — ADR-0011
 
 GENERATION and CAPACITY are what `volume init` decided for the volume (capacity decimal, as the box counts it); `--json` carries them as `media_type` and `capacity_bytes`.
 
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
+
 ```text
 tapectl volume list [OPTIONS]
 ```
 
 **Options**
 
-- `--status <STATUS>` — Only volumes in this status (initialized, active, retired, erased, sealed). Every status is shown when omitted. A medium's CONDITION (e.g. quarantined) is its own fact now (ADR-0012, the 2026-09-17 amendment) and is shown in its own column/line, not filterable here
+- `--status <STATUS>` — Only volumes in this status (initialized, active, retired, erased, sealed).
+  
+    Every status is shown when omitted. A medium's CONDITION (e.g. quarantined) is its own fact now (ADR-0012, the 2026-09-17 amendment) and is shown in its own column/line, not filterable here.
 
 ### tapectl volume info
 
-The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits.
+The dossier for one volume: capacity, cartridge, place, units, writes, verifies.
 
-Catalog-only: never opens a drive. Summarises units carried by default — the design probes ~280 units per cartridge (docs/design/v2-open-questions.md:434) — pass `--units` to list every one instead of the largest few.
+Catalog-only: never opens a drive. Summarises the units carried (a cartridge can hold hundreds) by default; pass `--units` to list every one instead of the largest few.
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl volume info [OPTIONS] <LABEL>
@@ -477,6 +637,8 @@ Record a pre-existing volume in the catalog
 
 Writes a catalog row for a tape this catalog has never seen and never touches the drive. For a tape tapectl wrote, `catalog rebuild --from-volume` reads what is on it instead.
 
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
+
 ```text
 tapectl volume import [OPTIONS] --generation <GENERATION> <LABEL>
 ```
@@ -488,9 +650,13 @@ tapectl volume import [OPTIONS] --generation <GENERATION> <LABEL>
 **Options**
 
 - `--generation <GENERATION>` *(required)* — Media generation (e.g., LTO-6, LTO-7, LTO-7-M8, LTO-8)
-- `--capacity <CAPACITY>` — Capacity (e.g., "2500G"). Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
+- `--capacity <CAPACITY>` — Capacity (e.g., "2500G").
+  
+    Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
   
     Defaults to the generation table's native capacity for `--generation` when omitted (ADR-0010, decision 3).
-- `--device <DEVICE>` — Which configured drive this volume belongs to, by its device path (ADR-0010). Only needed when more than one drive is configured; with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no configured drive claims is not an error
+- `--device <DEVICE>` — Which configured drive this volume belongs to, by its device path (ADR-0010).
+  
+    Only needed when more than one drive is configured; with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no configured drive claims is not an error.
 - `--notes <NOTES>` — Notes
 

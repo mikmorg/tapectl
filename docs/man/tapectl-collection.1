@@ -2,61 +2,74 @@
 .el .ds Aq '
 .TH tapectl-collection 1  "tapectl-collection " 
 .SH NAME
-tapectl\-collection \- Manage media collections (folder=unit factory + batch tape driver)
+tapectl\-collection \- Manage collections: folders of units, written in batches
 .SH SYNOPSIS
 \fBtapectl collection\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-Manage media collections (folder=unit factory + batch tape driver)
+Manage collections: folders of units, written in batches
+.PP
+A collection is a source root whose folders are units (one folder, one unit); `collection run` stages and writes them a batch at a time.
 .SH OPTIONS
 .TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
 \fB\-\-json\fR
-Output in JSON format
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Path to config file
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
 
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)
 .SH SUBCOMMANDS
 .TP
 tapectl\-collection\-add(1)
-Add a collection: a folder whose subfolders are each a unit of one tenant
+Add a collection: a folder whose subfolders are each a unit
 .TP
 tapectl\-collection\-remove(1)
-Take a collection out of config.toml; its units stay registered and untouched
+Take a collection out of config.toml; its units stay registered
 .TP
 tapectl\-collection\-sync(1)
-Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
+Sync every collection: register new unit folders, follow moved ones
 .TP
 tapectl\-collection\-status(1)
-Show each configured collection\*(Aqs pending, staged, under\-copied and missing units
+Show each collection\*(Aqs pending, staged, under\-copied and missing units
 .TP
 tapectl\-collection\-plan(1)
-Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units
+Show how each collection\*(Aqs pending units pack into tapes
 .TP
 tapectl\-collection\-run(1)
-Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy\*(Aqs `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR\-0012 item 217). Ends with what the copy holds and the next copy\*(Aqs command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
+Stage one batch of a collection and write it to one tape
 .TP
 tapectl\-collection\-help(1)
 Print this message or the help of the given subcommand(s)

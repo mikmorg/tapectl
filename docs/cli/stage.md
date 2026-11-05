@@ -12,17 +12,19 @@ tapectl stage [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`create`](#tapectl-stage-create) — Create staged slices (validate → dar → encrypt → checksums)
+- [`create`](#tapectl-stage-create) — Archive and encrypt each unit's newest snapshot into staging
 - [`for-location`](#tapectl-stage-for-location) — Stage what a location needs, packed into one volume bound there
 - [`list`](#tapectl-stage-list) — List the stage sets held in staging, with each version's copies
 - [`clean`](#tapectl-stage-clean) — Release staged slices from disk
-- [`info`](#tapectl-stage-info) — Show details for a stage set
+- [`info`](#tapectl-stage-info) — Show a version's newest stage set: its dar, sizes and slices
 
 ### tapectl stage create
 
-Create staged slices (validate → dar → encrypt → checksums)
+Archive and encrypt each unit's newest snapshot into staging
 
-Several units may be named; `--jobs` stages that many at once.
+Each unit's sources are hashed as dar reads them once, and dar's archive is cut into slices and age-encrypted in memory: no plaintext reaches staging. Several units may be named; `--jobs` stages that many at once. Every name is checked before any unit is staged. Under --json, an array of one object per unit, printed only when every unit was staged.
+
+Exit status: 0 = every unit staged; 2 = a unit failed or was refused (the error names each unit staged, failed and not started).
 
 ```text
 tapectl stage create [OPTIONS] <NAME>...
@@ -30,12 +32,18 @@ tapectl stage create [OPTIONS] <NAME>...
 
 **Arguments**
 
-- `<NAME>` — Unit name(s). Each unit's latest unstaged snapshot is staged (or `--version`'s, with one unit). Every name is checked before any unit is staged
+- `<NAME>` — The units to stage: each one's newest unstaged snapshot
+  
+    With one unit, `--version` stages that version instead.
 
 **Options**
 
-- `--version <VERSION>` — Re-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl stage clean --unit <name> --version <N>` already released that stage set's slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `stage clean --unit <name> --version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape-only unit); add `--force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor
-- `--jobs <JOBS>` — How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
+- `--version <VERSION>` — Stage this version again, after `stage clean` released it
+  
+    Re-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl stage clean --unit <name> --version <N>` already released that stage set's slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `stage clean --unit <name> --version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape-only unit); add `--force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor.
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16; default `[staging] jobs`)
+  
+    `[staging] jobs` is itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache).
 
 ### tapectl stage for-location
 
@@ -51,13 +59,17 @@ tapectl stage for-location [OPTIONS] --volume <LABEL> <LOCATION>
 
 **Arguments**
 
-- `<LOCATION>` — The location the volume will be kept at (a registered location, not a warehouse)
+- `<LOCATION>` — Where the volume will be kept: a registered location, not a warehouse
 
 **Options**
 
-- `--volume <LABEL>` *(required)* — The volume to fill: `volume init` done, nothing written yet
-- `--jobs <JOBS>` — How many units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`
-- `--device <DEVICE>` — The drive whose fill ceiling and end-of-tape reserve size the volume's room (no drive is touched). Defaults to the only configured drive; required when more than one is configured
+- `--volume <LABEL>` *(required)* — The volume to fill: initialized, nothing written yet
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16; default `[staging] jobs`)
+  
+    As `stage create --jobs`.
+- `--device <DEVICE>` — The drive whose fill ceiling and reserve size the volume's room
+  
+    No drive is touched. Defaults to the only configured drive; required when more than one is configured.
 
 ### tapectl stage list
 
@@ -71,7 +83,9 @@ tapectl stage list [OPTIONS]
 
 **Options**
 
-- `--status <STATUS>` — Only the stage sets of this status (staging, staged, failed, cleaned), held or not
+- `--status <STATUS>` — Only the stage sets of this status, held or not
+  
+    One of staging, staged, failed, cleaned.
 - `--owing` — Only the staged sets that still owe a copy
 - `--all` — The released (`cleaned`) and `failed` stage sets too
 
@@ -87,13 +101,19 @@ tapectl stage clean [OPTIONS]
 
 **Options**
 
-- `--force` — Clean all staged sets, not just those with completed writes; also releases a unit's staged data that a bare `stage clean` would otherwise retain for being below its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets, times the tape-only multiplier for a tape-only unit)
-- `--unit <UNIT>` — Narrow which staged sets are considered for release to this unit (repeatable). Without `--force`, the same copy-floor split still applies within the named unit(s): one below its own copy floor keeps its staged bytes retained (pass `--force` to release it too, exactly as for the whole-archive form). A `'failed'` stage_set is always swept regardless of this scope -- see `CleanScope::Units`'s own contract in `src/staging/clean.rs`. An unknown unit name is an error, not a silent no-op
-- `--version <VERSION>` — Narrow release further, to just this snapshot version within the single unit named by `--unit`. Requires exactly one `--unit`; zero or more than one is a usage error naming the constraint, never a silent widening back to unit-level scope. Exists so a `--force` release meant for one under-written version of a unit can never also release a DIFFERENT, still-unwritten version of that same unit -- see `CleanScope::UnitVersion`'s contract in `src/staging/clean.rs`
+- `--force` — Release unwritten sets and units below their copy floor too
+  
+    Releases every staged set in scope, not just those with completed writes, and a unit's staged data that a bare `stage clean` would retain for being below its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets, times the tape-only multiplier for a tape-only unit). It never releases a set a live write session or a pending `volume rewrite` is using.
+- `--unit <UNIT>` — Only this unit's staged sets (repeat it for several)
+  
+    Without `--force`, the same copy-floor split still applies within the named units: one below its own copy floor keeps its staged bytes (pass `--force` to release it too, exactly as for the whole-archive form). A failed stage set is always swept, whatever the scope. An unknown unit name is an error, not a silent no-op.
+- `--version <VERSION>` — Only this version of the one unit `--unit` names
+  
+    Requires exactly one `--unit`; zero or more than one is a usage error naming the constraint, never a silent widening back to the whole unit. So a `--force` release meant for one under-written version of a unit can never also release a DIFFERENT, still-unwritten version of that same unit.
 
 ### tapectl stage info
 
-Show details for a stage set
+Show a version's newest stage set: its dar, sizes and slices
 
 ```text
 tapectl stage info [OPTIONS] --version <VERSION> <NAME>
@@ -101,9 +121,9 @@ tapectl stage info [OPTIONS] --version <VERSION> <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--version <VERSION>` *(required)* — Snapshot version
+- `--version <VERSION>` *(required)* — The version
 

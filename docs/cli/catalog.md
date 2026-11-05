@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-Browse and search file catalog
+Browse and search the file catalog
 
 ```text
 tapectl catalog [OPTIONS] <COMMAND>
@@ -14,13 +14,15 @@ tapectl catalog [OPTIONS] <COMMAND>
 
 - [`list`](#tapectl-catalog-list) — List files in a unit's latest snapshot
 - [`search`](#tapectl-catalog-search) — Search for files by pattern, in each unit's newest version
-- [`locate`](#tapectl-catalog-locate) — Show which volume(s) contain a unit
-- [`stats`](#tapectl-catalog-stats) — Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes
-- [`rebuild`](#tapectl-catalog-rebuild) — Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
+- [`locate`](#tapectl-catalog-locate) — Show which volumes hold a unit
+- [`stats`](#tapectl-catalog-stats) — Show catalog statistics
+- [`rebuild`](#tapectl-catalog-rebuild) — Reconstruct catalog rows by reading a sealed volume
 
 ### tapectl catalog list
 
 List files in a unit's latest snapshot
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl catalog list [OPTIONS] <UNIT>
@@ -38,22 +40,30 @@ tapectl catalog list [OPTIONS] <UNIT>
 
 Search for files by pattern, in each unit's newest version
 
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
+
 ```text
 tapectl catalog search [OPTIONS] <PATTERN>
 ```
 
 **Arguments**
 
-- `<PATTERN>` — Search pattern. Split on non-alphanumerics; each token is PREFIX-matched and all must match (AND). So "foo bar" finds paths containing a word starting with foo AND one starting with bar -- it is not a substring match, and "ar" will not find "bar"
+- `<PATTERN>` — Search pattern.
+  
+    Split on non-alphanumerics; each token is PREFIX-matched and all must match (AND). So "foo bar" finds paths containing a word starting with foo AND one starting with bar -- it is not a substring match, and "ar" will not find "bar".
 
 **Options**
 
 - `--limit <LIMIT>` *(default: `50`)* — Limit results
-- `--all-versions` — Search every version of each unit, not only its newest: a file is listed once per version that holds it
+- `--all-versions` — Search every version of each unit, not only its newest.
+  
+    Search every version of each unit, not only its newest: a file is listed once per version that holds it
 
 ### tapectl catalog locate
 
-Show which volume(s) contain a unit
+Show which volumes hold a unit
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl catalog locate [OPTIONS] <UNIT>
@@ -65,7 +75,11 @@ tapectl catalog locate [OPTIONS] <UNIT>
 
 ### tapectl catalog stats
 
-Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes
+Show catalog statistics.
+
+Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes.
+
+Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
 
 ```text
 tapectl catalog stats [OPTIONS]
@@ -73,7 +87,11 @@ tapectl catalog stats [OPTIONS]
 
 ### tapectl catalog rebuild
 
-Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
+Reconstruct catalog rows by reading a sealed volume.
+
+The path back when the database is gone and there is no backup.
+
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 
 ```text
 tapectl catalog rebuild [OPTIONS] --from-volume --key <FILE>
@@ -81,11 +99,21 @@ tapectl catalog rebuild [OPTIONS] --from-volume --key <FILE>
 
 **Options**
 
-- `--from-volume` *(required)* — Rebuild from a sealed tape volume. Required: the only source today, named rather than implied so a later `--from-export` is additive
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured.
+- `--from-volume` *(required)* — Rebuild from a sealed tape volume.
+  
+    Required: the only source today, named rather than implied so a later `--from-export` is additive
+- `--device <DEVICE>` — Tape device (by-id path).
+  
+    Defaults to the only configured drive; required when more than one is configured.
   
     There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read-only dump this command writes what it reads into the catalog — a silent wrong-device default would file one tape's contents under another's. The sole configured drive's `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by-id/`.
-- `--key <FILE>` *(required)* — Operator or escrow secret key file (an age identity, `AGE-SECRET-KEY-1…`); repeat for several. For this command only: never copied into the home or registered as any key, so an heir can rebuild with the escrow key alone and then restore with the same `--key`. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh; a file that is not an identity is refused, naming it, before the drive is opened
-- `--label <LABEL>` — Refuse unless the tape's own reported label matches — a wrong-tape guard, not a database lookup
-- `--tenant <TENANT>` *(default: `recovered`)* — Tenant to file units under when no tenant envelope on this cartridge names their owner (only reachable with a damaged or partial tape)
+- `--key <FILE>` *(required)* — Operator or escrow secret key file (an age identity); repeat for several.
+  
+    Operator or escrow secret key file (an age identity, `AGE-SECRET-KEY-1…`); repeat for several. For this command only: never copied into the home or registered as any key, so an heir can rebuild with the escrow key alone and then restore with the same `--key`. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh; a file that is not an identity is refused, naming it, before the drive is opened
+- `--label <LABEL>` — Refuse unless the tape's own label matches (a wrong-tape guard).
+  
+    Refuse unless the tape's own reported label matches — a wrong-tape guard, not a database lookup
+- `--tenant <TENANT>` *(default: `recovered`)* — Tenant to file units under when no tenant envelope names their owner.
+  
+    Tenant to file units under when no tenant envelope on this cartridge names their owner (only reachable with a damaged or partial tape)
 

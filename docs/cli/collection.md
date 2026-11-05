@@ -4,7 +4,9 @@
 
 [All commands](README.md)
 
-Manage media collections (folder=unit factory + batch tape driver)
+Manage collections: folders of units, written in batches
+
+A collection is a source root whose folders are units (one folder, one unit); `collection run` stages and writes them a batch at a time.
 
 ```text
 tapectl collection [OPTIONS] <COMMAND>
@@ -12,18 +14,18 @@ tapectl collection [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`add`](#tapectl-collection-add) — Add a collection: a folder whose subfolders are each a unit of one tenant
-- [`remove`](#tapectl-collection-remove) — Take a collection out of config.toml; its units stay registered and untouched
-- [`sync`](#tapectl-collection-sync) — Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts)
-- [`status`](#tapectl-collection-status) — Show each configured collection's pending, staged, under-copied and missing units
-- [`plan`](#tapectl-collection-plan) — Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units
-- [`run`](#tapectl-collection-run) — Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR-0012 item 217). Ends with what the copy holds and the next copy's command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action
+- [`add`](#tapectl-collection-add) — Add a collection: a folder whose subfolders are each a unit
+- [`remove`](#tapectl-collection-remove) — Take a collection out of config.toml; its units stay registered
+- [`sync`](#tapectl-collection-sync) — Sync every collection: register new unit folders, follow moved ones
+- [`status`](#tapectl-collection-status) — Show each collection's pending, staged, under-copied and missing units
+- [`plan`](#tapectl-collection-plan) — Show how each collection's pending units pack into tapes
+- [`run`](#tapectl-collection-run) — Stage one batch of a collection and write it to one tape
 
 ### tapectl collection add
 
-Add a collection: a folder whose subfolders are each a unit of one tenant
+Add a collection: a folder whose subfolders are each a unit
 
-ROOT must be an absolute path to a directory that exists, neither inside another collection's root nor holding one. The tenant and the archive set must exist. The user tapectl runs as (the service user, under tapectl-op) must be able to read the whole tree and, unless --no-dotfiles, write a .tapectl-unit.toml into each unit folder; when it cannot, the setfacl lines that grant it are printed and nothing is added, since it cannot grant them itself. Then the [[collections]] table is written into config.toml, its comments kept, and the sync dry run is shown: `tapectl collection sync` registers the units.
+Each unit folder becomes a unit of one tenant. ROOT must be an absolute path to a directory that exists, neither inside another collection's root nor holding one. The tenant and the archive set must exist. The user tapectl runs as (the service user, under tapectl-op) must be able to read the whole tree and, unless --no-dotfiles, write a .tapectl-unit.toml into each unit folder; when it cannot, the setfacl lines that grant it are printed and nothing is added, since it cannot grant them itself. Then the [[collections]] table is written into config.toml, its comments kept, and the sync dry run is shown: `tapectl collection sync` registers the units.
 
 Exit status: 0 = added (with --dry-run: it would be); 2 = refused, nothing written.
 
@@ -33,22 +35,28 @@ tapectl collection add [OPTIONS] --tenant <TENANT> <NAME> <ROOT>
 
 **Arguments**
 
-- `<NAME>` — The collection's name. It begins every unit name the collection registers: NAME/FOLDER
+- `<NAME>` — The collection's name, which begins each unit's name: NAME/FOLDER
 - `<ROOT>` — The folder to walk: an absolute path
 
 **Options**
 
 - `--tenant <TENANT>` *(required)* — The tenant the collection's units are registered under
-- `--unit-depth <UNIT_DEPTH>` *(default: `1`)* — How deep the unit folders are: 1 = ROOT's own subfolders, 2 = theirs (show/season)
-- `--exclude <EXCLUDE>` — A folder or file name to leave out, as a glob (repeat it for several), e.g. '*.partial'
+- `--unit-depth <UNIT_DEPTH>` *(default: `1`)* — How deep the unit folders are: 1 = ROOT's subfolders, 2 = theirs
+  
+    2 is for a ROOT/show/season layout, where each season is a unit.
+- `--exclude <EXCLUDE>` — A folder or file name to leave out, as a glob, e.g. '*.partial'
+  
+    Repeat it for several.
 - `--archive-set <ARCHIVE_SET>` — The archive set the collection's units are registered in
-- `--no-dotfiles` — Write no .tapectl-unit.toml: each unit is known by its path, for a source tapectl must not write. A renamed folder then reads as a new unit, and the old one as missing
+- `--no-dotfiles` — Write no .tapectl-unit.toml: each unit is known by its path
+  
+    For a source tapectl must not write. A renamed folder then reads as a new unit, and the old one as missing.
 
 ### tapectl collection remove
 
-Take a collection out of config.toml; its units stay registered and untouched
+Take a collection out of config.toml; its units stay registered
 
-No sync walks its root after this, so none of its units is marked missing for it. They stay ordinary units, with their versions, copies and staged sets: `tapectl unit list` names them.
+Its units stay untouched: no sync walks its root after this, so none of them is marked missing for it. They stay ordinary units, with their versions, copies and staged sets: `tapectl unit list` names them.
 
 ```text
 tapectl collection remove [OPTIONS] <NAME>
@@ -60,7 +68,9 @@ tapectl collection remove [OPTIONS] <NAME>
 
 ### tapectl collection sync
 
-Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts).
+Sync every collection: register new unit folders, follow moved ones
+
+Registers each new unit folder, resolves a moved or renamed one by its dotfile's uuid, and marks a vanished one `missing` (never deleted or retired: those are operator acts).
 
 A unit registered before 1.9.0 whose .tapectl-unit.toml was never written is completed: the file is written with the unit's own identity. A dry run makes every check the real run makes, so it refuses what the real run would.
 
@@ -72,11 +82,11 @@ tapectl collection sync [OPTIONS]
 
 **Options**
 
-- `-n, --dry-run` — Report what would change without mutating anything
+- `-n, --dry-run` — Report what would change without changing anything
 
 ### tapectl collection status
 
-Show each configured collection's pending, staged, under-copied and missing units
+Show each collection's pending, staged, under-copied and missing units
 
 Pending is a unit never archived or dirty (changed since its last version); staged is a version waiting in staging for a copy it is still owed, which `volume write` writes.
 
@@ -88,9 +98,9 @@ tapectl collection status [OPTIONS]
 
 ### tapectl collection plan
 
-Show the batch plan (alphabetical next-fit, §7) for every configured collection's pending units.
+Show how each collection's pending units pack into tapes
 
-A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes last in its batch, and the plan names the unit that spans onto the next cartridge. It is refused when it is larger than the staging area, or, on a drive that does not declare `post_warning_bytes`, larger than the room under the fill ceiling.
+The units are packed in name order, each tape filled until the next unit does not fit (next-fit): each batch is one tape's worth. A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes last in its batch, and the plan names the unit that spans onto the next cartridge. It is refused when it is larger than the staging area, or, on a drive that does not declare `post_warning_bytes`, larger than the room under the fill ceiling.
 
 The units already staged and still owed a copy are listed after the batches, with the command that writes them.
 
@@ -104,15 +114,25 @@ tapectl collection plan [OPTIONS]
 
 **Options**
 
-- `--copies <COPIES>` *(default: `2`)* — Copies to plan for — informational only (batches don't change; this scales the printed cartridge-count estimate)
-- `--generation <GENERATION>` — Plan against this media generation rather than the drive's own (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded, and with no drive configured the plan takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve)
-- `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
-- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
-- `--policy-aware` — Pack first the units a write would help: those whose audit finds too few copies or a required location with no copy (a never-archived unit always does). Each group stays in name order. Batch numbers then follow this order, so give `collection run` the same flag to run the batch reviewed here
+- `--copies <COPIES>` *(default: `2`)* — How many copies to count cartridges for (the batches stay the same)
+- `--generation <GENERATION>` — Plan for tapes of this generation (LTO-5, LTO-6) instead of the drive's
+  
+    E.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded, and with no drive configured the plan takes a drive's defaults (the 97% fill ceiling, the 50M end-of-tape reserve).
+- `--device <DEVICE>` — The configured drive to plan against, by its device path
+  
+    Only needed when more than one `[[backends.lto]]` is configured.
+- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction: `0.99` or `99%`
+  
+    For this command only. Overrides the drive's `fill_ceiling` (default 97%).
+- `--policy-aware` — Pack first the units a write would help (too few copies or places)
+  
+    Those whose audit finds too few copies or a required location with no copy (a never-archived unit always does). Each group stays in name order. Batch numbers then follow this order, so give `collection run` the same flag to run the batch reviewed here.
 
 ### tapectl collection run
 
-Execute one batch: stage every unit in it once, write one session to the destination label, then release the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies (ADR-0012 item 217). Ends with what the copy holds and the next copy's command. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action.
+Stage one batch of a collection and write it to one tape
+
+Stages every unit in the batch once, writes one session to the destination label, then releases the staging of each unit that copy brings to its copy floor (the larger of its policy's `min_copies` and the sum of its `copies_at` targets); a unit still short keeps its staging for the further copies. Ends with what the copy holds and the next copy's command. Runs one collection (unlike `sync`, `status` and `plan`, which sweep every configured collection), since a batch write is a real, one-shot tape action.
 
 A unit that spans cartridges is released slice by slice, each slice once it has its copies, and the run names the slices released and the slices kept for the next `volume write`.
 
@@ -126,19 +146,41 @@ tapectl collection run [OPTIONS] --label <LABEL> [NAME]
 
 **Arguments**
 
-- `[NAME]` — The collection to run. Defaults to the only configured collection; with several configured, name one
+- `[NAME]` — The collection to run (default: the only one configured)
+  
+    With several configured, name one.
 
 **Options**
 
-- `--batch <BATCH>` *(default: `0`)* — Which batch to execute (0 = first). Numbered against THIS run's own budget — the destination `--label` volumes' recorded capacity, not the drive's generation. This matches `collection plan`'s ordering only when `plan` was run (`--generation <GEN>`) for the generation those volumes were actually initialised as; otherwise the batch reviewed in `plan` is not necessarily batch N here
+- `--batch <BATCH>` *(default: `0`)* — Which batch to run (0 = the first)
+  
+    Numbered against THIS run's own budget — the destination volume's recorded capacity, not the drive's generation. This matches `collection plan`'s numbering only when `plan` was run (`--generation <GEN>`) for the generation that volume was actually initialised as; otherwise the batch reviewed in `plan` is not necessarily batch N here.
 - `--label <LABEL>` *(required)* — Destination volume label: exactly one, since a run writes one copy. tapectl drives no changer, so a second copy needs a human to swap cartridges, and a run has no point where that could happen: a second --label is refused. The volume is already initialized on its own cartridge, or --init initializes it first. For each further copy, swap in the next cartridge after this run finishes and run `tapectl volume write <NEW-LABEL> --init --full-confirm` against the same staged data
-- `--init` — Initialize the destination first: `volume init LABEL` on the blank cartridge in the drive, as `volume write --init` runs it (a cartridge with no barcode takes the label as its barcode). The batch is then packed against the capacity the init records. If the run stops after the init, the volume stays initialized and the run says what to run next
-- `--move-to <LOCATION>` — Once the copy is sealed and confirmed, move the tape (the volume and its cartridge) to this location, as `volume write --move-to` does. A location that does not exist is refused before anything is staged
-- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--prewrite-hash` — See `volume write --prewrite-hash`: full-hash every staged slice before the tape moves, for every copy this run writes
-- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
-- `--jobs <JOBS>` — How many of the batch's units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`, itself 1
-- `--full-confirm` — See `volume write --full-confirm`: read every copy this run writes back in full after sealing it
-- `--full-confirm-first` — Read the run's first copy back in full after sealing it and confirm the others quickly: the one full readback to have before the run releases staging. A run writes one copy today, so this reads back the same copy `--full-confirm` does
-- `--policy-aware` — Number the batches as `collection plan --policy-aware` does: the units a write would help (too few copies, a required location with no copy) are packed first
+- `--init` — Initialize the destination first, on the blank cartridge in the drive
+  
+    `volume init LABEL`, as `volume write --init` runs it (a cartridge with no barcode takes the label as its barcode). The batch is then packed against the capacity the init records. If the run stops after the init, the volume stays initialized and the run says what to run next.
+- `--move-to <LOCATION>` — Once sealed and confirmed, move the tape to this location
+  
+    The volume and its cartridge, as `volume write --move-to` moves them. A location that does not exist is refused before anything is staged.
+- `--device <DEVICE>` — The tape drive, by its by-id path
+  
+    Defaults to the only configured drive; required when more than one is configured.
+- `--prewrite-hash` — Hash every staged slice in full before the tape moves
+  
+    As `volume write --prewrite-hash`, for every copy this run writes.
+- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction: `0.99` or `99%`
+  
+    For this command only. Overrides the drive's `fill_ceiling` (default 97%).
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16; default `[staging] jobs`)
+  
+    As `stage create --jobs`; `[staging] jobs` is itself 1 by default.
+- `--full-confirm` — Read every copy this run writes back in full after sealing it
+  
+    As `volume write --full-confirm`.
+- `--full-confirm-first` — Read the run's first copy back in full, the others quickly
+  
+    The one full readback to have before the run releases staging. A run writes one copy today, so this reads back the same copy `--full-confirm` does.
+- `--policy-aware` — Number the batches as `collection plan --policy-aware` does
+  
+    The units a write would help (too few copies, a required location with no copy) are packed first.
 

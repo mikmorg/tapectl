@@ -9,57 +9,53 @@ tapectl\-restore\-volume \- Restore several units from one volume in one pass ov
 Restore several units from one volume in one pass over the tape
 .PP
 The disaster\-recovery path: the drive is opened and rewound once and the units are read in the order they lie on the tape, each into its own directory, `DIR/<unit name>`. Each unit\*(Aqs newest version on the volume is restored (use `restore unit \-\-version` for an older one). One unit\*(Aqs failure does not stop the others (unless \-\-fail\-fast); the command fails if any unit was not restored
+.PP
+Exit status: 0 = every unit restored; 2 = a unit not restored, an error or a refusal; 75 = the catalog was busy.
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-to\fR \fI<DIR>\fR
+Destination directory: each unit is restored into `DIR/<unit name>`.
+
 Destination directory: each unit is restored into `DIR/<unit name>`, which must be empty or new
 .TP
 \fB\-\-unit\fR \fI<NAME>\fR
-A unit to restore; repeat for several. Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out; so is a unit of which the tape holds only a range (a version held across cartridges), with the `restore unit` that reads it. A unit named that the tape does not hold whole is refused before the drive is opened
+A unit to restore; repeat for several.
+
+Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out; so is a unit of which the tape holds only a range (a version held across cartridges), with the `restore unit` that reads it. A unit named that the tape does not hold whole is refused before the drive is opened
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
+Where each unit\*(Aqs scratch directory is made (default: inside its own directory).
+
 Where each unit\*(Aqs scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit\*(Aqs own directory, never the system temp directory
 .TP
 \fB\-\-overwrite\fR
-Restore into unit directories that already hold files, replacing any that collide. Without it a unit directory that is not empty is refused before the tape is touched
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Restore into unit directories that already hold files, replacing any that collide.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+Without it a unit directory that is not empty is refused before the tape is touched
 .TP
 \fB\-\-no\-space\-check\fR
+Skip the free\-space check of the whole set.
+
 Skip the free\-space check of the whole set (every restored unit, plus the largest unit\*(Aqs spooled slices)
 .TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
 \fB\-\-spool\fR
+Spool every unit\*(Aqs slices to the scratch directory instead of streaming them.
+
 Spool every unit\*(Aqs slices to the scratch directory instead of streaming them into dar (see `restore unit \-\-spool`)
 .TP
 \fB\-\-fail\-fast\fR
-Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
+Stop at the first unit that fails; the units after it are not attempted.
+
+Without it every unit is tried
 .TP
 \fB\-\-key\fR \fI<FILE>\fR
+An age identity file (a secret key) to decrypt with, in this command only.
+
 An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in this command only; repeat for several. It is added to the home\*(Aqs own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild \-\-from\-volume \-\-key`. A file that is not an identity is refused, naming it, before the drive is opened
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
@@ -69,4 +65,39 @@ Show what would be restored, unit by unit in tape order, without opening the dri
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 [\fILABEL\fR]
-Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive
+Volume label.
+
+Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

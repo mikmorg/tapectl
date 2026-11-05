@@ -4,7 +4,9 @@
 
 [All commands](README.md)
 
-Generate shell completions
+Print a shell completion script
+
+`tapectl completions bash` prints the script bash-completion loads; scripts/install-systemd.sh installs it for `tapectl` and `tapectl-op`.
 
 ```text
 tapectl completions [OPTIONS] <SHELL>

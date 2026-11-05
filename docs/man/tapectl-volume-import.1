@@ -9,51 +9,68 @@ tapectl\-volume\-import \- Record a pre\-existing volume in the catalog
 Record a pre\-existing volume in the catalog
 .PP
 Writes a catalog row for a tape this catalog has never seen and never touches the drive. For a tape tapectl wrote, `catalog rebuild \-\-from\-volume` reads what is on it instead.
+.PP
+Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
 .SH OPTIONS
 .TP
 \fB\-\-generation\fR \fI<GENERATION>\fR
 Media generation (e.g., LTO\-6, LTO\-7, LTO\-7\-M8, LTO\-8)
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-capacity\fR \fI<CAPACITY>\fR
-Capacity (e.g., "2500G"). Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
+Capacity (e.g., "2500G").
+
+Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR\-0012) — not the binary unit `slice_size`/`enospc_buffer` use.
 
 Defaults to the generation table\*(Aqs native capacity for `\-\-generation` when omitted (ADR\-0010, decision 3).
 .TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Which configured drive this volume belongs to, by its device path (ADR\-0010). Only needed when more than one drive is configured; with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no configured drive claims is not an error
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Which configured drive this volume belongs to, by its device path (ADR\-0010).
+
+Only needed when more than one drive is configured; with one drive, or none, the behaviour is unchanged. Resolved leniently: this command only writes a catalog row and never touches the device, so a path no configured drive claims is not an error.
 .TP
 \fB\-\-notes\fR \fI<NOTES>\fR
 Notes
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fILABEL\fR>
 Volume label
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.

@@ -12,45 +12,60 @@ tapectl drives no changer and never loads a cartridge, so cleaning is you insert
 .PP
 Which cleaning cartridge: `\-\-cartridge SERIAL`, or, without it, the one in the drive if its chip names a registered cleaning cartridge (read through the SCSI generic node; nothing moves, and nothing is sent while a tapectl command holds the drive). With neither, the cleaning is recorded against the drive alone and no cartridge\*(Aqs use is counted. Register a cleaning cartridge first with `drive cleaning\-cartridge add`.
 .PP
-Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at or past its rated life (a spent cartridge does not clean; replace it). A cartridge near its rated life is a warning with exit 0. Exit 2: not recorded — the drive gave no serial to record against, or the named cartridge is not registered.
-.PP
 The chip read that identifies the cartridge in the drive is kept whole in the MAM journal (`cartridge journal`), against no contact.
 .PP
 `\-\-dry\-run` reports what would be recorded and records nothing. With `\-\-json` the whole of stdout is one JSON object.
+.PP
+Exit status: 0 = recorded (a cartridge near its rated life is a warning with exit 0); 1 = recorded, and the cleaning cartridge is at or past its rated life (a spent cartridge does not clean; replace it); 2 = not recorded, the drive gave no serial to record against or the named cartridge is not registered.
 .SH OPTIONS
 .TP
 \fB\-\-cartridge\fR \fI<CARTRIDGE>\fR
-The cleaning cartridge used, by the serial it was registered under (`drive cleaning\-cartridge add`)
-.TP
-\fB\-\-json\fR
-Output in JSON format
+The cleaning cartridge used, by its registered serial
+
+The serial it was registered under (`drive cleaning\-cartridge add`).
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-The drive that was cleaned, by its tape node path as configured (`[[backends.lto]].device_tape`; a by\-id link). Defaults to the only configured drive
+The drive cleaned, by its tape node (default: the only one)
+
+As configured (`[[backends.lto]].device_tape`; a by\-id link).
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
 .TP
 \fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
 .TP
 \fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Path to config file
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
 
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
-\fB\-h\fR, \fB\-\-help\fR
-Print help (see a summary with \*(Aq\-h\*(Aq)

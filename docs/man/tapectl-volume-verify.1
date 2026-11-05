@@ -2,11 +2,13 @@
 .el .ds Aq '
 .TH tapectl-volume-verify 1  "tapectl-volume-verify " 
 .SH NAME
-tapectl\-volume\-verify \- Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
+tapectl\-volume\-verify \- Verify volume contents via the keyless chain walk (seal \-> front index \-> content)
 .SH SYNOPSIS
 \fBtapectl volume verify\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-full\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-quick\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
-Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing).
+Verify volume contents via the keyless chain walk (seal \-> front index \-> content).
+.PP
+Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing).
 .PP
 A full verify that was stopped part\-way CONTINUES when run again: files the volume\*(Aqs latest readback (this command\*(Aqs or a write\*(Aqs `\-\-full\-confirm`) already read back clean are not read again, as long as the front index on the tape is the one they were checked against.
 .PP
@@ -16,43 +18,71 @@ Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BA
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
-\fB\-\-json\fR
-Output in JSON format
+Tape device (by\-id path).
+
+Defaults to the only configured drive; required when more than one is configured.
 .TP
 \fB\-\-full\fR
-Full integrity chain walk (default): hash every content file against the front index\*(Aqs ciphertext hashes
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+Full chain walk: hash every content file against the front index (the default).
+
+Full integrity chain walk (default): hash every content file against the front index\*(Aqs ciphertext hashes.
 .TP
 \fB\-\-quick\fR
-Quick navigable\-only chain walk: seal binding + front index self\-consistency, no per\-file content hashing
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+Quick chain walk: the seal binding and the front index only, no content hashing.
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+Quick navigable\-only chain walk: seal binding + front index self\-consistency, no per\-file content hashing.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 [\fILABEL\fR]
-Volume label. Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
+Volume label.
+
+Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+.SH EXAMPLES
+.nf
+  Read every file of a volume back (the periodic full verify):
+    tapectl volume verify L6\-0001
+  Verify whatever tape is loaded, named by its File 0:
+    tapectl volume verify
+  Check only the seal and the front index:
+    tapectl volume verify L6\-0001 \-\-quick
+.fi

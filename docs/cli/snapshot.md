@@ -12,16 +12,20 @@ tapectl snapshot [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`create`](#tapectl-snapshot-create) — Create a snapshot (fast directory walk + manifest)
-- [`list`](#tapectl-snapshot-list) — List snapshots
-- [`diff`](#tapectl-snapshot-diff) — Compare two snapshot versions of a unit
-- [`delete`](#tapectl-snapshot-delete) — Delete an unwritten snapshot
-- [`purge`](#tapectl-snapshot-purge) — Purge a reclaimable snapshot (remove DB records)
-- [`mark-reclaimable`](#tapectl-snapshot-mark-reclaimable) — Mark a snapshot as reclaimable (with enforced preconditions)
+- [`create`](#tapectl-snapshot-create) — Record what each unit holds now: a new version when its content changed
+- [`list`](#tapectl-snapshot-list) — List the snapshots, newest version first
+- [`diff`](#tapectl-snapshot-diff) — Show the files added, removed and changed between two versions
+- [`delete`](#tapectl-snapshot-delete) — Delete a snapshot no tape holds
+- [`purge`](#tapectl-snapshot-purge) — Remove a reclaimable snapshot's catalog records
+- [`mark-reclaimable`](#tapectl-snapshot-mark-reclaimable) — Mark a superseded version reclaimable, so compaction may drop it
 
 ### tapectl snapshot create
 
-Create a snapshot (fast directory walk + manifest)
+Record what each unit holds now: a new version when its content changed
+
+Walks each unit's directory and hashes its files; a unit unchanged since its newest version is reported and gets none. Each unit is walked and reported on its own: one that fails does not stop the others. Under --json, an array of one object per unit, printed only when every unit was snapshotted.
+
+Exit status: 0 = every unit snapshotted (or unchanged); 2 = a unit failed, each named, the others snapshotted.
 
 ```text
 tapectl snapshot create [OPTIONS] <NAME>...
@@ -29,11 +33,11 @@ tapectl snapshot create [OPTIONS] <NAME>...
 
 **Arguments**
 
-- `<NAME>` — Unit name(s). Each unit is walked and reported on its own: one that fails does not stop the others, and the command then exits with an error naming every unit that failed
+- `<NAME>` — The units to snapshot
 
 ### tapectl snapshot list
 
-List snapshots
+List the snapshots, newest version first
 
 ```text
 tapectl snapshot list [OPTIONS]
@@ -41,12 +45,14 @@ tapectl snapshot list [OPTIONS]
 
 **Options**
 
-- `--unit <UNIT>` — Filter by unit name
-- `--status <STATUS>` — Filter by status (created, staged, current, reclaimable, purged)
+- `--unit <UNIT>` — Only this unit's snapshots
+- `--status <STATUS>` — Only the snapshots of this status
+  
+    One of created, staged, current, reclaimable, purged.
 
 ### tapectl snapshot diff
 
-Compare two snapshot versions of a unit
+Show the files added, removed and changed between two versions
 
 ```text
 tapectl snapshot diff [OPTIONS] --v1 <V1> --v2 <V2> <NAME>
@@ -54,16 +60,18 @@ tapectl snapshot diff [OPTIONS] --v1 <V1> --v2 <V2> <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--v1 <V1>` *(required)* — First version number
-- `--v2 <V2>` *(required)* — Second version number
+- `--v1 <V1>` *(required)* — The first version
+- `--v2 <V2>` *(required)* — The second version
 
 ### tapectl snapshot delete
 
-Delete an unwritten snapshot
+Delete a snapshot no tape holds
+
+Refused for a version on tape (a completed write or a range), and for one with staged data unless --force.
 
 ```text
 tapectl snapshot delete [OPTIONS] --version <VERSION> <NAME>
@@ -71,16 +79,18 @@ tapectl snapshot delete [OPTIONS] --version <VERSION> <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--version <VERSION>` *(required)* — Snapshot version to delete
-- `--force` — Force delete even if staged (but not written)
+- `--version <VERSION>` *(required)* — The version to delete
+- `--force` — Delete it though it is staged: its staged data goes too
+  
+    Never deletes a version on tape.
 
 ### tapectl snapshot purge
 
-Purge a reclaimable snapshot (remove DB records)
+Remove a reclaimable snapshot's catalog records
 
 ```text
 tapectl snapshot purge [OPTIONS] --version <VERSION> <NAME>
@@ -88,15 +98,17 @@ tapectl snapshot purge [OPTIONS] --version <VERSION> <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--version <VERSION>` *(required)* — Snapshot version
+- `--version <VERSION>` *(required)* — The version, which must be reclaimable
 
 ### tapectl snapshot mark-reclaimable
 
-Mark a snapshot as reclaimable (with enforced preconditions)
+Mark a superseded version reclaimable, so compaction may drop it
+
+Refused while the version superseding it is short of its copy floor or a copy target, unless confirmed (--force, --yes, or a terminal's prompt); a version no current version supersedes only with --force.
 
 ```text
 tapectl snapshot mark-reclaimable [OPTIONS] --version <VERSION> <NAME>
@@ -104,10 +116,12 @@ tapectl snapshot mark-reclaimable [OPTIONS] --version <VERSION> <NAME>
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — The unit
 
 **Options**
 
-- `--version <VERSION>` *(required)* — Snapshot version
-- `--force` — Confirm in advance, as the global --yes does: mark the version even though the version superseding it is short of its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets) or of a copy target at a location of its copies_at map (an archive set's required_locations counts as one copy at each name); for a tape-only unit, the multiplied floors. Without either flag a terminal asks, and a non-interactive run refuses, naming the shortfall. Only --force (not --yes, not a prompt) marks a version no current version supersedes — that releases the unit's only current version
+- `--version <VERSION>` *(required)* — The version to mark
+- `--force` — Mark it though its successor is short, or nothing supersedes it
+  
+    Confirm in advance, as the global --yes does: mark the version even though the version superseding it is short of its copy floor (the larger of its policy's min_copies and the sum of its copies_at targets) or of a copy target at a location of its copies_at map (an archive set's required_locations counts as one copy at each name); for a tape-only unit, the multiplied floors. Without either flag a terminal asks, and a non-interactive run refuses, naming the shortfall. Only --force (not --yes, not a prompt) marks a version no current version supersedes — that releases the unit's only current version
 

@@ -9,42 +9,53 @@ tapectl \- Multi\-tenant archival storage management for LTO tape and exportable
 Multi\-tenant archival storage management for LTO tape and exportable encrypted directories
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
-
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
-.TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 \fB\-V\fR, \fB\-\-version\fR
 Print version
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .SH SUBCOMMANDS
 .TP
 tapectl\-init(1)
-Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it, or \-\-escrow\-public\-key to adopt an existing one instead of minting a new identity)
+Make a new archive: catalog, config, operator tenant, keys, escrow
 .TP
 tapectl\-tenant(1)
 Manage tenants
@@ -56,7 +67,7 @@ tapectl\-unit(1)
 Manage archival units
 .TP
 tapectl\-collection(1)
-Manage media collections (folder=unit factory + batch tape driver)
+Manage collections: folders of units, written in batches
 .TP
 tapectl\-snapshot(1)
 Manage snapshots
@@ -77,7 +88,7 @@ tapectl\-audit(1)
 Policy compliance audit
 .TP
 tapectl\-catalog(1)
-Browse and search file catalog
+Browse and search the file catalog
 .TP
 tapectl\-location(1)
 Manage storage locations
@@ -92,24 +103,59 @@ tapectl\-quick\-archive(1)
 Quick archive: create + stage + write in one flow
 .TP
 tapectl\-drive(1)
-The tape drive: declare one (`drive add`), what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
+The tape drive: add it, see what is loaded, eject, health, cleanings
 .TP
 tapectl\-db(1)
-Database operations
+Back up, check, export and inspect the catalog database
 .TP
 tapectl\-config(1)
-Configuration management
+Show, check, read and edit config.toml
 .TP
 tapectl\-host(1)
 This host\*(Aqs fitness to feed a tape drive (the quiet\-host check)
 .TP
 tapectl\-status(1)
-The home screen: the home and why it was chosen, what is running, the units by state, the volumes due a verify, and the next commands
+The home screen: the home, what is running, units by state, next steps
 .TP
 tapectl\-completions(1)
-Generate shell completions
+Print a shell completion script
 .TP
 tapectl\-help(1)
 Print this message or the help of the given subcommand(s)
+.SH "EXIT STATUS"
+Exit status: 0 = done; 2 = an error, a usage error included; 75 = the catalog was busy, run it again. A command with codes of its own (audit, host check, config check, db fsck, volume verify, cartridge erase, the commands that write a tape, the drive commands) names them in its own \-\-help, and the CLI reference has every code in one table.
+.TP
+\fB0\fR
+done: the command did what it was asked, or what it checks is clean (every command)
+.TP
+\fB1\fR
+done, with warnings: the work stands and something deserves a look (`audit` (warnings only); `host check` (something tripped); `db fsck` (problems found, repaired or not); `collection sync`, `status`, `plan` and `run` (an entry outside any unit, a folder refused, a unit marked missing or refused); `drive poll` (a TapeAlert or an unrecovered error); `drive cleaned` (the cleaning cartridge at or past its rated life); `unit check\-integrity` (a damaged or missing file))
+.TP
+\fB2\fR
+an error, a usage error included: nothing was decided (every command, except the meanings below)
+.TP
+\fB2\fR
+a verdict, not an error: at least one violation (`audit`); the medium proven bad and the volume quarantined (`volume verify`); the configuration invalid (`config check`); the database's integrity broken (`db fsck`); the catalog unreadable (`status`) (`audit`, `volume verify`, `config check`, `db fsck`, `status`)
+.TP
+\fB2\fR
+refused, the medium untouched (the commands that write a tape (`volume write`, `volume resume`, `volume rewrite`, `volume compact\-write`, `volume compact`, `collection run`, `quick\-archive`) and `cartridge erase`)
+.TP
+\fB3\fR
+inconclusive: no verdict about the medium, which is untouched; every error of `volume verify`, a usage error after `verify` included (`volume verify`; the commands that write a tape (sealed, the confirm inconclusive); `cartridge erase` (erased, the read\-back inconclusive))
+.TP
+\fB4\fR
+interrupted: `volume resume` continues the session (`cartridge erase`: the erase failed part\-way, run it again) (the commands that write a tape, `cartridge erase`)
+.TP
+\fB5\fR
+aborted: the session cannot resume, write the label again (the commands that write a tape)
+.TP
+\fB6\fR
+the medium proven bad: the volume is quarantined (`cartridge erase`: the read\-back contradicts the erase) (the commands that write a tape, `cartridge erase`)
+.TP
+\fB70\fR
+no verdict: the audit stopped on an error, a usage error after `audit` included (`audit`)
+.TP
+\fB75\fR
+busy: another tapectl process held the catalog (or the drive) too long; nothing changed, run it again (every command that opens the catalog, except `volume verify` (3); `drive poll` and `drive eject` when a command holds the drive)
 .SH VERSION
 v1.8.1

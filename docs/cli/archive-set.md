@@ -16,7 +16,7 @@ tapectl archive-set [OPTIONS] <COMMAND>
 - [`edit`](#tapectl-archive-set-edit) — Edit an existing archive set (flags left out are left unchanged)
 - [`list`](#tapectl-archive-set-list) — List archive sets
 - [`info`](#tapectl-archive-set-info) — Show archive set details
-- [`sync`](#tapectl-archive-set-sync) — Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names)
+- [`sync`](#tapectl-archive-set-sync) — Sync archive sets from config.toml's [[archive_sets]] tables
 
 ### tapectl archive-set create
 
@@ -32,20 +32,34 @@ tapectl archive-set create [OPTIONS] <NAME>
 
 **Options**
 
-- `--min-copies <MIN_COPIES>` — Minimum copy count
-- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated); each must be a registered location (`tapectl location add`)
-- `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
-- `--compression <COMPRESSION>` — Compression mode
-- `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "1G", the default)
-- `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
-- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
-- `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
-- `--preserve-acls <PRESERVE_ACLS>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false). No effect of its own: ACLs follow --preserve-xattrs
-- `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
-- `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
-- `--allow-spanning <ALLOW_SPANNING>` *(one of `true`, `false`)* — Let this set's units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
-- `--copies-at <NAME=N>` — Copies each unit should hold at a location, as NAME=N (repeatable, e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]"
+- `--min-copies <N>` — Minimum copy count
+- `--required-locations <LIST>` — Required locations, comma-separated
+  
+    Each must be a registered location (`tapectl location add`).
+- `--encrypt <BOOL>` *(one of `true`, `false`)* — Encryption enabled (true/false)
+- `--compression <MODE>` — Compression mode
+- `--checksum-mode <MODE>` — Checksum mode
+- `--slice-size <SIZE>` — Slice size, e.g. "1G" (the default)
+- `--verify-interval-days <DAYS>` — Verify interval in days
+- `--warehouse-copies <N>` — Warehouse copies expected (ADR-0006)
+  
+    Never set means "defer to the system default".
+- `--preserve-xattrs <BOOL>` *(one of `true`, `false`)* — Keep extended attributes (true/false)
+  
+    And the POSIX ACLs stored as them; false drops them all.
+- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false; with --preserve-xattrs)
+  
+    No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
+- `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
+- `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
+  
+    Not read yet: dirty detection compares path, size and mtime only.
+- `--allow-spanning <BOOL>` *(one of `true`, `false`)* — Units may span tapes by their slices (true/false)
+  
+    From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
+- `--copies-at <NAME=N>` — Copies at a location, NAME=N (repeatable)
+  
+    E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]".
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set edit
@@ -62,20 +76,34 @@ tapectl archive-set edit [OPTIONS] <NAME>
 
 **Options**
 
-- `--min-copies <MIN_COPIES>` — Minimum copy count
-- `--required-locations <REQUIRED_LOCATIONS>` — Required locations (comma-separated); each must be a registered location (`tapectl location add`)
-- `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
-- `--compression <COMPRESSION>` — Compression mode
-- `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "1G", the default)
-- `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
-- `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
-- `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
-- `--preserve-acls <PRESERVE_ACLS>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false). No effect of its own: ACLs follow --preserve-xattrs
-- `--preserve-fsa <PRESERVE_FSA>` *(one of `true`, `false`)* — Keep filesystem-specific attributes such as chattr flags (true/false)
-- `--dirty-on-metadata-change <DIRTY_ON_METADATA_CHANGE>` *(one of `true`, `false`)* — Treat a metadata-only change as making a unit dirty (true/false). Not read yet: dirty detection compares path, size and mtime only
-- `--allow-spanning <ALLOW_SPANNING>` *(one of `true`, `false`)* — Let this set's units span tapes by their slices (true/false; from tapectl 1.7.0). Never set means "defer to [defaults]", which is off
-- `--copies-at <NAME=N>` — Copies each unit should hold at a location, as NAME=N (repeatable, e.g. --copies-at home=1 --copies-at offsite=1); each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]"
+- `--min-copies <N>` — Minimum copy count
+- `--required-locations <LIST>` — Required locations, comma-separated
+  
+    Each must be a registered location (`tapectl location add`).
+- `--encrypt <BOOL>` *(one of `true`, `false`)* — Encryption enabled (true/false)
+- `--compression <MODE>` — Compression mode
+- `--checksum-mode <MODE>` — Checksum mode
+- `--slice-size <SIZE>` — Slice size, e.g. "1G" (the default)
+- `--verify-interval-days <DAYS>` — Verify interval in days
+- `--warehouse-copies <N>` — Warehouse copies expected (ADR-0006)
+  
+    Never set means "defer to the system default".
+- `--preserve-xattrs <BOOL>` *(one of `true`, `false`)* — Keep extended attributes (true/false)
+  
+    And the POSIX ACLs stored as them; false drops them all.
+- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false; with --preserve-xattrs)
+  
+    No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
+- `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
+- `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
+  
+    Not read yet: dirty detection compares path, size and mtime only.
+- `--allow-spanning <BOOL>` *(one of `true`, `false`)* — Units may span tapes by their slices (true/false)
+  
+    From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
+- `--copies-at <NAME=N>` — Copies at a location, NAME=N (repeatable)
+  
+    E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]".
 - `-d, --description <DESCRIPTION>` — Description
 
 ### tapectl archive-set list
@@ -100,7 +128,9 @@ tapectl archive-set info [OPTIONS] <NAME>
 
 ### tapectl archive-set sync
 
-Sync archive sets from config.toml (writes only the keys each [[archive_sets]] table names)
+Sync archive sets from config.toml's [[archive_sets]] tables
+
+Writes only the keys each [[archive_sets]] table names.
 
 ```text
 tapectl archive-set sync [OPTIONS]

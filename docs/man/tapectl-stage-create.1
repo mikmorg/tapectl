@@ -2,50 +2,69 @@
 .el .ds Aq '
 .TH tapectl-stage-create 1  "tapectl-stage-create " 
 .SH NAME
-tapectl\-stage\-create \- Create staged slices (validate → dar → encrypt → checksums)
+tapectl\-stage\-create \- Archive and encrypt each unit\*(Aqs newest snapshot into staging
 .SH SYNOPSIS
 \fBtapectl stage create\fR [\fB\-\-json\fR] [\fB\-\-version\fR] [\fB\-\-jobs\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
 .SH DESCRIPTION
-Create staged slices (validate → dar → encrypt → checksums)
+Archive and encrypt each unit\*(Aqs newest snapshot into staging
 .PP
-Several units may be named; `\-\-jobs` stages that many at once.
+Each unit\*(Aqs sources are hashed as dar reads them once, and dar\*(Aqs archive is cut into slices and age\-encrypted in memory: no plaintext reaches staging. Several units may be named; `\-\-jobs` stages that many at once. Every name is checked before any unit is staged. Under \-\-json, an array of one object per unit, printed only when every unit was staged.
+.PP
+Exit status: 0 = every unit staged; 2 = a unit failed or was refused (the error names each unit staged, failed and not started).
 .SH OPTIONS
 .TP
-\fB\-\-json\fR
-Output in JSON format
-.TP
 \fB\-\-version\fR \fI<VERSION>\fR
-Re\-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl stage clean \-\-unit <name> \-\-version <N>` already released that stage set\*(Aqs slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `stage clean \-\-unit <name> \-\-version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape\-only unit); add `\-\-force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor
+Stage this version again, after `stage clean` released it
+
+Re\-stage a specific snapshot version instead of the latest unstaged one — for when `tapectl stage clean \-\-unit <name> \-\-version <N>` already released that stage set\*(Aqs slices and another copy is wanted. Refuses if a stage set for that version already has live slices; use `volume write` to consume them, or `stage clean \-\-unit <name> \-\-version <N>` to release them first. A plain clean releases it only when it already has a completed write AND the unit is not currently below its copy floor (the larger of its policy\*(Aqs min_copies and the sum of its copies_at targets, times [compaction] tape_only_safety_multiplier for a tape\-only unit); add `\-\-force` otherwise — including for a stage set that was never written anywhere, which a plain clean leaves untouched regardless of the copy floor.
 .TP
 \fB\-\-jobs\fR \fI<JOBS>\fR
-How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host\*(Aqs available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
-.TP
-\fB\-n\fR, \fB\-\-dry\-run\fR
-Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
-.TP
-\fB\-v\fR, \fB\-\-verbose\fR
-Enable verbose output
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
-.TP
-\fB\-y\fR, \fB\-\-yes\fR
-Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
-.TP
-\fB\-\-config\fR \fI<CONFIG>\fR
-Path to config file.
+How many units to stage at once (1 to 16; default `[staging] jobs`)
 
-NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
-.TP
-\fB\-\-home\fR \fI<HOME>\fR
-tapectl home directory: database, keys, catalogs, stage\-reports, logs.
-
-The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
-
-As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+`[staging] jobs` is itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host\*(Aqs available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache).
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fINAME\fR>
-Unit name(s). Each unit\*(Aqs latest unstaged snapshot is staged (or `\-\-version`\*(Aqs, with one unit). Every name is checked before any unit is staged
+The units to stage: each one\*(Aqs newest unstaged snapshot
+
+With one unit, `\-\-version` stages that version instead.
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
