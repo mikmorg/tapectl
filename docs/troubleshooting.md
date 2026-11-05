@@ -41,7 +41,7 @@ A few conventions:
 - [Verifying a volume](#verifying-a-volume)
 - [Restoring](#restoring)
 - [Audit findings](#audit-findings)
-- [`status` counts stage sets held in staging](#status-counts-stage-sets-held-in-staging)
+- [What staging holds: `status` and `stage list`](#what-staging-holds-status-and-stage-list)
 - [first-run.sh stopped](#first-runsh-stopped)
 - [Related pages](#related-pages)
 
@@ -49,23 +49,37 @@ A few conventions:
 
 ## Exit codes
 
-Any command that fails prints `error: <message>` on stderr and exits **2**.
-There are five exceptions. `volume verify` exits **3** on every error
-([below](#volume-verify-0-2-or-3)), and `audit` exits **70**
-([below](#audit-0-1-2-or-70)). The commands that write a tape — `volume
-write`, `volume resume`, `collection run`, `quick-archive`, `volume
-compact-write` and `volume compact` — share one table, and exit **2** only
-when nothing was written ([below](#the-write-family-0-2-3-4-5-6-or-75)).
-`cartridge erase` has a table in the same style
-([below](#cartridge-erase-0-2-3-4-6-or-75)). A
-**busy catalog** exits **75** ([below](#75-catalog-busy)). When one failure
-caused another, the
-message is the whole chain, joined by `: `. For example, a bad config file
-prints:
+Every code tapectl exits with, and the commands that use each, is in one table,
+generated from the binary itself: the command reference's
+[exit codes](cli/README.md#exit-codes). Each command's own `--help` names the codes
+it uses. This section does not repeat that table. It says what to do after the
+codes that need more than "read the error and run the command again": a busy
+catalog, the write family, `audit`, `volume verify` and `cartridge erase`.
+
+A command that fails prints `error: <message>` on stderr. When one failure
+caused another, the message is the whole chain, joined by `: `. For example, a
+bad config file prints:
 
 ```text
 error: failed to load config: configuration error: <path>/config.toml: TOML parse error at line 68, column 1
 ```
+
+Under `--json`, every error is also one JSON document on stdout, with the
+message and the exit code, and the `error:` line still goes to stderr, so a
+script that reads either keeps working (1.9.0):
+
+```text
+$ tapectl --json volume info NOPE
+{
+  "error": "volume not found: NOPE",
+  "exit_code": 2
+}
+error: volume not found: NOPE
+```
+
+`status --json` is the one exception: when it cannot read the
+catalog, its own document carries `error` and `exit_code` beside the home and the
+running sessions, and nothing goes to stderr.
 
 A mistyped command or flag (clap's usage error) also exits 2, with two
 exceptions: when the parse has already reached `volume verify`, an error in
@@ -75,23 +89,8 @@ with `--quick`, and a flag with no value. An error that comes before `verify`
 is an ordinary usage error and still exits 2: a mistyped subcommand such as
 `volume verfy` or `audt`, or an unknown flag in front of `verify`
 (`tapectl --hme <dir> volume verify <label>`,
-`tapectl volume --bogus verify <label>`). `--help` exits 0 everywhere.
-
-A few commands finish their work and then report a verdict through the exit code:
-
-| Command | 0 | 1 | 2 |
-|---|---|---|---|
-| [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation, and nothing else: an error exits 70 ([below](#audit-0-1-2-or-70)) |
-| [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
-| [`drive poll`](cli/drive.md#tapectl-drive-poll) | recorded; the drive reported nothing | recorded; the drive raised a TapeAlert or reported an unrecovered error (named) | no reading: no log page could be read, no drive is configured, or the catalog refuses writes (or an error); or a reading the catalog could not record, named and printed. **75**: a tapectl command holds the drive, or another is writing the catalog; nothing was read |
-| [`drive eject`](cli/drive.md#tapectl-drive-eject) | unloaded and recorded, or no cartridge was loaded | never used | not unloaded: the tape node could not be read, a cartridge is present and the drive is not ready, or the unload failed. **75**: a tapectl command holds the drive or a volume, or another process has the tape node open; nothing was sent |
-| [`drive cleaned`](cli/drive.md#tapectl-drive-cleaned) | recorded | recorded, and the cleaning cartridge is at or past its rated life | not recorded: the drive gave no serial, or the named cleaning cartridge is not registered |
-| [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
-| [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
-| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed (or, under `--policy-aware`, holds a `[policy]` value that does not resolve), or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error (`run`: see [the write family's table](#the-write-family-0-2-3-4-5-6-or-75)) |
-
-Apart from `volume verify`, `audit`, the write family, `cartridge erase` and a
-busy catalog, every other command exits 0 on success and 2 on error.
+`tapectl volume --bogus verify <label>`). `--help` exits 0 everywhere. A
+spelling 1.9.0 renamed exits 2 too ([below](#tapectl-old-was-renamed-in-190-use-tapectl-new)).
 
 ### 75: catalog busy
 
@@ -136,7 +135,7 @@ are left as, so a script knows what to do next without parsing the message:
 | 0 | **sealed and confirmed** | nothing (`collection run` exits 1 instead when it also refused a unit, [above](#exit-codes)) |
 | 2 | an error, **the medium untouched**: refused before anything was written, or a usage error. That covers an unknown label or one that is not a write target, the wrong cartridge (the File 0 check), an empty drive, a drive that cannot write the medium, a layout over the fill ceiling, the quiet-host pre-flight, `--dry-run`, a resume whose revalidation failed or whose File 0 would not read, a stage that failed before the write (`collection run`, `quick-archive`), and a signal before the tape moved (`--prewrite-hash`'s full hash, a stage). A session that existed before the command is left as it was. With `volume write --init`, a refusal only the tape contact can raise (the capacity gate, the quiet-host question) exits 2 although the cartridge was initialised: stderr says the volume stays initialized, and `--json` carries `"initialized": true` and `"volume_status": "initialized"`; run `tapectl volume write L` without `--init`. A refusal the catalog alone can raise (nothing staged, a staged slice missing, a tenant without a key, no escrow) comes before the cartridge is touched and leaves no volume (#445) | read the `error:` line, fix it, run the command again |
 | 3 | **confirm inconclusive**: the seal is on the tape and recorded, and the readback after it reached no verdict (a read or transport failure, as `volume verify`'s 3) | check the drive, reload the same cartridge, `tapectl volume resume <label>` re-enters the confirm |
-| 4 | **interrupted**: a signal, or a drive, staging-disk or catalog error, stopped the session part-way (writing, sealing, or a full confirm stopped by a signal). The tape is left as the session left it | fix the cause, reload the same cartridge, `tapectl volume resume <label>` (with `--full-confirm` when the message says so) |
+| 4 | **interrupted**: a signal, or a drive, staging-disk or catalog error, stopped the session part-way (writing, sealing, or a full confirm stopped by a signal). The tape is left as the session left it | fix the cause, reload the same cartridge, `tapectl volume resume <label>`: from 1.9.0 it keeps what the write asked for (`--full-confirm`, `--move-to`, `--keep-staging`, …) and says so |
 | 5 | **aborted**: the session cannot resume — the medium ran out (end of tape) or a staged slice changed while it was written. The tape is left unsealed | write the label again with `tapectl volume write <label>` once the cause is fixed (a full tape needs a smaller batch or another cartridge) |
 | 6 | **the medium proven bad**: the confirm, or a resume's contact check, found the tape is not what was written; the volume is quarantined and no longer counts as a copy | write the data to another cartridge |
 | 75 | the catalog was busy before anything was written ([above](#75-catalog-busy)) | run the command again once the other one has finished |
@@ -358,14 +357,79 @@ required location(s) <names> (policy requires <list>)` or `superseding v<n> in
 ### `tapectl is not initialized`
 
 ```text
-error: tapectl is not initialized — run `tapectl init` first
+error: tapectl is not initialized at /srv/tapectl: there is no catalog /srv/tapectl/tapectl.db there. The home
+was chosen because TAPECTL_HOME named it. TAPECTL_HOME is set, so the archive is meant to be there already:
+check that it names the directory holding tapectl.db.
 ```
 
-tapectl found no home at the resolved location: `--home`, then
-`TAPECTL_HOME`, then `~/.tapectl`. Either this really is a new machine (run
-[`tapectl init`](cli/init.md#tapectl-init)), or you are running as the wrong
-user or with the wrong home. On a first-run install the archive belongs to the
-service user, so use `tapectl-op`.
+tapectl found no catalog in the home it resolved. The message names that home
+and the rule that chose it: `--home`, `TAPECTL_HOME`, the directory of
+`--config`, this account's `~/.tapectl`, the home pointer `/etc/tapectl/home`, or
+the default `~/.tapectl` ([configuration.md](configuration.md#where-the-configuration-lives)).
+Its last sentence says what to do:
+
+- **`To start a new archive there: tapectl init.`** Nothing named a home and
+  the host has no home pointer, so this looks like a new machine: run
+  [`tapectl init`](cli/init.md#tapectl-init) if it is one.
+- **`TAPECTL_HOME is set, so the archive is meant to be there already`**, or
+  **`This host has a home pointer (…), so its archive is meant to exist
+  already`**: tapectl offers no `init`, because one would make a second archive
+  beside the real one. Check the variable or the pointer, or run the command as
+  the service user (`tapectl-op <command>`): on a first-run install the archive
+  belongs to it.
+
+An account that cannot see into the home at all is told so instead
+(`cannot reach the catalog … permission denied. The home belongs to another
+account …`). `tapectl status` shows the home in use and its rule even then.
+
+### `refusing to run as root`
+
+```text
+error: refusing to run as root: the home pointer /etc/tapectl/home names this host's tapectl home
+(/srv/archive_meta/tapectl/home), which belongs to the service user, and as root tapectl would open
+/root/.tapectl instead. Run it as the service user: tapectl-op <command>, e.g. `tapectl-op status`. To act on a
+home as root on purpose, name it with --home <dir> or TAPECTL_HOME.
+```
+
+From 1.9.0, on a host with a home pointer, root is refused unless `--home` or
+`TAPECTL_HOME` names the home: as root the pointer is never read, so the command
+would otherwise open an archive nobody chose. Use `tapectl-op`. `host check`,
+`--help`, `--version` and `completions` still run.
+
+### `` `tapectl <old>` was renamed in 1.9.0: use `tapectl <new>` ``
+
+```text
+error: `tapectl staging clean` was renamed in 1.9.0: use `tapectl stage clean`
+```
+
+1.9.0 renamed some commands and flags, and the old spellings are refused by
+name, with exit 2 and nothing done, however they are typed: as a command, with
+`--help`, through `tapectl help <old>`, or as a bare old group. Type the new
+spelling the message names. The full list is in the
+[1.9.0 release notes](releases/1.9.0.md). Under `--json` the refusal is the JSON
+error document ([Exit codes](#exit-codes)). A script written for 1.8 fails
+loudly here, never quietly: change its spelling.
+
+The three commands every tape's File 1 prints work for good: `init --operator
+… --escrow-public-key …`, `catalog rebuild --from-volume --device … --key …` and
+`restore unit --unit … --device … --to … --key …`.
+
+`config add collections` and `config remove 'collections[…]'` are refused the
+same way, pointing at `collection add` and `collection remove`.
+
+### What is this key set to?
+
+[`config get`](cli/config.md#tapectl-config-get) prints the value in force and
+where it comes from: the file, a default, or derived (a drive's `device_sg`):
+
+```text
+$ tapectl config get verify_interval_days
+defaults.verify_interval_days = 365  # set in ~/.tapectl/config.toml
+```
+
+A bare key names the one key of that name, and with one drive configured
+`post_warning_bytes` names that drive's
+([configuration.md](configuration.md#editing-from-the-command-line-config-get-set-add-remove)).
 
 ### `init: --operator is required when run as a system account`
 
@@ -507,19 +571,24 @@ See [configuration.md](configuration.md#archive_sets).
 ### No drive configured
 
 ```text
-error: configuration error: no LTO backend configured — tapectl does not know what tape drive to use.
-
-Add a [[backends.lto]] section to your tapectl config (by default ~/.tapectl/config.toml):
-...
-`tapectl init` leaves a commented-out example there to uncomment.
+error: configuration error: no LTO drive configured — tapectl does not know what tape drive to use. Add it with
+`tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6` (`ls -l
+/dev/tape/by-id/` lists the drives), which writes its [[backends.lto]] table to ~/.tapectl/config.toml; the
+commented example `tapectl init` left there is the same table by hand
 ```
 
 Every write path (`volume init`, `volume write`, `volume resume`,
-`collection run`) needs a `[[backends.lto]]` entry, and so do the planners,
-`volume plan` and `collection plan`, even with `--generation` (`volume plan`
-prints its plan first and then fails). Uncomment the example
-`init` left in config.toml, or add one with
-[`tapectl drive add`](cli/drive.md#tapectl-drive-add).
+`collection run`) needs a `[[backends.lto]]` entry. Add one with
+[`tapectl drive add`](cli/drive.md#tapectl-drive-add), or uncomment the example
+`init` left in the config file the message names. `config check` says the same
+in a `note:` line before any write.
+
+The planners need none (1.9.0): `volume plan` and `collection plan` read a
+configured drive's keys without opening it, so a drive that is not attached
+plans, and with no drive at all `--generation` stands in for one. Without
+either, `collection plan` refuses naming `--generation` and `drive add`, and
+`volume plan` prints its plan with `estimated tapes: not estimated: …` and
+exits 0.
 
 That message appears only when you leave out `--device`. With `--device`,
 tapectl instead reports that no backend has the path you named, and
@@ -533,12 +602,18 @@ The fix is the same: add the backend.
 
 Read paths (`volume identify`, `volume verify`, `restore`, `catalog rebuild`)
 work without a backend as long as you pass `--device`. This is deliberate, so
-a rebuilt machine holding only keys can still read its tapes.
+a rebuilt machine holding only keys can still read its tapes. Without
+`--device` they say so:
+
+```text
+error: configuration error: no drive configured in ~/.tapectl/config.toml and no --device given: name the drive
+with --device /dev/tape/by-id/<drive>-nst, or add it with `tapectl drive add`
+```
 
 ### Several drives: `pass --device to select one`
 
 ```text
-error: configuration error: multiple LTO backends configured (<name>, <name>); pass --device to select one
+error: configuration error: multiple LTO drives configured (<name>, <name>); pass --device to select one
 ```
 
 When exactly one drive is configured, `--device` defaults to it. When there
@@ -701,18 +776,27 @@ the message shows, `--alias family-primary`, is refused too, as `not
 
 ### `db backup refuses: …`
 
-[`db backup`](cli/db.md#tapectl-db-backup) writes to exactly the file `--to`
-names, and creates no directories. It refuses, before it opens anything and
-under `--dry-run` too:
+[`db backup`](cli/db.md#tapectl-db-backup) takes one path: a file to write, or
+an existing directory, where it writes `tapectl-YYYYmmddTHHMMSSZ.db` (the
+scheduled backup's name). It creates no directories and never overwrites a file
+(1.9.0). It refuses, before it opens anything and under `--dry-run` too:
 
 ```text
 error: db backup refuses: the destination directory <dir> does not exist — create it, or mount the medium it
 lives on, and run again (db backup does not create directories)
-error: db backup refuses: --to <path> is a directory; --to names the backup FILE, e.g. <path>/tapectl.db
-error: db backup refuses: <dir> is not a directory, so --to <path> cannot be written
-error: db backup refuses: --to <path> ends in .keys, which is exactly where --include-keys puts the private-key
-directory — the database file and the key directory would be the same path; give --to another extension, e.g. .db
+error: db backup refuses: <path> exists: name another file (a backup never overwrites one), or a directory, where
+it gets a dated name
+error: db backup refuses: <dir> is not a directory, so <path> cannot be written
+error: db backup refuses: <path> ends in .keys, which is exactly where --include-keys puts the private-key
+directory — the database file and the key directory would be the same path; give the backup file another
+extension, e.g. .db
 ```
+
+An existing file is a backup taken before: name a new file, or name the
+directory and let it take a dated name. Two backups into one directory in the
+same second meet the same refusal; run it again a second later. `db backup --to
+<path>`, the spelling before 1.9.0, is refused by name
+([renamed](#tapectl-old-was-renamed-in-190-use-tapectl-new)).
 
 A missing directory is usually a backup disk that is not mounted. With
 `--include-keys`, the private keys go beside the file, with its extension
@@ -1178,6 +1262,24 @@ you archive the new contents, compare the file against a copy you trust.
 and names that version, so a file you edited on purpose since an older
 version is not reported.
 
+From 1.9.0 it tells an edit from damage by the file's modified time. A file
+whose content differs at its recorded size is `CHANGED` when its modified time
+moved since the snapshot (an edit), and `BITROT` only when it did not:
+
+```text
+integrity check for "family/photos" against v1's checksums:
+  OK:            1
+  BITROT:        1
+    p.jpg — BITROT
+```
+
+It exits 1 when a file is `BITROT`, `MISSING` or a `SIZE_MISMATCH`, and 0 when
+every file matches. A check that finds only `CHANGED` files exits 0 and ends
+with a note naming the snapshot that would archive them (`1 file changed since
+the snapshot (v1): tapectl snapshot create family/letters archives it`). A
+version recorded with no modified times cannot tell the two apart: its report
+says `CHANGED or BITROT (no mtime recorded)` and counts the file with `BITROT`.
+
 ### The stage would not archive what the snapshot lists (1.1.2)
 
 Three refusals and one warning keep the catalogue and the tape saying the same
@@ -1478,18 +1580,45 @@ keeps this refusal.
 ```text
 error: refusing to write volume "<label>": the loaded cartridge already carries a SEALED volume — a valid seal
 marker parses at tape position <n>. ADR-0003: sealed volumes are immutable, there is no append, and --force
-cannot override this. If this cartridge should be reused: retire its current volume if this catalog holds it
-(`tapectl volume retire <label>`), then `tapectl cartridge erase`, which erases the tape in the drive, reads it
-back and records it — or erase the tape in the drive (a long erase, `mt -f <device> erase`, takes hours on real
-LTO; a filemark at its start, `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds, and `volume init` then
-needs `--force` unless `tapectl cartridge erase` did it) yourself and run `tapectl cartridge mark-erased` before writing to it again. Never degauss
-or bulk-erase an LTO cartridge: that destroys its factory servo tracks, and the cartridge with them.
+cannot override this. <the way on>
 ```
 
 This is a Tier-3 refusal. A sealed tape is never appended to or written over,
 and no flag changes that ([ADR-0003](adr/0003-sealed-volumes-immutable-no-append.md)).
 `volume init` finds the seal through the tape's own File 0, so it catches a
-sealed tape of any label. If you really mean to reuse the cartridge:
+sealed tape of any label. From 1.9.0 it then looks that volume up in this
+catalog by its uuid, and `<the way on>` says which case this is:
+
+```text
+It is this catalog's live copy: <volume>, a copy of <n> units. Leave it as it is: eject it (`tapectl drive
+eject`) and load a blank cartridge.
+
+It is this catalog's volume <volume> (<status>, condition <condition>), which the catalog has not given up.
+Leave it as it is: eject it (`tapectl drive eject`) and load a blank cartridge.
+
+This catalog holds it as volume <volume>, <status>. To reuse the cartridge: `tapectl cartridge erase` erases
+the tape in the drive, reads it back and records it. Never degauss or bulk-erase an LTO cartridge: that
+destroys its factory servo tracks, and the cartridge with them.
+
+This catalog holds no volume of that identity (`tapectl volume identify` shows what the tape says). To reuse
+the cartridge: `tapectl cartridge erase` erases the tape in the drive, reads it back and records it. Never
+degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks, and the cartridge with them.
+```
+
+- **This catalog's live copy, or a volume it has not given up** (quarantined,
+  say): the wrong cartridge is in the drive. Eject it and load a blank one.
+  Never erase a copy to make room; `volume info <volume>` shows what it holds.
+- **A volume this catalog holds `retired` or `erased`, or one it has never
+  seen** (a 1.0.0 tape after a fresh start, a test home's volume): steps 2
+  and 3 below reuse it, once you are sure its data is wanted nowhere.
+- A write to a volume already initialised does not look the tape up. Its
+  message ends `If this cartridge should be reused: retire its current volume
+  if this catalog holds it (`tapectl volume retire <label>`), then `tapectl
+  cartridge erase`, …`: steps 1 to 3 below.
+
+How to erase by hand left the message in 1.9.0; it is in step 2 below.
+
+If you really mean to reuse the cartridge:
 
 1. If this catalog holds the volume, retire it. The command shows which units
    lose a copy, and it refuses outright if this is a unit's last copy. A tape
@@ -1512,14 +1641,22 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    takes seconds: the old data stays on the tape past it, unreachable to a
    normal read but not overwritten. `--long` overwrites the whole tape and
    leaves it blank; it takes hours on real LTO, and is for a cartridge that
-   leaves your hands. Never use a bulk eraser (degausser) on an LTO cartridge:
-   LTO tape carries servo tracks written at the factory, a degausser wipes
-   them, and no drive can use the cartridge after that.
+   leaves your hands.
 
-   Without tapectl, `mt -f "$TAPE" rewind; mt -f "$TAPE" weof 1` (or `mt -f
-   "$TAPE" erase` for the long erase) does the same to the tape, but checks
-   nothing first and records nothing: follow it with `tapectl cartridge
-   mark-erased <barcode>`.
+   > [!WARNING]
+   > Never degauss or bulk-erase an LTO cartridge. LTO tape carries servo
+   > tracks written at the factory; a bulk eraser (degausser) wipes them, and
+   > no drive can use the cartridge after that. Erase it in a drive.
+
+   Without tapectl, erase it in the drive with `mt` (package `mt-st`). A
+   filemark at its start takes seconds; the long erase takes hours on real LTO:
+   ```bash
+   mt -f "$TAPE" rewind; mt -f "$TAPE" weof 1   # the short erase
+   mt -f "$TAPE" erase                          # the long erase
+   ```
+   Either does the same to the tape as `cartridge erase`, but checks nothing
+   first and records nothing: retire the volume first if this catalog holds it,
+   then follow it with `tapectl cartridge mark-erased <barcode>`.
 3. Initialise it again:
    ```bash
    tapectl volume init <new-label>
@@ -1530,8 +1667,11 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    (ADR-0012 item 57). Only a by-hand `mt weof 1`, which records nothing, still
    wants `--force` (see the previous entry):
    ```bash
-   tapectl volume init <new-label>
+   tapectl volume init <new-label> --force
    ```
+   To initialise it and write the next copy in one command, `tapectl volume
+   write <new-label> --init --full-confirm --move-to <place>` (the same
+   contact check, and the same `--force` after a by-hand erase).
 
 ### The drive reports no medium serial: name the cartridge
 
@@ -1642,7 +1782,9 @@ override this. ...
 ```
 
 Each message ends with its own way forward. Most often that is to start a new
-volume on another cartridge with `tapectl volume init <new-label>`. The last
+volume on another cartridge: `tapectl volume write <new-label> --init
+--full-confirm --move-to <place>` initialises it and writes the copy in one
+command. The last
 one may instead name a `volume verify` followed by a `volume resume`, which
 re-confirms a sealed session without writing anything.
 
@@ -1790,9 +1932,13 @@ default is to be tuned from.
 Size the batch before you write:
 
 ```bash
-tapectl volume plan --copies 2
+tapectl volume plan
 tapectl stage list
 ```
+
+`volume plan` plans as many copies as the largest copy floor among the staged
+units, and says whose (`--copies N` asks for another number). It needs no drive
+attached.
 
 Release what is already on enough tapes (`stage clean`), so that less rides
 along. Or split the work across cartridges. The
@@ -1813,14 +1959,19 @@ its warning has been measured (ADR-0012 items 84 and 123). Nothing has been
 written. Either give the drive its measured figure
 ([`post_warning_bytes`](configuration.md#backendslto), which
 `scripts/lto-profile.sh --emit` prints), or keep the unit whole on one tape
-with `allow_spanning = false`. `NAME` is the `name` of the drive's table:
+with `allow_spanning = false`. With one drive configured the bare key names it;
+with several, `backends.lto[NAME].post_warning_bytes`, where `NAME` is the
+`name` of the drive's table:
 
 ```bash
-tapectl config set 'backends.lto[NAME].post_warning_bytes' 99008M
+tapectl config set post_warning_bytes 99008M
 tapectl config check
 ```
 
-`99008M` is home2's HP LTO-6 figure; use your own drive's. `collection plan`
+`99008M` is home2's HP LTO-6 figure; use your own drive's. On a host installed
+by `scripts/first-run.sh`, put the figure in the host profile's
+`POST_WARNING_BYTES` instead, and step 8 writes it onto the drive
+([install.md](install.md)). `collection plan`
 and `collection run` refuse the same unit before anything is staged: "it
 allows spanning (allow_spanning), but a span is written only by a drive whose
 `[[backends.lto]]` entry declares `post_warning_bytes` (ADR-0012 item 123),
@@ -1880,12 +2031,16 @@ tapectl volume resume L6-0003
 `volume resume` explains itself when there is nothing it can pick up:
 
 - ``has a `planned` write session, not an interrupted one: … nothing was ever
-  written to tape``: clear it with `tapectl volume abort <label>`, then write
-  the batch under a NEW label on the same cartridge (`volume init <new>
-  --force`, then `volume write <new>`). The aborted label cannot be written
-  again: its aborted `writes` rows stay, and `writes` allows one row per stage
-  set and volume. File 0 still names the old label, so init refuses without
-  `--force`; with it, init marks the old volume `erased`.
+  written to tape``: clear it with `tapectl volume abort <label>` and run
+  `tapectl volume write <label>` again, under the same label. A write that
+  stopped this way says the same at once: ``write session was planned and
+  never started, so nothing reached the tape and there is nothing to resume.
+  Clear it with `tapectl volume abort <label>`, then run `tapectl volume write
+  <label> …` again``, with the flags the write was given. A later `volume
+  write` replaces an attempt abandoned before its seal. A write error whose
+  session is not left open ends ``has no write session left open, so there is
+  nothing to resume: run `tapectl volume write <label>` again`` instead of
+  naming `volume resume` (1.9.0).
 - ``has an `in_progress` write session … ANOTHER PROCESS IS WRITING THIS TAPE
   RIGHT NOW``: tapectl turns crashed sessions into `interrupted` whenever it
   opens the database, so a row still `in_progress` means a writer is live.
@@ -1895,8 +2050,9 @@ tapectl volume resume L6-0003
 
 Under `scripts/first-run.sh`, re-run step 13 with the same label
 (`--from 13 --label <label>`): it finds the interrupted session, offers the
-resume, and then runs the verify, audit, shelf and Heir Kit steps the first
-run never reached (`docs/install.md`, §5).
+resume, which keeps the write's full readback and move, and then runs the
+audit, shelf and Heir Kit steps the first run never reached (`docs/install.md`,
+§5).
 
 After a power cut the same holds: resume first, never re-initialise the
 cartridge. A cut after the seal leaves the seal on the medium (it is written
@@ -1956,15 +2112,28 @@ stage, verify, read-slices or restore. A second signal stops at once (exit
 
 A **full readback** stopped this way (a write's `--full-confirm`, or a full
 `volume verify`) is not lost: every file it read back clean is recorded as it
-goes. After a write the message names `tapectl volume resume <label>
---full-confirm`, which continues it; after a verify, running the same `volume
-verify` again continues it. Either way the next full readback of that volume
-reads File 3 and the seal marker again, skips the files already read back
-clean, and reads the rest. It skips nothing if the front index on the tape no
-longer hashes to the one those files were checked against, or if anything
-else verified the volume in between (only the volume's latest readback is
-continued). A resume without `--full-confirm` runs the quick confirm and
-leaves the full readback to `volume verify`.
+goes. After a write the message names `tapectl volume resume <label>`, which
+continues it; after a verify, running the same `volume verify` again continues
+it. Either way the next full readback of that volume reads File 3 and the seal
+marker again, skips the files already read back clean, and reads the rest. It
+skips nothing if the front index on the tape no longer hashes to the one those
+files were checked against, or if anything else verified the volume in between
+(only the volume's latest readback is continued).
+
+From 1.9.0 the write records what it was asked to do after the seal
+(`--full-confirm`, `--move-to`, `--for-location`, `--keep-staging`,
+`--keep-staging-for-locations`) in its session directory, and a bare `volume
+resume` keeps it, saying so first:
+
+```text
+volume "<label>": resuming with the interrupted write's --full-confirm --move-to <place>
+```
+
+A resume never turns a full confirm into a quick one. A `--move-to` on the
+resume that names another place than the write's is refused, naming both. A
+session written by 1.8.1 recorded nothing, so a resume of it is as before: it
+runs the quick confirm unless you pass `--full-confirm`, and leaves the full
+readback to `volume verify`.
 
 `volume write --prewrite-hash` stops too, inside the full hash of the staged
 slices (`… the full hash of the staged slices stopped at file N of M, before
@@ -2377,7 +2546,7 @@ apart ([Exit codes](#volume-verify-0-2-or-3)).
 **The medium is proven bad: the volume is quarantined. Exit 2.**
 
 ```text
-volume "<label>" QUARANTINED: <n> of <m> failure(s) prove the medium is bad. Its status is untouched (ADR-0012,
+volume "<label>" QUARANTINED: <n> of <m> failures prove the medium is bad. Its status is untouched (ADR-0012,
 2026-09-17) — only its condition changed, from "<old>" to "quarantined" — but it no longer counts as a copy, so
 `volume retire` will no longer refuse it as the last one — salvage what still reads off it first (`volume
 read-slices <UNIT> --from <label>`).
@@ -2387,7 +2556,7 @@ The volume's **condition** becomes `quarantined` (its **status** stays
 `sealed`), and it stops counting as a copy. `audit` will now report the
 missing copies. A volume that was already quarantined and fails again prints
 `volume "<label>" was ALREADY quarantined; this verify confirms it — <n> of
-<m> failure(s) prove the medium is bad.` and exits 2 as well. Salvage what
+<m> failures prove the medium is bad.` and exits 2 as well. Salvage what
 still reads, write it to a new cartridge, then retire the volume:
 
 ```bash
@@ -2397,11 +2566,11 @@ tapectl volume read-slices family/letters --from L6-0001
 (`--version N` reads one version; without it, every version on the tape except
 reclaimable or purged ones. A read that does not finish removes what it wrote.)
 
-Then load a blank cartridge and write the salvaged slices to it:
+Then load a blank cartridge and write the salvaged slices to it, with the full
+readback, and move it where the lost copy was:
 
 ```bash
-tapectl volume init L6-0009
-tapectl volume write L6-0009
+tapectl volume write L6-0009 --init --full-confirm --move-to <place>
 ```
 
 **Only read or transport errors: the volume is left alone. Exit 3.**
@@ -2584,10 +2753,10 @@ the unit again from another copy.
 ### `restore volume`: some units were not restored
 
 ```text
-restored "family/letters" v1 (1 slices) to /srv/restore/family/letters
+restored "family/letters" v1 (1 slice) to /srv/restore/family/letters
 FAILED "family/photos" v2 (12 slices) to /srv/restore/family/photos: slice 3 checksum mismatch on tape: expected <sha>..., got <sha>...
-restored "mike/notes" v4 (1 slices) to /srv/restore/mike/notes
-2 of 3 unit(s) restored from L8-0002
+restored "mike/notes" v4 (1 slice) to /srv/restore/mike/notes
+2 of 3 units restored from L8-0002
 error: 1 of 3 units not restored from L8-0002
 ```
 
@@ -2690,17 +2859,18 @@ and restore again.
 
 ### Restoring as a non-root user
 
-When the restore runs as anyone but root, tapectl logs a warning. It is shown
-at the default `logging.level`, and printed without colour when stderr is not
-a terminal or `NO_COLOR` is set to a non-empty value. From the tour:
+When the restore runs as anyone but root, tapectl prints one line on stderr,
+once, before the restore:
 
 ```text
-2026-09-29T08:20:05.900411Z  WARN tapectl::dar::restore: restoring as a non-root user: restored files will be owned by the invoking user, not their archived owners
+note: restoring as a non-root user, so the restored files are owned by you, not by the owners the archive recorded
 ```
 
 The contents are exact. Only ownership differs. If the original owners
 matter, run the restore as root. The service user of a first-run install is
-not root.
+not root. On a host with a home pointer, a command run as root is refused unless
+`--home` or `TAPECTL_HOME` names the home
+([refusing to run as root](#refusing-to-run-as-root)).
 
 ### Keys, and restores after a key rotation
 
@@ -3263,36 +3433,38 @@ RESTORE.sh. `--json` carries `seal_valid`, `unsealed_reason` and
 [`audit`](cli/audit.md#tapectl-audit) compares the catalog with each unit's
 resolved policy. It is advisory: it never blocks anything. It exits 0 when
 clean, 1 when there are only warnings, and 2 when there is any violation.
-This is the tour's audit after the first tape:
+Before any tape, with two units staged and one only snapshotted:
 
 ```text
-VIOLATIONS (4):
-  [copy_count] family/letters: has 1 copies, needs 2
-  [copy_count] family/photos/2019-italy: has 1 copies, needs 2
-  [copy_count] family/photos/2020-garden: has 1 copies, needs 2
-  [copy_count] work/invoices-2024: has 1 copies, needs 2
-WARNINGS (1):
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 4 violations, 1 warnings (exit 2)
+$ tapectl audit
+VIOLATIONS (3):
+  [copy_count] family/invoices: has 0 copies, needs 2: never written to tape (v1 snapshotted, not yet staged)
+  [copy_count] family/letters: has 0 copies, needs 2: never written to tape (v1 staged, awaiting a write)
+  [copy_count] family/photos: has 0 copies, needs 2: never written to tape (v1 staged, awaiting a write)
+audit: 3 violations, 0 warnings (exit 2)
+for the fixes: tapectl audit --action-plan
 ```
 
-`--action-plan` adds a `fix:` line under each finding, built from the current
-state of your archive:
+`--action-plan` adds an `ACTION PLAN` block after the findings: one `fix:`
+line per distinct remedy, built from the current state of your archive, naming
+the units it is for. A remedy several units share is one line (1.9.0):
 
 ```text
-  [copy_count] family/letters: has 1 copies, needs 2
-    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
-  ...
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit <dir>
+$ tapectl audit --action-plan
+VIOLATIONS (3):
+  …
+ACTION PLAN (2 fixes):
+  fix: tapectl snapshot create family/invoices && tapectl stage create family/invoices && tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location> — for family/invoices
+  fix: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location> — for 2 units: family/letters, family/photos
+audit: 3 violations, 0 warnings (exit 2)
 ```
 
-After the second tape, only the heir-kit warning was left, and `audit` exited 1:
+After a first tape, each unit reads `has 1 copy, needs 2`, and once a volume is
+sealed the audit warns until the Heir Kit is made:
 
 ```text
 WARNINGS (1):
-  [escrow_kit_missing] archive: 2 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warnings (exit 1)
+  [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
 ```
 
 `--json` gives the same findings as objects with `severity`, `unit`, `check`,
@@ -3306,81 +3478,84 @@ below) run only for a whole-archive audit, not with `--unit`. The `short_seal` f
 
 | Check | Severity | Message | Meaning and fix |
 |---|---|---|---|
-| `copy_count` | violation | `has <n> copies, needs <m>` | Fewer sealed, in-service copies of the unit's current Version than its policy's `min_copies`. A unit is as covered as its least-covered live Version. From 1.7.0 a Version held across cartridges is as covered as its least-covered slice: a tape holding a range of it counts only together with tapes holding its other slices (ADR-0012 item 127). For a tape-only unit `<m>` is `min_copies` times `[compaction] tape_only_safety_multiplier`, and the message ends `(tape-only <k>x)` (ADR-0012, 2026-10-12). Fix: write another volume. The `fix:` line re-stages or `read-slices` first when the staged data is gone. |
-| `location_presence` | violation | `no copy at required location(s) <names> (policy requires <list>; copies are in <n> location(s))` | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. For a tape-only unit each named location needs `[compaction] tape_only_safety_multiplier` copies; one short of it reads `has <n> copy at required location <name>, needs <m> (tape-only <m>x) (policy requires <list>)`. |
+| `copy_count` | violation | `has <n> copies, needs <m>` (`has 1 copy` for one); at 0 copies with no current version on tape, it ends with what there is instead: `: never archived`, `: never written to tape (v<n> snapshotted, not yet staged)`, `(v<n> staged, awaiting a write)` or `(v<n> was staged, and its staging released unwritten)` | Fewer sealed, in-service copies of the unit's current Version than its copy floor (the larger of its `min_copies` and its `copies_at` sum). A unit is as covered as its least-covered live Version. From 1.7.0 a Version held across cartridges is as covered as its least-covered slice: a tape holding a range of it counts only together with tapes holding its other slices (ADR-0012 item 127). For a tape-only unit `<m>` is the copy floor times `[compaction] tape_only_safety_multiplier`, and the message ends `(tape-only <k>x)` (ADR-0012, 2026-10-12). From 1.9.0 a unit no tape holds yet is reported here once, worded as above, and `no_archive` stays quiet. Fix: write another volume. For a unit never written, the `fix:` line is the one copy loop, `tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>`, after a `snapshot create` and `stage create` where nothing is staged; for a further copy it is `volume init` then `volume write`, and it re-stages or `read-slices` first when the staged data is gone. |
+| `location_presence` | violation | `no copy at required location <name> (policy requires <list>; copies are in <n> locations)` (`locations <names>` for several) | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. For a tape-only unit each named location needs `[compaction] tape_only_safety_multiplier` copies; one short of it reads `has <n> copy at required location <name>, needs <m> (tape-only <m>x) (policy requires <list>)`. |
 | `location_count` | violation | `has copies in <n> location(s), needs <m> ([defaults] min_locations)` | A tape-only unit's current Version sits in fewer distinct places than `[defaults] min_locations` (the fewest across its current Versions; a recorded warehouse deposit is a place; the multiplier never raises it, so there is no `(tape-only Nx)` note). Fix: write another copy, or move one to a place that holds none, as the `fix:` line spells out; it ends `&& tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>`. |
-| `warehouse_copies` | violation | `has <n> warehouse deposit(s), needs <m>` | The policy asks for cold-cloud deposits (`warehouse_copies > 0`). Fix: the deposit procedure in the [operator guide](operator-guide.md#warehouse-copies-cold-cloud), then `volume deposit add`. |
-| `encryption` | violation | `<n> unencrypted stage set(s) on tape, policy requires encryption` | Something on tape was written unencrypted (only possible with data from very old versions). Fix: re-stage and rewrite, as the `fix:` line spells out. |
+| `warehouse_copies` | violation | `has <n> warehouse deposits, needs <m>` | The policy asks for cold-cloud deposits (`warehouse_copies > 0`). Fix: the deposit procedure in the [operator guide](operator-guide.md#warehouse-copies-cold-cloud), then `volume deposit add`. |
+| `encryption` | violation | `<n> unencrypted stage sets on tape, policy requires encryption` | Something on tape was written unencrypted (only possible with data from very old versions). Fix: re-stage and rewrite, as the `fix:` line spells out. |
 | `policy_unresolvable` | violation | `policy could not be resolved (<why>); copy_count/location_presence/verify_age/encryption checks were SKIPPED for this unit` | The unit's policy chain (dotfile > archive set > `[defaults]`) is broken, so **no** check ran for it. The `fix:` line names the layer at fault: the unit's `.tapectl-unit.toml`, its archive set, or `[defaults]`. |
 | `dirty` | warning | `source has drifted since last archive (<a> added, <r> removed, <m> modified)` | The source moved on after its last snapshot. This is routine. Fix: `snapshot create`, `stage create`, `volume init`, then `volume write`, as the `fix:` line spells out. |
 | `dirty` | violation | `dirty scan could not run (<error>)` | tapectl could not even read the source to compare it (permissions, a missing path). Fix the access or the unit's dotfile. |
-| `no_archive` | warning | `no current snapshot or tape copies` | Never archived. Fix: snapshot, stage, init and write. |
+| `no_archive` | warning | `never archived`, or `never written to tape (…)` as `copy_count` words it | A unit no tape holds, reported here only where `copy_count` cannot judge it: a copy floor of 0, or a unit whose policy could not be resolved (`policy_unresolvable`). Any other unit never written is `copy_count`'s, at 0 copies, so it is reported once (1.9.0). Fix: as the `fix:` line spells out, the one copy loop after a snapshot and a stage where nothing is staged. |
 | `verify_age` | warning | `not verified within <d> days (last: <date or never>)` | Always: 365 days unless the unit's archive set or `[defaults] verify_interval_days` says otherwise (1.2.0; `tapectl config check` prints the value in force). A unit with a copy and no full readback at all shows `(last: never)`, and so does every unit just written with a quick confirm: that is expected, and it clears when a full `volume verify` passes (or the write used `--full-confirm`). Only a full readback counts, dated by when it started (a continued one by its oldest checkpoint). Fix: `volume verify <LABEL>` on a volume holding it. Only a readback of a volume that still counts as a copy (sealed, condition ok, with a completed write of the unit, or from 1.7.0 a range) refreshes the clock (#454). From 1.7.0, for a Version held across cartridges, each slice is dated by the newest full readback among the volumes holding it and the Version by its oldest slice, so a range read yesterday says nothing about the slices on another tape: verify every tape of the span. |
 | `escrow_coverage` | warning | `volume <label> (stage set <id>): <reason> — the current escrow key cannot recover it` | That copy cannot be opened by the escrow key. `coverage unknown …` means a catalog rebuilt from a tape with no recipient list; `catalog rebuild --key <escrow key>` attests it. Otherwise re-stage and rewrite, or accept that only the original recipients can open it. |
 | `tenancy` | warning | `the catalog says tenant "<t>" owns this unit, but <dir>/.tapectl-unit.toml names tenant "<other>"` | The unit's dotfile names another owner than the catalog. The catalog is the authority: set `tenant` under `[unit]` in the dotfile to the catalog's tenant. The dotfile is not content, so the edit creates no new version. |
 | `tenancy` | warning | `volume <label> (stage set <id>, v<n>) is encrypted to none of tenant "<t>"'s keys — …` | The catalog holds keys for that tenant, and none of them is a recipient of that copy. A retired key of the tenant counts as one of its keys. Two causes: the copy was encrypted before the unit moved to its current tenant (`tenant reassign`), or the catalog was rebuilt from tape and the tenant's key that opens the copy was never imported. Either way the operator and escrow keys still open it. Fix: if the tenant has a key the catalog does not list, [`key import`](cli/key.md#tapectl-key-import) its public key and run `audit` again. Otherwise re-stage and write a new copy if the tenant's key holders need it, or accept it. A tenant the catalog holds no key for at all (a rebuilt catalog before any `key import`) is not judged, so this check reports nothing for its copies. |
 | `compaction_candidate` | warning | `live data is <n>% of the archive data on this volume (<live> live, <r> in reclaimable/purged snapshots), below the <t>% compaction threshold` | Part of the volume's data belongs to snapshots marked reclaimable or purged, and the live share has fallen below `[compaction] utilization_threshold`. Only data slices count, never the fixed per-volume metadata, and a volume with nothing reclaimable is never a candidate. Fix: [compaction](operator-guide.md#compaction), starting with `volume compact-read <label>`. |
-| `escrow_kit_missing` | warning | `<n> sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them` | Fix: `tapectl key escrow-kit <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |
-| `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog (and the cover sheet's list of places) is behind; its secret opens every tape. Two causes, one finding: a volume sealed after the kit, or a volume moved with `volume move` / `cartridge move` after it; for a move the message adds `<n> volume(s) were moved to another place after the last heir kit` (#448). Fix: `tapectl key escrow-kit <dir>`, reprint COVER.txt, correct its "Tapes are at" box, and replace the stored copies. The escrow secret itself does not change. |
-| `escrow_identity_mismatch` | warning | `<n> stage set(s) the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
+| `escrow_kit_missing` | warning | `<n> sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them` (`1 sealed volume exists …` for one) | Fix: `tapectl key escrow-kit <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |
+| `escrow_kit_stale` | warning | `` <n> volumes were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog (and the cover sheet's list of places) is behind; its secret opens every tape. Two causes, one finding: a volume sealed after the kit, or a volume moved with `volume move` / `cartridge move` after it; for a move the message adds `<n> volumes were moved to another place after the last heir kit` (#448). Fix: `tapectl key escrow-kit <dir>`, reprint COVER.txt, correct its "Tapes are at" box, and replace the stored copies. The escrow secret itself does not change. |
+| `escrow_identity_mismatch` | warning | `<n> stage sets the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
 | `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`, 365 days when that is absent). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
 | `tape_alert` | warning | `volume "<label>": the drive raised a TapeAlert — <n> <flag>; … — at <time> during "<command>" with cartridge <barcode> loaded on drive <serial>` | A contact with this volume, or with the cartridge it is on (a [`drive poll`](operator-guide.md#the-daily-drive-poll) included), read page 0x2E with a flag raised, not before the volume's last passed full verify started (an alert raised during a readback, its own included, is not answered by it). Retired, erased and quarantined volumes are not named; an `initialized` one an interrupted write left is. A warning, never a violation: a flag may be the medium ("Media", "Read failure") or only the drive ("Cleaning required"), and the volume still counts as a copy. A cleaning flag (TapeAlert 20-23) is printed with its action, `<n> <flag> => clean the drive: …` (22 and 23 name the cleaning cartridge instead); the fix column is still the verify, which is what clears the warning. Fix: `tapectl volume verify <label>` — a pass clears it; a failure quarantines the volume and the copy checks take over. `report health` lists every sighting. |
-| `cut_without_ending` | warning | `` volume "<label>" has <n> write(s) recorded `cut` but no `ended_after`: a cut row exists only on a volume that sealed short, so this catalog does not say where that tape ended `` | One of the `short_seal` invariants (1.6.0, #420). A unit is `cut` only on a tape that sealed short, and the catalog records where such a tape ended (`volumes.ended_after`). Without it, `volume verify` would look for the seal at the planned position. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the five rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
-| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> write(s) on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Fix: as for `cut_without_ending`. |
-| `range_without_may_span` | warning | `` volume "<label>" has <n> write(s) recorded `range` with `may_span` unset: only a write planned as spannable is ever a range, and the schema refuses this row, so the catalog was edited around it `` | A `short_seal` invariant (1.7.0). Migration 039's row check refuses such a row, so it exists only where someone edited around it. Fix: as for `cut_without_ending`. |
-| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> range write(s) on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `cut_without_ending`. |
-| `range_not_one_run` | warning | `` volume "<label>" has <n> range write(s) whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `cut_without_ending`. |
-| `range_without_written_slice` | warning | `` volume "<label>" has <n> write(s) recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set is `cut` `` | A `short_seal` invariant (1.7.0). Fix: as for `cut_without_ending`. |
-| `span_in_progress` | warning | `` v<n> is a span still in progress: slice(s) <runs> of <total> are on no sealed volume yet, and <label> (slices <a>-<b>) holds the rest. The version stays `staged`, and counts no copy, until every slice is on a sealed volume `` | From 1.7.0 (ADR-0012 item 128). A Version of a unit that spans cartridges is on tape in part: some of its slices are on sealed volumes, others are not yet on any. That is the normal state between two tapes of a span, not damage. Until the last slice is on a sealed volume the Version stays `staged`, `copy_count` does not count it, and the retire floor protects the tapes that hold its only copy of a slice. With several holders the message lists each with its run and says they "hold the rest"; with none, "no sealed volume holds a written slice of it". Fix: load a fresh cartridge and run `tapectl volume write <LABEL>`, as the `fix:` line says: it writes the slices the span still owes first. |
+| `cut_without_ending` | warning | `` volume "<label>" has <n> writes recorded `cut` but no `ended_after`: a cut row exists only on a volume that sealed short, so this catalog does not say where that tape ended `` | One of the `short_seal` invariants (1.6.0, #420). A unit is `cut` only on a tape that sealed short, and the catalog records where such a tape ended (`volumes.ended_after`). Without it, `volume verify` would look for the seal at the planned position. Confirm, `catalog rebuild` and the adoption of a lost write never leave this, nor any of the five rows below: each means the catalog was edited around tapectl, or a bug. Fix: `tapectl volume verify <label>` (the `fix:` line): a full verify reads the tape's seal and names any disagreement with the catalog (`ended_after_disagrees`); report the finding. |
+| `completed_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes on it recorded `completed` have a slice past that (up to file <m>): those units are not on this tape whole, yet they count as copies `` | A `short_seal` invariant (1.6.0). A unit with a slice past where the tape ended is not on it whole, but the catalog counts it as a copy, so its copy count is too high. Fix: as for `cut_without_ending`. |
+| `range_without_may_span` | warning | `` volume "<label>" has <n> writes recorded `range` with `may_span` unset: only a write planned as spannable is ever a range, and the schema refuses this row, so the catalog was edited around it `` | A `short_seal` invariant (1.7.0). Migration 039's row check refuses such a row, so it exists only where someone edited around it. Fix: as for `cut_without_ending`. |
+| `range_written_past_ending` | warning | `` volume "<label>" ended after tape file <k>, but <n> writes recorded `range` on it record a slice `written` past that (up to file <m>): those slices are not on this tape, yet they count as copies of those slices `` | A `short_seal` invariant (1.7.0). Confirm records a range's slices past the tape's end as `pending`, never `written`. Fix: as for `cut_without_ending`. |
+| `range_not_one_run` | warning | `` volume "<label>" has <n> writes recorded `range` whose `written` slices are not one unbroken run: a volume holds at most one unbroken range of a stage set, so this catalog does not say which slices the tape holds `` | A `short_seal` invariant (1.7.0, ADR-0012 item 122). Fix: as for `cut_without_ending`. |
+| `range_without_written_slice` | warning | `` volume "<label>" has <n> writes recorded `range` with no slice `written`: a range is the slices the tape holds, and a write whose tape holds none of its set is `cut` `` | A `short_seal` invariant (1.7.0). Fix: as for `cut_without_ending`. |
+| `span_in_progress` | warning | `` v<n> is a span still in progress: slices <runs> of <total> are on no sealed volume yet, and <label> (slices <a>-<b>) holds the rest. The version stays `staged`, and counts no copy, until every slice is on a sealed volume `` | From 1.7.0 (ADR-0012 item 128). A Version of a unit that spans cartridges is on tape in part: some of its slices are on sealed volumes, others are not yet on any. That is the normal state between two tapes of a span, not damage. Until the last slice is on a sealed volume the Version stays `staged`, `copy_count` does not count it, and the retire floor protects the tapes that hold its only copy of a slice. With several holders the message lists each with its run and says they "hold the rest"; with none, "no sealed volume holds a written slice of it". Fix: load a fresh cartridge and run `tapectl volume write <LABEL>`, as the `fix:` line says: it writes the slices the span still owes first. |
 
 ---
 
-## `status` counts stage sets held in staging
-
-In the tour, after both copies were written, `status` said:
-
-```text
-tapectl summary
-  Tenants:    2 (the operator not counted)
-  Units:      4 active
-  Snapshots:  4
-  Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
-  Writes:     8 completed
-  Total data: 7.0 MiB on tape
-  Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl stage clean` decides which can be released)
-```
+## What staging holds: `status` and `stage list`
 
 A stage set stays in staging after its writes on purpose, so it can become the
-next copy, and every set still held there rides along on the next
-`volume write`. The `Staging` line counts those sets, written or not, and says
-how many still owe a copy: their version has fewer copies than its unit's
-`min_copies`. When some do, the line reads ``<n> stage set(s) held, <m> still
-owe a copy (`tapectl stage list --owing` lists them)``. `stage list --owing` lists only
-those:
+next copy. From 1.9.0 each write releases every unit whose copy floor is then
+met, unit by unit, and keeps the rest; `--keep-staging-for-locations` keeps a
+unit until every `copies_at` target is met too. So a unit still in staging after
+a write is one that still owes a copy, or one a write was told to keep.
+
+[`status`](cli/status.md) is the home screen. It counts the units by state and
+names the next command:
 
 ```text
-stage sets that still owe a copy:
-  <unit> v<n>: <s> slices, <size> — <c> of <m> copies
+$ tapectl status
+home: ~/.tapectl (named by TAPECTL_HOME)
+session logs: ~/.tapectl/logs
+running: nothing
+…
+units: 3 active
+  State          Units
+  pending        0
+  staged         2, awaiting a write
+  under-copied   3, below their copy floor
+volumes due a verify: none
+next:
+  tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>
 ```
 
-When none owe a copy, it prints `no stage set owes a copy`. A last line counts
-the sets that are only held in staging.
+[`stage list`](cli/stage.md#tapectl-stage-list) lists the stage sets held, with
+the copies of each set's version against its unit's copy floor; `--owing` lists
+only those that still owe a copy, and `--all` adds the released and failed ones:
 
-The line goes away once `stage clean` has released every held set. To see
-how often each set has actually been written, read the `Writes` column:
-
-```bash
-tapectl stage list
+```text
+$ tapectl stage list
+Stage Set   Unit             Version   Status   Slices   Size      Copies   Staged
+1           family/letters   v1        staged   1        1.8 KiB   0 of 2   2026-11-05 02:38 UTC
+2           family/photos    v1        staged   1        1.9 KiB   0 of 2   2026-11-05 02:38 UTC
 ```
 
-The tour's two writes were both done, and `stage clean` then released all
-four sets.
+A set that is held and owes nothing was kept on purpose (`--keep-staging`, a
+location target, a rewrite's hold); a bare `tapectl stage clean` releases what
+is already on enough tapes and keeps the rest.
 
-A script that read `staged_pending` from `status --json` finds it gone:
-`stage_sets_held` and `stage_sets_owing_a_copy` replace it, and
-`stage list --owing --json` now lists only the sets that owe a copy. The operator
-guide lists every `--json` field that changed, under
+`status` replaced `report summary`, and `stage list --owing` replaced `report
+pending`; both old spellings are refused by name
+([renamed](#tapectl-old-was-renamed-in-190-use-tapectl-new)). A script that read
+`report summary --json` reads `status --json` now, a different document: the
+home, the running sessions, `units` by state, `due_verify` and `next`. The
+operator guide lists every `--json` field that changed, under
 [Scripting against tapectl](operator-guide.md#scripting-against-tapectl).
 
 ---
@@ -3395,7 +3570,9 @@ where to re-enter (`--from N`); most do not. The step that stopped is the last
 To re-enter, run the script again with **every option you first gave it**
 (`--profile`, `--device`, `--home`, `--no-service-user`, `--user`,
 `--tapectl`, …), plus `--from N`. Options are not remembered from one run to
-the next. Without `--profile` or `--device`, the drive is lost. Step 6 is the
+the next, except the profile: a run without `--profile` on a host that recorded
+one refuses and names it ([install.md §2](install.md#2-the-one-command)). Without `--profile` or
+`--device`, the drive is lost. Step 6 is the
 only step that asks for it, so a run that starts after step 6 stops at step 8,
 12 or 13 (whichever it reaches first) with `no device chosen — pass --device,
 or run with --from 6`. Without `--home` or `--no-service-user`, the run works
