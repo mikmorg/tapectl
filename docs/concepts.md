@@ -79,15 +79,15 @@ $ tapectl snapshot create family/letters
 snapshot created: family/letters v1 (2 files, 235 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB dar, 1.8 KiB encrypted)
 
 $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 ...
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.7 KiB
+  family/letters v1: 1 slices, 1.8 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
   photos/2020-garden v1: 1 slices, 588.1 KiB
-  work/invoices-2024 v1: 1 slices, 1.7 KiB
+  work/invoices-2024 v1: 1 slices, 1.8 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
@@ -395,11 +395,15 @@ the factory, and no drive can use it again.
 
   ```text
   $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
-  cartridge L8-0001 auto-registered from MAM (chip serial E01001L8_1775794348; barcode L8-0001, the volume's label)
+  cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; barcode L8-0001, the volume's label)
   volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
-  medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
+  medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
   ...
   ```
+
+  (The session's virtual drive set a `capacity_override`, a key for virtual
+  drives only. A real LTO-8 cartridge reads `12.00 TB` there, its generation's
+  capacity.)
 
   `--barcode` names a different sticker at that first init. The cartridge keeps
   its barcode when a later volume goes on it (after an erase), and
@@ -873,10 +877,10 @@ or by the session itself when a write fails or its readback finds a mismatch).
 $ tapectl volume info L8-0001
 ...
 Writes:
-    work/invoices-2024 v1: completed (2026-11-05 02:30 UTC)
-    photos/2020-garden v1: completed (2026-11-05 02:30 UTC)
-    photos/2019-italy v1: completed (2026-11-05 02:30 UTC)
-    family/letters v1: completed (2026-11-05 02:30 UTC)
+    work/invoices-2024 v1: completed (2026-11-05 03:42 UTC)
+    photos/2020-garden v1: completed (2026-11-05 03:42 UTC)
+    photos/2019-italy v1: completed (2026-11-05 03:42 UTC)
+    family/letters v1: completed (2026-11-05 03:42 UTC)
 ```
 
 ## What is on a tape

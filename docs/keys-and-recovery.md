@@ -453,7 +453,7 @@ $ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
+  catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
   tapectl-1.9.0    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
@@ -847,15 +847,26 @@ is the same procedure for a service-user host.
    tapectl catalog rebuild --from-volume --key escrow.key --device "$TAPE" --label L8-0002
    ```
    ```text
-   rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelopes opened
-     on tape: written … UTC, sealed … UTC, chip load count at write …
+   rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 envelopes opened
+     on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
      inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
                4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-     cartridge "E01003L8_1775794348" registered from this tape's own identity and bound
+     cartridge "E01011L8_1775794348" registered from this tape's own identity and bound
+     dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
+     cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
+       L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
+         family: family/letters v1
+         family: photos/2019-italy v1
+         family: photos/2020-garden v1
+         work: work/invoices-2024 v1
      the slice hashes recorded are the tape's own claim; run `tapectl volume verify L8-0002` to check them
      escrow receipts: 4 stage sets carried theirs on the tape
    ```
-   Running it twice is safe: the second run finds its own rows and adds nothing.
+   The cross-volume index names the other tapes this one knew of when it was
+   written (here L8-0001, sealed before it), with what each holds; a tape sealed
+   later is not on it, so the shelf stays the list.
+   Running it twice is safe: the second run finds its own rows, adds nothing, and
+   says `no changes — the catalog already knew this volume`.
    A tape with no valid seal marker (an interrupted or aborted write) is recorded as
    an unsealed volume, not a sealed one: it counts as no copy, and the output says so
    ([troubleshooting](troubleshooting.md#catalog-rebuild-no-valid-seal-marker)).

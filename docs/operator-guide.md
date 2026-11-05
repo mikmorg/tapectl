@@ -388,7 +388,9 @@ copies (two, by default). Every copy is the same one command,
 `volume write LABEL --init --full-confirm --move-to PLACE`. This is the whole
 sequence, copy-pasteable. The output shown is from the
 [walkthrough](walkthrough.md)'s session: four small units and a policy of two
-copies.
+copies, on a virtual LTO-8 drive whose `capacity_override` makes the `medium:`
+line read 2.0 GB (a real LTO-8 cartridge reads `12.00 TB`, and the line names no
+override).
 
 ```bash
 # 0. Where things stand, is the host quiet, and what changed?
@@ -424,44 +426,44 @@ What success looks like at each step:
 $ tapectl snapshot create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 snapshot created: family/letters v1 (2 files, 235 B)
 snapshot created: photos/2019-italy v1 (4 files, 1.1 MiB)
-snapshot created: photos/2020-garden v1 (3 files, 586.1 KiB)
-snapshot created: work/invoices-2024 v1 (2 files, 226 B)
+snapshot created: photos/2020-garden v1 (3 files, 586.2 KiB)
+snapshot created: work/invoices-2024 v1 (2 files, 219 B)
 
 $ tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 ...
-staged: family/letters (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB dar, 1.8 KiB encrypted)
 staged: photos/2019-italy (1 slice, 1.1 MiB dar, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 587.3 KiB dar, 588.1 KiB encrypted)
+staged: photos/2020-garden (1 slice, 587.3 KiB dar, 588.2 KiB encrypted)
 staged: work/invoices-2024 (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
 
 $ tapectl volume plan
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
   photos/2019-italy v1: 1 slice, 1.1 MiB
-  photos/2020-garden v1: 1 slice, 588.1 KiB
-  family/letters v1: 1 slice, 1.7 KiB
+  photos/2020-garden v1: 1 slice, 588.2 KiB
+  family/letters v1: 1 slice, 1.8 KiB
   work/invoices-2024 v1: 1 slice, 1.7 KiB
 
-total: 4 slices, 1.7 MiB x 2 = 3.3 MiB
+total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
 cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
 $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
-cartridge L8-0001 auto-registered from MAM (chip serial E01001L8_1775794348; barcode L8-0001, the volume's label)
+cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; barcode L8-0001, the volume's label)
 volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
-medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
+medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.7 KiB
+  family/letters v1: 1 slices, 1.8 KiB
   photos/2019-italy v1: 1 slices, 1.1 MiB
-  photos/2020-garden v1: 1 slices, 588.1 KiB
+  photos/2020-garden v1: 1 slices, 588.2 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
 sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
 staging kept for 4 units still short of their policy; the next copy reuses their staged slices:
-  unit family/letters has 1 copy, needs 2
-  unit photos/2019-italy has 1 copy, needs 2
   unit photos/2020-garden has 1 copy, needs 2
+  unit photos/2019-italy has 1 copy, needs 2
+  unit family/letters has 1 copy, needs 2
   unit work/invoices-2024 has 1 copy, needs 2
 volume "L8-0001" moved to "home-rack"
   cartridge "L8-0001" moved with it
@@ -532,7 +534,7 @@ $ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
+  catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
   tapectl-1.9.0    the program that made this kit, …, sha256 … (named on the sheet)
 
 still to do, and only you can do it:
@@ -544,7 +546,7 @@ still to do, and only you can do it:
   4. store copies in at least TWO independent failure domains
 
 $ tapectl db backup /mnt/backup
-database backed up to /mnt/backup/tapectl-20261105T023512Z.db (520.0 KiB); private keys not included — pass --include-keys to copy them
+database backed up to /mnt/backup/tapectl-20261105T034233Z.db (728.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
 (The remaining warning, `escrow_kit_missing`, is what step 5's
@@ -1725,8 +1727,8 @@ whether it can be relied on.
 ```text
 $ tapectl catalog locate family/letters
 Volume    Status   Condition   Location    Snapshot   Slices   Holds   Written                Serviceable   Warehouse   Escrow   Verified
-L8-0001   sealed   ok          home-rack   1          1        whole   2026-11-05 02:30 UTC   yes           -           yes      0d ago
-L8-0002   sealed   ok          offsite     1          1        whole   2026-11-05 02:33 UTC   yes           -           yes      0d ago
+L8-0001   sealed   ok          home-rack   1          1        whole   2026-11-05 03:42 UTC   yes           -           yes      0d ago
+L8-0002   sealed   ok          offsite     1          1        whole   2026-11-05 03:42 UTC   yes           -           yes      0d ago
 
 note: "Verified" is this catalog's last-known record of each copy's most recent PASSED full readback (a full `volume verify`, or a write's full confirm; a quick one reads none of the copy's bytes and does not count) — not a check of the tape performed just now. "never" means no passed full readback is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
 ```
@@ -2814,9 +2816,12 @@ output names the volume on the cartridge and where it belongs:
 
 ```text
 $ tapectl drive eject
-ejected cartridge L8-0002 (chip E01003L8_1775794348; volume L8-0002) from /dev/tape/by-id/scsi-<SERIAL>-nst
+ejected cartridge L8-0002 (chip E01011L8_1775794348; volume L8-0002) from /dev/tape/by-id/scsi-<SERIAL>-nst
   L8-0002 belongs at offsite: take it there. Its volumes stay bound to the cartridge; if it is going elsewhere: tapectl cartridge move L8-0002 --to <location>
+  recorded as contact 9 (tapectl cartridge info)
 ```
+
+The last line numbers the contact it recorded, which `cartridge info` lists.
 
 A cartridge with no recorded place says so instead, with the `cartridge move`
 that records one. It refuses while any tapectl command holds
@@ -2952,8 +2957,8 @@ each volume by its newest line:
 
 ```text
 $ tapectl report verify-status
-  L8-0001: full passed, started 2026-11-05 02:30 UTC, completed 2026-11-05 02:30 UTC (15/15/0 checked/passed/failed); write check: no LBP (…)
-  L8-0002: full passed, started 2026-11-05 02:33 UTC, completed 2026-11-05 02:33 UTC (15/15/0 checked/passed/failed); write check: no LBP (…)
+  L8-0001: full passed, started 2026-11-05 03:42 UTC, completed 2026-11-05 03:42 UTC (15/15/0 checked/passed/failed); write check: no LBP (…)
+  L8-0002: full passed, started 2026-11-05 03:42 UTC, completed 2026-11-05 03:42 UTC (15/15/0 checked/passed/failed); write check: no LBP (…)
 ```
 
 (Those two are the writes' own full confirms. On a drive that took Logical
@@ -2962,7 +2967,9 @@ the volume was last read back in full, and by what, then reads it anyway; it
 never asks:
 
 ```text
-volume "L8-0001": last full read 2026-11-05 02:30 UTC (by volume write); reading it in full again now
+$ tapectl volume verify L8-0002
+volume "L8-0002": last full read 2026-11-05 03:42 UTC (by volume write); reading it in full again now
+verify L8-0002 (full tier): 15 checked, 15 passed, 0 failed
 ```
 
 `status` lists the volumes due a verify, each with why: no full readback, or
@@ -3432,10 +3439,13 @@ as its **barcode** (ADR-0012 item 219), so the sticker and the tape say the same
 thing:
 
 ```text
-cartridge L8-0001 auto-registered from MAM (chip serial E01001L8_1775794348; barcode L8-0001, the volume's label)
+cartridge L8-0001 auto-registered from MAM (chip serial E01010L8_1775794348; barcode L8-0001, the volume's label)
 volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
-medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
+medium: LTO-8, 2.0 GB (the cartridge chip's medium density code 0x5e; capacity from the drive's capacity_override)
 ```
+
+(A virtual drive with a `capacity_override`; on a real LTO-8 cartridge the
+`medium:` line reads `LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)`.)
 
 Write `L8-0001` on the sticker. One cartridge row, with that barcode on it and
 the chip serial underneath as its identity. Every command that takes a
@@ -3572,8 +3582,8 @@ tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did
 ```text
 $ tapectl cartridge list
 Barcode   Generation   Status   Location    Loads   Volume
-L8-0001   LTO-8        in_use   home-rack   564     L8-0001
-L8-0002   LTO-8        in_use   offsite     566     L8-0002
+L8-0001   LTO-8        in_use   home-rack   1       L8-0001
+L8-0002   LTO-8        in_use   offsite     1       L8-0002
 ```
 
 **`unretire` and `mark-erased` are different statements, and the difference
@@ -3911,11 +3921,11 @@ tapectl init --operator mike --escrow-public-key age1…   # the ORIGINAL, from 
 root; the recorded session below gives the same name the original home used.
 
 ```text
-$ tapectl --home ~/.tapectl-rebuilt init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+$ tapectl --home ~/.tapectl-rebuilt init --operator mike --escrow-public-key age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a
 tapectl initialized at ~/.tapectl-rebuilt
   operator: mike
   ...
-  escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
+  escrow:   adopted age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a (imported — its secret lives on the heir kit, not here)
   dar:      dar (found at /usr/bin/dar)
 
 next steps:
@@ -3997,13 +4007,28 @@ the operator tenant, for example `~/.tapectl/keys/mike-primary.age.key`.
 Rebuilding one tape into an empty catalog with the escrow key printed:
 
 ```text
-rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelopes opened
+rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 envelopes opened
+  on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-  cartridge "L8-0002" registered from this tape's own identity and bound
+  cartridge "E01011L8_1775794348" registered from this tape's own identity and bound
+  dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
+  cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
+    L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
+      family: family/letters v1
+      family: photos/2019-italy v1
+      family: photos/2020-garden v1
+      work: work/invoices-2024 v1
   the slice hashes recorded are the tape's own claim; run `tapectl volume verify L8-0002` to check them
   escrow receipts: 4 stage sets carried theirs on the tape
 ```
+
+The cross-volume index on the tape names the other tapes this one knew of when it
+was written, with what each holds; a tape sealed after it is not on that list, so
+the shelf stays the list. A cartridge registered by a
+rebuild has its chip serial as its barcode, since no tape records the sticker;
+`tapectl cartridge relabel E01011L8_1775794348 L8-0002` puts the sticker's name
+back.
 
 Run it once per cartridge, in any order. Running it twice, or over a catalog
 that is damaged rather than absent, is safe, because of what it does to rows
