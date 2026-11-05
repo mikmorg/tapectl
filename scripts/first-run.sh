@@ -2815,7 +2815,18 @@ if [ "$NV14" = 0 ]; then
   NEXT_LABEL="$(next_label "$NEXT_LABEL")"
 else
   NEXT_LABEL="$(next_label "${LABEL:-}")"
-  NEXT_STEP="   • The next copy: load a blank cartridge and run step 13 again, with the next label and the place the tape goes:"
+  # A copy is owed only while a staged set is short of its unit's copy floor
+  # (`stage list --owing`); after the last copy nothing is, and the next tape
+  # is for new or changed units, not another copy of these.
+  OWING14="$( { tc stage list --owing --json 2>/dev/null || true; } | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(-1)')"
+  if [ "$OWING14" = 0 ]; then
+    NEXT_STEP="   • Every staged unit has its copies: no tape is owed now. New or changed units (${OP_CMD} status names them)
+     go onto a new tape the same way, with the next label and the place it goes:"
+  else
+    NEXT_STEP="   • The next copy: load a blank cartridge and run step 13 again, with the next label and the place the tape goes:"
+  fi
 fi
 NEXT_PLACE="${LOCATIONS[1]:-}"; NEXT_PLACE="${NEXT_PLACE%%|*}"; NEXT_PLACE="${NEXT_PLACE:-<another place>}"
 cat <<EOF

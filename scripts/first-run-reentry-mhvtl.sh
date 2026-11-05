@@ -61,8 +61,9 @@
 #              --move-to, its full readback and no `volume verify`, the
 #              cartridge's barcode L2 (item 219), every unit's staging
 #              released (the copy floor met), the audit and the kit, exit 0;
-#              both volumes sealed, every unit 2 copies in 2 places. Then the
-#              cartridge goes back to its slot.
+#              both volumes sealed, every unit 2 copies in 2 places, and step 14
+#              asking for no third copy (phase C's step 14, one copy short, does
+#              ask: the control). Then the cartridge goes back to its slot.
 #          Under --auto every prompt of phase E is answered by first-run.sh
 #          itself or by a flag (--label, --erase-label): its typed-word
 #          prompts read /dev/tty, never stdin, so nothing is fed on stdin.
@@ -997,6 +998,20 @@ if len(rows) != n or bad:
 PY
 }
 check copy2_both_sealed_two_copies_two_places step_e1_two_copies
+# Step 14 asks for another copy only while one is owed (`stage list --owing`):
+# after copy 2 none is. Phase C's step 14, after copy 1 with every unit one copy
+# short, is the positive control: it does ask.
+step_e1_no_copy_owed() {
+    grep -F "The next copy:" "$RUN/phase-C.out" >/dev/null \
+        || { echo "phase C's step 14 did not ask for the next copy (the positive control)"; return 1; }
+    if grep -F "The next copy:" "$RUN/phase-E1.out" >/dev/null; then
+        echo "step 14 asked for another copy after copy 2, with nothing owed"; return 1
+    fi
+    grep -F "no tape is owed now" "$RUN/phase-E1.out" >/dev/null \
+        || { echo "step 14 did not say no tape is owed"; return 1; }
+    echo "step 14 after copy 1 asks for the next copy; after copy 2, says none is owed"
+}
+check copy2_step14_asks_for_no_third_copy step_e1_no_copy_owed
 check priority_phase_e1 assert_prio E1 "cartridge erase" "volume init" "volume write"
 check raise_notice_phase_e1 assert_raised_notice "$RUN/phase-E1.out"
 
