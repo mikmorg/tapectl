@@ -572,23 +572,6 @@ fn known(names: &[String]) -> Known {
     Known::Table(table_fields("", Shape::Table))
 }
 
-/// Levenshtein distance, by characters (the sibling of `error.rs`'s, which
-/// is that module's own).
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = Vec::with_capacity(b.len() + 1);
-        cur.push(i + 1);
-        for (j, cb) in b.iter().enumerate() {
-            let substitute = prev[j] + usize::from(ca != *cb);
-            cur.push(substitute.min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
-    }
-    prev[b.len()]
-}
-
 /// The names in `among` nearest `typed`, ignoring case: within a third of
 /// its length (at least one edit, at most three), the nearest only, and
 /// none when more than three are equally near.
@@ -598,7 +581,7 @@ fn nearest<'a>(typed: &str, among: impl IntoIterator<Item = &'a String>) -> Vec<
     let mut best = usize::MAX;
     let mut near: Vec<&String> = Vec::new();
     for name in among {
-        let d = edit_distance(&typed, &name.to_lowercase());
+        let d = crate::error::edit_distance(&typed, &name.to_lowercase());
         if d == 0 || d > limit {
             continue;
         }

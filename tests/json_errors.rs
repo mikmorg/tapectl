@@ -20,7 +20,10 @@ fn tapectl(home: &std::path::Path, args: &[&str]) -> Output {
 }
 
 /// The JSON error `out` printed: the whole of stdout is one document of
-/// exactly the two keys, its code the process's exit code, stderr empty.
+/// exactly the two keys, its code the process's exit code, and stderr the
+/// same message as the usual `error:` line (the coordinator's ruling at
+/// Wave 6: item 212 puts the error on stdout for a program; a person, and
+/// every script that reads a refusal from stderr, still finds it there).
 fn json_error(out: &Output) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let doc: serde_json::Value = serde_json::from_str(&stdout)
@@ -32,16 +35,17 @@ fn json_error(out: &Output) -> String {
         out.status.code().map(i64::from),
         "the document's exit_code is the process's: {doc}"
     );
-    assert!(
-        out.stderr.is_empty(),
-        "nothing on stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     assert!(stdout.contains("\n  \"error\""), "pretty-printed: {stdout}");
-    doc["error"]
+    let error = doc["error"]
         .as_str()
         .expect("error is a string")
-        .to_string()
+        .to_string();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("error: {error}\n"),
+        "stderr carries the same message as the text path"
+    );
+    error
 }
 
 #[test]

@@ -827,7 +827,7 @@ fn nearest_labels<'l>(typed: &str, labels: &'l [String]) -> Vec<&'l str> {
 }
 
 /// Levenshtein distance, by characters.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {
@@ -1072,7 +1072,7 @@ pub fn exit_with_rendered(text: &str, code: i32) -> ! {
 }
 
 /// Report an error already rendered and exit `code` (ADR-0012 item 212): an
-/// `error: ` line on stderr, or under `--json` (`json` true) one JSON
+/// `error: ` line on stderr and, under `--json` (`json` true), also one JSON
 /// document on stdout, `{"error": text, "exit_code": code}`, so a script
 /// reading stdout gets a document whatever happened. The exit code is the
 /// same either way.
@@ -1093,9 +1093,12 @@ pub fn exit_reporting_with(
         crate::render::print_json(&json_error_document(text, code, payload));
         use std::io::Write;
         let _ = std::io::stdout().flush();
-    } else {
-        eprintln!("error: {text}");
     }
+    // The `error:` line goes to stderr under `--json` too: item 212 puts the
+    // error on stdout as JSON for a program, and the person (and every script
+    // that reads a refusal from stderr, first-run.sh among them) still sees
+    // it where it always was.
+    eprintln!("error: {text}");
     process::exit(code);
 }
 

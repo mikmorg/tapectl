@@ -1708,10 +1708,13 @@ fn cmd_run(
         dry_run,
         assume_yes,
     );
-    if let Err(e) = &ran {
-        run_left_initialized(conn, lib, req.label, &init, e, json_output);
+    match ran {
+        Err(e) => match run_left_initialized(conn, lib, req.label, &init, &e, json_output) {
+            Some(doc) => Err(TapectlError::with_json(doc, e)),
+            None => Err(e),
+        },
+        ok => ok,
     }
-    ran
 }
 
 /// `collection run --init LABEL` where a volume already has the label:
@@ -1763,7 +1766,7 @@ fn run_left_initialized(
     init: &crate::volume::write::Initialized,
     error: &TapectlError,
     json_output: bool,
-) {
+) -> Option<serde_json::Value> {
     let fact = format!(
         "volume \"{label}\" was initialized by this run (id={}) and stays initialized, \
          whatever followed: the exit code describes the run, not the init.",
@@ -1778,13 +1781,13 @@ fn run_left_initialized(
         _ => format!("{fact} The error says what to run next."),
     };
     eprintln!("{line}");
-    if json_output {
+    json_output.then(|| {
         let mut doc = crate::cli::volume::left_initialized_json(label, init, error);
         if let Some(obj) = doc.as_object_mut() {
             obj.insert("collection".into(), lib.name.clone().into());
         }
-        crate::render::print_json(&doc);
-    }
+        doc
+    })
 }
 
 /// What `collection run --dry-run` reports: the plan the run would carry out

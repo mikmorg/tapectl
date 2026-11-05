@@ -500,11 +500,9 @@ pub fn volume_retire(
     // `force`, so `assume_yes` is not even in scope for this decision.
     if let Err(e) = refuse_last_eligible_copy(conn, &action, label, &impacts) {
         if json_output {
-            crate::render::print_json(&retire_refusal_json(
-                label,
-                &impacts,
-                &at_risk,
-                &e.to_string(),
+            return Err(TapectlError::with_json(
+                retire_refusal_json(label, &impacts, &at_risk, &e.to_string()),
+                e,
             ));
         } else {
             // Impact analysis only -- it already carries the per-version
@@ -552,7 +550,10 @@ pub fn volume_retire(
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
             let reason = e.to_string();
             if json_output {
-                crate::render::print_json(&retire_refusal_json(label, &impacts, &at_risk, &reason));
+                return Err(TapectlError::with_json(
+                    retire_refusal_json(label, &impacts, &at_risk, &reason),
+                    e,
+                ));
             } else {
                 // Impact analysis only, same as the Tier-3 path above: the
                 // refusal now carries its facts (`cli::consent`), and
@@ -1560,14 +1561,17 @@ pub fn cartridge_retire(
         if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
             let reason_text = e.to_string();
             if json_output {
-                crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode,
-                    "status": status,
-                    "affected_units": retire_impacts_json(&merged),
-                    "at_risk_units": at_risk,
-                    "consent": "refused",
-                    "reason": reason_text,
-                }));
+                return Err(TapectlError::with_json(
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "status": status,
+                        "affected_units": retire_impacts_json(&merged),
+                        "at_risk_units": at_risk,
+                        "consent": "refused",
+                        "reason": reason_text,
+                    }),
+                    e,
+                ));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `volume_retire`.
@@ -1610,14 +1614,17 @@ pub fn cartridge_retire(
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
         let reason_text = e.to_string();
         if json_output {
-            crate::render::print_json(&serde_json::json!({
-                "barcode": barcode,
-                "status": status,
-                "affected_units": retire_impacts_json(&merged),
-                "at_risk_units": at_risk,
-                "consent": "refused",
-                "reason": reason_text,
-            }));
+            return Err(TapectlError::with_json(
+                serde_json::json!({
+                    "barcode": barcode,
+                    "status": status,
+                    "affected_units": retire_impacts_json(&merged),
+                    "at_risk_units": at_risk,
+                    "consent": "refused",
+                    "reason": reason_text,
+                }),
+                e,
+            ));
         } else {
             // Impact analysis only; see `volume_retire`.
             print_cartridge_retire_impact(barcode, &status, &volume_labels, &merged, &at_risk);
@@ -2050,14 +2057,17 @@ pub fn cartridge_mark_erased(
         if let Err(e) = refuse_last_eligible_copy(conn, &action, vol_label, impacts) {
             let reason = e.to_string();
             if json_output {
-                crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode,
-                    "status": status,
-                    "affected_units": retire_impacts_json(&merged),
-                    "at_risk_units": at_risk,
-                    "consent": "refused",
-                    "reason": reason,
-                }));
+                return Err(TapectlError::with_json(
+                    serde_json::json!({
+                        "barcode": barcode,
+                        "status": status,
+                        "affected_units": retire_impacts_json(&merged),
+                        "at_risk_units": at_risk,
+                        "consent": "refused",
+                        "reason": reason,
+                    }),
+                    e,
+                ));
             } else {
                 // Impact analysis only; `main` prints the floor's own text
                 // once, on stderr. See `cartridge_retire`.
@@ -2076,10 +2086,13 @@ pub fn cartridge_mark_erased(
         if let Err(e) = crate::cli::consent::confirm(&action, &facts, force || assume_yes) {
             let reason = e.to_string();
             if json_output {
-                crate::render::print_json(&serde_json::json!({
-                    "barcode": barcode, "status": status,
-                    "consent": "refused", "reason": reason,
-                }));
+                return Err(TapectlError::with_json(
+                    serde_json::json!({
+                        "barcode": barcode, "status": status,
+                        "consent": "refused", "reason": reason,
+                    }),
+                    e,
+                ));
             }
             return Err(e);
         }
@@ -3976,9 +3989,12 @@ pub fn db_import(
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
         let reason = e.to_string();
         if json_output {
-            crate::render::print_json(&serde_json::json!({
-                "source": import_path, "consent": "refused", "reason": reason,
-            }));
+            return Err(TapectlError::with_json(
+                serde_json::json!({
+                    "source": import_path, "consent": "refused", "reason": reason,
+                }),
+                e,
+            ));
         }
         return Err(e);
     }

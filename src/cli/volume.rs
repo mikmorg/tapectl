@@ -2177,9 +2177,15 @@ fn write_and_follow(
     let written = steps.write(req.label, req.force && !req.init);
     // Issue #445: a write that fails leaves the volume this command
     // initialised initialised, and says so before the error is printed.
-    if let (Err(e), Some(init)) = (&written, &initialized) {
-        report_left_initialized(conn, req, init, e);
-    }
+    // Under `--json` the volume's document rides the error (one document on
+    // stdout, `TapectlError::with_json`), never a second print.
+    let written = match (written, &initialized) {
+        (Err(e), Some(init)) => match report_left_initialized(conn, req, init, &e) {
+            Some(doc) => Err(TapectlError::with_json(doc, e)),
+            None => Err(e),
+        },
+        (written, _) => written,
+    };
     written?;
     // Reached only when the write above returned `Ok` — sealed AND
     // confirmed. Issues #440 and #438. #420: how the tape ended, before the
@@ -2275,11 +2281,10 @@ fn report_left_initialized(
     req: &WriteRequest<'_>,
     init: &Initialized,
     error: &TapectlError,
-) {
+) -> Option<serde_json::Value> {
     eprintln!("{}", left_initialized_line(conn, req.label, init.volume_id));
-    if req.json_output {
-        println!("{}", left_initialized_json(req.label, init, error));
-    }
+    req.json_output
+        .then(|| left_initialized_json(req.label, init, error))
 }
 
 /// [`report_left_initialized`]'s line: the volume stays initialised, and —
