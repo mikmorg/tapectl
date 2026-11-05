@@ -94,8 +94,12 @@ pub fn check(root: &Path, lib: &CollectionConfig) -> Access {
                 let denied = err
                     .io_error()
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+                // A directory the walk yielded, found unreadable, and then
+                // failed to enter is named once.
                 if let (true, Some(path)) = (denied, err.path()) {
-                    access.unreadable.push(path.to_path_buf());
+                    if !access.unreadable.iter().any(|p| p == path) {
+                        access.unreadable.push(path.to_path_buf());
+                    }
                 }
                 continue;
             }
@@ -302,7 +306,8 @@ mod tests {
             !grant.contains("find"),
             "--no-dotfiles: no write grant: {grant}"
         );
-        assert!(grant.contains(&format!("cannot read {}", root.join("b").display())));
+        let unreadable = format!("cannot read {}", root.join("b").display());
+        assert_eq!(grant.matches(&unreadable).count(), 1, "named once: {grant}");
 
         for d in ["a", "b", "skipped"] {
             chmod(&root.join(d), 0o755);

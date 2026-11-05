@@ -1774,11 +1774,10 @@ fn resolve_slice_size_string(
     // (#211) — including, since issue #263, a misspelled TOP-LEVEL table
     // name (`[polcy]` instead of `[policy]`), which `policy::resolve` now
     // refuses by name too rather than letting it look like an absent
-    // `[policy]` section. Left as-is rather than rewired, because
-    // `slice_arg_for_dar`'s doc explains at length why this function hands
-    // dar the operator's RAW string, and changing how the string is
-    // obtained is a different, riskier change than correcting a comment: it
-    // moves real on-tape slice boundaries for every unit.
+    // `[policy]` section. Left as-is rather than rewired. dar itself is
+    // handed the string's byte count (`dar::slice::dar_slice_arg`), which
+    // cuts the same slices as any string dar's `-s` took (its suffixes are
+    // binary too).
     if let Some(ref path) = unit.current_path {
         let dotfile_path = Path::new(path).join(".tapectl-unit.toml");
         if let Ok(contents) = fs::read_to_string(&dotfile_path) {
@@ -2198,9 +2197,13 @@ fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> 
     }
     let in_flight = if inputs.in_flight.stages > 0 {
         format!(
-            " ({} of it may still be written by {} other stage(s) running now)",
+            " ({} of it may still be written by {} running now)",
             fmt(spoken_for),
-            inputs.in_flight.stages
+            crate::render::plural(
+                inputs.in_flight.stages as i64,
+                "other stage",
+                "other stages"
+            )
         )
     } else {
         String::new()
@@ -4430,7 +4433,7 @@ mod tests {
             .to_string();
         assert!(
             err.contains("may be too small for unit \"unit1\"")
-                && err.contains("may still be written by 1 other stage(s) running now")
+                && err.contains("may still be written by 1 other stage running now")
                 && err.contains("refused"),
             "{err}"
         );

@@ -1421,10 +1421,10 @@ pub fn text_lines(plan: &ForLocationPlan, staged: Option<&[Staged]>) -> (Vec<Str
         None => String::new(),
     };
     out.push(format!(
-        "stage for-location {x} --volume {}: {} unit(s), {}, against the volume's {} under its \
+        "stage for-location {x} --volume {}: {}, {}, against the volume's {} under its \
          fill ceiling{bound}{}",
         plan.volume,
-        plan.planned.len(),
+        crate::render::plural(plan.planned.len() as i64, "unit", "units"),
         bytes_text(plan.planned_bytes()),
         bytes_text(plan.room.fill),
         if staged.is_none() {
@@ -1456,8 +1456,8 @@ pub fn text_lines(plan: &ForLocationPlan, staged: Option<&[Staged]>) -> (Vec<Str
     }
     if !plan.waiting.is_empty() {
         out.push(format!(
-            "waiting for the next tape for {x} ({} unit(s)): the units above fill this one",
-            plan.waiting.len()
+            "waiting for the next tape for {x} ({}): the units above fill this one",
+            crate::render::plural(plan.waiting.len() as i64, "unit", "units")
         ));
         out.extend(plan.waiting.iter().map(|c| candidate_line(c, x, "")));
     }
@@ -2356,7 +2356,7 @@ mod tests {
         );
         assert!(
             out.iter().any(|l| l
-                == "waiting for the next tape for offsite (1 unit(s)): the units above fill \
+                == "waiting for the next tape for offsite (1 unit): the units above fill \
                     this one"),
             "{out:?}"
         );

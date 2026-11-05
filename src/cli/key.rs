@@ -537,13 +537,13 @@ pub fn run(
                     )
                 );
                 println!(
-                    "  {:<16} the program that made this kit, {} bytes, sha256 {} (named on the sheet)",
+                    "  {:<16} the program that made this kit, {}, sha256 {} (named on the sheet)",
                     report
                         .tapectl_copy
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
-                    report.tapectl_bytes,
+                    crate::progress::format_bytes(report.tapectl_bytes as u64),
                     report.tapectl_sha256
                 );
                 println!();

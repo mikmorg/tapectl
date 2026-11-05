@@ -662,7 +662,7 @@ fn no_entries(list: &str, key: &str) -> TapectlError {
     if list == "backends.lto" {
         TapectlError::Config(format!(
             "{key} is a key of a drive, and no drive is configured: add one with `tapectl \
-             drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`"
+             drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`"
         ))
     } else {
         TapectlError::Config(format!(

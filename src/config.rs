@@ -2092,9 +2092,10 @@ pub const LTO_BACKEND_EXAMPLE: &str = r#"
 pub fn no_lto_backend_error(config_file: Option<&Path>) -> TapectlError {
     TapectlError::Config(format!(
         "no LTO drive configured — tapectl does not know what tape drive to use. Add it \
-         with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst \
-         --generation LTO-6` (`ls -l /dev/tape/by-id/` lists the drives), which writes \
-         its [[backends.lto]] table to {}; the commented example `tapectl init` left \
+         with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst` \
+         (`ls -l /dev/tape/by-id/` lists the drives; the generation is read from its \
+         model), which writes its [[backends.lto]] table to {}; the commented example \
+         `tapectl init` left \
          there is the same table by hand",
         config_file_named(config_file)
     ))
@@ -2627,7 +2628,7 @@ pub fn resolve_planning_backend<'a>(
         return Err(TapectlError::Config(format!(
             "no drive is configured in {} to plan against: plan for a generation with \
              --generation (LTO-6, say), or add the drive with `tapectl drive add --name lto6 \
-             --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`",
+             --device-tape /dev/tape/by-id/<drive>-nst`",
             config_file_named(config.source_file.as_deref())
         )));
     }

@@ -1218,9 +1218,10 @@ fn cmd_remove(
                 file.display()
             ),
             false => println!(
-                "removed collection \"{name}\" from {}; its {kept} stay registered and \
+                "removed collection \"{name}\" from {}; its {kept} {} registered and \
                  untouched (`tapectl unit list` names them), and no sync walks {} now",
                 file.display(),
+                if units == 1 { "stays" } else { "stay" },
                 lib.root
             ),
         }

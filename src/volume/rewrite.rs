@@ -1875,14 +1875,14 @@ fn cut_by_the_destination(
     }
     Ok(TapectlError::WriteInterrupted(format!(
         "volume \"{destination}\" sealed short: the drive's early warning ended its tape{}, and \
-         the early end cut {} unit(s) of this rewrite: {}. They are not on \"{destination}\"; \
+         the early end cut {} of this rewrite: {}. They are not on \"{destination}\"; \
          their staged slices are their only copy and stay held (nothing releases them, \
          `--force` included). Write them whole onto another cartridge with a full readback — \
          load one and run `tapectl volume write <LABEL> --init --full-confirm` (it writes \
          every staged set, these among them) — then `tapectl volume rewrite --resume \
          {destination}` closes the rewrite and releases staging.",
         ended_after.map_or_else(String::new, |k| format!(" after file {k}")),
-        units.len(),
+        crate::render::plural(units.len() as i64, "unit", "units"),
         units.join(", ")
     )))
 }

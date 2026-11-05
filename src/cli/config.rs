@@ -766,7 +766,7 @@ pub(crate) fn check_notes(conn: Option<&Connection>, cfg: &crate::config::Config
     if cfg.backends.lto.is_empty() {
         notes.push(
             "no drive is configured, so every write refuses: add it with `tapectl drive add \
-             --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`"
+             --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`"
                 .to_string(),
         );
     }

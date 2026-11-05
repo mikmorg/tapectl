@@ -207,8 +207,13 @@ fn superseding_verdict(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} has no copy at required location(s) {} (policy requires {})",
+                "superseding v{} has no copy at required {} {} (policy requires {})",
                 superseding.1,
+                if missing.len() == 1 {
+                    "location"
+                } else {
+                    "locations"
+                },
                 missing.join(", "),
                 super::coverage::describe_targets(&resolved.copies_at),
             ),
@@ -872,7 +877,7 @@ pub(crate) mod tests {
                 assert_eq!(superseding_version, Some(2));
                 assert!(
                     reason.contains(
-                        "superseding v2 has no copy at required location(s) offsite \
+                        "superseding v2 has no copy at required location offsite \
                          (policy requires home, offsite)"
                     ),
                     "{reason}"
@@ -924,13 +929,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reason(with_map(r#"{"home":1,"offsite":1}"#)),
-            "superseding v2 has no copy at required location(s) offsite \
+            "superseding v2 has no copy at required location offsite \
              (policy requires home, offsite)",
             "the positive control: the set's own names, as a map"
         );
         assert_eq!(
             reason(with_map(r#"{"offsite":2}"#)),
-            "superseding v2 has no copy at required location(s) offsite \
+            "superseding v2 has no copy at required location offsite \
              (policy requires 2 at offsite)"
         );
         assert_eq!(
@@ -1153,7 +1158,7 @@ pub(crate) mod tests {
         let blocked = ReclaimVerdict::Blocked {
             superseding_version: Some(2),
             freeable_bytes: 1000,
-            reason: "superseding v2 has copies in 1 location(s), needs 2 \
+            reason: "superseding v2 has copies in 1 location, needs 2 \
                      ([defaults] min_locations)"
                 .to_string(),
         };

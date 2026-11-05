@@ -1255,14 +1255,15 @@ impl PlaceShortfall {
         (places < floor).then_some(PlaceShortfall { places, floor })
     }
 
-    /// `"copies in 1 location(s), needs 2 ([defaults] min_locations)"`: the
+    /// `"copies in 1 location, needs 2 ([defaults] min_locations)"`: the
     /// words `audit`'s `location_count` and `snapshot mark-reclaimable` put
     /// after their subject (`"has "`, `"superseding v2 has "`). It carries no
     /// tape-only note: the floor is not multiplied.
     pub fn describe(&self) -> String {
         format!(
-            "copies in {} location(s), needs {} ([defaults] min_locations)",
-            self.places, self.floor
+            "copies in {}, needs {} ([defaults] min_locations)",
+            crate::render::plural(self.places, "location", "locations"),
+            self.floor
         )
     }
 }
@@ -5328,7 +5329,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             short.describe(),
-            "copies in 2 location(s), needs 3 ([defaults] min_locations)"
+            "copies in 2 locations, needs 3 ([defaults] min_locations)"
         );
         assert_eq!(ask(&conn, &config, "active"), None, "no floor, no question");
 
