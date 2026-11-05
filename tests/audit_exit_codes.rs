@@ -137,7 +137,13 @@ fn an_audit_command_line_that_does_not_parse_exits_70() {
         (&["--json", "audit", "--bogus"][..], "unexpected argument"),
     ] {
         let out = tapectl(home.path(), args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Under --json the message is the JSON error on stdout (ADR-0012
+        // item 212); otherwise clap's text on stderr.
+        let stderr = if args.contains(&"--json") {
+            String::from_utf8_lossy(&out.stdout)
+        } else {
+            String::from_utf8_lossy(&out.stderr)
+        };
         assert!(
             stderr.contains(says),
             "{args:?}: clap's own message is printed unchanged: {stderr}"

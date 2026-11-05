@@ -246,21 +246,26 @@ fn a_device_no_backend_claims_is_looked_at_with_a_note() {
     );
 }
 
-/// No drive configured and none named: an error, not a report — nothing on
-/// stdout, and the reason says how to name one.
+/// No drive configured and none named: an error, not a report — under
+/// `--json` the JSON error on stdout and nothing else (ADR-0012 item 212),
+/// and the reason says how to name one.
 #[test]
 fn no_drive_configured_and_none_named_is_an_error() {
     let home = TempDir::new().unwrap();
     ok(&run(home.path(), &["init"]), "init");
     let out = run(home.path(), &["drive", "status", "--json"]);
     assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "one JSON error ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(v["exit_code"], 2, "{v}");
+    assert!(v.get("outcome").is_none(), "an error, not a report: {v}");
+    assert!(v["error"].as_str().unwrap().contains("--device"), "{v}");
     assert!(
-        out.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--device"),
+        out.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

@@ -35,12 +35,16 @@ use config::{Config, TapectlPaths};
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
+    // ADR-0012 item 212 (OQ7): under `--json` every error is one JSON
+    // document on stdout, those raised before clap has parsed the line
+    // included, so whether it was asked for is read from the line first.
+    let json = cli::json_requested(&args);
     // ADR-0012 item 203: a spelling 1.9.0 removed is refused by name,
     // however it is typed (`--help` and `help <old>` included), before clap
     // parses the line and before any home is resolved, so the refusal reads
     // nothing and creates nothing.
     if let Some(renamed) = cli::renamed::find(&args) {
-        error::exit_with_error_code(&renamed.refusal().into(), error::EXIT_ERROR);
+        error::exit_reporting(&renamed.message(), error::EXIT_ERROR, json);
     }
     // The grouped top-level help (ADR-0012 item 211) is `cli::command()`'s.
     let cli = match cli::try_parse_from(&args) {
@@ -48,8 +52,12 @@ fn main() {
         Err(err) => {
             // Exactly `clap::Error::exit`, with the code decided here: it
             // prints the message unchanged (help and version to stdout, a
-            // usage error to stderr) and exits.
+            // usage error to stderr) and exits. Under `--json` a usage error
+            // is the JSON error instead; help and version stay text.
             let code = parse_error_exit_code(&err, &args);
+            if json && err.use_stderr() {
+                error::exit_reporting(&cli::usage_error_text(&err), code, true);
+            }
             let _ = err.print();
             std::process::exit(code);
         }
@@ -104,6 +112,9 @@ fn main() {
     // command line that did not parse was mapped above, in
     // `parse_error_exit_code`.)
     let contract = cli::error_contract(&cli.command);
+    // Item 212: how the error is reported, decided before `run` consumes
+    // `cli` too.
+    let json = cli.json;
     // Issue #393: the progress session lives here, not in `run`, so its log
     // records how the command ended (`session result:`) before its end line.
     let mut session = None;
@@ -124,7 +135,12 @@ fn main() {
         // the command checks, so it exits 75 — except where a command's own
         // contract already has a code for "no verdict, try again" (`volume
         // verify`'s 3), which it keeps. `ErrorContract::exit_code` decides.
-        error::exit_with_rendered(&text, contract.exit_code(&err));
+        error::exit_reporting_with(
+            &text,
+            contract.exit_code(&err),
+            json,
+            error::json_payload(&err),
+        );
     }
 }
 

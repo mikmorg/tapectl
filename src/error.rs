@@ -150,8 +150,7 @@ impl WriteOutcome {
     /// worst one any error in its chain is classified as, or `None` when
     /// none is — an error before anything was written.
     pub fn of(err: &anyhow::Error) -> Option<WriteOutcome> {
-        err.chain()
-            .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+        tapectl_errors(err)
             .filter_map(TapectlError::write_outcome)
             .max()
     }
@@ -191,7 +190,13 @@ pub enum ErrorContract {
 impl ErrorContract {
     /// The exit code for `err`, an error this contract's command returned.
     pub fn exit_code(self, err: &anyhow::Error) -> i32 {
-        let busy = || crate::db::busy::is_catalog_busy(err);
+        let busy = || {
+            crate::db::busy::is_catalog_busy(err)
+                || tapectl_errors(err).any(|e| {
+                    crate::db::busy::is_busy_error(e)
+                        || matches!(e, TapectlError::VolumeBusy { .. })
+                })
+        };
         match self {
             ErrorContract::Verify => EXIT_VERIFY_INCONCLUSIVE,
             ErrorContract::Audit if busy() => EXIT_CATALOG_BUSY,
@@ -228,6 +233,22 @@ impl ErrorContract {
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum TapectlError {
+    /// An error whose `--json` document carries facts beside its message
+    /// (ADR-0012 item 212): a command that refuses with a JSON report (a
+    /// retirement's impact, a consent refused) returns it this way instead
+    /// of printing the report and then failing, which put two documents on
+    /// stdout. Under `--json` `main` prints ONE document, `payload`'s keys
+    /// with `error` and `exit_code` beside them ([`json_error_document`]).
+    /// Everything else is the wrapped error's: its text (this variant adds
+    /// none and has no source, so nothing prints twice), its exit code and
+    /// every classification of it ([`TapectlError::unwrapped`]). Made with
+    /// [`TapectlError::with_json`].
+    #[error("{error}")]
+    WithJson {
+        payload: Box<serde_json::Value>,
+        error: Box<TapectlError>,
+    },
+
     // Database
     /// The SQLite text once, after "database error:". Not `#[from]`: that
     /// would also make the error this variant's `source()`, and `{:#}`
@@ -554,6 +575,23 @@ pub enum TapectlError {
 }
 
 impl TapectlError {
+    /// `error`, carrying `payload` into its `--json` document (see
+    /// [`TapectlError::WithJson`]). The plain-text error is `error`'s alone.
+    pub fn with_json(payload: serde_json::Value, error: impl Into<TapectlError>) -> TapectlError {
+        TapectlError::WithJson {
+            payload: Box::new(payload),
+            error: Box::new(error.into()),
+        }
+    }
+
+    /// The error itself, through any [`TapectlError::WithJson`] around it.
+    pub fn unwrapped(&self) -> &TapectlError {
+        match self {
+            TapectlError::WithJson { error, .. } => error.unwrapped(),
+            other => other,
+        }
+    }
+
     /// The write-family outcome this error was classified as, if any
     /// (issue #408).
     pub fn write_outcome(&self) -> Option<WriteOutcome> {
@@ -580,9 +618,7 @@ impl TapectlError {
     /// [`Self::erase_exit_code`] of the first classified erase error in
     /// `err`'s chain.
     pub fn erase_exit_code_of(err: &anyhow::Error) -> Option<i32> {
-        err.chain()
-            .filter_map(|cause| cause.downcast_ref::<TapectlError>())
-            .find_map(TapectlError::erase_exit_code)
+        tapectl_errors(err).find_map(TapectlError::erase_exit_code)
     }
 
     /// An error raised once volume `label`'s write session holds state the
@@ -723,17 +759,56 @@ fn did_you_mean(typed: &str, labels: &[String]) -> String {
     format!(" — did you mean {}?", quoted.join(" or "))
 }
 
+/// Every [`TapectlError`] in `err`'s chain, each seen through any
+/// [`TapectlError::WithJson`] around it: what every classification of an
+/// error reads, so a JSON payload never changes an exit code or a message.
+fn tapectl_errors(err: &anyhow::Error) -> impl Iterator<Item = &TapectlError> {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+        .map(TapectlError::unwrapped)
+}
+
+/// The JSON payload `err` carries for its `--json` document, if a
+/// [`TapectlError::WithJson`] in its chain gives one (the outermost).
+pub fn json_payload(err: &anyhow::Error) -> Option<&serde_json::Value> {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+        .find_map(|e| match e {
+            TapectlError::WithJson { payload, .. } => Some(payload.as_ref()),
+            _ => None,
+        })
+}
+
+/// The one JSON document an error is under `--json` (ADR-0012 item 212):
+/// `{"error": text, "exit_code": code}` ([`crate::render::json_error`]), with
+/// `payload`'s keys beside them when the error carries one (an object's keys
+/// merged, `error` and `exit_code` winning; anything else as `details`).
+pub fn json_error_document(
+    text: &str,
+    code: i32,
+    payload: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let error = crate::render::json_error(text, code);
+    let mut doc = match payload {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map.clone()),
+        Some(other) => serde_json::json!({ "details": other }),
+        None => return error,
+    };
+    if let (Some(doc), serde_json::Value::Object(error)) = (doc.as_object_mut(), error) {
+        doc.extend(error);
+    }
+    doc
+}
+
 /// Whether [`render`] reads the catalog for `err`: a `volume not found`, or
 /// an interrupted write session's hint. `main` opens the catalog only then.
 pub fn render_reads_catalog(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
-        .any(|e| {
-            matches!(
-                e,
-                TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
-            )
-        })
+    tapectl_errors(err).any(|e| {
+        matches!(
+            e,
+            TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
+        )
+    })
 }
 
 /// The catalog at `db_file`, opened read-only for [`render`]: never created,
@@ -769,15 +844,12 @@ pub fn render(err: &anyhow::Error, catalog: Option<&rusqlite::Connection>) -> St
     let Some(conn) = catalog else {
         return text;
     };
-    let found = err
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<TapectlError>())
-        .find(|e| {
-            matches!(
-                e,
-                TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
-            )
-        });
+    let found = tapectl_errors(err).find(|e| {
+        matches!(
+            e,
+            TapectlError::VolumeNotFound(_) | TapectlError::WriteInterrupted(_)
+        )
+    });
     match found {
         Some(TapectlError::VolumeNotFound(label)) => match volume_labels(conn) {
             Ok(labels) => format!("{text}{}", did_you_mean(label, &labels)),
@@ -903,7 +975,34 @@ pub fn exit_with_error_code(err: &anyhow::Error, code: i32) -> ! {
 
 /// [`exit_with_error_code`] for an error already rendered ([`render`]).
 pub fn exit_with_rendered(text: &str, code: i32) -> ! {
-    eprintln!("error: {text}");
+    exit_reporting(text, code, false)
+}
+
+/// Report an error already rendered and exit `code` (ADR-0012 item 212): an
+/// `error: ` line on stderr, or under `--json` (`json` true) one JSON
+/// document on stdout, `{"error": text, "exit_code": code}`, so a script
+/// reading stdout gets a document whatever happened. The exit code is the
+/// same either way.
+pub fn exit_reporting(text: &str, code: i32, json: bool) -> ! {
+    exit_reporting_with(text, code, json, None)
+}
+
+/// [`exit_reporting`] for an error that may carry a JSON payload
+/// ([`json_payload`]): under `--json` its keys join the one document
+/// ([`json_error_document`]); the text path is unchanged.
+pub fn exit_reporting_with(
+    text: &str,
+    code: i32,
+    json: bool,
+    payload: Option<&serde_json::Value>,
+) -> ! {
+    if json {
+        crate::render::print_json(&json_error_document(text, code, payload));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    } else {
+        eprintln!("error: {text}");
+    }
     process::exit(code);
 }
 
@@ -934,6 +1033,64 @@ pub fn unfinished_after_seal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012 item 212: an error that carries a JSON payload is, under
+    /// `--json`, ONE document (the payload's keys, `error` and `exit_code`),
+    /// and in every other respect the error it wraps: its text once, its exit
+    /// code under every contract, its classification.
+    #[test]
+    fn an_error_with_a_json_payload_is_one_document_and_otherwise_the_error_it_wraps() {
+        let payload = serde_json::json!({
+            "consent": "refused",
+            "reason": "the LAST eligible copy",
+            "error": "the payload's own key loses",
+        });
+        let err: anyhow::Error = TapectlError::with_json(
+            payload.clone(),
+            TapectlError::Other("cannot retire: the LAST eligible copy".into()),
+        )
+        .into();
+        assert_eq!(render(&err, None), "cannot retire: the LAST eligible copy");
+        assert_eq!(json_payload(&err), Some(&payload));
+        let doc = json_error_document(&render(&err, None), EXIT_ERROR, json_payload(&err));
+        assert_eq!(doc["consent"], "refused");
+        assert_eq!(doc["reason"], "the LAST eligible copy");
+        assert_eq!(doc["error"], "cannot retire: the LAST eligible copy");
+        assert_eq!(doc["exit_code"], EXIT_ERROR);
+        // Without a payload: exactly the two keys.
+        let plain = json_error_document("x", 3, None);
+        assert_eq!(plain, crate::render::json_error("x", 3));
+        // A payload that is not an object is kept, under `details`.
+        let listed = json_error_document("x", 2, Some(&serde_json::json!([1, 2])));
+        assert_eq!(listed["details"], serde_json::json!([1, 2]));
+
+        // Classification sees through it: the write table, the erase table,
+        // a busy volume, a `volume not found` the render completes.
+        let wrapped = |e: TapectlError| -> anyhow::Error {
+            TapectlError::with_json(serde_json::json!({}), e).into()
+        };
+        assert_eq!(
+            ErrorContract::Write.exit_code(&wrapped(TapectlError::WriteInterrupted("L".into()))),
+            EXIT_WRITE_INTERRUPTED
+        );
+        assert_eq!(
+            ErrorContract::Erase.exit_code(&wrapped(TapectlError::EraseIncomplete("x".into()))),
+            EXIT_ERASE_INCOMPLETE
+        );
+        let busy = wrapped(TapectlError::VolumeBusy {
+            label: "L".into(),
+            action: "retire".into(),
+            holders: "pid 1".into(),
+        });
+        assert_eq!(ErrorContract::Ordinary.exit_code(&busy), EXIT_CATALOG_BUSY);
+        assert!(render_reads_catalog(&wrapped(
+            TapectlError::VolumeNotFound("L".into())
+        )));
+        // The positive control: an ordinary error under the same contracts.
+        let other = wrapped(TapectlError::Other("x".into()));
+        assert_eq!(ErrorContract::Ordinary.exit_code(&other), EXIT_ERROR);
+        assert_eq!(ErrorContract::Write.exit_code(&other), EXIT_ERROR);
+    }
 
     /// ADR-0012 2026-10-07 item 33: the warning names the copy that stands,
     /// the step and why, and the command that finishes it.

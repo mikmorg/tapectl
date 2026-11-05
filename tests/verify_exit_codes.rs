@@ -97,9 +97,12 @@ fn a_verify_whose_drive_cannot_be_opened_exits_3_and_touches_nothing() {
             "volume", "verify", "L6-EXIT", "--device", NO_DRIVE, "--json",
         ],
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("tape I/O error"), "stderr: {stderr}");
-    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    // Under --json the error is the JSON document on stdout (ADR-0012
+    // item 212), its exit_code the process's.
+    let stderr = String::from_utf8_lossy(&out.stdout);
+    assert!(stderr.contains("tape I/O error"), "stdout: {stderr}");
+    assert!(stderr.contains("\"exit_code\": 3"), "stdout: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stdout: {stderr}");
 
     let conn = tapectl::db::open(&db).unwrap();
     let (status, condition): (String, String) = conn
@@ -270,7 +273,13 @@ fn a_verify_command_line_that_does_not_parse_exits_3() {
         ),
     ] {
         let out = tapectl(home.path(), args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Under --json the message is the JSON error on stdout (ADR-0012
+        // item 212); otherwise clap's text on stderr.
+        let stderr = if args.contains(&"--json") {
+            String::from_utf8_lossy(&out.stdout)
+        } else {
+            String::from_utf8_lossy(&out.stderr)
+        };
         assert!(
             stderr.contains(says),
             "{args:?}: clap's own message is printed unchanged: {stderr}"

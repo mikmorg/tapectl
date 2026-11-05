@@ -907,9 +907,15 @@ pub fn overview_json(
             doc["next"] = serde_json::json!(s.next_commands());
         }
         Overview::NeedsServiceUser => doc["note"] = serde_json::json!(NEEDS_SERVICE_USER),
+        // The JSON error every command prints under `--json` (ADR-0012 item
+        // 212), its two keys beside what `status` could show.
         Overview::Unreadable(why) => {
-            doc["error"] = serde_json::json!(why);
-            doc["exit_code"] = serde_json::json!(EXIT_ERROR);
+            if let (Some(doc), serde_json::Value::Object(error)) = (
+                doc.as_object_mut(),
+                crate::render::json_error(why, EXIT_ERROR),
+            ) {
+                doc.extend(error);
+            }
         }
     }
     doc

@@ -169,6 +169,36 @@ pub fn try_parse_from(args: &[std::ffi::OsString]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cmd))
 }
 
+/// Whether `args` (argv, the program name first) asks for `--json`, read
+/// from the line itself: for the errors raised before clap has parsed it, a
+/// removed spelling's refusal and clap's own usage error, which under
+/// `--json` are JSON documents too (ADR-0012 item 212, OQ7). Nothing after
+/// `--` is read; once the line parses, `Cli::json` decides.
+pub fn json_requested(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|a| a.as_os_str() != "--")
+        .any(|a| a.as_os_str() == "--json")
+}
+
+/// The text of clap's usage error `err` for its JSON document: clap's own
+/// message without its `error: ` prefix, the usage and the hint after it
+/// kept. A command that needs a subcommand says so first (clap's text for
+/// it is the command's whole help).
+pub fn usage_error_text(err: &clap::Error) -> String {
+    let rendered = err.render().to_string();
+    let text = rendered.trim();
+    let text = text.strip_prefix("error: ").unwrap_or(text);
+    if err.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        let usage = text
+            .lines()
+            .find(|l| l.starts_with("Usage:"))
+            .unwrap_or("Usage:");
+        return format!("a subcommand is required ({usage}); --help lists them");
+    }
+    text.to_string()
+}
+
 /// clap's default help template with the command list replaced by
 /// [`HELP_GROUPS`], each command with its one-line about, and every option
 /// (all of them global at the top level, `-h` and `-V` with them) under
@@ -1043,6 +1073,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OQ7: `--json` is read from the line before clap parses it, wherever
+    /// it stands, and never after `--`.
+    #[test]
+    fn json_is_read_from_the_line_before_clap() {
+        let line = |a: &[&str]| -> Vec<std::ffi::OsString> {
+            std::iter::once("tapectl")
+                .chain(a.iter().copied())
+                .map(Into::into)
+                .collect()
+        };
+        assert!(json_requested(&line(&["--json", "volume", "info"])));
+        assert!(json_requested(&line(&["volume", "info", "L", "--json"])));
+        assert!(!json_requested(&line(&["volume", "info", "L"])));
+        assert!(!json_requested(&line(&[
+            "catalog", "search", "--", "--json"
+        ])));
+        assert!(!json_requested(&line(&["--jsonx"])));
     }
 
     /// Issue #427: a several-unit `stage create` names its session by the
