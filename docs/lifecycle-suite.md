@@ -56,13 +56,13 @@ the journal of everything done).
 | Name | What it exercises |
 |---|---|
 | `first-year` | Baseline: escrow BEFORE staging, 2 tenants, 3 units, 1 volume, full restore matrix |
-| `evolving-source` | Mutate every unit, dirty/diff/supersedable, v2 on a 2nd volume, both versions restorable |
+| `evolving-source` | Mutate every unit, dirty/diff/reclaimable, v2 on a 2nd volume, both versions restorable |
 | `key-rotation` | Rotate mid-archive; old (inactive), new, and escrow keys all still restore, on both volumes |
 | `tenant-reassign` | Move units between tenants; DB ownership change doesn't affect who can decrypt what |
 | `tape-only-and-reclaim` | mark-tape-only preconditions (copies/locations), reclaim and purge a superseded snapshot |
 | `compaction` | mhvtl-only: needs four cartridges, so it SKIPs, visibly, under `--single-cartridge` (which a real drive requires). compact-finish's copy-elsewhere refusal, then success once satisfied |
 | `retire-and-reuse` | Retire (refused sole-copy, then safe), cartridge reuse, ADR-0003 sealed-tape refusal |
-| `db-loss` | db backup/import, DB-less raw-volume + `import`, the pure heir path, `catalog rebuild` from tape |
+| `db-loss` | db backup/import, DB-less raw-volume + `volume import`, the pure heir path, `catalog rebuild` from tape |
 | `escrow-ordering` | issue #115 regression: stage-before-escrow refusal, then a working escrow restore |
 | `restore-file-and-catalog` | catalog vs. `find`, single-file restore (unicode/empty/symlink), integrity checks |
 | `quick-archive` | The one-shot create+stage+write flow |
@@ -70,7 +70,7 @@ the journal of everything done).
 | `permute` | Seeded random walk over the whole command surface (`--seed`/`--steps`) |
 | `stale-catalog-sealed-tape` | issue #208: a catalog restored from a backup taken before the write still calls the volume `initialized`; `volume write` must be refused by the tape-side seal check (the refusal cites ADR-0003), not by the catalog |
 | `cartridge-displacement` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issue #226: erase a cartridge bound to a sealed volume in place and re-init it without `--force` (ADR-0010). The displaced volume becomes `erased`, and the warning must tell the unit left with zero copies apart from the one with a copy elsewhere; a restore matrix off that other copy proves it is real |
-| `collection-second-copy` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issues #226/#229: `collection run` refuses a second `--label` before staging anything; one run writes copy 1 and keeps staging, a `volume write --keep-staging` makes copy 2 from the same staged bytes, a restore matrix runs off copy 2, then staging is released |
+| `collection-second-copy` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issues #226/#229: a second `--label` on `collection run` is a usage error, refused while the command line is parsed (exit 2), before anything is read or staged; one `collection run --init --move-to` initialises the blank cartridge, writes copy 1 and moves it, and keeps every unit's staging (each is at 1 of 2 copies; the release is per unit since 1.9.0), a `volume write --keep-staging` makes copy 2 from the same staged bytes, a restore matrix runs off copy 2, then staging is released |
 | `rewrite-in-place` | One cartridge, one volume, so it also runs under `--single-cartridge`. issue #483 (ADR-0012 item 106): `volume rewrite` compacts the tape on the cartridge it is on although it holds the only copy of every unit. `volume rewrite` is refused with `--yes` alone and with a wrong label (nothing changes), `--dry-run` shows the plan, then `--only-copy-on-staging VOL-R` runs it: VOL-R is erased and VOL-R2 sealed on the same cartridge, `report capacity` shows the freed space, the events name the window, `stage clean --force` finds nothing held, and the restore matrix recovers the tape-only unit `docs` and `big` from the rewritten tape |
 
 ## The restore matrix
@@ -141,10 +141,11 @@ and therefore the failure, is identical.
   (`pending_erase`, set by `volume retire`), not whether a physical erase
   happened — the DB has no way to observe that.
 - **Every check is expected to pass.** `db-loss`'s scenario (b) used to be a
-  deliberate failure — top-level `import` inserts only a bare `volumes` row,
+  deliberate failure — `volume import` (the top-level `import` before 1.9.0)
+  inserts only a bare `volumes` row,
   so a follow-on `restore unit` had nothing to resolve against. The CTO
   settled [#136](https://github.com/mikmorg/tapectl/issues/136) the other
-  way: `import` registers a cartridge and that is all it was for, and
+  way: `volume import` registers a cartridge and that is all it was for, and
   rebuilding the catalog is its own command. Arm (b) now asserts that
   refusal positively, and arm **(d)** drives
   `catalog rebuild --from-volume` end to end AND the disaster-recovery
