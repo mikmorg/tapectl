@@ -152,25 +152,16 @@ fn receipt_in_help_means_only_the_recipients_or_a_deposit() {
     }
 }
 
-/// The top-level commands Wave 6's two other workers bring to the rules
-/// below in parallel with this file (1.9.0: 6B the tape side, 6C sources and
-/// reports). The coordinator empties it at integration; from then on every
-/// command is held to them.
-const PENDING_WAVE6: &[&str] = &[
-    "volume",
-    "cartridge",
-    "restore",
-    "catalog",
-    "report",
-    "collection",
-    "unit",
-    "snapshot",
-    "stage",
-];
+/// Top-level commands exempt from the rules below. Empty since Wave 6's
+/// integration (1.9.0): every command is held to them.
+const PENDING_WAVE6: &[&str] = &[];
 
-/// The width `-h` is judged at: clap's own when the output is not a
-/// terminal, and the width every docs page and script sees.
-const HELP_WIDTH: usize = 100;
+/// The longest first paragraph `-h` may show: one line of help text. Item
+/// 211 asks that each command's and option's first paragraph be one line;
+/// how clap then wraps it depends on the terminal's width and the widest
+/// option name beside it, so the text is judged, not one rendering of it
+/// (coordinator's ruling at Wave 6: 6B kept to 92 characters).
+const SHORT_HELP_MAX: usize = 92;
 
 /// Every visible command under the grouped, built tree the binary parses,
 /// with its path, skipping the top-level commands in [`PENDING_WAVE6`],
@@ -230,46 +221,37 @@ fn visible_help_texts() -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// The entries of `-h` (rendered at [`HELP_WIDTH`]) that take more than one
-/// line: the command's own description above the usage, and each command,
-/// argument and option listed under a heading.
-fn wrapped_short_help(cmd: &clap::Command) -> Vec<String> {
-    let help = cmd.clone().term_width(HELP_WIDTH).render_help().to_string();
-    let mut wrapped = Vec::new();
-    let about: Vec<&str> = help
-        .lines()
-        .take_while(|l| !l.starts_with("Usage:"))
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if about.len() > 1 {
-        wrapped.push(format!("its description: {}", about.join(" / ")));
-    }
-    let mut entry: Option<&str> = None;
-    for line in help.lines().skip_while(|l| !l.starts_with("Usage:")) {
-        if line.chars().count() > HELP_WIDTH && !line.starts_with("Usage:") {
-            wrapped.push(format!("wider than {HELP_WIDTH}: {line}"));
+/// The entries `-h` shows for `cmd` whose first paragraph is not one line of
+/// at most [`SHORT_HELP_MAX`] characters: the command's own description, each
+/// visible argument and option, and each visible subcommand's description.
+fn long_short_help(cmd: &clap::Command) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut check = |what: String, text: Option<&clap::builder::StyledStr>| {
+        if let Some(t) = text {
+            let t = t.to_string();
+            if t.contains('\n') || t.chars().count() > SHORT_HELP_MAX {
+                found.push(format!("{what}: {t}"));
+            }
         }
-        // An entry starts at column 2 (a command, an argument, `-x, --x`)
-        // or at 6 (an option with no short form); anything else indented
-        // is the entry before it, carried on.
-        let indent = line.len() - line.trim_start().len();
-        let rest = line.trim_start();
-        if indent == 2 || (indent == 6 && rest.starts_with("--")) {
-            entry = Some(line);
-        } else if indent > 0 && !rest.is_empty() {
-            wrapped.push(format!("{} / {rest}", entry.unwrap_or("?").trim()));
-        } else if indent == 0 {
-            entry = None;
-        }
+    };
+    check("about".to_string(), cmd.get_about());
+    for arg in cmd.get_arguments().filter(|a| !a.is_hide_set()) {
+        let name = arg
+            .get_long()
+            .map(|l| format!("--{l}"))
+            .unwrap_or_else(|| format!("<{}>", arg.get_id()));
+        check(name, arg.get_help());
     }
-    wrapped
+    for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+        check(sub.get_name().to_string(), sub.get_about());
+    }
+    found
 }
 
 /// ADR-0012 item 211: `-h` gives one line per command and per option (the
 /// first paragraph of its doc comment) and `--help` the rest. Judged on the
-/// help itself, rendered at [`HELP_WIDTH`]: an entry that wraps, or that
-/// clap moves below its name because it would, takes two. A tree walk, so a
-/// command added later is held to it the day it is added.
+/// first paragraph itself ([`SHORT_HELP_MAX`]). A tree walk, so a command
+/// added later is held to it the day it is added.
 #[test]
 fn every_short_help_is_one_line() {
     let commands = visible_commands();
@@ -286,18 +268,18 @@ fn every_short_help_is_one_line() {
         .arg(
             clap::Arg::new("long")
                 .long("long")
-                .help("word ".repeat(HELP_WIDTH / 3)),
+                .help("word ".repeat(SHORT_HELP_MAX / 4)),
         );
-    let found = wrapped_short_help(&control);
+    let found = long_short_help(&control);
     assert!(
         !found.is_empty() && found.iter().all(|w| w.contains("--long")),
-        "the check finds the one wrapped entry: {found:?}"
+        "the check finds the one long entry: {found:?}"
     );
 
     let offenders: Vec<String> = commands
         .iter()
         .flat_map(|(path, cmd)| {
-            wrapped_short_help(cmd)
+            long_short_help(cmd)
                 .into_iter()
                 .map(move |w| format!("{path} -h: {w}"))
         })
