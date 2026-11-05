@@ -915,9 +915,11 @@ pub fn run(startup: &Startup, last: usize, json_output: bool) -> Result<i32> {
             render(logs_dir, &sessions),
             render_overview(&overview)
         );
-        if let Overview::Unreadable(why) = &overview {
-            eprintln!("error: {why}");
-        }
+    }
+    // The error line goes to stderr under `--json` too, as every command's
+    // does (`error::exit_reporting_with`): a script reading stderr sees it.
+    if let Overview::Unreadable(why) = &overview {
+        eprintln!("error: {why}");
     }
     Ok(overview.exit_code())
 }
