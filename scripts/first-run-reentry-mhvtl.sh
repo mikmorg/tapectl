@@ -755,9 +755,11 @@ barcode_of() { sql "SELECT c.barcode FROM cartridges c JOIN cartridge_volumes cv
                     JOIN volumes v ON v.id = cv.volume_id WHERE v.label = ?" "$1"; }
 
 # The precondition of copy 2, from the catalog D left: the copy floor is 2
-# ([defaults] min_copies and min_locations in force, read with config get;
-# nothing in the private profile sets them), and every unit is still staged
-# with its one copy, so the release E1 expects has something to release.
+# ([defaults] min_copies and min_locations in force, read with config get:
+# step 7's init writes both, and nothing in the private profile sets them;
+# and each staged unit's resolved floor, from stage list), and every unit is
+# still staged with its one copy, so the release E1 expects has something to
+# release.
 step_copy2_preconditions() {
     local key val nunits staged
     for key in defaults.min_copies defaults.min_locations; do
@@ -767,9 +769,15 @@ step_copy2_preconditions() {
         echo "$key: $val"
         [ "${val%% *}" = 2 ] || { echo "$key is not 2: copy 2 would not be the copy that meets the floor (report, do not change it)"; return 1; }
     done
-    if sudo -u "$SVC_USER" -H grep -E '^ *(min_copies|min_locations|copies_at) *=' "$RUN/home/config.toml"; then
-        echo "config.toml sets a copy floor of its own (above)"; return 1
-    fi
+    # The floor each staged unit is held to, resolved (min_copies and its
+    # copies_at), and its one copy so far.
+    sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" stage list --status staged --json \
+        | python3 -c 'import json, sys
+rows = json.load(sys.stdin)
+for r in rows:
+    print("staged:", r.get("unit"), "copy_floor=%s copies=%s" % (r.get("copy_floor"), r.get("copies")))
+sys.exit(0 if rows and all(r.get("copy_floor") == 2 and r.get("copies") == 1 for r in rows) else 1)' \
+        || { echo "want every staged unit at copy floor 2 with 1 copy (above)"; return 1; }
     nunits="$(units_count)"; staged="$(sql "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'")"
     echo "units: $nunits; stage sets: $(stage_sets_by_status); catalog: $(catalog_rows)"
     { [ "$nunits" -ge 1 ] && [ "$staged" = "$nunits" ]; } \
