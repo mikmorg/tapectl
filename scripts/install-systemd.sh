@@ -25,6 +25,14 @@
 #                                                tapectl home's path, root 0644, so
 #                                                an [ops] group member's plain
 #                                                `tapectl status` finds it (#437)
+#   /usr/local/share/bash-completion/completions/tapectl
+#   /usr/local/share/bash-completion/completions/tapectl-op
+#                                                bash completion, from `<tapectl>
+#                                                completions bash`; tapectl-op's is
+#                                                the same function, its words being
+#                                                tapectl's (ADR-0012 item 211)
+#   /usr/local/share/man/man1/tapectl*.1         the man pages, from docs/man/ (one
+#                                                per command; tapectl-op has none)
 #
 # The units under contrib/systemd/ are written for the default service user
 # (`tapectl`, home /var/lib/tapectl); this script rewrites User=, HOME=,
@@ -58,6 +66,12 @@
 # Everything else runs exactly as before. --tape-nice '' turns the raise off:
 # tapectl-op then always runs `sudo -u <user> -H <tapectl>`, as it used to, and
 # the drive-poll unit loses its Nice= and IOScheduling lines.
+#
+# The completion and the man pages are rewritten only when their bytes differ,
+# and a page a later release no longer ships is removed. The completion comes
+# from the binary this host runs, so a run before it is installed (first-run
+# step 3) skips it and says so. TAPECTL_COMPLETION_DIR and TAPECTL_MAN_DIR aim
+# them elsewhere, as TAPECTL_UNIT_DIR aims the units.
 #
 # What it never does: create the service user (scripts/first-run.sh step 5),
 # install the tapectl binary (step 3), touch a tape or a device node, or —
@@ -94,6 +108,10 @@ WRAPPER_TEMPLATE=tapectl-op.in   # under contrib/systemd/
 # The system home pointer (issue #437). The same variable the tapectl binary
 # reads to find it, so a dry run or a test can aim both at a scratch path.
 POINTER_PATH="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
+# Bash completion and the man pages (ADR-0012 item 211, OQ17), overridable as
+# the units' directory is.
+COMPLETION_DIR="${TAPECTL_COMPLETION_DIR:-/usr/local/share/bash-completion/completions}"
+MAN_DIR="${TAPECTL_MAN_DIR:-/usr/local/share/man/man1}"
 UNITS=(tapectl-audit.service tapectl-audit.timer tapectl-backup.service tapectl-backup.timer tapectl-drive-poll.service tapectl-drive-poll.timer)
 TIMERS=(tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer)
 SCRIPTS=(tapectl-scheduled-audit.sh tapectl-scheduled-backup.sh tapectl-scheduled-drive-poll.sh)
@@ -203,9 +221,11 @@ if [ "$UNINSTALL" = 1 ]; then
   for s in "${SCRIPTS[@]}"; do [ -e "$LIBDIR/$s" ] && as_root rm -f "$LIBDIR/$s"; done
   [ -d "$LIBDIR" ] && [ -z "$(ls -A "$LIBDIR" 2>/dev/null)" ] && as_root rmdir "$LIBDIR"
   [ -e "$WRAPPER_PATH" ] && as_root rm -f "$WRAPPER_PATH"
+  for c in tapectl tapectl-op; do [ -e "$COMPLETION_DIR/$c" ] && as_root rm -f "$COMPLETION_DIR/$c"; done
+  for m in "$MAN_DIR"/tapectl.1 "$MAN_DIR"/tapectl-*.1; do [ -e "$m" ] && as_root rm -f "$m"; done
   as_root systemctl daemon-reload
   as_root systemctl reset-failed 'tapectl-*' || true
-  ok "units, wrappers and $WRAPPER_PATH removed"
+  ok "units, wrappers, $WRAPPER_PATH, the bash completion and the man pages removed"
   note "left in place on purpose: the service user, its home, $BIN, the backups in $BACKUP_DIR, and the home pointer $POINTER_PATH"
   note "docs/install.md 'Uninstall' has the commands for those (remove the pointer when you delete the home it names)"
   exit 0
@@ -377,11 +397,32 @@ sed -e "s|@SVC_USER@|$SVC_USER|" -e "s|@TAPECTL@|$BIN|" \
     -e "s|@TAPE_NICE@|$TAPE_NICE|" -e "s|@TAPE_IONICE@|$IONICE_ARGS|" \
     -e "s|@TAPECTL_HOME@|$TAPECTL_HOME_DIR|" \
     "$SRC/$WRAPPER_TEMPLATE" > "$TMP/tapectl-op"
+# Bash completion (ADR-0012 item 211, OQ17): the binary's own script, plus the
+# same function bound to tapectl-op, whose words are tapectl's. From the binary
+# this host runs, and only when it is a tapectl that prints one.
+COMPLETION=0
+if [ -x "$BIN" ] && "$BIN" completions bash >"$TMP/completion" 2>/dev/null && grep -q '^_tapectl()' "$TMP/completion"; then
+  cat >>"$TMP/completion" <<'OPCOMPLETE'
+
+# tapectl-op runs tapectl as the service user: the same words, the same function.
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _tapectl -o nosort -o bashdefault -o default tapectl-op
+else
+    complete -F _tapectl -o bashdefault -o default tapectl-op
+fi
+OPCOMPLETE
+  COMPLETION=1
+fi
 if [ -n "$RENDER_DIR" ]; then
   mkdir -p "$RENDER_DIR" || die "cannot create $RENDER_DIR"
   for u in "${UNITS[@]}"; do cp "$TMP/$u" "$RENDER_DIR/$u"; done
   install -m 0755 "$TMP/tapectl-op" "$RENDER_DIR/tapectl-op"
-  ok "rendered ${#UNITS[@]} units and tapectl-op into $RENDER_DIR — nothing was installed"
+  if [ "$COMPLETION" = 1 ]; then
+    install -m 0644 "$TMP/completion" "$RENDER_DIR/tapectl.bash-completion"
+    ok "rendered ${#UNITS[@]} units, tapectl-op and the bash completion into $RENDER_DIR — nothing was installed"
+  else
+    ok "rendered ${#UNITS[@]} units and tapectl-op into $RENDER_DIR — nothing was installed"
+  fi
   exit 0
 fi
 if [ "$DRY" = 1 ]; then
@@ -421,6 +462,31 @@ if [ "$WRAPPER" = 1 ] && [ "$SVC_USER" = "$(id -un)" ]; then
 fi
 if [ "$WRAPPER" = 1 ]; then
   if same_as "$WRAPPER_PATH" "$TMP/tapectl-op"; then ok "$WRAPPER_PATH unchanged"; else as_root install -D -m 0755 "$TMP/tapectl-op" "$WRAPPER_PATH"; fi
+fi
+
+# --- bash completion and the man pages (ADR-0012 item 211, OQ17)
+if [ "$COMPLETION" = 1 ]; then
+  COMPLETION_NAMES=(tapectl); [ "$WRAPPER" = 1 ] && COMPLETION_NAMES+=(tapectl-op)
+  for c in "${COMPLETION_NAMES[@]}"; do
+    if same_as "$COMPLETION_DIR/$c" "$TMP/completion"; then ok "$COMPLETION_DIR/$c unchanged"; else as_root install -D -m 0644 "$TMP/completion" "$COMPLETION_DIR/$c"; fi
+  done
+else
+  note "no bash completion: $BIN is not a tapectl that prints one yet — re-run this script once it is installed"
+fi
+MAN_PAGES=("$REPO"/docs/man/tapectl.1 "$REPO"/docs/man/tapectl-*.1)
+if [ -f "${MAN_PAGES[0]}" ]; then
+  MAN_CHANGED=0
+  for m in "${MAN_PAGES[@]}"; do
+    same_as "$MAN_DIR/$(basename "$m")" "$m" && continue
+    as_root install -D -m 0644 "$m" "$MAN_DIR/$(basename "$m")"; MAN_CHANGED=$((MAN_CHANGED + 1))
+  done
+  # A page an earlier release installed for a command this one no longer has.
+  for m in "$MAN_DIR"/tapectl.1 "$MAN_DIR"/tapectl-*.1; do
+    if [ -e "$m" ] && [ ! -e "$REPO/docs/man/$(basename "$m")" ]; then as_root rm -f "$m"; MAN_CHANGED=$((MAN_CHANGED + 1)); fi
+  done
+  [ "$MAN_CHANGED" != 0 ] || ok "$MAN_DIR: ${#MAN_PAGES[@]} man pages unchanged"
+else
+  note "no man pages under $REPO/docs/man — run this script from a tapectl checkout"
 fi
 
 # --- the system home pointer (issue #437, ADR-0012 2026-10-15 item 62):
