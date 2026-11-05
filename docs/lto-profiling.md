@@ -260,12 +260,27 @@ Paste it into `config.toml` (replace the drive's existing block), then:
 tapectl config check
 ```
 
+Or set the one figure on the drive already configured, by the bare key when there is one
+drive (`config get post_warning_bytes` reads it back):
+
+```bash
+tapectl config set post_warning_bytes 99008M
+```
+
+On a host installed by `scripts/first-run.sh`, put the figure in the host profile instead,
+`POST_WARNING_BYTES=99008M`: step 8 writes it onto the drive's `post_warning_bytes`, on a first
+run and a re-run alike, and refuses, naming both values, a drive that already says something else
+([install.md](install.md)). Until the figure is set, `config check`
+says what the drive loses without it in a `note:` line.
+
 ## `post_warning_bytes` and the slice cap
 
 `post_warning_bytes` (a size in **decimal** units, like `capacity_override`: `99008M`, `99G`, or a
-bare byte count; above zero; `config set` validates it like the other keys and refuses a value that breaks the cap) is the room a write
-has between the drive's early warning and the hard end of the medium. Tapectl uses it for one
-check (ADR-0012 item 100): with the key on any configured drive, **a slice plus the seal must fit
+bare byte count; from 1.9.0 also `KiB` to `TiB`, which are binary; above zero; `config set`
+validates it like the other keys and refuses a value that breaks the cap) is the room a write
+has between the drive's early warning and the hard end of the medium. Only a drive that declares
+it may plan a tape past the fill ceiling (ADR-0012 item 113), and it sets one check (ADR-0012
+item 100): with the key on any configured drive, **a slice plus the seal must fit
 in half of the smallest such room** (a 2x margin for wear and variance), so that a tape can still
 be sealed after the warning.
 
