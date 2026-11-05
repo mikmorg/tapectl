@@ -284,7 +284,7 @@ so the examples in this guide, and in the other pages, leave it out. Pass it,
 as the by-id path, when:
 
 - **more than one drive is configured.** Every command that touches a tape
-  then refuses without it (`multiple LTO backends configured … pass --device to
+  then refuses without it (`multiple LTO drives configured (…); pass --device to
   select one`).
 - **a read has no backend configured.** `volume identify`, `volume verify`,
   `restore`, `catalog rebuild` and `volume read-slices` take any path you give
@@ -308,6 +308,11 @@ drill — pass `--home` (or export `TAPECTL_HOME`):
 tapectl --home /mnt/usb/archive report copies
 TAPECTL_HOME=/mnt/usb/archive tapectl audit
 ```
+
+`tapectl status` and `tapectl config check` print the home in use on a `home:`
+line, with the rule that chose it (`named by --home`, `named by TAPECTL_HOME`,
+`this account's ~/.tapectl`, the home pointer `/etc/tapectl/home`, …), so a
+command about to work on the wrong archive shows it.
 
 `--config` points at a config *file*. On its own it **also** relocates the
 whole home to that file's parent directory — database, keys, catalogs, stage
@@ -549,7 +554,8 @@ is not enough.) No `stage clean` was needed: the second copy released every
 unit's staging itself. `--keep-staging` on a write holds everything, and
 `--keep-staging-for-locations` holds each unit until every one of its
 `copies_at` targets is met too ([Copies by location](#copies-by-location));
-`stage clean` releases what they held later, by the same rule.
+`stage clean` releases what they held later, judging each unit by its copy
+floor.
 
 The long form is still there: `volume init LABEL`, then `volume write LABEL`,
 then `volume move LABEL --to PLACE`, with `--full-confirm` on the write or a
