@@ -49,7 +49,7 @@ needs preparing first has a prep script beside it. The profiles in
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
 | on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and when neither is set it refuses unless `--mint-escrow` is passed (§6) |
 | a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem or a disk with the home |
-| a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 asks for its medium serial and refuses any other cartridge |
+| a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 reads the loaded cartridge's chip first and refuses an empty drive before it asks anything; then it asks for the medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 asks for the directory, then shows what is free there |
 
 Staging and backups need thought on any host whose root filesystem is small. Step 7
@@ -145,11 +145,12 @@ can set the flags' own values: `DEVICE` (`--device`), `SG` (`--sg`), `DGEN`
 | `CONTENDER_PROCESSES` | 7 | an array: `[host_check] contender_processes`, the processes `host check` names before a write. It replaces the built-in list (`cargo rustc docker Runner.Worker`), so repeat that when adding one |
 | `DAR_BIN` (`--dar`) | 2, 4, 7, 12 | the dar that is checked, tested against, and written into `[dar] binary` |
 | `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
+| `POST_WARNING_BYTES` | 8 | the drive's `post_warning_bytes`: its room past the early warning, as `scripts/lto-profile.sh` measured it, in decimal units (`99008M` is 99,008,000,000 bytes; ADR-0012 item 200). Step 8 sets it with `config set` on the drive it registers, and on a re-run over a drive that has none. A drive that already has this value is left alone; one with a different value is refused, never overwritten, and the refusal names both values and the `config set` that takes the profile's. Empty: step 8 says once what a drive without it loses (planning past the fill ceiling, and the slice cap) and points to [Profiling an LTO drive](lto-profiling.md) |
 | `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |
 | `TENANTS=("name\|description" …)` | 11 | non-operator tenants, created if missing |
 | `ESCROW_PUBLIC_KEY` (`--escrow-public-key`) | 7 | the original escrow public key (`age1…` or a `.pub` path): `init` adopts it (`--escrow-public-key`) instead of minting a new escrow identity, so an existing Heir Kit stays valid. Empty: step 7 asks; under `--auto` it refuses on a fresh home unless `--mint-escrow` is on the command line (§2), which no profile can set |
 | `ADOPT_KEYS_FROM` (`--adopt-keys-from`) | 7, 11 | a directory of `<name>.key` age identity files: `init` adopts `<operator>.key` (`--operator-key`) and each `TENANTS` entry still to be created adopts `<tenant>.key` (`tenant add --adopt-key`) instead of minting keys, each previewed with `--dry-run` first. A missing or unreadable file stops the step before anything is created. The copy-out is in [keys-and-recovery.md](keys-and-recovery.md#f-keeping-existing-keys-on-a-fresh-home) |
-| `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
+| `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | each root granted by ACL, then added with `tapectl collection add` (it refuses a missing, relative or overlapping root, an unknown tenant, and access the service user lacks, then writes the `[[collections]]` table), then `collection sync`. A collection `config.toml` already has is left as it is. A host needs none here: `tapectl collection add NAME ROOT --tenant TENANT` adds one at any time (ADR-0012 items 204, 206) |
 | `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
 | `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands run at: default `-10` and `-c2 -n0` (best-effort, level 0) (#432, ADR-0012 2026-10-15 item 58). Step 13 raises `first-run.sh`'s own shell once with `sudo renice` and `sudo ionice`, and the write, resume and verify it starts inherit that; step 14 hands the same values to `install-systemd.sh` for [`tapectl-op` and the drive-poll unit](#7-the-timers-and-the-operator-wrapper). An empty `TAPE_NICE` never raises |
 | `ERASE_LABEL` | — | **never read from a profile**: it is consent to erase a sealed tape, so only `--erase-label` sets it (#469), and a profile's value is reported and ignored. `--mint-escrow` is a flag only for the same reason |
@@ -173,15 +174,16 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile --from 13
 The example prep's last part installs `/etc/sudoers.d/tapectl-operator`, which lets the
 operator run commands *as the service user* (and only as it) without a password.
 Every `tapectl` call in `first-run.sh` outside the step-12 rehearsal goes through
-`sudo -u tapectl`, and on a host whose sudo asks for a password the verify that
-follows a days-long write would otherwise wait at a prompt until sudo gives up.
+`sudo -u tapectl`, and on a host whose sudo asks for a password the commands that
+follow a days-long write (the shelf, the audit, the Heir Kit) would otherwise wait at
+a prompt until sudo gives up.
 
 That rule does not cover the one thing that needs root: raising the tape
 commands' priority (`TAPE_NICE`, above). Nice and ionice are inherited across
 `fork`, `exec` and `sudo -u`, so step 13 asks for root's `sudo` **once**, at its
 start, to raise `first-run.sh`'s own shell (`sudo renice`, `sudo ionice`: one
 password prompt, or `sudo -n` under `--auto`); every command it starts after
-that, the write, the resume branch and the post-write verify included, runs at
+that, the write with its full readback and the resume branch included, runs at
 that priority without asking root again. No sudo ticket is kept alive. The
 raise also covers step 13's other commands and step 14, and it cannot be undone
 by the script. Step 12's rehearsal and everything before step 13 stay at normal
@@ -208,14 +210,14 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only `dar`) | — | the script stops if red |
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |
 | 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (usually `tape`) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
-| 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`, created with `sudo mkdir -p` when missing and offered a `chown tapectl` when the service user cannot write it. With `OPS_GROUP` in the profile: that group (`groupadd --system`), the service user and you added to it, and `[ops] group` in `config.toml` (issue #393: members run `tapectl status` without sudo; step 7 writes the pointer `/etc/tapectl/home`, root 0644, naming the home, issue #437) | home 0700 `tapectl` (0710, group `OPS_GROUP`, with an ops group; `logs/` 2750); staging `tapectl` | `sudo -u tapectl -H tapectl config check`, `db fsck` |
-| 8 backend | a `[[backends.lto]]` table appended to `config.toml`: `device_tape` (by-id), `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010) | in `config.toml` | `tapectl config show` |
+| 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`. Step 7 then walks that path as the service user (ADR-0012 item 199): a directory above it that the service user cannot traverse is named, with the one line that grants traverse only (`sudo setfacl -m u:tapectl:x <parent>`), and the step stops; a parent that does not exist is refused ("Is its filesystem mounted?"), because making the whole path would put staging on the filesystem below it; a staging directory missing under a parent that exists is created (`sudo mkdir -m 0700`) and given to the service user; one that exists but the service user cannot write is refused with the `setfacl -m u:tapectl:rwx` line. Nothing that exists is chowned. With `OPS_GROUP` in the profile: that group (`groupadd --system`), the service user and you added to it, and `[ops] group` in `config.toml` (issue #393: members run `tapectl status` without sudo; step 7 writes the pointer `/etc/tapectl/home`, root 0644, naming the home, issue #437) | home 0700 `tapectl` (0710, group `OPS_GROUP`, with an ops group; `logs/` 2750); staging `tapectl`, 0700 when step 7 creates it | `sudo -u tapectl -H tapectl config check`, `db fsck` |
+| 8 drive | a `[[backends.lto]]` table appended to `config.toml` by `drive add`: `device_tape` (by-id), `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010); then `post_warning_bytes` from the profile's `POST_WARNING_BYTES` (ADR-0012 item 200) | in `config.toml` | `tapectl config show`, `tapectl config get post_warning_bytes` |
 | 9 heir kit | `~/heir-kit/` (**yours**; `--kit-out` moves it): `COVER.txt`, `escrow-kit.html`, `catalog.db.age`, `tapectl-<version>` (a copy of the installed binary; its sha256 is on the sheet) | you, 0700 | print `COVER.txt`, hand-write the secret on it, seal, two failure domains |
 | 10 location | a `locations` row (e.g. `home-rack`) | in the catalog | `tapectl location list` |
-| 11 tenants, units | tenant rows and keys under `keys/`; per unit: a POSIX ACL grant (`setfacl -R -m u:tapectl:rX` on the tree, the same as a default ACL so new files inherit it, `rwX` on the top directory only, `x` on each ancestor) and a **`.tapectl-unit.toml`** dotfile in the unit's top directory | files keep their owner and mode | `getfacl <dir>`, `tapectl unit list` |
-| 12 rehearsal | the lifecycle suite's run directories under `<work dir>/tapectl-lifecycle` (`--work-dir`: `/scratch` when it is writable, else `~/.cache/tapectl`; a profile's `WORK_DIR` sets another); on green, the marker **`~/.local/state/tapectl/rehearsal-ok-<sha256 of the binary, 16 hex>`**, which step 13 requires for that exact binary. May add **you** to the `tape` group (the suite runs as you) | you | the marker exists |
-| 13 first tape | the volume, its cartridge row (auto-registered from the chip serial), the write and verify records, a refreshed heir kit; per-run capture files under `~/.local/state/tapectl/` | — | `tapectl volume list`, `report verify-status` |
-| 14 timers, wrapper | via `scripts/install-systemd.sh` (§7): `/etc/systemd/system/tapectl-audit.{service,timer}`, `/etc/systemd/system/tapectl-backup.{service,timer}`, `/etc/systemd/system/tapectl-drive-poll.{service,timer}`, `/usr/local/lib/tapectl/tapectl-scheduled-{audit,backup,drive-poll}.sh`, the backup dir (**`/var/backups/tapectl`** by default), **`/usr/local/bin/tapectl-op`**, the home pointer **`/etc/tapectl/home`** | units root 0644, pointer root 0644, scripts root 0755, backup dir `tapectl` 0700, wrapper root 0755 | `systemctl list-timers 'tapectl-*'` |
+| 11 tenants, units | tenant rows and keys under `keys/`; per unit: a POSIX ACL grant (`setfacl -R -m u:tapectl:rX` on the tree, the same as a default ACL so new files inherit it, `rwX` on the top directory only, `x` on each ancestor) and a **`.tapectl-unit.toml`** dotfile in the unit's top directory; a profile's `COLLECTIONS` added by `collection add` as `[[collections]]` tables in `config.toml` | files keep their owner and mode | `getfacl <dir>`, `tapectl unit list`, `tapectl collection status` |
+| 12 rehearsal | the lifecycle suite's run directories under `<work dir>/tapectl-lifecycle` (`--work-dir`: `/scratch` when it is writable, else `~/.cache/tapectl`; a profile's `WORK_DIR` sets another); on green, the marker **`~/.local/state/tapectl/rehearsal-ok-<sha256 of the binary, 16 hex>`**, which step 13 requires for that exact binary. The step reads the loaded cartridge's chip before it asks for the serial, and refuses an empty drive there, before anything is asked or erased. May add **you** to the `tape` group (the suite runs as you) | you | the marker exists |
+| 13 first tape | the volume, its cartridge row (registered from the chip serial, with the volume's label as its barcode: ADR-0012 item 219), the write record, whose full readback is the tape's first full verify (item 218), the volume's location, a refreshed heir kit; per-run capture files under `~/.local/state/tapectl/` | — | `tapectl volume list`, `report verify-status` |
+| 14 timers, wrapper | via `scripts/install-systemd.sh` (§7): `/etc/systemd/system/tapectl-audit.{service,timer}`, `/etc/systemd/system/tapectl-backup.{service,timer}`, `/etc/systemd/system/tapectl-drive-poll.{service,timer}`, `/usr/local/lib/tapectl/tapectl-scheduled-{audit,backup,drive-poll}.sh`, the backup dir (**`/var/backups/tapectl`** by default), **`/usr/local/bin/tapectl-op`**, the home pointer **`/etc/tapectl/home`**, bash completion for `tapectl` and `tapectl-op` in `/usr/local/share/bash-completion/completions/`, the man pages in `/usr/local/share/man/man1/` | units root 0644, pointer root 0644, scripts root 0755, backup dir `tapectl` 0700, wrapper root 0755, completion and man pages root 0644 | `systemctl list-timers 'tapectl-*'` |
 
 Nothing is written to a tape before step 12, and step 12 erases only the
 cartridge whose serial you typed.
@@ -310,12 +312,22 @@ re-entry, and this list gives it for each:
   ```
   When the figures prove the unit cannot fit (`not enough space in staging
   directory …`), no flag overrides the refusal: free space first;
-- `volume init` refused in step 13. The script tells three kinds apart:
-  - a reason no flag overrides: a sealed cartridge (ADR-0003), `device_sg`
-    no longer bound to `device_tape`, or anything else the refusal names (no
-    cartridge loaded, a generation the drive cannot write, a retired
-    cartridge, …). The last line names `--from 13`, to run after acting on
-    the refusal;
+- `volume init` refused in step 13. The script tells these kinds apart:
+  - a SEALED volume of **this** catalog, one it still counts: most likely the
+    previous copy still in the drive when the next should be loaded. It is
+    never erased, and nothing is offered (ADR-0012 item 216): eject it
+    (`tapectl drive eject`), load a blank cartridge, and re-run `--from 13`
+    with the same `--label`;
+  - a SEALED volume this catalog holds no live copy of (a tape from an old
+    catalog, as after a fresh start): `--force` does not reach it (ADR-0003).
+    The step shows what the tape holds (`cartridge erase --dry-run`) and
+    offers `cartridge erase`: type the label File 0 carries, and it erases,
+    reads the tape back, records the cartridge and runs `volume init` again.
+    Under `--auto` it erases only when `--erase-label` names that label;
+  - a reason no flag overrides: `device_sg` no longer bound to
+    `device_tape`, or anything else the refusal names (no cartridge loaded,
+    a generation the drive cannot write, a retired cartridge, …). The last
+    line names `--from 13`, to run after acting on the refusal;
   - a stale or foreign tape (File 0 identifies a different volume that is
     not sealed) or an empty File 0. These are the only refusals `--force`
     overrides, and the script offers it where it stands: type the label to
@@ -326,6 +338,14 @@ re-entry, and this list gives it for each:
   - no readable medium serial. An interactive run asks you to name the
     cartridge (the barcode on its sticker) and carries on. Under `--auto` it
     stops and says to re-run `--from 13` interactively;
+- the write refused before anything was written (exit 2) in step 13. One
+  refusal to expect: step 13 writes with `--move-to` the place the tape goes
+  (`--location`, else the profile's first `LOCATIONS` entry), and a place the
+  catalog has no row for is refused before any byte (`--move-to location "X"
+  not found (known locations: …). Nothing was written.`). `tapectl location
+  list` names the places; add the missing one (`tapectl location add X -d
+  "…"`; step 10 adds a profile's `LOCATIONS`), then re-run `--from 13 --label
+  <label>`, which finds the volume initialised and goes straight to the write;
 - a red rehearsal, which ends `✗ rehearsal RED — do not write real data until
   this is understood` and names no re-entry: `--from 12` once understood.
   Never write real data over a red rehearsal.
@@ -338,10 +358,14 @@ catalog says the volume is (`tapectl volume info <label>`):
 - **initialised, nothing written** — straight to the write;
 - **an interrupted write** (a Ctrl-C, a dropped session, a crash) — the
   snapshot and staging phases are skipped and the step offers `volume resume`
-  on the same cartridge, after the quiet-host check. A tape whose seal was
-  written but whose confirm did not finish is re-confirmed, never rewritten;
-- **sealed** — only the post-write block is left: `volume verify --full`,
-  `audit`, the move to the shelf, the Heir Kit;
+  on the same cartridge, after the quiet-host check. The resume keeps what the
+  write asked for, its full readback and its shelf (ADR-0012 item 215). A tape
+  whose seal was written but whose confirm did not finish is re-confirmed,
+  never rewritten;
+- **sealed** — only what follows the write is left: the full readback, read
+  only when none is recorded (`report verify-status`: a write's
+  `--full-confirm` records one, as `volume verify --full` does), then the
+  move to the shelf, `audit` and the Heir Kit;
 - **a write in progress right now**, or **a session planned that never
   reached the tape** — it stops and names the remedy (let the live writer
   finish; `tapectl volume abort <label>`, then re-run this step with the
@@ -380,8 +404,10 @@ message naming the key, and offers to back the file up as
 through tapectl's own writer in a throwaway home (`init --no-escrow --operator
 config-template`, whose database is discarded), never a template. The
 database, keys, tenants and tapes are untouched; the `[[backends.lto]]` and
-`[[collections]]` tables are **not** carried over — step 8 re-adds the drive,
-collections are yours to re-add. The smallest fix is usually to edit the
+`[[collections]]` tables are **not** carried over — step 8 re-adds the drive
+and step 11 the profile's `COLLECTIONS`; any other collection is re-added with
+`tapectl collection add NAME ROOT --tenant TENANT` (the superseded file keeps its
+table). The smallest fix is usually to edit the
 named key by hand instead (delete it, or rename it as the message says).
 Under `--auto` the step never regenerates: it refuses, naming the key, and
 leaves the file as it is (ADR-0012 item 189). Fix the key, or run step 7
@@ -409,10 +435,12 @@ on the rebuilt machine, remove the empty home and start again — before
 importing or rebuilding anything into it. `docs/operator-guide.md`,
 "Disaster Recovery", step 1, has the full reasoning.
 
-**Step 8** finds the existing backend and only cross-checks it: if the
+**Step 8** finds the existing drive entry and only cross-checks it: if the
 config's `device_tape` is not the drive you chose in step 6, it says so and
 leaves the edit to you (`tapectl config set 'backends.lto[NAME].device_tape' <dev>`;
-there is no `backend edit`). `device_sg` is derived
+there is no `drive edit`). It then applies the profile's `POST_WARNING_BYTES`
+as on a first run: set when the drive has none, never over a different value
+(§2, "Host profiles"). `device_sg` is derived
 from `device_tape` whenever the config has no `device_sg` line (issue #431), so a
 renumbering never matters. Only an explicit `device_sg` can go stale: `config check`
 warns about a tape/sg pairing that names two different drives, and `volume write`
@@ -423,9 +451,10 @@ refuses it. The fix is to remove the line (`tapectl config remove
 instead of re-creating it — the dotfile carries the unit's uuid — by adding
 the path to `[discovery] watch_roots` and running `tapectl unit discover`. The
 ACL grant is re-applied first; ACLs are per host and do not travel with a
-copied tree. Before it appends a profile's `[[collections]]` table it deletes a
-`collections = []` line, which an older `init` wrote and which cannot sit
-beside that table.
+copied tree. A profile's `COLLECTIONS` entry that `config.toml` already has is
+left as it is; a new one goes through `collection add`, which also removes the
+`collections = []` line an older `init` wrote (it cannot sit beside a
+`[[collections]]` table).
 
 **Step 12** must be earned again: the marker is per binary hash and lives in
 your state directory, not the home.
@@ -464,6 +493,21 @@ timer whose unit changed, and prints `systemctl list-timers --all 'tapectl-*'`.
 differ from its render. Change what the script renders by re-running it with
 other options, and put every other setting in a drop-in ("Your own settings",
 below), which a re-run leaves alone.
+
+**Bash completion and the man pages** (ADR-0012 item 211). The script installs
+the installed binary's `tapectl completions bash` as
+`/usr/local/share/bash-completion/completions/tapectl`, and the same function
+bound to `tapectl-op` beside it (its words are tapectl's; not without the
+wrapper). It installs the checkout's `docs/man/` pages into
+`/usr/local/share/man/man1/`; `tapectl-op` has no page of its own. Each file is
+rewritten only when its bytes differ, and a page a later release no longer
+ships is removed. Run before the binary is installed (first-run step 3), the
+script skips the completion and says so. `TAPECTL_COMPLETION_DIR` and
+`TAPECTL_MAN_DIR` aim them elsewhere, as `TAPECTL_UNIT_DIR` aims the units;
+`--dry-run` prints a `would:` line for each file it would write, `--render-dir`
+also renders the completion (`tapectl.bash-completion`), and `--uninstall`
+removes them. A new login shell completes both commands; `man tapectl-volume-write`
+reads one page.
 
 | unit | schedule | runs | exit status |
 |---|---|---|---|
@@ -756,7 +800,7 @@ host.
 ```bash
 # old host
 sudo tar -C /var/lib/tapectl -cpf /media/usb/tapectl-home.tar --exclude='.tapectl/staging/*' .tapectl
-sudo -u tapectl -H tapectl db backup /var/lib/tapectl/tapectl-catalog.db   # a second, independent copy of the catalog
+sudo -u tapectl -H tapectl db backup /var/lib/tapectl/tapectl-catalog.db   # a second, independent copy of the catalog (refused if the file exists: a backup never overwrites one)
 sudo mv /var/lib/tapectl/tapectl-catalog.db /media/usb/
 # the heir kit directory (~/heir-kit) and the paper stay yours either way
 ```
@@ -792,7 +836,7 @@ steps 1 and 3 and to every run after them):
    ```
 3. `scripts/first-run.sh --from 6` — the drive by serial; step 7 finds the
    home initialised and probes the config (§6); step 8 cross-checks the
-   backend; step 9 asks before regenerating the
+   drive entry; step 9 asks before regenerating the
    kit; step 11 re-grants the ACLs and adopts the dotfiles; step 12 rehearses
    this host's binary; step 14 installs the timers with `--backup-dir` on the
    new host's second disk.
@@ -817,7 +861,7 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile --upgrade
 ```
 
 On a host installed without a profile, leave `--profile` out. `<old>` and `<new>`
-below are the two versions, such as `1.8.0` and `1.8.1`.
+below are the two versions, such as `1.8.1` and `1.9.0`.
 
 **Before you start.**
 
@@ -868,6 +912,31 @@ each envelope ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir
 and destroy the sheets they replace: an older kit's tapectl may refuse the tapes
 the new one writes (1.5.0's refuses every tape written by 1.6.0 or later).
 
+**From 1.8.1 to 1.9.0.** 1.9.0 is the CLI review's release (ADR-0012 items
+198-221; [its notes](releases/1.9.0.md)). It has no catalog migration (step 5
+reports the schema unchanged) and moves no byte on tape, so 1.8.1 and 1.9.0 read
+each other's tapes. What to know:
+
+- **Renamed commands and flags lose their old spelling.** An old spelling is
+  refused by name and exits 2 (`` `tapectl backend add` was renamed in 1.9.0:
+  use `tapectl drive add` ``), so a script or a cron line of your own that uses
+  one fails loudly rather than doing something else; the notes have the table.
+  The three commands every tape's File 1 prints are unchanged. The scripts in
+  the 1.9.0 checkout use the new spellings, and step 2 backs up with 1.8.1's
+  own (`db backup --to`).
+- **Step 6 re-renders `tapectl-op`** and installs the bash completion and the
+  man pages (§7).
+- **`config.toml` needs no edit.** `[[backends.lto]]` keeps its name, and the
+  `[[collections]]` tables stay. `POST_WARNING_BYTES` is a profile variable
+  now (§2), applied by step 8, which an upgrade does not run: look with
+  `tapectl-op config get post_warning_bytes`, and if the drive has none and
+  its profile measured one, set it with `tapectl-op config set
+  'backends.lto[NAME].post_warning_bytes' <value>`.
+- **The rollback is the binary alone**, since there is no migration: `sudo cp
+  -p /usr/local/bin/tapectl-1.8.1 /usr/local/bin/tapectl` puts 1.8.1 back over
+  the catalog as it is. The printed rollback below also works, and loses what
+  the catalog recorded after step 2.
+
 **Rolling back.** Step 13 prints the commands. With the timers stopped, import
 the backup from step 2 while the NEW binary is still installed, then put the
 kept binary back and check the catalog with it. The order matters: every tapectl
@@ -894,7 +963,7 @@ nothing else; the rest is deliberate, by hand, in this order.
 ```bash
 # 1. the timers, their wrappers and tapectl-op (disables and stops the timers,
 #    removes the six units and any drop-ins, /usr/local/lib/tapectl/, the wrapper,
-#    daemon-reloads)
+#    the bash completion and the man pages, daemon-reloads)
 scripts/install-systemd.sh --uninstall
 
 # 2. the binary, and the home pointer (with the home it names; --uninstall keeps it)
