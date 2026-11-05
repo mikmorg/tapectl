@@ -62,7 +62,7 @@ flowchart LR
     S -->|"2 · stage create<br/>dar + encrypt + sha256"| SS["Stage set<br/>slices in the staging directory"]
     SS -->|"3 · volume write<br/>plan, write, seal, confirm"| V["Sealed volume"]
     SS -->|"volume write again<br/>(another tape)"| V2["Second sealed volume"]
-    SS -.->|stage clean| X["staging space released"]
+    V2 -.->|"each unit at its copy floor"| X["staging space released"]
 ```
 
 | Phase | Command | What it does | Touches tape? |
@@ -72,24 +72,27 @@ flowchart LR
 | 3 | [`volume write`](cli/volume.md#tapectl-volume-write) | Builds the complete layout of the tape, checks it fits, writes it, writes the seal marker, then reads the front index and seal marker back to confirm it (every file with `--full-confirm`; otherwise a later `volume verify` does that). | Yes |
 
 From the session (the other three units were snapshotted and staged the same
-way before the write):
+way before the write, which is the one command that makes a copy):
 
 ```text
 $ tapectl snapshot create family/letters
-snapshot created: family/letters v1 (2 files, 224 B)
+snapshot created: family/letters v1 (2 files, 235 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slices, 1.1 KiB dar, 1.8 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
 
-$ tapectl volume write L8-0001 --yes
+$ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
+...
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.8 KiB
-  family/photos/2019-italy v1: 1 slices, 1.1 MiB
-  family/photos/2020-garden v1: 1 slices, 588.1 KiB
+  family/letters v1: 1 slices, 1.7 KiB
+  photos/2019-italy v1: 1 slices, 1.1 MiB
+  photos/2020-garden v1: 1 slices, 588.1 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
+sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
+...
 ```
 
 ### Why staging exists
@@ -110,16 +113,16 @@ because tape punishes surprises.
   [`volume plan`](cli/volume.md#tapectl-volume-plan) shows you the same arithmetic:
 
   ```text
-  $ tapectl volume plan --copies 2
-  volume write plan (2 copy/copies):
-    family/photos/2019-italy v1: 1 slices, 1.1 MiB
-    family/photos/2020-garden v1: 1 slices, 588.1 KiB
-    family/letters v1: 1 slices, 1.8 KiB
-    work/invoices-2024 v1: 1 slices, 1.7 KiB
+  $ tapectl volume plan
+  volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
+    photos/2019-italy v1: 1 slice, 1.1 MiB
+    photos/2020-garden v1: 1 slice, 588.1 KiB
+    family/letters v1: 1 slice, 1.7 KiB
+    work/invoices-2024 v1: 1 slice, 1.7 KiB
 
-  total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
+  total: 4 slices, 1.7 MiB x 2 = 3.3 MiB
   estimated tapes: 1 (at the 97% fill ceiling)
-  cross-volume index: about 1.1 KiB per tape, 2.2 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+  cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
   ```
 
 - **Stage once, write many.** A stage set stays on disk after it is written, so
@@ -127,14 +130,21 @@ because tape punishes surprises.
   is bit-for-bit the same ciphertext as the first. `volume write` picks up
   everything currently staged, so after the first tape is written, the next
   `volume write` to another tape writes the same stage sets again.
-  The `Writes` column of `stage list` shows how many times each stage set
-  has been written.
+  The `Copies` column of [`stage list`](cli/stage.md#tapectl-stage-list) shows how
+  many copies each stage set's version has of how many it needs, and
+  `stage list --owing` lists only the ones still owed one. A unit whose version
+  waits there for a copy it is still owed is **staged**.
 
-- **Release deliberately.**
-  [`stage clean`](cli/stage.md#tapectl-stage-clean) deletes the slice files
-  once a stage set has been written and its unit meets its copy requirement. It
-  does not touch stage sets whose units are still short of copies unless you
-  pass `--force`.
+- **Release unit by unit.** A write releases the staging of each unit that copy
+  brought to its copy floor (the larger of its `min_copies` and the sum of its
+  `copies_at` targets); a unit still short keeps its slices for the next copy,
+  whatever the units written beside it still owe. With
+  `--keep-staging-for-locations` a unit keeps them until every `copies_at`
+  target is met too, and `--keep-staging` keeps everything. A unit that spans
+  cartridges is released slice by slice.
+  [`stage clean`](cli/stage.md#tapectl-stage-clean) makes the same judgment on
+  demand, and sweeps stage sets whose staging failed. It does not touch stage
+  sets whose units are still short of copies unless you pass `--force`.
 
 ## Who owns what: tenants, units, tags, collections
 
@@ -165,15 +175,10 @@ and rebuild what you wrote.
 
 ```text
 $ tapectl tenant list
-+--------+--------+----------+---------------------+---------------------------+
-| Name   | Status | Operator | Created             | Description               |
-+--------+--------+----------+---------------------+---------------------------+
-| family | active |          | 2026-09-29 08:19:49 | family photos and letters |
-+--------+--------+----------+---------------------+---------------------------+
-| mike   | active | yes      | 2026-09-29 08:19:49 | System operator           |
-+--------+--------+----------+---------------------+---------------------------+
-| work   | active |          | 2026-09-29 08:19:50 | business records          |
-+--------+--------+----------+---------------------+---------------------------+
+Name     Status   Operator   Created                Description
+family   active              2026-11-05 02:28 UTC   family photos and letters
+mike     active   yes        2026-11-05 02:26 UTC   System operator
+work     active              2026-11-05 02:28 UTC   business records
 ```
 
 ### Unit
@@ -241,20 +246,22 @@ records them as they were when the unit was last archived.
 
 ### Collection
 
-A **collection** is a source root in `config.toml` whose child folders, at a
+A **collection** is a source root whose child folders, at a
 fixed depth, each become one unit. Use it for "a folder per film" or
 "a folder per year" shapes, where calling `unit init` by hand would be tedious.
 A collection is a factory and a batch driver over ordinary units. It is not a
 place where data is stored.
+[`collection add`](cli/collection.md#tapectl-collection-add) names one, and
+writes its `[[collections]]` table into `config.toml`:
 
-```toml
-[[collections]]
-name = "films"
-root = "/media/films"
-tenant = "family"
-unit_depth = 1              # 1 = immediate children; 2 = grandchildren (show/season)
-archive_set = "bulk-media"  # optional policy for every unit it registers
+```bash
+tapectl collection add films /media/films --tenant family --archive-set bulk-media
 ```
+
+`--unit-depth 2` makes the grandchildren the units (a show/season layout), and
+`--archive-set` gives every unit it registers that set's policy.
+[`collection remove`](cli/collection.md#tapectl-collection-remove) takes the
+table out again; the units stay registered, with their versions and copies.
 
 A collection's units are named `<collection name>/<relative path>`, for example
 `films/alien-1979`. They are not named with the path rule above.
@@ -265,7 +272,7 @@ home, after renaming the folder `alien-1979` to `alien`:
 
 ```text
 $ tapectl collection sync
-collection "films": 0 created, 1 moved, 0 reactivated, 0 missing, 1 pending, 0 dirty
+collection "films": 0 created; 0 refused · 1 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
 ```
 
 The unit kept its name, `films/alien-1979`, and its history. `collection plan`
@@ -303,7 +310,12 @@ Two related words appear in reports:
 - **Dirty**: the unit's directory no longer matches its latest snapshot. This is
   routine. The fix is a new snapshot, not an investigation.
 - **Pending**: a unit with archival work to do. It is either never archived (no
-  snapshot at all) or dirty.
+  snapshot at all) or dirty. `status` and `collection status` count both forms:
+  `pending        4 (4 never archived, 0 dirty)`.
+- **Staged**: a version whose stage set waits in staging for a copy it is still
+  owed. It is not pending: its snapshot exists, so the work left is a write, not a
+  walk. It stays staged until it has every copy it is owed (see
+  [Why staging exists](#why-staging-exists)).
 
 A snapshot that has been sealed onto a tape is **current**. More than one
 version of a unit can be current at once. Archiving v2 does not demote v1, and
@@ -345,7 +357,7 @@ inside the operator envelope. It is how tapectl knows the escrow recipient can
 decrypt a copy. `audit` reports escrow coverage as covered, a gap, or unknown,
 and `catalog locate` shows it in its Escrow column. A catalog rebuilt from tape
 recovers the receipts the tape carried
-(`escrow receipts: 4 stage set(s) carried theirs on the tape`).
+(`escrow receipts: 4 stage sets carried theirs on the tape`).
 
 Two nearby things are not receipts:
 
@@ -376,19 +388,26 @@ the factory, and no drive can use it again.
 
 - **A cartridge is known by its chip serial.** Every LTO cartridge has a memory
   chip (MAM) that reports a serial number. That serial is the cartridge's
-  identity for life. The **barcode** is a sticker you can relabel at any time
-  ([`cartridge relabel`](cli/cartridge.md#tapectl-cartridge-relabel)). When
-  `volume init` meets a cartridge it has never seen, it registers the cartridge
-  and uses the serial as a placeholder barcode:
+  identity for life. The **barcode** is the sticker. When `volume init` (or
+  `volume write --init`) meets a cartridge it has never seen, it registers the
+  cartridge by its serial and gives it its first barcode: the volume's label, so
+  the sticker and the tape say the same thing:
 
   ```text
-  $ tapectl volume init L8-0001
-  cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
-  volume "L8-0001" initialized (id=1)
+  $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
+  cartridge L8-0001 auto-registered from MAM (chip serial E01001L8_1775794348; barcode L8-0001, the volume's label)
+  volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
   medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
+  ...
   ```
 
-  Only when no chip serial can be read does the barcode you give
+  `--barcode` names a different sticker at that first init. The cartridge keeps
+  its barcode when a later volume goes on it (after an erase), and
+  [`cartridge relabel`](cli/cartridge.md#tapectl-cartridge-relabel) changes a
+  sticker afterwards. A cartridge registered by an older tapectl that still wears
+  its chip serial as a placeholder barcode takes the label at its next init.
+  Every command that takes a cartridge takes its barcode or its chip serial.
+  Only when no chip serial can be read does the cartridge you name
   (`volume init --cartridge`) become the identity.
 
 - **Generation is a property of the cartridge, not the drive.** An LTO-6 drive
@@ -449,7 +468,7 @@ together, in one transaction, so the shelf and the catalog cannot disagree.
 ```text
 $ tapectl volume move L8-0002 --to offsite
 volume "L8-0002" moved to "offsite"
-  cartridge "E01003L8_1775794348" moved with it
+  cartridge "L8-0002" moved with it
 ```
 
 Locations are something only you know. Nothing on the tape records where the
@@ -490,13 +509,14 @@ every unit one copy short:
 ```text
 $ tapectl audit
 VIOLATIONS (4):
-  [copy_count] family/letters: has 1 copies, needs 2
-  [copy_count] family/photos/2019-italy: has 1 copies, needs 2
-  [copy_count] family/photos/2020-garden: has 1 copies, needs 2
-  [copy_count] work/invoices-2024: has 1 copies, needs 2
+  [copy_count] family/letters: has 1 copy, needs 2
+  [copy_count] photos/2019-italy: has 1 copy, needs 2
+  [copy_count] photos/2020-garden: has 1 copy, needs 2
+  [copy_count] work/invoices-2024: has 1 copy, needs 2
 WARNINGS (1):
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 4 violations, 1 warnings (exit 2)
+  [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
+audit: 4 violations, 1 warning (exit 2)
+for the fixes: tapectl audit --action-plan
 ```
 
 After writing `L8-0002` and moving it offsite:
@@ -504,8 +524,8 @@ After writing `L8-0002` and moving it offsite:
 ```text
 $ tapectl report copies
   family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  family/photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  family/photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
+  photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
+  photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
   work/invoices-2024: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
 ```
 
@@ -555,8 +575,8 @@ defaults, a tape-only unit needs 4 copies in 2 locations, not 4 in 4;
 One rule applies it, so the commands cannot disagree: `audit`'s `copy_count`
 and `location_presence`, `unit mark-tape-only` (the unit is about to be
 tape-only), `snapshot mark-reclaimable` and `report reclaimable` (for the newer
-version), the retire family's below-policy question, `stage clean`'s
-retention and `stage list --owing`. A message whose floor the multiplier raised
+version), the retire family's below-policy question, the staging a write or `stage clean`
+keeps, and `stage list --owing`. A message whose floor the multiplier raised
 says so: `has 2 copies, needs 4 (tape-only 2x)`. A unit that is not tape-only is
 never multiplied. A shortfall stays a question to confirm, not an absolute
 refusal (ADR-0008 Tier 2).
@@ -635,24 +655,23 @@ never changes anything. Its exit code tells a script how bad things are:
 | 1 | Warnings only |
 | 2 | At least one violation |
 
-`audit --action-plan` adds a suggested fix under each finding. The audit after
-the first tape, with its plan:
+`audit --action-plan` adds an ACTION PLAN after the findings: one line per fix,
+each naming the units it is for, so a fix that several units share is written
+once. The audit after the first tape, with its plan:
 
 ```text
 $ tapectl audit --action-plan
 VIOLATIONS (4):
-  [copy_count] family/letters: has 1 copies, needs 2
-    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
-  [copy_count] family/photos/2019-italy: has 1 copies, needs 2
-    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
-  [copy_count] family/photos/2020-garden: has 1 copies, needs 2
-    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
-  [copy_count] work/invoices-2024: has 1 copies, needs 2
-    fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>
+  [copy_count] family/letters: has 1 copy, needs 2
+  [copy_count] photos/2019-italy: has 1 copy, needs 2
+  [copy_count] photos/2020-garden: has 1 copy, needs 2
+  [copy_count] work/invoices-2024: has 1 copy, needs 2
 WARNINGS (1):
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-    fix: tapectl key escrow-kit <dir>
-audit: 4 violations, 1 warnings (exit 2)
+  [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
+ACTION PLAN (2 fixes):
+  fix: tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL> — for 4 units: family/letters, photos/2019-italy, photos/2020-garden, work/invoices-2024
+  fix: tapectl key escrow-kit <DIR> — for archive
+audit: 4 violations, 1 warning (exit 2)
 ```
 
 Once `L8-0002` was written and moved offsite, only the heir-kit warning was
@@ -661,8 +680,9 @@ left, so `audit` exited 1:
 ```text
 $ tapectl audit
 WARNINGS (1):
-  [escrow_kit_missing] archive: 2 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warnings (exit 1)
+  [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
+audit: 0 violations, 1 warning (exit 1)
+for the fixes: tapectl audit --action-plan
 ```
 
 The commands that do give things up enforce the same coverage facts
@@ -829,7 +849,7 @@ stateDiagram-v2
     [*] --> cleaned : catalog rebuild from the tape
     staging --> staged : dar, encryption and checksums complete
     staging --> failed : stage create stopped partway
-    staged --> cleaned : stage clean
+    staged --> cleaned : a write brings its unit to its copy floor, or stage clean
     failed --> cleaned : stage clean
     cleaned --> staged : volume read-slices or compact-read brings the slices back
 ```
@@ -837,7 +857,7 @@ stateDiagram-v2
 | Status | Meaning |
 |---|---|
 | `staging` | `stage create` is running. |
-| `staged` | Slices are on disk and eligible for the next `volume write`. It stays `staged` after being written, so you can write more copies. |
+| `staged` | Slices are on disk and eligible for the next `volume write`. It stays `staged` after being written while its unit is still short of its copy floor, so the next copy reuses it; the write that brings the unit to its floor releases it. |
 | `failed` | `stage create` stopped partway: it crashed, or refused after it had begun (for example, the source changed since the snapshot, or the staging directory proved too small once the unit had been read). The next tapectl command that opens the catalog marks it `failed`; `stage clean` removes the leftovers. |
 | `cleaned` | Slice files deleted from staging. The record and its checksums remain. A stage set rebuilt from tape by `catalog rebuild` also starts here. |
 
@@ -853,17 +873,17 @@ or by the session itself when a write fails or its readback finds a mismatch).
 $ tapectl volume info L8-0001
 ...
 Writes:
-    work/invoices-2024 v1: completed (2026-09-29 08:20:01)
-    family/photos/2020-garden v1: completed (2026-09-29 08:20:01)
-    family/photos/2019-italy v1: completed (2026-09-29 08:20:01)
-    family/letters v1: completed (2026-09-29 08:20:01)
+    work/invoices-2024 v1: completed (2026-11-05 02:30 UTC)
+    photos/2020-garden v1: completed (2026-11-05 02:30 UTC)
+    photos/2019-italy v1: completed (2026-11-05 02:30 UTC)
+    family/letters v1: completed (2026-11-05 02:30 UTC)
 ```
 
 ## What is on a tape
 
 A sealed tape is one partition of numbered tape files, in a fixed order, written
-in 512 KiB blocks. The session's `L8-0002` had 13 files: two tenants' envelopes
-and four slices.
+in 512 KiB blocks. The session's `L8-0002` had 15 files: two tenants' envelopes,
+the operator's, a backup of each, and four slices.
 
 | File | Zone | On tape | What it holds |
 |---|---|---|---|
@@ -882,8 +902,8 @@ or cut short, only trailing slices are lost. Everything needed to find and
 decrypt what did land survives.
 
 [`volume identify`](cli/volume.md#tapectl-volume-identify) prints File 0; for
-`L8-0002` its `[layout]` table read `front_index = 3`, `seal_marker = 12`,
-`total_files = 13`.
+`L8-0002` its `[layout]` table read `front_index = 3`, `seal_marker = 14`,
+`total_files = 15`.
 
 ### What is plaintext
 
@@ -959,10 +979,10 @@ kit, and disaster recovery are covered in
 |---|---|---|
 | Archive set | A named policy (copies, locations, encryption, …) that units can join. | [Policy](#archive-sets-and-resolution-order) |
 | Audit | An advisory check of every unit against its policy; exit 0/1/2. | [Audit](#audit-is-advisory) |
-| Barcode | The relabelable sticker on a cartridge; not its identity. | [Volume and cartridge](#volume-and-cartridge) |
+| Barcode | The sticker on a cartridge, first its first volume's label; relabelable, not its identity. | [Volume and cartridge](#volume-and-cartridge) |
 | Cartridge | The physical tape, known for life by its chip serial. | [Volume and cartridge](#volume-and-cartridge) |
 | Catalog | The SQLite database of claims about what is where. | [The big picture](#the-big-picture) |
-| Collection | A config source root whose child folders each become a unit. | [Collection](#collection) |
+| Collection | A source root, named by `collection add`, whose child folders each become a unit. | [Collection](#collection) |
 | Condition | `ok` or `quarantined`: whether tapectl distrusts a volume's medium. | [Volume condition](#volume-condition) |
 | Copy | One version, identical content, on a sealed, unquarantined, unretired volume. | [Copies](#what-counts-as-a-copy) |
 | Current | A snapshot sealed onto tape that still counts; several can be current. | [Snapshot and Version](#snapshot-and-version) |
@@ -983,6 +1003,7 @@ kit, and disaster recovery are covered in
 | Snapshot | A recorded file list of a unit at one version. | [Snapshot and Version](#snapshot-and-version) |
 | Stage report | The text file per stage set in `stage-reports/`: slice sizes and hashes. Not a receipt. | [Receipt](#receipt) |
 | Stage set | A snapshot turned into encrypted slices on disk, ready to write. | [Stage set and slices](#stage-set-and-slices) |
+| Staged | A version waiting in staging for a copy it is still owed; not pending. | [Snapshot and Version](#snapshot-and-version) |
 | Tag | A free-form label on a unit, for filtering. | [Tags](#tags) |
 | Tape-only | A unit whose disk copy you may delete; gated on its resolved policy. | [Tape-only units](#tape-only-units) |
 | Tenant | A key domain; one tenant's keys cannot read another's data. | [Tenant](#tenant) |
