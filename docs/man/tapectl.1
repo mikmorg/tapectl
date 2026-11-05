@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl 1  "tapectl 1.8.1" 
+.TH tapectl 1  "tapectl 1.9.0" 
 .SH NAME
 tapectl \- Multi\-tenant archival storage management for LTO tape and exportable encrypted directories
 .SH SYNOPSIS
@@ -158,4 +158,4 @@ no verdict: the audit stopped on an error, a usage error after `audit` included 
 \fB75\fR
 busy: another tapectl process held the catalog (or the drive) too long; nothing changed, run it again (every command that opens the catalog, except `volume verify` (3); `drive poll` and `drive eject` when a command holds the drive)
 .SH VERSION
-v1.8.1
+v1.9.0
