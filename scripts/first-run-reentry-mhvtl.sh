@@ -39,6 +39,33 @@
 #          readback recorded (`report verify-status`) and reads nothing (OQ15):
 #          no tape command at all, no new verification session; it goes
 #          straight to the shelf, the audit and the kit, and exits 0.
+#   E      copy 2, as the operator runs it after copy 1 (docs/handoff.md (i)
+#          step 8): `--from 13 --label <L2> --location <the second place>`, with
+#          one volume in the catalog and every unit still staged (one copy, a
+#          copy floor of 2: the precondition check says so first).
+#          E0  this catalog's own sealed L1 is still in the drive (and the
+#              run names it with --erase-label, consent that must not reach
+#              it): `volume init L2` refuses it as the catalog's live copy,
+#              step 13 dies naming the eject, and nothing is erased or
+#              written — File 0 the same bytes, no catalog row added.
+#          E1  L1 goes back to its slot and the HIGHEST-numbered cartridge of
+#              the drive's generation is loaded (the chain's upgrade harness
+#              takes them from the low end), and a throwaway home of the run's
+#              own binary writes and seals a volume FOREIGN to this catalog on
+#              it, labelled L2 (as on home2, where the old tape's File 0 label
+#              is the new label). Then copy 2: the "1 volume(s) already in
+#              the catalog" confirm, nothing snapshotted or staged again,
+#              init's refusal of the foreign sealed volume, `cartridge erase`
+#              with the consent --erase-label L2 names, init with no --force
+#              on the verified erase, the write with --full-confirm and
+#              --move-to, its full readback and no `volume verify`, the
+#              cartridge's barcode L2 (item 219), every unit's staging
+#              released (the copy floor met), the audit and the kit, exit 0;
+#              both volumes sealed, every unit 2 copies in 2 places. Then the
+#              cartridge goes back to its slot.
+#          Under --auto every prompt of phase E is answered by first-run.sh
+#          itself or by a flag (--label, --erase-label): its typed-word
+#          prompts read /dev/tty, never stdin, so nothing is fed on stdin.
 #
 # Issue #432 rides on the same run: tape commands run at raised CPU and I/O
 # priority from every launcher. Before phase A a `tapectl_op_priority` check runs
@@ -66,6 +93,7 @@
 #   options: --signal KILL|INT  (default KILL; INT is the operator's Ctrl-C,
 #                                a clean interrupt that marks the session itself)
 #            --label L          (default FR414-1)
+#            --label2 L         (phase E's copy 2; default FR414-2)
 #            --unit-mib N       (MiB of random data per unit, 4 units; default 24)
 #            --workspace DIR    (default /scratch/tapectl-fr414)
 #            --keep             (keep the run directory even when green)
@@ -80,6 +108,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DEVICE="${TAPECTL_GATE_TAPE:-}"
 SIG=KILL
 LABEL=FR414-1
+LABEL2=FR414-2
 UNIT_MIB=24
 WORKSPACE=/scratch/tapectl-fr414
 KEEP=0
@@ -95,6 +124,7 @@ while [ $# -gt 0 ]; do
         --device) DEVICE="${2:-}"; shift 2 ;;
         --signal) SIG="${2:-}"; shift 2 ;;
         --label) LABEL="${2:-}"; shift 2 ;;
+        --label2) LABEL2="${2:-}"; shift 2 ;;
         --unit-mib) UNIT_MIB="${2:-}"; shift 2 ;;
         --workspace) WORKSPACE="${2:-}"; shift 2 ;;
         --keep) KEEP=1; shift ;;
@@ -108,6 +138,7 @@ done
 [ -n "$DEVICE" ] || die "--device not given — name the mhvtl drive (e.g. /dev/tape/by-id/scsi-XYZZY_A1-nst); there is no default"
 case "$SIG" in KILL|INT) ;; *) die "--signal must be KILL or INT, not '$SIG'" ;; esac
 case "$UNIT_MIB" in ''|*[!0-9]*) die "--unit-mib must be a whole number" ;; esac
+{ [ -n "$LABEL2" ] && [ "$LABEL2" != "$LABEL" ]; } || die "--label2 must name a label other than --label ($LABEL)"
 [ -e "$DEVICE" ] || die "$DEVICE does not exist"
 # The drive must be one an mhvtl by-id link names (the real LTO-6's serial is
 # not XYZZY). A path check only: nothing is opened yet.
@@ -351,7 +382,9 @@ export XDG_STATE_HOME="$RUN/state"
 # (which would redirect every HOME-isolated test on the box to this run's home).
 export TAPECTL_HOME_POINTER="$RUN/home-pointer"
 FR_LOG="$RUN/state/tapectl/first-run.log"
-first_run() { bash "$REPO/scripts/first-run.sh" --profile "$PROFILE" --auto --mint-escrow --label "$LABEL" "$@"; }
+first_run() { first_run_label "$LABEL" "$@"; }
+# first_run_label <label> [args...]: the same, for another volume (phase E's copy 2).
+first_run_label() { local l="$1"; shift; bash "$REPO/scripts/first-run.sh" --profile "$PROFILE" --auto --mint-escrow --label "$l" "$@"; }
 DB="$RUN/home/tapectl.db"
 # Catalog reads go through the service user (the home is 0700) and are
 # read-only URIs: this script never writes the catalog.
@@ -604,49 +637,51 @@ writes_count() { sql "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id = w.v
 # The post-write block, as the catalog and the kit record it, after a phase
 # that began when the newest verification session was $1 and $2 is a file
 # created when the phase began. $4 says where the full readback comes from
-# (ADR-0012 item 218, OQ15): `new`, recorded by this phase (the resume's own
-# --full-confirm: there is no separate verify any more), or `recorded`, by an
-# earlier phase, which this one must have read and not repeated.
-assert_post_write_block() { # assert_post_write_block <verify-id-before> <phase-start-file> <phase-out> <new|recorded>
-    local before="$1" since="$2" out="$3" readback="$4" bad sess loc
+# (ADR-0012 item 218, OQ15): `new`, recorded by this phase (the copy's own
+# --full-confirm, $7: the `resume` or the `write`; there is no separate verify
+# any more), or `recorded`, by an earlier phase, which this one must have read
+# and not repeated. $5 and $6 are the volume and its place ($LABEL at $SHELF
+# unless given).
+assert_post_write_block() { # assert_post_write_block <verify-id-before> <phase-start-file> <phase-out> <new|recorded> [label] [place] [resume|write]
+    local before="$1" since="$2" out="$3" readback="$4" label="${5:-$LABEL}" place="${6:-$SHELF}" what="${7:-resume}" bad sess loc
     bad="$(sql "SELECT w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
-                WHERE v.label = ? AND w.status <> 'completed'" "$LABEL" | tr '\n' ' ')"
-    [ "$(sql "SELECT status FROM volumes WHERE label = ?" "$LABEL")" = sealed ] \
-        || { echo "volume $LABEL is not sealed"; return 1; }
+                WHERE v.label = ? AND w.status <> 'completed'" "$label" | tr '\n' ' ')"
+    [ "$(sql "SELECT status FROM volumes WHERE label = ?" "$label")" = sealed ] \
+        || { echo "volume $label is not sealed"; return 1; }
     [ -z "${bad// /}" ] || { echo "writes not all completed: $bad"; return 1; }
     # The newest verification session. In a `new` phase the confirm of the
     # copy is the phase's last tape contact, so it is that confirm: full,
     # passed, and newer than the phase's start. In a `recorded` phase nothing
     # read the tape, so it is the one the phase began with, full and passed.
     sess="$(sql "SELECT s.id || ' ' || s.verify_type || ' ' || s.outcome FROM verification_sessions s
-                 JOIN volumes v ON v.id = s.volume_id WHERE v.label = ? ORDER BY s.id DESC LIMIT 1" "$LABEL")"
+                 JOIN volumes v ON v.id = s.volume_id WHERE v.label = ? ORDER BY s.id DESC LIMIT 1" "$label")"
     echo "newest verification session: $sess (newest before this phase: $before)"
     local sid stype soutcome
     read -r sid stype soutcome <<<"$sess"
     [ "${stype:-}" = full ] && [ "${soutcome:-}" = passed ] \
-        || { echo "the newest verification session of $LABEL is not a full, passed readback"; return 1; }
+        || { echo "the newest verification session of $label is not a full, passed readback"; return 1; }
     case "$readback" in
         new)
             [ "${sid:-0}" -gt "$before" ] || { echo "no full, passed readback recorded by this phase"; return 1; }
-            grep "$LABEL sealed and read back in full: the resume's confirm read every file back" "$out" >/dev/null \
-                || { echo "$out does not say the resume's confirm read $LABEL back in full"; return 1; } ;;
+            grep -F "$label sealed and read back in full: the $what's confirm read every file back" "$out" >/dev/null \
+                || { echo "$out does not say the $what's confirm read $label back in full"; return 1; } ;;
         recorded)
             [ "${sid:-0}" -eq "$before" ] || { echo "this phase recorded a verification session ($sid, newest before: $before): it read the tape again"; return 1; }
-            grep -E "^ +\\\$ .* report verify-status --volume $LABEL --json" "$out" >/dev/null \
-                || { echo "$out shows no 'report verify-status --volume $LABEL --json': the recorded readback was not asked for"; return 1; }
-            grep "$LABEL sealed and read back in full: a full readback passed on " "$out" >/dev/null \
-                || { echo "$out does not say a full readback of $LABEL is recorded"; return 1; } ;;
+            grep -E "^ +\\\$ .* report verify-status --volume $label --json" "$out" >/dev/null \
+                || { echo "$out shows no 'report verify-status --volume $label --json': the recorded readback was not asked for"; return 1; }
+            grep "$label sealed and read back in full: a full readback passed on " "$out" >/dev/null \
+                || { echo "$out does not say a full readback of $label is recorded"; return 1; } ;;
         *) echo "assert_post_write_block: new or recorded, not '$readback'"; return 1 ;;
     esac
     if grep -E "^ +\\\$ .* volume verify " "$out" >/dev/null; then
         echo "$out runs a volume verify: the copy's full readback was read a second time (ADR-0012 item 218)"; return 1
     fi
     grep -E '^ +\$ .* audit$' "$out" >/dev/null || { echo "$out shows no audit run"; return 1; }
-    loc="$(sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" volume info "$LABEL" --json \
+    loc="$(sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" volume info "$label" --json \
            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("location") or "")')"
-    [ "$loc" = "$SHELF" ] || { echo "volume $LABEL is at '$loc', expected $SHELF"; return 1; }
+    [ "$loc" = "$place" ] || { echo "volume $label is at '$loc', expected $place"; return 1; }
     [ "$RUN/kit/COVER.txt" -nt "$since" ] || { echo "the Heir Kit was not regenerated ($RUN/kit/COVER.txt not newer than the phase)"; return 1; }
-    echo "post-write block complete: sealed, read back in full once ($readback), audited, at $loc, kit regenerated"
+    echo "post-write block complete: $label sealed, read back in full once ($readback), audited, at $loc, kit regenerated"
 }
 
 echo "fr414: phase C — the re-entry, first-run.sh --from 13; output $RUN/phase-C.out"
@@ -695,5 +730,277 @@ check sealed_reentry_runs_only_the_post_write_block step_phase_d
 # (phase C's record, which saw `volume resume`, is the positive control).
 check no_tape_command_phase_d assert_no_tape D
 check raise_notice_phase_d assert_raised_notice "$RUN/phase-D.out"
+
+# ---------- phase E: copy 2, as the operator runs it ----------
+# docs/handoff.md (i) step 8: after copy 1, the operator loads the second
+# cartridge and runs step 13 again with the next label and the second place.
+# Every first_run_label below names $LABEL2 by flag (the WRITE confirmation
+# under --auto counts only then) and --location $PLACE2, as the operator does.
+PLACE2=fr414-offsite
+# The units, and the catalog rows phase E must not add to where it writes nothing.
+units_count() { sql "SELECT COUNT(*) FROM units"; }
+catalog_rows() { sql "SELECT 'volumes=' || (SELECT COUNT(*) FROM volumes) || ' writes=' || (SELECT COUNT(*) FROM writes)
+                      || ' cartridges=' || (SELECT COUNT(*) FROM cartridges) || ' snapshots=' || (SELECT COUNT(*) FROM snapshots)
+                      || ' stage_sets=' || (SELECT COUNT(*) FROM stage_sets)"; }
+stage_sets_by_status() { sql "SELECT status || '=' || COUNT(*) FROM stage_sets GROUP BY status ORDER BY status" | tr '\n' ' '; }
+# File 0's whole first block, hashed: read with mt and dd alone, as file0_label.
+file0_hash() {
+    mt -f "$DEVICE" rewind >/dev/null 2>&1 || return 1
+    dd if="$DEVICE" bs=512k count=1 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+# How many lines of a phase's output show first-run.sh starting `tapectl <words>`.
+ran_count() { grep -cE "^ +\\\$ .* $2( |\$)" "$1"; }
+# The cartridge the catalog binds a volume to, by its barcode.
+barcode_of() { sql "SELECT c.barcode FROM cartridges c JOIN cartridge_volumes cv ON cv.cartridge_id = c.id
+                    JOIN volumes v ON v.id = cv.volume_id WHERE v.label = ?" "$1"; }
+
+# The precondition of copy 2, from the catalog D left: the copy floor is 2
+# ([defaults] min_copies and min_locations in force, read with config get;
+# nothing in the private profile sets them), and every unit is still staged
+# with its one copy, so the release E1 expects has something to release.
+step_copy2_preconditions() {
+    local key val nunits staged
+    for key in defaults.min_copies defaults.min_locations; do
+        val="$(sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" config get "$key" --json \
+               | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("value"), d.get("source"))')" \
+            || { echo "config get $key failed"; return 1; }
+        echo "$key: $val"
+        [ "${val%% *}" = 2 ] || { echo "$key is not 2: copy 2 would not be the copy that meets the floor (report, do not change it)"; return 1; }
+    done
+    if sudo -u "$SVC_USER" -H grep -E '^ *(min_copies|min_locations|copies_at) *=' "$RUN/home/config.toml"; then
+        echo "config.toml sets a copy floor of its own (above)"; return 1
+    fi
+    nunits="$(units_count)"; staged="$(sql "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'")"
+    echo "units: $nunits; stage sets: $(stage_sets_by_status); catalog: $(catalog_rows)"
+    { [ "$nunits" -ge 1 ] && [ "$staged" = "$nunits" ]; } \
+        || { echo "want every unit staged once before copy 2 ($nunits units, $staged staged sets)"; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM volumes")" = 1 ] || { echo "want exactly one volume ($LABEL) in the catalog"; return 1; }
+}
+check copy2_preconditions step_copy2_preconditions
+must copy2_preconditions
+
+# E0: this catalog's own sealed copy is still in the drive. The run names it
+# with --erase-label $LABEL as well: consent to erase that very tape, which
+# must still not reach it (ADR-0012 item 216: init offers no erase for it).
+echo "fr414: phase E0 — first-run.sh --from 13 --label $LABEL2 with $LABEL still loaded; output $RUN/phase-E0.out"
+step_phase_e0() {
+    local rc f0_before rows_before w1_before out="$RUN/phase-E0.out" n
+    f0_before="$(file0_hash)"; rows_before="$(catalog_rows)"; w1_before="$(writes_count)"
+    [ -n "$f0_before" ] || { echo "could not read File 0 before the run"; return 1; }
+    sampler_start E0
+    first_run_label "$LABEL2" --from 13 --location "$PLACE2" --erase-label "$LABEL" </dev/null >"$out" 2>&1; rc=$?
+    sampler_stop E0
+    echo "first-run.sh exited $rc"
+    [ "$rc" -eq 1 ] || { echo "want exit 1 (step 13's die)"; tail -30 "$out"; return 1; }
+    grep -F "1 volume(s) already in the catalog." "$out" >/dev/null \
+        || { echo "no '1 volume(s) already in the catalog.' note"; return 1; }
+    grep -F "Write another tape now, or finish one an interrupted run left (same label)? [auto: yes]" "$out" >/dev/null \
+        || { echo "--auto did not take the 'write another tape' confirm"; return 1; }
+    # The init runs (it is what reads the tape) and refuses. The positive
+    # control for every absence below: commands are shown in this output.
+    n="$(ran_count "$out" "volume init $LABEL2")"
+    [ "$n" = 1 ] || { echo "want exactly one 'volume init $LABEL2' started, saw $n"; return 1; }
+    grep -F "It is this catalog's live copy: $LABEL, a copy of" "$out" >/dev/null \
+        || { echo "init's refusal does not name $LABEL as this catalog's live copy:"; grep -iE 'refus|sealed' "$out" | head; return 1; }
+    grep -F "Leave it as it is: eject it" "$out" >/dev/null || { echo "the refusal does not say to eject it"; return 1; }
+    grep -F "is this catalog's own volume (above): eject it" "$out" >/dev/null \
+        || { echo "step 13 did not die naming the eject"; tail -15 "$out"; return 1; }
+    for n in "cartridge erase" "volume write" "volume resume" "volume verify" "stage create"; do
+        [ "$(ran_count "$out" "$n")" = 0 ] || { echo "step 13 ran '$n' although init refused"; return 1; }
+    done
+    if grep -E "volume init .*--force" "$out" >/dev/null; then echo "step 13 forced an init"; return 1; fi
+    if grep -F "ERASE the tape" "$out" >/dev/null; then echo "step 13 offered an erase"; return 1; fi
+    [ "$(file0_hash)" = "$f0_before" ] || { echo "File 0 of the loaded cartridge changed"; return 1; }
+    [ "$(file0_label)" = "$LABEL" ] || { echo "File 0 no longer names $LABEL"; return 1; }
+    [ "$(sql "SELECT status FROM volumes WHERE label = ?" "$LABEL")" = sealed ] || { echo "$LABEL is no longer sealed"; return 1; }
+    [ "$(writes_count)" = "$w1_before" ] || { echo "write rows of $LABEL changed"; return 1; }
+    [ "$(catalog_rows)" = "$rows_before" ] || { echo "catalog rows changed: $rows_before -> $(catalog_rows)"; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM volumes WHERE label = ?" "$LABEL2")" = 0 ] \
+        || { echo "the refused init left a volume row for $LABEL2 (E1 would take the 'fresh' branch)"; return 1; }
+    echo "refused with nothing erased or written; File 0 $f0_before unchanged; catalog $rows_before unchanged"
+}
+check own_sealed_copy_refused step_phase_e0
+must own_sealed_copy_refused
+check priority_phase_e0 assert_prio E0 "volume init"
+check raise_notice_phase_e0 assert_raised_notice "$RUN/phase-E0.out"
+
+# E1, the setup: the first copy back to its slot, the second cartridge in.
+FIRST_TAG=""; FIRST_SLOT=""; SECOND_TAG=""; SECOND_SLOT=""
+step_load_second_cartridge() {
+    local status
+    status="$(mtx -f "$CHG_SG" status)" || return 1
+    FIRST_SLOT="$(echo "$status" | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+    FIRST_TAG="$(echo "$status" | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
+    { [ -n "$FIRST_SLOT" ] && [ -n "$FIRST_TAG" ]; } || { echo "the changer does not name the loaded cartridge's slot"; return 1; }
+    mtx -f "$CHG_SG" unload "$FIRST_SLOT" "$DTE" || return 1
+    # The HIGHEST-numbered full slot of the drive's generation: the chain's
+    # upgrade harness, on another drive, takes from the low end.
+    SECOND_SLOT="$(mtx -f "$CHG_SG" status | grep -E "Storage Element [0-9]+:Full" | grep "VolumeTag=[EF][0-9]*$GEN" \
+        | grep -v "VolumeTag=$FIRST_TAG" | tail -1 | sed -n 's/.*Storage Element \([0-9]*\):Full.*/\1/p')"
+    [ -n "$SECOND_SLOT" ] || { echo "no second $GEN cartridge in the library"; return 1; }
+    mtx -f "$CHG_SG" load "$SECOND_SLOT" "$DTE" || return 1
+    SECOND_TAG="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full.*VolumeTag *= *\([A-Z0-9]*\).*/\1/p")"
+    { [ -n "$SECOND_TAG" ] && [ "$SECOND_TAG" != "$FIRST_TAG" ]; } || { echo "the drive holds '$SECOND_TAG'"; return 1; }
+    mt -f "$DEVICE" rewind || return 1
+    echo "$LABEL's cartridge $FIRST_TAG back to slot $FIRST_SLOT; $SECOND_TAG loaded from slot $SECOND_SLOT"
+}
+check load_second_cartridge step_load_second_cartridge
+must load_second_cartridge
+# A sealed volume FOREIGN to the run's catalog, as home2's second cartridge
+# holds (L6-0002, written by an old catalog): a throwaway home of the run's own
+# binary, as this user, writes one tiny unit to it as $LABEL2 and seals it,
+# after an `mt erase` so its init meets a blank tape. It takes the tape lock
+# for itself only, in a subshell that ends before step 13 takes it.
+step_foreign_sealed_volume() {
+    local f="$RUN/foreign"
+    mkdir -p "$f/home/staging" "$f/src/foreign-u1" || return 1
+    echo "a unit of a catalog the fr414 run does not know" >"$f/src/foreign-u1/README"
+    (
+        flock -n 9 || { echo "the tape lock is held: another harness is using a drive"; exit 1; }
+        ft() { echo "\$ tapectl $*"; "$TAPECTL" --home "$f/home" "$@"; }
+        mt -f "$DEVICE" rewind && mt -f "$DEVICE" erase \
+            && ft init --operator fr414-foreign \
+            && ft drive add --name mhvtl --device-tape "$DEVICE" --generation "$DGEN" \
+            && ft config set staging.directory "$f/home/staging" \
+            && ft unit init "$f/src/foreign-u1" --tenant fr414-foreign --name foreign-u1 \
+            && ft snapshot create foreign-u1 && ft stage create foreign-u1 \
+            && ft volume write "$LABEL2" --init --device "$DEVICE" --yes
+    ) 9>/tmp/tapectl-tape.lock >"$f/write.out" 2>&1 || { echo "the foreign home could not write $LABEL2:"; tail -30 "$f/write.out"; return 1; }
+    [ "$("$TAPECTL" --home "$f/home" volume info "$LABEL2" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" = sealed ] \
+        || { echo "the foreign home's $LABEL2 is not sealed"; return 1; }
+    [ "$(file0_label)" = "$LABEL2" ] || { echo "File 0 of $SECOND_TAG does not name $LABEL2"; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM volumes WHERE label = ?" "$LABEL2")" = 0 ] || { echo "the run's catalog knows $LABEL2"; return 1; }
+    echo "$SECOND_TAG holds the foreign home's sealed $LABEL2; the run's catalog has no such volume"
+}
+check foreign_sealed_volume_on_second_cartridge step_foreign_sealed_volume
+must foreign_sealed_volume_on_second_cartridge
+
+# E1, copy 2.
+echo "fr414: phase E1 — copy 2, first-run.sh --from 13 --label $LABEL2 --location $PLACE2 --erase-label $LABEL2; output $RUN/phase-E1.out"
+E1_SLICES_BEFORE=""
+staged_slice_files() { sudo find "$RUN/staging" -type f -name '*.age' | wc -l; }
+step_phase_e1() {
+    local rc out="$RUN/phase-E1.out" state
+    E1_SLICES_BEFORE="$(staged_slice_files)"
+    touch "$RUN/phase-E1.start"; sleep 1
+    sampler_start E1
+    first_run_label "$LABEL2" --from 13 --location "$PLACE2" --erase-label "$LABEL2" </dev/null >"$out" 2>&1; rc=$?
+    sampler_stop E1
+    echo "first-run.sh exited $rc"
+    [ "$rc" -eq 0 ] || { echo "copy 2 exited non-zero"; tail -40 "$out"; return 1; }
+    grep -F "1 volume(s) already in the catalog." "$out" >/dev/null \
+        || { echo "no '1 volume(s) already in the catalog.' note"; return 1; }
+    grep -F "Write another tape now, or finish one an interrupted run left (same label)? [auto: yes]" "$out" >/dev/null \
+        || { echo "--auto did not take the 'write another tape' confirm"; return 1; }
+    state="$(grep "step 13: volume $LABEL2 is " "$FR_LOG" | tail -1)"
+    case "$state" in *" is absent") echo "$state" ;; *) echo "step 13 classified $LABEL2 as: ${state:-nothing}"; return 1 ;; esac
+}
+check copy2_runs step_phase_e1
+must copy2_runs
+# Nothing snapshotted or staged again: snapshot create finds every unit
+# unchanged, and step 13 skips each one already staged (#283).
+step_e1_nothing_restaged() {
+    local out="$RUN/phase-E1.out" n
+    n="$(units_count)"
+    [ "$(ran_count "$out" "stage create")" = 0 ] || { echo "step 13 ran stage create"; return 1; }
+    [ "$(grep -cF -- "is already staged -- skipping it" "$out")" = "$n" ] \
+        || { echo "want $n 'already staged -- skipping it' notes:"; grep -F "already staged" "$out"; return 1; }
+    [ "$(ran_count "$out" "snapshot create")" = "$n" ] || { echo "want $n snapshot create runs"; return 1; }
+    [ "$(grep -cE 'is unchanged since v[0-9]+; no snapshot created' "$out")" = "$n" ] \
+        || { echo "want every snapshot create to find its unit unchanged:"; grep -iE 'snapshot' "$out" | head; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM stage_sets")" = "$n" ] || { echo "a stage set was added: $(stage_sets_by_status)"; return 1; }
+    echo "$n units: no snapshot minted, no stage set added ($(stage_sets_by_status))"
+}
+check copy2_nothing_restaged step_e1_nothing_restaged
+# The foreign sealed volume: init refuses it, step 13 shows the dry run and
+# erases it on the --erase-label consent, then init again with no --force on
+# the verified erase (#469, #444).
+step_e1_foreign_tape_erased() {
+    local out="$RUN/phase-E1.out" proof
+    grep -F "already carries a SEALED volume" "$out" >/dev/null || { echo "init did not refuse the sealed foreign volume"; return 1; }
+    if grep -F "Leave it as it is: eject it" "$out" >/dev/null; then echo "the foreign volume was taken for this catalog's own"; return 1; fi
+    grep -E "^ +\\\$ .* cartridge erase --device .* --dry-run$" "$out" >/dev/null || { echo "no cartridge erase --dry-run"; return 1; }
+    grep -F "ERASE the tape holding $LABEL2 [auto: named by --erase-label]" "$out" >/dev/null \
+        || { echo "the erase was not offered naming File 0's label $LABEL2:"; grep -F "ERASE" "$out"; return 1; }
+    grep -E "^ +\\\$ .* cartridge erase --device .* --confirm-label $LABEL2$" "$out" >/dev/null \
+        || { echo "no 'cartridge erase --confirm-label $LABEL2'"; return 1; }
+    grep -F "the tape is erased, read back and recorded" "$out" >/dev/null || { echo "the erase did not complete"; return 1; }
+    [ "$(ran_count "$out" "volume init $LABEL2")" = 2 ] || { echo "want init run twice (refused, then after the erase)"; return 1; }
+    if grep -E "volume init .*--force" "$out" >/dev/null; then echo "step 13 forced volume init"; return 1; fi
+    proof="$(sql "SELECT json_extract(e.details, '\$.blank_proof.kind') FROM events e
+                  JOIN volumes v ON v.id = e.entity_id
+                  WHERE e.entity_type = 'volume' AND e.action = 'created' AND v.label = ?" "$LABEL2")"
+    [ "$proof" = verified_erase ] || { echo "volume $LABEL2 was created with blank proof '${proof:-none}', want verified_erase"; return 1; }
+    echo "refused, erased on --erase-label $LABEL2, inited with no --force (blank proof $proof)"
+}
+check copy2_foreign_tape_erased step_e1_foreign_tape_erased
+# What step 13 runs for the copy after the init: the write with its full
+# readback and the move, as one command (quoted into the check's record).
+step_e1_write_command() {
+    local line
+    line="$(grep -E "^ +\\\$ .* volume write $LABEL2 " "$RUN/phase-E1.out")"
+    echo "$line"
+    [ "$(printf '%s\n' "$line" | grep -c .)" = 1 ] || { echo "want one volume write"; return 1; }
+    printf '%s\n' "$line" | grep -E -- "volume write $LABEL2 --device [^ ]+ --yes --full-confirm --move-to $PLACE2\$" >/dev/null \
+        || { echo "the write is not 'volume write $LABEL2 --device D --yes --full-confirm --move-to $PLACE2'"; return 1; }
+}
+check copy2_write_command step_e1_write_command
+check copy2_post_write_block assert_post_write_block 0 "$RUN/phase-E1.start" "$RUN/phase-E1.out" new "$LABEL2" "$PLACE2" write
+# Item 219: a cartridge init registers takes the volume's label as its barcode.
+step_e1_barcode() {
+    local bc; bc="$(barcode_of "$LABEL2")"
+    echo "$LABEL2 is bound to the cartridge with barcode '${bc:-none}' (the library's tag: $SECOND_TAG)"
+    [ "$bc" = "$LABEL2" ]
+}
+check copy2_cartridge_barcode step_e1_barcode
+# The copy floor met, the write released every unit's staging (item 217).
+step_e1_staging_released() {
+    local n left files
+    n="$(units_count)"
+    left="$(sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" stage list --status staged --json \
+            | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" || { echo "stage list failed"; return 1; }
+    files="$(staged_slice_files)"
+    echo "stage sets: $(stage_sets_by_status); staged per stage list: $left; slice files in staging: $E1_SLICES_BEFORE before, $files after"
+    [ "$E1_SLICES_BEFORE" -gt 0 ] || { echo "no slice files in staging before copy 2: the release below proves nothing"; return 1; }
+    [ "$left" = 0 ] || { echo "units still staged"; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM stage_sets WHERE status = 'cleaned'")" = "$n" ] || { echo "want $n stage sets cleaned"; return 1; }
+    [ "$files" = 0 ] || { echo "slice files left in $RUN/staging"; return 1; }
+}
+check copy2_staging_released step_e1_staging_released
+# The end state: both volumes sealed, every unit 2 copies in 2 places
+# (`report copies`).
+step_e1_two_copies() {
+    local v
+    for v in "$LABEL" "$LABEL2"; do
+        [ "$(sql "SELECT status FROM volumes WHERE label = ?" "$v")" = sealed ] || { echo "$v is not sealed"; return 1; }
+    done
+    # shellcheck disable=SC2024  # the redirect is ours on purpose: the service user cannot write $RUN
+    sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" report copies --json >"$RUN/report-copies.json" \
+        || { echo "report copies failed"; return 1; }
+    python3 - "$RUN/report-copies.json" "$(units_count)" <<'PY'
+import json, sys
+rows, n = json.load(open(sys.argv[1])), int(sys.argv[2])
+for r in rows:
+    print(f"{r['unit']}: {r['copies']} copies, {r['locations']} locations, volumes {r.get('volumes')}")
+bad = [r["unit"] for r in rows if r["copies"] != 2 or r["locations"] != 2]
+if len(rows) != n or bad:
+    print(f"want {n} units each with 2 copies in 2 places; not so: {bad or 'the unit count'}")
+    sys.exit(1)
+PY
+}
+check copy2_both_sealed_two_copies_two_places step_e1_two_copies
+check priority_phase_e1 assert_prio E1 "cartridge erase" "volume init" "volume write"
+check raise_notice_phase_e1 assert_raised_notice "$RUN/phase-E1.out"
+
+# The library left tidy: the drive's cartridge back to its slot.
+step_library_tidy() {
+    local slot
+    slot="$(mtx -f "$CHG_SG" status | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+    [ -n "$slot" ] || { echo "the drive is already empty"; return 0; }
+    mtx -f "$CHG_SG" unload "$slot" "$DTE" || return 1
+    mtx -f "$CHG_SG" status | grep -E "Data Transfer Element $DTE:Empty" >/dev/null || { echo "DTE $DTE is not empty"; return 1; }
+    echo "the drive's cartridge is back in slot $slot"
+}
+check library_tidy step_library_tidy
 
 finish
