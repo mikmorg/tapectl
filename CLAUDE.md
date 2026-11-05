@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`), installed by `--upgrade` first.
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), installed by `--upgrade` first.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -452,6 +452,34 @@ escrow without `--mint-escrow` (item 188); step 12 stops the drive-poll timer (i
 home2 installed 1.8.1 by `--upgrade` on 2026-11-02, as handoff (i)'s step 0, before its fresh start (item 195; the rehearsal 53/53, `docs/runs/2026-11-02-1.8.1-handoff-i.md`).
 1.8.1 is tagged `v1.8.1` on `ac8bf8aa` (2026-11-01), after the whole chain passed on `5c17b52b`
 (chain57; the notes' Testing) and PR #510's CI.
+
+**1.9.0: the CLI review's release** (`docs/releases/1.9.0.md`; ADR-0012 items 198-221,
+`docs/audits/2026-11-04-cli-review.md`). No byte on tape changes and there is no migration (item
+221): every golden pin holds, and the minor moves because command and flag spellings were removed.
+A removed spelling is refused by name with exit 2, naming its replacement (`src/cli/renamed.rs`'s
+`RENAMED`; `tests/dry_run_contract.rs` holds every clap leaf to one verdict); the three File 1
+commands keep their spellings. Output goes through `src/render.rs` (borderless tables, real plurals,
+UTC times, colour only on verdict words); under `--json` every error is one JSON document on stdout
+(`TapectlError::with_json` merges a command's own payload) and the `error:` line still goes to
+stderr, so scripts that read stderr keep working. The first help paragraph of every command and
+flag is one line of at most 92 characters (`tests/help_text.rs`). What changed for the operator:
+`collection add|remove` edit `[[collections]]` with the access check and its `setfacl` lines
+(item 206); `config get`; `status` is the home screen (item 213; `volumes_past_verify_interval`
+in `policy::evidence` is the one "due a verify" rule it shares with `audit`); one copy loop,
+`volume write L --init --full-confirm --move-to X`, in every remedy, script and doc (item 218),
+and a `volume resume` keeps the write's `--full-confirm`/`--move-to` (item 215); staging is
+released per unit at its copy floor by default (item 217, read with item 154, the clarification
+under item 221); plans need no drive; a cartridge registered at `volume init` takes the label as
+its barcode (item 219); `unit check-integrity` tells CHANGED from BITROT (Q40's exit for CHANGED
+alone is `operations::changed_exit_code`, 0 as built, pending the CTO); `db backup DIR` writes a
+dated file and never overwrites. dar is handed `slice_size` as a byte count
+(`dar::slice::dar_slice_arg`), so the KiB-TiB spellings config accepts work there too. The scripts
+batch: `first-run.sh` step 7's staging diagnosis (item 199), `POST_WARNING_BYTES` (item 200), step
+11 through `collection add`, step 13 as the one copy loop with a same-label retry after an aborted
+write (#401), and `install-systemd.sh` installing bash completion and man pages. fr414's phase E
+runs copy 2 as home2 will (a second `--from 13` on a second cartridge that carries a foreign
+sealed volume). home2 installs 1.9.0 by `--upgrade` as handoff (i)'s next step, then copies 1
+and 2.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
