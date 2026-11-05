@@ -3524,10 +3524,11 @@ fn source_and_report_tables_and_json_keys_after_the_output_sweep() {
         "{snaps}"
     );
 
-    // report age: a table, in UTC.
+    // report age lists current versions; a snapshot is not current until a
+    // copy is written, so it says so (its table is pinned in report.rs's
+    // `capacity_and_age_are_borderless_tables`).
     let t = ok(&["report", "age"]);
-    assert!(t.contains("Unit") && t.contains("Created"), "{t}");
-    assert!(t.contains("alpha") && t.contains(" UTC"), "{t}");
+    assert!(t.contains("no current snapshots"), "{t}");
 
     // report dirty --json: a never-archived unit says so (beta has no
     // snapshot), never "new".
