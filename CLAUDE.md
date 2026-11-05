@@ -479,7 +479,8 @@ batch: `first-run.sh` step 7's staging diagnosis (item 199), `POST_WARNING_BYTES
 write (#401), and `install-systemd.sh` installing bash completion and man pages. fr414's phase E
 runs copy 2 as home2 will (a second `--from 13` on a second cartridge that carries a foreign
 sealed volume). home2 installs 1.9.0 by `--upgrade` as handoff (i)'s next step, then copies 1
-and 2.
+and 2. 1.9.0 is tagged `v1.9.0` on `4421e212` (2026-11-05), after the whole chain passed on
+`e48546d2` (chain65; the notes' Testing) and PR #512's CI.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
