@@ -1258,7 +1258,7 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
                  — re-run `tapectl catalog rebuild --from-volume --key <the REGISTERED escrow \
                  secret key>` to attest them, or re-stage",
                 crate::render::plural(
-                    report.unknown_remaining as i64,
+                    report.unknown_remaining,
                     "rebuilt stage set",
                     "rebuilt stage sets"
                 )
@@ -1271,7 +1271,7 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
                  catalog rebuild --from-volume --key <its secret key file>` to attest them, or \
                  re-stage",
                 crate::render::plural(
-                    report.unknown_remaining as i64,
+                    report.unknown_remaining,
                     "rebuilt stage set",
                     "rebuilt stage sets"
                 )
@@ -1327,7 +1327,7 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
             "  escrow: still `?` (unknown) for {} on this volume — \
              the escrow key found nothing new to attest this run",
             crate::render::plural(
-                report.unknown_remaining as i64,
+                report.unknown_remaining,
                 "rebuilt stage set",
                 "rebuilt stage sets"
             )
