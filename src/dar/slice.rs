@@ -320,12 +320,27 @@ impl SliceFrame {
     }
 }
 
+/// `slice_size` as dar's `-s` takes it: the byte count, since dar refuses
+/// the IEC spellings and fractions config accepts (ADR-0012 item 212).
+pub fn dar_slice_arg(slice_size: &str) -> Result<String> {
+    Ok(crate::staging::parse_size_to_bytes(slice_size)?.to_string())
+}
+
 /// Run the installed dar on an empty directory with slice size `slice_size`
-/// (the operator's string, unparsed) inside `work_dir`, and return the first
-/// bytes of its first slice: a slice header for [`cut_stream`]. `work_dir`
-/// must be empty and must not be under the staging directory; the archive
-/// holds nothing but an empty directory.
+/// (the operator's string) inside `work_dir`, and return the first bytes of
+/// its first slice: a slice header for [`cut_stream`]. `work_dir` must be
+/// empty and must not be under the staging directory; the archive holds
+/// nothing but an empty directory.
+///
+/// dar is given the size as a byte count, parsed by the same
+/// [`crate::staging::parse_size_to_bytes`] that `config check` validates
+/// with: dar's own `-s` refuses `512MiB` and a fraction such as `1.5G`,
+/// which config accepts (ADR-0012 item 212). dar's `k`/`M`/`G`/`T` are
+/// binary, as that parser's are, so a string dar took before cuts the same
+/// slices as its byte count.
 pub fn template(dar_binary: &str, slice_size: &str, work_dir: &Path) -> Result<Vec<u8>> {
+    let slice_size = dar_slice_arg(slice_size)?;
+    let slice_size = slice_size.as_str();
     let empty = work_dir.join("empty");
     std::fs::create_dir_all(&empty)?;
     let base = work_dir.join("template");
@@ -933,6 +948,27 @@ where
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// ADR-0012 item 212: config accepts `512MiB` and `1.5G` for
+    /// `slice_size`, and dar's `-s` refuses both. dar is given the byte
+    /// count, so each makes a template, and an IEC spelling cuts the same
+    /// slice size as the SI one dar always took.
+    #[test]
+    fn a_slice_size_config_accepts_is_one_dar_takes() {
+        assert_eq!(dar_slice_arg("1M").unwrap(), "1048576");
+        assert_eq!(dar_slice_arg("512MiB").unwrap(), "536870912");
+        assert_eq!(dar_slice_arg("1.5G").unwrap(), "1610612736");
+        assert!(dar_slice_arg("2GG").is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let size_of = |s: &str, dir: &str| {
+            let t = template("dar", s, &tmp.path().join(dir)).unwrap();
+            parse_header(&mut &t[..]).unwrap().slice_size
+        };
+        assert_eq!(size_of("1MiB", "iec"), size_of("1M", "si"));
+        assert_eq!(size_of("1M", "si-again"), Some(1_048_576));
+        assert_eq!(size_of("1.5M", "frac"), Some(1_572_864));
+    }
 
     /// A header built by hand in dar's layout, for the parser's refusals.
     fn header(flag: u8, slice_size: Option<&[u8]>) -> Vec<u8> {
