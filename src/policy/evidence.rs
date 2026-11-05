@@ -210,6 +210,97 @@ pub fn full_readback_date(session_alias: &str) -> String {
     format!("{session_alias}.started_at")
 }
 
+/// A volume past its verify interval ([`volumes_past_verify_interval`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverdueVolume {
+    pub label: String,
+    /// Its cartridge's barcode, when one is recorded.
+    pub barcode: Option<String>,
+    /// Its location's name, when one is recorded.
+    pub place: Option<String>,
+    /// Its newest passed full readback, dated by its start
+    /// ([`full_readback_date`]), as stored.
+    pub last_full: String,
+    /// The shortest `verify_interval_days` of the units on it.
+    pub interval_days: i64,
+    /// Whole days since `last_full`; `None` when that date does not parse.
+    pub age_days: Option<i64>,
+}
+
+/// `audit`'s per-volume clock (`volume_verify_age`), read by `audit` and by
+/// `status`'s "due a verify" alike (one rule, hoisted at 1.9.0's Wave 6): each
+/// volume that counts as a copy ([`crate::policy::coverage::eligible`]) and
+/// holds a completed write or a range, its newest passed full readback dated
+/// by its start, against the shortest `verify_interval_days` of the units on
+/// it (an archive set's, else `defaults_interval`). Past it by whole days, or
+/// with a date that does not parse, it is overdue; a volume no unit gives a
+/// clock is never overdue. A volume with NO passed full readback is
+/// [`sealed_without_full_verify`]'s, not this. Ordered by label.
+pub fn volumes_past_verify_interval(
+    conn: &Connection,
+    defaults_interval: Option<i64>,
+) -> Result<Vec<OverdueVolume>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT v.label, c.barcode, l.name,
+                MAX({dated}) AS last_full,
+                (SELECT MIN(COALESCE(a.verify_interval_days, ?1))
+                   FROM writes w2
+                   JOIN snapshots s2 ON s2.id = w2.snapshot_id
+                   JOIN units u2 ON u2.id = s2.unit_id
+                   LEFT JOIN archive_sets a ON a.id = u2.archive_set_id
+                  WHERE w2.volume_id = v.id
+                    AND w2.status IN ('completed', 'range')) AS interval_days
+           FROM volumes v
+           JOIN verification_sessions vs
+             ON vs.volume_id = v.id AND vs.outcome = 'passed' AND vs.verify_type = 'full'
+           LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+           LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+           LEFT JOIN locations l ON l.id = v.location_id
+          WHERE {eligible}
+            AND EXISTS (SELECT 1 FROM writes w
+                         WHERE w.volume_id = v.id AND w.status IN ('completed', 'range'))
+          GROUP BY v.id
+          ORDER BY v.label",
+        dated = full_readback_date("vs"),
+        eligible = crate::policy::coverage::eligible("v"),
+    ))?;
+    let rows = stmt
+        .query_map(params![defaults_interval], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now = chrono::Utc::now().naive_utc();
+    let mut out = Vec::new();
+    for (label, barcode, place, last_full, interval) in rows {
+        let Some(interval_days) = interval else {
+            continue; // no unit on it gives the volume a clock
+        };
+        // Whole days, strictly more than the interval (the per-unit
+        // `verify_age`'s rule); a date that does not parse is overdue.
+        let age_days = chrono::NaiveDateTime::parse_from_str(&last_full, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| (now - dt).num_days());
+        if age_days.is_some_and(|age| age <= interval_days) {
+            continue;
+        }
+        out.push(OverdueVolume {
+            label,
+            barcode,
+            place,
+            last_full,
+            interval_days,
+            age_days,
+        });
+    }
+    Ok(out)
+}
+
 /// The labels of every volume that counts as a copy
 /// ([`crate::policy::coverage::eligible`]) but has no PASSED FULL readback
 /// recorded — no `verification_sessions` row with `verify_type = 'full'`

@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::Config;
@@ -663,52 +663,15 @@ fn due_verify(conn: &Connection, defaults_interval: i64) -> Result<Vec<DueVerify
             interval_days: None,
         })
         .collect();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT v.label, MAX({dated}) AS last_full,
-                (SELECT MIN(COALESCE(a.verify_interval_days, ?1))
-                   FROM writes w2
-                   JOIN snapshots s2 ON s2.id = w2.snapshot_id
-                   JOIN units u2 ON u2.id = s2.unit_id
-                   LEFT JOIN archive_sets a ON a.id = u2.archive_set_id
-                  WHERE w2.volume_id = v.id
-                    AND w2.status IN ('completed', 'range')) AS interval_days
-           FROM volumes v
-           JOIN verification_sessions vs
-             ON vs.volume_id = v.id AND vs.outcome = 'passed' AND vs.verify_type = 'full'
-          WHERE {eligible}
-            AND EXISTS (SELECT 1 FROM writes w
-                         WHERE w.volume_id = v.id AND w.status IN ('completed', 'range'))
-          GROUP BY v.id
-          ORDER BY last_full, v.label",
-        dated = crate::policy::evidence::full_readback_date("vs"),
-        eligible = crate::policy::coverage::eligible("v"),
-    ))?;
-    let rows = stmt
-        .query_map(params![defaults_interval], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let now = chrono::Utc::now().naive_utc();
-    for (label, last_full, interval) in rows {
-        let Some(days) = interval else {
-            continue;
-        };
-        let age = chrono::NaiveDateTime::parse_from_str(&last_full, "%Y-%m-%d %H:%M:%S")
-            .ok()
-            .map(|dt| (now - dt).num_days());
-        if age.is_some_and(|a| a <= days) {
-            continue;
-        }
-        due.push(DueVerify {
-            label,
-            last_full: Some(last_full),
-            interval_days: Some(days),
-        });
-    }
+    let mut overdue =
+        crate::policy::evidence::volumes_past_verify_interval(conn, Some(defaults_interval))?;
+    // The longest overdue first, as before the rule was shared.
+    overdue.sort_by(|x, y| x.last_full.cmp(&y.last_full).then(x.label.cmp(&y.label)));
+    due.extend(overdue.into_iter().map(|v| DueVerify {
+        label: v.label,
+        last_full: Some(v.last_full),
+        interval_days: Some(v.interval_days),
+    }));
     Ok(due)
 }
 
@@ -962,6 +925,7 @@ pub fn run(startup: &Startup, last: usize, json_output: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     const RUNNING: &str = "\
 2026-10-01T03:12:40.118Z session start: volume write L6-0001 (tapectl 1.1.0, pid 4242, display Lines)
