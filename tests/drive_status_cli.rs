@@ -247,7 +247,8 @@ fn a_device_no_backend_claims_is_looked_at_with_a_note() {
 }
 
 /// No drive configured and none named: an error, not a report — under
-/// `--json` the JSON error on stdout and nothing else (ADR-0012 item 212),
+/// `--json` the JSON error on stdout (ADR-0012 item 212) and the same
+/// `error:` line on stderr as without it,
 /// and the reason says how to name one.
 #[test]
 fn no_drive_configured_and_none_named_is_an_error() {
@@ -264,9 +265,8 @@ fn no_drive_configured_and_none_named_is_an_error() {
     assert_eq!(v["exit_code"], 2, "{v}");
     assert!(v.get("outcome").is_none(), "an error, not a report: {v}");
     assert!(v["error"].as_str().unwrap().contains("--device"), "{v}");
-    assert!(
-        out.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("error: {}\n", v["error"].as_str().unwrap()),
     );
 }

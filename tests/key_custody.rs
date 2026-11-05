@@ -49,6 +49,14 @@ fn init_home() -> TempDir {
     home
 }
 
+/// A borderless table row's cells: runs of two or more spaces divide them.
+fn columns(line: &str) -> Vec<&str> {
+    line.split("  ")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
 // ── #350(c): the escrow key is labelled escrow, not `primary` ──
 
 /// The escrow row is stored with `key_type = 'primary'`: migration 001's
@@ -67,10 +75,11 @@ fn key_list_labels_the_escrow_key_as_escrow_in_the_table_and_in_json() {
         .lines()
         .find(|l| l.contains(&format!("{OP}-escrow")))
         .unwrap_or_else(|| panic!("no escrow row in the table:\n{table}"));
-    let cells: Vec<&str> = escrow_line.split('|').map(str::trim).collect();
-    // | Alias | Type | Active | Escrow | Fingerprint | Created |
+    // Alias  Type  Active  Escrow  Fingerprint  Created: a borderless table
+    // (1.9.0), its columns two or more spaces apart.
+    let cells = columns(escrow_line);
     assert_eq!(
-        cells.get(2).copied(),
+        cells.get(1).copied(),
         Some("escrow"),
         "the Type column of the escrow row must say escrow: {escrow_line:?}"
     );
@@ -79,8 +88,8 @@ fn key_list_labels_the_escrow_key_as_escrow_in_the_table_and_in_json() {
         .lines()
         .find(|l| l.contains(&format!("{OP}-primary")))
         .unwrap_or_else(|| panic!("no primary row in the table:\n{table}"));
-    let cells: Vec<&str> = primary_line.split('|').map(str::trim).collect();
-    assert_eq!(cells.get(2).copied(), Some("primary"), "{primary_line:?}");
+    let cells = columns(primary_line);
+    assert_eq!(cells.get(1).copied(), Some("primary"), "{primary_line:?}");
 
     let json: serde_json::Value = serde_json::from_str(&stdout(&ok(
         home.path(),

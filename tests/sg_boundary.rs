@@ -257,7 +257,10 @@ fn spawned_programs(text: &str) -> Vec<String> {
         while let Some(i) = rest.find("Command::new(") {
             let after = &rest[i + "Command::new(".len()..];
             let end = after.find(')').unwrap_or(after.len());
-            found.push(after[..end].trim().to_string());
+            // clap's `Command` builds a parser, never a process.
+            if !rest[..i].ends_with("clap::") {
+                found.push(after[..end].trim().to_string());
+            }
             rest = &after[end..];
         }
     }
@@ -299,6 +302,7 @@ fn the_spawn_scan_finds_a_program() {
         spawned_programs(
             "Command::new(\"mt\").arg(x); Command::new(MAM_TOOL);\n\
              /// `Command::new(binary)` in a doc comment\n\
+             let p = clap::Command::new(\"tapectl\");\n\
              #[cfg(test)]\nmod tests { Command::new(\"awk\") }"
         ),
         ["\"mt\"", "MAM_TOOL"]

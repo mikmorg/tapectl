@@ -72,12 +72,15 @@ fn a_commands_own_version_option_is_in_the_reference() {
 
     let create = section(&pages["stage.md"], "### tapectl stage create");
     assert!(
-        create.contains("- `--version <VERSION>` — Re-stage a specific snapshot version"),
+        create.contains(
+            "- `--version <VERSION>` — Stage this version again, after `stage clean` released it"
+        ),
         "stage create's own --version is missing: {create}"
     );
     let clean = section(&pages["stage.md"], "### tapectl stage clean");
     assert!(
-        clean.contains("- `--version <VERSION>` — Narrow release further"),
+        clean
+            .contains("- `--version <VERSION>` — Only this version of the one unit `--unit` names"),
         "stage clean's own --version is missing: {clean}"
     );
 
