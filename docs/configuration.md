@@ -417,7 +417,7 @@ Which commands read which keys:
   Without `--device`, both kinds use the only block. With no block and no
   `--device`, both refuse. With several blocks and no `--device`, both
   refuse at once with exit 2, and nothing is asked:
-  `configuration error: multiple LTO backends configured (lto6, second); pass --device to select one`.
+  `configuration error: multiple LTO drives configured (lto6, second); pass --device to select one`.
 - **`generation`** is what every write, and every read path named above, checks the
   loaded cartridge against. Every write refuses a cartridge this drive cannot write:
   `volume init`, `volume write`, `volume resume`, and through `volume write` also
