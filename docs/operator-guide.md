@@ -38,10 +38,12 @@ documentation is [docs/README.md](README.md).
   - [Configure](#configure)
   - [Working on a different archive](#working-on-a-different-archive)
 - [Day-to-Day Operations](#day-to-day-operations)
+  - [Status: where things stand](#status-where-things-stand)
   - [A typical write session](#a-typical-write-session)
   - [Watching a long operation: progress and the session log](#watching-a-long-operation-progress-and-the-session-log)
   - [Watching from another account](#watching-from-another-account)
   - [Register units](#register-units)
+  - [Adding a collection](#adding-a-collection)
   - [Archive to tape](#archive-to-tape)
   - [A quiet host while the tape runs](#a-quiet-host-while-the-tape-runs)
   - [Check what's pending](#check-whats-pending)
@@ -96,8 +98,12 @@ single-user machine.
 
 The service user needs **read** on every tree it archives and **write** on
 each unit's top directory (for the `.tapectl-unit.toml` dotfile). The installer
-grants this for the trees you name then; for a tree you add later, grant it
-yourself with POSIX ACLs (package `acl`):
+grants this for the trees you name then. For a tree you add later,
+`tapectl-op collection add` checks it as the service user and, when it cannot
+read or write what it must, prints the POSIX ACL lines (package `acl`) that
+grant it and adds nothing, since it cannot grant them itself
+([Adding a collection](#adding-a-collection)). For a single unit, the same
+lines by hand:
 
 ```bash
 sudo setfacl -R -m u:tapectl:rX /data/alice/photos      # read the whole tree
@@ -146,7 +152,18 @@ tapectl initialized at ~/.tapectl
   escrow:   age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
             (the SECRET was printed above — transcribe it now onto paper; ADR-0005)
   dar:      dar (found at /usr/bin/dar)
+
+next steps:
+  a tenant, whose data is archived    tapectl tenant add <TENANT>
+  the tape drive                      tapectl drive add --name <NAME> --device-tape /dev/tape/by-id/<DRIVE>-nst
+  what to archive, a folder of units  tapectl collection add <NAME> <ROOT> --tenant <TENANT>
+  or one folder as a unit             tapectl unit init <PATH> --tenant <TENANT>
+  where copies are kept               tapectl location add <PLACE>
+  a copy, once units are staged       tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <PLACE>
+`tapectl status` shows where things stand and the next command at every step.
 ```
+
+The next steps are this guide's next sections, in about that order.
 
 > [!WARNING]
 > The escrow secret is stored nowhere on disk. Copy it onto paper before you
@@ -159,15 +176,25 @@ original with `tapectl init --escrow-public-key age1…` (see
 
 ### Configure
 
-The config file is `~/.tapectl/config.toml` (under the service user's home on
-a production install). Register the drive with `drive add` rather than by
-editing the file — `first-run.sh` step 8 does this, reading the generation from
-the drive's own identification:
+The config file is `config.toml` in the home (`~/.tapectl/config.toml`, or
+the service user's home on a production install; `config check` and `status`
+name the home in use). Register the drive with `drive add` rather than by
+editing the file — `first-run.sh` step 8 does this. `drive add` reads the
+drive's generation from its model, so it needs only the device:
 
 ```bash
-tapectl drive add --name lto6 \
-    --device-tape /dev/tape/by-id/scsi-<SERIAL>-nst --generation LTO-6
+tapectl drive add --name lto6 --device-tape /dev/tape/by-id/scsi-<SERIAL>-nst
 ```
+
+```text
+generation LTO-6, read from the drive attached at /dev/tape/by-id/scsi-<SERIAL>-nst (model HP Ultrium 6-SCSI)
+drive "lto6" added to ~/.tapectl/config.toml (LTO-6, tape=/dev/tape/by-id/scsi-<SERIAL>-nst, sg=/dev/sgN (derived from device_tape))
+verify it with: tapectl config check
+```
+
+A model tapectl does not know, or a drive that is not attached yet, is refused
+naming `--generation LTO-N`, which then declares it; a `--generation` the
+attached drive's model contradicts is refused naming both.
 
 The drive's SCSI generic node (the cartridge chip, the health pages and Logical
 Block Protection go through it) is derived from the tape node at every use, so it
@@ -177,9 +204,19 @@ A drive declares only **what generation it is** (ADR-0010). It does not
 declare a media type or a capacity: the generation of each cartridge is
 detected from the medium at `volume init`, and that tape's capacity follows
 from it. `capacity_override` exists for virtual drives and test harnesses
-only. There is no `backend edit`; to change a backend, edit its
+only. There is no `drive edit`; to change a drive, edit its
 `[[backends.lto]]` table by hand or with `tapectl config set
 'backends.lto[NAME].<key>' <value>`, then run `tapectl config check`.
+`tapectl config get KEY` prints one key's value in force and where it comes
+from (the file, a default, or derived); with one drive configured a bare key
+names its key:
+
+```text
+$ tapectl config get post_warning_bytes
+backends.lto[lto6].post_warning_bytes is not set  # default
+$ tapectl config get defaults.min_copies
+defaults.min_copies = 2  # set in ~/.tapectl/config.toml
+```
 
 A minimal hand-written config looks like this (every key, its default and what
 it does are in [configuration.md](configuration.md)):
@@ -225,10 +262,19 @@ tapectl config check
 
 ```text
 config: valid
+home: ~/.tapectl (this account's ~/.tapectl)
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
+note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst --generation LTO-6`
+defaults: verify_interval_days = 365 (`audit` warns when a unit has gone longer without a passing full `volume verify`; an archive set that names its own interval overrides this for its units)
 ```
+
+The second line names the home and the rule that chose it. A `note:` line is
+not an error (the exit is still 0): it names something that will matter later,
+such as a missing drive, a drive with no `post_warning_bytes` (a write then
+plans to the fill ceiling; [LTO profiling](lto-profiling.md) measures it), or a
+collection that cannot run yet.
 
 **When `--device` is needed.** With exactly one `[[backends.lto]]` configured,
 every tapectl command that touches a tape finds the drive without `--device`,
@@ -271,141 +317,216 @@ file inside it.
 
 ## Day-to-Day Operations
 
+### Status: where things stand
+
+`tapectl status` is the home screen. Run it first, and whenever you are not
+sure what comes next:
+
+```text
+$ tapectl status
+home: ~/.tapectl (this account's ~/.tapectl)
+session logs: ~/.tapectl/logs
+running: nothing
+recent:
+  2026-11-05 02:28 UTC  stage create family/letters +3 more  — ok
+      ...
+units: 4 active
+  State          Units
+  pending        0
+  staged         4, awaiting a write
+  under-copied   4, below their copy floor
+volumes due a verify: none
+next:
+  tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>
+```
+
+From the top:
+
+- **The home**, and why it is the one: `named by --home`, `named by
+  TAPECTL_HOME`, `named by the home pointer /etc/tapectl/home`, `this account's
+  ~/.tapectl`, or the default. Every command works on the home this line
+  names; `config check` names it the same way.
+- **What is running and how the last sessions ended**, from the session logs:
+  the live session's phase, progress, rate and ETA, and each recent session's
+  outcome and phase timings (`--last N` shows more;
+  [Watching a long operation](#watching-a-long-operation-progress-and-the-session-log)).
+- **The units by state**, from the catalog: **pending** (never archived, or
+  dirty: changed since its last version), **staged** (a version waiting in
+  staging for a copy it is still owed), and **under-copied** (below its copy
+  floor).
+- **The volumes due a verify**: a volume with no full readback, or past the
+  `verify_interval_days` of a unit on it, each with why.
+- **The next commands**, at most three, in this order: an interrupted write to
+  resume (`volume resume LABEL`); pending units (`collection run` for a
+  collection's, `snapshot create` otherwise); staged or under-copied units (the
+  one copy loop, `volume write <NEW-LABEL> --init --full-confirm --move-to
+  <location>`); a volume to verify. With nothing due it says `next: nothing to
+  do`.
+
+`--json` gives the same as one document, with the next commands under `next`.
+`status` exits 0 when it read the catalog and 2 when it could not (not
+initialized, damaged or busy), said on stderr after the home and the sessions.
+An account in the home's `[ops] group` reads the session logs but not the
+catalog: it is shown the home and the sessions, and told `the overview needs
+the service user: tapectl-op status`
+([Watching from another account](#watching-from-another-account)).
+
 ### A typical write session
 
 Tape is write-once in tapectl: each `volume write` fills one freshly
 initialised cartridge in a single session and seals it, and nothing is ever
 appended to a sealed tape. So work comes in batches: snapshot and stage what
 changed, then write the batch to as many cartridges as your policy wants
-copies (two, by default). This is the whole sequence, copy-pasteable. The
-output shown is from a real session with four small units and a policy of two
+copies (two, by default). Every copy is the same one command,
+`volume write LABEL --init --full-confirm --move-to PLACE`. This is the whole
+sequence, copy-pasteable. The output shown is from the
+[walkthrough](walkthrough.md)'s session: four small units and a policy of two
 copies.
 
 ```bash
-# 0. Is the host quiet, and what changed?
+# 0. Where things stand, is the host quiet, and what changed?
+tapectl status
 tapectl host check
 tapectl report dirty
 
-# 1. Snapshot (fast metadata walk) and stage (dar + encrypt) each unit
-tapectl snapshot create family/letters
-tapectl stage create family/letters
+# 1. Snapshot (fast metadata walk) and stage (dar + encrypt) the units
+tapectl snapshot create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
+tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 
 # 2. What will go on tape, and how many cartridges?
-tapectl volume plan --copies 2
+tapectl volume plan
 
 # 3. First copy: load a blank cartridge. One command initialises it, writes the
 #    volume, reads every file back, and moves it to the shelf once it is confirmed
 tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 
-# 4. Second copy: swap in another blank cartridge. This write completes the
-#    policy's copies, so it also releases the staged slices (after its full readback)
+# 4. Second copy: swap in another blank cartridge. This write brings every unit
+#    to its copy floor, so each unit's staged slices are released after it
 tapectl volume write L8-0002 --init --full-confirm --move-to offsite
 
-# (the long form still works: volume init, volume write, volume verify --full,
-#  volume move; `tapectl volume verify` with no label verifies
-#  whichever volume is loaded)
-
-# 5. Check, release staging, refresh the Heir Kit, back up the catalog
+# 5. Check, refresh the Heir Kit, back up the catalog
 tapectl audit
 tapectl report copies
-tapectl stage clean
 tapectl key escrow-kit ~/heir-kit
-tapectl db backup /mnt/backup/tapectl.db   # a timer install: sudo systemctl start tapectl-backup.service
+tapectl db backup /mnt/backup   # a dated file in it; a timer install: sudo systemctl start tapectl-backup.service
 ```
 
 What success looks like at each step:
 
 ```text
-$ tapectl snapshot create family/letters
-snapshot created: family/letters v1 (2 files, 224 B)
+$ tapectl snapshot create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
+snapshot created: family/letters v1 (2 files, 235 B)
+snapshot created: photos/2019-italy v1 (4 files, 1.1 MiB)
+snapshot created: photos/2020-garden v1 (3 files, 586.1 KiB)
+snapshot created: work/invoices-2024 v1 (2 files, 226 B)
 
-$ tapectl stage create family/letters
-staged: family/letters (1 slices, 1.1 KiB dar, 1.8 KiB encrypted)
+$ tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
+...
+staged: family/letters (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: photos/2019-italy (1 slice, 1.1 MiB dar, 1.1 MiB encrypted)
+staged: photos/2020-garden (1 slice, 587.3 KiB dar, 588.1 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
 
-$ tapectl volume plan --copies 2
-volume write plan (2 copy/copies):
-  family/photos/2019-italy v1: 1 slices, 1.1 MiB
-  family/photos/2020-garden v1: 1 slices, 588.1 KiB
-  family/letters v1: 1 slices, 1.8 KiB
-  work/invoices-2024 v1: 1 slices, 1.7 KiB
+$ tapectl volume plan
+volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
+  photos/2019-italy v1: 1 slice, 1.1 MiB
+  photos/2020-garden v1: 1 slice, 588.1 KiB
+  family/letters v1: 1 slice, 1.7 KiB
+  work/invoices-2024 v1: 1 slice, 1.7 KiB
 
-total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
+total: 4 slices, 1.7 MiB x 2 = 3.3 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
-cross-volume index: about 1.1 KiB per tape, 2.2 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
+cross-volume index: about 2.8 KiB per tape, 5.5 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
-$ tapectl volume init L8-0001
-cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
-volume "L8-0001" initialized (id=1)
+$ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
+cartridge L8-0001 auto-registered from MAM (chip serial E01001L8_1775794348; barcode L8-0001, the volume's label)
+volume "L8-0001" initialized (id=1); writing it now. If the write does not complete the volume stays initialized, and what to run next is said when it stops.
 medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
-
-$ tapectl volume write L8-0001
 about to write to volume "L8-0001":
-  family/letters v1: 1 slices, 1.8 KiB
-  family/photos/2019-italy v1: 1 slices, 1.1 MiB
-  family/photos/2020-garden v1: 1 slices, 588.1 KiB
+  family/letters v1: 1 slices, 1.7 KiB
+  photos/2019-italy v1: 1 slices, 1.1 MiB
+  photos/2020-garden v1: 1 slices, 588.1 KiB
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
-
-$ tapectl volume verify L8-0001
-verify L8-0001 (full tier): 13 checked, 13 passed, 0 failed
-
-$ tapectl volume move L8-0001 --to home-rack
+sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
+staging kept for 4 units still short of their policy; the next copy reuses their staged slices:
+  unit family/letters has 1 copy, needs 2
+  unit photos/2019-italy has 1 copy, needs 2
+  unit photos/2020-garden has 1 copy, needs 2
+  unit work/invoices-2024 has 1 copy, needs 2
 volume "L8-0001" moved to "home-rack"
-  cartridge "E01001L8_1775794348" moved with it
+  cartridge "L8-0001" moved with it
+next: tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>
 ```
 
-`volume write` ends with a quick confirm: it reads the front index and the
-seal marker back and checks them against what it wrote, and a passing confirm
-seals the volume (ADR-0012, 2026-10-06). It does not read the data back, so
-the `volume verify` straight after it is the volume's first full readback —
-every file hashed against the front index, the one check that spans host,
-cable, drive and medium. Until one passes, `audit` names the volume
-(`no_full_verify`) and each unit on it (`verify_age`, `last: never`), and
-`report verify-status` lists the volume. `volume write
---full-confirm` does the full readback as part of the write instead (hours on
-a full cartridge); `volume verify` afterwards is then a second, independent
-read-back. Here `audit`
-after the first copy correctly reports that every unit is one copy short —
-that is the reminder to write the second:
+`--init` is `volume init`: it reads the cartridge's chip, registers a cartridge
+it has never seen by its serial, and gives it the volume's label as its barcode
+(ADR-0012 item 219), so the sticker you write says `L8-0001` too. The write ends
+with a confirm: it reads the front index and the seal marker back and checks
+them against what it wrote, and a passing confirm seals the volume (ADR-0012,
+2026-10-06). `--full-confirm` makes that confirm the volume's first full
+readback: every file hashed against the front index, the one check that spans
+host, cable, drive and medium, done while the staged slices are still on disk
+to write a bad copy again from. It costs about as long as the write (~2.3 h on
+a full LTO-6). Without it the confirm reads none of the data back, and until a
+full readback passes `audit` names the volume (`no_full_verify`) and each unit
+on it (`verify_age`, `last: never`), `report verify-status` and `status` list
+the volume, and `volume verify LABEL` is the readback.
+
+The copy then releases staging unit by unit (ADR-0012 item 217): each unit
+the copy brings to its copy floor (the larger of its `min_copies` and the sum
+of its `copies_at` targets, times the tape-only multiplier for a tape-only
+unit) gives up its staged slices, and a unit still short keeps them, named
+with how far short it is, whatever the units written beside it still owe.
+Here the first copy kept all four. `--move-to` moves the sealed volume and its
+cartridge, and the last line is the next command. `audit` after the first copy
+reports every unit one copy short, which is the reminder to write the second:
 
 ```text
 $ tapectl audit
 VIOLATIONS (4):
-  [copy_count] family/letters: has 1 copies, needs 2
-  [copy_count] family/photos/2019-italy: has 1 copies, needs 2
-  [copy_count] family/photos/2020-garden: has 1 copies, needs 2
-  [copy_count] work/invoices-2024: has 1 copies, needs 2
+  [copy_count] family/letters: has 1 copy, needs 2
+  [copy_count] photos/2019-italy: has 1 copy, needs 2
+  [copy_count] photos/2020-garden: has 1 copy, needs 2
+  [copy_count] work/invoices-2024: has 1 copy, needs 2
 WARNINGS (1):
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 4 violations, 1 warnings (exit 2)
+  [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
+audit: 4 violations, 1 warning (exit 2)
+for the fixes: tapectl audit --action-plan
 ```
 
-And after the second copy is written and moved offsite:
+And the second copy, written and moved offsite:
 
 ```text
+$ tapectl volume write L8-0002 --init --full-confirm --move-to offsite
+...
+volume "L8-0002" write completed
+sealed and confirmed: 4 units, 4 slices, 1.7 MiB; full readback passed
+staging released: 4 stage sets, 1.7 MiB freed (every unit written has its policy's copies)
+volume "L8-0002" moved to "offsite"
+  cartridge "L8-0002" moved with it
+next: nothing to do; every unit written has its policy's copies
+
 $ tapectl audit
 WARNINGS (1):
-  [escrow_kit_missing] archive: 2 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
-audit: 0 violations, 1 warnings (exit 1)
+  [escrow_kit_missing] archive: 2 sealed volumes exist but no heir kit has ever been generated — nothing off-site can decrypt them
+audit: 0 violations, 1 warning (exit 1)
+for the fixes: tapectl audit --action-plan
 
 $ tapectl report copies
   family/letters: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  family/photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-  family/photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
+  photos/2019-italy: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
+  photos/2020-garden: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
   work/invoices-2024: 2 copies, 2 locations [tapes holding any version: L8-0001,L8-0002]
-
-$ tapectl stage clean
-cleaned 4 stage set(s), 4 files removed, 2.1 MiB freed
-  sessions: 2 reclaimed, 0 retained, 0 orphaned; 4 lockfiles reclaimed
 
 $ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
-  tapectl-1.5.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
+  catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
+  tapectl-1.9.0    the program that made this kit, … bytes, sha256 … (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -414,63 +535,36 @@ still to do, and only you can do it:
      public half, and without the secret the sheet opens nothing
   3. seal it in a tamper-evident envelope
   4. store copies in at least TWO independent failure domains
+
+$ tapectl db backup /mnt/backup
+database backed up to /mnt/backup/tapectl-20261105T023512Z.db (520.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
 (The remaining warning, `escrow_kit_missing`, is what step 5's
 `key escrow-kit` clears. Take the catalog backup last, once the session is
 over; [Database Operations](#database-operations) says why a mid-session one
-is not enough.)
+is not enough.) No `stage clean` was needed: the second copy released every
+unit's staging itself. `--keep-staging` on a write holds everything, and
+`--keep-staging-for-locations` holds each unit until every one of its
+`copies_at` targets is met too ([Copies by location](#copies-by-location));
+`stage clean` releases what they held later, by the same rule.
+
+The long form is still there: `volume init LABEL`, then `volume write LABEL`,
+then `volume move LABEL --to PLACE`, with `--full-confirm` on the write or a
+`volume verify LABEL` after it. `tapectl volume verify` with no label verifies
+whichever volume is loaded.
 
 If you archive whole folders of similar things — one unit per subfolder of a
-media root — a [Collection](cli/collection.md) (`collection sync`,
-`collection plan`, `collection run`) does steps 1–4 for you, and
+media root — a [collection](#adding-a-collection) does steps 1–3 for you:
+`collection run --label L8-0003 --init --full-confirm --move-to home-rack`
+snapshots and stages its pending units one batch at a time and writes the
+batch as one copy, in the same one command; each further copy is the
+`volume write … --init --full-confirm --move-to` it names last.
 `quick-archive` registers, snapshots, stages and writes a single directory
 onto a volume you have already initialised.
 
-**`collection run` releases staging as soon as its copies are confirmed.**
-Each copy's write ends with the default quick confirm (the front index and the
-seal marker, not the data), and once every unit of the batch has the copies its
-`min_copies` asks for, the run releases those units' staged slices straight
-away (ADR-0012, 2026-10-07). So on this path no full readback of the data
-precedes the release. A `volume verify` after the run comes only after the staged
-slices are gone, and a copy it finds bad is rewritten from another copy (`volume
-read-slices`), not from staging; `--full-confirm-first` (or `--full-confirm`) on
-the run reads the data back while staging is still held.
-When the data matters, have at least one copy read back in full before the
-release. `collection run --full-confirm-first` reads the run's first copy back
-in full and confirms the others quickly; `--full-confirm` reads every copy back
-in full. Each full readback takes about as long as its write (~2.3 h on a full
-LTO-6). The two flags cannot be given together (ADR-0012, 2026-10-07). A
-`collection run` writes one copy today (it takes one `--label`), so the two
-flags read back the same copy; `--full-confirm-first` says what you mean if
-runs ever write more. A second copy written afterwards with `volume write`
-gets the quick confirm unless you pass it `--full-confirm`.
-
-`volume write` and `volume resume` release staging the same way (#440): once the
-copy they seal brings every unit written to the volume to its `min_copies`, they
-release those units' staged slices, and name any unit still short. Pass
-`--keep-staging` to hold them, for example for a full `volume verify` first, and
-run `stage clean` afterwards.
-
-A collection archives only its units: the real folders at exactly
-`unit_depth` below its root, and everything inside them. Anything else under
-the root down to that depth is in no unit and never reaches a tape: a loose
-file beside the unit folders (or, with `unit_depth` 2 or more, beside their
-parent folders), a symlink there, and a symlink to a folder standing where a
-unit folder would be (`collection sync` does not follow it). `collection sync`
-and `collection status` name each one and exit 1, so a clean run means the
-whole root is in units:
-
-```text
-collection "movies": 0 pending, 0 dirty, 0 missing, 0 under-copied
-  OUTSIDE ANY UNIT (not archived): 2 entries under the root belong to no unit
-    README.txt (file)
-    Brazil.1985 (symlinked directory)
-```
-
-Move such a file into a unit folder, replace the symlink with the folder
-itself, or list the name in the collection's `exclude` to say you meant to
-leave it out.
+`status` names whichever of these is due: with pending units in a collection it
+names `collection run`, with staged or under-copied units the one copy loop.
 
 ### Staging a source that is in use
 
@@ -749,30 +843,41 @@ timings are kept in the catalog regardless.
 
 ### Watching from another account
 
-`tapectl status` says what is running and how the last sessions ended, from
-the session logs alone — it opens no catalog and no config:
+`tapectl status` says what is running and how the last sessions ended from
+the session logs, which an operator account can read without sudo once it is
+in the home's `[ops] group` (below). The rest of the overview, the units and
+volumes, comes from the catalog, which only the service user opens; from your
+own account `status` shows the home and the sessions and says
+`the overview needs the service user: tapectl-op status`.
 
 ```bash
 tapectl status                       # what is running, and the last 5
 tapectl status --last 20 --json
+tapectl-op status                    # the whole overview, as the service user
 ```
 
 The home comes from the pointer `/etc/tapectl/home` (written by first-run step 7 and
-`install-systemd.sh`) when the account has no `~/.tapectl` of its own; it is ignored as
-root, and `--home` or `TAPECTL_HOME` override it.
+`install-systemd.sh`) when the account has no `~/.tapectl` of its own, and
+`--home` or `TAPECTL_HOME` override it. Root never reads the pointer: on a host
+that has one, a command run as root is refused unless `--home` or `TAPECTL_HOME`
+names the home, since it would otherwise open `/root/.tapectl`, an archive
+nobody chose; run it as `tapectl-op <command>`. (`host check`, `--version`,
+`--help` and `completions` run as root regardless.)
 
 ```text
+home: /srv/archive_meta/tapectl/home (named by the home pointer /etc/tapectl/home)
 session logs: /srv/archive_meta/tapectl/home/logs
-running: volume write L6-0002 (pid 81234), started 2026-10-06T03:12:40.118Z
+running: volume write L6-0002 (pid 81234), started 2026-10-06 03:12 UTC
   phase:    write
-  progress: write 512.0 GiB of 1.20 TiB (41.7%), 145.2 MiB/s, ETA 1h 21m, elapsed 1h 00m — file 19 of 43 (at 2026-10-06T04:12:41.002Z)
-  last log line at 2026-10-06T04:12:58.310Z
+  progress: write 512.0 GiB of 1.20 TiB (41.7%), 145.2 MiB/s, ETA 1h 21m, elapsed 1h 00m — file 19 of 43 (at 2026-10-06 04:12 UTC)
+  last log line at 2026-10-06 04:12 UTC
   log:      /srv/archive_meta/tapectl/home/logs/20261006T031240Z-volume-write-L6-0002-81234.log
 recent:
-  2026-10-05T19:02:11.904Z  stage create keepsake/1998-wedding  — ok
+  2026-10-05 19:02 UTC  stage create keepsake/1998-wedding  — ok
       check            2.1 s
       archive         41m 3s   88.2 GiB  36.6 MiB/s
       ...
+the overview needs the service user: tapectl-op status
 ```
 
 A running session's progress line is at most one interval (30 s) old, whatever
@@ -851,6 +956,133 @@ folders become units, ignores case too: a plain pattern there matches a
 candidate folder's name, and a `name/` pattern skips every candidate below a
 folder of that name. Every key is in [configuration.md](configuration.md).
 
+### Adding a collection
+
+A **collection** is a folder whose subfolders are each a unit: a folder per
+film, per trip, per year. Name it once, and every folder under it is a unit,
+now and as folders are added. The collection's name begins each unit's name
+(`movies/Alien.1979`), and every unit belongs to the collection's tenant.
+
+```bash
+tapectl collection add movies /media/movies --tenant family
+```
+
+```text
+added collection "movies" (root /media/movies, tenant family, a unit per folder 1 level below the root) to ~/.tapectl/config.toml
+its sync, as `tapectl collection sync` would run it now:
+collection "movies" (dry run): would create 2; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
+```
+
+`collection add` writes the collection's `[[collections]]` table into
+`config.toml`, keeping its comments, and shows what a sync would do; it
+registers nothing yet. Its flags are the table's keys: `--unit-depth 2` makes
+the grandchildren the units (`ROOT/show/season`), `--exclude PATTERN` leaves a
+folder or file out (repeat it), `--archive-set` gives every unit that set's
+policy, and `--no-dotfiles` is for a source tapectl must not write (each unit is
+then known by its path, so a renamed folder reads as a new unit). ROOT must be
+an absolute path that exists, inside no other collection's root and holding
+none, and the tenant and archive set must exist.
+
+Before it writes anything, `collection add` checks, as the user it runs as (the
+service user, under `tapectl-op`), that it can read the whole tree and write a
+`.tapectl-unit.toml` into each unit folder. When it cannot, it adds nothing and
+prints the lines that grant it, to run as root:
+
+```text
+error: user tapectl cannot read everything and write each unit folder's .tapectl-unit.toml under /media/movies, and tapectl cannot grant that itself. Grant it as root (POSIX ACLs: owners and modes stay as they are):
+  sudo setfacl -R -m u:tapectl:rX /media/movies
+  sudo setfacl -R -d -m u:tapectl:rX /media/movies
+  sudo find /media/movies -mindepth 1 -maxdepth 1 -type d -exec setfacl -m u:tapectl:rwX {} +
+then run `tapectl collection add` again. For a source tapectl must not write, add it with --no-dotfiles instead: each unit is then known by its path. What failed:
+  cannot read /media/movies/Alien.1979
+  cannot write /media/movies/Heat.1995
+```
+
+Then register the units, and see where the collection stands:
+
+```bash
+tapectl collection sync
+tapectl collection status
+```
+
+```text
+collection "movies": 2 created; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
+collection "movies": 2 pending (2 never archived) · 2 under-copied
+```
+
+`collection sync` registers each new unit folder, follows a moved or renamed
+one by its dotfile's uuid, and marks a vanished one `missing`, never deleting
+or retiring it; run it whenever folders are added (or let a timer run it).
+`collection status` counts each collection's units by what they need:
+**pending** (never archived, or dirty: changed since their last version), then
+**staged** (a version waiting in staging for a copy it is still owed), then
+under-copied and missing. Both sweep every collection, and one bad collection
+never stops the others: each exits 0 clean, 1 on warnings (a folder refused, an
+entry outside every unit, a unit marked missing), 2 on errors (a root that does
+not exist or is not absolute, an unknown tenant or archive set, permission
+denied, a dotfile that could not be written), the worst seen.
+
+A collection archives only its units: the real folders at exactly
+`unit_depth` below its root, and everything inside them. Anything else under
+the root down to that depth is in no unit and never reaches a tape: a loose
+file beside the unit folders (or, with `unit_depth` 2 or more, beside their
+parent folders), a symlink there, and a symlink to a folder standing where a
+unit folder would be (`collection sync` does not follow it). `collection sync`
+and `collection status` name each one and exit 1, so a clean run means the
+whole root is in units:
+
+```text
+collection "movies": 2 pending (2 never archived) · 2 under-copied
+  OUTSIDE ANY UNIT (not archived): 2 entries under the root belong to no unit
+    Brazil.1985 (symlinked directory)
+    README.txt (file)
+    move each into a unit folder, or exclude it: tapectl config add 'collections[movies].exclude' PATTERN
+```
+
+Move such a file into a unit folder, replace the symlink with the folder
+itself, or list the name in the collection's `exclude` to say you meant to
+leave it out.
+
+**Writing a collection.** `collection plan` shows how the pending units pack
+into tapes, one batch per tape, in name order; it needs no drive, only a
+generation (`--generation`, or the configured drive's). `collection run` then
+stages one batch and writes it as one copy, in the one command a copy is:
+
+```bash
+tapectl collection plan
+tapectl collection run movies --label L6-0003 --init --full-confirm --move-to home-rack
+```
+
+The collection's name may be left out when only one is configured. A run takes
+exactly one `--label`: tapectl drives no changer, so each further copy is a
+cartridge swap and the `volume write <NEW-LABEL> --init --full-confirm --move-to
+<location>` the run names on its last line. `--init` initialises the blank
+cartridge in the drive first, and the batch is packed against the capacity
+that init records; `--move-to` moves the sealed tape, and a location that does
+not exist is refused before anything is staged.
+
+A run releases staging as each copy confirms, unit by unit, as `volume write`
+does (ADR-0012 item 217): each unit the copy brings to its copy floor gives up
+its staged slices, and a unit still short keeps them for the next copy. A copy
+written without `--full-confirm` ends with the quick confirm (the front index
+and the seal marker, not the data), so on that path no full readback of the
+data precedes the release, and a copy a later `volume verify` finds bad is
+rewritten from another copy (`volume read-slices`), not from staging. When the
+data matters, have every copy read back in full before its release: pass
+`--full-confirm` to the run and to each `volume write` after it. Each full
+readback takes about as long as its write (~2.3 h on a full LTO-6).
+`--full-confirm-first` reads the run's first copy back in full and the others
+quickly; a run writes one copy today, so it reads back the same copy
+`--full-confirm` does, and the two cannot be given together (ADR-0012,
+2026-10-07).
+
+**Taking a collection out.** `collection remove movies` takes its table out of
+`config.toml`. Its units stay registered and untouched, with their versions,
+copies and staged sets: no sync walks the root after that, so none of them is
+marked missing for it. `tapectl config add collections` is refused, naming
+`collection add`, which makes the checks above; edit a collection's other keys
+with `tapectl config set 'collections[movies].<key>' <value>`.
+
 ### Archive to tape
 
 `tapectl init` creates the permanent escrow recipient (ADR-0005) for you and
@@ -872,12 +1104,12 @@ tapectl snapshot create tv/breaking-bad/s01
 # Step 2: Stage (dar archive + encrypt — needs staging disk space)
 tapectl stage create tv/breaking-bad/s01
 
-# Step 3: Write to tape (a blank or erased cartridge)
-tapectl volume init L6-0001
-tapectl volume write L6-0001
+# Step 3: Write a copy to tape (a blank or erased cartridge): initialise it,
+#         write it, read every file back, and record where it goes
+tapectl volume write L6-0001 --init --full-confirm --move-to home-rack
 
-# Step 4: Verify
-tapectl volume verify L6-0001
+# Step 4: The next copy, on the next blank cartridge
+tapectl volume write L6-0002 --init --full-confirm --move-to offsite
 ```
 
 **Staging space.** `stage create` writes only a unit's encrypted slices to
@@ -941,7 +1173,8 @@ total: 4 slices, 50.0 MiB
 ```
 
 That is by design, not a bug: staging happens once and a stage set stays
-`staged` until the write that completes its copies, or `stage clean`, releases it, which is what lets you write the
+`staged` until the write that brings its unit to its copy floor (or
+`stage clean`) releases it, which is what lets you write the
 same data to a second and third cartridge without re-archiving it (ADR-0006).
 The consequence is that a stage set left over from last week rides along on
 today's tape. **Read the list.** This is write-once media — a tape that
@@ -949,8 +1182,11 @@ received four units when you meant one cannot be un-written, and under ADR-0003
 it cannot even be overwritten without a real erase.
 
 The announcement is display only. It does not prompt, and there is no flag to
-select a subset: if the list is not what you want, stop, run `stage clean` to
-release what is already safely on tape, and start again. (`volume write` may
+select a subset: if the list is not what you want, stop and read
+`stage list --owing`. Everything on it still owes a copy, since a write
+releases each unit it brings to its copy floor; `stage clean --unit <UNIT>
+--force` drops a unit's staged data you do not mean to write, and then start
+again. (`volume write` may
 still ask one question — the quiet-host check below — which `--yes` answers.)
 
 **Integrity while writing.** Every staged slice is hashed as it streams to the
@@ -981,13 +1217,15 @@ same flag. Each completed write records how much of the capacity it used, as a
 tape the drive used (page 0x0c), each as a share of the capacity. Those figures
 are what the default is to be tuned from.
 
-**Cartridge wear.** Before it writes, `volume write` prints the cartridge's wear
-figures on stderr: the chip's own lifetime record (loads, initialisations,
+**Cartridge wear.** Before it writes, `volume write` reads the cartridge's wear
+figures: the chip's own lifetime record (loads, initialisations,
 lifetime MiB written and read, manufacture date, the last drives that loaded it)
 and the drive's lifetime counters for this cartridge from the newest page 0x17
 reading tapectl journalled (write and read retries, unrecovered errors,
-beginning-of-medium passes). `tapectl cartridge info <barcode>` shows the same
-block. There is no health score: until production data sets thresholds
+beginning-of-medium passes). It prints them on stderr only when the hardware
+raised something (the warnings below); otherwise they are one line in the
+session log, and on stderr under `-v`. `tapectl cartridge info <barcode>` shows
+the same block. There is no health score: until production data sets thresholds
 (ADR-0012, 2026-10-06 item 11) these are figures to read, and the only
 `WARNING: worn cartridge?` lines are things the hardware itself raised — TapeAlert
 flags on the chip, a medium TapeAlert from the drive (`Media`, `Media life`,
@@ -1026,10 +1264,11 @@ runs one — see [Monthly — verify a rotating slice of the library](#monthly--
 names every such volume (`no_full_verify`) and `report verify-status` lists
 it. `--full-confirm` makes the write read every file back and hash it, which
 costs about as long as the write itself (~2.3 h on a full LTO-6); the same six
-commands take it. A full readback that is interrupted (Ctrl-C, a dropped ssh
+commands take it, and every copy written as `volume write LABEL --init
+--full-confirm --move-to PLACE` has it. A full readback that is interrupted (Ctrl-C, a dropped ssh
 session, a reboot) keeps what it has read back clean: `tapectl volume resume
-<label> --full-confirm` continues it from there rather than from the first
-file — unless what it kept is older than the volume's `verify_interval_days`,
+<label>` continues it from there rather than from the first file (the resume
+keeps the `--full-confirm` the write asked for, and says so) — unless what it kept is older than the volume's `verify_interval_days`,
 in which case it reads everything again (see
 [the verify section](#monthly--verify-a-rotating-slice-of-the-library)).
 
@@ -1082,8 +1321,12 @@ clears it and says so in a note. Switching the drive off and on clears it too.
 `tapectl drive status` shows the page
 ([What is in the drive right now](#what-is-in-the-drive-right-now)).
 
-`stage clean` releases every unit that has met its policy's `min_copies` and
-**retains** the ones that have not, naming them (ADR-0012). So a unit still
+Each write already releases, unit by unit, the staging of every unit it brought
+to its copy floor ([A typical write session](#a-typical-write-session)).
+`stage clean` makes the same judgment on demand: it releases every written unit
+that has met its copy floor (the larger of its `min_copies` and the sum of its
+`copies_at` targets) and **retains** the ones that have not, naming them
+(ADR-0012). So a unit still
 short of its second copy keeps its staged bytes — the release cannot quietly
 discard the cheap route to a copy your own policy requires — while everything
 already safely on tape is freed. `--unit` (and `--version`) narrow what is
@@ -1248,25 +1491,45 @@ named.
 ### Check what's pending
 
 ```bash
-tapectl stage list --status staged
-tapectl volume plan --copies 2
+tapectl status
+tapectl stage list
 tapectl stage list --owing
+tapectl volume plan
 ```
 
-`stage list --status staged` is everything the next `volume write` would
-carry. `stage list --owing` is narrower: the stage sets whose version still owes a
-copy, fewer copies than its unit's resolved `min_copies`, each with how many it
-has of how many it needs. A stage set that already has all its copies is only
-counted on a last line, as held in staging until `stage clean` releases it:
+`status` is the place to start: it counts the units by what they need and
+names the next command ([Status: where things stand](#status-where-things-stand)).
+A unit is **pending** when it has archival work to do: never archived, or dirty
+(changed since its last version); `snapshot create` and `stage create`, or a
+`collection run`, take it from there. A version is **staged** when its stage set
+waits in staging for a copy it is still owed; the next `volume write` writes it.
+A staged unit is not pending: its snapshot exists, so what is left is a write.
+
+`stage list` is every stage set held in staging, so everything the next
+`volume write` would carry, with the copies its version has of its unit's copy
+floor (`--all` adds the released and failed ones). `stage list --owing` is
+narrower: only the stage sets whose version still owes a copy. On the
+walkthrough's session, before the first copy:
 
 ```text
 $ tapectl stage list --owing
-no stage set owes a copy
-4 more stage set(s) have every copy their own version needs and are only held in staging (`tapectl stage clean` decides which can be released)
+Stage Set   Unit                 Version   Status   Slices   Size        Copies   Staged
+1           family/letters       v1        staged   1        1.7 KiB     0 of 2   2026-11-05 02:28 UTC
+2           photos/2019-italy    v1        staged   1        1.1 MiB     0 of 2   2026-11-05 02:28 UTC
+3           photos/2020-garden   v1        staged   1        588.1 KiB   0 of 2   2026-11-05 02:28 UTC
+4           work/invoices-2024   v1        staged   1        1.7 KiB     0 of 2   2026-11-05 02:28 UTC
 ```
 
-`volume plan` estimates against the drive's own generation; pass
-`--generation LTO-5` to count cartridges of another generation that drive can
+A stage set that already has all its copies but is still held (a write passed
+`--keep-staging`, say) is only counted on a last line, `N more stage sets have
+every copy their own version needs and are only held in staging`, and
+`stage clean` decides which can be released; with nothing owed the table is
+`no stage set owes a copy`.
+
+`volume plan` plans as many copies as the largest copy floor among the staged
+units, and says so in its heading; `--copies N` plans another number. It needs
+no drive: it estimates against the configured drive's generation, and
+`--generation LTO-5` counts cartridges of another generation that drive can
 write.
 
 `--policy-aware` puts first the units a write would help: those `audit` finds
@@ -1278,9 +1541,9 @@ batches, each group in name order. Batch numbers follow that order, so give
 `collection run` the same flag to run the batch you reviewed:
 
 ```bash
-tapectl volume plan --copies 2 --policy-aware
+tapectl volume plan --policy-aware
 tapectl collection plan --policy-aware
-tapectl collection run movies --batch 0 --label L8-0003 --policy-aware
+tapectl collection run movies --batch 0 --label L8-0003 --init --full-confirm --move-to home-rack --policy-aware
 ```
 
 ### Restore
