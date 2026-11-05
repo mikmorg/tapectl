@@ -2710,3 +2710,10 @@ up before each copy.
      and item 203's refusals send a reader to the new ones. The glossary's new entries (Fill
      ceiling; Catalog, Tenant, Unit, Snapshot, Staged, Cartridge, Volume, File 0, Drive and
      Location; Barcode's first label) are in `CONTEXT.md`.
+
+*Clarification of item 217, as built (the coordinator, 2026-11-04; told to the CTO, not
+overruled).* "Every unit whose copy floor and copy targets are met" reads with item 154: by
+default a unit's staging is released once its **copy floor** is met (`ResolvedPolicy::copy_floor_base`),
+and every `copies_at` target is required as well only under `--keep-staging-for-locations`
+(`staging::release::Hold::EveryLocation`). The twin-copies sentence holds either way: with copies
+1 and 2 carrying the same units, every unit is below a floor of two until copy 2.
