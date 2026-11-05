@@ -176,9 +176,9 @@ and rebuild what you wrote.
 ```text
 $ tapectl tenant list
 Name     Status   Operator   Created                Description
-family   active              2026-11-05 02:28 UTC   family photos and letters
-mike     active   yes        2026-11-05 02:26 UTC   System operator
-work     active              2026-11-05 02:28 UTC   business records
+family   active              2026-11-05 02:37 UTC   family photos and letters
+mike     active   yes        2026-11-05 02:37 UTC   System operator
+work     active              2026-11-05 02:37 UTC   business records
 ```
 
 ### Unit
