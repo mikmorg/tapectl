@@ -119,6 +119,11 @@ TAPECTL_MHVTL=1 scripts/first-run-reentry-mhvtl.sh --device /dev/tape/by-id/scsi
 ## A map of the code
 
 - `src/cli/`: the commands (clap derive), thin over the library modules.
+  `src/cli/renamed.rs` is the one table of the spellings 1.9.0 removed: each old
+  spelling is refused by name, naming the new one (exit 2), and stays in the clap
+  tree only as a hidden stub, so nothing generated from the tree shows it.
+- `src/render.rs`: the output helpers every command shares (tables, UTC times,
+  plurals, human sizes, verdict words, the `--json` error document).
 - `src/db/`: the SQLite catalog and its forward-only migrations; `ontape_catalog.rs`
   is the operator envelope's `catalog.db`.
 - `src/staging/`: `dar -c -` cut into slices, hashed and age-encrypted in memory.
