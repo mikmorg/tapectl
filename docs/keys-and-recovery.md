@@ -253,22 +253,32 @@ So:
 
 | Copy | Catalog | Private keys | `config.toml` |
 |---|---|---|---|
-| `tapectl db backup X.db` | yes | **no** | no |
+| `tapectl db backup X.db` (or a directory, `tapectl db backup DIR`) | yes | **no** | no |
 | `tapectl db backup X.db --include-keys` | yes | yes, as a directory `X.keys/` beside it | no |
 | The daily backup timer (`tapectl-backup.timer`, see [install.md §7](install.md#7-the-timers-and-the-operator-wrapper)) | yes | no, unless you set `TAPECTL_BACKUP_INCLUDE_KEYS=1` in a drop-in for its service (`sudo systemctl edit tapectl-backup.service`) | no |
 | The Heir Kit's `catalog.db.age` | yes, encrypted to escrow | **no** | no |
 | A tarball of the whole home ([install.md §9](install.md#9-moving-to-a-new-host)) | yes | yes | yes |
 
 ```text
-$ tapectl db backup /tmp/tour/backup/tapectl.db
-database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
+$ tapectl db backup /tmp/tour/backup
+database backed up to /tmp/tour/backup/tapectl-20261105T023058Z.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 $ tapectl db backup /tmp/tour/backup/tapectl.db --include-keys
 database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
-With `--include-keys` the key directory is named after the destination with its
-extension replaced by `.keys`: `--to /media/usb/tapectl.db` also writes
-`/media/usb/tapectl.keys/`. It holds every file of `keys/`, active and deactivated
+Given a directory, `db backup` writes a dated file in it,
+`tapectl-YYYYmmddTHHMMSSZ.db`, the name the daily backup timer uses, so the same
+command run after every write session keeps every backup. Given a file name, it
+writes that file. Either way it never overwrites: a file that is already there is
+refused, and nothing is written (1.9.0):
+
+```text
+error: db backup refuses: /tmp/tour/backup/tapectl.db exists: name another file (a backup never overwrites one), or a directory, where it gets a dated name
+```
+
+With `--include-keys` the key directory is named after the backup file with its
+extension replaced by `.keys`: `db backup /media/usb/tapectl.db --include-keys`
+also writes `/media/usb/tapectl.keys/`. It holds every file of `keys/`, active and deactivated
 keys alike. The directory is created mode 0700 and the private key files keep
 mode 0600. The command also logs a warning naming that directory.
 
@@ -283,10 +293,9 @@ nothing, when:
 
 - the destination directory does not exist
   (`db backup refuses: the destination directory /media/usb does not exist — create it, or mount the medium it lives on, and run again (db backup does not create directories)`);
-- `--to` is itself a directory (`--to` names the backup *file*, for example
-  `/media/usb/tapectl.db`);
-- with `--include-keys`, `--to` ends in `.keys`, which is where the key directory
-  would go.
+- the backup file already exists (above);
+- with `--include-keys`, the backup file's name ends in `.keys`, which is where the
+  key directory would go.
 
 `--dry-run` checks the same things and names the key directory it would write.
 
@@ -444,8 +453,8 @@ $ tapectl key escrow-kit ~/heir-kit
 heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
-  catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
-  tapectl-1.5.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
+  catalog.db.age   encrypted catalog, 656.4 KiB, covering 2 sealed volumes
+  tapectl-1.9.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -455,6 +464,10 @@ still to do, and only you can do it:
   3. seal it in a tamper-evident envelope
   4. store copies in at least TWO independent failure domains
 ```
+
+The directory is the command's one argument (`--out DIR` before 1.9.0, refused by
+name since). It is created if absent, mode 0700. Running the command again into the
+same directory is the routine refresh: it writes the kit's files over the old ones.
 
 | File | What it is |
 |---|---|
@@ -507,12 +520,12 @@ it. The cover sheet's CUSTODY section says so:
 while no kit exists:
 
 ```text
-  [escrow_kit_missing] archive: 1 sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them
+  [escrow_kit_missing] archive: 1 sealed volume exists but no heir kit has ever been generated — nothing off-site can decrypt it
 ```
 
 Once a kit exists and volumes have been sealed after it, the warning is
-`escrow_kit_stale`: "*N* volume(s) were sealed after the last heir kit
-(*time*): the kit's escrow secret still opens them (it is a recipient of every
+`escrow_kit_stale`: "*N* volumes were sealed after the last heir kit
+(*time*, in UTC): the kit's escrow secret still opens them (it is a recipient of every
 tape), but the kit's encrypted catalog (catalog.db.age) does not list them —
 regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog
 rebuild --from-volume`". Both suggest `tapectl key escrow-kit <dir>`. The same
@@ -574,14 +587,14 @@ The catalog knows which volume holds what. Find a copy, then restore from it:
 
 ```bash
 tapectl catalog locate family/letters
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit
-tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters --from L8-0002 --to /tmp/restore
+tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
+tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit
+tapectl restore file family/letters 1998-letter-to-mum.txt --from L8-0002 --to /tmp/restore
 ```
 
 ```text
-would restore "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
-restored "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
+would restore "family/letters" v1 from L8-0002 (1 slice) to /tmp/restore/unit
+restored "family/letters" v1 from L8-0002 (1 slice) to /tmp/restore/unit
 restored "1998-letter-to-mum.txt" from "family/letters" on L8-0002 to /tmp/restore
 ```
 
@@ -595,8 +608,11 @@ tapectl restore volume L8-0002 --to /tmp/restore --unit family/letters --unit fa
 ```
 
 `--version N` picks an older version. The default is the newest one on that
-volume (`restore volume` always restores the newest). Restoring as a non-root user logs a warning that restored files will be
-owned by you, not by their archived owners. tapectl tries every key file in
+volume (`restore volume` always restores the newest). The unit can also be given as
+`--unit family/letters`, and the file as `--file PATH`, the spelling File 1 on every
+tape prints. Restoring as a non-root user prints one line on stderr, `note: restoring
+as a non-root user, so the restored files are owned by you, not by the owners the
+archive recorded`. tapectl tries every key file in
 `keys/` that belongs to the unit's tenant or to the operator, deactivated ones
 included (see [Tenant keys](#tenant-keys) for how a file's owner is decided), so
 a rotation in between needs nothing from you. Full reference:
@@ -633,8 +649,11 @@ and version is a copy: another version is never used.
    ```
    With tapectl installed, `tapectl volume identify --device "$TAPE"` prints the
    same text, but only once tapectl has a home. Until then every command except
-   `init` stops with ``error: tapectl is not initialized — run `tapectl init` first``. Do
-   not answer that with a plain `init`, which mints a new escrow identity that
+   `init` stops with an error that names the home it looked at and why that one:
+   ```text
+   error: tapectl is not initialized at /home/heir/.tapectl: there is no catalog /home/heir/.tapectl/tapectl.db there. The home was chosen because nothing named a home (no --home, TAPECTL_HOME or --config, no ~/.tapectl and no home pointer), so it is ~/.tapectl. To start a new archive there: `tapectl init`.
+   ```
+   Do not answer that with a plain `init`, which mints a new escrow identity that
    none of the tapes know. With the Heir Kit cover sheet's `age1…` public key
    in hand, `tapectl init --operator <name> --escrow-public-key age1…` adopts
    the original identity ([runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key),
@@ -768,7 +787,13 @@ is the same procedure for a service-user host.
      config:   ~/.tapectl-rebuilt/config.toml
      escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
      dar:      dar (found at /usr/bin/dar)
+
+   next steps:
+     a tenant, whose data is archived    tapectl tenant add <TENANT>
+     …
    ```
+   The `next steps:` block that follows is the list for a new archive; on a
+   rebuild, the steps below take its place.
    `init --operator-key` is not for this runbook when step 6 imports the kit's
    catalog: the import replaces every tenant and key row, so the surviving key
    files go back in step 5 instead. Adopting is for a fresh catalog
@@ -822,12 +847,13 @@ is the same procedure for a service-user host.
    tapectl catalog rebuild --from-volume --key escrow.key --device "$TAPE" --label L8-0002
    ```
    ```text
-   rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelope(s) opened
-     inserted: 2 tenant(s), 4 unit(s), 4 snapshot(s), 4 stage set(s),
-               4 slice(s), 4 write(s), 4 position(s), 11 file row(s), 1 volume
+   rebuilt from volume "L8-0002" (uuid 6ff3d909-0486-4310-a31e-68a0fd0d1ec5), 3 envelopes opened
+     on tape: written … UTC, sealed … UTC, chip load count at write …
+     inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
+               4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
      cartridge "E01003L8_1775794348" registered from this tape's own identity and bound
      the slice hashes recorded are the tape's own claim; run `tapectl volume verify L8-0002` to check them
-     escrow receipts: 4 stage set(s) carried theirs on the tape
+     escrow receipts: 4 stage sets carried theirs on the tape
    ```
    Running it twice is safe: the second run finds its own rows and adds nothing.
    A tape with no valid seal marker (an interrupted or aborted write) is recorded as
@@ -998,7 +1024,7 @@ What a catalog rebuilt from tapes alone (step 7 without step 6) **does not have*
 - **Locations.** Add them with `location add` and place each volume with
   `volume move`.
 - **Escrow coverage on tapes that predate the on-tape receipt.** A tape carries
-  each stage set's recipient list (as with "escrow receipts: 4 stage set(s)
+  each stage set's recipient list (as with "escrow receipts: 4 stage sets
   carried theirs" above), so any production tape comes back covered. A tape
   written before receipts existed comes back **unknown**, shown as `?` in
   `catalog locate`. `audit` warns and `volume write` refuses to re-copy it. The
@@ -1209,7 +1235,8 @@ tapectl, needs to know this:
   to an SQLite file. It makes the search easier, and you can recover data
   without it.
 - **With tapectl installed**, first give it a home: it refuses every other command
-  until one exists (``error: tapectl is not initialized — run `tapectl init` first``).
+  until one exists (`error: tapectl is not initialized at <home>: …`, naming the
+  home and ending `To start a new archive there: tapectl init`).
   Do **not** run a plain `init`, which makes a new escrow identity that none of
   the tapes know. Use the identity printed on the cover sheet:
   `tapectl init --operator <name> --escrow-public-key age1…`
