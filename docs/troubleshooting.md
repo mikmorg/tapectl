@@ -1612,9 +1612,9 @@ degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks, 
   seen** (a 1.0.0 tape after a fresh start, a test home's volume): steps 2
   and 3 below reuse it, once you are sure its data is wanted nowhere.
 - A write to a volume already initialised does not look the tape up. Its
-  message ends `If this cartridge should be reused: retire its current volume
+  message ends ``If this cartridge should be reused: retire its current volume
   if this catalog holds it (`tapectl volume retire <label>`), then `tapectl
-  cartridge erase`, …`: steps 1 to 3 below.
+  cartridge erase`, …``: steps 1 to 3 below.
 
 How to erase by hand left the message in 1.9.0; it is in step 2 below.
 
