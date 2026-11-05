@@ -424,6 +424,12 @@ fn step_13_resumes_and_finishes_instead_of_dying() {
                 .next()
         })
         .expect("step 13 is delimited");
+    // 1.9.0 renamed `host check --unit` to `--systemd-unit` and refuses the
+    // old spelling by name (exit 2): the quiet-host loop could never pass.
+    assert!(
+        step13.contains("HC_ARGS+=(--systemd-unit \"$u\")") && !step13.contains("HC_ARGS+=(--unit"),
+        "step 13's host check uses 1.9.0's --systemd-unit"
+    );
     assert!(
         step13.contains("volume_step13_state"),
         "step 13 classifies the label"

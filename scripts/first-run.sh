@@ -2293,7 +2293,7 @@ except Exception: pass')" || true
     # declared-but-empty array, so a profile's `CONTENDER_UNITS=()` read as unset
     # and brought the dev VM's timers back (found by the 2026-09-28 mhvtl run).
     if ! declare -p CONTENDER_UNITS >/dev/null 2>&1; then CONTENDER_UNITS=(homorg-db-suite.timer homorg-prune-target.timer); fi
-    HC_ARGS=(); for u in "${CONTENDER_UNITS[@]}"; do HC_ARGS+=(--unit "$u"); done
+    HC_ARGS=(); for u in "${CONTENDER_UNITS[@]}"; do HC_ARGS+=(--systemd-unit "$u"); done
     while ! run_capture "$HC_OUT" tc host check "${HC_ARGS[@]}"; do
       explain <<'EOF'
 THE HOST IS NOT QUIET. Each "host check:" line above names what tripped, what it measured and the limit it crossed. A busy host does not stop the write — it costs tape (the drive stops and restarts below ~54 MB/s of feed; a bursty feed used 48% more tape on this drive) and risks the session (a process killed for memory mid-write is a clean abort, but the hours are gone). Pause what is named, then check again. The limits are [host_check] in config.toml (docs/operator-guide.md, "A quiet host while the tape runs").
