@@ -6,7 +6,7 @@ use clap::Args;
 
 use crate::error::Result;
 
-/// The end of `tapectl setup --help`: examples and the exit codes.
+/// The end of the long help of `setup`: examples and the exit codes.
 pub const SETUP_AFTER_LONG_HELP: &str = "\
 EXAMPLES:
   Answer the questions one at a time (Enter takes the default in brackets):
