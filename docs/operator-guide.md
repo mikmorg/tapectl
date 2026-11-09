@@ -1978,10 +1978,11 @@ tapectl unit mark-tape-only tv/breaking-bad/s01
 ```
 
 `check-integrity` compares the files against the checksums of one version,
-the newest one that has been staged, and names it. A file whose content differs
-at its recorded size is `CHANGED` when its modified time moved since the
-snapshot (an edit, which the next `snapshot create` archives) and `BITROT` when
-it did not. It exits 0 when every file matches or only changed, and 1 when a
+the newest one that has been staged, and names it. A file whose content or size
+differs is `CHANGED` when its modified time moved since the snapshot (an edit,
+which the next `snapshot create` archives). When it did not, a content
+difference is `BITROT` and a size difference `SIZE_MISMATCH` (from 1.9.1; 1.9.0
+called every size difference `SIZE_MISMATCH`). It exits 0 when every file matches or only changed, and 1 when a
 file is `BITROT`, `MISSING` or a `SIZE_MISMATCH`, which is when the disk copy
 can no longer be trusted. A file you changed or deleted since an
 older version is not reported. A version you have snapshotted but not yet

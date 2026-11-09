@@ -3049,16 +3049,17 @@ rfc_restore_file_symlink() {
 
 rfc_check_integrity_clean() { TCTL unit check-integrity photos; }
 
-# ADR-0012 items 208 and 220 (1.9.0): an edit reads CHANGED (the hash differs
-# and the mtime moved since the snapshot), never BITROT, and check-integrity's
-# exit follows what it found: 1 on BITROT, MISSING or SIZE_MISMATCH; a
-# CHANGED-only check exits as `changed_exit_code()` decides, 0 today (Q40,
-# with the CTO: if it becomes 1, CHANGED_RC below follows it). `modify` flips
-# byte 0 long after the snapshot, so its file reads CHANGED -- unless the seed
-# picked the 0-byte fixture file, which `modify` grows to one byte: a
-# SIZE_MISMATCH, exit 1.
+# ADR-0012 items 208, 220 and 224 (1.9.0, 1.9.1): an edit reads CHANGED (the
+# content or the size differs and the mtime moved since the snapshot), never
+# BITROT or SIZE_MISMATCH, and check-integrity's exit follows what it found: 1
+# on BITROT, MISSING or SIZE_MISMATCH; a CHANGED-only check exits as
+# `changed_exit_code()` decides, 0 (item 223; if it ever becomes 1, CHANGED_RC
+# below follows it). `modify` rewrites one file long after the snapshot, so
+# its mtime moves and the file reads CHANGED even when the seed picked the
+# 0-byte fixture file, which `modify` grows to one byte (item 224; a
+# SIZE_MISMATCH, exit 1, under 1.9.0).
 rfc_check_integrity_after_modify() {
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert changed+size_mismatch > 0 and bitrot = 0; exit 0 when only CHANGED, 1 on a size mismatch)"; return 0; }
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: mutate photos (modify); tapectl unit check-integrity photos --json (assert changed > 0, bitrot = size_mismatch = missing = 0, exit 0: an edit, size change or not, is CHANGED)"; return 0; }
     mutate_source "$SRC/photos" "$SEED" modify || return 1
     local logf="$RUN/log-rfc.integrity_modify.json" rc=0
     TCTL unit check-integrity photos --json >"$logf" 2>"$logf.err" || rc=$?
@@ -3070,10 +3071,10 @@ rfc_check_integrity_after_modify() {
 import json, os, sys
 d = json.load(open(sys.argv[1]))
 assert d.get("bitrot", 0) == 0, ("an edit read as BITROT", d)
-assert d.get("changed", 0) + d.get("size_mismatch", 0) > 0, ("the modified file was not found", d)
-damaged = d["bitrot"] + d["missing"] + d["size_mismatch"]
-want = 1 if damaged else int(os.environ["CHANGED_RC"])
-assert int(os.environ["RC"]) == want, ("exit %s, expected %d" % (os.environ["RC"], want), d)
+assert d.get("size_mismatch", 0) == 0, ("an edit read as SIZE_MISMATCH (item 224)", d)
+assert d.get("missing", 0) == 0, ("modify lost a file", d)
+assert d.get("changed", 0) > 0, ("the modified file was not found", d)
+assert int(os.environ["RC"]) == int(os.environ["CHANGED_RC"]), ("exit %s, expected %s" % (os.environ["RC"], os.environ["CHANGED_RC"]), d)
 ' "$logf" || { cat "$logf"; return 1; }
 }
 

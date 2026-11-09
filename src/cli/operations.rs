@@ -82,15 +82,17 @@ pub struct IntegrityReport {
     /// checksums because it has nothing to hash, staged or not.
     pub newer_without_files: Option<i64>,
     pub ok: i64,
-    /// Content that differs at the recorded size while the file's mtime has
-    /// moved since the baseline was snapshotted: an edit, not damage
-    /// (ADR-0012 item 208).
+    /// Content that differs, at the recorded size or not, while the file's
+    /// mtime has moved since the baseline was snapshotted: an edit, not
+    /// damage (ADR-0012 items 208 and 224).
     pub changed: i64,
     /// Content that differs at the recorded size and the recorded mtime,
     /// and (counted with it) content that differs where the baseline
     /// recorded no mtime to tell an edit from damage.
     pub bitrot: i64,
     pub missing: i64,
+    /// A size that differs at the recorded mtime, or where the baseline
+    /// recorded no mtime (ADR-0012 item 224).
     pub size_mismatch: i64,
     /// Every path that is not OK.
     pub details: Vec<IntegrityDetail>,
@@ -261,7 +263,31 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
             continue;
         }
         let meta = fs::metadata(&full_path)?;
+        // ADR-0012 item 208: an edit moves the mtime, damage does not. The
+        // walk records whole seconds (`mtime_ns_from_secs`), so the live
+        // file is read at the same resolution.
+        let mtime_moved = {
+            use std::os::unix::fs::MetadataExt;
+            let now = crate::db::files::mtime_ns_from_secs(meta.mtime());
+            recorded_mtime.is_some_and(|then| now != Some(then))
+        };
         if meta.len() as i64 != *expected_size {
+            // ADR-0012 item 224: the mtime decides a size change too. A size
+            // change whose mtime moved since the snapshot is an edit,
+            // CHANGED like a same-size edit, and is not hashed. One at the
+            // recorded mtime stays SIZE_MISMATCH. Where the baseline
+            // recorded no mtime, an edit cannot be told from damage, so a
+            // size change stays SIZE_MISMATCH, as it was before item 224.
+            if mtime_moved {
+                report.changed += 1;
+                report.details.push(IntegrityDetail {
+                    path: rel_path.clone(),
+                    status: "CHANGED",
+                    sizes: None,
+                    no_mtime: false,
+                });
+                continue;
+            }
             report.size_mismatch += 1;
             report.details.push(IntegrityDetail {
                 path: rel_path.clone(),
@@ -281,15 +307,8 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
             report.ok += 1;
             continue;
         }
-        // ADR-0012 item 208: an edit moves the mtime, damage does not. The
-        // walk records whole seconds (`mtime_ns_from_secs`), so the live
-        // file is read at the same resolution.
-        let mtime_now = {
-            use std::os::unix::fs::MetadataExt;
-            crate::db::files::mtime_ns_from_secs(meta.mtime())
-        };
         let (status, no_mtime) = match recorded_mtime {
-            Some(then) if mtime_now != Some(*then) => ("CHANGED", false),
+            Some(_) if mtime_moved => ("CHANGED", false),
             Some(_) => ("BITROT", false),
             None => ("BITROT", true),
         };
@@ -5235,6 +5254,156 @@ mod tests {
         fs::metadata(path).unwrap().mtime()
     }
 
+    /// Set the file's mtime to `secs` whole seconds, as `touch -d` would.
+    fn set_mtime_secs(path: &Path, secs: i64) {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// ADR-0012 item 224: a size change whose file's mtime moved since the
+    /// snapshot is an edit, CHANGED like a same-size edit, and exits
+    /// `changed_exit_code()` (0) with the note naming `snapshot create`.
+    #[test]
+    fn check_integrity_calls_a_size_change_with_a_moved_mtime_changed() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"edited, and longer").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        // Snapshotted an hour before the edit, at five bytes.
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            5,
+            &direct_old_style_hash(b"hello"),
+            Some(mtime_secs(&f) - 3600),
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (report.changed, report.size_mismatch, report.bitrot),
+            (1, 0, 0),
+            "{:?}",
+            report.details
+        );
+        assert_eq!(report.details[0].status, "CHANGED");
+        assert_eq!(report.exit_code(), changed_exit_code());
+        assert_eq!(report.exit_code(), crate::error::EXIT_SUCCESS);
+        assert_eq!(
+            unit_check_integrity(&conn, "unit1", true).unwrap(),
+            crate::error::EXIT_SUCCESS
+        );
+        let text = render_integrity(&report);
+        assert!(text.contains("f.txt — CHANGED"), "{text}");
+        assert!(!text.contains("SIZE_MISMATCH"), "{text}");
+        assert!(
+            text.contains("`tapectl snapshot create unit1` archives it"),
+            "{text}"
+        );
+        let json = integrity_json(&report);
+        assert_eq!(
+            (json["changed"].clone(), json["size_mismatch"].clone()),
+            (1.into(), 0.into())
+        );
+        assert_eq!(json["details"][0]["status"], "CHANGED");
+    }
+
+    /// ...and a size change at the recorded mtime stays SIZE_MISMATCH,
+    /// exit 1, with no note pointing at `snapshot create`.
+    #[test]
+    fn check_integrity_calls_a_size_change_at_the_recorded_mtime_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        let then = mtime_secs(&f) - 3600;
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "f.txt",
+            5,
+            &direct_old_style_hash(b"hello"),
+            Some(then),
+        );
+        std::fs::write(&f, b"hello, longer").unwrap();
+        set_mtime_secs(&f, then);
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (report.changed, report.size_mismatch, report.bitrot),
+            (0, 1, 0),
+            "{:?}",
+            report.details
+        );
+        assert_eq!(report.details[0].status, "SIZE_MISMATCH");
+        assert_eq!(report.details[0].sizes, Some((5, 13)));
+        assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
+        let text = render_integrity(&report);
+        assert!(text.contains("f.txt — SIZE_MISMATCH"), "{text}");
+        assert!(!text.contains("snapshot create"), "{text}");
+        let json = integrity_json(&report);
+        assert_eq!(json["size_mismatch"], 1);
+        assert_eq!(
+            (
+                json["details"][0]["expected"].clone(),
+                json["details"][0]["actual"].clone()
+            ),
+            (5.into(), 13.into())
+        );
+    }
+
+    /// A unit with one of each: the edited file reads CHANGED, the one that
+    /// changed size at its recorded mtime SIZE_MISMATCH, and the damage
+    /// decides the exit, 1.
+    #[test]
+    fn check_integrity_with_a_size_edit_and_a_size_mismatch_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        let edited = tmp.path().join("edited");
+        let damaged = tmp.path().join("damaged");
+        std::fs::write(&edited, b"edited, and longer").unwrap();
+        std::fs::write(&damaged, b"damaged").unwrap();
+        let then = mtime_secs(&damaged) - 3600;
+        set_mtime_secs(&damaged, then);
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "edited",
+            5,
+            &direct_old_style_hash(b"hello"),
+            Some(mtime_secs(&edited) - 3600),
+        );
+        insert_file_with_mtime(
+            &conn,
+            v1,
+            "damaged",
+            3,
+            &direct_old_style_hash(b"dam"),
+            Some(then),
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (report.changed, report.size_mismatch, report.bitrot),
+            (1, 1, 0),
+            "{:?}",
+            report.details
+        );
+        assert_eq!(report.exit_code(), crate::error::EXIT_WARNING);
+        assert_eq!(
+            unit_check_integrity(&conn, "unit1", true).unwrap(),
+            crate::error::EXIT_WARNING
+        );
+        let text = render_integrity(&report);
+        assert!(text.contains("edited — CHANGED"), "{text}");
+        assert!(text.contains("damaged — SIZE_MISMATCH"), "{text}");
+    }
+
     /// ADR-0012 item 208: a hash mismatch whose file's mtime moved since the
     /// snapshot is an edit, CHANGED, never BITROT; the report says how to
     /// archive it, and the exit is `changed_exit_code()`'s.
@@ -5383,7 +5552,11 @@ mod tests {
         );
         assert_eq!(unit_check_integrity(&conn, "unit1", true).unwrap(), 0);
 
+        // At the recorded mtime (ADR-0012 item 224): a grown file whose
+        // mtime moved would be an edit, CHANGED.
+        let then = mtime_secs(&f);
         std::fs::write(&f, b"hello, longer").unwrap();
+        set_mtime_secs(&f, then);
         let grown = check_integrity(&conn, "unit1").unwrap();
         assert_eq!(grown.size_mismatch, 1);
         assert_eq!(grown.exit_code(), crate::error::EXIT_WARNING);
