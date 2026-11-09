@@ -65,7 +65,9 @@ documentation is [docs/README.md](README.md).
 ## Initial Setup
 
 > [!IMPORTANT]
-> Install with `scripts/first-run.sh`. It does everything in this section
+> One drive on your own account: run `tapectl setup` from the
+> [Quick start](quick-start.md). A host run by a service user, like home2:
+> install with `scripts/first-run.sh`. It does everything in this section
 > interactively, in order, explains each step, detects what is already done,
 > and rehearses on a test cartridge before your first real write.
 > [install.md](install.md) is its runbook: what each step creates on the host,

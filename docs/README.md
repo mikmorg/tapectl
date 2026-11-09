@@ -10,7 +10,8 @@ the repository, grouped by what you are trying to do.
 |---|---|
 | [Walkthrough](walkthrough.md) | One complete session with real output: init, tenants, units, two tapes in two places, audit, restore, the Heir Kit, a disaster-recovery rehearsal. **Start here.** |
 | [Concepts](concepts.md) | The model: tenants, units, collections, snapshots and versions, stage sets, volumes and cartridges, locations, copies and policy, what is on a tape. |
-| [Install](install.md) | The installer (`scripts/first-run.sh`) step by step, host profiles, the service user, timers, reinstalling, moving hosts, [upgrading in place](install.md#10-upgrading-in-place), uninstalling. |
+| [Quick start](quick-start.md) | **New here with one drive?** Install the release binary, run `tapectl setup`, and write your first two copies. |
+| [Install](install.md) | For a host run by a service user, like home2: the installer (`scripts/first-run.sh`) step by step, host profiles, the service user, timers, reinstalling, moving hosts, [upgrading in place](install.md#10-upgrading-in-place), uninstalling. |
 | [Operator guide](operator-guide.md) | Day-to-day operation: archiving, second copies, restores, tape-only units, retiring and compacting volumes, cartridge tracking, warehouse copies, the maintenance cadence. |
 | [Configuration](configuration.md) | Every `config.toml` key with its default, the per-unit `.tapectl-unit.toml`, archive sets and policy resolution, environment variables. |
 | [Keys and recovery](keys-and-recovery.md) | Primary, backup and escrow keys; who can decrypt what; the Heir Kit; restoring with tapectl, with only a key and a tape, and rebuilding a lost catalog. |

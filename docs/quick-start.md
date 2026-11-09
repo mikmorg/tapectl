@@ -10,18 +10,20 @@ A host run by a dedicated service user (the layout home2 uses) is installed by
 
 ## 1. Install
 
-Download the static binary for your machine and `SHA256SUMS` from the latest
-release, <https://github.com/mikmorg/tapectl/releases/latest>. Check the binary
-against `SHA256SUMS`, then put it on your `PATH` as `tapectl` (in `~/.local/bin`,
-or `/usr/local/bin` with sudo):
+Each release from 1.9.1 carries a static build for Linux on x86_64,
+`tapectl-<X.Y.Z>-x86_64-linux-musl`, beside a `SHA256SUMS` file, on the
+[releases page](https://github.com/mikmorg/tapectl/releases/latest). It needs no
+library from your machine. Download both into one directory, check it, and put it
+on your `PATH` as `tapectl` (here `~/.local/bin`):
 
 ```bash
-sha256sum -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS
+install -m 0755 tapectl-*-x86_64-linux-musl ~/.local/bin/tapectl
 ```
 
-Then `tapectl --version` names the release.
+`sha256sum` should say `OK` for the one file. Then `tapectl --version` names the release.
 
-No release binary for your machine? Build it (Rust from <https://rustup.rs>):
+Not on x86_64, or no release binary? Build it (Rust from <https://rustup.rs>):
 
 ```bash
 cargo install --locked --git https://github.com/mikmorg/tapectl
