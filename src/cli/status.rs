@@ -527,7 +527,17 @@ impl HomeScreen {
                         "tapectl collection run {collection} --label <NEW-LABEL> --init --full-confirm --move-to <a short location>"
                     )
                 }
-                None => format!("tapectl snapshot create {}", some_names(&pending)),
+                // One pending unit is named; several are one flag (item 225).
+                None if pending.len() == 1 => format!("tapectl snapshot create {}", pending[0]),
+                None => {
+                    let shown: Vec<&str> = pending.iter().take(3).map(|n| n.as_str()).collect();
+                    let more = if pending.len() > 3 { ", …" } else { "" };
+                    format!(
+                        "tapectl snapshot create --all-pending  ({} units: {}{more})",
+                        pending.len(),
+                        shown.join(", ")
+                    )
+                }
             });
         }
         if !self.staged.is_empty() {
@@ -1483,7 +1493,10 @@ mod tests {
             s.due_verify = vec![due.clone()];
         });
         assert_eq!(all.len(), 3, "{all:?}");
-        assert_eq!(all[1], "tapectl snapshot create n1 n2 n3  (1 more)");
+        assert_eq!(
+            all[1],
+            "tapectl snapshot create --all-pending  (4 units: n1, n2, n3, …)"
+        );
         assert!(all[2].starts_with("tapectl volume write"), "{all:?}");
     }
 
