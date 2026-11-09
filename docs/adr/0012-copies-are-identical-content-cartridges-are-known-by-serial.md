@@ -2717,3 +2717,50 @@ default a unit's staging is released once its **copy floor** is met (`ResolvedPo
 and every `copies_at` target is required as well only under `--keep-staging-for-locations`
 (`staging::release::Hold::EveryLocation`). The twin-copies sentence holds either way: with copies
 1 and 2 carrying the same units, every unit is below a floor of two until copy 2.
+
+## Amendment, 2026-11-09: after 1.9.0, the open questions
+
+Ruled 2026-11-09, in a grilling of the questions the CLI review and 1.9.0's build left open
+(asked one at a time; the CTO took each recommendation unless an item says otherwise). 1.9.0 had
+shipped (`v1.9.0` on `4421e212`), so a change to its behaviour is a 1.9.1.
+
+222. **The coordinator makes item 199's `acache-rebuild` edit** (option (a)): one line on home2
+     over ssh, committed in home-infra, nothing else in that repo touched.
+223. **CHANGED exits 0** (option (a), as 1.9.0 shipped): `unit check-integrity` reports an edit
+     with the note "unit is dirty: snapshot it"; BITROT, MISSING and SIZE_MISMATCH exit 1. No timer
+     runs the command; it answers the operator who asks.
+224. **The mtime decides a size change too, in 1.9.1** (option (a)). A file whose size changed and
+     whose mtime moved since the snapshot is CHANGED (exit 0); one whose size changed at the
+     recorded mtime stays SIZE_MISMATCH (exit 1). Under 1.9.0 every size change exits 1, so most
+     real edits "fail".
+225. **`snapshot create --all-pending`, in 1.9.1** (amends the CLI review's `--all-dirty`). Pending
+     is never archived or dirty, per the glossary; a dirty-only flag would leave new folders
+     unsnapshotted. The CTO chose 1.9.1 over the recommended 1.10.0.
+226. **`catalog rebuild` gives a cartridge its File 0 label as its barcode, in 1.9.1** (extends
+     item 219 to rebuilds). 1.9.0 registers the chip serial as the barcode, and the docs' `cartridge
+     relabel` step goes. The chip serial stays the identity. The CTO chose 1.9.1 over the
+     recommended 1.10.0.
+227. **Friends set up with `tapectl setup`, plus a Quick start page** (option (d)). The wizard is in
+     the binary: it asks where the home and staging go, detects the drive and reads its
+     generation, mints the escrow key with a printed warning, and makes two locations and a first
+     collection. Whatever needs root it prints as one copy-paste block. The Quick start page is the
+     wizard's transcript and that block.
+228. **`first-run.sh` stays home2's path** (option (a)): the service-user layout, `--upgrade` and
+     the copy steps, with its harnesses. The docs send everyone else to `tapectl setup`.
+229. **A friend's default layout is their own account** (option (a)): a home in `~/.tapectl` or a
+     folder they choose, their account in the `tape` group, backup and audit as user timers. No
+     service user, ACLs, `tapectl-op` or `/etc/tapectl/home` pointer; a service user stays an
+     option.
+230. **Each release carries a static binary built by CI from its tag** (option (b)), with
+     `cargo install --locked --git …` documented as the fallback. This is the CTO's standing
+     permission for one release build per tag, by CI; every other build stays debug or check.
+231. **The rehearsal and the drive profile are optional for a friend** (option (a)), offered only
+     with a spare cartridge. Without them the first copy's full readback is the proof, and planning
+     stays at the fill ceiling.
+232. **The friends' setup ships in 1.9.1** (amends the recommended 1.10.0). A new command is
+     patch-level under item 201, so 1.9.1 carries items 224-227, 229-231 and 234.
+233. **home2 does not wait for 1.9.1.** Nothing in 1.9.1 changes how a copy is written; home2
+     upgrades to 1.9.0 and writes copies 1 and 2 by handoff (i), then takes 1.9.1 by `--upgrade`.
+234. **The Heir Kit names the release's static binary, in 1.9.1** (#486; lifts the deferral of
+     2026-10-20). When the running tapectl is not static, `key escrow-kit` names the release's
+     static binary and its sha256 on the cover sheet, and copies it in when it is at hand.
