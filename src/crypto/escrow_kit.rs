@@ -237,10 +237,7 @@ pub fn version_by_running(program: &Path) -> Result<String> {
 /// Check that `file` is this release's static build: a static ELF for
 /// x86_64 whose `--version` (as `version_of` reads it) is this tapectl's
 /// (#486). Called before anything is written, so a refusal leaves no kit.
-fn check_static_binary(
-    file: &Path,
-    version_of: &dyn Fn(&Path) -> Result<String>,
-) -> Result<()> {
+fn check_static_binary(file: &Path, version_of: &dyn Fn(&Path) -> Result<String>) -> Result<()> {
     let want = env!("CARGO_PKG_VERSION");
     let facts = elf_facts(file).map_err(|e| {
         TapectlError::Other(format!(
@@ -326,14 +323,7 @@ pub fn generate_with_program(
     out_dir: &Path,
     program: &Path,
 ) -> Result<KitReport> {
-    generate_with_programs(
-        conn,
-        db_path,
-        out_dir,
-        program,
-        None,
-        &version_by_running,
-    )
+    generate_with_programs(conn, db_path, out_dir, program, None, &version_by_running)
 }
 
 /// [`generate`] with everything it runs named: the program to copy, the
@@ -1799,8 +1789,14 @@ mod tests {
             "the URL is one unbroken line: {text}"
         );
         let flat = flat(&text);
-        assert!(flat.contains("SHA256SUMS file of the same release"), "{text}");
-        assert!(flat.contains("download the static build named above"), "{text}");
+        assert!(
+            flat.contains("SHA256SUMS file of the same release"),
+            "{text}"
+        );
+        assert!(
+            flat.contains("download the static build named above"),
+            "{text}"
+        );
         assert_eq!(
             text.matches("sha256  ").count(),
             1,
