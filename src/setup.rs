@@ -774,14 +774,17 @@ impl Setup<'_> {
             "  staged slices are the encrypted archives waiting for the tape; give them a big \
              disk that is not the one your data is on"
         );
-        let answer = self
-            .ask
-            .text(
-                "Staging directory",
-                Some(&current.display().to_string()),
-                "--staging DIR",
-            )?
-            .expect("a default is given");
+        let answer = match &self.args.staging {
+            Some(given) => given.clone(),
+            None => self
+                .ask
+                .text(
+                    "Staging directory",
+                    Some(&current.display().to_string()),
+                    "--staging DIR",
+                )?
+                .expect("a default is given"),
+        };
         let want = absolute_dir(&answer, &self.facts.user_home, "staging directory")?;
         if !want.exists() {
             if self.dry() {
