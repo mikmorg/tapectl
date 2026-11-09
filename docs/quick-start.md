@@ -45,8 +45,9 @@ never opened); your keys and the **escrow identity**; two places to keep cartrid
 your first collection, a folder whose subfolders become the units; weekly
 catalog-backup and audit timers; a check of the config.
 
-A run of setup, trimmed (`~` is the account's home; mhvtl's virtual drive stands in
-for a real one here):
+A run of setup on a machine where mhvtl's virtual library stands in for a real drive,
+trimmed (`~` is the account's home; `…` marks lines cut; the answers typed are shown
+after each question, and Enter alone took the default):
 
 ```text
 tapectl setup: each step says what it is about to do, then what it did.
@@ -63,15 +64,20 @@ Enter takes the answer in [brackets]. Ctrl-C between steps is safe: run setup ag
   Staging directory [~/.tapectl/staging]: /srv/staging
   /srv/staging does not exist. Create it? [Y/n]:
   made /srv/staging
-  /srv/staging is writable, 1.8 TiB free
-  set staging.directory = "/srv/staging" in ~/.tapectl/config.toml
+  /srv/staging is writable, 50.4 GiB free
+set staging.directory = "/srv/staging" (was "~/.tapectl/staging") in ~/.tapectl/config.toml
 
 3. Drive: the tape drive tapectl writes with
-  found /dev/tape/by-id/scsi-XYZZY_A1-nst → /dev/nst0: IBM ULT3580-TD8, LTO-8
-  Use this drive? [Y/n]:
+  found 4 drives:
+    1) /dev/tape/by-id/scsi-XYZZY_A1-nst → /dev/nst0: IBM ULT3580-TD8, LTO-8
+    2) /dev/tape/by-id/scsi-XYZZY_A2-nst → /dev/nst1: IBM ULT3580-TD8, LTO-8
+    3) /dev/tape/by-id/scsi-XYZZY_A3-nst → /dev/nst2: IBM ULT3580-TD6, LTO-6
+    4) /dev/tape/by-id/scsi-XYZZY_A4-nst → /dev/nst3: IBM ULT3580-TD6, LTO-6
+  Which drive (its number or its path): 1
   generation LTO-8, read from the drive attached at /dev/tape/by-id/scsi-XYZZY_A1-nst (model IBM ULT3580-TD8)
   adding drive "lto8" (LTO-8) at /dev/tape/by-id/scsi-XYZZY_A1-nst
-  …
+drive "lto8" added to ~/.tapectl/config.toml (LTO-8, tape=/dev/tape/by-id/scsi-XYZZY_A1-nst, sg=/dev/sg2 (derived from device_tape))
+verify it with: tapectl config check
 
 4. Keys: the operator's keys and the escrow identity
   The operator's name [alice]:
@@ -95,26 +101,26 @@ Enter takes the answer in [brackets]. Ctrl-C between steps is safe: run setup ag
   Whoever holds it can read every tape: keep it as you keep a will.
   `tapectl key escrow-kit DIR` writes the Heir Kit to keep beside it.
 
-  Its public key (safe to keep anywhere): age1…
+  Its public key (safe to keep anywhere): age1r6mm0yx9…
   ==========================================================================
 
 5. Locations: the places cartridges are kept
   two places, so one copy survives what happens to the other (a fire, a flood, a burglary)
   The first place [home]:
-  The second place, away from the first [offsite]: parents
-  location "home" added (id=1, kind=shelf)
-  location "parents" added (id=2, kind=shelf)
+  The second place, away from the first [offsite]:
+location "home" added (id=1, kind=shelf)
+location "offsite" added (id=2, kind=shelf)
 
 6. First collection: a folder whose subfolders are the units
   a collection is a folder whose subfolders are the units, one folder, one unit: /media/photos with 2019-italy/ and 2020-garden/ in it makes two units
   The collection's folder, e.g. /media/photos: /media/photos
   The collection's name [photos]:
   The tenant its units belong to [alice]:
-  added collection "photos" (root /media/photos, tenant alice, a unit per folder 1 level below the root) to ~/.tapectl/config.toml
-  its sync, as `tapectl collection sync` would run it now:
-  …
+added collection "photos" (root /media/photos, tenant alice, a unit per folder 1 level below the root) to ~/.tapectl/config.toml
+its sync, as `tapectl collection sync` would run it now:
+collection "photos" (dry run): would create 2; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
   Register these units now? [Y/n]:
-  …
+collection "photos": 2 created; 0 refused · 0 moved, 0 reactivated, 0 missing · 2 pending (2 never archived)
 
 7. Backups and audit: user timers
   a weekly copy of the catalog to another disk, and a weekly `tapectl audit`, as systemd user timers that run as alice
@@ -128,22 +134,29 @@ Enter takes the answer in [brackets]. Ctrl-C between steps is safe: run setup ag
     systemctl --user daemon-reload && systemctl --user enable --now tapectl-backup.timer tapectl-audit.timer
 
 8. Check: `tapectl config check`
-  config: valid
-  …
+config: valid
+home: ~/.tapectl (~/.tapectl, the default: nothing named another home)
+dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+staging: '/srv/staging' exists and is writable
+…
   config check: ok
 
 9. What needs root
   setup never runs sudo; copy these and run them yourself:
 
-    sudo usermod -aG tape alice
-    sudo apt install dar sg3-utils age
     sudo loginctl enable-linger alice
 
-  usermod: the drive's group; then log out and back in (`id` lists tape)
-  apt: the tools tapectl and the tapes' RESTORE.sh run (Debian/Ubuntu package names; or your distro's)
   loginctl: so the timers run while you are logged out
 
 10. Next: the first two copies
+  see how the units pack into tapes:
+    tapectl collection plan
+  copy 1: load a blank cartridge, then
+    tapectl collection run photos --label L8-0001 --init --full-confirm --move-to home
+  copy 2: load the next blank cartridge, then
+    tapectl volume write L8-0002 --init --full-confirm --move-to offsite
+  where things stand, and the next command, at any time:
+    tapectl status
   …
 ```
 
@@ -181,9 +194,19 @@ and what losing each one costs.
 
 ## 4. The root block
 
-Setup never runs `sudo`. It prints only the lines that apply to your machine, as in
-step 9 above: your account into the drive's group (then log out and back in), the
-missing tools, and `loginctl enable-linger` so the timers run while you are logged
+Setup never runs `sudo`. It prints only the lines that apply to your machine. The
+account above was already in the drive's group and had every tool, so it got one
+line; a fresh machine gets up to three:
+
+```text
+    sudo usermod -aG tape alice
+    sudo apt install dar sg3-utils age mt-st
+    sudo loginctl enable-linger alice
+```
+
+`usermod` puts your account in the drive's group (log out and back in after it);
+`apt install` names the Debian/Ubuntu packages of the missing tools (another distro
+has its own names); `enable-linger` keeps the timers running while you are logged
 out. Run them, then turn the timers on with the `systemctl --user` line from step 7.
 
 ## 5. The first two copies
@@ -201,7 +224,7 @@ Then load the next blank cartridge and write copy 2 from the same staged slices,
 the other place:
 
 ```bash
-tapectl volume write L8-0002 --init --full-confirm --move-to parents
+tapectl volume write L8-0002 --init --full-confirm --move-to offsite
 ```
 
 Put the stickers `L8-0001` and `L8-0002` on the cartridges, and take the second one
