@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-**Next: (i), home2 starts over on 1.8.1, paused after step 6 for 1.9.1** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`; amended 2026-11-04, item 205: copy 1 waits for 1.9.0; on 2026-11-09 the CTO chose to build 1.9.1 before the copies, so home2 goes from 1.8.1 straight to 1.9.1). Steps 0 to 6 are done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53, and the new home `/srv/archive_meta/tapectl/home` (item 197) has its catalog, keys and keepsake's collection table since 2026-11-03, with no units yet (`docs/runs/2026-11-02-1.8.1-handoff-i.md`). Copy 1 waits for 1.9.1 (the CLI review's 1.9.0, ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`, and its patch, items 222-234), which carries the scripts batch too; home2 installs it by `--upgrade`, registers keepsake, then writes copies 1 and 2 (the block before step 7). What follows is the history before it.
+**Next: (i), home2 starts over on 1.8.1, paused after step 6 for 1.9.2** (ruled 2026-10-31; amended 2026-11-01, item 195: 1.8.1 goes on first, by `first-run.sh --upgrade`; amended 2026-11-04, item 205: copy 1 waits for 1.9.0; on 2026-11-09 the CTO chose to build 1.9.1 before the copies, so home2 goes from 1.8.1 straight to 1.9.1; 1.9.2, the same with SQLite 3.54.1 inside (#514), replaced it as the target the same day). Steps 0 to 6 are done: home2 runs 1.8.1 since 2026-11-02, its rehearsal 53/53, and the new home `/srv/archive_meta/tapectl/home` (item 197) has its catalog, keys and keepsake's collection table since 2026-11-03, with no units yet (`docs/runs/2026-11-02-1.8.1-handoff-i.md`). Copy 1 waits for 1.9.2 (the CLI review's 1.9.0, ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`, and its patches 1.9.1, items 222-234, and 1.9.2), which carries the scripts batch too; home2 installs it by `--upgrade`, registers keepsake, then writes copies 1 and 2 (the block before step 7). What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
@@ -45,7 +45,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
 | (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
 | (h) | Spanning's real-drive proof with a scratch 1.7.0 build (passed 2026-10-27) and the `v1.7.0` tag (done); the LBP acceptance on the 1.8.0 candidate (passed 2026-10-29) and the `v1.8.0` tag (done); then the upgrade of home2 from 1.5.0 to 1.8.0, spanning off until a unit allows it (ADR-0012 items 146, 183): **done 2026-10-29** | **you** (sudo for the install, and returning the test cartridge first) |
-| (i) | Install 1.8.1 with `first-run.sh --upgrade`, then start home2 over on it: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193-195). Paused after step 6 (2026-11-03): copy 1 waits for 1.9.1 (item 205; 2026-11-09) | **you** (sudo, the escrow key, the cartridges) |
+| (i) | Install 1.8.1 with `first-run.sh --upgrade`, then start home2 over on it: a new catalog, new keys, new units, `keepsake` written again on L6-0001 and L6-0002 (ADR-0012 items 193-195). Paused after step 6 (2026-11-03): copy 1 waits for 1.9.2 (item 205; 2026-11-09) | **you** (sudo, the escrow key, the cartridges) |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -561,7 +561,7 @@ inside tmux, in this order. (c) and (d) are the model. What differs from them:
   `TAPECTL_HOME_DIR` names it, so from step 5 on `first-run.sh` runs from `origin/master`, which
   carries it; the installed binary stays 1.8.1;
 - **1.9.0 goes on before copy 1** (ruled 2026-11-04, item 205), so the fresh start's tapes begin
-  on the reviewed CLI; from 2026-11-09, 1.9.1, which contains it. (i) pauses after step 6; the block before step 7 says what comes first.
+  on the reviewed CLI; from 2026-11-09, 1.9.2, which contains it. (i) pauses after step 6; the block before step 7 says what comes first.
 
 Never run step 7 under `script` or `tee`. If you mint an escrow identity, its secret prints there
 once, and only `first-run.sh`'s own log leaves step 7's output out.
@@ -682,14 +682,14 @@ once, and only `first-run.sh`'s own log leaves step 7's output out.
 
    No `--home`: step 5 pointed `/etc/tapectl/home` at the new home.
 
-**Paused here, for 1.9.1 (ruled 2026-11-04, ADR-0012 item 205; on 2026-11-09 the CTO chose to
-build 1.9.1 first, so home2 skips 1.9.0).** Steps 0 to 6 are done (2026-11-02 and 2026-11-03; the
-run record). Copy 1 waits for 1.9.1: the CLI review's release 1.9.0 (items 198-221;
-[releases/1.9.0.md](releases/1.9.0.md)) and its patch (items 222-234; [releases/1.9.1.md](releases/1.9.1.md)). 1.9.0 also carries the scripts batch:
+**Paused here, for 1.9.2 (ruled 2026-11-04, ADR-0012 item 205; on 2026-11-09 the CTO chose to
+build 1.9.1 first, so home2 skips 1.9.0, then 1.9.2 for the SQLite inside it, #514).** Steps 0 to 6 are done (2026-11-02 and 2026-11-03; the
+run record). Copy 1 waits for 1.9.2: the CLI review's release 1.9.0 (items 198-221;
+[releases/1.9.0.md](releases/1.9.0.md)) and its patches (items 222-234; [releases/1.9.1.md](releases/1.9.1.md), [releases/1.9.2.md](releases/1.9.2.md)). 1.9.0 also carries the scripts batch:
 #511, the staging diagnosis (item 199), `POST_WARNING_BYTES` (item 200) and keepsake out of
 `home2.profile` (item 204). Before step 7, in this order:
 
-- **Install 1.9.1 with `first-run.sh --upgrade`** on the new home, once `v1.9.1` is tagged
+- **Install 1.9.2 with `first-run.sh --upgrade`** on the new home, once `v1.9.2` is tagged
   (items 195, 205; `docs/install.md` §10), rehearsing on EW7VWMVKF6 as step 0 did. It is a drive
   step: tell the coordinator first, who sends the broker notice. Load EW7VWMVKF6 first. The new
   catalog has never seen it, so the rehearsal takes it. Step 1 uninstalled the timers and
@@ -699,36 +699,36 @@ run record). Copy 1 waits for 1.9.1: the CLI review's release 1.9.0 (items 198-2
   ```bash
   cd ~/devel/git/tapectl
   git fetch --tags
-  git checkout v1.9.1
+  git checkout v1.9.2
   scripts/first-run.sh --profile contrib/hosts/home2.profile --upgrade
   ```
 
   In order, it:
-  - backs the new catalog up with 1.8.1 to `/srv/local_backup/tapectl/tapectl-pre-1.9.1.db`;
+  - backs the new catalog up with 1.8.1 to `/srv/local_backup/tapectl/tapectl-pre-1.9.2.db`;
   - keeps 1.8.1 as `/usr/local/bin/tapectl-1.8.1`;
   - builds the release binary and installs it: a few minutes, and sudo asks once;
-  - opens the catalog with it: 1.9.1 has no migration, so the schema stays 41;
+  - opens the catalog with it: 1.9.2 has no migration, so the schema stays 41;
   - runs step 14 (answer yes): the timers, `tapectl-op` naming the new home, and the bash
     completion and man pages;
-  - stops at 1.9.1's "Upgrading" notes: press Enter;
+  - stops at 1.9.2's "Upgrading" notes: press Enter;
   - shows `status`, `audit` and `report failed-stages`;
   - rehearses on EW7VWMVKF6. It reads the chip first (an empty drive is refused there, before
     anything is asked), then you type its serial. The drive-poll timer is stopped for it and
     started again;
   - regenerates the Heir Kit in `~/tapectl-heir-kit` for the new catalog (answer yes);
-  - takes one backup with 1.9.1;
+  - takes one backup with 1.9.2;
   - lists what earlier runs left, by group, and removes a group only if you type `remove`. Keep
     every group: step 10 below tidies once the new L6-0002 has read back in full. None of
     the old state (i) keeps until then is in the list;
   - prints the rollback.
 
-  If the rehearsal is red, stop and send the coordinator its output: 1.9.1 has no migration,
+  If the rehearsal is red, stop and send the coordinator its output: 1.9.2 has no migration,
   so `sudo cp -p /usr/local/bin/tapectl-1.8.1 /usr/local/bin/tapectl` puts 1.8.1 back over the
   catalog as it is. Then check:
 
   ```bash
-  git describe --tags                      # v1.9.1
-  tapectl --version                        # tapectl 1.9.1 (v1.9.1, <date>)
+  git describe --tags                      # v1.9.2
+  tapectl --version                        # tapectl 1.9.2 (v1.9.2, <date>)
   ls ~/.local/state/tapectl/rehearsal-ok-$(sha256sum /usr/local/bin/tapectl | cut -c1-16)
   tapectl-op drive eject                   # the test cartridge out
   ```
@@ -831,7 +831,7 @@ run record). Copy 1 waits for 1.9.1: the CLI review's release 1.9.0 (items 198-2
 
    Copy 2's step 13 regenerated the Heir Kit in `~/tapectl-heir-kit` with both tapes in its
    catalog. Print its `COVER.txt` and replace the one in each envelope, with the new
-   `catalog.db.age` and `tapectl-1.9.1` on the media. The handwritten secret stays
+   `catalog.db.age` and `tapectl-1.9.2` on the media. The handwritten secret stays
    (or, with a new escrow identity, goes in beside the new sheet). A new identity also goes
    into the local profile for the next rebuild:
    `echo "ESCROW_PUBLIC_KEY=$(sudo grep -m1 '^age1' /srv/archive_meta/tapectl/home/keys/mikmorg-escrow.age.pub)" > ~/.config/tapectl/home2.local.profile`.
@@ -840,8 +840,8 @@ run record). Copy 1 waits for 1.9.1: the CLI review's release 1.9.0 (items 198-2
     - delete `~/heir-kit`, the stray kit from (f);
     - delete the rollback binaries `/usr/local/bin/tapectl-1.5.0` ((h)'s) and
       `/usr/local/bin/tapectl-1.8.0` (step 0's): no catalog either of them wrote remains.
-      Keep `/usr/local/bin/tapectl-1.8.1`, the 1.9.1 upgrade's rollback, until 1.9.1 has run a
-      while: 1.9.1 has no migration, so 1.8.1 still opens this catalog;
+      Keep `/usr/local/bin/tapectl-1.8.1`, the 1.9.2 upgrade's rollback, until 1.9.2 has run a
+      while: 1.9.2 has no migration, so 1.8.1 still opens this catalog;
     - give `parents` and `family` their new key files, since the old ones open only the erased tapes;
     - with a new escrow identity, destroy the old paper.
 

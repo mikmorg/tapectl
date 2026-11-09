@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), and since 2026-11-09 for 1.9.1, which contains it, installed by `--upgrade` first.
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), and since 2026-11-09 for 1.9.2, which contains it, installed by `--upgrade` first.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -499,6 +499,13 @@ with its File 0 label as the barcode (item 226; `binding::give_first_barcode_bec
 --all-pending` (item 225), which `status` suggests. home2 skips 1.9.0 and goes from 1.8.1 straight to
 1.9.1 by `--upgrade`, then copies 1 and 2 (handoff (i)); the whole chain passed on `691bf9aa`
 (chain66), including `upgrade-mhvtl.sh` from both `v1.8.1` and `v1.9.0`.
+
+**1.9.2: SQLite 3.54.1** (`docs/releases/1.9.2.md`; #514). A patch for RUSTSEC-2026-0459: rusqlite 0.39
+to 0.41 (libsqlite3-sys 0.39.1). No released `rusqlite_migration` takes rusqlite 0.41, so its 2.5.0
+source is vendored in `vendor/rusqlite_migration` with only that requirement raised, through
+`[patch.crates-io]` (`VENDORED.md` says when to drop it). rusqlite 0.41's hooks (`trace_v2`,
+`authorizer`, `commit_hook`, `busy_handler`) take `&mut Connection`: the test helpers that count
+statements hand their closure the connection. home2 installs 1.9.2, not 1.9.1, as handoff (i)'s next step.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
