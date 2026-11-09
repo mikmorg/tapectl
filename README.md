@@ -39,11 +39,12 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.9.0 is the current release. It is young: in real
+tapectl 1.9.1 is the current release. It is young: in real
 use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
 have been exercised only in a virtual tape library (mhvtl). 1.9.0 renamed some commands
 and flags (`stage list` for `staging status`, `drive add` for `backend add`, …): an old
 spelling is refused by name, naming the new one ([release notes](docs/releases/1.9.0.md)).
+1.9.1 added `tapectl setup` and a static binary on each release ([its notes](docs/releases/1.9.1.md)).
 
 The newest features each passed an acceptance run on a real HP LTO-6 drive before their
 release was tagged: the short seal (1.6.0, 2026-10-22), spanning (1.7.0, 2026-10-27) and

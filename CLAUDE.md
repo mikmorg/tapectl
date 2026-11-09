@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), installed by `--upgrade` first.
+(`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), and since 2026-11-09 for 1.9.1, which contains it, installed by `--upgrade` first.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -481,6 +481,24 @@ runs copy 2 as home2 will (a second `--from 13` on a second cartridge that carri
 sealed volume). home2 installs 1.9.0 by `--upgrade` as handoff (i)'s next step, then copies 1
 and 2. 1.9.0 is tagged `v1.9.0` on `4421e212` (2026-11-05), after the whole chain passed on
 `e48546d2` (chain65; the notes' Testing) and PR #512's CI.
+
+**1.9.1: the friends' setup and 1.9.0's open questions** (`docs/releases/1.9.1.md`; ADR-0012 items
+222-234, ruled 2026-11-09). A patch: no byte on tape, no migration, no spelling removed. `tapectl
+setup` (`src/setup.rs` holds the ten steps, `src/cli/setup.rs` the flags; `setup::make_home` is shared
+with `init`) installs a one-drive host as the operator's own account (item 229): it prints what needs
+root and never runs it, writes weekly backup and audit timers as systemd USER units, and mints the
+escrow as `init` does (shown once, stored nowhere; ADR-0005). Its tests are `tests/setup.rs`, with
+the env hooks `TAPECTL_SETUP_UNIT_DIR`, `TAPECTL_TEST_SETUP_GROUPS`, `TAPECTL_TEST_SETUP_BY_ID_DIR`.
+`docs/quick-start.md` is its page; `first-run.sh` stays the service-user installer (item 228).
+`.github/workflows/release.yml` builds a static musl binary on each `v*` tag and attaches it with
+`SHA256SUMS` (item 230: CI's release build is the one standing exception to the build rule).
+`key escrow-kit --static-binary FILE` puts it in the Heir Kit (item 234, #486; `escrow_kit::elf_facts`,
+and the kit runs `FILE --version`, listed in `tests/sg_boundary.rs`). `unit check-integrity`: a size
+change with a moved mtime is CHANGED, exit 0 (items 223, 224). `catalog rebuild` registers a cartridge
+with its File 0 label as the barcode (item 226; `binding::give_first_barcode_because`). `snapshot create
+--all-pending` (item 225), which `status` suggests. home2 skips 1.9.0 and goes from 1.8.1 straight to
+1.9.1 by `--upgrade`, then copies 1 and 2 (handoff (i)); the whole chain passed on `691bf9aa`
+(chain66), including `upgrade-mhvtl.sh` from both `v1.8.1` and `v1.9.0`.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
