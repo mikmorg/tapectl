@@ -39,7 +39,7 @@ You do not need this repository to get the data back.
 
 ## Status
 
-tapectl 1.9.1 is the current release. It is young: in real
+tapectl 1.9.2 is the current release. It is young: in real
 use since 1.0.0 (2026-10-01), and proven on one drive model, an HP LTO-6. Other drives
 have been exercised only in a virtual tape library (mhvtl). 1.9.0 renamed some commands
 and flags (`stage list` for `staging status`, `drive add` for `backend add`, …): an old

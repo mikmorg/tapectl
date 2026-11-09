@@ -944,10 +944,11 @@ each other's tapes. What to know:
   the catalog as it is. The printed rollback below also works, and loses what
   the catalog recorded after step 2.
 
-**From 1.8.1 or 1.9.0 to 1.9.1.** 1.9.1 is a patch (ADR-0012 items 222-234;
+**From 1.8.1 or 1.9.0 to 1.9.1 or 1.9.2.** 1.9.1 is a patch (ADR-0012 items 222-234;
 [its notes](releases/1.9.1.md)): no catalog migration, no byte on tape moved, no
 spelling removed. From 1.8.1, everything above for 1.9.0 applies too; the rollback
 is still the binary alone. The scripts are unchanged, and `config.toml` needs no edit.
+1.9.2 changes only the SQLite built into the binary ([its notes](releases/1.9.2.md)).
 
 **Rolling back.** Step 13 prints the commands. With the timers stopped, import
 the backup from step 2 while the NEW binary is still installed, then put the
