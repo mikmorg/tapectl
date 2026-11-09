@@ -454,7 +454,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
+  tapectl-1.9.1    the program that made this kit, 39.3 MiB, sha256 3a7bd3e2… (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -475,6 +476,23 @@ same directory is the routine refresh: it writes the kit's files over the old on
 | `escrow-kit.html` | The same words, with the identity also as a QR code. Self-contained; print it from any browser |
 | `catalog.db.age` | The **whole** `tapectl.db`, encrypted to the escrow recipient: units, versions, which volume is on which cartridge, and which location it is in. It holds no private keys |
 | `tapectl-<version>` | A copy of the tapectl program that made the kit (mode 0755), for Linux on the machine type the cover sheet names. The sheet prints its size and sha256 (check it with `sha256sum`). It is the heir's tool for reading around a damaged slice (`restore unit --key escrow.key`), so that does not depend on the repository surviving. A kit made before 1.5.0 has none. The kit copies whichever binary runs `key escrow-kit`, so run the installed production build. Regenerating a kit after an upgrade leaves the older `tapectl-<oldversion>` beside the new one: delete it |
+| `tapectl-<version>-x86_64-linux-musl` | From 1.9.1, only with `--static-binary FILE`: the release's static build of the same version (mode 0755). It needs no library from the machine, so it runs on any Linux on x86_64 machines, where the copy above runs only where its C library does. The kit refuses a file that is not a static x86_64 program, or whose `--version` is not the running tapectl's. The sheet names it first, with its size and sha256 |
+
+**The static binary (1.9.1).** Each release from 1.9.1 carries a static build of
+tapectl, `tapectl-<version>-x86_64-linux-musl`, beside a `SHA256SUMS` file. When the
+tapectl making the kit is not static and no `--static-binary` is given, the cover
+sheet names that asset's URL
+(`https://github.com/mikmorg/tapectl/releases/download/v<version>/tapectl-<version>-x86_64-linux-musl`)
+and says to check it against that release's `SHA256SUMS`; the kit states a sha256
+only for a file it holds. The command then prints one line saying how to put it in
+the kit:
+
+```bash
+tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-1.9.1-x86_64-linux-musl
+```
+
+When the tapectl making the kit is itself static, the sheet says so: its copy is the
+static binary, and there is no second program file.
 
 The command stops at the files. The rest of the ceremony is yours:
 

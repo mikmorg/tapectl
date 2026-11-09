@@ -6,6 +6,14 @@ use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::staging;
 
+/// `snapshot create --help`'s examples (ADR-0012 items 211 and 225).
+const CREATE_EXAMPLES: &str = "\
+Examples:
+  Snapshot two units by name:
+    tapectl snapshot create photos-2024 taxes
+  Snapshot every unit that is pending (never archived, or dirty):
+    tapectl snapshot create --all-pending";
+
 #[derive(Subcommand, Debug)]
 pub enum SnapshotCommands {
     /// Record what each unit holds now: a new version when its content changed
@@ -14,16 +22,25 @@ pub enum SnapshotCommands {
     /// since its newest version is reported and gets none. Each unit is
     /// walked and reported on its own: one that fails does not stop the
     /// others. Under --json, an array of one object per unit, printed only
-    /// when every unit was snapshotted.
+    /// when every unit was snapshotted. --all-pending takes every active unit
+    /// that is pending (never archived, or dirty), in name order, and ends
+    /// with a total.
     ///
-    /// Exit status: 0 = every unit snapshotted (or unchanged); 2 = a unit
-    /// failed, each named, the others snapshotted.
+    /// Exit status: 0 = every unit snapshotted (or unchanged), or nothing
+    /// pending; 2 = a unit failed, each named, the others snapshotted.
+    #[command(after_long_help = CREATE_EXAMPLES)]
     Create {
         /// The units to snapshot
-        #[arg(required = true, value_name = "NAME")]
+        #[arg(required_unless_present = "all_pending", value_name = "NAME")]
         name: Vec<String>,
-        // Q41: the flag that snapshots every dirty unit goes here once the
-        // CTO has named it (OQ22).
+        /// Snapshot every pending unit: never archived, or dirty
+        ///
+        /// Every active unit whose source has no snapshot or no longer
+        /// matches its newest one, in name order, each as if named. The same
+        /// scan `status` and `report dirty` count pending by. With nothing
+        /// pending it says so and exits 0.
+        #[arg(long, conflicts_with = "name")]
+        all_pending: bool,
     },
 
     /// List the snapshots, newest version first
@@ -289,6 +306,105 @@ fn end_of_run(
     )))
 }
 
+/// `snapshot create` of `names`, each judged and reported on its own (ADR-0012
+/// item 210): the named form, and `--all-pending` once it has the list.
+fn create_named(
+    conn: &Connection,
+    config: &Config,
+    names: &[String],
+    json_output: bool,
+) -> Result<()> {
+    for (i, n) in names.iter().enumerate() {
+        if names[..i].contains(n) {
+            return Err(TapectlError::Other(format!(
+                "unit \"{n}\" is named twice; a unit is snapshotted once"
+            )));
+        }
+    }
+    // ADR-0012 item 210: several units, each judged and reported on
+    // its own as it finishes; a unit that fails does not stop the
+    // ones after it.
+    let mut rows = Vec::with_capacity(names.len());
+    let mut done: Vec<String> = Vec::with_capacity(names.len());
+    let mut failed: Vec<(&str, TapectlError)> = Vec::new();
+    let mut not_started: Vec<&str> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        // Issue #404: a signal stops the run between units, the
+        // next unit's walk not started.
+        if i > 0 && crate::signal::is_interrupted() {
+            not_started = names[i..].iter().map(String::as_str).collect();
+            break;
+        }
+        match create_one(conn, config, name) {
+            Ok(created) => {
+                if !json_output {
+                    println!("{}", created.line);
+                }
+                rows.push(created.json);
+                done.push(created.line);
+            }
+            Err(e) => failed.push((name, e)),
+        }
+    }
+    // ADR-0012 item 212, one shape and one document: under --json an
+    // array, one object per unit, whether one unit was named or
+    // several (as `stage create` prints); and only when every unit
+    // was snapshotted. On any failure the error is the one document
+    // (JSON on stdout under --json), naming what was snapshotted.
+    if let Some(err) = end_of_run(names.len(), failed, &not_started, &done, json_output) {
+        return Err(err);
+    }
+    if json_output {
+        crate::render::print_json(&serde_json::Value::Array(rows));
+    }
+    Ok(())
+}
+
+/// `snapshot create --all-pending` (ADR-0012 item 225): every active unit
+/// that is Pending (CONTEXT.md: never archived, or dirty), in name order,
+/// snapshotted as `create_named` snapshots named units, then a total.
+///
+/// Pending is decided by `report::dirty_rows`, the one scan `status` and
+/// `report dirty` count it by (`fingerprint::classify` per active unit). A
+/// unit that scan could not read (a dotfile it refuses) is not pending and not
+/// snapshotted: it is named on stderr, as `status` names it not scanned.
+fn create_all_pending(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let mut pending: Vec<String> = Vec::new();
+    let (mut never_archived, mut dirty) = (0i64, 0i64);
+    for row in crate::cli::report::dirty_rows(conn, None, &config.defaults.global_excludes)? {
+        match row.state {
+            "new" => never_archived += 1,
+            "dirty" => dirty += 1,
+            "unreadable" => {
+                eprintln!(
+                    "warning: unit \"{}\" was not scanned, so it is not snapshotted: {}",
+                    row.name,
+                    row.error.as_deref().unwrap_or("unreadable")
+                );
+                continue;
+            }
+            _ => continue,
+        }
+        pending.push(row.name);
+    }
+    if pending.is_empty() {
+        if json_output {
+            crate::render::print_json(&serde_json::Value::Array(Vec::new()));
+        } else {
+            println!("nothing pending: every active unit's source matches its newest snapshot");
+        }
+        return Ok(());
+    }
+    create_named(conn, config, &pending, json_output)?;
+    if !json_output {
+        println!(
+            "total: {} ({never_archived} never archived, {dirty} dirty)",
+            crate::render::plural(pending.len() as i64, "pending unit", "pending units")
+        );
+    }
+    Ok(())
+}
+
 pub fn run(
     conn: &Connection,
     _paths: &TapectlPaths,
@@ -299,7 +415,10 @@ pub fn run(
     assume_yes: bool,
 ) -> Result<()> {
     match command {
-        SnapshotCommands::Create { name: names } => {
+        SnapshotCommands::Create {
+            name: names,
+            all_pending,
+        } => {
             // Issue #241: the sha256 directory walk IS the work — the
             // only way to know whether content changed (and so whether a
             // new version would be minted) is to run it, so there is
@@ -311,48 +430,10 @@ pub fn run(
                      version would be minted ARE the command's own work.",
                 ));
             }
-            for (i, n) in names.iter().enumerate() {
-                if names[..i].contains(n) {
-                    return Err(TapectlError::Other(format!(
-                        "unit \"{n}\" is named twice; a unit is snapshotted once"
-                    )));
-                }
-            }
-            // ADR-0012 item 210: several units, each judged and reported on
-            // its own as it finishes; a unit that fails does not stop the
-            // ones after it.
-            let mut rows = Vec::with_capacity(names.len());
-            let mut done: Vec<String> = Vec::with_capacity(names.len());
-            let mut failed: Vec<(&str, TapectlError)> = Vec::new();
-            let mut not_started: Vec<&str> = Vec::new();
-            for (i, name) in names.iter().enumerate() {
-                // Issue #404: a signal stops the run between units, the
-                // next unit's walk not started.
-                if i > 0 && crate::signal::is_interrupted() {
-                    not_started = names[i..].iter().map(String::as_str).collect();
-                    break;
-                }
-                match create_one(conn, config, name) {
-                    Ok(created) => {
-                        if !json_output {
-                            println!("{}", created.line);
-                        }
-                        rows.push(created.json);
-                        done.push(created.line);
-                    }
-                    Err(e) => failed.push((name, e)),
-                }
-            }
-            // ADR-0012 item 212, one shape and one document: under --json an
-            // array, one object per unit, whether one unit was named or
-            // several (as `stage create` prints); and only when every unit
-            // was snapshotted. On any failure the error is the one document
-            // (JSON on stdout under --json), naming what was snapshotted.
-            if let Some(err) = end_of_run(names.len(), failed, &not_started, &done, json_output) {
-                return Err(err);
-            }
-            if json_output {
-                crate::render::print_json(&serde_json::Value::Array(rows));
+            if *all_pending {
+                create_all_pending(conn, config, json_output)?;
+            } else {
+                create_named(conn, config, names, json_output)?;
             }
         }
 
@@ -583,6 +664,7 @@ mod tests {
         let paths = TapectlPaths::new(tmp.path().join("home"));
         let create = SnapshotCommands::Create {
             name: vec!["unit1".into(), "unit2".into()],
+            all_pending: false,
         };
         crate::signal::interrupt_this_thread(true);
         let err = run(

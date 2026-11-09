@@ -1,0 +1,117 @@
+# The release's static binary (ADR-0012 item 230). On a pushed tag v*, and on
+# nothing else: build tapectl for x86_64-unknown-linux-musl from the tag, prove
+# it static and of the tag's version, and attach it with its SHA256SUMS to the
+# GitHub release for the tag (made here when absent). This is the CTO's standing
+# permission for one release build per tag, by CI; every other build stays
+# debug or check (CLAUDE.md). The Heir Kit names the asset by this name
+# (`key escrow-kit`, item 234), so the name is a contract:
+#   tapectl-<X.Y.Z>-x86_64-linux-musl
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  static-binary:
+    name: Static binary for the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag itself, with history and tags, so build.rs's
+          # `git describe --tags` names it in `--version`.
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins 1.94.1, as in ci.yml.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        # musl-gcc: rusqlite's bundled SQLite is C, built for the musl target.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools file
+
+      - name: Build (release, static)
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Name the asset and prove it
+        id: asset
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          bin="target/$TARGET/release/tapectl"
+          name="tapectl-${version}-x86_64-linux-musl"
+
+          # Static: no program interpreter, and `file` or `ldd` agrees.
+          # Rust's musl target links static-pie, which newer `file` calls
+          # "static-pie linked" rather than "statically linked".
+          if readelf -lW "$bin" | grep -F 'Requesting program interpreter' >/dev/null; then
+            echo "::error::$bin asks for a program interpreter: it is not static"
+            readelf -lW "$bin" | grep -F interpreter
+            exit 1
+          fi
+          desc="$(file -b "$bin")"
+          echo "file: $desc"
+          ldd_out="$(ldd "$bin" 2>&1 || true)"
+          echo "ldd: $ldd_out"
+          if ! printf '%s\n' "$desc" | grep -E 'statically linked|static-pie linked' >/dev/null \
+             && ! printf '%s\n' "$ldd_out" | grep -E 'not a dynamic executable|statically linked' >/dev/null; then
+            echo "::error::$bin is not shown static by file or ldd"
+            exit 1
+          fi
+
+          # Its version is the tag's, without the v: `tapectl X.Y.Z (describe, date)`.
+          said="$("$bin" --version)"
+          echo "--version: $said"
+          got="$(printf '%s\n' "$said" | head -1 | awk '{print $2}')"
+          if [ "$got" != "$version" ]; then
+            echo "::error::--version says $got, the tag says $version"
+            exit 1
+          fi
+          case "$said" in
+            *-dirty*) echo "::error::built from a dirty tree: $said"; exit 1 ;;
+          esac
+
+          mkdir -p dist
+          cp "$bin" "dist/$name"
+          chmod 0755 "dist/$name"
+          (cd dist && sha256sum "$name" > SHA256SUMS && cat SHA256SUMS)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: ${{ steps.asset.outputs.name }}
+          VERSION: ${{ steps.asset.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            notes="docs/releases/${VERSION}.md"
+            if [ -f "$notes" ]; then
+              gh release create "$tag" --verify-tag --title "tapectl $VERSION" --notes-file "$notes"
+            else
+              gh release create "$tag" --verify-tag --title "tapectl $VERSION" --notes ""
+            fi
+          fi
+          gh release upload "$tag" "dist/$NAME" dist/SHA256SUMS --clobber

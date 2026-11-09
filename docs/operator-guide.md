@@ -535,7 +535,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, …, sha256 … (named on the sheet)
+  tapectl-1.9.1    the program that made this kit, …, sha256 … (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -1511,7 +1512,11 @@ tapectl volume plan
 names the next command ([Status: where things stand](#status-where-things-stand)).
 A unit is **pending** when it has archival work to do: never archived, or dirty
 (changed since its last version); `snapshot create` and `stage create`, or a
-`collection run`, take it from there. A version is **staged** when its stage set
+`collection run`, take it from there. From 1.9.1 `snapshot create --all-pending`
+snapshots every pending unit in one run, in name order, then prints a total
+(`total: 2 pending units (1 never archived, 1 dirty)`); with nothing pending it
+says so and exits 0. It is the same scan `status` and `report dirty` count by, and
+it cannot be given with unit names. A version is **staged** when its stage set
 waits in staging for a copy it is still owed; the next `volume write` writes it.
 A staged unit is not pending: its snapshot exists, so what is left is a write.
 
@@ -3178,7 +3183,7 @@ is the operator's routine.
 tapectl key escrow-kit ~/heir-kit
 ```
 
-It writes four files:
+It writes four files, and a fifth with `--static-binary` (below):
 
 | file | what to do with it |
 |---|---|
@@ -3186,6 +3191,19 @@ It writes four files:
 | `escrow-kit.html` | Same content with the identity as a QR, captioned as the identity. Open it and use the browser's print dialog. Self-contained: it renders with no network. |
 | `catalog.db.age` | The whole catalog, encrypted to the escrow recipient. Put it on the media that travels with the paper. |
 | `tapectl-<version>` | A copy of the tapectl binary that ran the command (mode 0755), from 1.5.0. The cover sheet names it with its size and sha256 and says it is for Linux on one machine type; File 1 on every tape sends an heir there first. Put it on the same media as `catalog.db.age`. Run the installed production binary to make the kit, since the copy is whatever binary ran; after an upgrade, delete the older `tapectl-<oldversion>` the new kit leaves beside it. |
+| `tapectl-<version>-x86_64-linux-musl` | From 1.9.1, only with `--static-binary FILE`: the release's static build of the same version, which runs on any Linux on x86_64 machines (the copy above runs only where its C library does). The kit refuses a file that is not a static x86_64 program or whose `--version` is not the running tapectl's. The cover sheet names it first, with its size and sha256. Put it on the same media. |
+
+**The static binary (1.9.1).** Every release from 1.9.1 carries a static build,
+`tapectl-<version>-x86_64-linux-musl`, and a `SHA256SUMS` file. When the running
+tapectl is not static and no `--static-binary` is given, the cover sheet names
+that asset's URL and says to check it against the release's `SHA256SUMS` (the
+kit states a sha256 only for a file it holds), and the command prints one line
+saying how to put it in the kit. When the running tapectl is itself static, its
+copy is the static binary and there is no fifth file.
+
+```bash
+tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-1.9.1-x86_64-linux-musl
+```
 
 **The command stops at the files. The rest is yours, and the kit is worth
 nothing until you do it:**
