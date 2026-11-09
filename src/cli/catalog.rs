@@ -796,6 +796,8 @@ fn dispatch(
                         // Issue #165: additive, every key above unchanged.
                         "cartridge_barcode": report.cartridge_barcode,
                         "cartridge_registered": report.cartridge_registered,
+                        // ADR-0012 item 226: additive.
+                        "cartridge_label_taken": report.cartridge_label_taken,
                         "cartridge_bound": report.cartridge_bound,
                         "serial_learned": report.serial_learned,
                         "serial_checked": report.serial_checked,
@@ -916,6 +918,9 @@ fn dispatch(
                             "  cartridge \"{barcode}\" registered from this tape's own \
                              identity and bound"
                         );
+                        if let Some(label) = &report.cartridge_label_taken {
+                            println!("{}", label_taken_note(label, barcode));
+                        }
                     }
                     (Some(barcode), _) if report.cartridge_bound => {
                         println!("  bound to cartridge \"{barcode}\"");
@@ -1709,6 +1714,19 @@ fn cartridge_supersession_note(superseded: &str, winner: &str) -> String {
     )
 }
 
+/// The `note: ...` line `catalog rebuild` prints when the cartridge it
+/// registered would have taken File 0's volume label as its barcode
+/// (ADR-0012 item 226) but another cartridge already wears that label: this
+/// one keeps its chip serial (`placeholder`) as its barcode until its
+/// sticker's text is given with `cartridge relabel`.
+fn label_taken_note(label: &str, placeholder: &str) -> String {
+    format!(
+        "  note: the volume label \"{label}\" is already another cartridge's barcode, so this \
+         cartridge keeps its chip serial \"{placeholder}\" as its barcode; give it its \
+         sticker's text with `tapectl cartridge relabel {placeholder} <barcode>`"
+    )
+}
+
 /// `catalog rebuild`'s line about the tape's own write (issue #305): when
 /// it was written (File 0's `created_at`, the plan time), when it was
 /// sealed, and the chip's load count then. Each absent fact is named as
@@ -2308,6 +2326,20 @@ mod tests {
         assert!(note.contains("NEW-BARCODE"), "{note}");
         assert!(note.contains("File 0"), "{note}");
         assert!(note.contains("ADR-0012"), "{note}");
+    }
+
+    /// ADR-0012 item 226: the note names the label another cartridge wears,
+    /// the placeholder this one keeps, and the command that changes it.
+    #[test]
+    fn label_taken_note_names_the_label_the_placeholder_and_relabel() {
+        let note = label_taken_note("L6-0001", "HU1234ABCD");
+        assert!(note.contains("\"L6-0001\""), "{note}");
+        assert!(note.contains("\"HU1234ABCD\""), "{note}");
+        assert!(
+            note.contains("`tapectl cartridge relabel HU1234ABCD <barcode>`"),
+            "{note}"
+        );
+        assert!(!note.contains("--cartridge"), "{note}");
     }
 
     // --- C2 pins: `catalog list`/`catalog locate` --json shapes, locked down

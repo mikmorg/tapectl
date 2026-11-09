@@ -1107,15 +1107,28 @@ pub(crate) fn give_first_barcode(
     old: &str,
     first: &FirstBarcode,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE cartridges SET barcode = ?1 WHERE id = ?2",
-        params![first.barcode, cartridge_id],
-    )?;
     let why = if first.from_flag {
         "volume init --barcode"
     } else {
         "volume init: the volume's label (ADR-0012 item 219)"
     };
+    give_first_barcode_because(conn, cartridge_id, old, first, why)
+}
+
+/// [`give_first_barcode`] with the reason the event records: `catalog
+/// rebuild` gives a cartridge it registers File 0's volume label the same
+/// way (ADR-0012 item 226).
+pub(crate) fn give_first_barcode_because(
+    conn: &Connection,
+    cartridge_id: i64,
+    old: &str,
+    first: &FirstBarcode,
+    why: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cartridges SET barcode = ?1 WHERE id = ?2",
+        params![first.barcode, cartridge_id],
+    )?;
     events::log_event(
         conn,
         "cartridge",

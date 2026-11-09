@@ -723,7 +723,7 @@ rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 env
   on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-  cartridge "E01011L8_1775794348" registered from this tape's own identity and bound
+  cartridge "L8-0002" registered from this tape's own identity and bound
   dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
   cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
     L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
@@ -743,8 +743,8 @@ work/invoices-2024   active   work
 
 Every unit, tenant and file row is back, read from the tape itself. The tape's
 cross-volume index names the one tape still to rebuild, L8-0001, and what it holds.
-The cartridge is registered under its chip serial, since no tape records the sticker;
-`tapectl cartridge relabel E01011L8_1775794348 L8-0002` gives it its barcode back.
+The cartridge is registered with the tape's volume label, L8-0002, as its barcode, as
+`volume init` gives a new cartridge one; its chip serial stays its identity.
 Repeat `catalog rebuild` for each tape, then `volume verify` them. The full procedure, and
 what a rebuilt catalog does not know, is in [Keys and recovery](keys-and-recovery.md).
 

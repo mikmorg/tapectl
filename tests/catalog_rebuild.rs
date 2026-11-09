@@ -2259,8 +2259,10 @@ fn a_rebuild_registers_the_cartridge_file_0_names_and_binds_the_volume_to_it() {
 
     let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
 
-    let (barcode, serial, status, media_type, capacity) = cartridge_row(&conn, "REBUILDSERIAL");
-    assert_eq!(barcode, "REBUILDSERIAL");
+    // ADR-0012 item 226: File 0's volume label is the barcode, as at
+    // `volume init` (item 219); the chip serial stays the identity.
+    let (barcode, serial, status, media_type, capacity) = cartridge_row(&conn, LABEL);
+    assert_eq!(barcode, LABEL);
     assert_eq!(serial.as_deref(), Some("REBUILDSERIAL"));
     assert_eq!(status, "in_use");
     assert_eq!(media_type, "LTO-6");
@@ -2274,14 +2276,68 @@ fn a_rebuild_registers_the_cartridge_file_0_names_and_binds_the_volume_to_it() {
     assert_eq!(cartridge_count(&conn), 1);
     assert_eq!(
         open_mount_cartridge(&conn, LABEL).as_deref(),
-        Some("REBUILDSERIAL"),
+        Some(LABEL),
         "the rebuilt volume must carry an open mount onto the registered cartridge"
     );
 
     assert!(report.cartridge_registered, "{report:?}");
     assert!(report.cartridge_bound, "{report:?}");
-    assert_eq!(report.cartridge_barcode.as_deref(), Some("REBUILDSERIAL"));
+    assert_eq!(report.cartridge_barcode.as_deref(), Some(LABEL));
+    assert!(report.cartridge_label_taken.is_none(), "{report:?}");
     assert!(report.unbound_reason.is_none());
+
+    // Recorded as `volume init` records its first barcode: a `renamed`
+    // change from the chip-serial placeholder to the label.
+    let (old, new, why): (String, String, String) = conn
+        .query_row(
+            "SELECT old_value, new_value, details FROM events
+             WHERE entity_type = 'cartridge' AND action = 'renamed' AND field = 'barcode'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((old.as_str(), new.as_str()), ("REBUILDSERIAL", LABEL));
+    assert!(why.contains("item 226"), "{why}");
+}
+
+/// ADR-0012 item 226: when another cartridge already wears File 0's volume
+/// label as its barcode, the cartridge the rebuild registers keeps its chip
+/// serial as the placeholder, the report names the label, and the other
+/// cartridge's barcode is untouched.
+#[test]
+fn a_rebuild_keeps_the_serial_placeholder_when_the_label_is_another_cartridges_barcode() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES (?1, 'LTO-6', 2400000000, 'OTHERSERIAL', 'available')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(cartridge_count(&conn), 2);
+    let (barcode, serial, ..) = cartridge_row(&conn, "REBUILDSERIAL");
+    assert_eq!(barcode, "REBUILDSERIAL", "the placeholder is kept");
+    assert_eq!(serial.as_deref(), Some("REBUILDSERIAL"));
+    let (_, other_serial, ..) = cartridge_row(&conn, LABEL);
+    assert_eq!(
+        other_serial.as_deref(),
+        Some("OTHERSERIAL"),
+        "the other cartridge keeps its barcode"
+    );
+    assert_eq!(
+        open_mount_cartridge(&conn, LABEL).as_deref(),
+        Some("REBUILDSERIAL")
+    );
+    assert!(report.cartridge_registered, "{report:?}");
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("REBUILDSERIAL"));
+    assert_eq!(report.cartridge_label_taken.as_deref(), Some(LABEL));
 }
 
 /// The other half of the same path: a serial File 0 names that the catalog
@@ -2319,6 +2375,34 @@ fn a_rebuild_binds_to_a_cartridge_already_registered_by_serial() {
     assert!(!report.cartridge_registered, "no new row this run");
     assert!(report.cartridge_bound);
     assert_eq!(report.cartridge_barcode.as_deref(), Some("L6-0001"));
+}
+
+/// ADR-0012 item 226: a rebuild never overwrites a barcode. A row it finds
+/// by serial keeps the barcode it has, even one still wearing its chip
+/// serial as the placeholder; only a cartridge it registers takes the label.
+#[test]
+fn a_rebuild_leaves_a_found_cartridges_placeholder_barcode_alone() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    conn.execute(
+        "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+         VALUES ('REBUILDSERIAL', 'LTO-6', 2400000000, 'REBUILDSERIAL', 'available')",
+        [],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(cartridge_count(&conn), 1);
+    let (barcode, ..) = cartridge_row(&conn, "REBUILDSERIAL");
+    assert_eq!(barcode, "REBUILDSERIAL");
+    assert!(!report.cartridge_registered, "{report:?}");
+    assert!(report.cartridge_label_taken.is_none(), "{report:?}");
+    assert_eq!(report.cartridge_barcode.as_deref(), Some("REBUILDSERIAL"));
 }
 
 /// Displacement is recorded (never refused) exactly when the serial PROVES
@@ -2567,12 +2651,7 @@ fn the_already_sealed_recipe_reaches_a_rebuilt_tape_and_completes_once_coverage_
     // Half 1: the rebuilt row IS reachable, and the Tier-3 floor is what
     // stops the erase -- with `force = true`, which reaches nothing here.
     let err = tapectl::cli::operations::cartridge_mark_erased(
-        &conn,
-        "REBUILDSERIAL",
-        true,
-        false,
-        false,
-        false,
+        &conn, LABEL, true, false, false, false,
     )
     .expect_err(
         "erasing a rebuilt tape that is a unit's last eligible copy must be refused (issue #289)",
@@ -2602,18 +2681,11 @@ fn the_already_sealed_recipe_reaches_a_rebuilt_tape_and_completes_once_coverage_
         .unwrap();
 
     // Half 2: with nothing live at stake, the recipe completes.
-    tapectl::cli::operations::cartridge_mark_erased(
-        &conn,
-        "REBUILDSERIAL",
-        true,
-        false,
-        false,
-        false,
-    )
-    .expect("once no live version is at stake the rebuilt cartridge must be erasable");
+    tapectl::cli::operations::cartridge_mark_erased(&conn, LABEL, true, false, false, false)
+        .expect("once no live version is at stake the rebuilt cartridge must be erasable");
     let status: String = conn
         .query_row(
-            "SELECT status FROM cartridges WHERE barcode = 'REBUILDSERIAL'",
+            "SELECT status FROM cartridges WHERE serial_number = 'REBUILDSERIAL'",
             [],
             |r| r.get(0),
         )

@@ -410,6 +410,8 @@ the factory, and no drive can use it again.
   [`cartridge relabel`](cli/cartridge.md#tapectl-cartridge-relabel) changes a
   sticker afterwards. A cartridge registered by an older tapectl that still wears
   its chip serial as a placeholder barcode takes the label at its next init.
+  `catalog rebuild` gives a cartridge it registers the tape's volume label the
+  same way, from 1.9.1.
   Every command that takes a cartridge takes its barcode or its chip serial.
   Only when no chip serial can be read does the cartridge you name
   (`volume init --cartridge`) become the identity.

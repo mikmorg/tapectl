@@ -1264,7 +1264,9 @@ version is not reported.
 
 From 1.9.0 it tells an edit from damage by the file's modified time. A file
 whose content differs at its recorded size is `CHANGED` when its modified time
-moved since the snapshot (an edit), and `BITROT` only when it did not:
+moved since the snapshot (an edit), and `BITROT` only when it did not. From
+1.9.1 the modified time decides a size change the same way: `CHANGED` when it
+moved, `SIZE_MISMATCH` when it did not:
 
 ```text
 integrity check for "family/photos" against v1's checksums:
@@ -1278,7 +1280,8 @@ every file matches. A check that finds only `CHANGED` files exits 0 and ends
 with a note naming the snapshot that would archive them (`1 file changed since
 the snapshot (v1): tapectl snapshot create family/letters archives it`). A
 version recorded with no modified times cannot tell the two apart: its report
-says `CHANGED or BITROT (no mtime recorded)` and counts the file with `BITROT`.
+says `CHANGED or BITROT (no mtime recorded)` and counts the file with `BITROT`,
+and calls a size change `SIZE_MISMATCH`.
 
 ### The stage would not archive what the snapshot lists (1.1.2)
 

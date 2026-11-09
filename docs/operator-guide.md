@@ -1978,10 +1978,11 @@ tapectl unit mark-tape-only tv/breaking-bad/s01
 ```
 
 `check-integrity` compares the files against the checksums of one version,
-the newest one that has been staged, and names it. A file whose content differs
-at its recorded size is `CHANGED` when its modified time moved since the
-snapshot (an edit, which the next `snapshot create` archives) and `BITROT` when
-it did not. It exits 0 when every file matches or only changed, and 1 when a
+the newest one that has been staged, and names it. A file whose content or size
+differs is `CHANGED` when its modified time moved since the snapshot (an edit,
+which the next `snapshot create` archives). When it did not, a content
+difference is `BITROT` and a size difference `SIZE_MISMATCH` (from 1.9.1; 1.9.0
+called every size difference `SIZE_MISMATCH`). It exits 0 when every file matches or only changed, and 1 when a
 file is `BITROT`, `MISSING` or a `SIZE_MISMATCH`, which is when the disk copy
 can no longer be trusted. A file you changed or deleted since an
 older version is not reported. A version you have snapshotted but not yet
@@ -4011,7 +4012,7 @@ rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 env
   on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-  cartridge "E01011L8_1775794348" registered from this tape's own identity and bound
+  cartridge "L8-0002" registered from this tape's own identity and bound
   dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
   cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
     L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
@@ -4025,10 +4026,13 @@ rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 env
 
 The cross-volume index on the tape names the other tapes this one knew of when it
 was written, with what each holds; a tape sealed after it is not on that list, so
-the shelf stays the list. A cartridge registered by a
-rebuild has its chip serial as its barcode, since no tape records the sticker;
-`tapectl cartridge relabel E01011L8_1775794348 L8-0002` puts the sticker's name
-back.
+the shelf stays the list. A cartridge registered by a rebuild takes the tape's
+volume label as its barcode (here L8-0002), as `volume init` gives a new
+cartridge one, and its chip serial stays its identity. A cartridge row the
+catalog already has keeps its barcode. When another cartridge already wears the
+label, the new one keeps its chip serial as a placeholder barcode and the
+rebuild prints a `note:` saying so; `tapectl cartridge relabel <chip serial>
+<barcode>` gives it its sticker's text, as it changes any sticker.
 
 Run it once per cartridge, in any order. Running it twice, or over a catalog
 that is damaged rather than absent, is safe, because of what it does to rows
