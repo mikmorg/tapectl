@@ -147,7 +147,10 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
         .map(|l| l["name"].as_str().unwrap())
         .collect();
     assert_eq!(names.len(), 2, "{locations}");
-    assert!(names.contains(&"home") && names.contains(&"offsite"), "{names:?}");
+    assert!(
+        names.contains(&"home") && names.contains(&"offsite"),
+        "{names:?}"
+    );
 
     // The collection, named for its folder, and its two units registered.
     let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
@@ -174,7 +177,10 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
         "{backup}"
     );
     assert!(
-        backup.contains(&format!("Environment=TAPECTL_HOME={}\n", w.home().display())),
+        backup.contains(&format!(
+            "Environment=TAPECTL_HOME={}\n",
+            w.home().display()
+        )),
         "{backup}"
     );
     let audit = std::fs::read_to_string(w.units().join("tapectl-audit.service")).unwrap();
@@ -184,7 +190,10 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
     );
     for timer in ["tapectl-backup.timer", "tapectl-audit.timer"] {
         let t = std::fs::read_to_string(w.units().join(timer)).unwrap();
-        assert!(t.contains("OnCalendar=") && t.contains("Persistent=true"), "{t}");
+        assert!(
+            t.contains("OnCalendar=") && t.contains("Persistent=true"),
+            "{t}"
+        );
     }
     assert!(
         stdout.contains("systemctl --user daemon-reload && systemctl --user enable --now"),
@@ -203,16 +212,25 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
         .expect("the secret file holds the identity");
     assert!(key_line.len() > 20, "{key_line}");
     assert!(stdout.contains("THE ESCROW SECRET"), "{stdout}");
-    assert!(stdout.contains(&secret_file.display().to_string()), "{stdout}");
+    assert!(
+        stdout.contains(&secret_file.display().to_string()),
+        "{stdout}"
+    );
     for (name, out) in [("stdout", &stdout), ("stderr", &stderr)] {
         assert!(
             !out.lines().any(|l| l.contains(key_line)),
             "the escrow secret is in {name}"
         );
-        assert!(!out.contains("AGE-SECRET-KEY-"), "a secret key is in {name}");
+        assert!(
+            !out.contains("AGE-SECRET-KEY-"),
+            "a secret key is in {name}"
+        );
     }
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&secret_file).unwrap().permissions().mode();
+    let mode = std::fs::metadata(&secret_file)
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
     // It is not in keys/, which `db backup --include-keys` copies.
     assert!(!w.home().join("keys/escrow-secret.age.key").exists());

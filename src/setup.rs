@@ -254,7 +254,7 @@ pub fn run(
              terminal, or pass --yes to take every default (with the flags for the answers \
              that have none, e.g. --collection-root DIR), or --dry-run to see what it would \
              do."
-                .to_string(),
+            .to_string(),
         ));
     }
     let mut setup = Setup {
@@ -313,7 +313,12 @@ struct Ask<'a> {
 
 impl Ask<'_> {
     /// One line of text. `None` only in a dry run with no default.
-    fn text(&mut self, question: &str, default: Option<&str>, flag: &str) -> Result<Option<String>> {
+    fn text(
+        &mut self,
+        question: &str,
+        default: Option<&str>,
+        flag: &str,
+    ) -> Result<Option<String>> {
         match self.mode {
             Mode::DryRun => Ok(default.map(str::to_string)),
             Mode::Yes => match default {
@@ -458,7 +463,8 @@ pub fn list_drives(dir: &Path) -> Vec<FoundDrive> {
             let identity = crate::tape::drive_identity::attached_identity(&by_id.to_string_lossy());
             let model = identity.as_ref().and_then(|i| i.model.clone());
             let vendor = identity.as_ref().and_then(|i| i.vendor.clone());
-            FoundDrive {
+            let serial = identity.as_ref().and_then(|i| i.serial.clone());
+            let drive = FoundDrive {
                 node: std::fs::canonicalize(&by_id).ok(),
                 generation: model
                     .as_deref()
@@ -469,8 +475,38 @@ pub fn list_drives(dir: &Path) -> Vec<FoundDrive> {
                     (v, None) => v,
                 },
                 by_id,
-            }
+            };
+            (drive, serial)
         })
+        .fold(
+            Vec::<(FoundDrive, Option<String>)>::new(),
+            |mut acc, (d, serial)| {
+                // udev links one drive under several names (its serial's, its
+                // WWN's): one entry per node, by the name that carries the
+                // serial when one does.
+                let names_serial = |d: &FoundDrive| {
+                    serial.as_deref().is_some_and(|s| {
+                        d.by_id
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().contains(s))
+                    })
+                };
+                match acc
+                    .iter_mut()
+                    .find(|(seen, _)| seen.node.is_some() && seen.node == d.node)
+                {
+                    Some((seen, _)) => {
+                        if names_serial(&d) && !names_serial(seen) {
+                            *seen = d;
+                        }
+                    }
+                    None => acc.push((d, serial)),
+                }
+                acc
+            },
+        )
+        .into_iter()
+        .map(|(d, _)| d)
         .collect();
     drives.sort_by(|a, b| a.by_id.cmp(&b.by_id));
     drives
@@ -515,9 +551,7 @@ pub fn root_lines(
     if !groups.iter().any(|g| g == drive_group) {
         lines.push(RootLine {
             command: format!("sudo usermod -aG {drive_group} {user}"),
-            why: format!(
-                "the drive's group; then log out and back in (`id` lists {drive_group})"
-            ),
+            why: format!("the drive's group; then log out and back in (`id` lists {drive_group})"),
         });
     }
     let mut missing: Vec<&str> = TOOLS
@@ -719,7 +753,10 @@ impl Setup<'_> {
     // ── 2. Staging ───────────────────────────────────────────────────────
 
     fn staging(&mut self) -> Result<()> {
-        header(2, "Staging: where archives wait between staging and the tape");
+        header(
+            2,
+            "Staging: where archives wait between staging and the tape",
+        );
         let cfg = self.config()?;
         let current = cfg
             .as_ref()
@@ -841,8 +878,11 @@ impl Setup<'_> {
         let attached = crate::tape::drive_identity::attached_identity(&device);
         let mut declared = self.args.generation.clone();
         let generation = loop {
-            match crate::cli::drive::drive_generation(&device, declared.as_deref(), attached.as_ref())
-            {
+            match crate::cli::drive::drive_generation(
+                &device,
+                declared.as_deref(),
+                attached.as_ref(),
+            ) {
                 Ok(g) => break g,
                 Err(e) if self.mode == Mode::Ask && declared.is_none() => {
                     println!("  {e}");
@@ -854,7 +894,9 @@ impl Setup<'_> {
                 }
                 Err(e) if self.dry() && declared.is_none() => {
                     println!("  {e}");
-                    println!("  would add the drive at {device} once --generation names its generation");
+                    println!(
+                        "  would add the drive at {device} once --generation names its generation"
+                    );
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -1045,7 +1087,9 @@ impl Setup<'_> {
             Some(value) => {
                 let pk = crate::cli::key::adopt_escrow_recipient(conn, paths, &value)?;
                 self.changed = true;
-                println!("  adopted the escrow public key {pk}; its secret stays wherever you keep it");
+                println!(
+                    "  adopted the escrow public key {pk}; its secret stays wherever you keep it"
+                );
             }
             None => {
                 let public_key = write_and_register_escrow(conn, paths, &secret_path)?;
@@ -1077,7 +1121,11 @@ impl Setup<'_> {
                 .expect("a default is given");
             let second = self
                 .ask
-                .text("The second place, away from the first", Some("offsite"), "--location NAME")?
+                .text(
+                    "The second place, away from the first",
+                    Some("offsite"),
+                    "--location NAME",
+                )?
                 .expect("a default is given");
             vec![first, second]
         } else {
@@ -1112,7 +1160,10 @@ impl Setup<'_> {
     // ── 6. Collection ────────────────────────────────────────────────────
 
     fn collection(&mut self) -> Result<()> {
-        header(6, "First collection: a folder whose subfolders are the units");
+        header(
+            6,
+            "First collection: a folder whose subfolders are the units",
+        );
         let cfg = self.config()?;
         if let Some(cfg) = cfg.as_ref().filter(|c| !c.collections.is_empty()) {
             let names: Vec<&str> = cfg.collections.iter().map(|c| c.name.as_str()).collect();
@@ -1129,7 +1180,11 @@ impl Setup<'_> {
             if unregistered > 0 {
                 println!(
                     "  {} not registered yet",
-                    crate::render::plural(unregistered as i64, "unit folder is", "unit folders are")
+                    crate::render::plural(
+                        unregistered as i64,
+                        "unit folder is",
+                        "unit folders are"
+                    )
                 );
                 self.register_units()?;
             }
@@ -1160,7 +1215,11 @@ impl Setup<'_> {
             Some(n) => n.clone(),
             None => self
                 .ask
-                .text("The collection's name", Some(&default_name), "--collection NAME")?
+                .text(
+                    "The collection's name",
+                    Some(&default_name),
+                    "--collection NAME",
+                )?
                 .expect("a default is given"),
         };
         let operator = self.operator()?.or_else(|| self.args.operator.clone());
@@ -1189,10 +1248,10 @@ impl Setup<'_> {
         if !tenant_exists {
             if self.dry() {
                 println!("  would add tenant \"{tenant}\", as `tapectl tenant add` does");
-            } else if self
-                .ask
-                .confirm(&format!("Tenant \"{tenant}\" does not exist. Add it?"), true)?
-            {
+            } else if self.ask.confirm(
+                &format!("Tenant \"{tenant}\" does not exist. Add it?"),
+                true,
+            )? {
                 let paths = self.paths;
                 let conn = self.conn()?.expect("the home exists");
                 crate::tenant::add_tenant(conn, paths, &tenant, None, false)?;
@@ -1349,9 +1408,8 @@ impl Setup<'_> {
             }
             return Ok(());
         }
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            TapectlError::Other(format!("could not create {}: {e}", dir.display()))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| TapectlError::Other(format!("could not create {}: {e}", dir.display())))?;
         for (name, text) in &files {
             let path = dir.join(name);
             std::fs::write(&path, text).map_err(|e| {
@@ -1461,9 +1519,7 @@ impl Setup<'_> {
              --full-confirm --move-to {first}"
         );
         println!("  copy 2: load the next blank cartridge, then");
-        println!(
-            "    tapectl volume write {prefix}-0002 --init --full-confirm --move-to {second}"
-        );
+        println!("    tapectl volume write {prefix}-0002 --init --full-confirm --move-to {second}");
         println!("  where things stand, and the next command, at any time:");
         println!("    tapectl status");
         println!();
@@ -1603,7 +1659,14 @@ mod tests {
         let all = root_lines("alice", "tape", &groups, bin.path().as_os_str(), true, true);
         assert!(all.is_empty(), "{all:?}");
 
-        let lines = root_lines("alice", "tape", &["alice".into()], empty.path().as_os_str(), true, false);
+        let lines = root_lines(
+            "alice",
+            "tape",
+            &["alice".into()],
+            empty.path().as_os_str(),
+            true,
+            false,
+        );
         let commands: Vec<&str> = lines.iter().map(|l| l.command.as_str()).collect();
         assert_eq!(
             commands,
@@ -1613,7 +1676,14 @@ mod tests {
                 "sudo loginctl enable-linger alice",
             ]
         );
-        let no_timers = root_lines("alice", "tape", &groups, empty.path().as_os_str(), false, false);
+        let no_timers = root_lines(
+            "alice",
+            "tape",
+            &groups,
+            empty.path().as_os_str(),
+            false,
+            false,
+        );
         assert!(no_timers.iter().all(|l| !l.command.contains("linger")));
     }
 
@@ -1621,11 +1691,19 @@ mod tests {
     /// with TAPECTL_HOME only for a home that is not the default.
     #[test]
     fn the_unit_files_run_tapectl_as_the_user() {
-        let files = unit_files(Path::new("/usr/local/bin/tapectl"), None, Path::new("/mnt/b"));
+        let files = unit_files(
+            Path::new("/usr/local/bin/tapectl"),
+            None,
+            Path::new("/mnt/b"),
+        );
         let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, UNIT_FILES);
-        assert!(files[0].1.contains("ExecStart=/usr/local/bin/tapectl db backup /mnt/b\n"));
-        assert!(files[2].1.contains("ExecStart=/usr/local/bin/tapectl audit\n"));
+        assert!(files[0]
+            .1
+            .contains("ExecStart=/usr/local/bin/tapectl db backup /mnt/b\n"));
+        assert!(files[2]
+            .1
+            .contains("ExecStart=/usr/local/bin/tapectl audit\n"));
         assert!(files[2].1.contains("SuccessExitStatus=1 75\n"));
         for (_, text) in &files {
             assert!(!text.contains("User="), "{text}");
@@ -1636,8 +1714,12 @@ mod tests {
             Some(Path::new("/srv/archive")),
             Path::new("/mnt/b"),
         );
-        assert!(elsewhere[0].1.contains("Environment=TAPECTL_HOME=/srv/archive\n"));
-        assert!(elsewhere[0].1.contains("ExecStart=\"/opt/my tools/tapectl\" db backup"));
+        assert!(elsewhere[0]
+            .1
+            .contains("Environment=TAPECTL_HOME=/srv/archive\n"));
+        assert!(elsewhere[0]
+            .1
+            .contains("ExecStart=\"/opt/my tools/tapectl\" db backup"));
     }
 
     #[test]
