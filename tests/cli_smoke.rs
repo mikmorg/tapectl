@@ -3249,6 +3249,109 @@ fn snapshot_create_takes_several_units_and_one_failing_stops_none() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("named twice"));
 }
 
+/// ADR-0012 item 225: `snapshot create --all-pending` snapshots every unit
+/// that is Pending (CONTEXT.md: never archived, or dirty) and no other, in
+/// name order, then a total. With nothing pending it says so and exits 0, and
+/// it cannot be given with unit names.
+#[test]
+fn snapshot_create_all_pending_takes_never_archived_and_dirty_units_only() {
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    let ok = |args: &[&str]| {
+        let out = run_tapectl(h, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    let versions = |unit: &str| -> usize {
+        let out = ok(&["--json", "snapshot", "list", "--unit", unit]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v.as_array().unwrap().len()
+    };
+    ok(&["init"]);
+    ok(&["tenant", "add", "acme"]);
+    let src = TempDir::new().unwrap();
+    for u in ["clean", "dirty", "fresh"] {
+        let d = src.path().join(u);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f.txt"), u).unwrap();
+        ok(&[
+            "unit",
+            "init",
+            d.to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            u,
+        ]);
+    }
+    ok(&["snapshot", "create", "clean", "dirty"]);
+    // A file added after the snapshot: `dirty`'s source no longer matches it.
+    std::fs::write(src.path().join("dirty").join("g.txt"), b"new").unwrap();
+
+    let out = ok(&["snapshot", "create", "--all-pending"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each line as the named form prints it (sizes count the unit's own
+    // dotfile, so only the head is pinned), in name order, then the total.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("snapshot created: dirty v2 (")
+            && lines[1].starts_with("snapshot created: fresh v1 ("),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[2], "total: 2 pending units (1 never archived, 1 dirty)",
+        "{stdout}"
+    );
+    assert_eq!(
+        (versions("clean"), versions("dirty"), versions("fresh")),
+        (1, 2, 1),
+        "the clean unit got no version"
+    );
+
+    // Nothing pending now: said, and exit 0; under --json an empty array.
+    let out = ok(&["snapshot", "create", "--all-pending"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("nothing pending"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = ok(&["--json", "snapshot", "create", "--all-pending"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON value");
+    assert_eq!(v, serde_json::json!([]), "{v}");
+
+    // --json with something pending: the named form's array, one object per
+    // unit snapshotted, and nothing else on stdout.
+    std::fs::write(src.path().join("clean").join("g.txt"), b"new").unwrap();
+    let out = ok(&["--json", "snapshot", "create", "--all-pending"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON value");
+    let units: Vec<&str> = v
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|r| r["unit"].as_str().unwrap())
+        .collect();
+    assert_eq!(units, ["clean"], "{v}");
+    assert_eq!(v[0]["minted"], true, "{v}");
+
+    // With a unit named it is refused by clap, before any walk.
+    let out = run_tapectl(h, &["snapshot", "create", "--all-pending", "fresh"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Neither names nor the flag: still a usage error.
+    let out = run_tapectl(h, &["snapshot", "create"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(versions("fresh"), 1);
+}
+
 /// ADR-0012 item 212: a command under `--json` prints at most one document
 /// on stdout. A failure is the error alone: nothing on stdout from the
 /// command itself, and under the JSON-error envelope one `{"error", …}`
