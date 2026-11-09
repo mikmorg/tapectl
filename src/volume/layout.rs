@@ -16100,7 +16100,7 @@ sha256_encrypted = \"bbb\"
         );
         // 1. every tape, with the sticker, the chip serial and the place.
         let mut stmt = conn.prepare(&sqls[0]).unwrap();
-        let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
         assert_eq!(
             cols,
             [
@@ -16145,7 +16145,7 @@ sha256_encrypted = \"bbb\"
         // range) writes, each version on each tape that holds it, the erased
         // tape marked, with what each holds (item 141).
         let mut stmt = conn.prepare(&sqls[1]).unwrap();
-        let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
         assert_eq!(
             cols,
             [

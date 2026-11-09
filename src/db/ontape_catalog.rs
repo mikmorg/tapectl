@@ -1355,7 +1355,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let out = Connection::open(dir.path().join("catalog.db")).unwrap();
+        let mut out = Connection::open(dir.path().join("catalog.db")).unwrap();
         let commits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&commits);
         out.commit_hook(Some(move || {

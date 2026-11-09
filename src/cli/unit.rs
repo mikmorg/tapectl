@@ -822,7 +822,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let conn = crate::db::open_memory().unwrap();
+        let mut conn = crate::db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO tenants (name, is_operator, status) VALUES ('fam', 0, 'active')",
             [],
@@ -830,7 +830,7 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO tags (name) VALUES ('photos'), ('tax')", [])
             .unwrap();
-        let add = |n: usize| {
+        let add = |conn: &Connection, n: usize| {
             for i in 0..n {
                 conn.execute(
                     "INSERT INTO units (uuid, name, tenant_id, current_path, status)
@@ -850,7 +850,7 @@ mod tests {
                 .unwrap();
             }
         };
-        let selects = |conn: &Connection| -> (usize, Vec<(String, String, String)>) {
+        let selects = |conn: &mut Connection| -> (usize, Vec<(String, String, String)>) {
             let n = Arc::new(AtomicUsize::new(0));
             let counter = n.clone();
             conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
@@ -872,8 +872,8 @@ mod tests {
             (n.load(Ordering::SeqCst), rows)
         };
 
-        add(3);
-        let (few, rows) = selects(&conn);
+        add(&conn, 3);
+        let (few, rows) = selects(&mut conn);
         assert_eq!(
             rows[..2],
             [
@@ -883,8 +883,8 @@ mod tests {
         );
         conn.execute("DELETE FROM unit_tags", []).unwrap();
         conn.execute("DELETE FROM units", []).unwrap();
-        add(30);
-        let (many, rows) = selects(&conn);
+        add(&conn, 30);
+        let (many, rows) = selects(&mut conn);
         assert_eq!(rows.len(), 30);
         assert!(few > 0, "positive control: the authorizer counts SELECTs");
         assert_eq!(

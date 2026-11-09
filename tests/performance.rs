@@ -751,15 +751,20 @@ fn count_statement(event: rusqlite::trace::TraceEvent<'_>) {
 
 /// Run `f` with every statement `conn` runs counted; return its result, the
 /// count and the time it took.
-fn counted<T>(conn: &Connection, f: impl FnOnce() -> T) -> (T, u64, Duration) {
+fn counted<T>(conn: &mut Connection, f: impl FnOnce(&Connection) -> T) -> (T, u64, Duration) {
     use rusqlite::trace::TraceEventCodes;
     use std::sync::atomic::Ordering;
     STATEMENTS.store(0, Ordering::Relaxed);
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement))
+        .unwrap();
     let start = Instant::now();
-    let out = f();
+    let out = f(conn);
     let elapsed = start.elapsed();
-    conn.trace_v2(TraceEventCodes::empty(), None);
+    conn.trace_v2(
+        TraceEventCodes::empty(),
+        None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+    )
+    .unwrap();
     (out, STATEMENTS.load(Ordering::Relaxed), elapsed)
 }
 
@@ -807,7 +812,7 @@ fn entries_under(dir: &Path) -> u64 {
 }
 
 fn unit_of_files(n: usize) -> UnitCost {
-    let h = setup(&format!("files-{n}"));
+    let mut h = setup(&format!("files-{n}"));
     tenant::add_tenant(&h.conn, &h.paths, "op", None, true).unwrap();
     let dir = h.source_root.join("unit");
     for i in 0..n {
@@ -829,11 +834,11 @@ fn unit_of_files(n: usize) -> UnitCost {
     .unwrap();
 
     reset_peak_rss();
-    let (sid, snap_stmts, snap_time) = counted(&h.conn, || {
-        staging::snapshot_create(&h.conn, "files-unit", &h.config).unwrap()
+    let (sid, snap_stmts, snap_time) = counted(&mut h.conn, |conn| {
+        staging::snapshot_create(conn, "files-unit", &h.config).unwrap()
     });
-    let ((), stage_stmts, stage_time) = counted(&h.conn, || {
-        staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
+    let ((), stage_stmts, stage_time) = counted(&mut h.conn, |conn| {
+        staging::stage_create(conn, &h.paths, &h.config, sid, true).unwrap();
     });
     let cost = UnitCost {
         entries: entries_under(&dir),

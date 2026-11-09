@@ -537,7 +537,7 @@ mod tests {
 
         const N: usize = 3_000;
         let dir = tempfile::tempdir().unwrap();
-        let conn = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
+        let mut conn = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
         conn.execute_batch(
             "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
              INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);

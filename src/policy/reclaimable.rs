@@ -537,7 +537,7 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let count = |conn: &Connection| -> (usize, Vec<Candidate>) {
+        let count = |conn: &mut Connection| -> (usize, Vec<Candidate>) {
             let n = Arc::new(AtomicUsize::new(0));
             let counter = n.clone();
             conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
@@ -556,10 +556,10 @@ pub(crate) mod tests {
         };
 
         for second in ["sealed", "quarantined"] {
-            let (few_conn, few_unit) = setup("sup-few", 3, second, "active");
-            let (many_conn, many_unit) = setup("sup-many", 9, second, "active");
-            let (few, few_found) = count(&few_conn);
-            let (many, many_found) = count(&many_conn);
+            let (mut few_conn, few_unit) = setup("sup-few", 3, second, "active");
+            let (mut many_conn, many_unit) = setup("sup-many", 9, second, "active");
+            let (few, few_found) = count(&mut few_conn);
+            let (many, many_found) = count(&mut many_conn);
             assert_eq!(few_found.len(), 2);
             assert_eq!(many_found.len(), 8);
             assert!(few > 0, "positive control: the authorizer counts SELECTs");

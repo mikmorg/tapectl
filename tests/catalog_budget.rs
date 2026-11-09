@@ -56,11 +56,13 @@ fn record(event: TraceEvent<'_>) {
 }
 
 /// Run `f` with every statement `conn` runs recorded; return them.
-fn traced(conn: &Connection, f: impl FnOnce()) -> Vec<String> {
+fn traced(conn: &mut Connection, f: impl FnOnce(&Connection)) -> Vec<String> {
     RAN.with(|r| r.borrow_mut().clear());
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
-    f();
-    conn.trace_v2(TraceEventCodes::empty(), None);
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record))
+        .unwrap();
+    f(conn);
+    conn.trace_v2(TraceEventCodes::empty(), None::<fn(TraceEvent<'_>)>)
+        .unwrap();
     RAN.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
@@ -119,7 +121,7 @@ struct Cost {
     scans: BTreeMap<String, usize>,
 }
 
-fn cost(conn: &Connection, f: impl FnOnce()) -> Cost {
+fn cost(conn: &mut Connection, f: impl FnOnce(&Connection)) -> Cost {
     let ran = traced(conn, f);
     let mut scans = BTreeMap::new();
     for sql in &ran {
@@ -332,10 +334,10 @@ fn run(command: Command, conn: &Connection, config: &Config) {
 
 fn costs(units: usize) -> BTreeMap<Command, Cost> {
     let dir = tempfile::tempdir().unwrap();
-    let (conn, config) = catalog(units, dir.path());
+    let (mut conn, config) = catalog(units, dir.path());
     COMMANDS
         .iter()
-        .map(|c| (*c, cost(&conn, || run(*c, &conn, &config))))
+        .map(|c| (*c, cost(&mut conn, |conn| run(*c, conn, &config))))
         .collect()
 }
 
@@ -445,13 +447,13 @@ fn the_statement_counter_sees_a_per_unit_statement() {
 #[test]
 fn a_table_rebuilt_without_its_indexes_breaks_the_restore_lookups_pin() {
     let dir = tempfile::tempdir().unwrap();
-    let (conn, config) = catalog(SMALL, dir.path());
-    let pinned = |conn: &Connection| {
-        cost(conn, || run(Command::RestoreSelect, conn, &config))
+    let (mut conn, config) = catalog(SMALL, dir.path());
+    let pinned = |conn: &mut Connection| {
+        cost(conn, |conn| run(Command::RestoreSelect, conn, &config))
             .scans
             .is_empty()
     };
-    assert!(pinned(&conn), "the pin holds with the schema's indexes");
+    assert!(pinned(&mut conn), "the pin holds with the schema's indexes");
     conn.execute_batch(
         "PRAGMA foreign_keys = OFF;
          CREATE TABLE write_positions_rebuilt AS SELECT * FROM write_positions;
@@ -459,7 +461,7 @@ fn a_table_rebuilt_without_its_indexes_breaks_the_restore_lookups_pin() {
          ALTER TABLE write_positions_rebuilt RENAME TO write_positions;",
     )
     .unwrap();
-    assert!(!pinned(&conn), "and breaks without them");
+    assert!(!pinned(&mut conn), "and breaks without them");
 }
 
 /// The plan reader's positive control: a predicate on an unindexed column

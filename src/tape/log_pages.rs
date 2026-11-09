@@ -2477,7 +2477,7 @@ pub(crate) mod tests {
     #[test]
     fn a_lock_held_past_the_bound_reports_the_0x2e_bytes_and_fails_nothing() {
         let s = sweep(&mut FixtureSource::default());
-        let (dir, conn) = file_catalog();
+        let (dir, mut conn) = file_catalog();
         let contact = open_contact(&conn);
         conn.busy_handler(Some(refuse_and_count)).unwrap();
         let policy = BusyPolicy {

@@ -7147,14 +7147,19 @@ pub(crate) mod tests {
     }
 
     /// The statements `f` runs on `conn`.
-    fn statements_run(conn: &Connection, f: impl FnOnce()) -> usize {
+    fn statements_run(conn: &mut Connection, f: impl FnOnce(&Connection)) -> usize {
         STATEMENTS.with(|n| n.set(0));
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(count_statement),
-        );
-        f();
-        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        )
+        .unwrap();
+        f(conn);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::empty(),
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
         STATEMENTS.with(|n| n.get())
     }
 
@@ -7163,11 +7168,11 @@ pub(crate) mod tests {
     /// `collection status` cost what they did), and one otherwise.
     #[test]
     fn short_of_copies_at_runs_no_statement_without_a_target() {
-        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        let (mut conn, unit_id, _vol) = setup_unit_with_deposit("active");
         let config = crate::config::Config::default();
-        let short = |resolved: &crate::policy::ResolvedPolicy| {
+        let short = |conn: &Connection, resolved: &crate::policy::ResolvedPolicy| {
             short_of_copies_at(
-                &conn,
+                conn,
                 &config,
                 NamedScope::Unit(unit_id),
                 resolved,
@@ -7180,15 +7185,15 @@ pub(crate) mod tests {
         let zero = policy_with_map(&conn, "photos", &[("home", 0)]);
         let two = policy_with_map(&conn, "photos", &[("home", 2), ("glacier", 3)]);
         assert_eq!(
-            statements_run(&conn, || assert!(short(&none).is_empty())),
+            statements_run(&mut conn, |c| assert!(short(c, &none).is_empty())),
             0
         );
         assert_eq!(
-            statements_run(&conn, || assert!(short(&zero).is_empty())),
+            statements_run(&mut conn, |c| assert!(short(c, &zero).is_empty())),
             0
         );
         assert_eq!(
-            statements_run(&conn, || assert_eq!(short(&two).len(), 2)),
+            statements_run(&mut conn, |c| assert_eq!(short(c, &two).len(), 2)),
             1,
             "the positive control: one statement for every target name"
         );

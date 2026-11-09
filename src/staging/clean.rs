@@ -2871,7 +2871,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let (conn, stage_set_id, path, dir) = seed_stage_set();
+        let (mut conn, stage_set_id, path, dir) = seed_stage_set();
         let second = dir.path().join("slice_2.age");
         std::fs::write(&second, b"second staged slice").unwrap();
         conn.execute(
@@ -3367,7 +3367,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let (conn, set, _files, dir) = seed_span(3);
+        let (mut conn, set, _files, dir) = seed_span(3);
         seed_range_on(&conn, set, "V-T1", 1..=2);
         seed_range_on(&conn, set, "V-T2", 3..=3);
         let commits = Arc::new(AtomicUsize::new(0));
