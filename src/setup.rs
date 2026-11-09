@@ -30,11 +30,6 @@ use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::startup::Startup;
 
-/// The file the minted escrow secret is written to, in the home: never in
-/// `keys/`, which `db backup --include-keys` copies and where the escrow
-/// secret is never kept (ADR-0005).
-pub const ESCROW_SECRET_FILE: &str = "escrow-secret.age.key";
-
 /// The unit files setup writes, in the user unit directory.
 pub const UNIT_FILES: [&str; 4] = [
     "tapectl-backup.service",
@@ -268,7 +263,6 @@ pub fn run(
         changed: false,
         check_failed: false,
         timers_written: false,
-        escrow_secret: None,
     };
     if mode == Mode::DryRun {
         println!("tapectl setup (DRY RUN — no changes made)");
@@ -388,8 +382,6 @@ struct Setup<'a> {
     changed: bool,
     check_failed: bool,
     timers_written: bool,
-    /// The escrow secret file this run wrote.
-    escrow_secret: Option<PathBuf>,
 }
 
 fn header(n: usize, title: &str) {
@@ -1038,21 +1030,12 @@ impl Setup<'_> {
                 }
             }
         };
-        let secret_path = self.paths.home.join(ESCROW_SECRET_FILE);
         let escrow = match self.conn()? {
             Some(conn) => crate::db::queries::escrow_key_exists(conn)?,
             None => false,
         };
         if escrow {
             println!("  already done: the escrow identity is registered");
-            if secret_path.exists() && self.escrow_secret.is_none() {
-                println!(
-                    "  REMINDER: the escrow secret is still on this machine, at {}. Move it \
-                     offline (print it, or a USB stick in a safe), then delete it: rm {}",
-                    secret_path.display(),
-                    secret_path.display()
-                );
-            }
             return Ok(());
         }
         let adopt = match &self.args.escrow_public_key {
@@ -1077,9 +1060,8 @@ impl Setup<'_> {
             match adopt {
                 Some(k) => println!("  would adopt the escrow public key {k}"),
                 None => println!(
-                    "  would mint the escrow identity for \"{operator}\" and write its secret to \
-                     {}, to be moved offline and deleted",
-                    secret_path.display()
+                    "  would mint the escrow identity for \"{operator}\" and show its secret \
+                     once, to copy onto paper; it is stored nowhere"
                 ),
             }
             return Ok(());
@@ -1095,10 +1077,19 @@ impl Setup<'_> {
                 );
             }
             None => {
-                let public_key = write_and_register_escrow(conn, paths, &secret_path)?;
+                // As `init` mints it (ADR-0005): the secret is shown once, on
+                // stderr, and stored nowhere.
+                let created = crate::cli::key::create_escrow_recipient(conn, paths, None)?;
                 self.changed = true;
-                self.escrow_secret = Some(secret_path.clone());
-                print_escrow_box(&public_key, &secret_path);
+                crate::cli::key::print_escrow_secret_warning(
+                    &created.keypair.public_key,
+                    &created.keypair.secret_key,
+                );
+                println!("  escrow:   {}", created.keypair.public_key);
+                println!(
+                    "            (the SECRET was printed above, once: copy it onto paper now, \
+                     and keep it in two places; ADR-0005)"
+                );
             }
         }
         Ok(())
@@ -1533,14 +1524,6 @@ impl Setup<'_> {
              (--full-confirm) is the proof, and planning stays at the fill ceiling."
         );
         println!("  The Quick start: {QUICK_START_URL}");
-        if self.escrow_secret.is_some()
-            || self.paths.home.join(ESCROW_SECRET_FILE).exists() && !self.dry()
-        {
-            println!(
-                "  Before the first copy: move the escrow secret offline and delete it from \
-                 this machine (step 4)."
-            );
-        }
         Ok(())
     }
 }
@@ -1554,83 +1537,6 @@ fn same_disk(a: &Path, b: &Path) -> bool {
             .map(|m| m.dev())
     };
     matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
-}
-
-/// Mint the escrow identity, write its secret to `secret_path` (mode 0600,
-/// never overwriting), and only then register its public half, so a write
-/// that fails leaves no recipient whose secret is lost. Returns the public
-/// key.
-fn write_and_register_escrow(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    secret_path: &Path,
-) -> Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let kp = crate::crypto::keys::generate_keypair();
-    let text = format!(
-        "# tapectl escrow identity (ADR-0005): the one key that reads every tape if\n\
-         # everything else is lost. Move it offline (print it, or a USB stick in a\n\
-         # safe), then delete this file from this machine.\n\
-         # created: {}\n\
-         # public key: {}\n\
-         {}\n",
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        kp.public_key,
-        kp.secret_key
-    );
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(secret_path)
-        .map_err(|e| {
-            TapectlError::Other(format!(
-                "could not write the escrow secret to {}: {e} (a file left there by an \
-                 earlier run: move it offline if it is a secret you keep, delete it, and run \
-                 setup again)",
-                secret_path.display()
-            ))
-        })?;
-    let written = f.write_all(text.as_bytes()).and_then(|_| f.sync_all());
-    drop(f);
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(secret_path);
-        return Err(TapectlError::Other(format!(
-            "could not write the escrow secret to {}: {e}",
-            secret_path.display()
-        )));
-    }
-    if let Err(e) = crate::cli::key::register_escrow_keypair(conn, paths, &kp, None) {
-        let _ = std::fs::remove_file(secret_path);
-        return Err(e);
-    }
-    Ok(kp.public_key)
-}
-
-/// The warning box for a minted escrow identity. The secret itself is never
-/// printed: only where it is.
-fn print_escrow_box(public_key: &str, secret_path: &Path) {
-    let rule = "  ==========================================================================";
-    let file = secret_path.display();
-    println!();
-    println!("{rule}");
-    println!("  THE ESCROW SECRET: MOVE IT OFFLINE, THEN DELETE IT FROM THIS MACHINE");
-    println!("{rule}");
-    println!("  The escrow identity is the one key that reads every tape tapectl writes");
-    println!("  if everything else is lost: this machine, the catalog, the operator's");
-    println!("  keys. Every tape is encrypted to it as well as to its tenant.");
-    println!();
-    println!("  Its secret was written to:");
-    println!("      {file}");
-    println!();
-    println!("  Move it offline now: print it, or copy it to a USB stick kept in a");
-    println!("  safe, in two places if you can. Then delete it from this machine:");
-    println!("      rm {file}");
-    println!("  Whoever holds it can read every tape: keep it as you keep a will.");
-    println!("  `tapectl key escrow-kit DIR` writes the Heir Kit to keep beside it.");
-    println!();
-    println!("  Its public key (safe to keep anywhere): {public_key}");
-    println!("{rule}");
 }
 
 #[cfg(test)]

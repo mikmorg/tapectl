@@ -58,8 +58,9 @@ pub struct SetupArgs {
     /// Adopt this escrow public key instead of minting a new escrow identity
     ///
     /// An age1… literal, or a path to a .pub file, as for `init
-    /// --escrow-public-key`. Left out, setup mints one and writes its secret
-    /// to one file in the home, to be moved offline and deleted.
+    /// --escrow-public-key`. Left out, setup mints one as `init` does: its
+    /// secret is printed once on stderr (under --yes too, terminal or not),
+    /// to copy onto paper, and stored nowhere (ADR-0005).
     #[arg(long, value_name = "KEY_OR_FILE")]
     pub escrow_public_key: Option<String>,
 

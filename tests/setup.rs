@@ -127,7 +127,7 @@ fn assert_ok(out: &Output, what: &str) -> (String, String) {
 /// check` passes, two locations, the collection with its units registered,
 /// the four unit files running this tapectl as the user, the root block
 /// naming `usermod` for an account outside the drive's group, and the
-/// escrow warning naming the secret's file without printing the secret.
+/// escrow secret shown once, as `init` shows it, and stored nowhere.
 #[test]
 fn yes_with_the_needed_flags_finishes_a_working_home() {
     let w = World::new();
@@ -203,37 +203,54 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
     // The root block: the account is not in the drive's group.
     assert!(stdout.contains("sudo usermod -aG tape friend"), "{stdout}");
 
-    // The escrow warning names the file; the secret never appears.
-    let secret_file = w.home().join("escrow-secret.age.key");
-    let secret = std::fs::read_to_string(&secret_file).unwrap();
-    let key_line = secret
-        .lines()
-        .find(|l| l.starts_with("AGE-SECRET-KEY-"))
-        .expect("the secret file holds the identity");
-    assert!(key_line.len() > 20, "{key_line}");
-    assert!(stdout.contains("THE ESCROW SECRET"), "{stdout}");
+    // The escrow secret is shown once on stderr, as `init` shows it
+    // (ADR-0005), and stored nowhere. Positive control: the box and exactly
+    // one secret line are there to be found.
     assert!(
-        stdout.contains(&secret_file.display().to_string()),
-        "{stdout}"
+        stderr.contains("ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE"),
+        "{stderr}"
     );
-    for (name, out) in [("stdout", &stdout), ("stderr", &stderr)] {
-        assert!(
-            !out.lines().any(|l| l.contains(key_line)),
-            "the escrow secret is in {name}"
-        );
-        assert!(
-            !out.contains("AGE-SECRET-KEY-"),
-            "a secret key is in {name}"
-        );
+    let secret_lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("AGE-SECRET-KEY-"))
+        .collect();
+    assert_eq!(secret_lines.len(), 1, "{stderr}");
+    let escrow_secret = secret_lines[0];
+    assert!(escrow_secret.len() > 20, "{escrow_secret}");
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY-"),
+        "a secret key is in stdout"
+    );
+    // No file under the home, staging, the backups or the unit directory
+    // holds it. The only secrets on disk are the tenants' own key files in
+    // keys/ (the operator's primary and backup), which `init` writes too.
+    let mut tenant_keys = 0;
+    for dir in [w.home(), w.p("staging"), w.p("backups"), w.units()] {
+        for (path, bytes) in w.tree() {
+            if !path.starts_with(&dir) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(escrow_secret),
+                "the escrow secret is in {}",
+                path.display()
+            );
+            if text.contains("AGE-SECRET-KEY-") {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(
+                    path.parent() == Some(w.home().join("keys").as_path())
+                        && (name.ends_with("-primary.age.key")
+                            || name.ends_with("-backup.age.key")),
+                    "a secret key outside the tenants' key files: {}",
+                    path.display()
+                );
+                tenant_keys += 1;
+            }
+        }
     }
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&secret_file)
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
-    // It is not in keys/, which `db backup --include-keys` copies.
-    assert!(!w.home().join("keys/escrow-secret.age.key").exists());
+    assert_eq!(tenant_keys, 2, "the operator's primary and backup keys");
 
     // The next commands, in this release's spellings.
     assert!(
@@ -248,19 +265,20 @@ fn yes_with_the_needed_flags_finishes_a_working_home() {
     );
 }
 
-/// A second run on a finished home changes nothing and says so; the escrow
-/// secret still on the machine is named again.
+/// A second run on a finished home changes nothing and says so, and never
+/// shows a secret again.
 #[test]
 fn a_second_run_is_a_no_op_that_says_done() {
     let w = World::new();
     assert_ok(&w.setup(&[]), "the first setup");
     let before = w.tree();
-    let (stdout, _) = assert_ok(&w.setup(&[]), "the second setup");
+    let (stdout, stderr) = assert_ok(&w.setup(&[]), "the second setup");
     assert!(
         stdout.contains("every step was already done; nothing changed"),
         "{stdout}"
     );
-    assert!(stdout.contains("REMINDER: the escrow secret is still on this machine"));
+    assert!(stdout.contains("already done: the escrow identity is registered"));
+    assert!(!stderr.contains("AGE-SECRET-KEY-"), "{stderr}");
     let after = w.tree();
     let changed: Vec<&PathBuf> = before
         .keys()
@@ -324,16 +342,18 @@ fn yes_refuses_a_question_without_a_default_and_a_rerun_finishes() {
     assert!(stdout.contains("added collection \"photos\""), "{stdout}");
 }
 
-/// Adopting an escrow public key writes no secret file.
+/// Adopting an escrow public key prints no secret.
 #[test]
-fn an_adopted_escrow_key_writes_no_secret() {
+fn an_adopted_escrow_key_prints_no_secret() {
     let w = World::new();
     let kp = tapectl::crypto::keys::generate_keypair();
-    let (stdout, _) = assert_ok(
+    let (stdout, stderr) = assert_ok(
         &w.setup(&["--escrow-public-key", &kp.public_key]),
         "setup --escrow-public-key",
     );
     assert!(stdout.contains(&format!("adopted the escrow public key {}", kp.public_key)));
-    assert!(!w.home().join("escrow-secret.age.key").exists());
-    assert!(!stdout.contains("THE ESCROW SECRET"), "{stdout}");
+    assert!(!stderr.contains("ESCROW IDENTITY GENERATED"), "{stderr}");
+    for out in [&stdout, &stderr] {
+        assert!(!out.contains("AGE-SECRET-KEY-"), "{out}");
+    }
 }

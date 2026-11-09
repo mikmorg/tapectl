@@ -41,7 +41,8 @@ It asks one question at a time; Enter takes the answer in brackets. Each step sa
 what it is about to do, then what it did. In order: where the catalog lives
 (`~/.tapectl`); a staging directory, on a big disk that is not the one your data is
 on; the drive, found under `/dev/tape/by-id/` (only its identity is read; the tape is
-never opened); your keys and the **escrow identity**; two places to keep cartridges;
+never opened); your keys and the **escrow identity**, whose secret is shown once for
+you to copy onto paper; two places to keep cartridges;
 your first collection, a folder whose subfolders become the units; weekly
 catalog-backup and audit timers; a check of the config.
 
@@ -85,24 +86,23 @@ verify it with: tapectl config check
   the escrow identity is the one key that reads every tape if everything else is lost; setup mints a new one unless you already have one to adopt
   Mint a new escrow identity? [Y/n]:
 
-  ==========================================================================
-  THE ESCROW SECRET: MOVE IT OFFLINE, THEN DELETE IT FROM THIS MACHINE
-  ==========================================================================
-  The escrow identity is the one key that reads every tape tapectl writes
-  if everything else is lost: this machine, the catalog, the operator's
-  keys. Every tape is encrypted to it as well as to its tenant.
+================================================================================
+  ESCROW IDENTITY GENERATED -- THIS SECRET IS SHOWN EXACTLY ONCE, RIGHT NOW
+================================================================================
 
-  Its secret was written to:
-      ~/.tapectl/escrow-secret.age.key
+  tapectl does NOT store this secret anywhere: not in the database, not in
+  a config file, not in any file on this machine. Close this terminal without
+  transcribing it and it is gone forever -- the escrow recipient becomes
+  useless for every future encryption it was meant to protect.
+  …
+  SECRET -- transcribe this line:
 
-  Move it offline now: print it, or copy it to a USB stick kept in a
-  safe, in two places if you can. Then delete it from this machine:
-      rm ~/.tapectl/escrow-secret.age.key
-  Whoever holds it can read every tape: keep it as you keep a will.
-  `tapectl key escrow-kit DIR` writes the Heir Kit to keep beside it.
+    AGE-SECRET-KEY-1…
+  …
+================================================================================
 
-  Its public key (safe to keep anywhere): age1r6mm0yx9…
-  ==========================================================================
+  escrow:   age1r6mm0yx9…
+            (the SECRET was printed above, once: copy it onto paper now, and keep it in two places; ADR-0005)
 
 5. Locations: the places cartridges are kept
   two places, so one copy survives what happens to the other (a fire, a flood, a burglary)
@@ -173,14 +173,15 @@ finished by the next one, and a run on a finished home changes nothing and says 
 
 ## 3. The escrow secret
 
-Do this before the first copy. The escrow secret is the one key that reads every tape
-if this machine, its catalog and your own keys are all lost. Setup writes it to
-`~/.tapectl/escrow-secret.age.key` and never prints it. Print it on paper, or copy it
-to a USB stick you keep in a safe (two places if you can), then delete the file:
-
-```bash
-rm ~/.tapectl/escrow-secret.age.key
-```
+The escrow secret is the one key that reads every tape if this machine, its catalog
+and your own keys are all lost. Setup mints it as `tapectl init` does: it prints the
+secret **once**, in the box above (on the terminal's error stream, under `--yes`
+too), and stores it nowhere, not in the catalog and not in any file. Copy it onto
+paper before you go on, check the copy character by character, and keep the paper in
+two places, as [Keys and recovery](keys-and-recovery.md#the-escrow-recipient) says.
+If the box scrolled away before you copied it, nothing can show it again. No tape
+has been written yet, so start over: remove the new home (`~/.tapectl`) and run
+`tapectl setup` again.
 
 Then write the Heir Kit, the papers that let someone else find and read your tapes,
 and keep it with the secret:

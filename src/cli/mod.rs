@@ -290,10 +290,11 @@ pub enum Commands {
     /// (~/.tapectl unless --home names another); a staging directory; the
     /// drive, found under /dev/tape/by-id/ with its generation read from its
     /// model (the tape is never opened); the operator's keys and a new escrow
-    /// identity, whose secret is written to one file in the home for you to
-    /// move offline and delete; two locations; a first collection, its units
-    /// registered on yes; weekly catalog-backup and audit timers as systemd
-    /// user units (files only); `config check`. Then what needs root, as one
+    /// identity, whose secret is printed once on stderr, as `init` prints it
+    /// (under --yes too), to copy onto paper, and stored nowhere; two
+    /// locations; a first collection, its units registered on yes; weekly
+    /// catalog-backup and audit timers as systemd user units (files only);
+    /// `config check`. Then what needs root, as one
     /// block for you to run (setup never runs sudo), and the commands for the
     /// first two copies.
     ///
