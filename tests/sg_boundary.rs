@@ -292,6 +292,10 @@ const SPAWNS: &[(&str, &str)] = &[
     // line, run as the user tapectl runs as, given the collection's name and root
     // and the snapshot's path and no device. tapectl does not choose what it runs.
     ("src/collection/hook.rs", "\"sh\""),
+    // `<FILE> --version` over the static tapectl the operator hands
+    // `key escrow-kit --static-binary` (ADR-0012 item 234): its version is
+    // checked before the kit copies it. Stdin closed, no device named.
+    ("src/crypto/escrow_kit.rs", "program"),
 ];
 
 #[test]
