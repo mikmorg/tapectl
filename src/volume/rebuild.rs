@@ -319,6 +319,11 @@ pub struct RebuildReport {
     /// alone (no catalog and no `--cartridge` — rebuild resolves its own
     /// identity claim, never `binding::lookup_cartridge`'s).
     pub cartridge_registered: bool,
+    /// The cartridge registered this run would have taken File 0's volume
+    /// label as its barcode (ADR-0012 item 226), but another cartridge
+    /// already wears it: this one keeps its chip serial as the placeholder.
+    /// The label, when so; `None` otherwise.
+    pub cartridge_label_taken: Option<String>,
     /// A `cartridge_volumes` mount was opened this run. `false` on an
     /// idempotent re-run that found the volume already mounted to the same
     /// cartridge, and `false` when [`Self::unbound_reason`] is set — a
@@ -3484,7 +3489,9 @@ fn resolve_and_bind_cartridge(
 
     let resolved = match identity {
         RebuildIdentity::Unknown(_) => unreachable!("handled above"),
-        RebuildIdentity::Mam(serial) => resolve_mam_identity(tx, serial, meta, media, report)?,
+        RebuildIdentity::Mam(serial) => {
+            resolve_mam_identity(tx, serial, label, meta, media, report)?
+        }
         RebuildIdentity::Operator(barcode) => {
             resolve_operator_identity(tx, barcode, observed_serial, meta, media, report)?
         }
@@ -3688,15 +3695,24 @@ fn cartridge_capacity_bytes(meta: &format::IdThunkVolumeMeta) -> i64 {
 /// The `mam`-identity resolve, in three probes: find by `serial_number`;
 /// else find by the operator's unconfirmed CLAIM, `operator_serial` (issue
 /// #214); else, if nothing already wears S as a barcode, auto-register
-/// with `barcode = serial_number = S` — the same convention
+/// with `serial_number = S` — the same convention
 /// `binding::resolve_or_register_cartridge`'s auto-register uses, but never
 /// calling it directly: that function only ever auto-registers FROM a
 /// serial (never a barcode, and rebuild's operator path needs exactly that),
 /// so sharing it for one identity and not the other would read as more
 /// coupled than two short, obviously-parallel functions actually are.
+///
+/// The cartridge it registers takes File 0's volume `label` as its barcode,
+/// as `volume init` gives a new cartridge (ADR-0012 items 219 and 226):
+/// registered with its chip serial as the placeholder, then given its first
+/// barcode by `binding::give_first_barcode_because`. When another cartridge
+/// already wears that label, it keeps the placeholder and
+/// `report.cartridge_label_taken` says so. A row the probes find keeps the
+/// barcode it has: a rebuild never overwrites one.
 fn resolve_mam_identity(
     tx: &Connection,
     serial: &str,
+    label: &str,
     meta: &format::IdThunkVolumeMeta,
     media: Option<&format::IdThunkMedia>,
     report: &mut RebuildReport,
@@ -3833,9 +3849,32 @@ fn resolve_mam_identity(
     let id = tx.last_insert_rowid();
     crate::db::events::log_created(tx, "cartridge", id, serial, None)?;
     report.cartridge_registered = true;
+    // ADR-0012 item 226: File 0's volume label is its first barcode, unless
+    // another cartridge already wears it (that one keeps it, and this one
+    // keeps its chip serial as the placeholder; the report names the label).
+    let label = label.trim();
+    let barcode = if label.is_empty() || label == serial {
+        serial.to_string()
+    } else if crate::volume::binding::select_cartridge(tx, "barcode", label)?.is_some() {
+        report.cartridge_label_taken = Some(label.to_string());
+        serial.to_string()
+    } else {
+        let first = crate::volume::binding::FirstBarcode {
+            barcode: label.to_string(),
+            from_flag: false,
+        };
+        crate::volume::binding::give_first_barcode_because(
+            tx,
+            id,
+            serial,
+            &first,
+            "catalog rebuild: File 0's volume label (ADR-0012 item 226)",
+        )?;
+        first.barcode
+    };
     Ok(ResolvedCartridge {
         id,
-        barcode: serial.to_string(),
+        barcode,
         prior_status: "in_use".to_string(),
         witnessed: true,
     })
@@ -4302,7 +4341,14 @@ mod tests {
         hand_registered(&conn, "HU1234ABCD", None);
 
         let mut report = RebuildReport::default();
-        let err = resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report);
+        let err = resolve_mam_identity(
+            &conn,
+            "HU1234ABCD",
+            "L6-0001",
+            &mam_drill_meta(),
+            None,
+            &mut report,
+        );
         let err = match err {
             Ok(r) => panic!(
                 "expected a refusal, but it resolved to cartridge \"{}\" (id {})",
@@ -4340,9 +4386,15 @@ mod tests {
         let id = hand_registered(&conn, "HU1234ABCD", Some("HU1234ABCD"));
 
         let mut report = RebuildReport::default();
-        let resolved =
-            resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report)
-                .unwrap();
+        let resolved = resolve_mam_identity(
+            &conn,
+            "HU1234ABCD",
+            "L6-0001",
+            &mam_drill_meta(),
+            None,
+            &mut report,
+        )
+        .unwrap();
 
         assert_eq!(resolved.id, id, "it must adopt the hand-registered row");
         assert_eq!(resolved.barcode, "HU1234ABCD");
@@ -4372,7 +4424,14 @@ mod tests {
         hand_registered(&conn, "BC-TWO", Some("HU1234ABCD"));
 
         let mut report = RebuildReport::default();
-        let err = resolve_mam_identity(&conn, "HU1234ABCD", &mam_drill_meta(), None, &mut report);
+        let err = resolve_mam_identity(
+            &conn,
+            "HU1234ABCD",
+            "L6-0001",
+            &mam_drill_meta(),
+            None,
+            &mut report,
+        );
         let err = match err {
             Ok(r) => panic!(
                 "expected a refusal, but it resolved to cartridge \"{}\" (id {})",

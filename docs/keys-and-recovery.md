@@ -851,7 +851,7 @@ is the same procedure for a service-user host.
      on tape: written 2026-11-05 03:42:18 UTC, sealed 2026-11-05 03:42:19 UTC, chip load count at write 1
      inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
                4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
-     cartridge "E01011L8_1775794348" registered from this tape's own identity and bound
+     cartridge "L8-0002" registered from this tape's own identity and bound
      dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
      cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
        L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
