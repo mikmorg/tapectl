@@ -649,7 +649,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.0    the program that made this kit, …, sha256 … (named on the sheet)
+  tapectl-1.9.1    the program that made this kit, …, sha256 … (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
