@@ -115,6 +115,8 @@ Write the Heir Kit: the cover sheet, its catalog and this tapectl
 
 The printed Heir Kit and the encrypted catalog bundle (ADR-0005, ADR-0009). Writes four files: COVER.txt (the plain-text cover sheet — the artifact with the decades-scale claim), escrow-kit.html (the same content with an inline QR, for printing), catalog.db.age (the whole catalog encrypted to the escrow recipient), and tapectl-VERSION (a copy of this tapectl program, mode 0755, whose size and sha256 the cover sheet names, so the kit does not depend on a repository surviving).
 
+A tapectl that is not static runs only where its C library does. With --static-binary, the release's static build goes in beside it as tapectl-VERSION-x86_64-linux-musl and the sheet names it first. Without it, the sheet names that release asset's URL. When this tapectl is itself static, its copy is the static binary.
+
 This command stops at the files. Printing them, sealing them into tamper-evident envelopes and distributing them across at least two independent failure domains is the operator's part, and the cover sheet states those requirements. Re-run after each production write session; `audit` warns when the kit has fallen behind the tapes.
 
 ```text
@@ -125,6 +127,12 @@ tapectl key escrow-kit [OPTIONS] <DIR>
 
 - `<DIR>` — Directory to write the kit into (created if absent, mode 0700)
 
+**Options**
+
+- `--static-binary <FILE>` — The release's static tapectl, to put in the kit beside this one
+  
+    The tapectl-VERSION-x86_64-linux-musl asset of this version's GitHub release. It must be a static x86_64 program whose --version is this tapectl's; the kit copies it in under that name (mode 0755) and the cover sheet names it first, with its size and sha256. Not copied when this tapectl is itself static.
+
 **Examples**
 
 ```bash
@@ -132,5 +140,7 @@ tapectl key escrow-kit [OPTIONS] <DIR>
 tapectl key escrow-kit /mnt/usb/heir-kit
 # Under the service user
 tapectl-op key escrow-kit /srv/archive_meta/heir-kit
+# With the release's static build, downloaded and checked against SHA256SUMS
+tapectl key escrow-kit /mnt/usb/heir-kit --static-binary ./tapectl-VERSION-x86_64-linux-musl
 ```
 

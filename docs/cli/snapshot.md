@@ -23,17 +23,32 @@ tapectl snapshot [OPTIONS] <COMMAND>
 
 Record what each unit holds now: a new version when its content changed
 
-Walks each unit's directory and hashes its files; a unit unchanged since its newest version is reported and gets none. Each unit is walked and reported on its own: one that fails does not stop the others. Under --json, an array of one object per unit, printed only when every unit was snapshotted.
+Walks each unit's directory and hashes its files; a unit unchanged since its newest version is reported and gets none. Each unit is walked and reported on its own: one that fails does not stop the others. Under --json, an array of one object per unit, printed only when every unit was snapshotted. --all-pending takes every active unit that is pending (never archived, or dirty), in name order, and ends with a total.
 
-Exit status: 0 = every unit snapshotted (or unchanged); 2 = a unit failed, each named, the others snapshotted.
+Exit status: 0 = every unit snapshotted (or unchanged), or nothing pending; 2 = a unit failed, each named, the others snapshotted.
 
 ```text
-tapectl snapshot create [OPTIONS] <NAME>...
+tapectl snapshot create [OPTIONS] [NAME]...
 ```
 
 **Arguments**
 
-- `<NAME>` — The units to snapshot
+- `[NAME]` — The units to snapshot
+
+**Options**
+
+- `--all-pending` — Snapshot every pending unit: never archived, or dirty
+  
+    Every active unit whose source has no snapshot or no longer matches its newest one, in name order, each as if named. The same scan `status` and `report dirty` count pending by. With nothing pending it says so and exits 0.
+
+**Examples**
+
+```bash
+Snapshot two units by name:
+tapectl snapshot create photos-2024 taxes
+Snapshot every unit that is pending (never archived, or dirty):
+tapectl snapshot create --all-pending
+```
 
 ### tapectl snapshot list
 

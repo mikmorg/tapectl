@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl 1  "tapectl 1.9.0" 
+.TH tapectl 1  "tapectl 1.9.1" 
 .SH NAME
 tapectl \- Multi\-tenant archival storage management for LTO tape and exportable encrypted directories
 .SH SYNOPSIS
@@ -53,6 +53,9 @@ The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; t
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
 .SH SUBCOMMANDS
+.TP
+tapectl\-setup(1)
+Set up tapectl for one drive on your own account, step by step
 .TP
 tapectl\-init(1)
 Make a new archive: catalog, config, operator tenant, keys, escrow
@@ -158,4 +161,4 @@ no verdict: the audit stopped on an error, a usage error after `audit` included 
 \fB75\fR
 busy: another tapectl process held the catalog (or the drive) too long; nothing changed, run it again (every command that opens the catalog, except `volume verify` (3); `drive poll` and `drive eject` when a command holds the drive)
 .SH VERSION
-v1.9.0
+v1.9.1

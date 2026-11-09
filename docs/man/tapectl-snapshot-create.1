@@ -4,19 +4,24 @@
 .SH NAME
 tapectl\-snapshot\-create \- Record what each unit holds now: a new version when its content changed
 .SH SYNOPSIS
-\fBtapectl snapshot create\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+\fBtapectl snapshot create\fR [\fB\-\-all\-pending\fR] [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fINAME\fR] 
 .SH DESCRIPTION
 Record what each unit holds now: a new version when its content changed
 .PP
-Walks each unit\*(Aqs directory and hashes its files; a unit unchanged since its newest version is reported and gets none. Each unit is walked and reported on its own: one that fails does not stop the others. Under \-\-json, an array of one object per unit, printed only when every unit was snapshotted.
+Walks each unit\*(Aqs directory and hashes its files; a unit unchanged since its newest version is reported and gets none. Each unit is walked and reported on its own: one that fails does not stop the others. Under \-\-json, an array of one object per unit, printed only when every unit was snapshotted. \-\-all\-pending takes every active unit that is pending (never archived, or dirty), in name order, and ends with a total.
 .PP
-Exit status: 0 = every unit snapshotted (or unchanged); 2 = a unit failed, each named, the others snapshotted.
+Exit status: 0 = every unit snapshotted (or unchanged), or nothing pending; 2 = a unit failed, each named, the others snapshotted.
 .SH OPTIONS
+.TP
+\fB\-\-all\-pending\fR
+Snapshot every pending unit: never archived, or dirty
+
+Every active unit whose source has no snapshot or no longer matches its newest one, in name order, each as if named. The same scan `status` and `report dirty` count pending by. With nothing pending it says so and exits 0.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fINAME\fR>
+[\fINAME\fR]
 The units to snapshot
 .SH "GLOBAL OPTIONS"
 .TP
@@ -56,3 +61,10 @@ tapectl home directory: database, keys, catalogs, stage\-reports, logs
 The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
 
 As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+.SH EXAMPLES
+.nf
+  Snapshot two units by name:
+    tapectl snapshot create photos\-2024 taxes
+  Snapshot every unit that is pending (never archived, or dirty):
+    tapectl snapshot create \-\-all\-pending
+.fi

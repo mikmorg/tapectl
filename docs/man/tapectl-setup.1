@@ -1,0 +1,117 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-setup 1  "tapectl-setup " 
+.SH NAME
+tapectl\-setup \- Set up tapectl for one drive on your own account, step by step
+.SH SYNOPSIS
+\fBtapectl setup\fR [\fB\-\-json\fR] [\fB\-\-staging\fR] [\fB\-\-device\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-operator\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-escrow\-public\-key\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-location\fR] [\fB\-\-collection\-root\fR] [\fB\-\-home\fR] [\fB\-\-collection\fR] [\fB\-\-tenant\fR] [\fB\-\-backup\-dir\fR] [\fB\-\-no\-timers\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Set up tapectl for one drive on your own account, step by step
+.PP
+For one person with one tape drive on their own Linux account (a host with a service user is set up by scripts/first\-run.sh instead). Each step says what it is about to do, then what it did: the home (~/.tapectl unless \-\-home names another); a staging directory; the drive, found under /dev/tape/by\-id/ with its generation read from its model (the tape is never opened); the operator\*(Aqs keys and a new escrow identity, whose secret is printed once on stderr, as `init` prints it (under \-\-yes too), to copy onto paper, and stored nowhere; two locations; a first collection, its units registered on yes; weekly catalog\-backup and audit timers as systemd user units (files only); `config check`. Then what needs root, as one block for you to run (setup never runs sudo), and the commands for the first two copies.
+.PP
+A step already done is skipped, so a run that stopped is finished by running setup again, and a run on a finished home changes nothing. Each question has its flag; \-\-yes takes every default and refuses a question that has none, naming its flag; \-\-dry\-run says what each step would do and changes nothing. Without a terminal, setup needs \-\-yes or \-\-dry\-run.
+.SH OPTIONS
+.TP
+\fB\-\-staging\fR \fI<DIR>\fR
+Directory for staged slices: ideally a big disk that is not the source
+
+Created when it does not exist (setup asks first). Default: the staging directory config.toml already names, `<home>/staging` in a new home.
+.TP
+\fB\-\-device\fR \fI<PATH>\fR
+The tape drive\*(Aqs node, preferably its /dev/tape/by\-id/…\-nst link
+
+Default: the one drive under /dev/tape/by\-id/; with several, setup asks which. A /dev/nstN is written as the by\-id link that names it, when one does. Only the drive\*(Aqs identity is read (from the kernel\*(Aqs records); the tape is never opened.
+.TP
+\fB\-\-generation\fR \fI<GEN>\fR
+The generation the drive writes, e.g. LTO\-6 (default: its model\*(Aqs)
+
+As for `drive add`: needed when the drive is not attached now or its model is not one tapectl knows.
+.TP
+\fB\-\-operator\fR \fI<NAME>\fR
+The operator\*(Aqs name (default: this account\*(Aqs login name)
+.TP
+\fB\-\-escrow\-public\-key\fR \fI<KEY_OR_FILE>\fR
+Adopt this escrow public key instead of minting a new escrow identity
+
+An age1… literal, or a path to a .pub file, as for `init \-\-escrow\-public\-key`. Left out, setup mints one as `init` does: its secret is printed once on stderr (under \-\-yes too, terminal or not), to copy onto paper, and stored nowhere (ADR\-0005).
+.TP
+\fB\-\-location\fR \fI<NAME>\fR
+A place cartridges are kept; give it twice (default: home, offsite)
+.TP
+\fB\-\-collection\-root\fR \fI<DIR>\fR
+The folder whose subfolders are the units, e.g. /media/photos
+
+The first collection\*(Aqs root. It has no default: under \-\-yes, setup refuses without it.
+.TP
+\fB\-\-collection\fR \fI<NAME>\fR
+The first collection\*(Aqs name (default: its folder\*(Aqs name)
+.TP
+\fB\-\-tenant\fR \fI<NAME>\fR
+The tenant the collection\*(Aqs units belong to (default: the operator)
+
+Added when it does not exist.
+.TP
+\fB\-\-backup\-dir\fR \fI<DIR>\fR
+Directory for the weekly catalog backup, best on another disk
+
+Default: ~/tapectl\-backups (setup warns when it is on the home\*(Aqs disk).
+.TP
+\fB\-\-no\-timers\fR
+Write no systemd user timers for the backup and the audit
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "GLOBAL OPTIONS"
+.TP
+\fB\-\-json\fR
+Output in JSON format, errors included
+
+Under it an error is one JSON document on stdout, `{"error": …, "exit_code": N}`, and the exit code is the command\*(Aqs own.
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Show what would be done without making changes
+
+Commands that cannot preview refuse the flag rather than ignore it.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Debug tracing on stderr
+
+Raises the log level to DEBUG (never lowers a `[logging] level` set higher); it never changes what a command does or prints on stdout.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr
+
+Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/.
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Answer yes to the confirmation prompts of risks you may accept
+
+It never reaches a refusal: what is refused is a fact, not a risk to accept (ADR\-0008, Tier 3), and a command\*(Aqs own \-\-force names what it overrides.
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs
+
+The home is the first of: \-\-home; TAPECTL_HOME; the directory of \-\-config; this account\*(Aqs ~/.tapectl, when it exists; the home named by the home pointer /etc/tapectl/home (TAPECTL_HOME_POINTER names another file), when the account has no ~/.tapectl of its own; else ~/.tapectl, where `tapectl init` makes a new one. The config file is <home>/config.toml unless \-\-config names another. `tapectl status` and `tapectl config check` name the home in use and the rule that chose it.
+
+As root the home pointer is never read, and on a host that has one tapectl refuses unless \-\-home or TAPECTL_HOME names the home: the service user\*(Aqs commands run through `tapectl\-op`.
+.SH EXTRA
+EXAMPLES:
+  Answer the questions one at a time (Enter takes the default in brackets):
+    tapectl setup
+
+  Take every default, naming what has none:
+    tapectl setup \-\-yes \-\-staging /srv/staging \-\-device /dev/tape/by\-id/<DRIVE>\-nst \\
+        \-\-collection\-root /media/photos
+
+  See what each step would do, and change nothing:
+    tapectl setup \-\-dry\-run
+
+Exit status: 0 = every step is done (a second run on a finished home says so and
+changes nothing); 2 = a step was refused or failed: what was done before it stays
+done, and running setup again finishes the rest.

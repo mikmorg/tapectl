@@ -14,6 +14,7 @@ definitions it parses. For what to *do* with them, start at the
 
 | Command | What it does |
 |---|---|
+| [`setup`](setup.md) | Set up tapectl for one drive on your own account, step by step |
 | [`init`](init.md) | Make a new archive: catalog, config, operator tenant, keys, escrow |
 | [`tenant`](tenant.md) | Manage tenants |
 | &nbsp;&nbsp;[`tenant add`](tenant.md#tapectl-tenant-add) | Add a tenant, with a new key pair or an adopted one |

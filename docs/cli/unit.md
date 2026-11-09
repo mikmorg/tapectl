@@ -159,9 +159,9 @@ tapectl unit discover [OPTIONS]
 
 Check a unit's files against the newest staged version's checksums
 
-A file whose content differs at its recorded size is CHANGED when its modified time moved since the snapshot (an edit, which `snapshot create` archives) and BITROT when it did not; with no modified time recorded it cannot tell, and counts the file with BITROT.
+A file whose content or size differs is CHANGED when its modified time moved since the snapshot (an edit, which `snapshot create` archives). When it did not, a content difference is BITROT and a size difference SIZE_MISMATCH. With no modified time recorded it cannot tell: a content difference counts with BITROT, a size difference is SIZE_MISMATCH.
 
-Exit status: 0 = every file matches; 1 = a file is BITROT, MISSING or a SIZE_MISMATCH; 2 = an error.
+Exit status: 0 = every file matches or is CHANGED; 1 = a file is BITROT, MISSING or a SIZE_MISMATCH; 2 = an error.
 
 ```text
 tapectl unit check-integrity [OPTIONS] <NAME>
