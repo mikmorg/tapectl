@@ -609,7 +609,39 @@ pub fn create_escrow_recipient(
     // deliberately NOT keys::generate_and_save, which would write the secret
     // to a key file.
     let kp = keys::generate_keypair();
+    let alias = register_minted_escrow(conn, paths, &operator, &kp, description)?;
+    Ok(CreatedEscrow { keypair: kp, alias })
+}
 
+/// Register `kp`, a keypair minted by the caller, as the permanent escrow
+/// recipient: [`create_escrow_recipient`]'s registration, for `tapectl
+/// setup`, which writes the secret where the person can move it offline
+/// BEFORE the recipient is registered (ADR-0012 item 227), so a failed write
+/// leaves no registered recipient whose secret is lost. Refuses as
+/// [`create_escrow_recipient`] does. Returns the alias.
+pub fn register_escrow_keypair(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    kp: &keys::GeneratedKeypair,
+    description: Option<&str>,
+) -> Result<String> {
+    if queries::escrow_key_exists(conn)? {
+        return Err(escrow_already_registered_error());
+    }
+    let operator = queries::get_operator_tenant(conn)?.ok_or_else(|| {
+        TapectlError::Other("no operator tenant — run `tapectl init` first".into())
+    })?;
+    register_minted_escrow(conn, paths, &operator, kp, description)
+}
+
+/// The rows and the `.age.pub` file of a minted escrow recipient.
+fn register_minted_escrow(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    operator: &crate::db::models::Tenant,
+    kp: &keys::GeneratedKeypair,
+    description: Option<&str>,
+) -> Result<String> {
     let full_alias = format!("{}-escrow", operator.name);
     let desc = description
         .map(str::to_string)
@@ -633,10 +665,7 @@ pub fn create_escrow_recipient(
     let pub_path = paths.keys_dir.join(format!("{full_alias}.age.pub"));
     keys::save_public_key(&pub_path, &kp.public_key)?;
 
-    Ok(CreatedEscrow {
-        keypair: kp,
-        alias: full_alias,
-    })
+    Ok(full_alias)
 }
 
 fn generate_escrow_key(

@@ -54,5 +54,6 @@ pub mod policy;
 pub mod progress;
 pub mod render;
 pub mod research;
+pub mod setup;
 pub mod store;
 pub mod util;

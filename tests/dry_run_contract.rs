@@ -302,6 +302,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // `restore_units`' dry branch plans the set and returns before the
     // drive is opened. Proven in `tests/dry_run_global.rs`.
     (&["restore", "volume"], Verdict::Honours),
+    // ADR-0012 item 227: each step says what it would do and the whole
+    // tree is unchanged, proven in `tests/setup.rs` (a_dry_run_writes_nothing).
+    (&["setup"], Verdict::Honours),
     (
         &["snapshot", "create"],
         Verdict::Refuses {

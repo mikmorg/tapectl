@@ -1,5 +1,12 @@
 # Installing tapectl — the runbook
 
+> [!NOTE]
+> **Who reads what.** One tape drive on your own Linux account: read the
+> [Quick start](quick-start.md) and run `tapectl setup` (ADR-0012 item 227). This
+> runbook is the service-user layout `scripts/first-run.sh` installs (a `tapectl`
+> service user, `tapectl-op`, the home pointer, the rehearsal): home2's path, and
+> that of hosts like it (item 228).
+
 Written for a **reinstall from a bare machine** (ADR-0012, 2026-09-24 amendment,
 item 6: "installation is a formal, repeatable procedure, so a reinstall is
 easy"). It says what the one entry point creates on the host, how to resume it,

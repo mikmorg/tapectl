@@ -132,7 +132,12 @@ output of every command.
 
 ## Install
 
-The guided route builds a release binary, creates a dedicated `tapectl` service user
+**One drive, your own Linux box:** the [Quick start](docs/quick-start.md). Download
+the release binary (or `cargo install --locked --git https://github.com/mikmorg/tapectl`)
+and run `tapectl setup`, which asks a question at a time and prints the few lines
+that need root.
+
+**A host with a dedicated service user:** the guided route builds a release binary, creates a dedicated `tapectl` service user
 to own the keys and catalog, finds the drive by serial, walks you through the escrow
 key and the Heir Kit, rehearses on a test cartridge, and writes your first tape:
 
