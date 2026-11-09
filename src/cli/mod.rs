@@ -15,6 +15,7 @@ pub mod operations;
 pub mod renamed;
 pub mod report;
 pub mod restore;
+pub mod setup;
 pub mod snapshot;
 pub mod stage;
 pub mod staging;
@@ -128,6 +129,7 @@ pub const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Set up",
         &[
+            "setup",
             "init",
             "tenant",
             "key",
@@ -280,6 +282,31 @@ pub fn completion_command() -> clap::Command {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Set up tapectl for one drive on your own account, step by step
+    ///
+    /// For one person with one tape drive on their own Linux account (a host
+    /// with a service user is set up by scripts/first-run.sh instead). Each
+    /// step says what it is about to do, then what it did: the home
+    /// (~/.tapectl unless --home names another); a staging directory; the
+    /// drive, found under /dev/tape/by-id/ with its generation read from its
+    /// model (the tape is never opened); the operator's keys and a new escrow
+    /// identity, whose secret is printed once on stderr, as `init` prints it
+    /// (under --yes too), to copy onto paper, and stored nowhere; two
+    /// locations; a first collection, its units registered on yes; weekly
+    /// catalog-backup and audit timers as systemd user units (files only);
+    /// `config check`. Then what needs root, as one
+    /// block for you to run (setup never runs sudo), and the commands for the
+    /// first two copies.
+    ///
+    /// A step already done is skipped, so a run that stopped is finished by
+    /// running setup again, and a run on a finished home changes nothing.
+    /// Each question has its flag; --yes takes every default and refuses a
+    /// question that has none, naming its flag; --dry-run says what each step
+    /// would do and changes nothing. Without a terminal, setup needs --yes or
+    /// --dry-run.
+    #[command(after_long_help = setup::SETUP_AFTER_LONG_HELP)]
+    Setup(setup::SetupArgs),
+
     /// Make a new archive: catalog, config, operator tenant, keys, escrow
     ///
     /// Creates the database, config.toml, the operator tenant with its keys,
@@ -783,6 +810,8 @@ pub fn error_contract(command: &Commands) -> crate::error::ErrorContract {
         Commands::Cartridge {
             command: cartridge::CartridgeCommands::Erase { .. },
         } => ErrorContract::Erase,
+        // A refused step exits 2, as any command's error does.
+        Commands::Setup(_) => ErrorContract::Ordinary,
         _ => ErrorContract::Ordinary,
     }
 }

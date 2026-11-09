@@ -340,6 +340,14 @@ fn run(
     let home = startup::resolve(cli.home.as_deref(), cli.config.as_deref())?;
     let paths = home.paths.clone();
 
+    // ADR-0012 item 227: `setup` makes the home itself, step by step, and
+    // finishes one a run before it began, so it runs before the
+    // initialization gate, as `init` does.
+    if let Commands::Setup(ref args) = cli.command {
+        cli::setup::run(&home, args, cli.json, cli.dry_run, cli.yes)?;
+        return Ok(());
+    }
+
     // Init is special — it creates everything from scratch
     if let Commands::Init {
         ref operator,
@@ -709,6 +717,7 @@ fn run(
             exit_if_nonzero(exit_code);
         }
         Commands::Init { .. }
+        | Commands::Setup(_)
         | Commands::Completions { .. }
         | Commands::Host { .. }
         | Commands::Drive { .. }
@@ -842,43 +851,10 @@ fn cmd_init(
         return Ok(());
     }
 
-    // Create directory structure
-    paths.ensure_dirs()?;
-
-    // Write default config, then append the commented [[backends.lto]] example.
-    // It has to go on after serialization: an empty Vec serializes to nothing,
-    // and toml round-trips drop comments, so the section cannot be carried in
-    // the struct — leaving a fresh config with no hint that a tape drive must
-    // be declared at all, or what it needs (#124).
-    let mut cfg = Config::default();
-    // Issue #140: the staging default is `<tapectl home>/staging`, and the
-    // home a fresh init is actually using may be `--home`/`TAPECTL_HOME`
-    // rather than the default one the serde default can see. Record the real
-    // one, and CREATE it here with the same 0700 discipline as the rest of
-    // the home — a default path that does not exist is what made
-    // `config check`'s staging warning fire on every stock machine.
-    let staging_dir = paths.home.join("staging");
-    std::fs::create_dir_all(&staging_dir).context("failed to create the staging directory")?;
-    tapectl::config::secure_path(&staging_dir, 0o700);
-    cfg.staging.directory = staging_dir.to_string_lossy().into_owned();
-    cfg.save(&paths.config_file)?;
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&paths.config_file)
-            .context("failed to reopen config to append the drive example")?;
-        f.write_all(tapectl::config::LTO_BACKEND_EXAMPLE.as_bytes())
-            .context("failed to append the drive example")?;
-        // ADR-0012, 2026-09-24 amendment, item 7: the quiet-host keys,
-        // documented where the operator will look, commented out so the
-        // defaults stay the defaults.
-        f.write_all(tapectl::config::HOST_CHECK_EXAMPLE.as_bytes())
-            .context("failed to append the host-check example")?;
-    }
-
-    // Create database with schema
-    let conn = db::open(&paths.db_file).context("failed to create database")?;
+    // The directories, config.toml with the staging directory made, and the
+    // catalog's schema: the skeleton `tapectl setup` makes too, through the
+    // same function (ADR-0012 item 227).
+    let (cfg, conn) = tapectl::setup::make_home(paths, true)?;
 
     // Create operator tenant with keypairs: minted, or the one adopted
     // (#424), checked again against the catalog (empty here) and against the
