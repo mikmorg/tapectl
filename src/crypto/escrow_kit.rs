@@ -15,6 +15,15 @@
 //! | `escrow-kit.html` | The same content, self-contained, with the identity as an inline SVG QR and print styling. Exists so the ceremony is one keystroke, because ADR-0005 requires repeating it after every write session and a ceremony with friction is one that gets skipped. |
 //! | `catalog.db.age` | The **full** `tapectl.db`, age-encrypted to the escrow recipient. |
 //! | `tapectl-<version>` | A copy of the tapectl program that generated the kit (`std::env::current_exe`), mode 0755, so the heir's one tool for reading around a damaged slice does not depend on a repository still existing (ADR-0012 item 109, #485). The cover sheet and the HTML page name it with its size and sha256. |
+//! | `tapectl-<version>-x86_64-linux-musl` | Only with `--static-binary FILE`: the release's static build of the same version (ADR-0012 items 230, 234; #486), checked to be a static ELF for x86_64 whose `--version` is this tapectl's, mode 0755. The sheets name it first, with its size and sha256, as the one to try on a different Linux. |
+//!
+//! **The static binary (#486).** A copy of a dynamically linked tapectl runs
+//! only where its C library does. When the running program is itself static
+//! (an ELF with no `PT_INTERP` program header, [`elf_facts`]) its copy is the
+//! static binary and the sheet says so; there is no second file. When it is
+//! not, and no `--static-binary` was given, the sheet names the release asset
+//! by its URL ([`static_asset_url`]) and says to check it against that
+//! release's `SHA256SUMS`: the kit states a sha256 only for a file it holds.
 //!
 //! **Why the full database and not #83's filtered `catalog.db`** (ADR-0009):
 //! the filtered schema was designed to ride *on tape*, where the sacred
@@ -49,6 +58,15 @@ pub struct KitReport {
     pub tapectl_sha256: String,
     /// Its size in bytes, as the cover sheet names it.
     pub tapectl_bytes: u64,
+    /// The copy is a static program (#486): it is the static binary, and no
+    /// second file was written.
+    pub program_is_static: bool,
+    /// The static binary `--static-binary` put in the kit (#486), when the
+    /// running program is not static.
+    pub static_copy: Option<StaticCopy>,
+    /// Where the release's static binary is, when the kit holds none: the
+    /// running program is not static and no `--static-binary` was given.
+    pub static_url: Option<String>,
     /// Size of the encrypted catalog bundle, so the operator can sanity-check
     /// that something real was written before carrying it to a printer.
     pub catalog_bytes: u64,
@@ -58,29 +76,276 @@ pub struct KitReport {
     pub sealed_volumes: i64,
 }
 
+/// The static binary `--static-binary` put in the kit (#486).
+#[derive(Debug, Clone)]
+pub struct StaticCopy {
+    /// `tapectl-<version>-x86_64-linux-musl` in the kit directory.
+    pub path: PathBuf,
+    /// Hex sha256 of the copy in the kit, read back from the disk.
+    pub sha256: String,
+    /// Its size in bytes.
+    pub bytes: u64,
+}
+
+/// The release asset's name for this version's static build, as
+/// `.github/workflows/release.yml` attaches it (ADR-0012 item 230).
+pub fn static_asset_name() -> String {
+    format!("tapectl-{}-x86_64-linux-musl", env!("CARGO_PKG_VERSION"))
+}
+
+/// Where the release keeps this version's static build.
+pub fn static_asset_url() -> String {
+    format!(
+        "https://github.com/mikmorg/tapectl/releases/download/v{}/{}",
+        env!("CARGO_PKG_VERSION"),
+        static_asset_name()
+    )
+}
+
+/// What an ELF file's header says, as far as the kit cares (#486).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfFacts {
+    /// No `PT_INTERP` program header: the kernel runs it without a dynamic
+    /// loader, so it needs no library from the machine (static or static-pie).
+    pub is_static: bool,
+    /// Built for x86-64 (`e_machine` 62).
+    pub x86_64: bool,
+}
+
+/// Read `path`'s ELF header and program headers. `Ok(None)` when it is not
+/// an ELF file at all (a script, a truncated download).
+pub fn elf_facts(path: &Path) -> std::io::Result<Option<ElfFacts>> {
+    use std::io::{Seek, SeekFrom};
+    const PT_INTERP: u32 = 3;
+    const EM_X86_64: u16 = 62;
+
+    let mut f = fs::File::open(path)?;
+    let mut ident = [0u8; 64];
+    let n = read_up_to(&mut f, &mut ident)?;
+    if n < 52 || ident[..4] != [0x7f, b'E', b'L', b'F'] {
+        return Ok(None);
+    }
+    let wide = match ident[4] {
+        1 => false,
+        2 => true,
+        _ => return Ok(None),
+    };
+    let little = match ident[5] {
+        1 => true,
+        2 => false,
+        _ => return Ok(None),
+    };
+    if wide && n < 64 {
+        return Ok(None);
+    }
+    let u16_at = |b: &[u8], o: usize| {
+        let a = [b[o], b[o + 1]];
+        if little {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        }
+    };
+    let u32_at = |b: &[u8], o: usize| {
+        let a = [b[o], b[o + 1], b[o + 2], b[o + 3]];
+        if little {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
+    };
+    let machine = u16_at(&ident, 18);
+    let (phoff, phentsize, phnum) = if wide {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&ident[32..40]);
+        let off = if little {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        };
+        (off, u16_at(&ident, 54), u16_at(&ident, 56))
+    } else {
+        (
+            u64::from(u32_at(&ident, 28)),
+            u16_at(&ident, 42),
+            u16_at(&ident, 44),
+        )
+    };
+    let mut is_static = true;
+    if phnum > 0 {
+        if (phentsize as usize) < 4 {
+            return Ok(None);
+        }
+        let mut table = vec![0u8; phentsize as usize * phnum as usize];
+        f.seek(SeekFrom::Start(phoff))?;
+        if read_up_to(&mut f, &mut table)? < table.len() {
+            return Ok(None);
+        }
+        is_static = !table
+            .chunks_exact(phentsize as usize)
+            .any(|ph| u32_at(ph, 0) == PT_INTERP);
+    }
+    Ok(Some(ElfFacts {
+        is_static,
+        x86_64: machine == EM_X86_64,
+    }))
+}
+
+/// `read` until `buf` is full or the file ends; the bytes read.
+fn read_up_to(f: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// The version a tapectl program reports: the second word of the first line
+/// of `<program> --version` (`tapectl 1.9.1 (v1.9.1, 2026-11-10)`).
+pub fn version_by_running(program: &Path) -> Result<String> {
+    let out = std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            TapectlError::Other(format!(
+                "could not run {} --version: {e}",
+                program.display()
+            ))
+        })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next().unwrap_or("");
+    let mut words = first.split_whitespace();
+    match (out.status.success(), words.next(), words.next()) {
+        (true, Some("tapectl"), Some(v)) => Ok(v.to_string()),
+        _ => Err(TapectlError::Other(format!(
+            "{} --version did not name a tapectl version (it printed {:?}{})",
+            program.display(),
+            first,
+            if out.status.success() {
+                String::new()
+            } else {
+                format!(", and exited {}", out.status)
+            }
+        ))),
+    }
+}
+
+/// Check that `file` is this release's static build: a static ELF for
+/// x86_64 whose `--version` (as `version_of` reads it) is this tapectl's
+/// (#486). Called before anything is written, so a refusal leaves no kit.
+fn check_static_binary(
+    file: &Path,
+    version_of: &dyn Fn(&Path) -> Result<String>,
+) -> Result<()> {
+    let want = env!("CARGO_PKG_VERSION");
+    let facts = elf_facts(file).map_err(|e| {
+        TapectlError::Other(format!(
+            "could not read --static-binary {}: {e}",
+            file.display()
+        ))
+    })?;
+    let Some(facts) = facts else {
+        return Err(TapectlError::Other(format!(
+            "--static-binary {} is not a Linux program (it has no ELF header). The release's \
+             static build of tapectl {want} is {}",
+            file.display(),
+            static_asset_url()
+        )));
+    };
+    if !facts.is_static {
+        return Err(TapectlError::Other(format!(
+            "--static-binary {} is not static: it asks for a program interpreter, so it needs \
+             the libraries of the machine it runs on. The release's static build of tapectl \
+             {want} is {}",
+            file.display(),
+            static_asset_url()
+        )));
+    }
+    if !facts.x86_64 {
+        return Err(TapectlError::Other(format!(
+            "--static-binary {} is not built for x86_64 machines, and the kit names it \
+             {}. The release's static build is {}",
+            file.display(),
+            static_asset_name(),
+            static_asset_url()
+        )));
+    }
+    let got = version_of(file)?;
+    if got != want {
+        return Err(TapectlError::Other(format!(
+            "--static-binary {} is tapectl {got}, not {want}, the tapectl making this kit; a \
+             kit carries one release. The static build of {want} is {}",
+            file.display(),
+            static_asset_url()
+        )));
+    }
+    Ok(())
+}
+
 /// Generate the Heir Kit into `out_dir`.
 ///
 /// Refuses when no escrow recipient is registered: ADR-0005 makes the escrow
 /// identity the thing the whole kit is addressed to, so a kit without one
 /// would be a cover sheet pointing at nothing and an unopenable bundle.
-pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<KitReport> {
+///
+/// `static_binary` is `--static-binary FILE` (#486): the release's static
+/// build, copied in beside the running program's copy when that is not
+/// static, after [`check_static_binary`] runs it with `--version`.
+pub fn generate(
+    conn: &Connection,
+    db_path: &Path,
+    out_dir: &Path,
+    static_binary: Option<&Path>,
+) -> Result<KitReport> {
     let exe = std::env::current_exe().map_err(|e| {
         TapectlError::Other(format!(
             "cannot find the running tapectl program to copy into the kit: {e}. \
              The kit carries the program that made it (ADR-0012 item 109)."
         ))
     })?;
-    generate_with_program(conn, db_path, out_dir, &exe)
+    generate_with_programs(
+        conn,
+        db_path,
+        out_dir,
+        &exe,
+        static_binary,
+        &version_by_running,
+    )
 }
 
 /// [`generate`] with the program to copy named: the running binary in
 /// production, a small file in the tests (a copy of a debug test binary is
-/// hundreds of megabytes, once for each test).
+/// hundreds of megabytes, once for each test). No `--static-binary`.
 pub fn generate_with_program(
     conn: &Connection,
     db_path: &Path,
     out_dir: &Path,
     program: &Path,
+) -> Result<KitReport> {
+    generate_with_programs(
+        conn,
+        db_path,
+        out_dir,
+        program,
+        None,
+        &version_by_running,
+    )
+}
+
+/// [`generate`] with everything it runs named: the program to copy, the
+/// `--static-binary` file, and how a program's version is read (`--version`
+/// in production; the tests' stand-in ELF headers do not run).
+pub fn generate_with_programs(
+    conn: &Connection,
+    db_path: &Path,
+    out_dir: &Path,
+    program: &Path,
+    static_binary: Option<&Path>,
+    version_of: &dyn Fn(&Path) -> Result<String>,
 ) -> Result<KitReport> {
     let escrow = queries::escrow_public_key(conn)?.ok_or_else(|| {
         TapectlError::Other(
@@ -90,6 +355,16 @@ pub fn generate_with_program(
                 .into(),
         )
     })?;
+
+    // #486: whether the program the kit copies is itself static, and the
+    // --static-binary file checked, before anything is written.
+    let program_is_static = elf_facts(program)
+        .ok()
+        .flatten()
+        .is_some_and(|f| f.is_static);
+    if let Some(file) = static_binary {
+        check_static_binary(file, version_of)?;
+    }
 
     fs::create_dir_all(out_dir)?;
     // The directory holds an encrypted bundle and a cover sheet naming where
@@ -108,6 +383,24 @@ pub fn generate_with_program(
     // size of the file as it now lies in the kit, read back from the disk.
     let tapectl_copy = out_dir.join(program_file_name());
     let (tapectl_sha256, tapectl_bytes) = copy_program(program, &tapectl_copy)?;
+
+    // #486: the release's static build beside it, named first on the sheet;
+    // not when the program copied is itself static (it IS the static binary).
+    let static_copy = match static_binary {
+        Some(file) if !program_is_static => {
+            let path = out_dir.join(static_asset_name());
+            let (sha256, bytes) = copy_program(file, &path).inspect_err(|_| {
+                let _ = fs::remove_file(&tapectl_copy);
+            })?;
+            Some(StaticCopy {
+                path,
+                sha256,
+                bytes,
+            })
+        }
+        _ => None,
+    };
+    let static_url = (!program_is_static && static_copy.is_none()).then(static_asset_url);
 
     let sealed_volumes: i64 = conn.query_row(
         "SELECT COUNT(*) FROM volumes WHERE status = 'sealed'",
@@ -134,6 +427,19 @@ pub fn generate_with_program(
             arch: std::env::consts::ARCH,
             sha256: tapectl_sha256.clone(),
             bytes: tapectl_bytes,
+        }),
+        static_binary: Some(match &static_copy {
+            _ if program_is_static => StaticFact::RunningIs,
+            Some(c) => StaticFact::InKit(ProgramFact {
+                file_name: static_asset_name(),
+                version: env!("CARGO_PKG_VERSION"),
+                arch: "x86_64",
+                sha256: c.sha256.clone(),
+                bytes: c.bytes,
+            }),
+            None => StaticFact::AtRelease {
+                url: static_asset_url(),
+            },
         }),
     };
     fs::write(&cover_txt, render_cover_text(&facts))?;
@@ -166,6 +472,9 @@ pub fn generate_with_program(
         tapectl_copy,
         tapectl_sha256,
         tapectl_bytes,
+        program_is_static,
+        static_copy,
+        static_url,
         catalog_bytes,
         escrow_public_key: escrow,
         sealed_volumes,
@@ -274,6 +583,20 @@ struct KitFacts<'a> {
     /// The copy of the tapectl program in the kit (#485); `None` renders no
     /// mention of one (the unit tests of the other paragraphs).
     program: Option<ProgramFact>,
+    /// The static binary (#486): the program's copy is it, a second file is,
+    /// or the release has it. Rendered only beside a `program`.
+    static_binary: Option<StaticFact>,
+}
+
+/// Where the heir finds a static tapectl (#486).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaticFact {
+    /// The program the kit copied is static: its copy is the static binary.
+    RunningIs,
+    /// `--static-binary` put the release's static build in the kit.
+    InKit(ProgramFact),
+    /// The kit holds none; the release does, at this URL.
+    AtRelease { url: String },
 }
 
 /// The tapectl program the kit carries, as the cover sheet names it.
@@ -850,25 +1173,61 @@ GENERATED
         warehouse = warehouse_section(f.warehouse_deposits),
         generations = generations_text(f.generations),
         places = places_text(f.places),
-        program_entry = program_entry(f.program.as_ref()),
-        program_hint = program_hint(f.program.as_ref()),
+        program_entry = program_entry(f.program.as_ref(), f.static_binary.as_ref()),
+        program_hint = program_hint(f.program.as_ref(), f.static_binary.as_ref()),
     )
 }
 
-/// The list entry for the copy of tapectl in the kit's folder (#485), with
-/// the sha256 and size an heir checks the file against. Empty when the kit
-/// carries none. The hash is one unbroken line so it can be searched for.
-fn program_entry(p: Option<&ProgramFact>) -> String {
+/// The list entries for the tapectl programs in the kit's folder (#485,
+/// #486), with the sha256 and size an heir checks each file against. Empty
+/// when the kit carries none. A hash is one unbroken line so it can be
+/// searched for. The release's static build, when the kit holds it, comes
+/// first; when the kit holds none, its URL follows the program's entry, with
+/// no hash: the kit states one only for a file it holds.
+fn program_entry(p: Option<&ProgramFact>, s: Option<&StaticFact>) -> String {
     let Some(p) = p else {
         return String::new();
     };
-    format!(
+    let mut out = String::new();
+    if let Some(StaticFact::InKit(st)) = s {
+        out.push_str(&format!(
+            "
+  {name}
+                   The tapectl program to try first: tapectl
+                   {version} for Linux on {arch} machines, built
+                   static, so it needs no library from the machine
+                   and runs on a different Linux from the one that
+                   made this kit. A file in the same folder as
+                   catalog.db.age. Check the copy against this sheet:
+
+    sha256sum {name}
+
+      sha256  {sha}
+      size    {bytes} bytes
+",
+            name = st.file_name,
+            version = st.version,
+            arch = st.arch,
+            sha = st.sha256,
+            bytes = st.bytes,
+        ));
+    }
+    let is_static = if matches!(s, Some(StaticFact::RunningIs)) {
+        "
+                   It is static: it needs no library from the
+                   machine, so it runs on any Linux on {arch}
+                   machines."
+            .replace("{arch}", p.arch)
+    } else {
+        String::new()
+    };
+    out.push_str(&format!(
         "
   {name:<16} The program that made this kit, a file in the same
                    folder as catalog.db.age (it is not on paper). It
                    is tapectl {version} for Linux on {arch} machines,
                    and its source is at
-                   https://github.com/mikmorg/tapectl, tag v{version}.
+                   https://github.com/mikmorg/tapectl, tag v{version}.{is_static}
                    Check the copy against this sheet:
 
     sha256sum {name}
@@ -881,14 +1240,53 @@ fn program_entry(p: Option<&ProgramFact>) -> String {
         arch = p.arch,
         sha = p.sha256,
         bytes = p.bytes,
-    )
+    ));
+    if let Some(StaticFact::AtRelease { url }) = s {
+        out.push_str(&format!(
+            "
+                   It may need libraries a different Linux lacks.
+                   A static build of the same release needs none.
+                   It is not in this kit; download it from
+
+    {url}
+
+                   and check it against the SHA256SUMS file of the
+                   same release (sha256sum -c SHA256SUMS).
+"
+        ));
+    }
+    out
 }
 
 /// What step 4 of WHAT TO DO FIRST adds when the kit carries tapectl.
-fn program_hint(p: Option<&ProgramFact>) -> String {
+fn program_hint(p: Option<&ProgramFact>, s: Option<&StaticFact>) -> String {
     let Some(p) = p else {
         return String::new();
     };
+    if let Some(StaticFact::InKit(st)) = s {
+        return format!(
+            "
+   A copy of tapectl is in this kit's folder: run it as ./{first}
+   in place of `tapectl` above. If it will not run on your machine,
+   try ./{name}; if neither does, the source link above builds it
+   (File 1 on every tape, in \"tapectl itself\", says how).
+",
+            first = st.file_name,
+            name = p.file_name,
+        );
+    }
+    if let Some(StaticFact::AtRelease { .. }) = s {
+        return format!(
+            "
+   A copy of tapectl is in this kit's folder: run it as ./{name}
+   in place of `tapectl` above. If it will not run on your machine,
+   download the static build named above; failing that, the source
+   link above builds it (File 1 on every tape, in \"tapectl itself\",
+   says how).
+",
+            name = p.file_name,
+        );
+    }
     format!(
         "
    A copy of tapectl is in this kit's folder: run it as ./{name}
@@ -1175,6 +1573,321 @@ mod tests {
         }
     }
 
+    /// A stand-in ELF64 (little-endian) with two program headers: a PT_LOAD,
+    /// and a PT_INTERP when `interp` (a dynamically linked program) or a
+    /// PT_NOTE when not (a static one). It does not run; the tests that need a
+    /// version pass `version_of`.
+    fn elf_stand_in(interp: bool, machine: u16) -> tempfile::NamedTempFile {
+        let mut b = vec![0u8; 64 + 2 * 56];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // little-endian
+        b[6] = 1; // EV_CURRENT
+        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN, as static-pie is
+        b[18..20].copy_from_slice(&machine.to_le_bytes());
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[52..54].copy_from_slice(&64u16.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+        b[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        let second: u32 = if interp { 3 } else { 4 };
+        b[120..124].copy_from_slice(&second.to_le_bytes());
+        b.extend_from_slice(b"the rest of a program");
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), &b).unwrap();
+        f
+    }
+
+    const X86_64: u16 = 62;
+
+    fn this_version(_: &Path) -> Result<String> {
+        Ok(env!("CARGO_PKG_VERSION").to_string())
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #486: the ELF reader tells a static program (no PT_INTERP) from a
+    /// dynamic one, and a script from either. The positive control is a real
+    /// ELF: this test binary, dynamically linked on a gnu target.
+    #[test]
+    fn elf_facts_tell_static_from_dynamic_and_a_script_from_both() {
+        let st = elf_facts(elf_stand_in(false, X86_64).path()).unwrap();
+        assert_eq!(
+            st,
+            Some(ElfFacts {
+                is_static: true,
+                x86_64: true
+            })
+        );
+        let dy = elf_facts(elf_stand_in(true, X86_64).path()).unwrap();
+        assert_eq!(dy.map(|f| f.is_static), Some(false));
+        let arm = elf_facts(elf_stand_in(false, 183).path()).unwrap();
+        assert_eq!(arm.map(|f| f.x86_64), Some(false));
+        assert_eq!(elf_facts(fake_program().path()).unwrap(), None);
+        let me = elf_facts(&std::env::current_exe().unwrap())
+            .unwrap()
+            .expect("this test binary is an ELF");
+        if cfg!(target_env = "gnu") {
+            assert!(!me.is_static, "a gnu test binary has an interpreter");
+        }
+    }
+
+    /// #486 (ADR-0012 item 234): `--static-binary` with the release's static
+    /// build. It is copied in beside the running program's copy as
+    /// `tapectl-<version>-x86_64-linux-musl`, mode 0755, and both pages name it
+    /// FIRST with the sha256 and size of the file in the kit.
+    #[test]
+    fn a_static_binary_is_copied_in_and_named_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let program = fake_program();
+        let st = elf_stand_in(false, X86_64);
+        let report = generate_with_programs(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            program.path(),
+            Some(st.path()),
+            &this_version,
+        )
+        .expect("kit generation");
+
+        let name = format!("tapectl-{}-x86_64-linux-musl", env!("CARGO_PKG_VERSION"));
+        let running = format!("tapectl-{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            files_in(&out),
+            [
+                "COVER.txt",
+                "catalog.db.age",
+                "escrow-kit.html",
+                running.as_str(),
+                name.as_str()
+            ]
+        );
+        let copy = report.static_copy.as_ref().expect("a static copy");
+        assert_eq!(copy.path, out.join(&name));
+        assert_eq!(fs::read(&copy.path).unwrap(), fs::read(st.path()).unwrap());
+        assert_eq!(
+            fs::metadata(&copy.path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let want = sha256_of(&copy.path);
+        assert_eq!(copy.sha256, want);
+        assert!(!report.program_is_static);
+        assert_eq!(report.static_url, None, "the kit holds it: no URL");
+        assert_eq!(
+            report.tapectl_sha256,
+            sha256_of(&out.join(&running)),
+            "the running program's copy is still there, named as before"
+        );
+        for (what, text) in [
+            ("COVER.txt", fs::read_to_string(&report.cover_txt).unwrap()),
+            ("escrow-kit.html", fs::read_to_string(&report.html).unwrap()),
+        ] {
+            let flat = flat(&text);
+            assert!(flat.contains(&want), "{what} carries the sha256 {want}");
+            assert!(
+                flat.contains(&format!("size {} bytes", copy.bytes)),
+                "{what}"
+            );
+            assert!(flat.contains(&format!("sha256sum {name}")), "{what}");
+            assert!(flat.contains("The tapectl program to try first"), "{what}");
+            assert!(flat.contains("runs on a different Linux"), "{what}");
+            assert!(
+                flat.contains(&format!("run it as ./{name} in place of `tapectl` above")),
+                "{what}: {text}"
+            );
+            let first = text.find(&format!("sha256sum {name}")).unwrap();
+            let second = text.find(&format!("sha256sum {running}\n")).unwrap();
+            assert!(first < second, "{what} names the static build first");
+            assert!(!flat.contains("releases/download"), "{what}: no URL");
+        }
+    }
+
+    /// #486: a `--static-binary` that is not static (it asks for a program
+    /// interpreter), or not an ELF at all, is refused before anything is
+    /// written.
+    #[test]
+    fn a_dynamic_or_non_elf_static_binary_is_refused() {
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let dynamic = elf_stand_in(true, X86_64);
+        let script = fake_program();
+        for (file, said) in [
+            (dynamic.path(), "is not static"),
+            (script.path(), "is not a Linux program"),
+        ] {
+            let err = generate_with_programs(
+                &conn,
+                Path::new("/nonexistent.db"),
+                &out,
+                fake_program().path(),
+                Some(file),
+                &this_version,
+            )
+            .expect_err("refused");
+            let msg = err.to_string();
+            assert!(msg.contains(said), "{msg}");
+            assert!(msg.contains(&static_asset_url()), "names the asset: {msg}");
+            assert!(!out.exists(), "nothing written");
+        }
+    }
+
+    /// #486: a `--static-binary` of another release is refused: a kit names
+    /// one release.
+    #[test]
+    fn a_static_binary_of_another_version_is_refused() {
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let st = elf_stand_in(false, X86_64);
+        let err = generate_with_programs(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            fake_program().path(),
+            Some(st.path()),
+            &|_: &Path| Ok("1.0.0".to_string()),
+        )
+        .expect_err("refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "is tapectl 1.0.0, not {}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{msg}"
+        );
+        assert!(!out.exists(), "nothing written");
+    }
+
+    /// #486: the running program is not static and no `--static-binary` was
+    /// given. The sheet names the release asset's URL and that release's
+    /// SHA256SUMS, and states a sha256 only for the file the kit holds.
+    #[test]
+    fn without_a_static_binary_the_sheet_names_the_release_asset() {
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let report = generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            fake_program().path(),
+        )
+        .unwrap();
+        let url = format!(
+            "https://github.com/mikmorg/tapectl/releases/download/v{0}/tapectl-{0}-x86_64-linux-musl",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(report.static_url.as_deref(), Some(url.as_str()));
+        assert!(report.static_copy.is_none() && !report.program_is_static);
+        let text = fs::read_to_string(&report.cover_txt).unwrap();
+        assert!(
+            text.lines().any(|l| l.trim() == url),
+            "the URL is one unbroken line: {text}"
+        );
+        let flat = flat(&text);
+        assert!(flat.contains("SHA256SUMS file of the same release"), "{text}");
+        assert!(flat.contains("download the static build named above"), "{text}");
+        assert_eq!(
+            text.matches("sha256  ").count(),
+            1,
+            "a sha256 for the file the kit holds, none for the download: {text}"
+        );
+        assert!(fs::read_to_string(&report.html).unwrap().contains(&url));
+    }
+
+    /// #486: the running program is static. Its copy IS the static binary:
+    /// one program file, the sheet says it is static, and no URL; a
+    /// `--static-binary` given anyway is not copied.
+    #[test]
+    fn a_static_running_program_is_the_static_binary_and_one_file() {
+        let conn = conn_with_escrow();
+        let running = elf_stand_in(false, X86_64);
+        let st = elf_stand_in(false, X86_64);
+        for given in [None, Some(st.path())] {
+            let tmp = TempDir::new().unwrap();
+            let out = tmp.path().join("kit");
+            let report = generate_with_programs(
+                &conn,
+                Path::new("/nonexistent.db"),
+                &out,
+                running.path(),
+                given,
+                &this_version,
+            )
+            .unwrap();
+            assert!(report.program_is_static);
+            assert!(report.static_copy.is_none() && report.static_url.is_none());
+            let name = format!("tapectl-{}", env!("CARGO_PKG_VERSION"));
+            assert_eq!(
+                files_in(&out),
+                [
+                    "COVER.txt",
+                    "catalog.db.age",
+                    "escrow-kit.html",
+                    name.as_str()
+                ],
+                "{given:?}"
+            );
+            let flat = flat(&fs::read_to_string(&report.cover_txt).unwrap());
+            assert!(
+                flat.contains(&format!(
+                    "It is static: it needs no library from the machine, so it runs on any \
+                     Linux on {} machines.",
+                    std::env::consts::ARCH
+                )),
+                "{flat}"
+            );
+            assert!(!flat.contains("releases/download"), "{flat}");
+            assert!(!flat.contains("try first"), "{flat}");
+        }
+    }
+
+    /// `version_by_running` reads `tapectl X.Y.Z (...)`'s second word, and
+    /// refuses output that names no tapectl version.
+    #[test]
+    fn version_by_running_reads_the_second_word() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let run = |body: &str| {
+            let p = tmp.path().join(format!("v{}", body.len()));
+            fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            // A script written by one thread can be busy to exec while another
+            // test thread forks (ETXTBSY): try again a few times.
+            let mut last = None;
+            for _ in 0..20 {
+                match version_by_running(&p) {
+                    Err(e) if e.to_string().contains("Text file busy") => {
+                        last = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    r => return r,
+                }
+            }
+            Err(last.unwrap())
+        };
+        assert_eq!(
+            run("echo 'tapectl 9.8.7 (v9.8.7, 2026-11-10)'").unwrap(),
+            "9.8.7"
+        );
+        let err = run("echo 'something else'").unwrap_err().to_string();
+        assert!(err.contains("did not name a tapectl version"), "{err}");
+    }
+
     /// The copy is the RUNNING program: `generate` takes no program argument.
     /// (The one test that copies a test binary; every other test names a small
     /// file to `generate_with_program`.)
@@ -1183,7 +1896,8 @@ mod tests {
         let conn = conn_with_escrow();
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("kit");
-        let report = generate(&conn, Path::new("/nonexistent.db"), &out).expect("kit generation");
+        let report =
+            generate(&conn, Path::new("/nonexistent.db"), &out, None).expect("kit generation");
         let exe = std::env::current_exe().unwrap();
         assert_eq!(report.tapectl_sha256, sha256_of(&exe));
         assert_eq!(report.tapectl_bytes, fs::metadata(&exe).unwrap().len());
@@ -1239,6 +1953,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -1278,6 +1993,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         for forbidden in [
@@ -1315,6 +2031,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -1368,6 +2085,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -1393,6 +2111,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -1419,6 +2138,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -1480,6 +2200,7 @@ mod tests {
             generations,
             places,
             program: None,
+            static_binary: None,
         }
     }
 
@@ -1936,6 +2657,7 @@ mod tests {
             generations: &[],
             places: &[],
             program: None,
+            static_binary: None,
         };
         let html = render_cover_html(&f).unwrap();
         assert!(html.contains("<svg"), "the QR must be inlined as SVG");

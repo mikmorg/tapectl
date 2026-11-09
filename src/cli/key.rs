@@ -118,6 +118,12 @@ pub enum KeyCommands {
     /// cover sheet names, so the kit does not depend on a repository
     /// surviving).
     ///
+    /// A tapectl that is not static runs only where its C library does. With
+    /// --static-binary, the release's static build goes in beside it as
+    /// tapectl-VERSION-x86_64-linux-musl and the sheet names it first. Without
+    /// it, the sheet names that release asset's URL. When this tapectl is
+    /// itself static, its copy is the static binary.
+    ///
     /// This command stops at the files. Printing them, sealing them into
     /// tamper-evident envelopes and distributing them across at least two
     /// independent failure domains is the operator's part, and the cover
@@ -128,11 +134,22 @@ Examples:
   # After a write session: the kit again, to print and seal
   tapectl key escrow-kit /mnt/usb/heir-kit
   # Under the service user
-  tapectl-op key escrow-kit /srv/archive_meta/heir-kit")]
+  tapectl-op key escrow-kit /srv/archive_meta/heir-kit
+  # With the release's static build, downloaded and checked against SHA256SUMS
+  tapectl key escrow-kit /mnt/usb/heir-kit --static-binary ./tapectl-VERSION-x86_64-linux-musl")]
     EscrowKit {
         /// Directory to write the kit into (created if absent, mode 0700)
         #[arg(value_name = "DIR")]
         dir: String,
+        /// The release's static tapectl, to put in the kit beside this one
+        ///
+        /// The tapectl-VERSION-x86_64-linux-musl asset of this version's
+        /// GitHub release. It must be a static x86_64 program whose
+        /// --version is this tapectl's; the kit copies it in under that name
+        /// (mode 0755) and the cover sheet names it first, with its size and
+        /// sha256. Not copied when this tapectl is itself static.
+        #[arg(long, value_name = "FILE")]
+        static_binary: Option<std::path::PathBuf>,
     },
 }
 
@@ -493,7 +510,10 @@ pub fn run(
             }
         }
 
-        KeyCommands::EscrowKit { dir: out } => {
+        KeyCommands::EscrowKit {
+            dir: out,
+            static_binary,
+        } => {
             // Issue #241: building a real preview would mean reading and
             // summarising the whole catalog (the same work `generate`
             // does to build `catalog.db.age`) for no benefit over just
@@ -509,6 +529,7 @@ pub fn run(
                 conn,
                 &paths.db_file,
                 std::path::Path::new(out),
+                static_binary.as_deref(),
             )?;
             if json_output {
                 crate::render::print_json(&serde_json::json!({
@@ -519,6 +540,13 @@ pub fn run(
                     "tapectl_copy": report.tapectl_copy,
                     "tapectl_sha256": report.tapectl_sha256,
                     "tapectl_bytes": report.tapectl_bytes,
+                    "program_is_static": report.program_is_static,
+                    "static_copy": report.static_copy.as_ref().map(|c| serde_json::json!({
+                        "path": c.path,
+                        "sha256": c.sha256,
+                        "bytes": c.bytes,
+                    })),
+                    "static_url": report.static_url,
                     "catalog_bytes": report.catalog_bytes,
                     "sealed_volumes": report.sealed_volumes,
                     "escrow_public_key": report.escrow_public_key,
@@ -546,6 +574,30 @@ pub fn run(
                     crate::progress::format_bytes(report.tapectl_bytes as u64),
                     report.tapectl_sha256
                 );
+                // #486: where the heir's static tapectl is.
+                if let Some(c) = &report.static_copy {
+                    println!(
+                        "  {} the release's static build, to try first on a different Linux, {}, sha256 {} (named on the sheet)",
+                        c.path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        crate::progress::format_bytes(c.bytes),
+                        c.sha256
+                    );
+                } else if report.program_is_static {
+                    println!(
+                        "  this tapectl is static, so its copy is the static binary: it runs on any Linux on {} machines",
+                        std::env::consts::ARCH
+                    );
+                }
+                if let Some(url) = &report.static_url {
+                    println!(
+                        "note: this tapectl is not static; the sheet names the release's static build, {url}. \
+                         To put it in the kit, download it, check it against that release's SHA256SUMS, \
+                         and run this again with --static-binary FILE"
+                    );
+                }
                 println!();
                 // ADR-0005 puts the custody requirements on the printed sheet,
                 // but the operator is standing here now — and the kit has no
