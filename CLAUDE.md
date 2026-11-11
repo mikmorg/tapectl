@@ -505,7 +505,7 @@ to 0.41 (libsqlite3-sys 0.39.1). No released `rusqlite_migration` takes rusqlite
 source is vendored in `vendor/rusqlite_migration` with only that requirement raised, through
 `[patch.crates-io]` (`VENDORED.md` says when to drop it). rusqlite 0.41's hooks (`trace_v2`,
 `authorizer`, `commit_hook`, `busy_handler`) take `&mut Connection`: the test helpers that count
-statements hand their closure the connection. home2 installs 1.9.2, not 1.9.1, as handoff (i)'s next step.
+statements hand their closure the connection. home2 runs 1.9.2 since 2026-11-10 (1.8.1 → 1.9.1 → 1.9.2 by `--upgrade`, each rehearsal 53/53), and handoff (i)'s copies are done: `keepsake`'s 27 units on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), 1.20 TiB each, sealed with a full readback, `audit` clean (`docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`).
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
