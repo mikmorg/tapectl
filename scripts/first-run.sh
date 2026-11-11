@@ -918,8 +918,9 @@ build_release() {
 # known_cartridge NAME: the barcode of the catalog's cartridge whose barcode,
 # chip serial or claimed serial is NAME, or nothing when none is. It fails when
 # the catalog cannot be read, so the caller refuses rather than guesses
-# (step 12, ADR-0012 item 192). `cartridge list --json` carries no serial, so
-# each row is asked with `cartridge info --json`; a catalog holds a few.
+# (step 12, ADR-0012 item 192). Each row is asked with `cartridge info --json`
+# (a catalog holds a few); since #516 `cartridge list --json` carries both
+# serials too, but this reads the record one command owns.
 known_cartridge() {
   local list barcodes b info rc
   list="$(tc cartridge list --json 2>/dev/null)" || return 1
@@ -2383,14 +2384,21 @@ EOF
       ;;
   esac
 if [ "$VSTATE" = absent ] || [ "$VSTATE" = fresh ]; then
-  explain <<'EOF'
-THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and gives it the volume's label as its barcode (ADR-0012 item 219): write the label on the cartridge's sticker, and the sticker, the tape and the catalog say the same. The chip serial stays its identity. Do not register it by hand first: init matches on the serial, and a row registered without one (a bare `cartridge register --barcode`) is another cartridge to it — two rows for one tape, or a refusal when that row already carries the label. (`cartridge register --serial <medium serial>` is matched.)
-EOF
+  # #517: with no units there is nothing to write, so say so before the
+  # cartridge's explanation, and name what registers units. On home2's fresh
+  # start (handoff (i)) the collection was configured and only its sync was
+  # owed; step 11 again would have walked back through tenants and keys.
   UNITS="$(tc unit list --json 2>/dev/null | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("units",[]); print("\n".join(r.get("name","") for r in rows))
 except Exception: pass' 2>/dev/null || true)"
-  [ -n "$UNITS" ] || die "no units registered — run with --from 11"
+  if [ -z "$UNITS" ]; then
+    run tc collection status || true
+    die "no units registered, so there is nothing to write. Register them first: \`$OP_CMD collection sync\` for a collection in config.toml (\`$OP_CMD collection status\`, above, lists each with its pending folders), \`$OP_CMD unit init DIR --tenant TENANT\` for one folder, or scripts/first-run.sh --from 11 to set tenants and collections up. Then re-run scripts/first-run.sh --from 13 --label $LABEL"
+  fi
+  explain <<'EOF'
+THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and gives it the volume's label as its barcode (ADR-0012 item 219): write the label on the cartridge's sticker, and the sticker, the tape and the catalog say the same. The chip serial stays its identity. Do not register it by hand first: init matches on the serial, and a row registered without one (a bare `cartridge register --barcode`) is another cartridge to it — two rows for one tape, or a refusal when that row already carries the label. (`cartridge register --serial <medium serial>` is matched.)
+EOF
   printf '   units:\n%s\n' "$(printf '%s\n' "$UNITS" | sed 's/^/     /')"
   # Issue #269: this used to be ONE confirm covering both phases, and then a
   # single loop doing snapshot+stage per unit. Two problems on production day.
