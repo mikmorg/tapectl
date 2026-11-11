@@ -357,6 +357,19 @@ pub enum CartridgeCommands {
 struct CartridgeRow {
     #[tabled(rename = "Barcode")]
     barcode: String,
+    /// The cartridge's identity (ADR-0012): the chip serial a MAM read
+    /// recorded, or else the operator's claim marked as one, or `(none)`
+    /// (#516). Since item 219 the barcode is the volume's label, so without
+    /// this column the list never showed which physical tape a row is.
+    /// Table-only: `--json` carries the two values themselves, keyed as
+    /// `cartridge info --json` keys them.
+    #[tabled(rename = "Serial")]
+    #[serde(skip)]
+    serial: String,
+    #[tabled(skip)]
+    serial_number: Option<String>,
+    #[tabled(skip)]
+    operator_serial: Option<String>,
     /// The cartridge's generation (`cartridges.media_type`). Table-only
     /// until CTO decision 2026-09-11 (architecture review C2 follow-up, C2b).
     /// Headed and keyed "generation" since 1.9.0 (ADR-0012 item 208: the
@@ -449,6 +462,17 @@ fn display_opt_i64(v: &Option<i64>) -> String {
 
 fn display_opt_string(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
+}
+
+/// `cartridge list`'s Serial cell (#516): the chip-confirmed serial when a
+/// MAM read recorded one, the operator's claim marked "(claimed)" when only
+/// that exists, `(none)` otherwise, the word `cartridge info` uses.
+fn serial_cell(serial_number: &Option<String>, operator_serial: &Option<String>) -> String {
+    match (serial_number, operator_serial) {
+        (Some(chip), _) => chip.clone(),
+        (None, Some(claim)) => format!("{claim} (claimed)"),
+        (None, None) => "(none)".to_string(),
+    }
 }
 
 /// `cartridge info`'s two serial lines, split out so the exact rendered text
@@ -1683,6 +1707,7 @@ fn cartridge_rows(
     // has never been placed must still appear in the list. The same
     // reasoning as `catalog.rs`'s volume listing.
     const SELECT: &str = "SELECT c.barcode, c.media_type, c.status, c.total_load_count,
+                c.serial_number, c.operator_serial,
                 (SELECT v.label FROM cartridge_volumes cv
                  JOIN volumes v ON v.id = cv.volume_id
                  WHERE cv.cartridge_id = c.id AND cv.unmounted_at IS NULL
@@ -1707,13 +1732,18 @@ fn cartridge_rows(
     };
     let rows = stmt
         .query_map(bound.as_slice(), |row| {
+            let serial_number = row.get::<_, Option<String>>(4)?;
+            let operator_serial = row.get::<_, Option<String>>(5)?;
             Ok(CartridgeRow {
                 barcode: row.get(0)?,
+                serial: serial_cell(&serial_number, &operator_serial),
+                serial_number,
+                operator_serial,
                 generation: row.get(1)?,
                 status: row.get(2)?,
                 loads: row.get::<_, Option<i64>>(3)?,
-                volume: row.get::<_, Option<String>>(4)?,
-                location: row.get::<_, Option<String>>(5)?,
+                volume: row.get::<_, Option<String>>(6)?,
+                location: row.get::<_, Option<String>>(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1798,6 +1828,9 @@ mod tests {
         let rows = vec![
             CartridgeRow {
                 barcode: "A001L6".to_string(),
+                serial: serial_cell(&Some("EW7VWMVKF6".to_string()), &None),
+                serial_number: Some("EW7VWMVKF6".to_string()),
+                operator_serial: None,
                 generation: "LTO-6".to_string(),
                 status: "available".to_string(),
                 loads: Some(12),
@@ -1806,6 +1839,9 @@ mod tests {
             },
             CartridgeRow {
                 barcode: "A002L6".to_string(),
+                serial: serial_cell(&None, &Some("EWCLAIM01".to_string())),
+                serial_number: None,
+                operator_serial: Some("EWCLAIM01".to_string()),
                 generation: "LTO-6".to_string(),
                 status: "retired_permanent".to_string(),
                 loads: None,
@@ -1816,7 +1852,7 @@ mod tests {
         let value = cartridge_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"barcode":"A001L6","generation":"LTO-6","loads":12,"location":"home-rack","status":"available","volume":"L6-0001"},{"barcode":"A002L6","generation":"LTO-6","loads":null,"location":null,"status":"retired_permanent","volume":null}]"#
+            r#"[{"barcode":"A001L6","generation":"LTO-6","loads":12,"location":"home-rack","operator_serial":null,"serial_number":"EW7VWMVKF6","status":"available","volume":"L6-0001"},{"barcode":"A002L6","generation":"LTO-6","loads":null,"location":null,"operator_serial":"EWCLAIM01","serial_number":null,"status":"retired_permanent","volume":null}]"#
         );
     }
 
@@ -1826,6 +1862,9 @@ mod tests {
     fn cartridge_list_heads_the_generation_column_generation() {
         let rows = vec![CartridgeRow {
             barcode: "A001L6".to_string(),
+            serial: serial_cell(&None, &None),
+            serial_number: None,
+            operator_serial: None,
             generation: "LTO-6".to_string(),
             status: "available".to_string(),
             loads: None,
@@ -1838,6 +1877,45 @@ mod tests {
         assert!(!table.contains('|'), "{table}");
         assert!(header.contains("Generation"), "{table}");
         assert!(!header.contains("Type"), "{table}");
+    }
+
+    /// #516: the list shows each cartridge's identity, its chip serial, and
+    /// says when the only serial is the operator's claim. Through the real
+    /// query, so the column is wired, not only rendered.
+    #[test]
+    fn cartridge_list_shows_the_chip_serial_or_the_claim() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+                 VALUES ('L6-0001', 'LTO-6', 2500000000000, 'EW6XY4HGNV');
+             INSERT INTO cartridges (barcode, media_type, nominal_capacity, operator_serial)
+                 VALUES ('L6-0002', 'LTO-6', 2500000000000, 'EW81WMR8VC');
+             INSERT INTO cartridges (barcode, media_type, nominal_capacity)
+                 VALUES ('L6-0003', 'LTO-6', 2500000000000);",
+        )
+        .unwrap();
+        let rows = cartridge_rows(&conn, None, None).unwrap();
+        let cells: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.barcode.as_str(), r.serial.as_str()))
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                ("L6-0001", "EW6XY4HGNV"),
+                ("L6-0002", "EW81WMR8VC (claimed)"),
+                ("L6-0003", "(none)"),
+            ]
+        );
+        let table = crate::render::tabled_table(&rows, None);
+        let header = table.lines().next().unwrap();
+        assert!(header.starts_with("Barcode   Serial"), "{table}");
+        assert!(table.contains("EW6XY4HGNV"), "{table}");
+        let json = cartridge_rows_to_json(&rows);
+        assert_eq!(json[0]["serial_number"], "EW6XY4HGNV");
+        assert!(json[0]["operator_serial"].is_null());
+        assert_eq!(json[1]["operator_serial"], "EW81WMR8VC");
+        assert!(json[0].get("serial").is_none(), "the cell is table-only");
     }
 
     /// ADR-0012 item 208: every `<CARTRIDGE>` argument takes the chip serial

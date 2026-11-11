@@ -3485,13 +3485,14 @@ its next init.
 > registers a *second* cartridge. You end up with this:
 >
 > ```text
-> Barcode   Generation   Status      Location   Loads     Volume
-> L6-0009   LTO-8        in_use                 3         L6-0009
-> CART-07   LTO-8        available              unknown
+> Barcode   Serial       Generation   Status      Location   Loads     Volume
+> L6-0009   HA1B2C3D4E   LTO-8        in_use                 3         L6-0009
+> CART-07   (none)       LTO-8        available              unknown
 > ```
 >
 > Two rows for one physical tape — and the sticker you registered is on the one
-> the catalog is *not* using. Let `volume init` register it, with `--barcode`
+> the catalog is *not* using. The Serial column tells them apart: the row `volume
+> init` made carries the chip's serial, and yours carries none. Let `volume init` register it, with `--barcode`
 > for a sticker of your own.
 
 ### When the drive reads no serial
@@ -3602,10 +3603,16 @@ tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did
 
 ```text
 $ tapectl cartridge list
-Barcode   Generation   Status   Location    Loads   Volume
-L8-0001   LTO-8        in_use   home-rack   1       L8-0001
-L8-0002   LTO-8        in_use   offsite     1       L8-0002
+Barcode   Serial       Generation   Status   Location    Loads   Volume
+L8-0001   HA1B2C3D4E   LTO-8        in_use   home-rack   1       L8-0001
+L8-0002   HA5F6G7H8J   LTO-8        in_use   offsite     1       L8-0002
 ```
+
+The Serial column is the cartridge's identity, the serial its chip reported
+(ADR-0012). A serial you typed with `cartridge register --serial` that no
+drive has confirmed yet reads `<serial> (claimed)`, and a row with neither
+reads `(none)`. `--json` gives both as `serial_number` and `operator_serial`,
+as `cartridge info --json` does.
 
 **`unretire` and `mark-erased` are different statements, and the difference
 matters.** `cartridge retire` is a claim about the *medium*: this plastic is
