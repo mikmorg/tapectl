@@ -72,7 +72,10 @@ places are not reconciled. None is a defect in the code; each is the record sayi
   2026-10-21 … item 143", and its last rows are from 2026-10-25. Nothing in it mentions the
   cross-volume index (v4.0 §8.7; 1.3.0), `volume rewrite` (§2.10; 1.4.0), Logical Block
   Protection (§2.29 and §1.3's "rejected: full SG_IO"; 1.8.0), the spellings 1.9.0 removed from
-  §5, or `tapectl setup` (§1.4; 1.9.1). The first two predate the header's own date.
+  §5, or `tapectl setup` (§1.4; 1.9.1). The first two predate the header's own date, and its
+  closing paragraph still lists compaction among what "remains authoritative as written".
+  (Searched for: `rewrite`, `R4`, `#418`, `#483`, `#388`, `sg_wr_mode`, `units.tsv`, `setup`,
+  items 198 on. `#418` appears once, for R3's `catalog.db`, not for the index.)
 - **C2. What a tenant is says two things.** The errata's row and `CONTEXT.md`'s first line say
   tenants are "one operator's data classes, not separate people", from intent 1. ADR-0012
   (2026-09-28, item 5) says "tenants are rings of trust held as keys: the operator, then
@@ -136,7 +139,7 @@ time (1.0.0, the fresh start on 1.1.0, the second on 1.9.2): five full cartridge
 | Short seal | 1.6.0 | #420; item 9 said "later, after home2's writes show how much capacity they really use" | in the session and the tape layer | `requires = ["short-seal"]` | armed on every write; never reached (tapes are half full) |
 | Spanning | 1.7.0 | item 90 replaced item 77's trigger (a unit past half a cartridge) with "right after #420, whatever the unit sizes, for the tape fill" | 840 + coverage, session, RESTORE.sh `span_*` | `requires = [.., "spanning"]` on a tape that carries a span | no: off, and the largest unit is 20% of a cartridge |
 | `copies_at`, auto-stage | 1.7.1 | #493 | 1,570 | none | no |
-| Logical Block Protection | 1.8.0 | #388 | 950 | none | armed at every open |
+| Logical Block Protection | 1.8.0 | #388 | 950 | none | armed at every open by design; handoff (i)'s record does not say |
 | RESTORE.sh feeds dar one stream | 1.8.0 | #498, dar's FIFO bug | in RESTORE.sh | re-pin | yes |
 | `first-run.sh --upgrade` | 1.8.1 | #505 | scripts + a harness | none | yes, three times |
 | The CLI review | 1.9.0 | asked 2026-11-04 | `render.rs`, `renamed.rs` | none | yes |
@@ -167,14 +170,15 @@ the same job by hand with `mt`, `dd`, `truncate`, `age`, `tar`, `sha256sum` and 
 runs RESTORE.sh with the real tools on every release. And each tape carries the script of the
 tapectl that wrote it, so the script never has to read a newer tape.
 
-Three things do not. The script has already met a changed substrate, twice in October, on
-Ubuntu 26.04's coreutils: a `sha256sum` that quotes names hid damaged files from its list
-(item 145), and a `tail` on a FIFO hung (item 184). CI caught both before a tag; nothing will
-catch the next one in 2040. The manual steps are the fallback for that day, and **no test
-executes them**: six fresh readers read them, and the gate and the lifecycle suite run only
-the script. And of the heir's ten programs, `dar` and `age` are the two an ordinary install
-lacks, and dar is the one whose version matters. The kit carries tapectl; it carries neither
-dar nor age, and tapectl's own restore needs dar too.
+Three things do not. The script has already met a changed substrate, twice in October, on Ubuntu
+26.04's coreutils: a `sha256sum` that quotes names hid damaged files from its list (item 145),
+and a `tail` on a FIFO hung (item 184). CI caught both before a tag; nothing will catch the next
+one in 2040. The manual steps are the fallback for that day, and **nothing on record has carried
+them through to a restored file**: six fresh readers read them, the gate and the lifecycle suite
+run only the script, and a search of `tests/`, `scripts/`, `docs/runs/` and the 2026-09-10
+journal for the steps' own commands found no run of them. And of the heir's ten programs, `dar`
+and `age` are the two an ordinary install lacks, and dar is the one whose version matters. The
+kit carries tapectl; it carries neither dar nor age, and tapectl's own restore needs dar too.
 
 **The operator.** Small, and it got smaller: one copy loop (`volume write L --init
 --full-confirm --move-to X`), `status`, `audit`, `collection sync`, and `first-run.sh`. The
@@ -188,13 +192,13 @@ archive only because of the first design's best decision: the tapes do not need 
 tapectl were never built again, the two cartridges, the kit and File 1 would still be the
 archive. The size of the tool is a cost to changing it, not a threat to what it has written.
 
-**The cost that was real is churn, not size.** Twenty-two tags in six weeks meant five
-cartridge writes of the same data, two fresh starts with new keys, and one window in which
-`keepsake` had no copy on tape (item 37, accepted). Eight releases between 2026-10-13 and
-2026-10-29 changed the bytes tapectl writes to tape, and the golden pins moved in 19 commits. A
-format that moves that often is not yet an archive format. It has been still since 1.8.0:
-1.8.1 to 1.9.2 changed no byte on tape, and `requires` (1.1.0) means a later tapectl reads
-these two tapes or refuses them by name.
+**The cost that was real is churn, not size.** Twenty-two tags in six weeks meant five cartridge
+writes of the same data, two fresh starts with new keys, and one window in which `keepsake` had
+no copy on tape (item 37, accepted). Eight releases between 2026-10-13 and 2026-10-29 changed
+the bytes tapectl writes to tape, and the golden pins moved in about 19 commits. A format that
+moves that often is not yet an archive format. It has been still since 1.8.0: 1.8.1 to 1.9.2
+changed no byte on tape, and `requires` (1.1.0) means a later tapectl reads these two tapes or
+refuses them by name.
 
 ## 6. Against the alternatives
 
@@ -251,9 +255,9 @@ until a named unit or collection needs them.
 
 **The heir's hardest problem is not software.** LTO-6 is read only by LTO-6 and LTO-7 drives.
 In twenty years the heir needs one that works, a SAS card and a machine that takes it. File 1
-says so. ADR-0006 already models a cold-storage *warehouse* deposit of a sealed volume, which is
-ciphertext, and `volume deposit` records one. The run records show none. For the core that is
-about $15 a year for a third copy on a medium that needs no drive (§8, D6).
+says so. ADR-0006 already models a cold-storage *warehouse* deposit of a sealed volume, and
+`volume deposit` records one. The run records show none. For the core that is about $15 a year
+for a third copy on a medium that needs no drive (§8, D6).
 
 ## 7. The verdict
 
@@ -278,8 +282,7 @@ about $15 a year for a third copy on a medium that needs no drive (§8, D6).
    exercised, not from more of it.
 5. **The next effort belongs to the heir, not to features.** The remaining risks to intent 4
    are an LTO-6 drive in twenty years, dar on the heir's machine, a 7,000-line script whose
-   fallback has never been executed by a test, and a drill that has not been run on these two
-   tapes.
+   by-hand fallback has no recorded run, and a drill that has not been run on these two tapes.
 
 ## 8. For the CTO
 
@@ -288,34 +291,42 @@ Each is a decision, with the coordinator's recommendation. Nothing here is filed
 - **D1. Is the bulk coming to tape through tapectl: about how much, and about when?**
   Everything in §4's middle group turns on it. *Recommended:* answer it in the intent statement
   (a sixth line, or an amended fifth), whatever the answer is.
-- **D2. A feature freeze.** No new capability without a registered unit or collection that
-  needs it, named in the ruling. Patches for security advisories and for defects met in
-  production. *Recommended: yes, whatever D1's answer.* It is intent 5 with a test attached, and
-  item 77's first trigger for spanning ("when a registered unit passes about half a cartridge")
-  was that test before item 90 replaced it.
+- **D2. A feature freeze.** No new capability without a registered unit or collection that needs
+  it, named in the ruling. Three things stay open: patches for security advisories, defects met
+  in production, and work that lowers what the heir needs (D4 to D6 are that). *Recommended:
+  yes, whatever D1's answer.* It is intent 5 with a test attached, and item 77's first trigger
+  for spanning ("when a registered unit passes about half a cartridge") was that test before
+  item 90 replaced it.
 - **D3. The bytes on tape stand still.** No re-pin of RESTORE.sh, File 1 or the format without a
   defect met in production or the start of a bulk campaign. *Recommended: yes.*
 - **D4. An heir drill on a production cartridge.** `docs/operator-guide.md` asks for one a year
   and none is recorded for L6-0001 or L6-0002. Someone who is not the operator, with only the
-  kit: one unit by RESTORE.sh, and one small unit by File 1's manual steps, which have never
-  been run end to end. *Recommended: yes, before anything else is built.* It is the only proof
-  intent 4 has not had on these two tapes.
+  kit: one unit by RESTORE.sh, and one small unit by File 1's manual steps, which no test,
+  script or run record carries through to a restored file. *Recommended: yes, before anything
+  else is built.* It is the only proof intent 4 has not had on these two tapes.
 - **D5. dar.** Two questions. (a) *Now:* put a static `dar` and `age` beside tapectl in the Heir
   Kit. That is a patch with no byte on tape, and it hands the heir the two programs an ordinary
-  install lacks, in versions known to read these tapes. *Recommended: yes.* (b) *Before any bulk campaign:* decide dar or tar on the
-  record. Today a change of archiver costs a new `requires` feature and, if wanted, nine hours
-  of drive time to rewrite two cartridges; the tapes already written keep their own File 1 and
-  RESTORE.sh and are not stranded. After 30 TB it costs the bulk. If the bulk is not coming,
-  dar stays and (a) is the whole answer. *Recommended: do not switch now; rule (b) with D1.*
+  install lacks, in versions known to read these tapes. *Recommended: yes.* (b) *Before any bulk
+  campaign:* decide dar or tar on the record. Today a change of archiver costs a new `requires`
+  feature and, if wanted, nine hours of drive time to rewrite two cartridges; the tapes already
+  written keep their own File 1 and RESTORE.sh and are not stranded. After 30 TB it costs the
+  bulk. If the bulk is not coming, dar stays and (a) is the whole answer. *Recommended: do not
+  switch now; rule (b) with D1.*
 - **D6. A third copy of the core that needs no drive.** A warehouse deposit of one sealed
-  volume, as ADR-0006 models it: ciphertext only, about $15 a year at cold-storage rates. It
-  answers the drive-in-twenty-years risk, at the cost of an account that must outlive the
-  operator and a credential on a host. *Recommended: the CTO's call; worth it for the core.*
+  volume, as ADR-0006 models it, about $15 a year at cold-storage rates. It answers the
+  drive-in-twenty-years risk. Its costs are an account that must outlive the operator, a
+  credential on a host, and one disclosure to weigh: a volume has no content metadata in
+  plaintext, but Files 0 to 3 and the seal are plaintext, and the front index gives every
+  file's size. The size channel was accepted on 2026-07-22 for a tape on a shelf, not for a
+  provider. *Recommended: the CTO's call; worth it for the core if that channel is accepted
+  there too.*
 - **D7. The record.** (a) Amend the intent statement for item 5's rings of trust, and say
   whether friends are in its scope or whether 1.9.1's setup is finished and frozen. (b) Bring
-  `docs/design-errata.md` to item 234 and correct its tenant row and `CONTEXT.md`'s first line
-  to match (a). (c) An errata row for C4 once D5 is ruled. *Recommended: (a) is the CTO's
-  wording; (b) and (c) are the coordinator's work once (a) and D5 are answered.*
+  `docs/design-errata.md` to item 234. Its rows for the index, `volume rewrite`, Logical Block
+  Protection, the removed spellings and `tapectl setup` are ruled facts and wait on nothing.
+  (c) Its tenant row and `CONTEXT.md`'s first line follow (a), and a row for C4 follows D5.
+  *Recommended: (a) is the CTO's wording; (b) is the coordinator's work on the CTO's word, with
+  every item from 144 on read against v4.0; (c) after (a) and D5.*
 
 ## 9. Not reached
 
