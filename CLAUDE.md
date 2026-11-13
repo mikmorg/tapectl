@@ -146,6 +146,22 @@ this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's instal
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
 (`keepsake` on L6-0001 and L6-0002), upgraded in place to 1.5.0 on 2026-10-20 (handoff (f)), and to 1.8.0 on 2026-10-29 (handoff (h)). On 2026-10-31 the CTO ruled a second fresh start, with a new catalog, new keys and new units (ADR-0012 items 193, 194; handoff (i)); on 2026-11-01, that it runs on 1.8.1, installed first by `first-run.sh --upgrade` (item 195). That upgrade ran on 2026-11-02 ((i) step 0, rehearsal 53/53; `docs/runs/2026-11-02-1.8.1-handoff-i.md`), and home2 runs 1.8.1. On 2026-11-03 the CTO moved the home out of the hidden `.tapectl`: from (i)'s fresh start it is `/srv/archive_meta/tapectl/home`, named by `home2.profile`'s `TAPECTL_HOME_DIR` (`first-run.sh --tapectl-home`; ADR-0012 item 197), and `tapectl-op` and the units carry it as `TAPECTL_HOME`. (i) paused after step 6 on 2026-11-03, with the new home made and no units yet: copy 1 waits for 1.9.0, the CLI review's release (ADR-0012 items 198-221, `docs/audits/2026-11-04-cli-review.md`; below), and since 2026-11-09 for 1.9.2, which contains it, installed by `--upgrade` first.
 
+**2026-11-13: the existing tapes and catalog are tests, and a queue stands before production**
+(ADR-0012 items 235-238). The design and defect review of 2026-11-12
+(`docs/audits/2026-11-12-design-and-defect-review.md`) found that the dar catalogue in every
+envelope since 1.1.0 carries the wrong slice layout (H1, #518): `dar -l <catalogue> -T slice`
+means nothing, RESTORE.sh's `--restore --path` and `--fill-from` read the wrong slices, and
+`restore file` plans from the same numbers. The whole-unit restore, the per-file check and
+slice replacement are not affected. The CTO ruled L6-0001, L6-0002 and home2's catalog test
+articles, disposable (a status: nothing on home2 is erased or changed by it), and that every
+finding is addressed before production runs start. The paragraph above and the handoff still
+describe what home2 holds; read "production" there as "the test articles". **The queue is the
+label `review-2026-11-12` (#518 to #553), its waves and the open questions are in #554, and no
+on-tape authorization is open**: an issue labelled `on-tape` is not built, and no golden pin
+moves, until ADR-0012 says so. When a test needs a dar catalogue, make it as staging does
+(`-@`, then `dar -C ... -A ...`), never with the test-only `extract_catalog`, which is how H1
+hid.
+
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now

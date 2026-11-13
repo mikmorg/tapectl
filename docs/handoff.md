@@ -9,6 +9,16 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
+**2026-11-13: read this first.** The CTO ruled the two cartridges and home2's catalog test
+articles, disposable, and that every finding of the 2026-11-12 design and defect review is
+addressed before production runs start (ADR-0012 items 235-238). Nothing below is undone by
+that and nothing on home2 changes: L6-0001 and L6-0002 still hold the only copy of `keepsake`
+on tape. What stands before production is the queue under the label `review-2026-11-12`
+(#518 to #553); its waves and the questions for the CTO are in #554. The handoff for the
+production runs is written once the CTO has said what a production run is (a new catalog and
+keys, or these). Until then: stage no further copy (item 236), and do not use RESTORE.sh's
+`--restore --path` or `--fill-from` on these tapes (item 235, #518).
+
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 
 home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20; (g)'s upgrade to 1.6.0 did not run, and (h) took it from 1.5.0 straight to 1.8.0 on 2026-10-29 (ADR-0012 item 183; `docs/runs/2026-10-29-1.8.0-handoff-h.md`), which carries 1.7.0's spanning (its real-drive proof passed on 2026-10-27, `v1.7.0`), 1.7.1 and 1.7.2's Logical Block Protection, whose real-drive acceptance passed on the 1.8.0 candidate on 2026-10-29, `v1.8.0`). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape

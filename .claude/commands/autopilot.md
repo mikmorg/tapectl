@@ -19,6 +19,29 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **QUEUE STATE 2026-11-13 — THE PRE-PRODUCTION QUEUE OF THE 2026-11-12 REVIEW. READ THIS
+  ENTRY FIRST; every entry below it is history.** home2 runs 1.9.2 and holds `keepsake` on
+  L6-0001 and L6-0002, which the CTO ruled test articles, disposable, with home2's catalog
+  (ADR-0012 items 235-238; a status, so touch nothing on home2). Every finding of
+  `docs/audits/2026-11-12-design-and-defect-review.md` is an issue under the label
+  `review-2026-11-12` (#518 to #553); the epic #554 holds the id-to-issue table, the six waves
+  and the questions for the CTO. Production runs wait on that label being empty.
+  - **Waves 1 to 3 need no ruling** (rebuild's unit matching, `db import`, the escrow key's
+    parsing, `cartridge erase` and `volume rewrite --resume`, the resume after an early
+    warning, the unstaged snapshot, the scripts, the Heir Kit's sheet, and #553's move of
+    RESTORE.sh's text out of Rust strings under the pins as they stand). They start on the
+    CTO's go: the 2026-11-13 instruction was to file and prepare, not to build.
+  - **Wave 4 waits on rulings** (`needs:cto`: #534, #535, #542, #550, #545).
+  - **Wave 5 is on tape and waits on an authorization that is NOT open** (#518, #520 to #523,
+    #525, #526, #528, #547). Do not build it, and never move a golden pin, until ADR-0012
+    authorizes it. #518's fix shape (make the catalogue right, or stop using slice numbers) is
+    the CTO's; both are measured in the issue.
+  - **Wave 6 is proof**: the whole chain, #532 on the real drive, the drill #548 on the test
+    cartridges, a second drive (#549), the reads of #551, then `v1.10.0`.
+  - Stage no further copy (item 236). The lesson that outlives the queue: a test that reads a
+    dar catalogue makes it as staging does (`-@`, then `dar -C -A`), never with
+    `extract_catalog`; H1 hid for a month behind that fixture.
+
 - **v1.6.0 IS TAGGED on c9c5877 (2026-10-22); #420 is closed.** The real-drive acceptance on
   EW7VWMVKF6 passed 7/7 (2026-10-21 14:02 to 10-22 05:25 UTC; `docs/runs/2026-10-21-1.6.0-acceptance.md`):
   the short seal after file 2338, item 114's readback, both full reads, restores, a rebuild that

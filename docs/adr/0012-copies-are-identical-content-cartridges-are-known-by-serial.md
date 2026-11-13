@@ -2764,3 +2764,50 @@ shipped (`v1.9.0` on `4421e212`), so a change to its behaviour is a 1.9.1.
 234. **The Heir Kit names the release's static binary, in 1.9.1** (#486; lifts the deferral of
      2026-10-20). When the running tapectl is not static, `key escrow-kit` names the release's
      static binary and its sha256 on the cover sheet, and copies it in when it is at hand.
+
+## Amendment, 2026-11-13: the defect review's first rulings
+
+Ruled 2026-11-13, on `docs/audits/2026-11-12-design-and-defect-review.md` (master `4299cfde`),
+whose decisions D8 to D13 continue the intent review's D1 to D7. The CTO's words, whole:
+"Ratify D8,9. Consider existing tapes and catalog as just tests, disposable. File gh issues for
+all findings and prep to address them all prior to starting prod runs." The four items below
+record those three sentences and nothing more; what they leave open is listed after them.
+
+235. **D8 is ratified** (the dar catalogue's slice numbers, H1 of the review; #518). As the
+     review put it: (a) the Heir Kit's sheet and the troubleshooting guide say that on tapes
+     written by 1.1.0 to 1.9.2 `--restore --path` and `--fill-from` are not to be used, that
+     `-T slice` from the envelope's catalogue is not to be trusted, and that the way to one
+     file or to a damaged file is the whole unit from the other copy (#519; no byte on tape);
+     (b) the readers, the test fixtures and the gate are fixed on master, and the generator's
+     fix waits for a re-pin; (c) L6-0001 and L6-0002 are not written again for it. Parts (b)'s
+     "waits for a re-pin" and (c) were written for tapes that counted as the archive; item 237
+     was ruled in the same message, and this item does not reconcile the two.
+236. **D9 is ratified.** No further copy is staged until B2 of the review (#528: a re-staged
+     copy lists the unit dotfile with the first staging's sha256, so the heir's file check
+     calls the unit damaged) is fixed or ruled out for that copy.
+237. **The existing tapes and catalog are tests, disposable.** L6-0001, L6-0002 and home2's
+     catalog are test articles, not the archive, and production runs have not started. This is
+     a status. It erases, deletes and changes nothing on home2: what becomes of the two
+     cartridges and the catalog, and when, is the CTO's to say, and until production copies
+     exist and have read back, the two cartridges hold the only copy of `keepsake` on tape.
+     Records that call them production (items 36 to 49, 193 to 195, the handoffs, the run
+     records, the two reviews of 2026-11-12) say what was so when they were written and are
+     not edited.
+238. **Every finding of the review is filed, and all of them are addressed before production
+     runs start.** The queue is the GitHub label `review-2026-11-12` (36 issues, #518 to #553;
+     the epic and its waves are #554), on the precedent of `review-2026-09-13`: production
+     runs do not start while the label holds an open issue the CTO has not marked `deferred`.
+
+Not ruled by that message, and put to the CTO in #554:
+
+- **No on-tape authorization is open.** The last one (items 181 and 184) ended when `v1.8.0`
+  was installed. An issue labelled `on-tape` (#518, #520 to #523, #525, #526, #528, #547)
+  changes generated on-tape bytes and is not built until an item here authorizes it and says
+  where it ends. The golden pins are not moved by an agent.
+- **D10 to D13.** D10's patch is overtaken by item 238 (one release carries the queue; by the
+  version rule it is 1.10.0, since on-tape bytes change). D11's checks are the operator's.
+  D12 is #550 and D13 is #551; neither is ruled.
+- **What a production run is**: a new catalog, keys and units or the ones home2 has, and
+  whether the escrow identity is kept.
+- **The fix shape for #518**, the notification channel (#535), the default exclusions (#542),
+  two places for active units (#550), and which features production uses at its start (#551).
