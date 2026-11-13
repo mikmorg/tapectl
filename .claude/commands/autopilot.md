@@ -28,10 +28,15 @@ the normative design set named in the Policy block below.
   and the questions for the CTO. Production runs wait on that label being empty.
   - **Waves 1 to 3 need no ruling** (rebuild's unit matching, `db import`, the escrow key's
     parsing, `cartridge erase` and `volume rewrite --resume`, the resume after an early
-    warning, the unstaged snapshot, the scripts, the Heir Kit's sheet, and #553's move of
-    RESTORE.sh's text out of Rust strings under the pins as they stand). They start on the
-    CTO's go: the 2026-11-13 instruction was to file and prepare, not to build.
-  - **Wave 4 waits on rulings** (`needs:cto`: #534, #535, #542, #550, #545).
+    warning, the scripts, the Heir Kit's sheet, and #553's move of RESTORE.sh's text out of
+    Rust strings under the pins as they stand), **except four confirmations**: #527 (refuse a
+    name match under another uuid), #530 (`fsck --repair` refuses on a failed integrity
+    check), #539 (`--all-pending` exits non-zero after a skipped unit), #544 case 1 (item 218
+    covers the hint). They start on the CTO's go: the 2026-11-13 instruction was to file and
+    prepare, not to build.
+  - **Wave 4 waits on rulings** (`needs:cto`: #534, #529, #535, #542, #550, #545).
+  - The thirteen finders' reports, whole, are comments on #551; the paper run's method is
+    on #548.
   - **Wave 5 is on tape and waits on an authorization that is NOT open** (#518, #520 to #523,
     #525, #526, #528, #547). Do not build it, and never move a golden pin, until ADR-0012
     authorizes it. #518's fix shape (make the catalogue right, or stop using slice numbers) is
