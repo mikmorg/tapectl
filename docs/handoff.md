@@ -21,9 +21,12 @@ keys, or these). Until then: stage no further copy (item 236), and do not use RE
 
 **2026-11-14.** The data zone changes before production (ADR-0012 items 239-241): tape-file
 slices and their rules stay, and a slice's payload becomes a plain cut of a tar stream, with
-dar out of the data zone (#555). It is a design ruling, not an authorization: the build waits
-on the questions re-asked in #554. The two cartridges stay the only copy on tape through that
-build, which is why #519's note for them goes out first.
+dar out of the data zone (#555). Later that day (items 242-249): no reverse compatibility with the current version; the
+on-tape authorization for the new layout; a production run is a fresh start (new catalog, keys
+and unit identities, the escrow kept if the paper passes); the two cartridges can be rewritten
+whenever; spanning is supported from the first day; production is gated on total completion
+of all features and fixes. No go has been given, and the questions still open are in #554.
+The handoff for the production runs is written when they are answered.
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

@@ -37,17 +37,26 @@ the normative design set named in the Policy block below.
   - **Wave 4 waits on rulings** (`needs:cto`: #534, #529, #535, #542, #550, #545).
   - The thirteen finders' reports, whole, are comments on #551; the paper run's method is
     on #548.
-  - **Wave 5 is on tape and waits on an authorization that is NOT open** (#518, #520 to #523,
-    #525, #526, #528, #547, #555). Do not build it, and never move a golden pin, until
-    ADR-0012 authorizes it.
+  - **Wave 5 is on tape** (#518, #520 to #523, #525, #526, #528, #547, #555). **The on-tape
+    authorization was given on 2026-11-14 (ADR-0012 item 243)**, for the new layout, ending
+    when its release is installed; each pin still moves in a commit of its own. It is not a
+    go.
+  - **2026-11-14 (later), items 242-249:** no reverse compatibility with the current version
+    (the new tapectl reads and writes the new layout only); a production run is a fresh start;
+    the two cartridges can be rewritten whenever; spanning is supported from the first day;
+    production is gated on total completion of all features and fixes; the three behaviours
+    of #534, #529 and #548 and the four confirmations (#527, #530, #539, #544) are ratified.
+    "Simplify" removes compatibility, not features: propose dropping none. **NO GO HAS BEEN
+    GIVEN. Build nothing until the CTO says so.** The wave lists in this entry and in #554
+    predate these rulings and are rebuilt once the open questions of #554 are answered
+    (7a, 7b, 15 to 26).
   - **2026-11-14: the data zone is re-designed, not yet built** (ADR-0012 items 239-241, #555).
     Tape-file slices and every rule on them stay; a slice's payload becomes a plain cut of a
     tar stream; dar leaves the data zone. That makes Wave 5 a rewrite of the data path (the
     archiver seam in staging, both restores, RESTORE.sh's data path, File 1), with the `on-tape`
-    issues as its acceptance criteria (each carries a comment saying what survives). The
-    rulings are a design, NOT the authorization and NOT a go. The questions they open are
-    re-asked in #554 (1, 4 to 10, 13 to 19); build nothing of Wave 5 until they are answered.
-    The release's number is held (it was called 1.10.0 before the ruling).
+    issues as its acceptance criteria (each carries a comment saying what survives). Items
+    239-241 are the design; the authorization is item 243, above. The release's number is
+    held (it was called 1.10.0 before the ruling).
   - **Wave 6 is proof**: the whole chain, #532 on the real drive, the drill #548 on the test
     cartridges, a second drive (#549), the reads of #551, then the tag.
   - Stage no further copy (item 236). The lesson that outlives the queue: a test that reads a

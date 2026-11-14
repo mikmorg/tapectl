@@ -2851,3 +2851,49 @@ Not ruled by these three items, and asked in #554:
   (the queue's "1.10.0" was named before this ruling).
 - Whether spanning is carried to the new payload in this release or parked behind its
   `requires` entry. Item 240 keeps its rules either way.
+
+## Amendment, 2026-11-14 (later): the first round's answers
+
+Ruled 2026-11-14, on the questions of #554 as re-asked that day. The CTO's words, whole: "Note I
+do not wish to retain reverse compatibility with current version, simplify. Ratify q1 q4; q5
+they can be rewritten whenever. Q6) why park spanning? I want this support day 1. Q7 needs
+explaining. Ratify q8. Q9 gate on total completion of all features and fixes. Ratify q10.
+Rebuild questions for me with this updated perspective"
+
+242. **No reverse compatibility with the current version; simplify.** This settles question 14:
+     the new tapectl reads and writes the new layout only, and a Layout 2 tape is read with
+     tapectl 1.9.2 or with its own RESTORE.sh. What else the coordinator reads from the
+     sentence (one baseline schema, no upgrade from 1.x, the renamed-spellings table, the
+     release's number) is a reading, put back to the CTO in #554, and not a ruling. "Simplify"
+     stands beside items 246 and 248, so it removes compatibility, not features.
+243. **The on-tape authorization** (question 1, ratified). Generated on-tape bytes may change
+     for the new layout: the data zone of item 241, RESTORE.sh, File 1, RECOVERY.md, the
+     envelopes' contents and the index, in the issues labelled `on-tape` and in #555. It ends
+     when the release that carries them is installed on the production host. Each golden pin
+     moves in a commit of its own. It authorizes the change and is not a go: no build has been
+     asked for.
+244. **A production run is a fresh start** (question 4, ratified): a new catalog, new operator
+     and tenant keys, new unit identities (the dotfiles deleted first, as in item 193), and the
+     escrow identity kept if the paper passes its `age-keygen -y` check (items 39 and 194).
+245. **The two cartridges can be rewritten whenever** (question 5, in the CTO's words). Nothing
+     is owed to L6-0001 and L6-0002 before they are written again, and item 237's remark that
+     they hold the only copy on tape keeps no window open for them. The rest of question 5's
+     recommendation (a drill on them first, two other cartridges for production) was not
+     ratified.
+246. **Spanning is supported from the first day** (question 6: "why park spanning? I want this
+     support day 1"). It is carried to the tar payload and proven in the release that precedes
+     production. It is not parked behind its `requires` entry. Item 240 keeps its rules.
+247. **Three behaviours** (question 8, ratified): `audit` warns of a folder under a collection
+     root that is not a unit (#534); a unit whose newest snapshot was never staged is pending
+     (#529); the yearly heir drill gets a recorded event and a clock in `audit` (#548).
+248. **Production is gated on total completion of all features and fixes** (question 9, in the
+     CTO's words). Whether the queue's three proofs (#548 the drill, #549 a read in a second
+     drive, #551 the reads of unread code) are part of that is asked back in #554.
+249. **Four confirmations** (question 10, ratified): `catalog rebuild` refuses a unit whose name
+     matches a catalog unit under another uuid (#527); `db fsck --repair` refuses on a failed
+     integrity check (#530); `snapshot create --all-pending` exits non-zero when it skipped a
+     unit (#539); the hint after a stopped write names the whole copy command, as item 218
+     asks (#544).
+
+Not ruled: question 7 (asked again in plain words), questions 15 to 19, and the questions these
+answers open (20 on), all in #554. No go has been given.

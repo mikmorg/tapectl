@@ -156,9 +156,9 @@ slice replacement are not affected. The CTO ruled L6-0001, L6-0002 and home2's c
 articles, disposable (a status: nothing on home2 is erased or changed by it), and that every
 finding is addressed before production runs start. The paragraph above and the handoff still
 describe what home2 holds; read "production" there as "the test articles". **The queue is the
-label `review-2026-11-12` (#518 to #553), its waves and the open questions are in #554, and no
-on-tape authorization is open**: an issue labelled `on-tape` is not built, and no golden pin
-moves, until ADR-0012 says so. When a test needs a dar catalogue, make it as staging does
+label `review-2026-11-12` (#518 to #555), and its open questions are in #554.** The on-tape
+authorization came on 2026-11-14 (item 243, below); a pin still moves only in a commit of its
+own, and only once a go is given. When a test needs a dar catalogue, make it as staging does
 (`-@`, then `dar -C ... -A ...`), never with the test-only `extract_catalog`, which is how H1
 hid.
 
@@ -167,10 +167,17 @@ the measurements). Format changes are made now. Tape-file slices stay, with ever
 defined on them (the early warning W1-W9, the short seal, ranges and spanning, resume, the
 retry after a refusal, replacement by sha256). A slice's payload becomes a plain cut of a tar
 stream: dar's slice framing goes and dar leaves the data zone, so #518's fix shape is moot
-for new tapes. **This is a ruling on the design, not an authorization and not a go**: nothing
-is built on it, and the questions it opens (the layout version, whether today's tapes are
-still read, who writes the stream, the index's per-file place, the heir's repair model, hard
-links, spanning now or parked) are in #554. Measured limits to design around: a lost slice
+for new tapes. Later that day the CTO ruled the rest of the first round (items 242-249): **no reverse
+compatibility with the current version, simplify** (the new tapectl reads and writes the new
+layout only; a Layout 2 tape is read with 1.9.2 or its own RESTORE.sh); **the on-tape
+authorization** for the new layout, ending when its release is installed; a production run is
+a fresh start (new catalog, keys and unit identities, the escrow kept if the paper passes);
+the two cartridges can be rewritten whenever; **spanning is supported from the first day**;
+production is gated on total completion of all features and fixes. "Simplify" removes
+compatibility, not features. **No go has been given**: nothing is built until the CTO says
+so, and the questions still open (who writes the stream, the per-stage-set file table, the
+heir's repair model, hard links, a range as a source, what the compatibility note removes)
+are in #554. Measured limits to design around: a lost slice
 must be zero-filled to its exact size, a hard-linked name depends on the slices of the name
 archived first, and busybox tar exits 0 with files missing, so a restore is judged by the
 per-file sha256 check.
