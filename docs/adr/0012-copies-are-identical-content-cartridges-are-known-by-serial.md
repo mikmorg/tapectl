@@ -2897,3 +2897,101 @@ Rebuild questions for me with this updated perspective"
 
 Not ruled: question 7 (asked again in plain words), questions 15 to 19, and the questions these
 answers open (20 on), all in #554. No go has been given.
+
+## Amendment, 2026-11-14 (evening): the second round's answers
+
+Ruled 2026-11-14, on the questions of #554 as rebuilt after items 242 to 249 (7a, 7b, 15 to
+25). The CTO's words, whole: "Q7a) don't build this in, just make cli sufficient for reporting
+tools on top later, separately. Do not gate on a second LTO drive. Ratify all recommendations".
+Each item below is the question and the recommendation as #554 showed them.
+
+250. **No notification is built in** (question 7a, in the CTO's words). tapectl gains no ping
+     address, mail or `OnFailure=` of its own; its command line is made sufficient for
+     reporting tools written on top, later and separately (#535). The optional ping the
+     scheduled wrappers already carry is left as it is. By this ruling a failed scheduled job
+     reaches nobody until such a tool exists.
+251. **A second LTO drive does not gate production** (the CTO's words). #549 is `deferred`.
+252. **A new install leaves no file out by default** (question 7b). `init` writes an empty
+     exclusion list, and every snapshot reports what a pattern left out (#542).
+253. **GNU tar on the host writes the stream** (question 15): pax format with xattrs and ACLs,
+     from the exact file list tapectl gives it. tapectl reads the stream as it passes: it
+     checks the members against the snapshot, takes each file's sha256 from the bytes that go
+     to tape, and notes where each member starts. GNU tar replaces dar as the host's
+     dependency. `preserve_fsa` goes, since tar keeps no `chattr` flags. Ratified with three
+     things not yet measured (#555): GNU tar 1.30, bsdtar as a reader, and real scale. They
+     are measured before any code is written on this item, and a failure reopens it.
+254. **A file table for each staging a tape holds, in place of the dar catalogue** (question
+     16). Each tenant envelope carries, for every unit copy on the tape: each path, its size,
+     the sha256 of the bytes on this tape, and where it starts (slice and offset). A listing, a
+     one-path restore and the per-file check read it. `index/paths.tsv` stays the listing by
+     version across tapes. This settles #528: the check is against what this tape holds, the
+     unit dotfile included.
+255. **The heir has one repair** (question 17). A bad slice is zero-filled and the restore goes
+     on; the damaged files are listed; the repair is to restore those paths from another copy.
+     RESTORE.sh loses slice replacement in mid-run (`--slices-from`, `--swap-tapes`), its
+     salvage mode and `--fill-from`. One prompt stays, for a unit that continues on the next
+     cartridge. tapectl's own restore keeps slice replacement by sha256.
+256. **Hard links are kept as links** (question 18). The file table marks a link and names its
+     target, so a reader fetches the target's slices. The limit of item 241 stands: a second
+     name depends on the slices of the name archived first.
+257. **Two places for the units are held by `audit`**, through `[defaults] copies_at` (question
+     19, #550).
+258. **What "no reverse compatibility, simplify" removes** (question 20, all six readings of
+     item 242 confirmed): (a) the layout is Layout Version 3, the short seal is part of it, a
+     plain tape's `requires` is empty and `spanning` is its one entry; (b) one baseline schema
+     replaces the 41 migrations, and a 1.x catalog is refused by name; (c) there is no upgrade
+     from 1.x: the upgrade tool stays and starts from this release; (d) the refusals that name
+     old spellings and old config keys, the three generations of the on-tape `catalog.db` and
+     the old-script fixtures go; (e) the release is 2.0.0; (f) #518 is closed as a Layout 2
+     defect when Layout 2 is no longer written, its criteria carried by #555.
+259. **#519 is closed unbuilt** (question 21). This reverses item 235(a): the note was for
+     holders of tapes written by 1.1.0 to 1.9.2, the two here can be rewritten whenever (item
+     245), and no compatibility is kept (item 242).
+260. **A range is a source for the files whose slices it holds** (question 22). This amends
+     item 143, which made a range never a fill source.
+261. **Three behaviours adjusted while building are ratified as built** (question 23, #545): a
+     whole unit that a queued spannable unit pushes past the fill ceiling waits for the next
+     tape and is not refused (1.7.0's fork X12); an owed run is tied to a location only when it
+     starts after slice 1 (item 159 as built); an archive set's `required_locations` count
+     toward its copy floor (items 149 and 156 read together).
+262. **The drill and the reads gate production** (question 24): the restore drill at real scale
+     (#548) and the adversarial reads of code not yet read (#551) are part of item 248's
+     completion. The read in a second drive is not (item 251).
+263. **The first production run is the acceptance** (question 25). Both cartridges are written
+     at real scale by the release candidate, the drill runs on them, and they count as
+     production when it passes.
+
+**What these supersede, named, because item 240 said §4.4 does not change.** The writer's half
+stands as item 240 has it: W1 to W9, the full and the short seal, a range's records on tape, the
+plan order, copies counted per slice, and the acceptance of a cartridge by a slice's sha256
+under its seal (R5, R8, R9 of `volume-format-v2.md` §4.4). The reader's half in RESTORE.sh
+changes: item 101(a)'s second tape or directory as a slice source in the script (tapectl's
+stays, with 101(b)); item 102's mechanism (a fill through the copy's dar catalogue becomes a
+restore of the listed paths through its file table; the damaged-file list of item 103 stays);
+item 143 (amended by 260); and, with dar gone under item 241, the rulings that are about dar's
+stream alone (items 176 to 184 and the dar half of 132). Item 235(a) is reversed by 259.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *The order of item 263.* The work is complete and proven on a candidate commit; that build is
+  installed on the production host by the fresh start of item 244 and writes both cartridges;
+  the drill runs; if it passes, that commit is tagged `v2.0.0`, the cartridges count as
+  production, and item 243's authorization ends there. If it fails, the cartridges are test
+  articles again, the defect is fixed under the same authorization, and the run is repeated.
+- *Spanning in the heir's script.* A restore of a unit across cartridges streams, with the one
+  prompt of item 255. Item 132's default (each tape's range kept in scratch as ciphertext) and
+  item 88's choice between that and the stream are not carried. A whole-unit restore still
+  starts on a tape that holds slice 1, as §4.4 has it; item 260 concerns the repair by path.
+- *What "sufficient" means in item 250*: a tool can learn from the command line alone, in JSON
+  and by exit code, the audit's verdict, the age and check of the newest catalog backup, the
+  drive's last health reading, and what is pending. The list is the coordinator's.
+- *Not objected to, and taken as settled until the CTO says otherwise* (they were listed as
+  defaults in #554 and are not part of the message above): pax; the file list sorted bytewise;
+  access and change times not stored; `slice_size` a multiple of 512; every reader zero-fills
+  a lost slice to its exact size; a restore judged by the per-file sha256 check, never by
+  tar's exit status; sparse files stored as their bytes; the new RESTORE.sh one file, living
+  in the source tree as a file from the start and linted in CI (#553).
+
+Not ruled: no go has been given, and nothing is built. Outside this queue and still open: the
+intent review's D6 (a warehouse deposit) and D7 (the intent statement and the errata), #444 and
+#482. #499 (reporting dar's FIFO defect upstream) is moot for tapectl once dar is gone.

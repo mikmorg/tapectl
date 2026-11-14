@@ -174,10 +174,19 @@ authorization** for the new layout, ending when its release is installed; a prod
 a fresh start (new catalog, keys and unit identities, the escrow kept if the paper passes);
 the two cartridges can be rewritten whenever; **spanning is supported from the first day**;
 production is gated on total completion of all features and fixes. "Simplify" removes
-compatibility, not features. **No go has been given**: nothing is built until the CTO says
-so, and the questions still open (who writes the stream, the per-stage-set file table, the
-heir's repair model, hard links, a range as a source, what the compatibility note removes)
-are in #554. Measured limits to design around: a lost slice
+compatibility, not features. That evening the second round was answered too (items 250-263), so **the design of tapectl
+2.0.0, Layout Version 3, is ruled**: GNU tar on the host writes a pax stream from tapectl's
+exact file list and tapectl reads it as it passes (member check, per-file sha256, member
+starts); a file table per staging replaces the dar catalogue in the tenant envelope; the heir
+has one repair (zero-fill, list, restore the listed paths from another copy) and one prompt
+(the next cartridge of a span); hard links stay links; a range is a source for the files whose
+slices it holds (item 143 amended); one baseline schema, no upgrade from 1.x; no notification
+is built in (the command line is made sufficient for reporting tools); a new install leaves no
+file out by default; a second drive does not gate; the drill (#548) and the reads (#551) do;
+the first production run is the acceptance. The amendment names what this supersedes in the
+reader's half of spanning, and marks the coordinator's readings as readings. **No go has been
+given: build nothing until the CTO says so.** The plan is #554, by phase; Phase 0 is three
+measurements (GNU tar 1.30, bsdtar, real scale) that come before any code. Measured limits to design around: a lost slice
 must be zero-filled to its exact size, a hard-linked name depends on the slices of the name
 archived first, and busybox tar exits 0 with files missing, so a restore is judged by the
 per-file sha256 check.

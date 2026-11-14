@@ -47,9 +47,23 @@ the normative design set named in the Policy block below.
     production is gated on total completion of all features and fixes; the three behaviours
     of #534, #529 and #548 and the four confirmations (#527, #530, #539, #544) are ratified.
     "Simplify" removes compatibility, not features: propose dropping none. **NO GO HAS BEEN
-    GIVEN. Build nothing until the CTO says so.** The wave lists in this entry and in #554
-    predate these rulings and are rebuilt once the open questions of #554 are answered
-    (7a, 7b, 15 to 26).
+    GIVEN. Build nothing until the CTO says so.**
+  - **2026-11-14 (evening), items 250-263: every question is answered; the design of tapectl
+    2.0.0, Layout Version 3, is ruled.** The plan is #554, by phase, and it replaces the wave
+    lists in this entry: Phase 0 three measurements before any code (GNU tar 1.30 in a
+    container, bsdtar as a reader, real scale; a failure reopens item 253) and the operator's
+    `age-keygen -y` check; Phase 1 the normative set (the Layout 3 format document first, no
+    code); Phase 2 the fixes that depend on nothing (#527; #530 #538 #533; #536 #537; #531
+    #541 #544; #539 #529 #534 #535; #540 #546); Phase 3 compatibility out (one baseline
+    schema); Phase 4 the data path on tar (staging, what a tape carries, the restores, rebuild,
+    the heir's script new and in files, the texts, the installers); Phase 5 every carried
+    feature on the new payload, spanning first; Phase 6 the reads (#551), the pins, #552, the
+    whole chain, the real drive; Phase 7 the acceptance run (item 263). Rules from the review:
+    a fixture goes through the real staging path; one gate leg per heir mode; new code gets
+    its own read. #519 is closed (item 259); #549 is deferred (item 251). The amendment marks
+    four readings as the coordinator's (the order of the acceptance run, a span restore
+    streams, what "sufficient" means for #535, the defaults not objected to): correct them if
+    the CTO does.
   - **2026-11-14: the data zone is re-designed, not yet built** (ADR-0012 items 239-241, #555).
     Tape-file slices and every rule on them stay; a slice's payload becomes a plain cut of a
     tar stream; dar leaves the data zone. That makes Wave 5 a rewrite of the data path (the
