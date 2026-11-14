@@ -2811,3 +2811,43 @@ Not ruled by that message, and put to the CTO in #554:
   whether the escrow identity is kept.
 - **The fix shape for #518**, the notification channel (#535), the default exclusions (#542),
   two places for active units (#550), and which features production uses at its start (#551).
+
+## Amendment, 2026-11-14: the data zone before production
+
+Ruled 2026-11-13 and 2026-11-14, on the questions of #554 and the measurements of #555. The
+CTO's words, whole. On 2026-11-13, to question 3 (whether the format window reopens): "I want
+to do any format change now, before we start using this in production. Consider best design,
+not held to current schema/layout; cut out slices re q2? Careful about EOT logic and
+spanning". On 2026-11-14, to questions 11 and 12 as #555 put them: "Ratify q11,12.. re-ask
+questions with updated context".
+
+239. **Format changes are made now, before production.** The design is not held to the
+     current schema or layout. This overtakes the intent review's D3 ("the bytes on tape stand
+     still"), which protected tapes that item 237 has since made test articles.
+240. **Tape-file slices stay, and their rules stay as ruled** (question 11). A slice is one
+     age-encrypted tape file with its position, size and ciphertext sha256 in the front index.
+     The writer at the early warning (W1 to W9 of `volume-format-v2.md` §4.3), the full and
+     the short seal (§4.1, §4.2), a range and spanning (§4.4), `volume resume`, the retry
+     after a Logical Block Protection refusal (item 174), confirm and verify per file, and a
+     slice replaced from another copy by its sha256 are all defined on it and do not change.
+241. **A slice's payload is a plain cut of a tar stream** (question 12). dar's slice framing
+     goes, and dar leaves the data zone: staging no longer re-creates dar's slice header and
+     trailer, and no reader strips them. This answers the intent review's D5(b) ("dar or
+     tar") and overtakes question 2 of #554 (#518's fix shape): the dar catalogue whose slice
+     layout was wrong is not part of the new data zone. What was measured, and what was not,
+     is in #555. Two limits are part of the ruling's record: a lost slice costs the files in
+     it only when a reader zero-fills it to its exact size, and a hard-linked name depends on
+     the slices of the name archived first.
+
+Not ruled by these three items, and asked in #554:
+
+- **They are not the on-tape authorization and not a go.** No pin moves and nothing is built
+  on them alone.
+- Who writes the stream (GNU tar on the host, or tapectl itself), the tar format (pax), the
+  explicit file list, sparse files and hard links.
+- Whether the index records each file's slices, and what the envelope carries in place of the
+  dar catalogues.
+- The layout version, whether the new tapectl reads today's tapes, and the release's number
+  (the queue's "1.10.0" was named before this ruling).
+- Whether spanning is carried to the new payload in this release or parked behind its
+  `requires` entry. Item 240 keeps its rules either way.

@@ -38,11 +38,18 @@ the normative design set named in the Policy block below.
   - The thirteen finders' reports, whole, are comments on #551; the paper run's method is
     on #548.
   - **Wave 5 is on tape and waits on an authorization that is NOT open** (#518, #520 to #523,
-    #525, #526, #528, #547). Do not build it, and never move a golden pin, until ADR-0012
-    authorizes it. #518's fix shape (make the catalogue right, or stop using slice numbers) is
-    the CTO's; both are measured in the issue.
+    #525, #526, #528, #547, #555). Do not build it, and never move a golden pin, until
+    ADR-0012 authorizes it.
+  - **2026-11-14: the data zone is re-designed, not yet built** (ADR-0012 items 239-241, #555).
+    Tape-file slices and every rule on them stay; a slice's payload becomes a plain cut of a
+    tar stream; dar leaves the data zone. That makes Wave 5 a rewrite of the data path (the
+    archiver seam in staging, both restores, RESTORE.sh's data path, File 1), with the `on-tape`
+    issues as its acceptance criteria (each carries a comment saying what survives). The
+    rulings are a design, NOT the authorization and NOT a go. The questions they open are
+    re-asked in #554 (1, 4 to 10, 13 to 19); build nothing of Wave 5 until they are answered.
+    The release's number is held (it was called 1.10.0 before the ruling).
   - **Wave 6 is proof**: the whole chain, #532 on the real drive, the drill #548 on the test
-    cartridges, a second drive (#549), the reads of #551, then `v1.10.0`.
+    cartridges, a second drive (#549), the reads of #551, then the tag.
   - Stage no further copy (item 236). The lesson that outlives the queue: a test that reads a
     dar catalogue makes it as staging does (`-@`, then `dar -C -A`), never with
     `extract_catalog`; H1 hid for a month behind that fixture.

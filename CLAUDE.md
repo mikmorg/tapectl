@@ -162,6 +162,19 @@ moves, until ADR-0012 says so. When a test needs a dar catalogue, make it as sta
 (`-@`, then `dar -C ... -A ...`), never with the test-only `extract_catalog`, which is how H1
 hid.
 
+**2026-11-14: the data zone changes before production** (ADR-0012 items 239-241; #555 holds
+the measurements). Format changes are made now. Tape-file slices stay, with every rule
+defined on them (the early warning W1-W9, the short seal, ranges and spanning, resume, the
+retry after a refusal, replacement by sha256). A slice's payload becomes a plain cut of a tar
+stream: dar's slice framing goes and dar leaves the data zone, so #518's fix shape is moot
+for new tapes. **This is a ruling on the design, not an authorization and not a go**: nothing
+is built on it, and the questions it opens (the layout version, whether today's tapes are
+still read, who writes the stream, the index's per-file place, the heir's repair model, hard
+links, spanning now or parked) are in #554. Measured limits to design around: a lost slice
+must be zero-filled to its exact size, a hard-linked name depends on the slices of the name
+archived first, and busybox tar exits 0 with files missing, so a restore is judged by the
+per-file sha256 check.
+
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
