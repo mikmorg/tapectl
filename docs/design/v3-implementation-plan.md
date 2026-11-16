@@ -17,7 +17,7 @@ with the same numbers:
 | 0 | Measure before any code | no code; a dated note | worker, operator | yes (T0.1, T0.2); T0.3 and T0.4 need the operator |
 | 1 | The normative set: the Layout 3 format document and its companions | `master` (documents) | **coordinator** | no: it is written by the coordinator, and §S1 lists what it must decide |
 | 2 | Fifteen fixes that depend on nothing else | `master` | workers, three at a time | yes, on the go |
-| 3 | Compatibility out | `layout-3` | workers | yes, on the go and after Stage 2 |
+| 3 | Compatibility out | `layout-3` | workers | yes, on the go and after Stage 2; T3.1 also needs the CTO to have seen D9 (how a 2.x catalog is known) |
 | 4 | The data path on the tar payload | `layout-3` | workers, by task order | no: every task reads Stage 1's documents |
 | 5 | Every carried feature, proven on the new payload | `layout-3` | workers | no: after Stage 4 |
 | 6 | Reads and proof | `master` | coordinator, fresh readers, operator | no |
@@ -84,7 +84,7 @@ reasonable one. The coordinator takes it to the CTO.
   the Agent tool's `isolation: "worktree"` (it forks from `origin/master`).
 - **`cargo test --no-fail-fast` is green at every commit of `master` and of `layout-3`.** Two
   things make that possible while a payload is replaced:
-  1. **Pending tests.** Between T4.4 (staging switches to tar) and the tasks that port the
+  1. **Pending tests.** Between T4.5 (staging switches to tar) and the tasks that port the
      readers, a test that fails *only because a later task's path is not ported yet* is
      marked `#[ignore = "L3-pending T4.<n>: <the path it waits for>"]` by the task that broke
      it. Nothing else may be ignored this way: not a test of the task's own work, not a test
@@ -93,10 +93,10 @@ reasonable one. The coordinator takes it to the CTO.
      integration, and the merge to `master` needs it empty.
   2. **dar's tests leave with dar's code.** A test of the dar wrapper, of dar's slice framing
      or of the one stream into dar is deleted in the commit that deletes the code it tests
-     (T4.11 names them), never ignored.
+     (T4.5, T4.8 and T4.15 between them), never ignored.
 - **The tape chain** (the mhvtl gate, `first-run.sh`'s rehearsal, the lifecycle suite, the
   acceptance scripts) is run by the coordinator only. It is green on `master` after Stage 2,
-  is **not expected green on `layout-3` between T4.4 and T4.10**, and is green again before
+  is **not expected green on `layout-3` between T4.5 and T4.16**, and is green again before
   the merge.
 
 ## 4. Rules for every task
@@ -205,7 +205,7 @@ the table says what it holds back.
 | Task | Gates | Owner |
 |---|---|---|
 | T0.1 The readers of an ACL stored once | Stage 1 (which record the format keeps) | worker |
-| T0.2 GNU tar built on Debian 10 | T4.10's host step, and Stage 7 | worker |
+| T0.2 GNU tar built on Debian 10 | T4.14's host step, and Stage 7 | worker |
 | T0.3 Real scale | Stage 4 (item 253's own condition) | coordinator, on the operator's go-ahead |
 | T0.4 The escrow paper | Stage 7 (item 244) | operator |
 
@@ -273,7 +273,7 @@ result as a comment; the writer's exact flags for the kept record are stated.
 **Read:** #563; `contrib/hosts/home2-prep.sh` step 7 (how dar 2.7.21 was built there).
 
 **Goal:** show that GNU tar 1.35 or later builds on Debian 10 with ACL support and writes ACL
-entries by number, and write down the exact recipe the host step (T4.10) will use.
+entries by number, and write down the exact recipe the host step (T4.14) will use.
 
 **Steps:**
 1. Look at `https://ftp.gnu.org/gnu/tar/` for the newest release. Use the newest release
@@ -728,6 +728,9 @@ refused and no copy counted; the full suite passes.
 - Test fixtures store fake recipients (`age1fake...`) straight into the database. They do
   not pass through the parser and need no change. If a test does pass a fake key through
   the parser, give it a real generated recipient.
+- The tests that pass an escrow key through `init`, `setup` or `key import`
+  (`tests/setup.rs`, `tests/cli_smoke.rs`, `tests/adopt_key.rs`, `tests/first_run_adopt.rs`)
+  were checked on `dc7e7605`: each passes a generated recipient, so none of them breaks.
 - Do not run the workflow. Do not create a tag. The change is read, not executed.
 
 **Done when:** a string that starts `age1` and is not a recipient is refused at all three
@@ -775,7 +778,9 @@ The inventory behind these fences was taken on `dc7e7605`. Line numbers are lead
 
 ### T3.1 One baseline schema, and a 1.x catalog refused by name
 
-**Owner:** worker. **Depends:** Stage 2 landed. **Carries out:** item 258(b), (c); D9.
+**Owner:** worker. **Depends:** Stage 2 landed, **and D9 seen by the CTO** (this task
+builds how a 2.x catalog is known and how a 1.x one is refused; while D9 is still a
+proposal, stop). **Carries out:** item 258(b), (c); D9.
 **Read:** ADR-0012 item 258; this plan's D9; `src/db/mod.rs` from `fn migrations()` to
 `schema_is_current`; `vendor/rusqlite_migration/VENDORED.md`.
 
@@ -1687,6 +1692,10 @@ rewritten: every test in `src/volume/span_proofs.rs` and the span tests of
 new is the table across tapes: every tape whose plan holds a slice of a staging carries that
 staging's whole table (#562), and "this tape holds F" means every slice from F's start to
 its end is at or before `ended_after`.
+**Fence:** `src/volume/span_proofs.rs`; the span tests of `tests/catalog_rebuild.rs`,
+`tests/integration.rs` and `tests/format_v3.rs`; `scripts/span-acceptance.sh` (the
+coordinator runs it). A source file is changed only for a defect a proof shows: report the
+defect and the file first, and the coordinator widens the fence.
 **Done when:** item 93's shape (two copies: tapes 1 and 3, or tape 2 alone) and a three-tape
 span restore whole through tapectl and through the heir's script, in tests and on mhvtl
 (`scripts/span-acceptance.sh --mhvtl`); `volume rewrite` and compaction still refuse a
@@ -1721,6 +1730,9 @@ how to get a tar that meets the floor (item 274). The warehouse deposit of seale
 is a documented procedure over ciphertext and is restated for Layout 3's restore.
 **Fence:** `src/setup.rs`, `src/cli/setup.rs`, `tests/setup.rs`, `docs/quick-start.md`,
 `docs/operator-guide.md` (the warehouse section).
+**Done when:** `setup` on a host whose tar is below the floor names the floor and stops
+before it makes a home, shown by a test with a stand-in tar; the quick start's steps pass
+`check-docs.py`; the warehouse section's restore is the Layout 3 one.
 
 ### T5.5 The host scripts' low findings, and the record (#543, #545)
 
@@ -1728,6 +1740,12 @@ is a documented procedure over ciphertext and is restated for Layout 3's restore
 home pointer, the tape lock and `tapectl-op`, as its criteria list them. #545 is the
 coordinator's: the three rulings adjusted while building have their item (261), and the two
 stale texts are corrected.
+**Fence:** `scripts/first-run.sh`, `scripts/install-systemd.sh`, `scripts/check-tapectl-op.sh`,
+`contrib/systemd/tapectl-op`, and the doc #543 names as contradicting `tapectl-op`; the
+`tests/first_run_*.rs` pins of a text this task changes.
+**Done when:** each of #543's criteria is met or reported as needing the tape; `bash -n`
+passes; the report lists what the coordinator must run to prove it (the rehearsal, and the
+upgrade's backup and rollback once a 2.x predecessor exists).
 
 ### T5.6 The drill's event and its clock (#548's code; item 247)
 
@@ -1735,7 +1753,11 @@ stale texts are corrected.
 which script version), and `audit` warns when the last one is older than a year or there
 has been none. The event is a row the baseline holds. The command's spelling and the config key are
 D18's, once the CTO has seen them; until then this task stops. **Fence:** `src/cli/audit.rs`,
-a new command module, `src/db/migrations/001_baseline.sql`, their tests, the generated pages.
+a new command module, `src/cli/mod.rs`, `src/main.rs` (the dispatch line),
+`src/db/migrations/001_baseline.sql`, their tests, the generated pages.
+**Done when:** `audit` warns with no drill recorded and with one older than the interval,
+and is quiet after a fresh one, each shown by a test with its exit code; the command is in
+`tests/dry_run_contract.rs` with one verdict.
 ---
 
 ## S6. Stage 6: reads and proof
@@ -1751,12 +1773,13 @@ One read-only agent for each area, given the code and the normative text and **n
 the coordinator's view of what might be wrong. Each returns defects with file and line and a
 concrete failing case. The areas:
 
-1. the stream reader and the stream's checks (T4.1, T4.2)
-2. staging on tar, the file table and the id map (T4.3, T4.4)
-3. what a tape carries, and a tape of another layout at contact (T4.5, T4.8)
-4. tapectl's restores (T4.6)
-5. `catalog rebuild` and the adoption of a lost write (T4.7)
-6. the heir's script, File 1 and RECOVERY.md (T4.9)
+1. the writer, the stream reader and the stream's checks (T4.1, T4.2)
+2. the file table and the id map, the snapshot, staging on tar (T4.3, T4.4, T4.5)
+3. what a tape carries, and a tape of another layout at contact (T4.6, T4.7)
+4. tapectl's restores (T4.8)
+5. `catalog rebuild` and the adoption of a lost write (T4.9)
+6. the heir's script, File 1 and RECOVERY.md (T4.10 to T4.13), and the Heir Kit's sheet
+   (T4.14)
 7. spanning end to end (T5.1)
 8. `copies_at` and the per-location writes; compaction; `volume rewrite` (T5.2, T5.3)
 9. `tapectl setup` and the host scripts (T5.4, T5.5)
@@ -1808,7 +1831,7 @@ static debug build and a scratch home, on a test cartridge:
 2. the short seal with Logical Block Protection armed, and `volume init`'s page clear (#532)
 3. spanning's acceptance on the tar payload (`scripts/span-acceptance.sh`)
 
-The host needs a tar that meets the floor first (T4.10's step, run by the operator).
+The host needs a tar that meets the floor first (T4.14's step, run by the operator).
 
 ### T6.7 Release preparation
 
@@ -1930,8 +1953,9 @@ and built where shown.
 
 ## Appendix B. What waits on the CTO
 
-1. **The go**, stage by stage. Stage 2 and Stage 3 need nothing else. T0.1 and T0.2 are
-   measurements in containers and change no code.
+1. **The go**, stage by stage. Stage 2 needs nothing else. Stage 3 needs nothing else but
+   D9 for T3.1. T0.1 and T0.2 are measurements in containers and change no code; they have
+   not been started.
 2. **D15**: what becomes of `compression`. It is the one place this plan found where
    carrying a feature and the ruled design disagree. T4.5 stops at it.
 3. **D1 to D18** as a list to see before Stage 1 writes them into the format document.
