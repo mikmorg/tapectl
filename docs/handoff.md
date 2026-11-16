@@ -29,7 +29,9 @@ of all features and fixes. That evening the second round was answered (items 250
 Layout Version 3, is ruled, and #554 holds the plan by phase. No go has been given. The
 handoff for the production run (item 263: the candidate writes both cartridges after a fresh
 start, the drill runs on them, and they count as production when it passes) is written when
-the build reaches it.
+the build reaches it, from the order the CTO rules in #559 (2026-11-16: the order first read
+into item 263 cannot be repeated after a failed drill; see
+`docs/research/2026-11-16-layout-3-before-the-build.md`).
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

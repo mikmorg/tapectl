@@ -64,6 +64,17 @@ the normative design set named in the Policy block below.
     four readings as the coordinator's (the order of the acceptance run, a span restore
     streams, what "sufficient" means for #535, the defaults not objected to): correct them if
     the CTO does.
+  - **2026-11-16: the research before the build is done**
+    (`docs/research/2026-11-16-layout-3-before-the-build.md`). Phase 0: GNU tar 1.30 and bsdtar
+    pass; scale is partial (one 96 GiB member and 50,100 small files). TWO THINGS ABOVE NO
+    LONGER STAND until the CTO answers: the zero-fill default (#556: readers splice by the
+    file table instead) and the order of the acceptance run (#559: tag first). Eight
+    questions are open, 26 to 33, in #554 and in #556 to #561. #562 holds the rules for the
+    Layout 3 format document that need no ruling; read it before writing Phase 1. The
+    sixteen fixes of Phase 2 depend on none of the questions. STILL NO GO. Operational rules
+    learned in this pass: every `docker run` gets `--log-driver none` and never carries data
+    on stdout; a NOTICE or WINDOW to the broker before ANY heavy job under the lock, tests
+    included.
   - **2026-11-14: the data zone is re-designed, not yet built** (ADR-0012 items 239-241, #555).
     Tape-file slices and every rule on them stay; a slice's payload becomes a plain cut of a
     tar stream; dar leaves the data zone. That makes Wave 5 a rewrite of the data path (the

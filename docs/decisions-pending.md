@@ -26,3 +26,9 @@ policy) and are struck from this file.
 | ~~14~~ | **ANSWERED 2026-11-14 (items 253-256, 260).** ~~The new data zone's open design: who writes the tar stream, the per-stage-set file table, the heir's repair model, hard links, a range as a source (item 143).~~ | 2026-11-14 | [#554](https://github.com/mikmorg/tapectl/issues/554), [#555](https://github.com/mikmorg/tapectl/issues/555) |
 | ~~15~~ | **ANSWERED 2026-11-14 (items 251, 262): the drill and the reads gate; a second drive does not.** ~~Whether the three proofs (#548, #549, #551) are part of "total completion" (item 248), and whether a second drive exists.~~ | 2026-11-14 | [#554](https://github.com/mikmorg/tapectl/issues/554) |
 | 16 | The go for the 2.0.0 build (the design is ruled, items 235-263; nothing is built). | 2026-11-14 | [#554](https://github.com/mikmorg/tapectl/issues/554) |
+| 17 | The reader's primitive: byte ranges from the file table in place of a zero-filled slice (changes a recorded default and the wording of items 241 and 255). | 2026-11-16 | [#556](https://github.com/mikmorg/tapectl/issues/556) |
+| 18 | Where the per-staging file table lives between tapes. | 2026-11-16 | [#557](https://github.com/mikmorg/tapectl/issues/557) |
+| 19 | A tape that holds part of a spanning unit, alone; and whether the heir's restore across cartridges streams only (items 88 and 132). | 2026-11-16 | [#558](https://github.com/mikmorg/tapectl/issues/558) |
+| 20 | The acceptance run's order: tag first; what a failed drill means; when the on-tape authorization ends. | 2026-11-16 | [#559](https://github.com/mikmorg/tapectl/issues/559) |
+| 21 | What 2.0.0 does with a Layout 2 cartridge in the drive. | 2026-11-16 | [#560](https://github.com/mikmorg/tapectl/issues/560) |
+| 22 | Owner names, sockets, and the heir's work directory. | 2026-11-16 | [#561](https://github.com/mikmorg/tapectl/issues/561) |

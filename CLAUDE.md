@@ -186,7 +186,22 @@ file out by default; a second drive does not gate; the drill (#548) and the read
 the first production run is the acceptance. The amendment names what this supersedes in the
 reader's half of spanning, and marks the coordinator's readings as readings. **No go has been
 given: build nothing until the CTO says so.** The plan is #554, by phase; Phase 0 is three
-measurements (GNU tar 1.30, bsdtar, real scale) that come before any code. Measured limits to design around: a lost slice
+measurements (GNU tar 1.30, bsdtar, real scale) that come before any code.
+
+**2026-11-16: the research before the build**
+(`docs/research/2026-11-16-layout-3-before-the-build.md`). GNU tar 1.30 and bsdtar pass, and a
+96 GiB member came back identical through 96 cut and encrypted pieces; nothing measured
+reopens item 253 (scale is shown only that far). Two things recorded on 2026-11-14 do NOT
+stand and are back with the CTO: **the default "every reader zero-fills a lost slice"**
+(measured: a zero-filled slice makes every tar stop and exit 0 with the later files missing,
+and `--ignore-zeros` extracts a tar file's contents as the unit's own; feeding tar whole
+members by byte range from the file table works on every tar tested, #556), and **the
+coordinator's reading of the acceptance run's order** (an untagged candidate cannot be
+repeated and its Heir Kit names a tag that does not exist, #559). An independent reader found
+the rest: the file table has no home between tapes (#557), a range tape alone and the
+scratch mode of a span restore (#558), a Layout 2 cartridge at contact (#560), owner names,
+sockets and the heir's work directory (#561). Questions 26 to 33 are in #554; the rules for
+the Layout 3 format document that need no ruling are #562. Still no go. Measured limits to design around: a lost slice
 must be zero-filled to its exact size, a hard-linked name depends on the slices of the name
 archived first, and busybox tar exits 0 with files missing, so a restore is judged by the
 per-file sha256 check.
