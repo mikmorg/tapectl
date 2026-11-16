@@ -172,9 +172,11 @@ The first three are Layout 2's and are carried unchanged. The rest are Layout 3'
    feature hard to carry stops and reports.
 10. **The standard is not lowered to an old tool on the host that writes** (item 273). The
     heir's readers stay wide: the heir's script and File 1 are held to old and small tools.
-11. **Each slice decompresses alone, and every offset is of the stream before compression**
-    (item 280). Compression comes after the cut and before encryption. Nothing compresses
-    the stream as a whole, and no check of the stream is made after compression.
+11. **Compression never reaches past its own piece, and it comes after every check** (item
+    280). The stream is never compressed as one whole: a lost slice costs only what lies in
+    and beside it. Every check of the stream (members, hashes, names, ACLs) is made before
+    compression, and a member's offsets in the file table are of the tar stream. Which piece
+    is compressed alone, a slice or a frame of members, is D15's question 41.
 12. **Nothing is argued from what the present collection holds** (item 281). A task that
     finds a feature costly does not answer "the data does not need it". It stops and
     reports.
@@ -216,7 +218,7 @@ the table says what it holds back.
 | T0.3 Real scale, in two legs | Stage 4 (item 253's own condition) | first leg: coordinator, on the operator's go-ahead; second leg: worker |
 | T0.4 The escrow paper | Stage 7 (item 244) | operator |
 | T0.5 The decompressors on a slice compressed alone | Stage 1 (the format's section on compression), T4.5 | worker |
-| T0.6 The compression libraries in the static build | question 39, if it is ruled for tapectl compressing itself; T4.5 | worker |
+| T0.6 The compression libraries in the static build | shape B of D15 (question 41) and question 39; T4.5 | worker |
 
 A Stage 0 task changes nothing under `src/`, `tests/` or `scripts/`. Its product is a dated
 note under `docs/research/`, which the coordinator lands, and a comment on the issue.
@@ -360,8 +362,13 @@ document states compression, measure the readers an heir may have.
 1. Make the stream and the cut as #565's script does, with the writer's flags, on a tree
    that also holds real data of several kinds (text, source code, a database dump, images
    that do not shrink). Record where the data came from; use nothing private.
-2. For each of the seven, compress each slice alone, as one frame, with its own tool, at
-   the tool's default level and at its highest. Encrypt each with the real `age`.
+2. For each of the seven, with its own tool, at the tool's default level and at its
+   highest, make both shapes of D15: each slice compressed alone (A), and the stream in
+   frames that begin at member boundaries, joined and then cut (B; #565's second script is
+   the model). Encrypt each slice with the real `age`.
+   For B, **sweep the frame size** (1, 4, 16 and 64 MiB of the tar stream): the frame sets
+   both what a lost slice costs and how well the data packs, and neither is measured on
+   real data.
 3. Read back with each reader: the newest tools on this host; Debian 10's (`debian:10-slim`:
    zstd 1.3.8, xz 5.2.4, gzip 1.9); BusyBox (`busybox` image) where it has the applet. For
    each: every slice decoded alone gives the cut; one file is restored from only its
@@ -377,6 +384,9 @@ document states compression, measure the readers an heir may have.
 7. For each algorithm, which readers exist: its own tool in Debian 10, in this host's
    release, and in BusyBox; whether a stock install of each has it without a package
    being added.
+   For shape B's two cuts (`tail -c +N | head -c M` before and after the decoder): GNU,
+   BusyBox and uutils `head` and `tail` (the `tapectl-u26` container has uutils; run it as
+   uid 1000). Only GNU and BusyBox are measured so far.
 8. The positive control, required: a slice stored with no compression goes through the
    same harness and every row passes. If it does not, the harness is wrong.
 
@@ -398,9 +408,11 @@ a comment.
 recommendation rests on it. **Read:** `.github/workflows/release.yml` (how the static musl
 binary is built); `Cargo.toml`.
 
-**Goal:** question 39 recommends that tapectl compress in-process. That adds a library for
-each algorithm to a binary that is built static for musl, and none has been tried there.
-Try it outside tapectl's tree.
+**Goal:** shape B of D15 has tapectl compress in-process, because a frame ends where the
+stream reader sees a member end. That adds a library for each algorithm to a binary that is
+built static for musl, and none has been tried there. Try it outside tapectl's tree. **If
+it fails, shape B falls back to one process of the host's tool for each frame**, which is a
+second writer's tool under items 273 and 274: say so plainly in the note.
 
 **Steps:**
 1. In a new, empty crate under `/scratch` (never in the repo), depend on one maintained
@@ -410,7 +422,8 @@ Try it outside tapectl's tree.
    target up. Record what had to be installed and every failure.
 3. Its one program compresses a file as one frame for each algorithm and decompresses it
    again. For each: the frame is read by the algorithm's own tool on this host, and a frame
-   made by the tool is read by the program.
+   made by the tool is read by the program. Then the same with several frames joined: the
+   tool decodes the joined frames in one call, and from the second frame alone.
 4. `ldd` on the binary says it is static. Record its size with and without each library.
 5. Run `cargo audit` on the crate's lock file and record the result.
 
@@ -473,11 +486,13 @@ the format document, flag by flag, from the commands #555 and the research note 
 
 **D3. The cut, and what each size means.** A slice is `slice_size` bytes of the stream, and
 the last slice is what remains. `slice_size` is a multiple of 512. With compression (D15)
-the order is cut, compress, encrypt. A slice's `size_bytes` and `sha256_plain` are of the
-**cut**, before compression, with or without it: a reader divides offsets by them. Its
-`encrypted_bytes` and `sha256_encrypted` are of the tape file. A slice's size on tape is at
-most its cut plus a stated bound for encryption and, with compression, for the algorithm's
-worst case; the early warning's rules and `post_warning_bytes` are held to that sum.
+what a slice's sizes mean depends on question 41. **Under shape B (recommended)** nothing
+changes: the stored stream is cut, every slice but the last is `slice_size`, and
+`size_bytes` and `sha256_plain` are of the bytes that are encrypted, as today. **Under shape
+A** the order is cut, compress, encrypt: `size_bytes` and `sha256_plain` are of the cut
+before compression, a slice's size on tape varies, and the format states a worst case for
+each algorithm that the early warning's rules and `post_warning_bytes` are held to. In both,
+`encrypted_bytes` and `sha256_encrypted` are of the tape file.
 
 **D4. The file table's text** (items 254, 264; #562). One file for each staging the tape
 holds, in that tenant's envelope, at `tables/<staging>.tsv`, named as `catalogs/` names a
@@ -593,41 +608,72 @@ pattern left out, and reports it. `init` writes an empty list.
 
 **D15. Compression** (item 280: "made available optionally for select archives"). Ruled:
 it is carried, off by default, chosen by `[defaults]`, an archive set or a unit's dotfile
-as today. What items 240, 241, 253 and 264 leave for its shape, as the amendment of
-2026-11-16 (night) writes it out:
+as today (the three layers are the coordinator's reading of "select archives"). #565 holds
+the measurements. **Its shape is question 41, and T0.5, T0.6 and Stage 1 come before any
+task that builds it.**
 
-- Each slice is compressed alone, after the cut and before it is encrypted (rule 11).
-- Offsets, `slice_size`, `size_bytes` and `sha256_plain` are of the stream before
-  compression (D3).
-- A slice that decompresses to more or less than its `size_bytes` is damage.
-- Inside a compressed slice, what follows a bad 64 KiB chunk cannot be decompressed: the
-  members with bytes from the bad chunk to the slice's end are left out.
-- The decompressor is a tool of the heir's for a unit that states compression, checked
-  before the tape is read, and only for such a unit.
-- The algorithm is frozen for a staging when it is staged, and is stated in the catalog
-  (`stage_sets.compression`, which exists) and in the MANIFEST's block (D6).
-- A compressed slice's size on tape follows its content, and the front index states every
-  tape file's size in plaintext. A reader with no key can therefore see how well each slice
-  of a compressed unit shrank, which an uncompressed unit's equal slices do not show. The
-  format's rule permits sizes; the threat model gains the sentence at Stage 1; an archive
-  for which it matters is not chosen for compression.
+*Two shapes meet items 241 and 264.* The amendment of 2026-11-16 (night) named only the
+first; that deduction was too narrow, and the correction is owed to the next amendment.
 
-**Three questions are the CTO's, and T4.5 stops until they are ruled** (#565):
+- **A. Each slice compressed alone.** Cut, compress, encrypt.
+- **B. The stream stored in frames, then cut as today.** The tar stream is compressed in
+  frames. A frame begins at a member's start. A member larger than a frame continues in
+  frames of its own, and the frame that holds its end closes there, so that no other member
+  begins in a frame that did not begin at a member's start. The frames, joined, are the
+  **stored stream**; it is cut into slices of `slice_size` and encrypted exactly as an
+  uncompressed stream is. The file table gains one column, `at`: where in the stored stream
+  the frame begins in which the member begins. A reader takes the stored bytes from `at` to
+  the first later frame that begins at or after the member's end, decodes them, and cuts
+  the member out by its offsets in the tar stream. A unit that is not compressed is the same
+  thing, with the tar stream as its own stored stream and no `at` column.
 
-- *Question 38, which algorithms.* dar offered seven. Each one carried costs the same
-  things whatever the data: a decompressor an heir may have to find, a gate leg, readers to
-  measure across versions, and under question 39's recommendation a library in the build.
-  Recommended, on that cost alone: `gzip`, `xz` and `zstd`; `bzip2`, `lzo`, `lzma` and
-  `lz4` go. `lzma` is xz's algorithm in an older container that xz's own tool reads. The
-  first check cannot rank the rest (its data was random words), so T0.5 measures all seven
-  on real data, and its table confirms the ruling or reopens it. Carrying all seven is the
-  other answer, and it is no cut.
-- *Question 39, who compresses.* Recommended: tapectl itself, writing the standard frame of
-  each algorithm, which adds a library for each algorithm to the static build and no second
-  tool to the host that writes; a gate leg for each algorithm reads the frames back with
-  the real tool. **Not yet tried:** those libraries in the static musl build (T0.6).
+| | A | B |
+|---|---|---|
+| Item 240's slice rules (W1 to W9, the short seal, ranges, spanning, resume, the retry, replacement by sha256, the capacity plan) | a slice's size on tape varies; "size" means two things; a worst case for each algorithm | **untouched**: equal slices, one meaning of size and hash |
+| A lost slice costs | the files with bytes in it | the frames with bytes in it: those files and their neighbours in each edge frame (**a widening of item 264's limit**) |
+| A bad 64 KiB chunk costs | everything to the slice's end | its frame |
+| One path | its slices, each decoded from its start | the slices its frame is in; one frame decoded |
+| The file table | as D4 | one more column |
+| Seen with no key | how well each slice shrank | nothing new |
+| Who compresses | tapectl or a host tool | tapectl (a frame ends where the stream reader sees a member end) |
+| Algorithms | any | those whose frames join and whose tool starts at any frame: zstd, xz, gzip, bzip2 measured; lz4 not measured; `lzo` and `lzma` cannot |
+
+Measured for B with a reader that was given only the table's text and the slices (#565):
+zstd, xz, gzip and bzip2 restore the whole unit through one decoder call, one small file
+from one slice of fifteen, a file over three frames, and every file outside a lost slice;
+BusyBox decodes xz, gzip and bzip2 and its `head` and `tail` make the cuts. The widening
+was 94 to 188 small files more than the lost span itself held, about one frame; with a
+16 MiB frame and a 1 GiB slice the two edge frames are about 3% of what the slice held.
+
+**The questions are the CTO's** (#565; #554):
+
+- *Question 41, the shape.* Recommended: **B**. The slice is where the design's hardest
+  rules are defined ("Careful about EOT logic and spanning"), and under B a compressed
+  unit's slices are the same objects as any other unit's. Its price is the widening above
+  and that tapectl itself compresses.
+- *Question 38, which algorithms.* Each one carried costs the same things whatever the
+  data: a decompressor an heir may have to find, a gate leg, readers to measure, a library
+  in the build. Recommended, on that cost alone: `gzip`, `xz` and `zstd`. T0.5 measures
+  every candidate on real data, and its table confirms the ruling or reopens it.
+- *Question 39, who compresses.* Under B, tapectl itself. **Not yet tried:** a library for
+  each algorithm in the static musl build (T0.6). Under A the choice is open.
 - *Question 40, a level.* Recommended: an optional `compression_level` beside
   `compression`, in the same three layers, with a stated default for each algorithm.
+
+**Stage 4's tasks below are written for shape A**, the first one recorded. If question 41
+is ruled B, T1.7 rewrites them with these deltas, and nothing else in them changes:
+
+- T4.2: the stream reader reports each member's end to the compressor as it passes.
+- T4.3: `stage_files` and the table's text gain `at`; the header states the stored
+  stream's length; `filetable::ranges` works in stored offsets, with the tar-stream offsets
+  for the cut after decoding; `held_whole` is "every slice of the member's stored range".
+- T4.5: the compressor sits **between the stream reader and the cutter** and ends a frame
+  by the frame rule; the cutter and everything after it are as for an uncompressed unit.
+- T4.6: the MANIFEST's block states `compression`; no slice field changes.
+- T4.8 and the heir's script: a run of members is a stored range that begins at a frame;
+  a bad chunk or a lost slice costs the frames it touches, and the next run starts at the
+  first frame after it.
+- T5.7: the same proofs, and one more: a reader given only what the tape carries.
 
 **D16. tapectl's own check after a restore.** Today tapectl's restore hashes restored files
 only after damage; the heir's script hashes every file every time. For Layout 3: tapectl
@@ -2156,9 +2202,11 @@ and built where shown.
 1. **The go**, stage by stage. Stage 2 needs nothing else. Stage 3 needs nothing else but
    D9 for T3.1. T0.1 and T0.2 are measurements in containers and change no code; they have
    not been started.
-2. **Questions 38 to 40** (D15, #565), now that compression is carried (item 280): which
-   algorithms, who compresses, and whether an archive may set a level. T4.5 waits on all
-   three. T0.5 and T0.6 wait on none of them and inform 38 and 39.
+2. **Question 41, then 38 to 40** (D15, #565), now that compression is carried (item 280).
+   41 is the shape: each slice compressed alone, or the stream stored in frames and then
+   cut as today (recommended, because it leaves every slice rule as it is). 38 (which
+   algorithms) and 39 (who compresses) largely follow from 41; 40 is whether an archive may
+   set a level. T4.5 waits on all four. T0.5 and T0.6 wait on none of them.
 3. **D1 to D18** as a list to see before Stage 1 writes them into the format document.
 4. **T0.3**: a go-ahead for a read-only run over the production host's collection, or a
    ruling that the scale proof is taken from Stage 6's real-drive acceptance (which changes
