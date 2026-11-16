@@ -78,9 +78,17 @@ the normative design set named in the Policy block below.
     one kind (item 273 was the first): a recommendation that rested on the present host or
     the present data. Before recommending that a feature be cut or a test be shaped, ask
     whether the reason is a fact about home2 or about keepsake; if it is, it is not a reason.
-    The shape (each slice compressed alone, after the cut, before encryption; offsets in the
-    stream before compression) is in the amendment, #565 and the plan's D15. Open with the
-    CTO: questions 38 (algorithms), 39 (who compresses), 40 (a level). The entry below says
+    THE SHAPE IS OPEN (question 41). The amendment deduced "each slice compressed alone"
+    (shape A); that was too narrow. After the CTO's "Consider how best to integrate with
+    current design", shape B was measured and is recommended: the tar stream compressed in
+    frames that begin at member boundaries, the joined frames cut and encrypted exactly as
+    an uncompressed stream, one more column in the file table. B leaves every slice rule of
+    item 240 untouched; its price is a widening of item 264's limit (a lost slice also costs
+    its edge frames' other files). Lesson: when a ruling adds a feature, look for the layer
+    where it leaves the ruled machinery untouched before writing "what the ruled items
+    leave". The comparison and the task deltas are in the plan's D15 and #565; Stage 4's
+    tasks are still written for A. Open with the CTO: question 41 (the shape), then 38
+    (algorithms), 39 (who compresses), 40 (a level). The entry below says
     D15 is open with a recommendation to remove: that is history.
   - **2026-11-16 (evening), items 274-279: "Ratify all, write up all plans in detail for
     worker LLM to implement in stages".** Questions 34a, 34b, 35 to 37 are RULED as

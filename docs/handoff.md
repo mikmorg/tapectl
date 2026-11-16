@@ -55,9 +55,10 @@ id map's shape is ruled (items 276-278). **The build is planned task by task in
 operator's there is T0.3 (a read-only scale run on home2, on a go-ahead), T0.4 (the escrow
 paper's `age-keygen -y` check), the host's tar, T6.6's real-drive runs and Stage 7. Open with
 the CTO: the go; the eighteen choices D1 to D18 that the format document must make; T0.3;
-and, since item 280 ruled that compression is carried (optional, for select archives, each
-slice compressed alone; #565), questions 38 to 40: which algorithms, who compresses, and
-whether an archive may set a level.
+and, since item 280 ruled that compression is carried (optional, for select archives; #565),
+question 41 (its shape: each slice compressed alone, or the stream stored in frames and cut
+as today, which is recommended) and questions 38 to 40 (which algorithms, who compresses,
+whether an archive may set a level).
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 
