@@ -86,8 +86,10 @@ the normative design set named in the Policy block below.
     item 240 untouched; its price is a widening of item 264's limit (a lost slice also costs
     its edge frames' other files). RE-WEIGHED the same night after the CTO's "I'm skeptical
     that b is better than a": the recommendation is now A. No rule of item 240 depends on
-    equal slices, and read by hand with no file table a B slice gives nothing alone and a
-    lost slice costs every file after it (a comment on #565). Lesson: before recommending
+    equal slices; through `age` and the stock decompressor an A slice decodes alone to its
+    plain cut (a compressed unit reads as an uncompressed one), while a B slice gives
+    nothing alone and the decompressor stops at a gap until the file table restarts it (a
+    comment on #565; what tar then gives depends on the tar, so quote no tar figure as a rule). Lesson: before recommending
     a layer that "protects the ruled machinery", check that the simpler shape breaks any of
     it, and ask what one slice gives the stock tools alone. Also asked that night: question
     42, do slices stay (#566; recommended yes). The comparison and the task deltas are in the plan's D15 and #565; Stage 4's

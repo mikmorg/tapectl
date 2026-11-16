@@ -631,8 +631,8 @@ first; that deduction was too narrow, and the correction is owed to the next ame
 |---|---|---|
 | Item 240's slice rules (W1 to W9, the short seal, ranges, spanning, resume, the retry, replacement by sha256, the capacity plan) | hold as written: each is defined on a slice's number, position and hash, and none on equal sizes. A slice's size on tape varies, and the format states a worst case for each algorithm | hold as written; slices stay equal |
 | A lost slice costs | the files with bytes in it | the frames with bytes in it: those files and their neighbours in each edge frame (**a widening of item 264's limit**) |
-| A lost slice, read by hand with no file table (measured, #565) | the files with bytes in it | every file after it: the decompressor stops at the gap |
-| One slice alone, read by hand (measured, #565) | the files it holds whole | nothing: it begins inside a frame |
+| One slice alone, through `age` and the decompressor (measured, #565) | exactly its plain cut, so a compressed unit reads as an uncompressed one does, with any reader and any tar | nothing: it begins inside a frame |
+| A unit with a slice lost, through `age` and the decompressor (measured, #565) | exactly every other slice's plain cut | the bytes before the gap; the decompressor starts again only from the file table's `at` |
 | A bad 64 KiB chunk costs tapectl's own reader (the heir's `age` loses the slice in either shape, item 101) | everything to the slice's end (**a widening of item 101(b)**, repaired by slice replacement) | its frame |
 | One path | its slices, each decoded from its start | the slices its frame is in; one frame decoded |
 | The file table | as D4 | one more column |
@@ -662,8 +662,10 @@ have to be reworded for a compressed unit.
 - *Question 41, the shape.* Recommended: **A** (revised 2026-11-16 after the CTO's "I'm
   skeptical that b is better than a"; first recorded as B, on this table's first row,
   which did not hold when checked: no rule of item 240 depends on equal slices). Under A
-  a slice is read alone by the stock tools, with or without the file table, and item
-  264's limit stands as it reads. B's advantage is that nothing new shows without a key.
+  a slice decodes alone to its plain cut, so a compressed unit reads exactly as an
+  uncompressed one does, and item 264's limit stands as it reads. Under B the
+  decompressor is a stage that needs the file table to pass a gap. B's advantage is that
+  nothing new shows without a key.
   The re-weighing and its measurement are a comment on #565.
 - *Question 38, which algorithms.* Each one carried costs the same things whatever the
   data: a decompressor an heir may have to find, a gate leg, readers to measure, a library
@@ -2223,7 +2225,7 @@ and built where shown.
    not been started.
 2. **Question 41, then 38 to 40** (D15, #565), now that compression is carried (item 280).
    41 is the shape: each slice compressed alone (recommended since the re-weighing on
-   #565: a slice is then read alone by the stock tools), or the stream stored in frames
+   #565: a slice then decodes alone to its plain cut), or the stream stored in frames
    and then cut as today. 38 (which
    algorithms) and 39 (who compresses) largely follow from 41; 40 is whether an archive may
    set a level. T4.5 waits on all four. T0.5 and T0.6 wait on none of them.
