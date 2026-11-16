@@ -92,7 +92,11 @@ the normative design set named in the Policy block below.
     comment on #565; what tar then gives depends on the tar, so quote no tar figure as a rule). Lesson: before recommending
     a layer that "protects the ruled machinery", check that the simpler shape breaks any of
     it, and ask what one slice gives the stock tools alone. Also asked that night: question
-    42, do slices stay (#566; recommended yes). The comparison and the task deltas are in the plan's D15 and #565; Stage 4's
+    42, do slices stay (#566; recommended yes). THEN the CTO: "I'm ok changing the
+    EOT/spanning logic for optimal overall design" = #567: question 43 (a slice ends at a
+    member's start; measured, recommended; if yes, question 41 is A) and question 44 (every
+    unit continues at the early warning, queued to fill; reasoned, recommended; reverses
+    items 9 and 82's opt-in). Neither ruled; permission is not the go. The comparison and the task deltas are in the plan's D15 and #565; Stage 4's
     tasks are still written for A. Open with the CTO: question 41 (the shape), then 38
     (algorithms), 39 (who compresses), 40 (a level). The entry below says
     D15 is open with a recommendation to remove: that is history.

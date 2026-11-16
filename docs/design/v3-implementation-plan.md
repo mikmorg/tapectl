@@ -494,6 +494,13 @@ before compression, a slice's size on tape varies, and the format states a worst
 each algorithm that the early warning's rules and `post_warning_bytes` are held to. In both,
 `encrypted_bytes` and `sha256_encrypted` are of the tape file.
 
+*Asked on 2026-11-16 and not ruled (#567, question 43):* that a slice end at a member's
+start (whole members, as many as fit in `slice_size`; a member larger than a slice gets a
+run of slices to itself), so that each slice is an archive any tar reads alone. If it is
+ruled, this paragraph is rewritten, shape A follows for D15, and the file table states
+each member's slice. Question 44 there (every unit continues at the early warning) would
+change T5.1's policy and not W1 to W9.
+
 **D4. The file table's text** (items 254, 264; #562). One file for each staging the tape
 holds, in that tenant's envelope, at `tables/<staging>.tsv`, named as `catalogs/` names a
 staging's dar catalogue today. Tab-separated, one row for each member, in stream order,

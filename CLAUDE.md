@@ -316,6 +316,25 @@ ruled, and neither message was the go.** When weighing a format choice, ask firs
 slice gives the stock tools alone, with no file table, and state it by what does not depend
 on the tar.
 
+**2026-11-16 (last): the EOT and spanning logic may change, and two questions follow** (#567).
+The CTO: "I'm ok changing the EOT/spanning logic for optimal overall design". That lifted the
+constraint #566 had held (the early-warning and spanning rules as proven), and #567 withdraws
+two things #566 said: "keep the plain cut", and the acceptances of 1.6.0 to 1.8.0 as a reason
+against change. **Question 43** (measured): a slice ends at a member's start, holding whole
+members; a member larger than `slice_size` gets a run of slices to itself; the slices joined
+are the same stream. With no file table and each slice in its own tar run, a plain cut fails
+every run (GNU tar 2,396 of 2,428 files, BusyBox tar 168) and a cut at member starts fails
+none (2,428 with both); a lost slice costs exactly its files at exit 0. Its price: a slice's
+size on tape follows the files in it (a file over half a slice shows its size without a key,
+finer than the per-unit sizes accepted on 2026-07-22), and up to about twice the slices. If
+it is ruled yes, question 41 is A by consequence and question 42 is answered. **Question 44**
+(reasoned, not measured): every unit continues on the next cartridge at the early warning,
+with the queue filled to it. W1 to W9 stay as measured; the `cut` unit, `allow_spanning` and
+the planner's two classes go; `volume rewrite` and compaction must carry a range; it reverses
+item 9 and item 82's opt-in, and one tape then no longer holds only whole units. Both are
+recommended and **neither is ruled; the permission is not the go.** Not yet run: bsdtar and
+GNU tar 1.30 on a slice with no end-of-archive blocks, needed before the format document.
+
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
