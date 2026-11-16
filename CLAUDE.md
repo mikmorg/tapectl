@@ -237,13 +237,32 @@ designing down. So the format is not bent to tar 1.30, and item 270 stands as it
 readings recorded with it: it concerns the host that WRITES (the heir's readers stay as wide
 as they were); no name is in the stream, an ACL is stored once in the record a reader's
 ordinary flags restore (the readers' measurement picks it), and the proof is tapectl's own
-check of the stream, with the tar version as the early refusal. Open in #554: 34a (does the
-floor, GNU tar 1.35 with ACL support, bind every host that writes; Debian 11 and 12 and Ubuntu
-22.04 ship 1.34), 34b (how home2 gets such a tar: built into `/usr/local` as dar 2.7.21 was, or
-an OS upgrade before Phase 6's real-drive proofs), and 35 to 37 (#564, the id map's shape:
-whether each tenant envelope carries it as text, what it holds, whether a restore shows it or
-acts on it). Phase 1's format document depends on 34a, 35 and 36; the sixteen fixes of Phase 2
-depend on none of them. Still no go.
+check of the stream, with the tar version as the early refusal.
+
+**2026-11-16 (evening): questions 34 to 37 are ruled, and the build is planned in stages**
+(ADR-0012 items 274-279; the CTO: "Ratify all, write up all plans in detail for worker LLM to
+implement in stages"). The writer's floor, GNU tar 1.35 built with ACL support, binds every
+host that writes: tapectl 2.0.0 refuses to stage below it, and its own check of the stream is
+the proof, both ways (a name in the stream; a file's ACL missing from it, which is what a
+1.35 built without ACL support produces) (274). home2 gets its tar built from the upstream
+release into `/usr/local`, as dar 2.7.21 was (275; not yet tried on Debian 10). Each tenant
+envelope carries the id map as text beside the file table (276); it holds, per staging, every
+user and group id the stream carries with the name the host gave or none (277); a restore
+shows it and never acts on it (278). **The plan is `docs/design/v3-implementation-plan.md`**
+(279): #554's phases as tasks `T<stage>.<n>`, each with its owner (worker, coordinator,
+operator, CTO), what it depends on, the texts it is read with, its fence, its traps and what
+proves it done; Appendix A maps every issue, item and #562 rule to a task. Read it before
+dispatching any worker, and build worker prompts from it and `.claude/commands/worktree-agent.md`.
+What it fixed: Stage 2 is FIFTEEN fixes (never sixteen) in seven tasks and three waves,
+because #554's a-to-f grouping put #544, #540, #536 and #529 beside files another group
+edits; Stage 2 lands on `master`, Stages 3 to 5 on the integration branch `layout-3`; the
+suite stays green through the payload's replacement by tests marked `L3-pending T4.<n>`.
+Stage 1 (the Layout 3 format document) is the coordinator's, never a worker's, and waits on
+T0.1 (which ACL record the readers restore). **That message was not the go either: build
+nothing.** Waiting on the CTO (the plan's Appendix B): the go; D15, what becomes of
+`compression` under tar, which no item rules and which is a feature cut if removed; the
+eighteen byte, schema and command-line choices D1 to D18, to be seen before Stage 1 writes
+them; and T0.3, real scale on home2 or its move to Stage 6.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

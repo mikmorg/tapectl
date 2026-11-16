@@ -47,9 +47,15 @@ stream is written with `--numeric-owner`, and a user and group id map is stored 
 home2's tar is GNU tar 1.30, which writes names in an ACL's text record even with
 `--numeric-owner`; the first release that writes numbers is 1.35 (#563). So before 2.0.0
 stages anything on home2, home2 has a GNU tar that meets the floor, and the handoff for the
-production run carries that step as question 34b is ruled. Open with the CTO: 34a and 34b
-(#563: whether the floor binds every host that writes, and how home2 gets its tar), 35 to 37
-(#564: the id map's shape), and the go.
+production run carries that step: GNU tar 1.35 or later built from the upstream release into
+`/usr/local`, the system's tar left as it is (item 275; the build is tried in a Debian 10
+container first, the plan's T0.2). The floor binds every host that writes (item 274), and the
+id map's shape is ruled (items 276-278). **The build is planned task by task in
+`docs/design/v3-implementation-plan.md`** (item 279), with an owner for each task; what is the
+operator's there is T0.3 (a read-only scale run on home2, on a go-ahead), T0.4 (the escrow
+paper's `age-keygen -y` check), the host's tar, T6.6's real-drive runs and Stage 7. Open with
+the CTO: the go; what becomes of `compression` under tar (the plan's D15); the eighteen
+choices D1 to D18 that the format document must make; and T0.3.
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

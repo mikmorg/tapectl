@@ -71,6 +71,22 @@ the normative design set named in the Policy block below.
     readers splice by the file table (264), and the acceptance run tags `v2.0.0` first (268).
     "RATIFY ALL" WAS NOT THE GO: start neither Phase 1 nor Phase 2. #556 to #561 are no
     longer `needs:cto`; their remaining criteria are build work.
+  - **2026-11-16 (evening), items 274-279: "Ratify all, write up all plans in detail for
+    worker LLM to implement in stages".** Questions 34a, 34b, 35 to 37 are RULED as
+    recommended (floor = GNU tar 1.35 with ACL support on every writer; home2's tar built into
+    `/usr/local`; the id map also in each tenant envelope, per staging, shown and never acted
+    on). **THE PLAN IS `docs/design/v3-implementation-plan.md`: read its sections 1 to 6 and
+    the stage you are in before dispatching anything.** It supersedes #554's phase list where
+    they differ: Stage 2 is FIFTEEN fixes in seven tasks (T2.1 to T2.7) and three waves, on
+    `master`; Stages 3 to 5 are on the integration branch `layout-3`; a worker's prompt is
+    `.claude/commands/worktree-agent.md` plus the task's entry, with the normative set the
+    plan's section 1 names for that stage (Layout 2's texts for Stages 2 and 3, Layout 3's
+    from Stage 4). Stage 1 is the COORDINATOR's and waits on T0.1. STILL NO GO: that message
+    asked for the plan. Open with the CTO (the plan's Appendix B): the go; D15 (`compression`
+    under tar: unruled, a feature cut if removed); D1 to D18; T0.3 (real scale on home2). On
+    the go, T0.1 and T0.2 (container measurements) and Stage 2's wave 1 can start at once.
+    Where the two entries below say "34a, 34b, 35 to 37 are open" or "sixteen fixes", they
+    are history.
   - **2026-11-16 (later still), item 273: "Do not lower standards to home2 current
     toolchain".** NEVER recommend bending the design to an old tool on home2: say what the
     design needs and that home2 is brought up to it. It came from #563: GNU tar 1.30 (home2's)
