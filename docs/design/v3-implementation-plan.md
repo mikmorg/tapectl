@@ -14,7 +14,7 @@ with the same numbers:
 
 | Stage | What | Lands on | Owner | Worker-ready as written? |
 |---|---|---|---|---|
-| 0 | Measure before any code | no code; a dated note | worker, operator | yes (T0.1, T0.2, T0.5); T0.3 and T0.4 need the operator |
+| 0 | Measure before any code | no code; a dated note | worker, operator | yes (T0.1, T0.2, T0.5, T0.6, and T0.3's second leg); T0.3's first leg and T0.4 need the operator |
 | 1 | The normative set: the Layout 3 format document and its companions | `master` (documents) | **coordinator** | no: it is written by the coordinator, and §S1 lists what it must decide |
 | 2 | Fifteen fixes that depend on nothing else | `master` | workers, three at a time | yes, on the go |
 | 3 | Compatibility out | `layout-3` | workers | yes, on the go and after Stage 2; T3.1 also needs the CTO to have seen D9 (how a 2.x catalog is known) |
@@ -216,6 +216,7 @@ the table says what it holds back.
 | T0.3 Real scale, in two legs | Stage 4 (item 253's own condition) | first leg: coordinator, on the operator's go-ahead; second leg: worker |
 | T0.4 The escrow paper | Stage 7 (item 244) | operator |
 | T0.5 The decompressors on a slice compressed alone | Stage 1 (the format's section on compression), T4.5 | worker |
+| T0.6 The compression libraries in the static build | question 39, if it is ruled for tapectl compressing itself; T4.5 | worker |
 
 A Stage 0 task changes nothing under `src/`, `tests/` or `scripts/`. Its product is a dated
 note under `docs/research/`, which the coordinator lands, and a comment on the issue.
@@ -346,8 +347,10 @@ mints a new escrow identity. Gates Stage 7 only.
 
 ### T0.5 The decompressors on a slice compressed alone
 
-**Owner:** worker. **Depends:** question 38 ruled (which algorithms). **Carries out:** item
-280; #565's third criterion. **Read:** #565, whole, and its first comment (the method and
+**Owner:** worker. **Depends:** nothing. **Carries out:** item 280; #565's third criterion.
+It measures **all seven** algorithms dar offered (gzip, bzip2, lzo, xz, lzma, zstd, lz4), so
+that question 38 is ruled, or its ruling checked, on real data and not on the first check's
+random words. **Read:** #565, whole, and its first comment (the method and
 the script of the first check).
 
 **Goal:** what was measured on 2026-11-16 used this host's tools only. Before the format
@@ -357,8 +360,8 @@ document states compression, measure the readers an heir may have.
 1. Make the stream and the cut as #565's script does, with the writer's flags, on a tree
    that also holds real data of several kinds (text, source code, a database dump, images
    that do not shrink). Record where the data came from; use nothing private.
-2. For each algorithm carried, compress each slice alone, as one frame, at the level
-   question 40 leaves as the default. Encrypt each with the real `age`.
+2. For each of the seven, compress each slice alone, as one frame, with its own tool, at
+   the tool's default level and at its highest. Encrypt each with the real `age`.
 3. Read back with each reader: the newest tools on this host; Debian 10's (`debian:10-slim`:
    zstd 1.3.8, xz 5.2.4, gzip 1.9); BusyBox (`busybox` image) where it has the applet. For
    each: every slice decoded alone gives the cut; one file is restored from only its
@@ -368,9 +371,13 @@ document states compression, measure the readers an heir may have.
    the decompressor after it writes and how it exits, and which members come out whole.
 5. The growth bound: for each algorithm, the largest growth over slices of bytes that do
    not shrink, at 4 MiB, 1 GiB and the largest `slice_size` in use.
-6. Speed: megabytes a second to compress and to decompress, for each algorithm at its
-   default level and at its highest, on the real data. Staging time is the operator's cost.
-7. The positive control, required: a slice stored with no compression goes through the
+6. Size and speed on the real data, for each kind of data apart: the packed size, and the
+   megabytes a second to compress and to decompress, at the default level and at the
+   highest. Staging time is the operator's cost.
+7. For each algorithm, which readers exist: its own tool in Debian 10, in this host's
+   release, and in BusyBox; whether a stock install of each has it without a package
+   being added.
+8. The positive control, required: a slice stored with no compression goes through the
    same harness and every row passes. If it does not, the harness is wrong.
 
 **Traps:**
@@ -382,7 +389,38 @@ document states compression, measure the readers an heir may have.
   library-made frames against the real tools.
 
 **Done when:** a note holds the tables (reader × algorithm), the damage rows, the growth
-bound and the speeds, with the method so it can be repeated; #565 has a comment.
+bound, and size and speed by kind of data, with the method so it can be repeated; #565 has
+a comment.
+
+### T0.6 The compression libraries in the static build
+
+**Owner:** worker. **Depends:** nothing. **Carries out:** #565; question 39's
+recommendation rests on it. **Read:** `.github/workflows/release.yml` (how the static musl
+binary is built); `Cargo.toml`.
+
+**Goal:** question 39 recommends that tapectl compress in-process. That adds a library for
+each algorithm to a binary that is built static for musl, and none has been tried there.
+Try it outside tapectl's tree.
+
+**Steps:**
+1. In a new, empty crate under `/scratch` (never in the repo), depend on one maintained
+   library for each of the seven algorithms. Record each crate, its version, its licence,
+   whether it builds C source, and its last release date.
+2. Build it in **debug** for `x86_64-unknown-linux-musl`, the way `release.yml` sets the
+   target up. Record what had to be installed and every failure.
+3. Its one program compresses a file as one frame for each algorithm and decompresses it
+   again. For each: the frame is read by the algorithm's own tool on this host, and a frame
+   made by the tool is read by the program.
+4. `ldd` on the binary says it is static. Record its size with and without each library.
+5. Run `cargo audit` on the crate's lock file and record the result.
+
+**Traps:**
+- Debug only. No release build. `CARGO_TARGET_DIR` under `/scratch`, under the build lock.
+- An algorithm with no library that writes the frame its own tool reads is a finding, not
+  something to work around: say which.
+
+**Done when:** a note holds the table (algorithm, crate, builds static or not, tool reads
+library frame, library reads tool frame, size added); #565 has a comment.
 ---
 
 ## S1. Stage 1: the normative set (no code)
@@ -568,16 +606,26 @@ as today. What items 240, 241, 253 and 264 leave for its shape, as the amendment
   before the tape is read, and only for such a unit.
 - The algorithm is frozen for a staging when it is staged, and is stated in the catalog
   (`stage_sets.compression`, which exists) and in the MANIFEST's block (D6).
+- A compressed slice's size on tape follows its content, and the front index states every
+  tape file's size in plaintext. A reader with no key can therefore see how well each slice
+  of a compressed unit shrank, which an uncompressed unit's equal slices do not show. The
+  format's rule permits sizes; the threat model gains the sentence at Stage 1; an archive
+  for which it matters is not chosen for compression.
 
 **Three questions are the CTO's, and T4.5 stops until they are ruled** (#565):
 
-- *Question 38, which algorithms.* dar offered seven. Each one carried is a decompressor an
-  heir may have to find, a gate leg, and readers to measure. Recommended: `gzip`, `xz` and
-  `zstd`; `bzip2`, `lzo`, `lzma` and `lz4` go.
+- *Question 38, which algorithms.* dar offered seven. Each one carried costs the same
+  things whatever the data: a decompressor an heir may have to find, a gate leg, readers to
+  measure across versions, and under question 39's recommendation a library in the build.
+  Recommended, on that cost alone: `gzip`, `xz` and `zstd`; `bzip2`, `lzo`, `lzma` and
+  `lz4` go. `lzma` is xz's algorithm in an older container that xz's own tool reads. The
+  first check cannot rank the rest (its data was random words), so T0.5 measures all seven
+  on real data, and its table confirms the ruling or reopens it. Carrying all seven is the
+  other answer, and it is no cut.
 - *Question 39, who compresses.* Recommended: tapectl itself, writing the standard frame of
-  each algorithm, which adds three dependencies to the static build and no second tool to
-  the host that writes; a gate leg for each algorithm reads the frames back with the real
-  tool.
+  each algorithm, which adds a library for each algorithm to the static build and no second
+  tool to the host that writes; a gate leg for each algorithm reads the frames back with
+  the real tool. **Not yet tried:** those libraries in the static musl build (T0.6).
 - *Question 40, a level.* Recommended: an optional `compression_level` beside
   `compression`, in the same three layers, with a stated default for each algorithm.
 
@@ -1099,6 +1147,9 @@ is integrated):
 3. Add `acl` (for `setfacl` and `getfacl`) to what `.github/workflows/ci.yml` installs, and
    to `tests/test_dependencies.rs`'s named requirements, beside dar for now.
 4. Confirm the runner's tar meets the floor: `tar --version` in a CI step, kept as a step.
+5. Add the decompressor of each algorithm question 38 carries to what `ci.yml` installs and
+   to `tests/test_dependencies.rs`'s named requirements: T4.5's and T4.8's tests read
+   library-made frames back with the real tools.
 
 ### T4.1 The writer: GNU tar run with the format's exact command line, and the floor
 
@@ -2044,7 +2095,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #538 | T2.4 | #562 | T1.1, and the tasks in the third table |
 | #539 | T2.3 | #563 | T0.1, T0.2, T4.1, T4.2, T4.5, T4.13, T4.14 |
 | #540 | T2.4 | #564 | T1.3, T4.3, T4.5, T4.6, T4.8, T4.9, T4.11 |
-| #541 | T2.1 | #565 | T0.5, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
+| #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
 
 **ADR-0012's items from 239.**
 
@@ -2106,8 +2157,8 @@ and built where shown.
    D9 for T3.1. T0.1 and T0.2 are measurements in containers and change no code; they have
    not been started.
 2. **Questions 38 to 40** (D15, #565), now that compression is carried (item 280): which
-   algorithms, who compresses, and whether an archive may set a level. T0.5 waits on 38;
-   T4.5 waits on all three.
+   algorithms, who compresses, and whether an archive may set a level. T4.5 waits on all
+   three. T0.5 and T0.6 wait on none of them and inform 38 and 39.
 3. **D1 to D18** as a list to see before Stage 1 writes them into the format document.
 4. **T0.3**: a go-ahead for a read-only run over the production host's collection, or a
    ruling that the scale proof is taken from Stage 6's real-drive acceptance (which changes

@@ -277,11 +277,15 @@ the stream before compression; a slice on tape can be slightly larger than its c
 a compressed slice a bad chunk costs everything to the slice's end; the heir needs the
 decompressor only for a unit that states compression. A decompressor's exit status is never
 the verdict (BusyBox `unxz` exits 0 after writing wrong bytes). Open with the CTO, in #565
-and #554: question 38 (which algorithms; recommended gzip, xz, zstd), 39 (who compresses;
-recommended tapectl itself, three new dependencies), 40 (a level; recommended an optional
-`compression_level`). The plan carries it: T0.5 (the older and smaller decompressors,
-gating Stage 1), T4.5, T4.6, T4.8, the heir's script, a gate leg for each algorithm, and
-T5.7. T0.3 gained a second leg of millions of small members. Still no go.
+and #554: question 38 (which algorithms; recommended gzip, xz, zstd on reader and build
+cost alone, since the first check's random words cannot rank them), 39 (who compresses;
+recommended tapectl itself, with a library for each algorithm, untried in the static musl
+build), 40 (a level; recommended an optional `compression_level`). The plan carries it: T0.5
+(all seven algorithms on real data, the older and smaller decompressors, real `age`),
+T0.6 (the libraries in the static build), T4.5, T4.6, T4.8, the heir's script, a gate leg
+for each algorithm, and T5.7. T0.3 gained a second leg of millions of small members. One
+thing a compressed unit shows that an uncompressed one does not: its slices' sizes on tape
+follow their content, and the front index states sizes in plaintext. Still no go.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

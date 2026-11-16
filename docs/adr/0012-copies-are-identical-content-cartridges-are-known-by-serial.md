@@ -3206,9 +3206,8 @@ ensure proper compression is made available optionally for select archives. My e
 (keepsakes) are not the only content in perpetuity".
 
 280. **Compression is made available, optionally, for select archives** (the CTO's words). The
-     `compression` setting is carried to Layout 3. It is off unless an archive asks for it,
-     and an archive asks as it does today: by `[defaults]`, by its archive set, or by the
-     unit's dotfile, the most specific winning. The recommendation to remove it is withdrawn.
+     `compression` setting is carried to Layout 3, and an archive is compressed only when it
+     is chosen for it. The recommendation to remove the setting is withdrawn.
 281. **The design is not sized to the present corpus** (the CTO's words: "My example data
      (keepsakes) are not the only content in perpetuity"). `keepsake` is an example of what
      tapectl holds. What it will hold in later years is not known, and a recommendation does
@@ -3237,20 +3236,30 @@ ensure proper compression is made available optionally for select archives. My e
   touch the chunk.
 - *The heir needs the decompressor* for a unit that states compression. File 1 and the script
   name it before the tape is read.
+- *A compressed slice's size on tape follows its content.* Without compression every full
+  slice of a unit has one size. The front index states each tape file's size in plaintext,
+  as it always has: sizes and ciphertext hashes are the plaintext facts the format permits.
+  So a reader with no key can see how well each slice of a compressed unit shrank. No rule
+  is broken, and it is something a tape did not show before. An archive for which that
+  matters is not chosen for compression.
 
 **Measured for it** (#565 holds the method and the tables; this host's tools only: zstd 1.5.5,
 xz 5.4.5, gzip 1.12, bzip2 1.0.8, lzop 1.04, BusyBox 1.36.1; a 25 MB stream cut in 4 MiB
-slices). Each line is MEASURED.
+slices). Each line is MEASURED unless it says otherwise.
 
 - With each of the five, a slice compressed alone decompresses to the cut; one file is
   restored from only the slices its range touches; and a member that lies across two slices
   is restored from those two.
 - BusyBox reads xz, gzip, bzip2 and lzop. It has no zstd applet in this build.
-- A slice cut short, which is what a decompressor is given when `age` stops at a bad chunk,
-  makes every one of them exit non-zero after writing a correct prefix.
-- A flipped byte in the compressed data makes the GNU tools exit non-zero after writing
-  wrong bytes. BusyBox `unxz` writes the wrong bytes and exits 0. So a decompressor's exit
-  status is not the verdict, as tar's is not: the per-file sha256 check is.
+- A slice cut short makes every one of them exit non-zero after writing a correct prefix.
+  REASONED, not measured: that is what a decompressor is given when `age` stops at a chunk
+  that fails its check. Real `age` was not in the pipeline.
+- A flipped byte in the compressed data: zstd, xz, gzip and bzip2 exit non-zero after
+  writing wrong bytes; lzop exits non-zero after a correct prefix; BusyBox `unxz` writes the
+  wrong bytes and exits 0. So a decompressor's exit status is not the verdict, as tar's is
+  not: the per-file sha256 check is.
+- The ratios measured say nothing: the text was random words. On it bzip2 was the smallest
+  and the fastest, which shows only that this data cannot rank the algorithms.
 - Four mebibytes that do not shrink grow by 106 bytes under zstd, 272 under xz, 658 under
   gzip, 234 under lzop, and 19,298 (0.46%) under bzip2.
 - GNU tar takes `--directory` in order: given after `--files-from`, the list is read against
@@ -3263,8 +3272,9 @@ library and read by the tools, real `age` in the pipeline, and data that is not 
 **Readings, not rulings, said so that they can be corrected:**
 
 - *This is not the go.* Nothing is built on it.
-- *"Select archives"* is the three layers that set `compression` today. No new way to choose
-  is added, and the default stays `none`.
+- *"Select archives"* is read as the three layers that set `compression` today: `[defaults]`,
+  an archive set, and a unit's dotfile, the most specific winning. No new way to choose is
+  added, and the default stays `none`.
 - *The reach of item 281.* It is about more than compression. Where a recommendation of the
   coordinator's rested on what `keepsake` holds, it is looked at again. Two were found: the
   removal of compression (withdrawn by item 280), and the shape of the real-scale measurement,
@@ -3277,6 +3287,7 @@ Not ruled, and asked in #554:
 - Question 38: which algorithms Layout 3 carries. dar offered seven. Each one carried is a
   decompressor an heir may have to find.
 - Question 39: who compresses, tapectl itself or a tool on the host. The first adds
-  dependencies to the build. The second is a second writer's tool, under items 273 and 274.
+  dependencies to the build, and they have not been tried in the static build. The second
+  is a second writer's tool, under items 273 and 274.
 - Question 40: whether an archive may set a level.
 - The go. No build has been asked for, and nothing is built.
