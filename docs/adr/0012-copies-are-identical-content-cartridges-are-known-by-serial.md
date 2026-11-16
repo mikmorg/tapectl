@@ -3134,3 +3134,66 @@ Not ruled, and asked in #554:
   binds every host that writes; and how the production host gets a tar that meets it.
 - Questions 35 to 37 (#564), as they were.
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-16 (evening): questions 34 to 37 are ruled, and the build is planned in stages
+
+Ruled 2026-11-16, in answer to questions 34a, 34b and 35 to 37 as #554 put them after item 273.
+The CTO's words, whole: "Ratify all, write up all plans in detail for worker LLM to implement in
+stages".
+
+274. **The writer's floor binds every host that writes** (question 34a, #563). The floor is GNU
+     tar 1.35 built with ACL support. tapectl 2.0.0 refuses to stage with a GNU tar below it,
+     and names the floor. The version is the early refusal. The proof, on any version, is
+     tapectl's own check of the stream as it passes, and it goes both ways: a staging whose
+     stream holds a user or group name is refused, and so is one whose stream has lost the ACL
+     of a file that has one on disk. A host on Debian 11 or 12 or Ubuntu 22.04 needs a newer
+     tar before it writes. One standard holds for the operator's host and for a friend's.
+275. **The production host gets its tar built from the upstream release** (question 34b, #563).
+     GNU tar 1.35 or later is built into `/usr/local` with ACL support, and the system's tar
+     is left as it is, the way `home2-prep.sh` built dar 2.7.21. This does not ask for an
+     upgrade of that host's operating system. The build has not been tried on Debian 10: it is
+     a measurement owed before the host's step (#554, Phase 0).
+276. **Each tenant envelope carries the id map too** (question 35, #564; item 272). The catalog
+     database holds it, and `db backup`, the Heir Kit's catalogue and every tape's operator
+     `catalog.db` carry what the database holds. Each tenant envelope carries it as text beside
+     the file table, for each staging that envelope holds, and it names only that tenant's own
+     ids. It is in no plaintext file of the tape.
+277. **What the map holds** (question 36, #564). For each staging: every user id and group id
+     that its stream carries, as a member's owner or group and in an ACL entry, with the name
+     the host gave that id when the stream was written, or no name when the host knew none. It
+     is per staging, because an id can be renamed or given to another account between
+     stagings.
+278. **A restore shows the map and never acts on it** (question 37, #564). tapectl's restore
+     and the heir's script print it for the unit restored. A restore is by number. No remap by
+     name is built.
+279. **The build is planned in stages for worker agents** (the CTO's words: "write up all plans
+     in detail for worker LLM to implement in stages"). The plan is
+     `docs/design/v3-implementation-plan.md`. Each task in it names its owner (a worker, the
+     coordinator, the operator, or the CTO's go-ahead), the texts it is read with, the files
+     it may change, and what proves it done.
+
+**A correction to the amendment before this one.** That amendment says GNU tar 1.35 built
+without ACL support "keeps the names, after one warning". Read again in the same source
+(`src/xattrs.c`, `acls_get_text`), that is wrong. Such a build warns once that
+`--numeric-owner` is ignored for ACLs, makes no text, and the member carries no ACL record at
+all. Item 273's reading stands with one more half: tapectl's check of the stream refuses a
+name in it, and refuses a file's ACL missing from it. Item 274 states both.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *This is not the go either.* It asks for the plans. Nothing is built on it: no change under
+  `src/`, no pin, and no Layout 3 format document, which is Stage 1 of the plan.
+- *The three readings recorded with item 273 stand as readings.* They were put to the CTO on
+  2026-11-16 with the five questions and were not corrected.
+- *A tar that is not GNU tar is refused as one below the floor is.* Item 253 names GNU tar as
+  the writer; item 274's words speak only of a GNU tar's version.
+- *Where the early refusal is said.* Wherever tapectl or its scripts check a host's tools:
+  `config check`, `setup`, `first-run.sh` and `stage create`, as #563 lists them.
+- *What the format document decides is shown first.* The choices no item makes at the level of
+  bytes, schema or command line (the file table's and the id map's text, the MANIFEST and
+  File 0 fields, the magic, the baseline schema, the modes of the heir's script) are listed in
+  the plan as proposals. Each is the CTO's to see before anything is built on it.
+
+Not ruled:
+
+- The go. No build has been asked for, and nothing is built.
