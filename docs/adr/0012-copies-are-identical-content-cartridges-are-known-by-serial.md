@@ -3197,3 +3197,86 @@ name in it, and refuses a file's ACL missing from it. Item 274 states both.
 Not ruled:
 
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-16 (night): compression is carried, and the design is not sized to one corpus
+
+Ruled 2026-11-16, in answer to the plan's D15, which asked what becomes of the `compression`
+setting under the tar payload and recommended removing it. The CTO's words, whole: "We need to
+ensure proper compression is made available optionally for select archives. My example data
+(keepsakes) are not the only content in perpetuity".
+
+280. **Compression is made available, optionally, for select archives** (the CTO's words). The
+     `compression` setting is carried to Layout 3. It is off unless an archive asks for it,
+     and an archive asks as it does today: by `[defaults]`, by its archive set, or by the
+     unit's dotfile, the most specific winning. The recommendation to remove it is withdrawn.
+281. **The design is not sized to the present corpus** (the CTO's words: "My example data
+     (keepsakes) are not the only content in perpetuity"). `keepsake` is an example of what
+     tapectl holds. What it will hold in later years is not known, and a recommendation does
+     not rest on what the present collection happens to contain.
+
+**What the ruled items leave for the shape.** This is not a new ruling. It is what items 240,
+241, 253 and 264 allow, written out so that it can be corrected.
+
+- *Each slice is compressed by itself, after the cut and before it is encrypted.* tar has no
+  compression of a member (item 253 has GNU tar write the stream). Compressing the whole
+  stream would make every byte after a lost slice unreadable, against item 241's limit as
+  item 264 reads it: a lost slice costs the files that have bytes in it. So each slice must
+  decompress alone.
+- *The file table and `slice_size` stay in bytes of the stream before compression.* A reader
+  decrypts a slice, decompresses it, and then cuts its ranges (item 264). A slice's stated
+  size and plaintext hash are of the cut. Its size on tape and its ciphertext hash are of the
+  tape file, as now.
+- *Every check of the stream is made before compression*: the member check, each file's
+  sha256, the names and the ACLs (items 253, 270, 274).
+- *A slice on tape can be larger than its cut*, when its bytes do not shrink. Item 240 keeps
+  every rule that is defined on a slice's size (the early warning, `post_warning_bytes`), so
+  the format states the worst case for each algorithm.
+- *The read around a bad chunk is coarser inside a compressed slice.* What follows the bad
+  chunk in that slice cannot be decompressed, so the members with bytes from the bad chunk
+  to the slice's end are left out, where an uncompressed slice loses only the members that
+  touch the chunk.
+- *The heir needs the decompressor* for a unit that states compression. File 1 and the script
+  name it before the tape is read.
+
+**Measured for it** (#565 holds the method and the tables; this host's tools only: zstd 1.5.5,
+xz 5.4.5, gzip 1.12, bzip2 1.0.8, lzop 1.04, BusyBox 1.36.1; a 25 MB stream cut in 4 MiB
+slices). Each line is MEASURED.
+
+- With each of the five, a slice compressed alone decompresses to the cut; one file is
+  restored from only the slices its range touches; and a member that lies across two slices
+  is restored from those two.
+- BusyBox reads xz, gzip, bzip2 and lzop. It has no zstd applet in this build.
+- A slice cut short, which is what a decompressor is given when `age` stops at a bad chunk,
+  makes every one of them exit non-zero after writing a correct prefix.
+- A flipped byte in the compressed data makes the GNU tools exit non-zero after writing
+  wrong bytes. BusyBox `unxz` writes the wrong bytes and exits 0. So a decompressor's exit
+  status is not the verdict, as tar's is not: the per-file sha256 check is.
+- Four mebibytes that do not shrink grow by 106 bytes under zstd, 272 under xz, 658 under
+  gzip, 234 under lzop, and 19,298 (0.46%) under bzip2.
+- GNU tar takes `--directory` in order: given after `--files-from`, the list is read against
+  the wrong directory and tar exits 2. The writer's command line puts it first or runs tar
+  in the unit's root.
+
+Not measured: older decompressors (Debian 10's zstd 1.3.8 and xz 5.2.4), a frame made by a
+library and read by the tools, real `age` in the pipeline, and data that is not synthetic.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *This is not the go.* Nothing is built on it.
+- *"Select archives"* is the three layers that set `compression` today. No new way to choose
+  is added, and the default stays `none`.
+- *The reach of item 281.* It is about more than compression. Where a recommendation of the
+  coordinator's rested on what `keepsake` holds, it is looked at again. Two were found: the
+  removal of compression (withdrawn by item 280), and the shape of the real-scale measurement,
+  which took the collection's largest unit and so had no leg of millions of small members
+  (the plan's T0.3 gains one). The intent review of 2026-11-12 measured the design against
+  the 1.2 TiB that existed; item 281 is the CTO's word on that measure.
+
+Not ruled, and asked in #554:
+
+- Question 38: which algorithms Layout 3 carries. dar offered seven. Each one carried is a
+  decompressor an heir may have to find.
+- Question 39: who compresses, tapectl itself or a tool on the host. The first adds
+  dependencies to the build. The second is a second writer's tool, under items 273 and 274.
+- Question 40: whether an archive may set a level.
+- The go. No build has been asked for, and nothing is built.
