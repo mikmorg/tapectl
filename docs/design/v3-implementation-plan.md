@@ -1478,7 +1478,7 @@ path, whole; File 1 as a reader would (the generated text, from a test); #520, #
 `src/volume/restore_script.rs` (deleted when nothing uses it); `src/volume/build.rs` (the
 one call that puts File 2 on tape); new `tests/heir_restore.rs` and `tests/common/heir/`;
 `tests/heir_restore_sh.rs` (deleted); `.github/workflows/ci.yml` (the lint job); a test
-helper program under `examples/` or `src/bin/`.
+helper program under `examples/`, where `short_seal_filler.rs` already is.
 
 **Build:**
 1. The script is **new**, written as a shell file in the tree, and put on tape byte for
@@ -1502,7 +1502,8 @@ helper program under `examples/` or `src/bin/`.
    run under `gawk`, `mawk` and busybox `awk`, in a job of `ci.yml`.
 5. The tests' fixture is a real staging and a real volume build, laid out as the directory
    tape the old tests used, with `mt` and `dd` as stand-ins (carry `FAKE_MT` and `FAKE_DD`).
-   **`age` in the tests is a small program built from the `age` crate** that takes the
+   **`age` in the tests is a small program built from the `age` crate** (an example, as
+   `examples/short_seal_filler.rs` is) that takes the
    arguments the script gives the real `age`, so the tape holds what staging wrote. If that
    cannot be done without a new dependency, stop and report.
 
@@ -1741,7 +1742,7 @@ home pointer, the tape lock and `tapectl-op`, as its criteria list them. #545 is
 coordinator's: the three rulings adjusted while building have their item (261), and the two
 stale texts are corrected.
 **Fence:** `scripts/first-run.sh`, `scripts/install-systemd.sh`, `scripts/check-tapectl-op.sh`,
-`contrib/systemd/tapectl-op`, and the doc #543 names as contradicting `tapectl-op`; the
+`contrib/systemd/tapectl-op.in`, and the doc #543 names as contradicting `tapectl-op`; the
 `tests/first_run_*.rs` pins of a text this task changes.
 **Done when:** each of #543's criteria is met or reported as needing the tape; `bash -n`
 passes; the report lists what the coordinator must run to prove it (the rehearsal, and the
