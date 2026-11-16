@@ -71,6 +71,17 @@ the normative design set named in the Policy block below.
     readers splice by the file table (264), and the acceptance run tags `v2.0.0` first (268).
     "RATIFY ALL" WAS NOT THE GO: start neither Phase 1 nor Phase 2. #556 to #561 are no
     longer `needs:cto`; their remaining criteria are build work.
+  - **2026-11-16 (night), items 280-281: compression is CARRIED, and NOTHING IS ARGUED FROM
+    WHAT `keepsake` HOLDS.** The CTO overruled the plan's D15 (remove `compression`): "We need
+    to ensure proper compression is made available optionally for select archives. My example
+    data (keepsakes) are not the only content in perpetuity". This is the second correction of
+    one kind (item 273 was the first): a recommendation that rested on the present host or
+    the present data. Before recommending that a feature be cut or a test be shaped, ask
+    whether the reason is a fact about home2 or about keepsake; if it is, it is not a reason.
+    The shape (each slice compressed alone, after the cut, before encryption; offsets in the
+    stream before compression) is in the amendment, #565 and the plan's D15. Open with the
+    CTO: questions 38 (algorithms), 39 (who compresses), 40 (a level). The entry below says
+    D15 is open with a recommendation to remove: that is history.
   - **2026-11-16 (evening), items 274-279: "Ratify all, write up all plans in detail for
     worker LLM to implement in stages".** Questions 34a, 34b, 35 to 37 are RULED as
     recommended (floor = GNU tar 1.35 with ACL support on every writer; home2's tar built into

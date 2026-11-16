@@ -259,10 +259,29 @@ edits; Stage 2 lands on `master`, Stages 3 to 5 on the integration branch `layou
 suite stays green through the payload's replacement by tests marked `L3-pending T4.<n>`.
 Stage 1 (the Layout 3 format document) is the coordinator's, never a worker's, and waits on
 T0.1 (which ACL record the readers restore). **That message was not the go either: build
-nothing.** Waiting on the CTO (the plan's Appendix B): the go; D15, what becomes of
-`compression` under tar, which no item rules and which is a feature cut if removed; the
-eighteen byte, schema and command-line choices D1 to D18, to be seen before Stage 1 writes
-them; and T0.3, real scale on home2 or its move to Stage 6.
+nothing.** Waiting on the CTO (the plan's Appendix B): the go; the eighteen byte, schema and
+command-line choices D1 to D18, to be seen before Stage 1 writes them; and T0.3, real scale
+on home2 or its move to Stage 6.
+
+**2026-11-16 (night): compression is carried, and the design is not sized to one corpus**
+(ADR-0012 items 280-281; #565). The plan's D15 had recommended removing the `compression`
+setting under tar; the CTO: "We need to ensure proper compression is made available
+optionally for select archives. My example data (keepsakes) are not the only content in
+perpetuity". So `compression` stays, off by default, chosen by `[defaults]`, an archive set
+or a unit's dotfile as today (280). **Never argue a design choice from what `keepsake`
+happens to hold** (281): it is an example, and what tapectl archives later is not known.
+The shape the ruled items leave, measured with this host's tools: each slice is compressed
+ALONE, after the cut and before encryption (compressing the whole stream would break items
+241 and 264); the file table, `slice_size`, `size_bytes` and `sha256_plain` stay in bytes of
+the stream before compression; a slice on tape can be slightly larger than its cut; inside
+a compressed slice a bad chunk costs everything to the slice's end; the heir needs the
+decompressor only for a unit that states compression. A decompressor's exit status is never
+the verdict (BusyBox `unxz` exits 0 after writing wrong bytes). Open with the CTO, in #565
+and #554: question 38 (which algorithms; recommended gzip, xz, zstd), 39 (who compresses;
+recommended tapectl itself, three new dependencies), 40 (a level; recommended an optional
+`compression_level`). The plan carries it: T0.5 (the older and smaller decompressors,
+gating Stage 1), T4.5, T4.6, T4.8, the heir's script, a gate leg for each algorithm, and
+T5.7. T0.3 gained a second leg of millions of small members. Still no go.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
