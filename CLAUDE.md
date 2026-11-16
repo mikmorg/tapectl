@@ -170,7 +170,8 @@ stream: dar's slice framing goes and dar leaves the data zone, so #518's fix sha
 for new tapes. Later that day the CTO ruled the rest of the first round (items 242-249): **no reverse
 compatibility with the current version, simplify** (the new tapectl reads and writes the new
 layout only; a Layout 2 tape is read with 1.9.2 or its own RESTORE.sh); **the on-tape
-authorization** for the new layout, ending when its release is installed; a production run is
+authorization** for the new layout (it ends when a drill passes on the production run, item
+268; item 243 first had it end at the install); a production run is
 a fresh start (new catalog, keys and unit identities, the escrow kept if the paper passes);
 the two cartridges can be rewritten whenever; **spanning is supported from the first day**;
 production is gated on total completion of all features and fixes. "Simplify" removes
@@ -178,7 +179,8 @@ compatibility, not features. That evening the second round was answered too (ite
 2.0.0, Layout Version 3, is ruled**: GNU tar on the host writes a pax stream from tapectl's
 exact file list and tapectl reads it as it passes (member check, per-file sha256, member
 starts); a file table per staging replaces the dar catalogue in the tenant envelope; the heir
-has one repair (zero-fill, list, restore the listed paths from another copy) and one prompt
+has one repair (the members a bad slice touches are left out and listed, and the listed paths
+are restored from another copy; item 264 replaced the zero-fill first recorded) and one prompt
 (the next cartridge of a span); hard links stay links; a range is a source for the files whose
 slices it holds (item 143 amended); one baseline schema, no upgrade from 1.x; no notification
 is built in (the command line is made sufficient for reporting tools); a new install leaves no

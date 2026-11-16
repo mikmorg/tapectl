@@ -38,9 +38,10 @@ the normative design set named in the Policy block below.
   - The thirteen finders' reports, whole, are comments on #551; the paper run's method is
     on #548.
   - **Wave 5 is on tape** (#518, #520 to #523, #525, #526, #528, #547, #555). **The on-tape
-    authorization was given on 2026-11-14 (ADR-0012 item 243)**, for the new layout, ending
-    when its release is installed; each pin still moves in a commit of its own. It is not a
-    go.
+    authorization was given on 2026-11-14 (ADR-0012 item 243)**, for the new layout. It ends
+    when a drill passes on the production run (item 268, 2026-11-16, which restated item 243's
+    end; a failed drill leaves it open for the fix). Each pin still moves in a commit of its
+    own. It is not a go.
   - **2026-11-14 (later), items 242-249:** no reverse compatibility with the current version
     (the new tapectl reads and writes the new layout only); a production run is a fresh start;
     the two cartridges can be rewritten whenever; spanning is supported from the first day;
