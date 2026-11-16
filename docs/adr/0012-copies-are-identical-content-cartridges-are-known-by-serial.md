@@ -2995,3 +2995,89 @@ stream alone (items 176 to 184 and the dar half of 132). Item 235(a) is reversed
 Not ruled: no go has been given, and nothing is built. Outside this queue and still open: the
 intent review's D6 (a warehouse deposit) and D7 (the intent statement and the errata), #444 and
 #482. #499 (reporting dar's FIFO defect upstream) is moot for tapectl once dar is gone.
+
+## Amendment, 2026-11-16: after the research before the build
+
+Ruled 2026-11-16, on questions 26 to 33 of #554, which the research note
+(`docs/research/2026-11-16-layout-3-before-the-build.md`, §9) put with a recommendation each.
+The CTO's words, whole: "Ratify all. We should also store a user, group id mapping in our
+catalog". Items 264 to 271 are the questions and the recommendations as #554 showed them. Item
+272 is the second sentence.
+
+264. **Readers feed tar whole members, by byte range from the file table** (question 26, #556).
+     The ranges are joined at member boundaries. No reader zero-fills a lost slice, and none
+     uses `--ignore-zeros`. This withdraws the default recorded on 2026-11-14 ("every reader
+     zero-fills a lost slice to its exact size") and amends the wording of two items. Item
+     241's first limit now reads: a lost slice costs the files that have bytes in it, and a
+     reader leaves those members out. Item 255's first sentence now reads: the members a bad
+     slice touches are left out and the restore goes on. The rest of item 255 stands (the
+     damaged files are listed, the repair is to restore those paths from another copy, and
+     there is one prompt).
+265. **The file table is kept in the catalog database** (question 27, #557), so that `db
+     backup`, the Heir Kit's catalogue and every tape's operator `catalog.db` carry it beside
+     the tenant envelope's copy. It outlives the release of its slices. A write refuses, by
+     name, a unit whose table it cannot supply. This completes item 254, which gave the table
+     no home between tapes.
+266. **A restore may start on any tape of a span** (question 28, #558). It takes the files that
+     tape holds whole. At the prompt for the next cartridge the heir may answer that they do
+     not have it, and the restore goes on and lists the rest. This changes
+     `volume-format-v2.md` §4.4's "where a restore starts" for Layout 3.
+267. **The heir's script restores across cartridges as a stream** (question 29, #558), with the
+     one prompt of item 255. Item 132's default (each tape's range kept in scratch) and item
+     88's choice between that and the stream are withdrawn. The reading of 2026-11-14 said the
+     same and could not withdraw a ruled default. This item does.
+268. **The acceptance run's order** (question 30, #559). `v2.0.0` is tagged when the build is
+     complete and proven on test cartridges. That release is installed by the fresh start of
+     item 244, CI builds its static binary, and the Heir Kit carries it. It writes both
+     cartridges and the drill runs. Until a drill passes, the run is not production for items
+     238, 248 and 262. If it passes, the cartridges are production and the on-tape
+     authorization ends there. If it fails, they are test articles: the fix is a new release
+     and never a re-pushed tag (#546), the minor moves if on-tape bytes move, and the run is
+     repeated by another fresh start, which mints new keys and discards the first kit. Tagging
+     publishes a release binary, so a failed drill leaves a published 2.0.0 that never held
+     production. This replaces the reading of 2026-11-14 under item 263. It also restates the
+     end of item 243: the authorization ends when a drill passes, and no longer at the
+     install.
+269. **A Layout 2 cartridge in the drive** (question 31, #560). tapectl 2.0.0 knows a tapectl
+     volume of another layout when it meets one. It reads its label, never writes over it
+     without `cartridge erase` and the typed label, and reads nothing else from it. That is
+     consent and not compatibility: item 242 stands.
+270. **Numeric owners, and no sockets** (question 32, #561). The writer passes
+     `--numeric-owner`, so only numeric ids are stored and the stream does not depend on the
+     host's passwd. The snapshot leaves sockets out of every unit and says so, since tar skips
+     them at exit 0.
+271. **The heir's work directory is inside the destination by default** (question 33, #561),
+     and `TMPDIR` no longer decides it. This amends items 71 to 75 for Layout 3.
+272. **A user and group id mapping is stored in the catalog** (the CTO's words, #564). It
+     stands beside item 270: the stream holds the ids and the catalog holds their names. For
+     owner names it reverses a position recorded twice. Migration 027 dropped the `username`
+     and `groupname` columns of `manifest_entries`, which were NULL on every production row.
+     `volume-format-v2.md` §1.4 keeps owners out of the on-tape `catalog.db`. Both rested on
+     dar's catalogue keeping them, and dar is gone (item 241). What the sentence leaves open is
+     asked below.
+
+**Measured the same day, and it bears on item 270** (#563 holds the method and the tables). On
+GNU tar 1.30, which is the production host's, `--numeric-owner` empties the names in a
+member's header and does not reach its ACL. The text record still names every user and group
+that the host's passwd knows (`user:daemon:r--`). GNU tar 1.35 writes those entries by number
+(`user:1:r--`). The raw record of the same ACL holds numbers on both. An archive written by
+1.30 was read back by GNU tar 1.35 with `--acls`. On a host where the name is unknown, the file
+is restored with no ACL after a warning. Where the name belongs to another id, the entry is
+restored to that other id with no warning. Both exit 0. Every file of the production host's
+collection carries a named entry: the read grant that tapectl's own access check asks for. So
+item 270's "only numeric ids are stored" holds for a member's owner and group, and on that tar
+it does not hold for the entries of an ACL. A finding does not amend a ruling. It is question
+34.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *"Ratify all" is not the go.* It answers the eight questions. Nothing is built on it.
+- *Item 272 is part of 2.0.0.* It is a feature, so item 248 gates production on it, and the one
+  baseline schema of item 258(b) holds it from the start.
+
+Not ruled, and asked in #554:
+
+- Question 34 (#563): how Layout 3 stores an ACL, given the measurement above.
+- Questions 35 to 37 (#564): where the id map is carried beyond the catalog database, what it
+  holds, and whether a restore shows it or acts on it.
+- The go. No build has been asked for, and nothing is built.

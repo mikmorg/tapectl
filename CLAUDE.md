@@ -200,11 +200,35 @@ coordinator's reading of the acceptance run's order** (an untagged candidate can
 repeated and its Heir Kit names a tag that does not exist, #559). An independent reader found
 the rest: the file table has no home between tapes (#557), a range tape alone and the
 scratch mode of a span restore (#558), a Layout 2 cartridge at contact (#560), owner names,
-sockets and the heir's work directory (#561). Questions 26 to 33 are in #554; the rules for
-the Layout 3 format document that need no ruling are #562. Still no go. Measured limits to design around: a lost slice
-must be zero-filled to its exact size, a hard-linked name depends on the slices of the name
-archived first, and busybox tar exits 0 with files missing, so a restore is judged by the
+sockets and the heir's work directory (#561). Questions 26 to 33 were in #554 and are answered
+(next paragraph); the rules for the Layout 3 format document that need no ruling are #562.
+Measured limits to design around: a zero-filled slice stops every tar at exit 0, so readers
+feed tar whole members by byte range; a hard-linked name depends on the slices of the name
+archived first; and busybox tar exits 0 with files missing, so a restore is judged by the
 per-file sha256 check.
+
+**2026-11-16 (later): questions 26 to 33 are ruled, and an id map is added** (ADR-0012 items
+264-272; the CTO: "Ratify all. We should also store a user, group id mapping in our catalog").
+Readers feed tar whole members by byte range from the file table, and none zero-fills or uses
+`--ignore-zeros` (264). The file table is kept in the catalog database, outlives its slices,
+and a write refuses a unit without one (265). A restore may start on any tape of a span, and
+the heir may answer "I do not have it" at the prompt (266); the heir's restore across
+cartridges streams (267). **The acceptance run's order: `v2.0.0` is tagged first, installed by
+the fresh start, writes both cartridges, and the drill decides; a pass ends the on-tape
+authorization, a failed drill means a new release and another fresh start** (268, which
+restates item 243's end). A Layout 2 cartridge is known by its label and never written over
+without `cartridge erase` and the typed label (269). The writer passes `--numeric-owner` and
+sockets are left out and reported (270). The heir's work directory is inside the destination
+(271). A user and group id map is stored in the catalog (272, #564). **"Ratify all" was not the
+go: build nothing until the CTO says so.** Four questions are open, 34 to 37 in #554. Question
+34 (#563) comes from a measurement made after the answer: home2's tar is GNU tar 1.30, where
+`--numeric-owner` does not reach an ACL, so its text record keeps the host's names (1.35 writes
+numbers; the raw `system.posix_acl_*` record is numbers on both), and every file of home2's
+collection carries such an entry, the service account's read grant. Read back on another host
+the entry is dropped (name unknown) or moved to another account (name with another id), both
+at exit 0. Questions 35 to 37 (#564) are the id map's shape: whether each tenant envelope
+carries it as text, what it holds, and whether a restore shows it or acts on it. Phase 1's
+format document depends on 34 to 36; the sixteen fixes of Phase 2 depend on none of them.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

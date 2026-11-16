@@ -64,6 +64,17 @@ the normative design set named in the Policy block below.
     four readings as the coordinator's (the order of the acceptance run, a span restore
     streams, what "sufficient" means for #535, the defaults not objected to): correct them if
     the CTO does.
+  - **2026-11-16 (later): QUESTIONS 26 TO 33 ARE RULED AS RECOMMENDED, AND AN ID MAP IS ADDED**
+    (ADR-0012 items 264-272; "Ratify all. We should also store a user, group id mapping in
+    our catalog"). So the entry below is history where it says the two things no longer stand:
+    readers splice by the file table (264), and the acceptance run tags `v2.0.0` first (268).
+    "RATIFY ALL" WAS NOT THE GO: start neither Phase 1 nor Phase 2. Open with the CTO, in #554:
+    question 34 (#563: GNU tar 1.30, home2's, keeps names in an ACL's text record even with
+    `--numeric-owner`; recommended: the raw record only, after tar 1.30 and bsdtar are measured
+    as its readers) and questions 35 to 37 (#564: the id map of item 272, whether each tenant
+    envelope carries it, what it holds, whether a restore shows it or acts on it). Phase 1's
+    format document depends on 34 to 36; Phase 2's sixteen fixes on none. #556 to #561 are no
+    longer `needs:cto`; their remaining criteria are build work.
   - **2026-11-16: the research before the build is done**
     (`docs/research/2026-11-16-layout-3-before-the-build.md`). Phase 0: GNU tar 1.30 and bsdtar
     pass; scale is partial (one 96 GiB member and 50,100 small files). TWO THINGS ABOVE NO

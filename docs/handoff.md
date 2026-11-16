@@ -29,9 +29,23 @@ of all features and fixes. That evening the second round was answered (items 250
 Layout Version 3, is ruled, and #554 holds the plan by phase. No go has been given. The
 handoff for the production run (item 263: the candidate writes both cartridges after a fresh
 start, the drill runs on them, and they count as production when it passes) is written when
-the build reaches it, from the order the CTO rules in #559 (2026-11-16: the order first read
-into item 263 cannot be repeated after a failed drill; see
-`docs/research/2026-11-16-layout-3-before-the-build.md`).
+the build reaches it, from the order of item 268 (below), which replaced the order first read
+into item 263.
+
+**2026-11-16.** The research before the build
+(`docs/research/2026-11-16-layout-3-before-the-build.md`) put eight questions, and the CTO
+ratified all eight (ADR-0012 items 264-271) and added one (item 272). What a handoff needs from
+them: **the acceptance run's order is item 268.** `v2.0.0` is tagged when the build is complete
+and proven on test cartridges; that release is installed on home2 by the fresh start; the Heir
+Kit carries CI's static binary; it writes both cartridges; the drill runs. A pass makes the
+cartridges production and ends the on-tape authorization. A failed drill makes them test
+articles: the fix is a new release, never a re-pushed tag, and the run is repeated by another
+fresh start with new keys and a new kit. A cartridge of Layout 2 in the drive is known by its
+label and is never written over without `cartridge erase` and the typed label (item 269). The
+stream is written with `--numeric-owner`, and a user and group id map is stored in the catalog
+(items 270, 272). Open with the CTO: four questions (34 to 37 in #554: how an ACL is stored,
+#563; the id map's shape, #564) and the go. home2's tar is GNU tar 1.30, and it writes names in
+an ACL's text record even with `--numeric-owner` (#563).
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 
