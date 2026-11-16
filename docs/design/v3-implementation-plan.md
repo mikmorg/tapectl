@@ -641,9 +641,19 @@ first; that deduction was too narrow, and the correction is owed to the next ame
 Measured for B with a reader that was given only the table's text and the slices (#565):
 zstd, xz, gzip and bzip2 restore the whole unit through one decoder call, one small file
 from one slice of fifteen, a file over three frames, and every file outside a lost slice;
-BusyBox decodes xz, gzip and bzip2 and its `head` and `tail` make the cuts. The widening
-was 94 to 188 small files more than the lost span itself held, about one frame; with a
-16 MiB frame and a 1 GiB slice the two edge frames are about 3% of what the slice held.
+BusyBox decodes xz, gzip and bzip2 and its `head` and `tail` make the cuts. The widening,
+MEASURED for zstd, xz and gzip: 94 to 139 small files more than the lost span itself held,
+about one frame (bzip2's count shows none only because its decoder's output comes in large
+blocks, so the span's edge could not be placed). REASONED, not measured: with a 16 MiB
+frame and a 1 GiB slice the two edge frames are about 3% of what the slice held.
+
+*What was hashed is not what goes to tape, in either shape.* Item 253 takes each file's
+sha256 "from the bytes that go to tape". With compression the bytes are packed after the
+hash, and nothing at staging would show that they unpack to what was hashed. So, proposed
+for both shapes: **staging decodes every frame (or slice) it has just packed and compares
+it with what it packed, before the bytes go on**, and a difference refuses the staging.
+That is a check made in every staging, not a test. Without it, item 253's sentence would
+have to be reworded for a compressed unit.
 
 **The questions are the CTO's** (#565; #554):
 
@@ -1396,8 +1406,10 @@ file and an excluded folder reports all three, shown by a test; the suite is gre
 
 ### T4.5 Staging on tar: the switch
 
-**Owner:** worker (one, alone in its wave). **Depends:** T4.1 to T4.4, T0.5, and questions
-38 to 40 ruled (D15). **Carries out:** items 241, 253, 254, 265, 270, 272, 274, 277, 280;
+**Owner:** worker (one, alone in its wave). **Depends:** T4.1 to T4.4, T0.5, T0.6, and
+questions 41 and 38 to 40 ruled (D15). **This entry's compression steps are written for
+shape A. If question 41 is ruled B, do not start until T1.7 has rewritten them** by D15's
+deltas. **Carries out:** items 241, 253, 254, 265, 270, 272, 274, 277, 280;
 #555; #562 "The writer"; #563; #564; #565. **Read:** the format document on the stream, the cut and staging's products;
 `src/staging/mod.rs` `stage_create_inner`, top to bottom; `src/staging/validate.rs` `plan`
 and `recheck`; `src/staging/files.rs`.
@@ -1423,6 +1435,8 @@ redefines); `src/setup.rs` and `src/main.rs` (the tool checks only);
    document's section on compression gives the frame and who compresses, as questions 38
    to 40 are ruled). `size_bytes` and `sha256_plain` are taken from the cut **before**
    compression (D3). The staging's algorithm is recorded in `stage_sets.compression`.
+   **Every piece is decoded again and compared with what was packed before it goes on**
+   (D15: what was hashed is not what goes to tape); a difference refuses the staging.
 5. After tar: `finish` must be `Clean`; the reader must have seen every entry; `recheck`
    compares each entry with step 3, and a file inside the racy window is hashed from disk
    and compared with the stream's hash, as today.
