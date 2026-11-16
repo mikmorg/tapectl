@@ -3081,3 +3081,56 @@ Not ruled, and asked in #554:
 - Questions 35 to 37 (#564): where the id map is carried beyond the catalog database, what it
   holds, and whether a restore shows it or acts on it.
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-16 (later): the standard is not lowered to the production host's tools
+
+Ruled 2026-11-16, in answer to questions 34 to 37 as #554 put them after items 264 to 272. The
+CTO's words, whole: "Do not lower standards to home2 current toolchain".
+
+273. **The standard is not lowered to home2's current toolchain** (the CTO's words). Where the
+     design needs something that the production host's tools do not do, the host is brought up
+     to the design. This settles the part of question 34 (#563) that rested on GNU tar 1.30. Of
+     that issue's options, keeping the text record with the names that 1.30 writes is out. So
+     is the reason given for the raw record, that it holds numbers on every tar version. Item
+     270 stands as it reads: only numeric ids are stored.
+
+**Measured and read for it** (#563 holds the method). Each line says which.
+
+- GNU tar 1.34 (Debian 12's, linked with libacl) writes names in an ACL's text record with
+  `--numeric-owner`, as 1.30 does. MEASURED. GNU tar 1.35 (Ubuntu 24.04's) writes numbers.
+  MEASURED.
+- Upstream 1.35's source (`tar-1.35.tar.xz`, sha256 `4d62ff37…3edc16`) is the first that
+  consults the option for an ACL. READ. The source of 1.31 to 1.33 has the code of 1.30 and
+  1.34. READ, from a third-party mirror only.
+- The same 1.35 source keeps the names, after one warning, when tar is built without libacl.
+  READ. So a version number is not the proof.
+- An archive that holds the text record alone, by number, is restored by GNU tar 1.35 with the
+  ordinary `--acls`, access and default entries both. MEASURED. GNU tar 1.30, bsdtar and
+  busybox as its readers are not measured: Phase 0's bsdtar pass was on streams that held both
+  records.
+- Debian 13 and Ubuntu 24.04 and 26.04 ship 1.35. Debian 11 and 12 and Ubuntu 22.04 ship 1.34.
+  Ubuntu 20.04 and the production host's Debian 10 ship 1.30. Looked up in the two
+  distributions' archive indexes on 2026-11-16; no other distribution was checked.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *It concerns the host that writes.* The heir's readers stay as wide as they were: the heir's
+  script and File 1 are still held to old and small tools.
+- *It reaches beyond tar.* A later place where the design would bend to a tool version on the
+  production host is decided the same way. In the design of 2.0.0, GNU tar 1.30 as the writer
+  is the only such place found. Phase 0's pass of 1.30 as a writer is no longer what the
+  writer is held to. The fixed `exthdr.name` option, which only tar below 1.33 needs, is kept:
+  it costs nothing and states the format. The measurement listed earlier today, of 1.30
+  writing the raw record alone, is moot.
+- *The rule for the format document, in place of a choice of record.* No user or group name is
+  in the stream. An ACL is stored once, in the record that a reader's ordinary flags restore,
+  and the measurement of the readers picks it. The proof is tapectl's own check of the stream
+  as it passes: a staging whose stream holds a name is refused, by name. The tar version is
+  the early refusal.
+
+Not ruled, and asked in #554:
+
+- Question 34, rebuilt (#563): whether the writer's floor, GNU tar 1.35 with ACL support,
+  binds every host that writes; and how the production host gets a tar that meets it.
+- Questions 35 to 37 (#564), as they were.
+- The go. No build has been asked for, and nothing is built.

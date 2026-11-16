@@ -43,9 +43,13 @@ articles: the fix is a new release, never a re-pushed tag, and the run is repeat
 fresh start with new keys and a new kit. A cartridge of Layout 2 in the drive is known by its
 label and is never written over without `cartridge erase` and the typed label (item 269). The
 stream is written with `--numeric-owner`, and a user and group id map is stored in the catalog
-(items 270, 272). Open with the CTO: four questions (34 to 37 in #554: how an ACL is stored,
-#563; the id map's shape, #564) and the go. home2's tar is GNU tar 1.30, and it writes names in
-an ACL's text record even with `--numeric-owner` (#563).
+(items 270, 272). **The standard is not lowered to home2's current toolchain (item 273).**
+home2's tar is GNU tar 1.30, which writes names in an ACL's text record even with
+`--numeric-owner`; the first release that writes numbers is 1.35 (#563). So before 2.0.0
+stages anything on home2, home2 has a GNU tar that meets the floor, and the handoff for the
+production run carries that step as question 34b is ruled. Open with the CTO: 34a and 34b
+(#563: whether the floor binds every host that writes, and how home2 gets its tar), 35 to 37
+(#564: the id map's shape), and the go.
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

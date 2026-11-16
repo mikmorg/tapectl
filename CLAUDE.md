@@ -222,15 +222,28 @@ restates item 243's end). A Layout 2 cartridge is known by its label and never w
 without `cartridge erase` and the typed label (269). The writer passes `--numeric-owner` and
 sockets are left out and reported (270). The heir's work directory is inside the destination
 (271). A user and group id map is stored in the catalog (272, #564). **"Ratify all" was not the
-go: build nothing until the CTO says so.** Four questions are open, 34 to 37 in #554. Question
-34 (#563) comes from a measurement made after the answer: home2's tar is GNU tar 1.30, where
-`--numeric-owner` does not reach an ACL, so its text record keeps the host's names (1.35 writes
-numbers; the raw `system.posix_acl_*` record is numbers on both), and every file of home2's
-collection carries such an entry, the service account's read grant. Read back on another host
-the entry is dropped (name unknown) or moved to another account (name with another id), both
-at exit 0. Questions 35 to 37 (#564) are the id map's shape: whether each tenant envelope
-carries it as text, what it holds, and whether a restore shows it or acts on it. Phase 1's
-format document depends on 34 to 36; the sixteen fixes of Phase 2 depend on none of them.
+go: build nothing until the CTO says so.** A measurement made after the answer (#563): home2's
+tar is GNU tar 1.30, where `--numeric-owner` does not reach an ACL, so its text record keeps
+the host's names (1.34 does the same; 1.35 is the first release that writes numbers, and only
+when built with ACL support; the raw `system.posix_acl_*` record is numbers on all three), and
+every file of home2's collection carries such an entry, the service account's read grant. Read
+back on another host the entry is dropped (name unknown) or moved to another account (name
+with another id), both at exit 0.
+
+**2026-11-16 (later still): the standard is not lowered to home2's current toolchain** (ADR-0012
+item 273, the CTO's words). Where the design needs what home2's tools do not do, home2 is
+brought up to the design; a recommendation that bends the format to an old tool there is
+designing down. So the format is not bent to tar 1.30, and item 270 stands as it reads. The
+readings recorded with it: it concerns the host that WRITES (the heir's readers stay as wide
+as they were); no name is in the stream, an ACL is stored once in the record a reader's
+ordinary flags restore (the readers' measurement picks it), and the proof is tapectl's own
+check of the stream, with the tar version as the early refusal. Open in #554: 34a (does the
+floor, GNU tar 1.35 with ACL support, bind every host that writes; Debian 11 and 12 and Ubuntu
+22.04 ship 1.34), 34b (how home2 gets such a tar: built into `/usr/local` as dar 2.7.21 was, or
+an OS upgrade before Phase 6's real-drive proofs), and 35 to 37 (#564, the id map's shape:
+whether each tenant envelope carries it as text, what it holds, whether a restore shows it or
+acts on it). Phase 1's format document depends on 34a, 35 and 36; the sixteen fixes of Phase 2
+depend on none of them. Still no go.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

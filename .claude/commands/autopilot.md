@@ -69,13 +69,21 @@ the normative design set named in the Policy block below.
     (ADR-0012 items 264-272; "Ratify all. We should also store a user, group id mapping in
     our catalog"). So the entry below is history where it says the two things no longer stand:
     readers splice by the file table (264), and the acceptance run tags `v2.0.0` first (268).
-    "RATIFY ALL" WAS NOT THE GO: start neither Phase 1 nor Phase 2. Open with the CTO, in #554:
-    question 34 (#563: GNU tar 1.30, home2's, keeps names in an ACL's text record even with
-    `--numeric-owner`; recommended: the raw record only, after tar 1.30 and bsdtar are measured
-    as its readers) and questions 35 to 37 (#564: the id map of item 272, whether each tenant
-    envelope carries it, what it holds, whether a restore shows it or acts on it). Phase 1's
-    format document depends on 34 to 36; Phase 2's sixteen fixes on none. #556 to #561 are no
+    "RATIFY ALL" WAS NOT THE GO: start neither Phase 1 nor Phase 2. #556 to #561 are no
     longer `needs:cto`; their remaining criteria are build work.
+  - **2026-11-16 (later still), item 273: "Do not lower standards to home2 current
+    toolchain".** NEVER recommend bending the design to an old tool on home2: say what the
+    design needs and that home2 is brought up to it. It came from #563: GNU tar 1.30 (home2's)
+    and 1.34 keep names in an ACL's text record even with `--numeric-owner`; 1.35 is the first
+    release that writes numbers, and only when built with ACL support. The coordinator's first
+    recommendation (the raw record, because it is numbers on every tar version) was designing
+    down and is withdrawn. The rule now: no name in the stream; an ACL stored once, in the
+    record a reader's ordinary flags restore (the readers' measurement picks it, Phase 0);
+    tapectl's own check of the stream is the proof and the tar version the early refusal. The
+    reading recorded with it: it concerns the host that WRITES, and the heir's readers stay as
+    wide as they were. Open with the CTO, in #554: 34a (does the floor bind every host that
+    writes), 34b (how home2 gets its tar), 35 to 37 (#564: the id map of item 272), and the go.
+    Phase 1's format document depends on 34a, 35 and 36; Phase 2's sixteen fixes on none.
   - **2026-11-16: the research before the build is done**
     (`docs/research/2026-11-16-layout-3-before-the-build.md`). Phase 0: GNU tar 1.30 and bsdtar
     pass; scale is partial (one 96 GiB member and 50,100 small files). TWO THINGS ABOVE NO
