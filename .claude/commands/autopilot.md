@@ -80,13 +80,17 @@ the normative design set named in the Policy block below.
     whether the reason is a fact about home2 or about keepsake; if it is, it is not a reason.
     THE SHAPE IS OPEN (question 41). The amendment deduced "each slice compressed alone"
     (shape A); that was too narrow. After the CTO's "Consider how best to integrate with
-    current design", shape B was measured and is recommended: the tar stream compressed in
+    current design", shape B was measured and was first recommended: the tar stream compressed in
     frames that begin at member boundaries, the joined frames cut and encrypted exactly as
     an uncompressed stream, one more column in the file table. B leaves every slice rule of
     item 240 untouched; its price is a widening of item 264's limit (a lost slice also costs
-    its edge frames' other files). Lesson: when a ruling adds a feature, look for the layer
-    where it leaves the ruled machinery untouched before writing "what the ruled items
-    leave". The comparison and the task deltas are in the plan's D15 and #565; Stage 4's
+    its edge frames' other files). RE-WEIGHED the same night after the CTO's "I'm skeptical
+    that b is better than a": the recommendation is now A. No rule of item 240 depends on
+    equal slices, and read by hand with no file table a B slice gives nothing alone and a
+    lost slice costs every file after it (a comment on #565). Lesson: before recommending
+    a layer that "protects the ruled machinery", check that the simpler shape breaks any of
+    it, and ask what one slice gives the stock tools alone. Also asked that night: question
+    42, do slices stay (#566; recommended yes). The comparison and the task deltas are in the plan's D15 and #565; Stage 4's
     tasks are still written for A. Open with the CTO: question 41 (the shape), then 38
     (algorithms), 39 (who compresses), 40 (a level). The entry below says
     D15 is open with a recommendation to remove: that is history.

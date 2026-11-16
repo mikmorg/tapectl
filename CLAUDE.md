@@ -272,7 +272,7 @@ or a unit's dotfile as today (280). **Never argue a design choice from what `kee
 happens to hold** (281): it is an example, and what tapectl archives later is not known.
 Its shape is NOT settled. The amendment deduced "each slice must decompress alone" (shape A:
 cut, compress, encrypt); that was too narrow, and after the CTO's "Consider how best to
-integrate with current design" a second shape was measured and is recommended (shape B): the
+integrate with current design" a second shape was measured and was first recommended (shape B): the
 tar stream is compressed in frames that begin at member boundaries, the frames joined are
 the STORED stream, and it is cut and encrypted exactly as an uncompressed stream is; the
 file table gains one column (where the member's frame begins in the stored stream). B leaves
@@ -284,7 +284,7 @@ the slices: zstd, xz, gzip and bzip2 pass; `lzo` and `lzma` cannot be carried un
 plan's D15 holds the comparison and the task deltas; Stage 4's tasks are still written for
 A. In both shapes every stream check precedes compression, and a decompressor's exit status
 is never the verdict (BusyBox `unxz` exits 0 after writing wrong bytes). Open with the CTO,
-in #565 and #554: question 41 (the shape; recommended B), question 38 (which algorithms; recommended gzip, xz, zstd on reader and build
+in #565 and #554: question 41 (the shape; recommended A since the re-weighing in the next paragraph), question 38 (which algorithms; recommended gzip, xz, zstd on reader and build
 cost alone, since the first check's random words cannot rank them), 39 (who compresses;
 recommended tapectl itself, with a library for each algorithm, untried in the static musl
 build), 40 (a level; recommended an optional `compression_level`). The plan carries it: T0.5
@@ -293,6 +293,24 @@ T0.6 (the libraries in the static build), T4.5, T4.6, T4.8, the heir's script, a
 for each algorithm, and T5.7. T0.3 gained a second leg of millions of small members. Under
 shape A only, a compressed unit's slice sizes on tape follow their content, and the front
 index states sizes in plaintext. Still no go.
+
+**2026-11-16 (late): slices and the compression shape, asked again** (#566; a comment on #565).
+The CTO asked whether slices should be dropped for another way of spanning. Recommended: they
+stay (question 42). A unit's ciphertext is made once at staging and the heir has the stock
+`age`, which begins only at a header, so a tape of a span either ends on a staged age file (a
+slice, whatever it is called) or ends mid-file; measured with age 1.1.1, one stream a unit
+gives nothing from the second tape of a span and loses the rest of a copy to one bad chunk.
+What made slices heavy in 1.x was dar's framing, which item 241 removed. Then the CTO: "I'm
+skeptical that b is better than a, re q41", and the re-weighing changed the recommendation to
+**A**. The row B rested on ("item 240's rules untouched") did not hold: no rule of item 240
+depends on equal slices. Measured by hand with no file table: under A one slice alone gives the
+files it holds and a lost slice costs only them; under B one slice alone gives nothing (it
+begins inside a frame) and a lost slice costs every file after it. "A bad chunk costs a frame"
+is tapectl's reader only; the heir loses the slice in both. B's one advantage is that nothing
+new shows without a key; on-tape sizes are permitted in plaintext and the size channel was
+accepted on 2026-07-22 with compression off, so its weight is the CTO's. **Neither question is
+ruled, and neither message was the go.** When weighing a format choice, ask first what one
+slice gives the stock tools alone, with no file table.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):

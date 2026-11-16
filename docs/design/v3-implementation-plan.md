@@ -486,7 +486,7 @@ the format document, flag by flag, from the commands #555 and the research note 
 
 **D3. The cut, and what each size means.** A slice is `slice_size` bytes of the stream, and
 the last slice is what remains. `slice_size` is a multiple of 512. With compression (D15)
-what a slice's sizes mean depends on question 41. **Under shape B (recommended)** nothing
+what a slice's sizes mean depends on question 41. **Under shape B** nothing
 changes: the stored stream is cut, every slice but the last is `slice_size`, and
 `size_bytes` and `sha256_plain` are of the bytes that are encrypted, as today. **Under shape
 A** the order is cut, compress, encrypt: `size_bytes` and `sha256_plain` are of the cut
@@ -629,12 +629,14 @@ first; that deduction was too narrow, and the correction is owed to the next ame
 
 | | A | B |
 |---|---|---|
-| Item 240's slice rules (W1 to W9, the short seal, ranges, spanning, resume, the retry, replacement by sha256, the capacity plan) | a slice's size on tape varies; "size" means two things; a worst case for each algorithm | **untouched**: equal slices, one meaning of size and hash |
+| Item 240's slice rules (W1 to W9, the short seal, ranges, spanning, resume, the retry, replacement by sha256, the capacity plan) | hold as written: each is defined on a slice's number, position and hash, and none on equal sizes. A slice's size on tape varies, and the format states a worst case for each algorithm | hold as written; slices stay equal |
 | A lost slice costs | the files with bytes in it | the frames with bytes in it: those files and their neighbours in each edge frame (**a widening of item 264's limit**) |
-| A bad 64 KiB chunk costs | everything to the slice's end | its frame |
+| A lost slice, read by hand with no file table (measured, #565) | the files with bytes in it | every file after it: the decompressor stops at the gap |
+| One slice alone, read by hand (measured, #565) | the files it holds whole | nothing: it begins inside a frame |
+| A bad 64 KiB chunk costs tapectl's own reader (the heir's `age` loses the slice in either shape, item 101) | everything to the slice's end (**a widening of item 101(b)**, repaired by slice replacement) | its frame |
 | One path | its slices, each decoded from its start | the slices its frame is in; one frame decoded |
 | The file table | as D4 | one more column |
-| Seen with no key | how well each slice shrank | nothing new |
+| Seen with no key | how well each slice shrank. On-tape sizes are permitted in plaintext (`volume-format-v2.md` §2), and the size channel was accepted on 2026-07-22 with compression off | nothing new |
 | Who compresses | tapectl or a host tool | tapectl (a frame ends where the stream reader sees a member end) |
 | Algorithms | any | those whose frames join and whose tool starts at any frame: zstd, xz, gzip, bzip2 measured; lz4 not measured; `lzo` and `lzma` cannot |
 
@@ -657,16 +659,19 @@ have to be reworded for a compressed unit.
 
 **The questions are the CTO's** (#565; #554):
 
-- *Question 41, the shape.* Recommended: **B**. The slice is where the design's hardest
-  rules are defined ("Careful about EOT logic and spanning"), and under B a compressed
-  unit's slices are the same objects as any other unit's. Its price is the widening above
-  and that tapectl itself compresses.
+- *Question 41, the shape.* Recommended: **A** (revised 2026-11-16 after the CTO's "I'm
+  skeptical that b is better than a"; first recorded as B, on this table's first row,
+  which did not hold when checked: no rule of item 240 depends on equal slices). Under A
+  a slice is read alone by the stock tools, with or without the file table, and item
+  264's limit stands as it reads. B's advantage is that nothing new shows without a key.
+  The re-weighing and its measurement are a comment on #565.
 - *Question 38, which algorithms.* Each one carried costs the same things whatever the
   data: a decompressor an heir may have to find, a gate leg, readers to measure, a library
   in the build. Recommended, on that cost alone: `gzip`, `xz` and `zstd`. T0.5 measures
   every candidate on real data, and its table confirms the ruling or reopens it.
 - *Question 39, who compresses.* Under B, tapectl itself. **Not yet tried:** a library for
-  each algorithm in the static musl build (T0.6). Under A the choice is open.
+  each algorithm in the static musl build (T0.6). Under A the choice is open: recommended
+  tapectl itself, with a host tool for each slice as the fallback if a library fails there.
 - *Question 40, a level.* Recommended: an optional `compression_level` beside
   `compression`, in the same three layers, with a stated default for each algorithm.
 
@@ -2217,8 +2222,9 @@ and built where shown.
    D9 for T3.1. T0.1 and T0.2 are measurements in containers and change no code; they have
    not been started.
 2. **Question 41, then 38 to 40** (D15, #565), now that compression is carried (item 280).
-   41 is the shape: each slice compressed alone, or the stream stored in frames and then
-   cut as today (recommended, because it leaves every slice rule as it is). 38 (which
+   41 is the shape: each slice compressed alone (recommended since the re-weighing on
+   #565: a slice is then read alone by the stock tools), or the stream stored in frames
+   and then cut as today. 38 (which
    algorithms) and 39 (who compresses) largely follow from 41; 40 is whether an archive may
    set a level. T4.5 waits on all four. T0.5 and T0.6 wait on none of them.
 3. **D1 to D18** as a list to see before Stage 1 writes them into the format document.
