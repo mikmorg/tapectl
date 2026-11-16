@@ -325,14 +325,17 @@ members; a member larger than `slice_size` gets a run of slices to itself; the s
 are the same stream. With no file table and each slice in its own tar run, a plain cut fails
 every run (GNU tar 2,396 of 2,428 files, BusyBox tar 168) and a cut at member starts fails
 none (2,428 with both); a lost slice costs exactly its files at exit 0. Its price: a slice's
-size on tape follows the files in it (a file over half a slice shows its size without a key,
-finer than the per-unit sizes accepted on 2026-07-22), and up to about twice the slices. If
-it is ruled yes, question 41 is A by consequence and question 42 is answered. **Question 44**
-(reasoned, not measured): every unit continues on the next cartridge at the early warning,
-with the queue filled to it. W1 to W9 stay as measured; the `cut` unit, `allow_spanning` and
-the planner's two classes go; `volume rewrite` and compaction must carry a range; it reverses
-item 9 and item 82's opt-in, and one tape then no longer holds only whole units. Both are
-recommended and **neither is ruled; the permission is not the go.** Not yet run: bsdtar and
+size on tape follows the files in it (a file alone in its slice, or in a run of its own, shows
+its size without a key, finer than the per-unit sizes accepted on 2026-07-22), and more
+slices (at worst three for each `slice_size` of stream). If it is ruled yes, question 41 is A
+by consequence, and question 42 is only "slices stay, each an age file and a tape file".
+**Question 44** (reasoned, not measured) is two. 44a: every unit continues on the next
+cartridge at the early warning, with no opt-in and no `cut` unit; W1 to W9 stay as measured;
+`allow_spanning` and the planner's two classes go; `volume rewrite` and compaction must carry a
+range; it reverses item 9 and item 82's opt-in. 44b: the queue is filled to the warning (item
+123's bound made the one bound), so one unit lies across the end of every full tape and one
+tape no longer holds only whole units; with 44a alone a unit crosses only where one is cut
+today. All three are recommended and **none is ruled; the permission is not the go.** Not yet run: bsdtar and
 GNU tar 1.30 on a slice with no end-of-archive blocks, needed before the format document.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
