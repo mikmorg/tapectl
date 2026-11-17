@@ -1474,39 +1474,132 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 
 ## 10. Open points (Stage 1)
 
-None. The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two
-stagings of one version on one tape; the id map's header; the MANIFEST's new keys and their
-order; a magic in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into
-§1.4, §1.6, §1.9 and §5.
+The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings of one
+version on one tape; the id map's header; the MANIFEST's new keys and their order; a magic
+in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into §1.4, §1.6,
+§1.9 and §5. Open now, from T1.5's listing:
+
+1. **Appendix A.2** Whether the fresh baseline keeps `writes.eot_recovery` and
+   `writes.sacrificed_slice_id`, inert since Layout 2's salvage was rejected.
+2. **Appendix A.4** Whether the on-tape `stage_sets` and `stage_slices` carry the new
+   columns (`compression`, `compression_level`, `tar_version`, `continues`), or a rebuild
+   takes those from the MANIFEST.
 
 ---
 
-## Appendix A. The baseline schema
+## Appendix A. The baseline schema (T1.5)
 
-T1.5's product: the reviewed listing of every table and column of the 1.9.2 schema that is
-kept, the ones that go, and the new ones, from which T3.1 writes
-`src/db/migrations/001_baseline.sql` (D9). Decided so far (D9 as ratified, item 290, and
-the plan's determination under it):
+The reviewed listing from which T3.1 writes `src/db/migrations/001_baseline.sql` (D9,
+item 258(b)). It was taken from a catalog that tapectl 1.9.2 made with `init` (`PRAGMA
+user_version` 41, all 41 migrations), read table by table with `pragma_table_info`, and
+sorted into what is kept, what changes and what is new by the ruled texts (D9 and D11 as
+ratified, item 290; items 287 and 288; the plan's determinations under D9).
 
-- A 2.x catalog is known by SQLite's `application_id`, set by the baseline. A database that
-  has tables and lacks it is a 1.x catalog and is refused by name.
-- **New:** `stage_files` (the file table: `stage_set_id`, `seq`, `kind`, `slice`,
-  `path_id` into `paths`, `size`, `sha256` as 32 raw bytes or NULL, `start`, `end`,
-  `link_path_id`; primary key `(stage_set_id, seq)`, an index on `(stage_set_id,
-  path_id)`); `stage_ids` (the id map: `stage_set_id`, `kind`, `id`, `name` or NULL;
-  primary key `(stage_set_id, kind, id)`); `snapshot_left_out` (D14); a `drills` table
-  (D18). Both `stage_files` and `stage_ids` outlive the release of the staging's slices
-  and go only with the staging's own row (item 265).
-- **Changed:** `stage_sets` gains `tar_version`, `tar_command`, `stream_bytes` and
-  `compression_level`, and loses the old archiver's columns and `catalog_path`;
-  `stage_slices` gains `continues`; the old archiver's report table becomes
-  `tar_create_reports`, and its columns of `restores` become `tar_*` (D11; §9).
-- **Gone with T5.1:** the policy key that opted a staging in to spanning (an archive set's
-  and a unit's frozen copy), the write's frozen copy of it, and the write status `cut`
-  (items 288, 289; §9).
+- A 2.x catalog is known by SQLite's `application_id`, set by the baseline (1.9.2 sets
+  none: it reads 0). A database that has tables and lacks it is a 1.x catalog and is
+  refused by name.
 - Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
+  After the tag it is frozen and changes are numbered migrations again.
 
-The full listing is written by T1.5 into this appendix.
+**Counts.** 1.9.2 has 43 tables: 37 of its own, and `paths_fts` (a full-text virtual
+table) with the five shadow tables SQLite keeps for it. Of the 43: **37 kept as they are**,
+**6 kept with changed columns** (one of them renamed), **none gone**; **4 new**. Columns: **4
+go**, **12 are renamed**, **5 are new** on existing tables.
+
+### A.1 Kept as they are (37)
+
+`cartridge_contacts`, `cartridge_volumes`, `cartridges`, `cleaning_cartridges`, `drives`,
+`encryption_keys`, `events`, `file_versions`, `health_logs`, `locations`,
+`log_page_journal`, `mam_journal`, `meta`, `mtget_journal`, `paths`, `paths_fts` (and its
+shadow tables `paths_fts_config`, `paths_fts_data`, `paths_fts_docsize`, `paths_fts_idx`;
+the sixth name SQLite lists is the virtual table itself), `pending_rewrite_sets`,
+`pending_rewrites`, `phase_timings`, `readback_checkpoints`, `snapshots`,
+`st_stats_journal`, `tags`, `tenants`, `unit_path_history`, `unit_tags`, `units`,
+`verification_results`, `verification_sessions`, `volume_deposits`, `volume_movements`,
+`volumes`, `write_positions`. Every column, index, trigger and CHECK of these is the 1.9.2
+catalog's.
+
+### A.2 Kept with changed columns (6)
+
+| Table | Goes | Renamed | New |
+|---|---|---|---|
+| `archive_sets` | `preserve_fsa` (D11, item 253); `allow_spanning` (item 288; leaves with T5.1) | | `compression_level` (item 287) |
+| `stage_sets` | `catalog_path` (D11) | `dar_version` → `tar_version`, `dar_command` → `tar_command`, `total_dar_size` → `stream_bytes` (D11) | `compression_level` (items 286, 287: the level is recorded with the staging) |
+| `stage_slices` | | | `continues` (D22: 0 or 1) |
+| `writes` | `may_span` (item 288; leaves with T5.1), and the status `cut` and the check that a `range` row has `may_span` set | | |
+| `restores` | | `dar_argv`, `dar_exit_code`, `dar_stdout`, `dar_stderr`, `dar_version` → `tar_argv`, `tar_exit_code`, `tar_stdout`, `tar_stderr`, `tar_version` (D11) | |
+| `dar_create_reports` → **`tar_create_reports`** (D11) | | `dar_command`, `dar_exit_code`, `dar_stderr`, `dar_version` → `tar_command`, `tar_exit_code`, `tar_stderr`, `tar_version` | |
+
+The kept columns of these six tables are the 1.9.2 catalog's: `archive_sets`' `id`,
+`name`, `description`, `min_copies`, `required_locations`, `encrypt`, `compression`,
+`checksum_mode`, `slice_size`, `verify_interval_days`, `preserve_xattrs`, `preserve_acls`,
+`dirty_on_metadata_change`, `created_at`, `updated_at`, `warehouse_copies`, `copies_at`;
+`stage_sets`' `id`, `snapshot_id`, `status`, `slice_size`, `compression`, `encrypted`,
+`key_fingerprints`, `num_slices`, `total_encrypted_size`, `source_validated_at`,
+`staged_at`, `cleaned_at`, `created_at`, `notes`, `origin`; `stage_slices`' `id`,
+`stage_set_id`, `slice_number`, `size_bytes`, `encrypted_bytes`, `sha256_plain`,
+`sha256_encrypted`, `staging_path`, `released_at`; `writes`' `id`, `stage_set_id`,
+`snapshot_id`, `volume_id`, `status`, `write_verified`, `eot_recovery`,
+`sacrificed_slice_id`, `started_at`, `completed_at`, `notes`, `created_at`,
+`session_dir`; `restores`' `id`, `contact_id`, `volume_id`, `volume_label`, `unit_id`,
+`unit_name`, `version`, `kind`, `file_path`, `destination`, `started_at`, `finished_at`,
+`outcome`, `error`, `slices_read`, `bytes_restored`, `files_restored`, `tapectl_version`;
+the report table's `id`, `captured_at`, `stage_set_id`, `unit_name`, `snapshot_version`,
+`outcome`, `tapectl_version`.
+
+`allow_spanning`, `writes.may_span` and the status `cut` are in the baseline T3.1 makes,
+because the code still reads them then; T5.1 removes them with that code (D9).
+
+**OPEN (Stage 1):** `writes.eot_recovery` and `writes.sacrificed_slice_id` are inert
+reserve (Layout 2's end-of-tape salvage, rejected; `docs/design-errata.md`), still named by
+`src/db/models.rs` and one insert in `src/db/mod.rs`. Does the fresh baseline keep them
+(the repo's inert-reserve convention) or drop them (item 258(b)'s one baseline with
+nothing inherited)? Listed above as kept until answered.
+
+### A.3 New (4)
+
+- **`stage_files`**, the file table (D4, D9; item 265): `stage_set_id` (the staging,
+  deleted with it), `seq` (the member's place in the stream, from 0), `kind`, `slice`,
+  `path_id` (into `paths`; no path text is stored twice), `size`, `sha256` (32 raw bytes,
+  NULL where the text has `-`), `start`, `end`, `link_path_id` (NULL but for kind `h`).
+  Primary key `(stage_set_id, seq)`; an index on `(stage_set_id, path_id)`. It outlives the
+  release of the staging's slices.
+- **`stage_ids`**, the id map (D5, D9; items 272, 277): `stage_set_id`, `kind` (`u` or
+  `g`), `id`, `name` (NULL where the host knew none). Primary key `(stage_set_id, kind,
+  id)`. It outlives the release of the staging's slices.
+- **`snapshot_left_out`** (D14, #542): `snapshot_id`, `seq`, `reason` (`pattern` or
+  `socket`), `pattern` (NULL for a socket), `path` (text, escaped as the index is), `kind`
+  (`file` or `folder`), `files` and `bytes` (what was under a folder; 1 and the file's
+  size for a file). Primary key `(snapshot_id, seq)`.
+- **`drills`** (D18, item 247): `id`, `recorded_at`, `volume_id`, `script_sha256`,
+  `tar_version`, `age_version`, `note`.
+
+### A.4 The on-tape `catalog.db` (§1.4; item 294)
+
+Exactly the tables `catalog rebuild` reads (`db::ontape_catalog`, generation 3), plus
+`stage_files` and `stage_ids`, and nothing else:
+
+| Table | Columns |
+|---|---|
+| `tenants` | `id`, `name` |
+| `units` | `id`, `uuid`, `name`, `tenant_id`, `status` |
+| `snapshots` | `id`, `unit_id`, `version`, `snapshot_type`, `source_path`, `total_size`, `file_count` |
+| `stage_sets` | `id`, `snapshot_id`, `slice_size`, `num_slices`, `stream_bytes` (1.x `total_dar_size`, renamed by D11), `total_encrypted_size`, `key_fingerprints` |
+| `stage_slices` | `id`, `stage_set_id`, `slice_number`, `size_bytes`, `encrypted_bytes`, `sha256_plain`, `sha256_encrypted` |
+| `paths` | `id`, `unit_id`, `path` |
+| `file_versions` | `snapshot_id`, `path_id`, `kind` (0 dir, 1 regular, 2 symlink, 3 special), `size_bytes`, `mtime_ns`, `sha256` (32 bytes or NULL), `link_target`; primary key `(snapshot_id, path_id)`, `WITHOUT ROWID` |
+| `stage_files` | as A.3, for the stagings this tape holds a slice of |
+| `stage_ids` | as A.3, for the same stagings |
+
+`paths` has no `UNIQUE(unit_id, path)` index, no full-text index and no triggers. Layout
+2's generation-1 and generation-2 `files` table is not carried (item 258(d)).
+
+**OPEN (Stage 1):** whether the on-tape `stage_sets` and `stage_slices` also carry the
+columns the main catalog gains (`compression`, `compression_level`, `tar_version`,
+`stage_slices.continues`). The MANIFEST states `compression`, `tar_version` and
+`continues` (§1.9), and item 294 limits the file to "the tables `catalog rebuild` reads";
+which of these columns a rebuild reads from `catalog.db` rather than the MANIFEST is not
+ruled.
 
 ## Appendix B. #562's rules, each with the section that carries it
 
