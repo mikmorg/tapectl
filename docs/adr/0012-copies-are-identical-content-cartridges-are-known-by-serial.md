@@ -3725,3 +3725,13 @@ to the CTO in four questions, each with a recommendation. The CTO chose each rec
      - **No magic key is added to File 3 or the seal.** D1's "the front index's and the seal
        marker's magics move with it" is read as: what moves in those two files is
        `layout_version = 3`. File 0's magic is `tapectl-volume-v3`.
+
+295. **Two points of the baseline schema** (asked the same night, from Stage 1's schema
+     listing; the CTO chose each recommendation):
+     - `writes.eot_recovery` and `writes.sacrificed_slice_id` **are dropped** from the
+       baseline. They belonged to Layout 2's end-of-tape salvage, which was rejected
+       outright, and carry no meaning (item 242: simplify).
+     - **The on-tape `stage_sets` and `stage_slices` carry the columns the catalog gains**
+       (`compression`, `compression_level`, `tar_version`, `continues`), so that a rebuild
+       reads every fact of a staging from the on-tape `catalog.db` alone. The MANIFEST
+       still states `compression`, `tar_version` and `continues`, for the heir.

@@ -1474,16 +1474,12 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 
 ## 10. Open points (Stage 1)
 
-The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings of one
-version on one tape; the id map's header; the MANIFEST's new keys and their order; a magic
-in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into §1.4, §1.6,
-§1.9 and §5. Open now, from T1.5's listing:
-
-1. **Appendix A.2** Whether the fresh baseline keeps `writes.eot_recovery` and
-   `writes.sacrificed_slice_id`, inert since Layout 2's salvage was rejected.
-2. **Appendix A.4** Whether the on-tape `stage_sets` and `stage_slices` carry the new
-   columns (`compression`, `compression_level`, `tar_version`, `continues`), or a rebuild
-   takes those from the MANIFEST.
+None. The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings
+of one version on one tape; the id map's header; the MANIFEST's new keys and their order; a
+magic in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into §1.4,
+§1.6, §1.9 and §5. The two T1.5's listing found (two inert columns of `writes`; the new
+columns of the on-tape `stage_sets` and `stage_slices`) were ruled by item 295 and are
+written into Appendix A.2 and A.4.
 
 ---
 
@@ -1539,8 +1535,7 @@ The kept columns of these six tables are the 1.9.2 catalog's: `archive_sets`' `i
 `staged_at`, `cleaned_at`, `created_at`, `notes`, `origin`; `stage_slices`' `id`,
 `stage_set_id`, `slice_number`, `size_bytes`, `encrypted_bytes`, `sha256_plain`,
 `sha256_encrypted`, `staging_path`, `released_at`; `writes`' `id`, `stage_set_id`,
-`snapshot_id`, `volume_id`, `status`, `write_verified`, `eot_recovery`,
-`sacrificed_slice_id`, `started_at`, `completed_at`, `notes`, `created_at`,
+`snapshot_id`, `volume_id`, `status`, `write_verified`, `started_at`, `completed_at`, `notes`, `created_at`,
 `session_dir`; `restores`' `id`, `contact_id`, `volume_id`, `volume_label`, `unit_id`,
 `unit_name`, `version`, `kind`, `file_path`, `destination`, `started_at`, `finished_at`,
 `outcome`, `error`, `slices_read`, `bytes_restored`, `files_restored`, `tapectl_version`;
@@ -1550,11 +1545,9 @@ the report table's `id`, `captured_at`, `stage_set_id`, `unit_name`, `snapshot_v
 `allow_spanning`, `writes.may_span` and the status `cut` are in the baseline T3.1 makes,
 because the code still reads them then; T5.1 removes them with that code (D9).
 
-**OPEN (Stage 1):** `writes.eot_recovery` and `writes.sacrificed_slice_id` are inert
-reserve (Layout 2's end-of-tape salvage, rejected; `docs/design-errata.md`), still named by
-`src/db/models.rs` and one insert in `src/db/mod.rs`. Does the fresh baseline keep them
-(the repo's inert-reserve convention) or drop them (item 258(b)'s one baseline with
-nothing inherited)? Listed above as kept until answered.
+`writes.eot_recovery` and `writes.sacrificed_slice_id` go (ADR-0012 item 295): they
+belonged to Layout 2's end-of-tape salvage, which was rejected. T3.1 removes the model
+fields and the one insert that still writes them.
 
 ### A.3 New (4)
 
@@ -1584,8 +1577,8 @@ Exactly the tables `catalog rebuild` reads (`db::ontape_catalog`, generation 3),
 | `tenants` | `id`, `name` |
 | `units` | `id`, `uuid`, `name`, `tenant_id`, `status` |
 | `snapshots` | `id`, `unit_id`, `version`, `snapshot_type`, `source_path`, `total_size`, `file_count` |
-| `stage_sets` | `id`, `snapshot_id`, `slice_size`, `num_slices`, `stream_bytes` (1.x `total_dar_size`, renamed by D11), `total_encrypted_size`, `key_fingerprints` |
-| `stage_slices` | `id`, `stage_set_id`, `slice_number`, `size_bytes`, `encrypted_bytes`, `sha256_plain`, `sha256_encrypted` |
+| `stage_sets` | `id`, `snapshot_id`, `slice_size`, `num_slices`, `stream_bytes` (1.x `total_dar_size`, renamed by D11), `total_encrypted_size`, `key_fingerprints`, `compression`, `compression_level`, `tar_version` |
+| `stage_slices` | `id`, `stage_set_id`, `slice_number`, `size_bytes`, `encrypted_bytes`, `sha256_plain`, `sha256_encrypted`, `continues` |
 | `paths` | `id`, `unit_id`, `path` |
 | `file_versions` | `snapshot_id`, `path_id`, `kind` (0 dir, 1 regular, 2 symlink, 3 special), `size_bytes`, `mtime_ns`, `sha256` (32 bytes or NULL), `link_target`; primary key `(snapshot_id, path_id)`, `WITHOUT ROWID` |
 | `stage_files` | as A.3, for the stagings this tape holds a slice of |
@@ -1594,12 +1587,10 @@ Exactly the tables `catalog rebuild` reads (`db::ontape_catalog`, generation 3),
 `paths` has no `UNIQUE(unit_id, path)` index, no full-text index and no triggers. Layout
 2's generation-1 and generation-2 `files` table is not carried (item 258(d)).
 
-**OPEN (Stage 1):** whether the on-tape `stage_sets` and `stage_slices` also carry the
-columns the main catalog gains (`compression`, `compression_level`, `tar_version`,
-`stage_slices.continues`). The MANIFEST states `compression`, `tar_version` and
-`continues` (§1.9), and item 294 limits the file to "the tables `catalog rebuild` reads";
-which of these columns a rebuild reads from `catalog.db` rather than the MANIFEST is not
-ruled.
+The on-tape `stage_sets` and `stage_slices` carry the columns the main catalog gains
+(`compression`, `compression_level`, `tar_version`, `continues`), so that a rebuild reads
+every fact of a staging from this one file (ADR-0012 item 295). The MANIFEST still states
+`compression`, `tar_version` and `continues` (§1.9), for the heir.
 
 ## Appendix B. #562's rules, each with the section that carries it
 
