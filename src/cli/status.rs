@@ -510,6 +510,9 @@ pub struct HomeScreen {
     /// The collection each pending unit belongs to, in pending order (name,
     /// collection); a unit in none is absent.
     pub pending_collections: Vec<(String, String)>,
+    /// The newest `db backup` the catalog recorded: (UTC time, file, check
+    /// `ok`/`failed`, whole days old). ADR-0012 item 250.
+    pub last_backup: Option<(String, String, String, i64)>,
 }
 
 impl HomeScreen {
@@ -662,6 +665,7 @@ pub fn gather(conn: &Connection, config: &Config) -> Result<HomeScreen> {
 
     screen.due_verify = due_verify(conn, config.defaults.verify_interval_days)?;
     screen.interrupted = interrupted_write_targets(conn)?;
+    screen.last_backup = crate::db::events::last_backup(conn)?;
     Ok(screen)
 }
 
@@ -923,6 +927,7 @@ pub fn overview_json(
         "due_verify": null,
         "interrupted": null,
         "next": null,
+        "last_backup": null,
     });
     match overview {
         Overview::Read(s) => {
@@ -950,6 +955,15 @@ pub fn overview_json(
                 })
                 .collect();
             doc["interrupted"] = serde_json::json!(s.interrupted);
+            doc["last_backup"] = match &s.last_backup {
+                Some((at, path, check, age_days)) => serde_json::json!({
+                    "at": crate::render::json_time(at),
+                    "path": path,
+                    "check": check,
+                    "age_days": age_days,
+                }),
+                None => serde_json::Value::Null,
+            };
             doc["next"] = serde_json::json!(s.next_commands());
         }
         Overview::NeedsServiceUser => doc["note"] = serde_json::json!(NEEDS_SERVICE_USER),

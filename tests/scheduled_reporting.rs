@@ -208,3 +208,74 @@ fn what_is_pending_is_in_status_json() {
         "{doc}"
     );
 }
+
+fn tapectl_env(home: &Path, args: &[&str], env: (&str, &str)) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TAPECTL_HOME")
+        .env(env.0, env.1)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to spawn tapectl binary")
+}
+
+/// Fact 2, from the command line alone: `status --json`'s `last_backup`
+/// is null until a backup is made, then names it, its check and its age.
+#[test]
+fn status_json_gives_the_newest_backups_age_and_check() {
+    let home = initialised_home();
+    let doc = json(&ok(home.path(), &["--json", "status"]));
+    assert!(
+        doc.get("last_backup").is_some(),
+        "the key is always there: {doc}"
+    );
+    assert!(doc["last_backup"].is_null(), "{doc}");
+
+    let dir = TempDir::new().unwrap();
+    let out = ok(
+        home.path(),
+        &["--json", "db", "backup", dir.path().to_str().unwrap()],
+    );
+    let backup = json(&out);
+    assert_eq!(backup["check"], "ok", "{backup}");
+    let doc = json(&ok(home.path(), &["--json", "status"]));
+    let last = &doc["last_backup"];
+    assert_eq!(last["check"], "ok", "{doc}");
+    assert_eq!(last["path"], backup["backup"], "{doc}");
+    assert_eq!(last["age_days"], 0, "{doc}");
+    assert!(last["at"].as_str().is_some(), "{doc}");
+    // The check left no sidecar beside the backup.
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "only the backup: {names:?}");
+}
+
+/// A backup whose check fails is kept, recorded `failed`, and exits non-zero.
+#[test]
+fn a_backup_that_fails_its_check_is_kept_recorded_failed_and_exits_nonzero() {
+    let home = initialised_home();
+    let dir = TempDir::new().unwrap();
+    let out = tapectl_env(
+        home.path(),
+        &["--json", "db", "backup", dir.path().to_str().unwrap()],
+        ("TAPECTL_TEST_BACKUP_CHECK_FAILS", "1"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json(&out)["check"], "failed");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "the file is kept"
+    );
+    let doc = json(&ok(home.path(), &["--json", "status"]));
+    assert_eq!(doc["last_backup"]["check"], "failed", "{doc}");
+}

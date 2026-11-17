@@ -2775,8 +2775,8 @@ stdout, and an error is one JSON document with the command's exit code.
 | fact | command | what to read | exit code |
 |---|---|---|---|
 | the audit's verdict | `tapectl --json audit` | `exit_code`, `violations`, `warnings`, and each of `findings` (`check`, `unit`, `message`) | 0 clean, 1 warnings only, 2 violations, 70 no verdict, 75 catalog busy |
-| the newest catalog backup's age | the newest `tapectl-<UTC stamp>.db` in the backup directory | the stamp in the name (`YYYYmmddTHHMMSSZ`, the time it was made) | not applicable |
-| whether it passed its check | `tapectl --json db import FILE --dry-run` | `dry_run` and `source_schema_version` | 0 the file passes (an SQLite database, passes its integrity check, a tapectl catalog of a schema this tapectl opens), non-zero it does not; nothing is changed |
+| the newest catalog backup's age and check | `tapectl --json status` | `last_backup`: `at` (UTC), `path`, `check` (`ok` or `failed`) and `age_days`, or `null` when `db backup` never ran here. Every real `db backup` records it, after running SQLite's integrity check on the copy | 0 |
+| a backup made elsewhere (the fallback) | the newest `tapectl-<UTC stamp>.db` file, and `tapectl --json db import FILE --dry-run` | the stamp in the name (`YYYYmmddTHHMMSSZ`) is its age; the dry run exits 0 when the file passes (an SQLite database, passes its integrity check, a tapectl catalog of a schema this tapectl opens), non-zero when not, and changes nothing | 0 or non-zero |
 | the drive's last health reading | `tapectl --json report health` | `readings[0]` (newest first: `at`, `operation`, `tape_alerts`, `corrected`, `uncorrected`, `drive_serial`, `cartridge_barcode`) and `tape_alerts_raised` | always 0 |
 | what is pending | `tapectl --json status` | `units.pending`, and the lists `units.never_archived`, `dirty`, `unstaged`, `not_scanned`, the count `units.unsynced_folders`, `units.under_copied`, `due_verify`, `interrupted` and `next` (the commands to run) | 0 |
 
@@ -2787,10 +2787,10 @@ Things to know when writing the tool:
   at any time. `drive status` touches the drive and is not for a tool to poll.
   The reading's age is its `at`; a drive poll that stops running shows as an old
   `at`, not as an error.
-- The catalog records no backup. A backup's age and its check come from the
-  file the backup wrote (the dated name above, and the dry-run import), in the
-  directory the tool already knows (the scheduled backup's
-  `TAPECTL_BACKUP_DIR`). The newest by name is the newest by time.
+- `db backup` exits 2 when its copy fails the integrity check: the file is
+  kept, the failure is named on stderr, and `last_backup.check` says `failed`.
+  A `last_backup` that is old, `failed` or `null` is the finding; the wrapper's
+  own success only says the copy was made.
 - Exit 75 means the catalog was busy: no answer this time, not a finding.
   Ask again; a tool that sees it on several runs in a row has its own news.
 - A pending unit is advice, not a failure: `status` exits 0 whatever is

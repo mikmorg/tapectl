@@ -3919,6 +3919,31 @@ pub struct BackupReport {
     pub db_bytes: u64,
     /// The summed size of the key files copied; 0 when none were.
     pub keys_bytes: u64,
+    /// Why the copy fails SQLite's integrity check, or `None` when it
+    /// passes (ADR-0012 item 250: a reporting tool learns the check from
+    /// `status --json`). A failing copy is kept, never removed.
+    pub check_failure: Option<String>,
+}
+
+/// SQLite's integrity check on a backup, opened read only so no sidecar is
+/// left beside it. `None` is a pass. The env hook
+/// `TAPECTL_TEST_BACKUP_CHECK_FAILS` makes a test copy fail.
+fn backup_check_failure(file: &Path) -> Option<String> {
+    if std::env::var_os("TAPECTL_TEST_BACKUP_CHECK_FAILS").is_some() {
+        return Some("integrity check failed (test hook)".to_string());
+    }
+    let rows = crate::db::with_read_only(file, |conn| {
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    });
+    match rows {
+        Ok(rows) if rows.len() == 1 && rows[0] == "ok" => None,
+        Ok(rows) => Some(rows.into_iter().take(3).collect::<Vec<_>>().join("; ")),
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// DB backup using SQLite backup API.
@@ -4023,8 +4048,10 @@ pub fn db_backup(
         info!("--include-keys not set; private keys were not copied to this backup");
     }
 
+    let check_failure = backup_check_failure(&file);
     info!(dest = %dest, bytes = db_bytes, "database backup complete");
     Ok(Some(BackupReport {
+        check_failure,
         file,
         keys_dir: keys_copied_to,
         db_bytes,

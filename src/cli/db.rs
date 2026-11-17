@@ -52,6 +52,40 @@ pub fn run(
             let report =
                 crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
             if let Some(report) = report {
+                // ADR-0012 item 250: one event per real backup, so `status`
+                // can tell a reporting tool the newest backup's age and check.
+                let check = if report.check_failure.is_none() {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                crate::db::events::log_event(
+                    conn,
+                    "catalog",
+                    0,
+                    None,
+                    crate::db::events::DB_BACKUP,
+                    None,
+                    None,
+                    Some(&report.file.display().to_string()),
+                    Some(
+                        &serde_json::json!({
+                            "bytes": report.db_bytes,
+                            "check": check,
+                            "keys_included": include_keys,
+                        })
+                        .to_string(),
+                    ),
+                    None,
+                )?;
+                if let Some(why) = &report.check_failure {
+                    eprintln!(
+                        "error: the backup at {} fails its integrity check ({why}); the file is \
+                         kept, and is not to be relied on",
+                        report.file.display()
+                    );
+                    exit_code = crate::error::EXIT_ERROR;
+                }
                 let size = crate::util::format_bytes_binary(report.db_bytes as i64);
                 let to = report.file.display();
                 if json_output {
@@ -59,7 +93,8 @@ pub fn run(
                         &serde_json::json!({"backup": to.to_string(), "keys_included": include_keys,
                                            "keys_dir": report.keys_dir,
                                            "size_bytes": report.db_bytes,
-                                           "keys_bytes": report.keys_bytes}),
+                                           "keys_bytes": report.keys_bytes,
+                                           "check": check}),
                     );
                 } else if let Some(keys_dir) = &report.keys_dir {
                     println!(

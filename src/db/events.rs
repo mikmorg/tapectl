@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 
@@ -26,6 +26,26 @@ pub fn lbp_refusal_seen(conn: &Connection, volume_id: i64) -> Result<bool> {
         params![volume_id, WRITE_LBP_REFUSAL],
         |r| r.get(0),
     )?)
+}
+
+/// The action of the event one real `db backup` records (entity `catalog`;
+/// `new_value` is the file, `details` JSON with `bytes`, `check`, `keys_included`).
+pub const DB_BACKUP: &str = "db_backup";
+
+/// The newest `db backup` event: (UTC time, file, check, days old).
+pub fn last_backup(conn: &Connection) -> Result<Option<(String, String, String, i64)>> {
+    let row = conn
+        .query_row(
+            "SELECT timestamp, COALESCE(new_value, ''),
+                    COALESCE(json_extract(details, '$.check'), 'failed'),
+                    CAST(julianday('now') - julianday(timestamp) AS INTEGER)
+             FROM events WHERE entity_type = 'catalog' AND action = ?1
+             ORDER BY id DESC LIMIT 1",
+            params![DB_BACKUP],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    Ok(row)
 }
 
 /// Log an event to the audit trail.
