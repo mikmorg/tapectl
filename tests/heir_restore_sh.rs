@@ -359,9 +359,6 @@ struct Template {
 /// ADR-0012 item 111). The script under test is always this tapectl's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Era {
-    /// 1.1.0 to 1.5.0: `requires = []` everywhere, no `ended_after`, no
-    /// `may_end_early`.
-    V150,
     /// 1.6.0: `requires = ["short-seal"]` in File 0 and the seal, every seal
     /// states `ended_after`, File 3 and the envelopes state `may_end_early`.
     /// A tape 1.7.0 writes that holds no slice of a unit that may span is
@@ -399,47 +396,36 @@ fn era_file0(era: Era, text: String) -> String {
         1,
         "this tapectl's File 0:\n{text}"
     );
-    match era {
-        Era::V160 | Era::V170Span => text,
-        Era::V150 => text.replace(short, "\nrequires = []\n"),
-    }
+    text
 }
 
-/// File 3 as `era` writes it.
-fn era_front_index(era: Era, text: String) -> String {
+/// File 3 as `era` writes it: the same in every era the fixtures make.
+fn era_front_index(_era: Era, text: String) -> String {
     assert_eq!(text.matches(MAY_END_EARLY_PARAGRAPH).count(), 1, "{text}");
     assert_eq!(
         text.matches("\nmay_end_early = true\n").count(),
         1,
         "{text}"
     );
-    match era {
-        Era::V160 | Era::V170Span => text,
-        Era::V150 => text
-            .replace(MAY_END_EARLY_PARAGRAPH, "")
-            .replace("\nmay_end_early = true\n", "\n"),
-    }
+    text
 }
 
-/// An envelope's MANIFEST.toml as `era` writes it.
-fn era_manifest(era: Era, text: String) -> String {
+/// An envelope's MANIFEST.toml as `era` writes it: the same in every era
+/// the fixtures make.
+fn era_manifest(_era: Era, text: String) -> String {
     assert_eq!(
         text.matches("\nmay_end_early = true\n").count(),
         1,
         "{text}"
     );
-    match era {
-        Era::V160 | Era::V170Span => text,
-        Era::V150 => text.replace("\nmay_end_early = true\n", "\n"),
-    }
+    text
 }
 
-/// A seal marker with its `[seal]` table as `era` writes it: 1.6.0's
-/// `requires = ["short-seal"]` and `ended_after = file_count - 2` (§4.1, the
-/// key after `file_count`), or 1.5.0's `requires = []` and no `ended_after`.
+/// A seal marker with its `[seal]` table as `era` writes it: its `requires`
+/// and `ended_after = file_count - 2` (§4.1, the key after `file_count`).
 /// Whatever the generator wrote on those two lines is replaced, so a fixture
-/// holds its era's bytes whether or not the generator writes 1.6.0 seals yet;
-/// the header and the `[[files]]` entries are the generator's.
+/// holds its era's bytes; the header and the `[[files]]` entries are the
+/// generator's.
 fn era_seal(era: Era, text: &str) -> String {
     let mut out = String::new();
     let mut in_seal = false;
@@ -453,7 +439,6 @@ fn era_seal(era: Era, text: &str) -> String {
         if in_seal && line.starts_with("requires = ") {
             requires += 1;
             out.push_str(match era {
-                Era::V150 => "requires = []\n",
                 Era::V160 => "requires = [\"short-seal\"]\n",
                 Era::V170Span => "requires = [\"short-seal\", \"spanning\"]\n",
             });
@@ -464,7 +449,7 @@ fn era_seal(era: Era, text: &str) -> String {
         }
         out.push_str(line);
         out.push('\n');
-        if in_seal && era != Era::V150 {
+        if in_seal {
             if let Some(n) = line.strip_prefix("file_count = ") {
                 let n: i64 = n.parse().unwrap();
                 out.push_str(&format!("ended_after = {}\n", n - 2));
@@ -585,13 +570,6 @@ fn run_dar(args: &[&str]) {
 fn template() -> &'static Template {
     static T: OnceLock<Template> = OnceLock::new();
     T.get_or_init(|| build_template_full("main", &main_tenants(), true, true, &[], Era::V160))
-}
-
-/// The same volume as a 1.5.0 tapectl wrote it: what this script must still
-/// read exactly as before (volume-format-v2.md §6 "Since 1.6.0").
-fn template_150() -> &'static Template {
-    static T: OnceLock<Template> = OnceLock::new();
-    T.get_or_init(|| build_template_full("main150", &main_tenants(), true, true, &[], Era::V150))
 }
 
 fn main_tenants() -> Vec<TenantSpec> {
@@ -2301,58 +2279,43 @@ fn walk(h: &Heir) -> (Vec<i64>, usize) {
 
 /// A K-slice restore rewinds once, at the start, and then only moves
 /// forward: it used to rewind and space from BOT before every file it read.
-/// That is a 1.5.0 tape's; a 1.6.0 tape's adds the one wind to the seal
-/// before the first envelope (R1), and is forward only after it.
+/// It winds once to the seal before the first envelope (R1), and is forward
+/// only after it.
 #[test]
 fn a_multi_slice_restore_rewinds_once_and_only_spaces_forward() {
-    for (era, h) in [
-        (Era::V150, Heir::of(template_150(), &[])),
-        (Era::V160, Heir::new()),
-    ] {
-        let photos = unit("photos/2019");
-        let k = photos.positions.len();
-        let dest = h.sub("restored");
-        let (code, text) = h.run(&[
-            "--restore",
-            "--key",
-            &h.key("alice"),
-            "--unit",
-            "photos/2019",
-            "--to",
-            &dest,
-        ]);
-        assert_eq!(code, 0, "{era:?}: {text}");
-        assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
-        let ops = h.ops();
-        let (walked, rewinds, wind) = match era {
-            Era::V150 => {
-                assert_eq!(h.count("mt eod"), 0, "no seal read before 1.6.0:\n{ops:#?}");
-                (reads(&h), h.count("mt rewind"), 0)
-            }
-            Era::V160 | Era::V170Span => {
-                let (r, w) = walk(&h);
-                (r, w, 1)
-            }
-        };
-        assert_eq!(
-            rewinds, 1,
-            "{era:?}: one rewind for the whole restore:\n{ops:#?}"
-        );
-        // File 0 -> File 3 and envelope -> first slice are the only gaps (and,
-        // on a 1.6.0 tape, the start of the tape -> the first envelope after
-        // the wind); the slices are contiguous, so K-1 is a generous ceiling.
-        assert!(
-            h.fsfs() <= 2 + wind + k.saturating_sub(1),
-            "{era:?}: forward spaces: {} for {k} slices:\n{ops:#?}",
-            h.fsfs()
-        );
-        // Every slice read exactly once, in ascending order.
-        let slices: Vec<i64> = walked
-            .into_iter()
-            .filter(|p| photos.positions.contains(p))
-            .collect();
-        assert_eq!(slices, photos.positions, "{era:?}: {ops:#?}");
-    }
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let k = photos.positions.len();
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+    let ops = h.ops();
+    let (walked, rewinds) = walk(&h);
+    let wind = 1;
+    assert_eq!(rewinds, 1, "one rewind for the whole restore:\n{ops:#?}");
+    // File 0 -> File 3 and envelope -> first slice are the only gaps (and the
+    // start of the tape -> the first envelope after the wind); the slices are
+    // contiguous, so K-1 is a generous ceiling.
+    assert!(
+        h.fsfs() <= 2 + wind + k.saturating_sub(1),
+        "forward spaces: {} for {k} slices:\n{ops:#?}",
+        h.fsfs()
+    );
+    // Every slice read exactly once, in ascending order.
+    let slices: Vec<i64> = walked
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .collect();
+    assert_eq!(slices, photos.positions, "{ops:#?}");
 }
 
 /// --verify on a 1.6.0 tape reads the seal marker right after the front index
@@ -2380,28 +2343,6 @@ fn verify_on_a_1_6_0_tape_reads_the_seal_first_and_then_walks_forward() {
     assert_eq!(got, sorted, "each file once, ascending:\n{ops:#?}");
     assert_eq!(got[..4], [0, 1, 2, 3], "{ops:#?}");
     assert!(!got.contains(&seal), "{ops:#?}");
-}
-
-/// --verify on a 1.5.0 tape walks the tape once, ascending: one rewind, every
-/// file read once, and the seal marker read last (#412 item 8), not before the
-/// walk, exactly as before 1.6.0.
-#[test]
-fn verify_rewinds_once_and_reads_the_seal_marker_last() {
-    let h = Heir::of(template_150(), &[]);
-    let (code, text) = h.run(&["--verify"]);
-    assert_eq!(code, 0, "{text}");
-    let ops = h.ops();
-    assert_eq!(h.count("mt rewind"), 1, "{ops:#?}");
-    let got = reads(&h);
-    let mut sorted = got.clone();
-    sorted.sort();
-    sorted.dedup();
-    assert_eq!(got, sorted, "each file once, ascending:\n{ops:#?}");
-    assert_eq!(
-        got.last().copied(),
-        Some(template().total_files as i64 - 1),
-        "the seal marker is read last:\n{ops:#?}"
-    );
 }
 
 /// --info and --find-envelope read ascending from one rewind too.
@@ -3283,7 +3224,7 @@ fn with_requires(t: &str, line: &str) -> String {
 /// A 1.6.0 tape requires `short-seal`, in File 0 and in the seal, whether
 /// it sealed full or short (ADR-0012 item 111), and its seal states
 /// `ended_after`. The third place `requires` lives is RESTORE.sh's own
-/// `KNOWN_FEATURES`, which names it. A 1.5.0 tape states it empty.
+/// `KNOWN_FEATURES`, which names it.
 #[test]
 fn a_new_tape_states_short_seal_in_file_0_and_the_seal() {
     let t = template();
@@ -3314,9 +3255,6 @@ fn a_new_tape_states_short_seal_in_file_0_and_the_seal() {
         1,
         "RESTORE.sh knows short-seal and spanning"
     );
-    let old = template_150();
-    let f0 = std::fs::read_to_string(old.dir.join("tape/0")).unwrap();
-    assert!(f0.contains("\nrequires = []\n"), "a 1.5.0 File 0");
 }
 
 /// §6 "Since 1.6.0": the text that tells an heir a tape is newer than the
@@ -10225,161 +10163,6 @@ fn swap_tapes_reads_the_second_tapes_seal_first_and_takes_nothing_past_its_end()
     }
 }
 
-/// The 1.6.0 script reads a 1.5.0 tape exactly as before (§6 "Since 1.6.0"):
-/// SEALED with no word of an early end, `--verify` passes every file, and no
-/// mode winds to the seal before the envelopes: a restore and `--where` rewind
-/// once and never space to end of data.
-#[test]
-fn the_1_6_0_script_reads_a_1_5_0_tape_as_before() {
-    let t = template_150();
-    let h = Heir::of(t, &[]);
-    let (code, text) = h.run(&["--info"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(text.contains("Verdict: SEALED"), "{text}");
-    assert!(!text.contains("ended early"), "{text}");
-    assert!(!text.contains("NOT ON TAPE"), "{text}");
-    assert!(!text.contains("WARNING"), "{text}");
-
-    let (code, text) = h.run(&["--verify"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains("VERIFY: PASS — every file matches the front index."),
-        "{text}"
-    );
-    let passes = text.lines().filter(|l| l.starts_with("PASS  file")).count();
-    assert_eq!(passes, t.total_files as usize - 1, "{text}");
-
-    let photos = unit_of(t, "photos/2019");
-    let dest = h.sub("restored");
-    let (code, text) = h.run(&[
-        "--restore",
-        "--key",
-        &h.key("alice"),
-        "--unit",
-        "photos/2019",
-        "--to",
-        &dest,
-    ]);
-    assert_eq!(code, 0, "{text}");
-    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
-    assert_eq!(h.count("mt eod"), 0, "{:#?}", h.ops());
-    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
-    assert!(!text.contains("ended early"), "{text}");
-
-    let (code, text) = h.run(&["--where", "docs", "--key", &h.key("alice")]);
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains(&format!("tape {LABEL}  (this tape)")),
-        "{text}"
-    );
-    assert_eq!(h.count("mt eod"), 0, "{:#?}", h.ops());
-    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
-}
-
-/// RESTORE.sh as tapectl 1.5.0 wrote it, byte for byte (the fixture's README
-/// says how it was made; the hash is the pin `tests/on_tape_golden.rs` held
-/// from 1.3.0 to 1.5.0).
-const RESTORE_SH_1_5_0: &str = include_str!("fixtures/restore_sh_1_5_0/RESTORE-GOLD01-12.sh");
-const RESTORE_SH_1_5_0_SHA256: &str =
-    "95862b49b0621e5970ebd91c49a353231725009e1f527c691cf98b3a116a6315";
-
-/// ADR-0012 item 111: every 1.6.0 tape, full or short, fences out older
-/// readers. A 1.5.0 RESTORE.sh refuses it at File 0, by name, in every mode,
-/// before it reads anything else of it, and points to the RESTORE.sh on the
-/// tape itself. The positive control: the same script reads a 1.5.0 tape.
-#[test]
-fn the_1_5_0_script_refuses_a_1_6_0_tape_full_or_short_at_file_0_by_name() {
-    assert_eq!(
-        sha256_hex(RESTORE_SH_1_5_0.as_bytes()),
-        RESTORE_SH_1_5_0_SHA256,
-        "the fixture is v1.5.0's RESTORE.sh"
-    );
-    for short in [false, true] {
-        let h = Heir::new();
-        if short {
-            h.cut(unit("ledgers").positions[0]);
-        }
-        std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_5_0).unwrap();
-        let alice = h.key("alice");
-        let dest = h.sub("restored");
-        for args in [
-            vec!["--info"],
-            vec!["--verify"],
-            vec!["--find-envelope", "--key", &alice],
-            vec![
-                "--restore",
-                "--key",
-                &alice,
-                "--unit",
-                "docs",
-                "--to",
-                &dest,
-            ],
-            vec!["--where", "docs", "--key", &alice],
-        ] {
-            let (code, text) = h.run(&args);
-            assert_eq!(code, 1, "short {short}, {args:?}: {text}");
-            for needle in [
-                "this tape requires feature(s) short-seal, which this script does not know",
-                "This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely",
-                "fsf 2",
-            ] {
-                assert!(
-                    text.contains(needle),
-                    "short {short}, {args:?}: {needle:?}:\n{text}"
-                );
-            }
-            assert_eq!(
-                reads(&h),
-                vec![0],
-                "short {short}, {args:?}: File 0 alone is read:\n{:#?}",
-                h.ops()
-            );
-        }
-    }
-    let h = Heir::of(template_150(), &[]);
-    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_5_0).unwrap();
-    let (code, text) = h.run(&["--info"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(text.contains("Verdict: SEALED"), "{text}");
-}
-
-/// A 1.5.0 RESTORE.sh given a 1.6.0 tape as its second cartridge
-/// (`--swap-tapes`) refuses it by the same rule, at that tape's File 0 (§6
-/// "Since 1.6.0").
-#[test]
-fn the_1_5_0_script_refuses_a_1_6_0_tape_as_its_second_cartridge() {
-    let t = template_150();
-    let photos = unit_of(t, "photos/2019");
-    let h = Heir::of(t, &[]);
-    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_5_0).unwrap();
-    flip_in_tape(&h, photos.positions[1]);
-    let all: Vec<Vec<u8>> = (0..photos.positions.len())
-        .map(|i| good_slice(t, &photos, i))
-        .collect();
-    second_tape(&h, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
-    let dest = h.sub("restored");
-    let (code, text) = run_with(
-        &h,
-        &restore_args(&h, "photos/2019", &dest),
-        &["--swap-tapes"],
-        "\n",
-        &[("FAKE_SWAP_ON_SETBLK", "2")],
-    );
-    assert_eq!(code, 1, "{text}");
-    let swap = h.ops().iter().position(|l| l == "swap").expect("a swap");
-    assert_eq!(
-        reads_in(&h.ops()[swap..]),
-        vec![0],
-        "only the second tape's File 0:\n{:#?}",
-        h.ops()
-    );
-    assert!(
-        text.contains("this tape requires feature(s) short-seal, which this script does not know"),
-        "{text}"
-    );
-}
-
 /// §4.1's parse rules: a seal that breaks S1 (`ended_after` is not
 /// `file_count - 2`), S2 (it requires short-seal and states no `ended_after`)
 /// or S5 (it ends inside the metadata) is no seal, and the tape reads as
@@ -10451,18 +10234,6 @@ fn a_seal_before_the_planned_one_is_the_short_ending_only_on_a_short_seal_tape()
         )),
         "{text}"
     );
-
-    // A 1.5.0 tape (its File 0 requires nothing) that ends in a short seal.
-    let h = Heir::of(template_150(), &[]);
-    let k = unit_of(template_150(), "ledgers").positions[0];
-    h.cut(k);
-    let (code, text) = h.run(&["--info"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains("WARNING: File 0 says the seal marker is file"),
-        "{text}"
-    );
-    assert!(!text.contains("ended early"), "{text}");
 }
 
 /// R2: a 1.6.0 tape with no readable seal (a write that never sealed, ending in
@@ -10984,14 +10755,13 @@ fn where_and_find_print_each_holders_run_and_a_range_is_no_copy() {
         "{holders:#?}\n{text}"
     );
 
-    for h in [Heir::new(), Heir::of(template_150(), &[])] {
-        let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            !text.contains("a range") && !text.contains("only)"),
-            "{text}"
-        );
-    }
+    let h = Heir::new();
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.contains("a range") && !text.contains("only)"),
+        "{text}"
+    );
 }
 
 /// Item 93's middle tape: a unit that may span, planned and held whole on one
@@ -11251,145 +11021,12 @@ fn a_fill_from_a_tape_holding_a_range_is_refused_and_the_list_kept() {
     assert_eq!(std::fs::read_to_string(&list).unwrap(), body);
 }
 
-/// RESTORE.sh as tapectl 1.6.0 wrote it, byte for byte (the fixture's README
-/// says how it was made; the hash is the pin `tests/on_tape_golden.rs` held in
-/// 1.6.0).
-const RESTORE_SH_1_6_0: &str = include_str!("fixtures/restore_sh_1_6_0/RESTORE-GOLD01-12.sh");
-const RESTORE_SH_1_6_0_SHA256: &str =
-    "d9787a4ffdd05ba038416696d9866a9a285fc97509c35692a18dc3a9b68f9e9d";
-
-/// ADR-0012 item 124: a 1.6.0 RESTORE.sh refuses a span tape at File 0, by
-/// name, in every mode, before it reads anything else of it, full or short,
-/// and points to the RESTORE.sh on the tape itself. The positive control: it
-/// still reads a tape 1.7.0 writes that does not span (it requires
-/// short-seal alone), and restores from it.
+/// This script reads a tape that holds no range as before: none of the range
+/// text appears on it, in any mode that names units.
 #[test]
-fn the_1_6_0_script_refuses_a_span_tape_at_file_0_by_name_and_reads_one_that_does_not_span() {
-    assert_eq!(
-        sha256_hex(RESTORE_SH_1_6_0.as_bytes()),
-        RESTORE_SH_1_6_0_SHA256,
-        "the fixture is v1.6.0's RESTORE.sh"
-    );
-    for short in [false, true] {
-        let t = span_tail_template();
-        let h = Heir::of(t, &[]);
-        if short {
-            h.cut(unit_of(t, "docs").positions[0]);
-        }
-        std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
-        let alice = h.key("alice");
-        let dest = h.sub("restored");
-        for args in [
-            vec!["--info"],
-            vec!["--verify"],
-            vec!["--find-envelope", "--key", &alice],
-            vec![
-                "--restore",
-                "--key",
-                &alice,
-                "--unit",
-                "docs",
-                "--to",
-                &dest,
-            ],
-            vec!["--list", "--key", &alice],
-            vec!["--where", "docs", "--key", &alice],
-        ] {
-            let (code, text) = h.run(&args);
-            assert_eq!(code, 1, "short {short}, {args:?}: {text}");
-            for needle in [
-                "this tape requires feature(s) spanning, which this script does not know",
-                "This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely",
-                "fsf 2",
-            ] {
-                assert!(
-                    text.contains(needle),
-                    "short {short}, {args:?}: {needle:?}:\n{text}"
-                );
-            }
-            assert_eq!(
-                reads(&h),
-                vec![0],
-                "short {short}, {args:?}: File 0 alone is read:\n{:#?}",
-                h.ops()
-            );
-        }
-    }
-    let h = Heir::new();
-    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
-    let (code, text) = h.run(&["--info"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(text.contains("Verdict: SEALED"), "{text}");
-    let dest = h.sub("restored");
-    let (code, text) = h.run(&[
-        "--restore",
-        "--key",
-        &h.key("alice"),
-        "--unit",
-        "docs",
-        "--to",
-        &dest,
-    ]);
-    assert_eq!(code, 0, "{text}");
-    assert!(same_tree(&unit("docs").src, Path::new(&dest)), "{text}");
-}
-
-/// A 1.6.0 RESTORE.sh given a span tape as its second cartridge
-/// (`--swap-tapes`) refuses it by the same rule, at that tape's File 0, and
-/// reads nothing else of it.
-#[test]
-fn the_1_6_0_script_refuses_a_span_tape_as_its_second_cartridge() {
-    let t = template();
-    let photos = unit("photos/2019");
-    let h = Heir::new();
-    std::fs::write(h.dir.join("RESTORE.sh"), RESTORE_SH_1_6_0).unwrap();
-    flip_in_tape(&h, photos.positions[1]);
-    let all: Vec<Vec<u8>> = (0..photos.positions.len())
-        .map(|i| good_slice(t, &photos, i))
-        .collect();
-    second_tape(&h, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
-    let f0 = h.dir.join("tape2/0");
-    let text: String = String::from_utf8(
-        std::fs::read(&f0)
-            .unwrap()
-            .into_iter()
-            .filter(|b| *b != 0)
-            .collect(),
-    )
-    .unwrap();
-    std::fs::write(
-        &f0,
-        padded(with_requires(&text, SPAN_REQUIRES).into_bytes()),
-    )
-    .unwrap();
-    let dest = h.sub("restored");
-    let (code, text) = run_with(
-        &h,
-        &restore_args(&h, "photos/2019", &dest),
-        &["--swap-tapes"],
-        "\n",
-        &[("FAKE_SWAP_ON_SETBLK", "2")],
-    );
-    assert_eq!(code, 1, "{text}");
-    let swap = h.ops().iter().position(|l| l == "swap").expect("a swap");
-    assert_eq!(
-        reads_in(&h.ops()[swap..]),
-        vec![0],
-        "only the second tape's File 0:\n{:#?}",
-        h.ops()
-    );
-    assert!(
-        text.contains("this tape requires feature(s) spanning, which this script does not know"),
-        "{text}"
-    );
-}
-
-/// This script reads the tapes 1.6.0 and 1.5.0 wrote as before: none of the
-/// range text appears on them, in any mode that names units.
-#[test]
-fn the_1_7_0_script_reads_1_6_0_and_1_5_0_tapes_as_before() {
-    for t in [template(), template_150()] {
-        let h = Heir::of(t, &[]);
+fn the_1_7_0_script_reads_a_tape_with_no_range_as_before() {
+    {
+        let h = Heir::of(template(), &[]);
         for args in [
             vec!["--info".to_string()],
             vec!["--verify".to_string()],
@@ -12970,13 +12607,12 @@ fn swap_tapes_takes_a_slice_from_a_range_only_at_a_position_its_seal_covers() {
     );
 }
 
-/// R5 for a second cartridge that does not require short-seal (a tape written
-/// before 1.6.0): its seal is read first too, now that every second-tape read
-/// learns where the tape ends. Sealed, it gives its slices as before; with a
-/// seal that does not parse it gives none, says why, and the restore goes on
-/// without them.
+/// R5 for a second cartridge: its seal is read first, at the end of its
+/// data, since every second-tape read learns where the tape ends. Sealed, it
+/// gives its slices; with a seal that does not parse it gives none, says why,
+/// and the restore goes on without them.
 #[test]
-fn swap_tapes_reads_a_1_5_0_second_cartridges_seal_and_takes_nothing_from_one_without() {
+fn swap_tapes_reads_a_second_cartridges_seal_and_takes_nothing_from_one_without() {
     let t = template();
     let photos = unit("photos/2019");
     let all: Vec<Vec<u8>> = (0..photos.positions.len())
@@ -12987,27 +12623,8 @@ fn swap_tapes_reads_a_1_5_0_second_cartridges_seal_and_takes_nothing_from_one_wi
         flip_in_tape(&h, photos.positions[1]);
         second_tape(&h, "COPY15", "c0c0c0c0-0015-4000-8000-000000000015", &all);
         let d = h.dir.join("tape2");
-        let text_of = |p: &Path| -> String {
-            String::from_utf8(
-                std::fs::read(p)
-                    .unwrap()
-                    .into_iter()
-                    .filter(|b| *b != 0)
-                    .collect(),
-            )
-            .unwrap()
-        };
-        let f0 = d.join("0");
-        std::fs::write(&f0, padded(era_file0(Era::V150, text_of(&f0)).into_bytes())).unwrap();
         let seal_at = last_file(&d);
-        let seal = d.join(seal_at.to_string());
-        if sealed {
-            std::fs::write(
-                &seal,
-                padded(era_seal(Era::V150, &text_of(&seal)).into_bytes()),
-            )
-            .unwrap();
-        } else {
+        if !sealed {
             garble(&d, seal_at);
         }
         let dest = h.sub("restored");
