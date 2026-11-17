@@ -279,7 +279,9 @@ pub fn sync_collection_with_config(
     for p in &scan.pending {
         match p.reason {
             super::fingerprint::PendingReason::New => report.never_archived += 1,
-            super::fingerprint::PendingReason::Dirty => report.dirty += 1,
+            // Counted with `dirty` (#529), as `collection status` counts it.
+            super::fingerprint::PendingReason::Dirty
+            | super::fingerprint::PendingReason::Unstaged => report.dirty += 1,
         }
     }
     if dry_run {
@@ -350,7 +352,10 @@ fn unreadable(dir: &Path, cause: &std::io::Error) -> SyncProblem {
 /// Beside them, each directory down to that depth this user may not read,
 /// an error naming the grant (ADR-0012 item 220): a folder the walk cannot
 /// enter hides every unit under it.
-fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> (Vec<PathBuf>, Vec<SyncProblem>) {
+pub(crate) fn candidate_unit_dirs(
+    root: &Path,
+    lib: &CollectionConfig,
+) -> (Vec<PathBuf>, Vec<SyncProblem>) {
     let depth = lib.unit_depth.max(1);
     let excludes = crate::staging::exclude::Excludes::new(root, &lib.exclude);
 
@@ -383,6 +388,40 @@ fn candidate_unit_dirs(root: &Path, lib: &CollectionConfig) -> (Vec<PathBuf>, Ve
         }
     }
     (dirs, unreadable_dirs)
+}
+
+/// The folders `collection sync` would register under `lib`'s root: the
+/// walk's own candidates ([`candidate_unit_dirs`], never a second walk) that
+/// no unit holds. A folder is a unit's when a unit's recorded path is it, or,
+/// for a collection with dotfiles, when its dotfile names a unit the catalog
+/// knows (a moved unit is `sync`'s to resolve, not a new folder). A root that
+/// cannot be read or a folder the user may not enter is `sync`'s to name;
+/// here they are no folders. One `list_units` statement and the directory
+/// walk, however many folders there are (#534).
+pub fn unregistered_folders(conn: &Connection, lib: &CollectionConfig) -> Result<Vec<PathBuf>> {
+    let Ok(root) = super::canonical_root(lib) else {
+        return Ok(Vec::new());
+    };
+    let (dirs, _unreadable) = candidate_unit_dirs(Path::new(&root), lib);
+    let held: std::collections::HashSet<String> = super::units_under_root(conn, &root)?
+        .into_iter()
+        .filter_map(|u| u.current_path)
+        .collect();
+    let mut out = Vec::new();
+    for dir in dirs {
+        if held.contains(dir.to_string_lossy().as_ref()) {
+            continue;
+        }
+        if lib.dotfiles {
+            if let Ok(df) = dotfile::read_dotfile(&dir.join(dotfile::UNIT_DOTFILE)) {
+                if queries::get_unit_by_uuid(conn, &df.uuid)?.is_some() {
+                    continue;
+                }
+            }
+        }
+        out.push(dir);
+    }
+    Ok(out)
 }
 
 /// The unit name collection sync assigns: `"{collection}/{path relative to

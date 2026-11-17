@@ -2172,6 +2172,17 @@ fewer places than `[defaults] min_locations` (2 by default, never multiplied) re
 `has copies in 1 location, needs 2 ([defaults] min_locations)`.
 `snapshot mark-reclaimable` asks the same of the version that supersedes.
 
+Two warnings name content no tape holds yet. `dirty` also fires for a unit
+whose newest version was never staged (`stage create` failed or never ran,
+so the source matches the snapshot but nothing holds it) while an older
+version is on tape; the fix is `tapectl stage create UNIT` and the copy
+loop. `status` counts such a unit as pending (`unstaged`), and so does
+`unit mark-tape-only`, which lists it among the facts it asks about.
+`collection_unsynced` names the folders under a `[[collections]]` root that
+are not units, so a new folder cannot sit unnoticed between runs of
+`collection sync`: one warning per collection (exit 1), the fix
+`tapectl collection sync NAME`, and `status` shows the count as `not units`.
+
 ### Reports
 
 ```bash

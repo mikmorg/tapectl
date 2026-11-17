@@ -789,7 +789,7 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
                 {} as locations,
                 {} as deposits
          FROM units u
-         WHERE u.status = 'active'",
+         WHERE u.status IN ('active', 'tape_only', 'missing')",
         crate::policy::coverage::copy_count_expr(&scope),
         crate::policy::coverage::location_count_expr(&scope),
         crate::policy::coverage::deposit_count_expr(&scope),
@@ -815,7 +815,9 @@ pub(crate) fn fire_risk_rows(conn: &Connection, config: &Config) -> Result<Vec<F
     // which keeps the two commands reading the same unit set as well as the
     // same threshold.
     let mut at_risk = Vec::new();
-    for unit in crate::db::queries::list_units(conn, None, Some("active"))? {
+    // #539 (C2): a tape-only or missing unit below its floor is the unit
+    // whose source is gone, the one `audit` judges and this must not leave out.
+    for unit in crate::db::queries::list_units(conn, None, None)? {
         let Some((name, status, copies, locations, deposits)) = counts.get(&unit.id).cloned()
         else {
             continue;
@@ -1637,7 +1639,7 @@ fn report_tape_only(conn: &Connection, unit_filter: Option<&str>, json_output: b
 /// stdout.
 pub(crate) struct DirtyRow {
     pub(crate) name: String,
-    pub(crate) state: &'static str, // "clean" | "new" | "dirty" | "unreadable"
+    pub(crate) state: &'static str, // "clean" | "new" | "unstaged" | "dirty" | "unreadable"
     pub(crate) added: Vec<String>,
     pub(crate) removed: Vec<String>,
     pub(crate) modified: Vec<String>,
@@ -1689,6 +1691,9 @@ pub(crate) fn dirty_rows(
             Ok(None) => ("clean", fingerprint::FingerprintDiff::default(), None),
             Ok(Some(p)) if p.reason == PendingReason::New => {
                 ("new", fingerprint::FingerprintDiff::default(), None)
+            }
+            Ok(Some(p)) if p.reason == PendingReason::Unstaged => {
+                ("unstaged", fingerprint::FingerprintDiff::default(), None)
             }
             Ok(Some(p)) => ("dirty", p.changes, None),
             Err(e) => (
@@ -1757,6 +1762,10 @@ fn report_dirty(
                 // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item
                 // 208), here and in the JSON (`dirty_state_json`).
                 "new" => println!("  {}: never archived", r.name),
+                "unstaged" => println!(
+                    "  {}: its newest version was never staged (the source matches it)",
+                    r.name
+                ),
                 "unreadable" => println!(
                     "  {}: UNREADABLE — dirty scan could not run ({})",
                     r.name,
@@ -4999,6 +5008,9 @@ mod tests {
 
         crate::staging::snapshot_create(&conn, "clean_unit", &Config::default()).unwrap();
         crate::staging::snapshot_create(&conn, "dirty_unit", &Config::default()).unwrap();
+        // Both written: a snapshot still `created` reads Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         // Mutate dirty_unit's directory after its snapshot was taken.
         std::fs::write(dirty_dir.join("g.txt"), b"new file").unwrap();
@@ -8322,5 +8334,25 @@ Read error counter page  [0x3]
                 .unwrap();
             }
         }
+    }
+
+    /// #529: a newest snapshot never staged is its own state in `report dirty`.
+    #[test]
+    fn dirty_rows_names_a_newest_snapshot_never_staged() {
+        let root = TempDir::new().unwrap();
+        let conn = setup_two_units(&root);
+        conn.execute(
+            "UPDATE snapshots SET status = 'current'
+              WHERE unit_id = (SELECT id FROM units WHERE name = 'clean_unit')",
+            [],
+        )
+        .unwrap();
+        let file = root.path().join("clean_unit").join("f.txt");
+        std::fs::write(&file, b"hello again, longer").unwrap();
+        crate::staging::snapshot_create(&conn, "clean_unit", &Config::default()).unwrap();
+
+        let rows = dirty_rows(&conn, Some("clean_unit"), &[]).unwrap();
+        assert_eq!(rows[0].state, "unstaged");
+        assert_eq!(dirty_json(&rows)[0]["state"], "unstaged");
     }
 }

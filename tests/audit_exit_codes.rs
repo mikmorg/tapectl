@@ -165,3 +165,42 @@ fn an_audit_command_line_that_does_not_parse_exits_70() {
         );
     }
 }
+
+/// #534 (ADR-0012 item 247): a folder under a `[[collections]]` root that is
+/// not a unit is an advisory finding, `collection_unsynced`: exit 1 (warnings
+/// only), never 2. Before it the weekly audit exited 0 while the newest
+/// folder had no copy. Its remedy is `collection sync`; a root with no new
+/// folder stays 0 (the positive control: the same config, nothing new).
+#[test]
+fn a_folder_under_a_collection_root_that_is_not_a_unit_exits_1() {
+    let home = initialised_home();
+    let root = TempDir::new().unwrap();
+    let config = home.path().join(".tapectl").join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[[collections]]\nname = \"keepsake\"\nroot = \"{}\"\ntenant = \"operator\"\n",
+        root.path().display()
+    ));
+    std::fs::write(&config, text).unwrap();
+
+    let out = tapectl(home.path(), &["audit"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty root: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::create_dir(root.path().join("new-folder")).unwrap();
+    let out = tapectl(home.path(), &["audit"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
+    assert!(stdout.contains("collection_unsynced"), "{stdout}");
+    assert!(stdout.contains("new-folder"), "{stdout}");
+    let out = tapectl(home.path(), &["audit", "--action-plan"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tapectl collection sync keepsake"),
+        "{stdout}"
+    );
+}

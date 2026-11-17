@@ -3297,7 +3297,10 @@ fn snapshot_create_all_pending_takes_never_archived_and_dirty_units_only() {
     // Each line as the named form prints it (sizes count the unit's own
     // dotfile, so only the head is pinned), in name order, then the total.
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 3, "{stdout}");
+    // `clean` was snapshotted by the named form above and never staged: it is
+    // pending (#529) but needs `stage create`, not a snapshot, so the run
+    // names it after the total instead of snapshotting it.
+    assert_eq!(lines.len(), 4, "{stdout}");
     assert!(
         lines[0].starts_with("snapshot created: dirty v2 (")
             && lines[1].starts_with("snapshot created: fresh v1 ("),
@@ -3308,10 +3311,30 @@ fn snapshot_create_all_pending_takes_never_archived_and_dirty_units_only() {
         "{stdout}"
     );
     assert_eq!(
+        lines[3], "1 unit has a snapshot never staged: tapectl stage create clean",
+        "{stdout}"
+    );
+    assert_eq!(
         (versions("clean"), versions("dirty"), versions("fresh")),
         (1, 2, 1),
         "the clean unit got no version"
     );
+
+    // Every unit now holds a snapshot nothing has staged: pending (#529), so
+    // "nothing pending" would be false. Nothing to snapshot, and the stage
+    // that is owed is named; exit 0.
+    let out = ok(&["snapshot", "create", "--all-pending"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "nothing to snapshot: 3 units have a snapshot never staged: \
+         tapectl stage create clean dirty fresh"
+    );
+    // The same units once their versions are written (the catalog says so
+    // directly; staging and a tape are not this test's subject).
+    rusqlite::Connection::open(h.join(".tapectl").join("tapectl.db"))
+        .unwrap()
+        .execute("UPDATE snapshots SET status = 'current'", [])
+        .unwrap();
 
     // Nothing pending now: said, and exit 0; under --json an empty array.
     let out = ok(&["snapshot", "create", "--all-pending"]);

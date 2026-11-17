@@ -55,6 +55,11 @@ pub enum PendingReason {
     /// A snapshot exists, but the current on-disk fingerprint no longer
     /// matches its recorded one (files added/removed/changed).
     Dirty,
+    /// The newest snapshot matches the source but was never staged: it is
+    /// `created`, so no stage set holds it and no tape does (ADR-0012 item
+    /// 247, #529). Pending in its own right: the content that exists now is
+    /// on no tape, whatever older version a tape holds.
+    Unstaged,
 }
 
 // `FingerprintDiff` itself (specific added/removed/modified paths behind a
@@ -230,7 +235,7 @@ fn classify_from_walk(
 ) -> Result<Option<PendingUnit>> {
     let estimated_bytes: u64 = fresh.iter().map(|f| f.size_bytes.max(0) as u64).sum();
 
-    let Some((snapshot_id, _version, _status)) = content_match::latest_snapshot(conn, unit.id)?
+    let Some((snapshot_id, _version, status)) = content_match::latest_snapshot(conn, unit.id)?
     else {
         return Ok(Some(PendingUnit {
             unit: unit.clone(),
@@ -249,6 +254,19 @@ fn classify_from_walk(
         crate::staging::validate::hash_source_file,
     )?;
     if changes.is_empty() {
+        // The source equals the newest snapshot. That is clean only when the
+        // snapshot is not waiting to be staged (#529): a `created` row has no
+        // stage set, so a `stage create` that failed or never ran left the
+        // newest content on no tape. (`staged` holds its slices, awaiting a
+        // write; `current` is written; a dead row is not newest content.)
+        if status == "created" {
+            return Ok(Some(PendingUnit {
+                unit: unit.clone(),
+                reason: PendingReason::Unstaged,
+                estimated_bytes,
+                changes,
+            }));
+        }
         return Ok(None);
     }
     Ok(Some(PendingUnit {
@@ -439,6 +457,9 @@ mod tests {
 
         // Simulate a real snapshot_create by using it directly.
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         assert!(
             classify(&conn, &unit, &[]).unwrap().is_none(),
@@ -463,6 +484,9 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         // Mutate after the snapshot: add a new file.
         std::fs::write(tmp.path().join("g.txt"), b"world!!").unwrap();
@@ -504,6 +528,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let snap = crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
         assert_eq!(
             crate::db::files::fixture::count(&conn, snap, Some(".tapectl-unit.toml")),
             1,
@@ -548,6 +575,9 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         std::fs::remove_file(&file_path).unwrap();
 
@@ -576,6 +606,9 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         // A different size is enough for mtime_size to see this without
         // needing to fuss with mtime precision.
@@ -625,6 +658,9 @@ mod tests {
             .unwrap();
         assert_eq!(unit.checksum_mode, "mtime_size");
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
         std::fs::write(&file_path, b"REPLACED content!").unwrap(); // same length (17 bytes)
@@ -666,6 +702,11 @@ mod tests {
         assert_eq!(unit.checksum_mode, "sha256");
 
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+
+        // A written snapshot: `created` would read Unstaged (#529).
+
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         // Establish the sha256 baseline for the original content — what a
         // real `stage_create` would have backfilled via the exact same
@@ -726,6 +767,11 @@ mod tests {
             .unwrap();
 
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+
+        // A written snapshot: `created` would read Unstaged (#529).
+
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
         // Never staged — files.sha256 stays NULL for f.txt.
 
         assert!(
@@ -768,6 +814,9 @@ mod tests {
         // snapshot_create's real walk records the symlink's file_type
         // ('symlink') and leaves its sha256 NULL — nothing to backfill.
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         // Run the scan twice: the trap is specifically about a symlink
         // being flagged dirty *forever*, not just once.
@@ -812,6 +861,11 @@ mod tests {
             .unwrap();
 
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+
+        // A written snapshot: `created` would read Unstaged (#529).
+
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
         // snapshot_create leaves sha256 NULL (only staging populates it),
         // and a NULL baseline is skipped — so give it one, which is what a
         // previously-staged unit would have.
@@ -1162,6 +1216,9 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         assert!(
             classify(&conn, &unit, &[]).unwrap().is_none(),
@@ -1234,6 +1291,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.defaults.global_excludes = global_excludes.clone();
         crate::staging::snapshot_create(&conn, &unit.name, &cfg).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         assert!(
             classify(&conn, &unit, &global_excludes).unwrap().is_none(),
@@ -1313,6 +1373,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.defaults.global_excludes = global_excludes.clone();
         crate::staging::snapshot_create(&conn, "testlib/alpha", &cfg).unwrap();
+        // A written snapshot: `created` would read Unstaged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         let lib = crate::config::CollectionConfig {
             name: "testlib".into(),
@@ -1478,5 +1541,55 @@ pattern = ["*.tmp"]
             "the refusal reason must name the offending key: {}",
             scan.refused[0].reason
         );
+    }
+
+    /// #529: v1 `current`, then the source is edited and `snapshot create`
+    /// mints v2 `created`; `stage create` never runs. The source equals the
+    /// newest snapshot, so the content-only scan said clean while the
+    /// newest content was on no tape. It is pending, with a reason of its own.
+    #[test]
+    fn a_newest_snapshot_never_staged_is_pending_unstaged() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let unit_id = seed_unit(&conn, tmp.path());
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let config = Config::default();
+        crate::staging::snapshot_create(&conn, &name, &config).unwrap();
+        conn.execute(
+            "UPDATE snapshots SET status = 'current' WHERE unit_id = ?1",
+            params![unit_id],
+        )
+        .unwrap();
+        let unit = crate::db::queries::get_unit_by_name(&conn, &name)
+            .unwrap()
+            .unwrap();
+        assert!(
+            classify(&conn, &unit, &[]).unwrap().is_none(),
+            "v1 is written: clean"
+        );
+
+        std::fs::write(&file, b"hello, a longer edit").unwrap();
+        crate::staging::snapshot_create(&conn, &name, &config).unwrap();
+        let p = classify(&conn, &unit, &[])
+            .unwrap()
+            .expect("v2 was never staged: pending");
+        assert_eq!(p.reason, PendingReason::Unstaged);
+        assert!(p.changes.is_empty(), "the source matches v2");
+
+        // Once v2 holds a stage set it waits for a write, not for staging.
+        conn.execute(
+            "UPDATE snapshots SET status = 'staged' WHERE unit_id = ?1 AND version = 2",
+            params![unit_id],
+        )
+        .unwrap();
+        assert!(classify(&conn, &unit, &[]).unwrap().is_none());
     }
 }

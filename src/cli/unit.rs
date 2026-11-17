@@ -698,7 +698,7 @@ fn resolve_unit_name(conn: &Connection, unit_id: i64) -> Result<String> {
 /// printing so the result is directly assertable in tests without
 /// capturing stdout.
 struct DirtyStatus {
-    state: &'static str, // "clean" | "new" | "dirty"
+    state: &'static str, // "clean" | "new" | "unstaged" | "dirty"
     changes: crate::collection::fingerprint::FingerprintDiff,
 }
 
@@ -722,6 +722,10 @@ fn dirty_status(
         },
         Some(p) if p.reason == PendingReason::New => DirtyStatus {
             state: "new",
+            changes: fingerprint::FingerprintDiff::default(),
+        },
+        Some(p) if p.reason == PendingReason::Unstaged => DirtyStatus {
+            state: "unstaged",
             changes: fingerprint::FingerprintDiff::default(),
         },
         Some(p) => DirtyStatus {
@@ -759,6 +763,10 @@ fn show_dirty_status(
             "clean" => println!("unit \"{}\": clean", unit.name),
             // CONTEXT.md: "Never Archived", never "new" (ADR-0012 item 208).
             "new" => println!("unit \"{}\": never archived", unit.name),
+            "unstaged" => println!(
+                "unit \"{}\": its newest version was never staged (the source matches it)",
+                unit.name
+            ),
             _ => {
                 println!(
                     "unit \"{}\": dirty ({} added, {} removed, {} modified)",
@@ -1014,6 +1022,9 @@ mod tests {
         std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
         let (conn, _uid) = setup_unit(tmp.path().to_str().unwrap(), "mtime_size");
         crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        // Written, so its newest snapshot is not waiting to be staged (#529).
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
 
         let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
         let status = dirty_status(&conn, &unit, &[]).unwrap();

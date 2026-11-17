@@ -2960,14 +2960,20 @@ pub fn unit_mark_tape_only(
     // is junk. `tape_only` is the signal that local data may be deleted,
     // so a stale copy still warrants asking by default.
     if let Some(p) = &pending {
-        if matches!(
-            p.reason,
-            crate::collection::fingerprint::PendingReason::Dirty
-        ) {
-            facts.push(format!(
+        use crate::collection::fingerprint::PendingReason;
+        match p.reason {
+            PendingReason::Dirty => facts.push(format!(
                 "unit is dirty: on-disk contents changed since the last snapshot — {}",
                 p.changes.describe()
-            ));
+            )),
+            // #529: the source equals its newest snapshot, which no tape
+            // holds: the older version on tape is not what is on disk.
+            PendingReason::Unstaged => facts.push(
+                "unit is unstaged: its newest snapshot was never staged, so the \
+                 content on disk now is on no tape"
+                    .to_string(),
+            ),
+            PendingReason::New => {}
         }
     }
     if !facts.is_empty() {
@@ -5676,6 +5682,32 @@ mod tests {
         assert_eq!(unit_status(&conn), "tape_only");
     }
 
+    /// #529: the source equals its newest snapshot, which was never staged
+    /// (`stage create` failed or never ran), while v1 is on tape: the Tier-2
+    /// "dirty" fact was omitted, so a unit meeting its floor went tape-only
+    /// without a word. Now the fact is shown and the gate asks.
+    #[test]
+    fn mark_tape_only_shows_a_fact_for_a_newest_snapshot_never_staged() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("f.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
+        std::fs::write(&file_path, b"hello, world! now a different size").unwrap();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        let config = config_with_zero_tape_only_thresholds();
+        let err = unit_mark_tape_only(&conn, &config, "unit1", false, false)
+            .expect_err("an unstaged newest snapshot must ask before tape-only");
+        let msg = err.to_string();
+        assert!(msg.contains("unit is unstaged"), "{msg}");
+        assert_eq!(unit_status(&conn), "active");
+        unit_mark_tape_only(&conn, &config, "unit1", true, false).expect("--force confirms it");
+        assert_eq!(unit_status(&conn), "tape_only");
+    }
+
     #[test]
     fn mark_tape_only_does_not_block_a_clean_unit() {
         // Regression guard for the guard itself: proves it doesn't
@@ -5684,6 +5716,10 @@ mod tests {
         std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
         let conn = setup_unit_for_tape_only(tmp.path().to_str().unwrap());
         crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        // A snapshot nothing wrote is not clean (#529: it is `unstaged`); the
+        // unit is clean when its newest snapshot is the one on tape.
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
         // No mutation after the snapshot — stays clean.
 
         let config = config_with_zero_tape_only_thresholds();

@@ -314,6 +314,21 @@ fn create_named(
     names: &[String],
     json_output: bool,
 ) -> Result<()> {
+    let rows = create_named_rows(conn, config, names, json_output)?;
+    if json_output {
+        crate::render::print_json(&serde_json::Value::Array(rows));
+    }
+    Ok(())
+}
+
+/// [`create_named`] without its closing JSON document: the rows, for a caller
+/// that has more to say in the same document (`--all-pending`, #539).
+fn create_named_rows(
+    conn: &Connection,
+    config: &Config,
+    names: &[String],
+    json_output: bool,
+) -> Result<Vec<serde_json::Value>> {
     for (i, n) in names.iter().enumerate() {
         if names[..i].contains(n) {
             return Err(TapectlError::Other(format!(
@@ -354,53 +369,122 @@ fn create_named(
     if let Some(err) = end_of_run(names.len(), failed, &not_started, &done, json_output) {
         return Err(err);
     }
-    if json_output {
-        crate::render::print_json(&serde_json::Value::Array(rows));
-    }
-    Ok(())
+    Ok(rows)
 }
 
 /// `snapshot create --all-pending` (ADR-0012 item 225): every active unit
-/// that is Pending (CONTEXT.md: never archived, or dirty), in name order,
-/// snapshotted as `create_named` snapshots named units, then a total.
+/// that needs a snapshot (CONTEXT.md: never archived, or dirty), in name
+/// order, snapshotted as `create_named` snapshots named units, then a total.
+/// An unstaged unit (#529) is Pending too but has its snapshot: `snapshot
+/// create` would mint nothing, so the run names it with the `stage create`
+/// that it needs, and never says "nothing pending" while one exists.
 ///
 /// Pending is decided by `report::dirty_rows`, the one scan `status` and
 /// `report dirty` count it by (`fingerprint::classify` per active unit). A
-/// unit that scan could not read (a dotfile it refuses) is not pending and not
-/// snapshotted: it is named on stderr, as `status` names it not scanned.
+/// unit that scan could not read (a dotfile it refuses) is not pending and
+/// not snapshotted, and the run does not end clean (ADR-0012 item 249, #539):
+/// it names each such unit on stderr, finishes the units it could scan, and
+/// then exits non-zero, never saying "nothing pending" about a unit it did
+/// not scan.
 fn create_all_pending(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
     let mut pending: Vec<String> = Vec::new();
+    let mut unstaged: Vec<String> = Vec::new();
+    let mut not_scanned: Vec<(String, String)> = Vec::new();
     let (mut never_archived, mut dirty) = (0i64, 0i64);
     for row in crate::cli::report::dirty_rows(conn, None, &config.defaults.global_excludes)? {
         match row.state {
             "new" => never_archived += 1,
             "dirty" => dirty += 1,
+            // Snapshotted already: it needs `stage create`, which the run
+            // says instead of minting nothing for it.
+            "unstaged" => {
+                unstaged.push(row.name);
+                continue;
+            }
             "unreadable" => {
+                let why = row.error.unwrap_or_else(|| "unreadable".to_string());
                 eprintln!(
-                    "warning: unit \"{}\" was not scanned, so it is not snapshotted: {}",
-                    row.name,
-                    row.error.as_deref().unwrap_or("unreadable")
+                    "warning: unit \"{}\" was not scanned, so it is not snapshotted: {why}",
+                    row.name
                 );
+                not_scanned.push((row.name, why));
                 continue;
             }
             _ => continue,
         }
         pending.push(row.name);
     }
+    let skipped_error = |rows: &[serde_json::Value]| -> Option<TapectlError> {
+        if not_scanned.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = not_scanned.iter().map(|(n, _)| n.as_str()).collect();
+        let error = TapectlError::Other(format!(
+            "{} not scanned, so {} not snapshotted and may be pending: {}; \
+             `tapectl report dirty` says why",
+            crate::render::plural(names.len() as i64, "unit was", "units were"),
+            if names.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            },
+            names.join(", ")
+        ));
+        Some(TapectlError::with_json(
+            serde_json::json!({
+                "snapshotted": rows,
+                "not_scanned": not_scanned
+                    .iter()
+                    .map(|(n, why)| serde_json::json!({"unit": n, "error": why}))
+                    .collect::<Vec<_>>(),
+            }),
+            error,
+        ))
+    };
+    let total_line = || {
+        format!(
+            "total: {} ({never_archived} never archived, {dirty} dirty)",
+            crate::render::plural(pending.len() as i64, "pending unit", "pending units"),
+        )
+    };
+    let unstaged_line = || {
+        format!(
+            "{} never staged: tapectl stage create {}",
+            crate::render::plural(
+                unstaged.len() as i64,
+                "unit has a snapshot",
+                "units have a snapshot"
+            ),
+            unstaged.join(" ")
+        )
+    };
     if pending.is_empty() {
+        if let Some(err) = skipped_error(&[]) {
+            return Err(err);
+        }
         if json_output {
             crate::render::print_json(&serde_json::Value::Array(Vec::new()));
-        } else {
+        } else if unstaged.is_empty() {
             println!("nothing pending: every active unit's source matches its newest snapshot");
+        } else {
+            println!("nothing to snapshot: {}", unstaged_line());
         }
         return Ok(());
     }
-    create_named(conn, config, &pending, json_output)?;
-    if !json_output {
-        println!(
-            "total: {} ({never_archived} never archived, {dirty} dirty)",
-            crate::render::plural(pending.len() as i64, "pending unit", "pending units")
-        );
+    let rows = create_named_rows(conn, config, &pending, json_output)?;
+    if let Some(err) = skipped_error(&rows) {
+        if !json_output {
+            println!("{}", total_line());
+        }
+        return Err(err);
+    }
+    if json_output {
+        crate::render::print_json(&serde_json::Value::Array(rows));
+    } else {
+        println!("{}", total_line());
+        if !unstaged.is_empty() {
+            println!("{}", unstaged_line());
+        }
     }
     Ok(())
 }
@@ -782,5 +866,39 @@ mod tests {
             "{table}"
         );
         assert!(!table.contains('|') && !table.contains('+'), "{table}");
+    }
+
+    /// #539 (B11): a unit whose dotfile the scan refuses was skipped with a
+    /// stderr warning, and with nothing else pending the run printed
+    /// "nothing pending" and exited 0. Now it finishes the units it could scan
+    /// and ends in an error naming the unit (non-zero), whether or not
+    /// anything else was pending; under `--json` the error carries what was
+    /// snapshotted.
+    #[test]
+    fn all_pending_ends_in_an_error_naming_a_unit_it_could_not_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = two_units(root.path());
+        std::fs::write(
+            root.path().join("unit2").join(".tapectl-unit.toml"),
+            "[excludes]\npattern = [\"*.env\"]\n",
+        )
+        .unwrap();
+        let config = Config::default();
+
+        // unit1 is never archived: snapshotted; unit2 is skipped; the run errs.
+        let err = create_all_pending(&conn, &config, false).expect_err("a skip is not success");
+        assert!(err.to_string().contains("unit2"), "{err}");
+        assert_eq!(versions(&conn, "unit1"), 1, "the scannable unit was done");
+        assert_eq!(versions(&conn, "unit2"), 0);
+
+        // Nothing else pending: the same error, never the all-clear.
+        conn.execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
+        let err = create_all_pending(&conn, &config, true).expect_err("still not success");
+        assert!(err.to_string().contains("unit2"), "{err}");
+        assert!(
+            matches!(err, TapectlError::WithJson { .. }),
+            "--json carries the document: {err:?}"
+        );
     }
 }

@@ -62,7 +62,10 @@ pub fn status_for_collection(
     for p in &scan.pending {
         match p.reason {
             PendingReason::New => status.never_archived += 1,
-            PendingReason::Dirty => status.dirty += 1,
+            // Pending in its second form: a snapshot exists and the newest
+            // content is not on tape (#529). Counted with `dirty`, as the
+            // collection commands print two forms (cli/collection.rs).
+            PendingReason::Dirty | PendingReason::Unstaged => status.dirty += 1,
         }
     }
     status.refused = scan.refused;
@@ -183,5 +186,40 @@ mod tests {
             0,
             "a missing unit's vanished directory must not be walked for pending-detection"
         );
+    }
+
+    /// #529: a unit whose newest snapshot was never staged is pending in a
+    /// collection's status too (counted with the dirty form).
+    #[test]
+    fn status_counts_a_newest_snapshot_never_staged_as_pending() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        std::fs::write(root.path().join("alpha").join("f.txt"), b"x").unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+        let config = Config::default();
+        crate::staging::snapshot_create(&conn, "testlib/alpha", &config).unwrap();
+
+        let status = status_for_collection(&conn, &config, &lib).unwrap();
+        assert_eq!(status.never_archived, 0);
+        assert_eq!(status.pending(), 1, "created, never staged: pending");
     }
 }

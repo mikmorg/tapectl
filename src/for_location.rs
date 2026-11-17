@@ -779,7 +779,10 @@ fn source_of(conn: &Connection, config: &Config, unit: &Unit) -> Result<Source> 
             if path.is_empty() { "(no path)" } else { path }
         )));
     }
+    // An unstaged newest version (#529) is a version the plan stages from
+    // the source below, never a new snapshot: it is not a pending source.
     let pending = fingerprint::classify(conn, unit, &config.defaults.global_excludes)?
+        .filter(|p| p.reason != PendingReason::Unstaged)
         .map(|p| (p.reason, p.estimated_bytes));
     Ok(Source::Available { pending })
 }
@@ -1377,6 +1380,7 @@ fn disposition(c: &Candidate, staged: Option<&Staged>) -> String {
             match reason {
                 PendingReason::New => "never archived",
                 PendingReason::Dirty => "changed since its last version",
+                PendingReason::Unstaged => "its newest version was never staged",
             }
         ),
         (_, How::Stage { restage: false, .. }) => "to stage from its source".to_string(),

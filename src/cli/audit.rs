@@ -421,6 +421,15 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // #534 (ADR-0012 item 247): a folder under a collection root that is
+        // not a unit has no copy, and nothing else sees it between
+        // `collection sync` runs. A warning, scoped to the archive.
+        name: "collection_unsynced",
+        scope: Scope::Archive {
+            run: check_collection_unsynced,
+        },
+    },
+    Check {
         // #420 (layout-session.md, `volumes.ended_after`): the two
         // invariants of a short-sealed volume's rows, and (#478, X27) the
         // four of a `range` row. Umbrella name for one function
@@ -791,6 +800,13 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, dest: &Dest<'_>) -> Re
         ));
     }
     Ok(action)
+}
+
+/// `copy_count`'s remedy for `unit`, for `status`'s next command (#539): one
+/// source of the command, so the home screen never suggests what `audit`
+/// would not.
+pub(crate) fn under_copied_remedy(conn: &Connection, unit: &Unit) -> Result<String> {
+    additional_copy_action(conn, unit, &Dest::ANYWHERE)
 }
 
 /// The remedy for "this unit's CURRENT-snapshot content at version
@@ -1538,6 +1554,27 @@ fn check_dirty(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> 
                     Dest::ANYWHERE.write_new()
                 ),
             });
+        } else if row.state == "unstaged" && Unwritten::of(ctx.conn, unit)?.is_none() {
+            // #529: the newest snapshot matches the source but was never
+            // staged, and an older version is on tape, so `copy_count` is
+            // satisfied and nothing else names it. A unit with no current
+            // version is `copy_count`'s (or `no_archive`'s), as `new` is.
+            let version = crate::unit::content_match::latest_snapshot(ctx.conn, unit.id)?
+                .map(|(_, v, _)| v)
+                .unwrap_or_default();
+            f.warnings.push(AuditFinding {
+                unit: unit.name.clone(),
+                check: "dirty".into(),
+                message: format!(
+                    "v{version}, the newest version, was never staged: the source matches it \
+                     but no tape holds it"
+                ),
+                action: format!(
+                    "tapectl stage create {0} && {1}",
+                    unit.name,
+                    Dest::ANYWHERE.write_new()
+                ),
+            });
         } else if row.state == "unreadable" {
             // Issue #263: the dirty scan itself failed for this unit — a
             // dotfile present but not valid TOML, or one `deny_unknown_fields`
@@ -2027,6 +2064,47 @@ fn check_escrow_identity_mismatch(ctx: &Ctx<'_>) -> Result<Findings> {
 // A warning, never a violation (ADR-0004): the copy is real, only its
 // end-to-end evidence is missing. Archive-wide, because the gap is a
 // volume's, whatever units it holds.
+/// The folders under each configured collection root that no unit holds, as
+/// `collection sync` discovers them (`collection::sync::unregistered_folders`:
+/// the same walk, never a second one). One warning per collection naming
+/// them, with `collection sync` as the next command. An audit of one unit has
+/// no archive to judge, so it reads none (#534).
+fn check_collection_unsynced(ctx: &Ctx<'_>) -> Result<Findings> {
+    let mut f = Findings::default();
+    if ctx.unit_filter.is_some() {
+        return Ok(f);
+    }
+    for lib in &ctx.config.collections {
+        let folders = crate::collection::sync::unregistered_folders(ctx.conn, lib)?;
+        if folders.is_empty() {
+            continue;
+        }
+        let root = crate::collection::canonical_root(lib)?;
+        let names: Vec<String> = folders
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
+            .collect();
+        let shown = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = match names.len() {
+            n if n > 5 => format!(", and {} more", n - 5),
+            _ => String::new(),
+        };
+        f.warnings.push(AuditFinding {
+            unit: "archive".into(),
+            check: "collection_unsynced".into(),
+            message: format!(
+                "{} under collection \"{}\" {} not a unit, so no tape holds {}: {shown}{more}",
+                crate::render::plural(names.len() as i64, "folder", "folders"),
+                lib.name,
+                if names.len() == 1 { "is" } else { "are" },
+                if names.len() == 1 { "it" } else { "them" },
+            ),
+            action: format!("tapectl collection sync {}", lib.name),
+        });
+    }
+    Ok(f)
+}
+
 fn check_no_full_verify(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
@@ -3959,6 +4037,54 @@ mod tests {
                 warnings[0].action,
                 "tapectl snapshot create dirty_unit && tapectl stage create dirty_unit && \
                  tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <location>"
+            );
+        }
+
+        /// #529: v1 `current`, v2 `created` (a `stage create` that failed or
+        /// never ran), the source equal to v2. `audit` warned of nothing.
+        /// Now it is a `dirty` warning naming v2, whose remedy runs; a unit
+        /// with no `current` version stays `no_archive`'s alone.
+        #[test]
+        fn dirty_check_warns_of_a_newest_snapshot_never_staged() {
+            let root = TempDir::new().unwrap();
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            let dir = root.path().join("moved_on");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
+                 VALUES ('u-m', 'moved_on', ?1, ?2, 'mtime_size', 1, 'active')",
+                params![tid, dir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            let config = config_without_min_copies();
+            crate::staging::snapshot_create(&conn, "moved_on", &config).unwrap();
+
+            // Only a `created` v1: `no_archive` alone, no second report.
+            let (_, warnings) = collect_findings(&conn, &config, Some("moved_on")).unwrap();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].check, "no_archive");
+
+            conn.execute("UPDATE snapshots SET status = 'current'", [])
+                .unwrap();
+            std::fs::write(dir.join("f.txt"), b"hello, a longer edit").unwrap();
+            crate::staging::snapshot_create(&conn, "moved_on", &config).unwrap();
+            let (violations, warnings) =
+                collect_findings(&conn, &config, Some("moved_on")).unwrap();
+            assert!(violations.is_empty(), "{violations:?}");
+            let w: Vec<_> = warnings.iter().filter(|w| w.check == "dirty").collect();
+            assert_eq!(w.len(), 1, "{warnings:?}");
+            assert!(w[0].message.contains("v2") && w[0].message.contains("never staged"));
+            assert!(
+                w[0].action.starts_with("tapectl stage create moved_on && "),
+                "{}",
+                w[0].action
             );
         }
 
@@ -6375,6 +6501,7 @@ mod tests {
             "no_full_verify",
             "volume_verify_age",
             "tape_alert",
+            "collection_unsynced",
             "cut_without_ending",
             "completed_past_ending",
             "range_without_may_span",
@@ -6397,15 +6524,16 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 9 archive-wide checks. `policy_unresolvable`
+            // 10 per-unit checks + 10 archive-wide checks (#534 added
+            // `collection_unsynced`). `policy_unresolvable`
             // is not one of them (see below), `escrow_kit_missing`/
             // `escrow_kit_stale` share one row, and so do
             // `cut_without_ending`/`completed_past_ending` (#420) and the
             // four range invariants (#478, X27).
             assert_eq!(
                 names.len(),
-                19,
-                "expected 10 per-unit + 9 archive-wide CHECKS rows, got: {names:?}"
+                20,
+                "expected 10 per-unit + 10 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {

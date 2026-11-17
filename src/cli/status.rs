@@ -484,13 +484,24 @@ pub struct HomeScreen {
     pub never_archived: Vec<String>,
     /// Pending, Dirty: the source no longer matches the snapshot.
     pub dirty: Vec<String>,
+    /// Pending, Unstaged: the source matches the newest snapshot, which was
+    /// never staged, so the newest content is on no tape (#529).
+    pub unstaged: Vec<String>,
     /// Units whose source the dirty scan could not read.
     pub not_scanned: Vec<String>,
+    /// Folders under a collection root that are not units, by collection
+    /// (name, count): what `audit`'s `collection_unsynced` names (#534).
+    pub unsynced: Vec<(String, usize)>,
     /// Units with a stage set held in staging that still owes a copy.
     pub staged: Vec<String>,
     /// Units below their copy floor (Never Archived ones are pending, not
     /// counted here).
     pub under_copied: Vec<String>,
+    /// The command `audit` gives for the first under-copied unit's state
+    /// (`audit::under_copied_remedy`), so `status` suggests only a command
+    /// that runs (#539): a bare `stage create` refuses a unit whose current
+    /// version is unchanged.
+    pub under_copied_remedy: Option<String>,
     /// Units whose policy does not resolve, so their copies cannot be judged.
     pub policy_unresolvable: Vec<String>,
     pub due_verify: Vec<DueVerify>,
@@ -502,9 +513,10 @@ pub struct HomeScreen {
 }
 
 impl HomeScreen {
-    /// Pending: Never Archived and Dirty (CONTEXT.md).
+    /// Pending: Never Archived, Dirty, and Unstaged (CONTEXT.md; ADR-0012
+    /// item 247).
     pub fn pending(&self) -> usize {
-        self.never_archived.len() + self.dirty.len()
+        self.never_archived.len() + self.dirty.len() + self.unstaged.len()
     }
 
     /// At most three next commands, in OQ9's order: an interrupted session,
@@ -520,7 +532,11 @@ impl HomeScreen {
             next.push(format!("tapectl volume resume {first}{more}"));
         }
         let pending: Vec<&String> = self.never_archived.iter().chain(&self.dirty).collect();
-        if !pending.is_empty() {
+        // A collection's run snapshots (a no-op for an unstaged version) and
+        // stages every pending unit under it; outside one, an unstaged unit
+        // needs the stage alone (`snapshot create` mints nothing for it).
+        let collection_run = self.pending_collections.first().map(|(_, c)| c);
+        if !pending.is_empty() || (collection_run.is_some() && !self.unstaged.is_empty()) {
             next.push(match self.pending_collections.first() {
                 Some((_, collection)) => {
                     format!(
@@ -540,16 +556,32 @@ impl HomeScreen {
                 }
             });
         }
+        if let Some((collection, _)) = self.unsynced.first() {
+            next.push(format!("tapectl collection sync {collection}"));
+        }
+        if collection_run.is_none() && !self.unstaged.is_empty() {
+            let units: Vec<&String> = self.unstaged.iter().collect();
+            next.push(format!("tapectl stage create {}", some_names(&units)));
+        }
         if !self.staged.is_empty() {
             next.push(
                 "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to <a short location>"
                     .to_string(),
             );
-        } else if !self.under_copied.is_empty() {
-            // Nothing staged to write: the copy floor is met by staging the
-            // units again first (a write takes only what is staged).
-            let units: Vec<&String> = self.under_copied.iter().collect();
-            next.push(format!("tapectl stage create {}", some_names(&units)));
+        } else if let (false, Some(remedy)) =
+            (self.under_copied.is_empty(), &self.under_copied_remedy)
+        {
+            // Nothing staged to write: the remedy `audit` gives for the first
+            // unit's state (#539), not a bare `stage create` that refuses.
+            let more = match self.under_copied.len() {
+                1 => String::new(),
+                n => format!(
+                    "  ({} more under-copied: {})",
+                    n - 1,
+                    self.under_copied[1..].join(", ")
+                ),
+            };
+            next.push(format!("{remedy}{more}"));
         }
         if let Some(due) = self.due_verify.first() {
             next.push(format!("tapectl volume verify {}", due.label));
@@ -579,14 +611,25 @@ pub fn gather(conn: &Connection, config: &Config) -> Result<HomeScreen> {
         match row.state {
             "new" => screen.never_archived.push(row.name),
             "dirty" => screen.dirty.push(row.name),
+            "unstaged" => screen.unstaged.push(row.name),
             "unreadable" => screen.not_scanned.push(row.name),
             _ => {}
+        }
+    }
+    for lib in &config.collections {
+        let n = crate::collection::sync::unregistered_folders(conn, lib)?.len();
+        if n > 0 {
+            screen.unsynced.push((lib.name.clone(), n));
         }
     }
     screen.pending_collections = pending_collections(
         conn,
         config,
-        screen.never_archived.iter().chain(&screen.dirty),
+        screen
+            .never_archived
+            .iter()
+            .chain(&screen.dirty)
+            .chain(&screen.unstaged),
     )?;
 
     let mut staged: Vec<String> = crate::cli::stage::stage_set_rows(
@@ -608,6 +651,12 @@ pub fn gather(conn: &Connection, config: &Config) -> Result<HomeScreen> {
             }
             _ if screen.never_archived.contains(&row.unit) => {}
             _ => screen.under_copied.push(row.unit),
+        }
+    }
+
+    if let Some(first) = screen.under_copied.first() {
+        if let Some(unit) = crate::db::queries::get_unit_by_name(conn, first)? {
+            screen.under_copied_remedy = Some(crate::cli::audit::under_copied_remedy(conn, &unit)?);
         }
     }
 
@@ -757,8 +806,12 @@ pub fn render_overview(overview: &Overview) -> String {
     let pending = if screen.pending() == 0 {
         "0".to_string()
     } else {
+        let unstaged = match screen.unstaged.len() {
+            0 => String::new(),
+            n => format!(", {n} unstaged"),
+        };
         format!(
-            "{} ({} never archived, {} dirty)",
+            "{} ({} never archived, {} dirty{unstaged})",
             screen.pending(),
             screen.never_archived.len(),
             screen.dirty.len()
@@ -781,6 +834,16 @@ pub fn render_overview(overview: &Overview) -> String {
             format!(
                 "{} (the source could not be read: tapectl report dirty says why)",
                 screen.not_scanned.len()
+            ),
+        ]);
+    }
+    if !screen.unsynced.is_empty() {
+        let n: usize = screen.unsynced.iter().map(|(_, n)| n).sum();
+        rows.push(vec![
+            "not units".to_string(),
+            format!(
+                "{} under collections, in no unit (tapectl collection sync registers them)",
+                crate::render::plural(n as i64, "folder", "folders")
             ),
         ]);
     }
@@ -868,7 +931,9 @@ pub fn overview_json(
                 "pending": s.pending(),
                 "never_archived": s.never_archived,
                 "dirty": s.dirty,
+                "unstaged": s.unstaged,
                 "not_scanned": s.not_scanned,
+                "unsynced_folders": s.unsynced.iter().map(|(_, n)| n).sum::<usize>(),
                 "staged": s.staged,
                 "under_copied": s.under_copied,
                 "policy_unresolvable": s.policy_unresolvable,
@@ -1466,11 +1531,15 @@ mod tests {
             }),
             ["tapectl snapshot create d", "tapectl volume verify L1"]
         );
-        // Under-copied with nothing staged: stage first, a write takes only
-        // what is staged.
+        // Under-copied with nothing staged: the remedy `audit` gives for the
+        // first unit's state (#539; it was a bare `stage create a b`, which
+        // refuses a unit whose current version is unchanged), the others named.
         assert_eq!(
-            screen(&|s| s.under_copied = vec!["a".into(), "b".into()]),
-            ["tapectl stage create a b"]
+            screen(&|s| {
+                s.under_copied = vec!["a".into(), "b".into()];
+                s.under_copied_remedy = Some("tapectl stage create a --version 1 && W".into());
+            }),
+            ["tapectl stage create a --version 1 && W  (1 more under-copied: b)"]
         );
         // A pending unit in a collection: the collection run.
         assert_eq!(
@@ -1564,5 +1633,90 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[ops] group"), "{err}");
+    }
+
+    /// #529: v1 current, v2 minted and never staged, the source equal to v2.
+    /// The home screen counts it pending and its next command stages it.
+    #[test]
+    fn the_home_screen_counts_a_newest_snapshot_never_staged_as_pending() {
+        let c = Catalog::new();
+        c.unit("moved-on", true);
+        let config = Config::default();
+        crate::staging::snapshot_create(&c.conn, "moved-on", &config).unwrap();
+        c.conn
+            .execute("UPDATE snapshots SET status = 'current'", [])
+            .unwrap();
+        std::fs::write(c.dir.path().join("moved-on").join("f.txt"), "a longer edit").unwrap();
+        crate::staging::snapshot_create(&c.conn, "moved-on", &config).unwrap();
+
+        let screen = gather(&c.conn, &config).unwrap();
+        assert_eq!(screen.unstaged, ["moved-on"], "{screen:?}");
+        assert_eq!(screen.pending(), 1);
+        assert_eq!(screen.next_commands()[0], "tapectl stage create moved-on");
+        let text = render_overview(&Overview::Read(Box::new(screen)));
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("pending 1 (0 never archived, 0 dirty, 1 unstaged)"),
+            "{text}"
+        );
+    }
+
+    /// #539 (C2): a tape-only unit below its copy floor is on the home screen,
+    /// and the suggestion for an under-copied unit is the command `audit`
+    /// gives, not a bare `stage create` that refuses.
+    #[test]
+    fn a_tape_only_unit_below_its_floor_is_under_copied_with_audits_remedy() {
+        let c = Catalog::new();
+        let unit = c.unit("gone", false);
+        c.conn
+            .execute(
+                "UPDATE units SET status = 'tape_only' WHERE id = ?1",
+                params![unit],
+            )
+            .unwrap();
+        let set = c.staged(c.snapshot(unit));
+        c.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                params![set],
+            )
+            .unwrap();
+        // Its only copy is on a volume that is no longer in service.
+        let lost = c.volume("L-LOST", "retired");
+        c.write(set, lost, "completed");
+        let screen = gather(&c.conn, &Config::default()).unwrap();
+        assert_eq!(screen.under_copied, ["gone"], "{screen:?}");
+        let remedy = screen.under_copied_remedy.clone().expect("a remedy");
+        assert!(
+            remedy.contains("catalog locate gone"),
+            "no source to stage from, so no `stage create`: {remedy}"
+        );
+        assert_eq!(screen.next_commands()[0], remedy);
+    }
+
+    /// #534: a folder under a collection root that is no unit is counted on
+    /// the home screen, with `collection sync` as the next command.
+    #[test]
+    fn the_home_screen_counts_a_folder_under_a_collection_root_that_is_no_unit() {
+        let c = Catalog::new();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("fresh-folder")).unwrap();
+        let mut config = Config::default();
+        config.collections.push(crate::config::CollectionConfig {
+            name: "keepsake".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "t".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
+        });
+        let screen = gather(&c.conn, &config).unwrap();
+        assert_eq!(screen.unsynced, [("keepsake".to_string(), 1)]);
+        assert_eq!(screen.next_commands(), ["tapectl collection sync keepsake"]);
+        let text = render_overview(&Overview::Read(Box::new(screen)));
+        assert!(text.contains("1 folder under collections"), "{text}");
     }
 }
