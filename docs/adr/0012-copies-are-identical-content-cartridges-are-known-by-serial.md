@@ -3483,3 +3483,169 @@ Not ruled:
 - D1 to D22 of the plan, as a list for the CTO to see.
 - The real-scale run on the production host (T0.3), or its move to Stage 6.
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-17 (later): the format's choices are ratified, the scale run is ruled, and the coordinator's role is handed on
+
+Ruled 2026-11-17. The coordinator had shown the CTO the twenty-two choices the Layout 3
+format document must make (D1 to D22 of `docs/design/v3-implementation-plan.md`), one line
+each, with a recommendation for the real-scale measurement, and had asked the go as a
+separate question, saying that a "ratify all" would be read as the first two only. The
+CTO's words, whole: "Ratify all & handoff for opus to take over; make sure complex
+decisions have been thoroughly determined".
+
+290. **The format's choices D1 to D22 are ratified as proposed.** Each is stated here, so
+     that this record holds them and not only a plan that can be edited.
+     - **D1, the layout's identity.** `layout_version = 3`. The magic is
+       `tapectl-volume-v3` in File 0, and the front index's and the seal marker's magics
+       move with it. `requires` is empty on every Layout 3 tape: the short seal and a unit
+       that continues on another cartridge are part of the layout. The key stays, for a
+       later feature.
+     - **D2, the stream.** One pax stream for each staging, written by GNU tar with a
+       command line the format document fixes flag by flag: `--create --file=-
+       --format=pax --numeric-owner --xattrs --acls` (with the flags that store an ACL
+       once, in the record the plan's T0.1 picks), `--no-recursion --null
+       --verbatim-files-from --files-from=<list>`, `--pax-option=exthdr.name=%d/PaxHeaders/%f`
+       with access and change times not stored, no `--sparse`, no compression. The list is
+       tapectl's: NUL-separated, every name prefixed `./`, sorted bytewise, folders as
+       their own entries, the unit's dotfile included. tar runs in the unit's root with
+       `LC_ALL=C` and without `TAR_OPTIONS` or `POSIXLY_CORRECT`.
+     - **D3, the cut.** The cutter works at member starts, given each member's start and
+       whole length before its bytes. A member that fits in what is left of the slice
+       goes into it. One that does not fit, and is no larger than `slice_size`, ends the
+       slice before it. One larger than `slice_size` ends the slice before it and is cut
+       at every `slice_size` bytes, its last piece ending where it ends (its *run*); the
+       member after it begins a new slice. The stream's tail is placed as a member is.
+       `slice_size` is the most a slice's cut holds and is a multiple of 512.
+       `size_bytes` and `sha256_plain` are of the cut before compression;
+       `encrypted_bytes` and `sha256_encrypted` are of the tape file. The format states
+       each algorithm's worst growth, and the early warning's rules are held to
+       `slice_size` plus it.
+     - **D4, the file table's text.** `tables/<staging>.tsv` in the tenant's envelope:
+       the header lines `#tapectl-file-table 1` and `#stream_bytes <n>`, then one
+       tab-separated row for each member in stream order: kind (`f`, `d`, `l`, `h`, `p`,
+       `c`, `b`), the slice in which the member begins, its start and end in the stream,
+       the file's size, its sha256 (`-` where there is none; the target's for a hard
+       link), its path, and for a hard link its target. Paths are escaped by the index's
+       one rule.
+     - **D5, the id map's text.** `tables/<staging>.ids.tsv`: rows `u <id> <name>` and
+       `g <id> <name>`, sorted by kind and number, the name empty where the host knew
+       none.
+     - **D6, the MANIFEST's block.** dar's fields go. New: `payload = "tar"`,
+       `stream_bytes`, the table's and the map's names, the writer's `tar --version` line,
+       and `compression` for a compressed staging only. Kept: the unit, version and
+       tenant facts and the slice list (each slice's size and plaintext hash of the cut,
+       its size on tape, its ciphertext sha256, its tape position). `may_span` goes.
+     - **D7, the on-tape `catalog.db`.** One generation, carrying each staging's file
+       table and id map as the catalog holds them.
+     - **D8, the index.** `index/units.tsv` and `index/paths.tsv` stay, and `paths.tsv`
+       states no sha256 for the unit dotfile.
+     - **D9, the baseline schema.** One file, `001_baseline.sql`; a 2.x catalog is known
+       by SQLite's `application_id`, and a database with tables and without it is a 1.x
+       catalog, refused by name. New tables `stage_files` and `stage_ids`, which outlive
+       the release of a staging's slices. The baseline is edited in place until `v2.0.0`
+       is tagged. `compression_level` joins `compression`; `allow_spanning`,
+       `writes.may_span` and the status `cut` leave with the code that reads them.
+     - **D10, the heir's script.** One file in the tree, the same bytes on every tape,
+       with the modes `--info`, `--verify`, `--find-envelope`, `--list`, `--restore`
+       (`--all`, `--unit`, `--version`, `--path`, `--paths-from`), `--where`, `--find`,
+       and `--work`, `--no-space-check`, `--overwrite`, `--no-file-check`. Its reader:
+       each slice is checked against the front index, decrypted into the work directory
+       and, where compressed, decompressed and checked against its `size_bytes`, before
+       tar sees it; the good slices go in order to one tar run; a bad slice is left out
+       and its members listed; a long member's run is fed piece by piece, and a failed
+       piece ends that run and removes the member's partial file. One decrypted slice at
+       a time rests in the work directory. One prompt, for the next cartridge of a unit
+       that continues, where "I do not have it" is an answer. Gone: `--slices-from`,
+       `--swap-tapes`, `--stream-tapes`, `--fill-from`, the salvage mode.
+     - **D11, the command line and the config.** `[dar]` becomes `[tar]` with one key,
+       `binary`. `preserve_fsa` and `[staging] hash_threads` go; `preserve_xattrs` and
+       `preserve_acls` come to mean what they say. `compression` takes `none`, `gzip`,
+       `xz` or `zstd`, and `compression_level` joins it. `allow_spanning` goes. The
+       restores lose `--spool`. The names that say dar become `tar_version`,
+       `tar_command`, `stream_bytes`, `tar_create_reports` and `tar_*`.
+     - **D12, the stream's checks.** For each member as it passes: it is the next entry
+       of the list by path, kind and size; its user and group name fields are empty and
+       it has no `uname` or `gname` record; every qualifier in an ACL record is a number;
+       a listed file that had an ACL on disk carries the kept ACL record. After tar
+       exits: status 0, every entry seen, and each file's device, inode, size, mtime and
+       ctime what they were before.
+     - **D13, names for the id map.** The C library's lookup by id; what the static
+       binary can resolve is measured with that binary and written into File 1 and the
+       guide.
+     - **D14, exclusions.** tapectl's matcher is the only one; tar is given the exact
+       list; a snapshot records and reports what each pattern left out; `init` writes an
+       empty list.
+     - **D15, compression's detail.** One complete frame of the algorithm for each
+       slice, as its own tool writes and reads it (a gzip member, an xz stream, a zstd
+       frame), with nothing of tapectl's around it. The level is a whole number in the
+       algorithm's own range; unset, it is the algorithm's default (gzip 6, xz 6, zstd 3);
+       one outside the range is refused. The format states each algorithm's worst growth.
+       Staging decodes every slice it has packed and compares it with the cut before the
+       bytes go on.
+     - **D16, tapectl's check after a restore.** Every member's hash is checked as tar is
+       fed, and every restored file is hashed on disk after tar ends, unless
+       `--no-file-check`.
+     - **D17, a range and `restore volume`.** `restore volume` and `restore unit` take
+       what a tape holds whole when the other cartridges are not offered, and list the
+       rest; with them offered they go on across them.
+     - **D18, the drill's record.** `drill record LABEL` writes one event; `audit` warns
+       when none is recorded or the newest is older than `[defaults]
+       drill_interval_days`, 365 when absent.
+     - **D19, the batch.** `collection run` takes units in the collection's order and
+       skips none. Units are added while the plan's end is at or below the cartridge's
+       nominal capacity; the unit that carries the plan past it is the batch's last and
+       is planned whole. A batch is still bounded by the staging area.
+     - **D20, the one plan bound.** On a drive that declares `post_warning_bytes` a plan
+       lists slices to the end of the unit that passes nominal capacity, and the early
+       warning ends the tape. Without the key the plan stops at the last slice under the
+       fill ceiling, the tape is sealed in full there, and the rest continues. An early
+       warning before the plan's end seals short in both cases.
+     - **D21, a range in rewrite and compaction.** Both carry a volume's live slices as
+       they are, by ciphertext, in slice order; the new volume's block lists every slice
+       of the staging and gives positions to the ones it holds; whether a slice is live
+       is its version's state; `volume rewrite`'s consent names every version of which
+       the volume is the only holder of some slice.
+     - **D22, a long member's run.** In the MANIFEST's slice list a slice that continues
+       a member states `continues = true`. No plaintext file says which slices are a
+       run.
+291. **The real-scale measurement is taken in two places** (the plan's T0.3). The leg
+     over a made tree of two million small files is run before the code, on the
+     development host, with no production data. The leg over the collection's largest
+     real unit is not run before the code: its proof is taken from the real-drive
+     acceptance (the plan's T6.6). This amends item 253's "before any code" for that leg
+     only, and a content mismatch or a tool's failure in either place still reopens item
+     253.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *This is not the go.* The coordinator had written, in the message this answers, that a
+  "ratify all" would be read as the two questions above and that the go needs the word.
+  The CTO's answer does not say it. Nothing is built.
+- *"Handoff for opus to take over"* is read as: the coordinator's role passes to another
+  session, which starts from the records and not from this session's memory. Its entry is
+  `docs/coordinator-handoff.md`. The roles of the plan (worker, coordinator, operator,
+  CTO) do not change.
+- *"Make sure complex decisions have been thoroughly determined"* is read as an
+  instruction to the coordinator, not as a ruling on any one point: what Stage 1 or a
+  task would have had to settle by judgment is settled now and written into the plan,
+  so that what follows is execution. Three kinds were found and done:
+  - every measurement task has its decision rule fixed before it runs (T0.3, T0.5 and
+    T0.6 had none, and T0.7's last step had none);
+  - every place the plan left to "Stage 1 decides" is decided there (the format
+    document's outline, section by section; the baseline's new tables; the fields of each
+    algorithm's frame and its range of levels; the flags of tapectl's own reader; what a
+    rebuild reads; the staging-space estimate; how the seal's rules read without the
+    `short-seal` entry);
+  - the two designs item 288 left owed are worked out against the code: the plan order
+    once every unit continues (T5.1), and a range carried through `volume rewrite` and
+    compaction (T5.3, which item 133 had called "its own design").
+- *These are determinations, not rulings.* Each is marked "determined" in the plan. A
+  coordinator may correct one that the code shows wrong, in the plan and in its report.
+  One whose correction would change bytes on tape, the schema or a command's spelling
+  goes to the CTO first.
+- *D21's reach.* Item 290 ratifies D21 as it was shown, in four clauses. What T5.3 adds
+  under it is determination.
+
+Not ruled:
+
+- The go. No build has been asked for, and nothing is built.
