@@ -17,11 +17,10 @@
 //! | tenant name per unit | each tenant envelope's manifest | the operator manifest files every unit under the placeholder tenant `"operator"` |
 //! | per-file index, `source_path`, sizes | operator envelope's `catalog.db` (#83), via `db::ontape_catalog` | no manifest carries files |
 //!
-//! `db::ontape_catalog::Generation` is how an old tape's `catalog.db` (no
-//! `tenants`, no `key_fingerprints`, no `sha256_plain`; or, before 1.1.0, no
-//! file kinds or link targets) is told apart from a current one — probed
-//! from the file's actual shape, never from a version number (see that
-//! module's doc for why, and `volume-format-v2.md` §1.4).
+//! The `catalog.db` is read in the one shape this tapectl writes; a file of
+//! any other shape (those written before 1.1.0 among them) is refused,
+//! naming what was found (`db::ontape_catalog::check_shape`,
+//! `volume-format-v2.md` §1.4; ADR-0012 item 258(d)).
 //!
 //! # What it deliberately does not do
 //!
@@ -1785,7 +1784,7 @@ struct Supplement {
     /// (issue #413). A version with no rows on tape has no entry.
     file_snapshot: HashMap<(String, i64), i64>,
     /// The open `catalog.db`, when the tape carries one, and where each
-    /// version's file rows lie in it, whatever its generation.
+    /// version's file rows lie in it.
     db: Option<(Connection, ontape_catalog::FileSpans)>,
     /// unit uuid -> owning tenant name, when `catalog.db` carries `tenants`.
     tenant_of: HashMap<String, String>,
@@ -1872,7 +1871,7 @@ impl Supplement {
         }
 
         // Only where each version's rows lie: `ensure_files` streams them.
-        let spans = ontape_catalog::FileSpans::read(&db, cat.generation)?;
+        let spans = ontape_catalog::FileSpans::read(&db)?;
         out.file_snapshot = snapshot_key
             .into_iter()
             .filter(|(id, _)| spans.contains(*id))
@@ -1880,12 +1879,10 @@ impl Supplement {
             .collect();
         out.db = Some((db, spans));
 
-        out.has_tenants = cat.generation.carries_ownership_and_receipts();
-        if out.has_tenants {
-            for u in &cat.units {
-                if let Some(tname) = tenant_name.get(&u.tenant_id) {
-                    out.tenant_of.insert(u.uuid.clone(), tname.clone());
-                }
+        out.has_tenants = true;
+        for u in &cat.units {
+            if let Some(tname) = tenant_name.get(&u.tenant_id) {
+                out.tenant_of.insert(u.uuid.clone(), tname.clone());
             }
         }
 

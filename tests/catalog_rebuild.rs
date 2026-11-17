@@ -79,20 +79,7 @@ const UNITS: &[(&str, &str, &[u8])] = &[
 enum CatalogDb {
     /// None at all — a tape written before #83.
     None,
-    /// Generation 1's shape, the pre-2026-09-11 one: `files` with no file
-    /// kinds, and no `tenants`, no `key_fingerprints`, no `sha256_plain`.
-    /// Made by `ontape_catalog::fixture::downgrade` from this tape's own
-    /// generation-3 file, so it names this tape's slices; its `files.id`
-    /// numbering is that of master's never-shipped post-030 writer (from 1),
-    /// not the shipped writers' (the catalog's own ids, verbatim). Files the
-    /// shipped writers made are pinned in `db::ontape_catalog`'s tests
-    /// (`tests/fixtures/ontape_catalog/`).
-    Old,
-    /// Generation 2's shape, 2026-09-11 until 1.1.0: generation 1 plus
-    /// ownership and receipts, still `files` with no file kinds. Made the
-    /// same way, with the same caveat.
-    Gen2,
-    /// Generation 3, what `build_catalog_snapshot` writes today (1.1.0 on).
+    /// What `build_catalog_snapshot` writes.
     New,
 }
 
@@ -242,8 +229,8 @@ fn build_sealed_volume_with_a_tenant_named_operator(catalog_db: CatalogDb) -> Se
 
 thread_local! {
     /// SQL [`build_sealed_volume_editing_catalog_db`] runs against the
-    /// `catalog.db` before it goes into the operator envelope: a stand-in for
-    /// a value an older tapectl wrote that today's catalog cannot hold.
+    /// `catalog.db` before it goes into the operator envelope: a value or a
+    /// shape today's writer does not make from this fixture's catalog.
     static CATALOG_DB_EDIT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -257,6 +244,18 @@ fn build_sealed_volume_editing_catalog_db(catalog_db: CatalogDb, sql: &str) -> S
     );
     CATALOG_DB_EDIT.with(|e| *e.borrow_mut() = Some(sql.to_string()));
     build_sealed_volume_with(catalog_db)
+}
+
+/// A tape whose `catalog.db` records no escrow receipt
+/// (`stage_sets.key_fingerprints` NULL) for any stage set: the column is
+/// nullable in the writer's schema, and a staging the source catalog holds
+/// no recipient list for is written that way. Its rebuilt rows read
+/// `unknown` until attested (#137).
+fn build_sealed_volume_without_receipts() -> SealedVolume {
+    build_sealed_volume_editing_catalog_db(
+        CatalogDb::New,
+        "UPDATE stage_sets SET key_fingerprints = NULL;",
+    )
 }
 
 thread_local! {
@@ -575,20 +574,9 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let catalog_dir = tempfile::tempdir().unwrap();
     let catalog_db_path = match catalog_db {
         CatalogDb::None => None,
-        CatalogDb::New | CatalogDb::Gen2 | CatalogDb::Old => {
+        CatalogDb::New => {
             let p = catalog_dir.path().join("catalog.db");
             db::catalog_snapshot::build_catalog_snapshot(&conn, &stage_set_ids, &p).unwrap();
-            match catalog_db {
-                CatalogDb::Old => db::ontape_catalog::fixture::downgrade(
-                    &p,
-                    db::ontape_catalog::Generation::Original,
-                ),
-                CatalogDb::Gen2 => db::ontape_catalog::fixture::downgrade(
-                    &p,
-                    db::ontape_catalog::Generation::WithOwnershipAndReceipts,
-                ),
-                CatalogDb::New | CatalogDb::None => {}
-            }
             if let Some(sql) = CATALOG_DB_EDIT.with(|e| e.borrow_mut().take()) {
                 rusqlite::Connection::open(&p)
                     .unwrap()
@@ -1583,19 +1571,16 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
     assert_eq!(source, format!("/src/{}", UNITS[0].0));
 }
 
-/// ADR-0012 2026-10-12 item 48 (#381's on-tape half): a catalog rebuilt
-/// from a 1.1.0 tape (generation 3 `catalog.db`) keeps each entry's kind
-/// and link target, so a symlink and a FIFO come back as what the walk
-/// recorded, not as regular files with data. The same version on a
-/// generation-2 tape comes back as regular files: that shape records only
-/// `is_directory`, the documented limit for tapes written before 1.1.0.
+/// ADR-0012 2026-10-12 item 48 (#381's on-tape half): a rebuilt catalog
+/// keeps each entry's kind and link target, so a symlink and a FIFO come
+/// back as what the walk recorded, not as regular files with data.
 #[test]
 fn a_rebuilt_catalog_keeps_each_kind_and_link_target() {
     use db::files::FileKind;
     let unit = UNITS[0].0;
-    for generation in [CatalogDb::New, CatalogDb::Gen2] {
+    {
         WITH_LINK_AND_SPECIAL.with(|w| w.set(true));
-        let mut vol = build_sealed_volume_with(generation);
+        let mut vol = build_sealed_volume_with(CatalogDb::New);
         WITH_LINK_AND_SPECIAL.with(|w| w.set(false));
         let dir = tempfile::tempdir().unwrap();
         let conn = fresh_db(dir.path());
@@ -1617,25 +1602,19 @@ fn a_rebuilt_catalog_keeps_each_kind_and_link_target() {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let (link_kind, link_target, pipe_kind) = if generation == CatalogDb::New {
-            (
-                FileKind::Symlink,
-                Some("file0.bin".to_string()),
-                FileKind::Special,
-            )
-        } else {
-            (FileKind::Regular, None, FileKind::Regular)
-        };
         assert_eq!(
             rows,
             vec![
                 (format!("{unit}/file0.bin"), FileKind::Regular, None, true),
                 (format!("{unit}/file1.bin"), FileKind::Regular, None, true),
-                (format!("{unit}/latest"), link_kind, link_target, false),
-                (format!("{unit}/pipe"), pipe_kind, None, false),
-            ],
-            "catalog.db generation {}",
-            generation as u8
+                (
+                    format!("{unit}/latest"),
+                    FileKind::Symlink,
+                    Some("file0.bin".to_string()),
+                    false
+                ),
+                (format!("{unit}/pipe"), FileKind::Special, None, false),
+            ]
         );
     }
 }
@@ -1644,13 +1623,11 @@ fn a_rebuilt_catalog_keeps_each_kind_and_link_target() {
 /// regular files. Rebuild used to leave `files.file_type` NULL, and staging
 /// validates only `file_type = 'regular'`, so it planned zero files: the
 /// size check and the sha256 baseline from the tape were both skipped and
-/// the stage went ahead on whatever the source held. Generations 1 and 2 of
-/// `catalog.db` carry `is_directory` only and generation 3 the kind itself,
-/// so all three are covered.
+/// the stage went ahead on whatever the source held.
 #[test]
 fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
-    for generation in [CatalogDb::Old, CatalogDb::Gen2, CatalogDb::New] {
-        let mut vol = build_sealed_volume_with(generation);
+    {
+        let mut vol = build_sealed_volume_with(CatalogDb::New);
         let dir = tempfile::tempdir().unwrap();
         let conn = fresh_db(dir.path());
         let scratch = tempfile::tempdir().unwrap();
@@ -1686,9 +1663,7 @@ fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
         .unwrap_or_else(|| {
             panic!(
                 "a rebuilt version must be content-validated against the tape's \
-                 sha256 baseline, so changed bytes are refused (catalog.db \
-                 generation {})",
-                generation as u8
+                 sha256 baseline, so changed bytes are refused"
             )
         })
         .to_string();
@@ -1697,66 +1672,6 @@ fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
             "the refusal names the file whose bytes changed: {err}"
         );
     }
-}
-
-/// A tape written before migration 030 can carry a `modified_at` the walk
-/// spelled for a file dated past 2262 (or before 1677), which no nanosecond
-/// count holds. The rebuild records no mtime for it, as a fresh walk of that
-/// file does today, and keeps every other row's; it used to refuse the whole
-/// rebuild over that one value. Text the walk never writes is still refused,
-/// naming the row (and is this test's positive control that the edit reached
-/// the tape).
-#[test]
-fn a_far_off_modified_at_on_tape_rebuilds_with_no_mtime() {
-    let far = "2300-01-01T00:00:00+00:00";
-    let near = "2026-09-01T12:00:00+00:00";
-    let mut vol = build_sealed_volume_editing_catalog_db(
-        CatalogDb::Old,
-        &format!(
-            "UPDATE files SET modified_at = '{near}';
-             UPDATE files SET modified_at = '{far}' WHERE id = (SELECT MIN(id) FROM files);"
-        ),
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_db(dir.path());
-    let scratch = tempfile::tempdir().unwrap();
-    let secret = vol.operator_secret.clone();
-    rebuild(&conn, &mut vol, &secret, scratch.path())
-        .expect("one far-off timestamp must not fail a DR rebuild");
-
-    let mtimes: Vec<(String, Option<i64>)> = conn
-        .prepare(
-            "SELECT p.path, fv.mtime_ns FROM file_versions fv JOIN paths p ON p.id = fv.path_id
-             ORDER BY p.path",
-        )
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(mtimes.len(), UNITS.len() * 2, "every row came back");
-    let near_ns = db::files::mtime_ns_from_secs(1_788_264_000);
-    let unset = mtimes.iter().filter(|(_, ns)| ns.is_none()).count();
-    assert_eq!(unset, 1, "only the far-off row has no mtime: {mtimes:?}");
-    assert!(
-        mtimes.iter().all(|(_, ns)| ns.is_none() || *ns == near_ns),
-        "every other row keeps its mtime: {mtimes:?}"
-    );
-
-    let mut vol = build_sealed_volume_editing_catalog_db(
-        CatalogDb::Old,
-        "UPDATE files SET modified_at = 'yesterday' WHERE id = (SELECT MIN(id) FROM files);",
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_db(dir.path());
-    let secret = vol.operator_secret.clone();
-    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
-        .expect_err("text the walk never writes is refused")
-        .to_string();
-    assert!(
-        err.contains("catalog.db files row") && err.contains("\"yesterday\""),
-        "{err}"
-    );
 }
 
 /// A tape written before #83 carries no `catalog.db`. The restore path must
@@ -3104,9 +3019,9 @@ fn the_escrow_key_rebuilds_as_well_as_the_operator_key() {
 /// recipient list" — the same verdict, a different explanation.
 #[test]
 fn rebuilt_stage_sets_are_marked_as_such() {
-    // Old shape on purpose: a NEW-shape tape carries the receipt, and then the
-    // predicate answers "yes", not "?" — see `receipts_ride_the_tape...`.
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    // No receipt on purpose: a tape that carries the receipt makes the
+    // predicate answer "yes", not "?" — see `receipts_ride_the_tape...`.
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();
@@ -3179,58 +3094,44 @@ fn receipts_ride_the_tape_so_a_rebuilt_new_tape_is_escrow_covered() {
     }
 }
 
-/// A tape written before 2026-09-11 carries the old `catalog.db` shape.
-/// Ownership must still come back — from the tenant envelopes — and the
-/// receipt honestly cannot: those rows are `unknown`, attestable later.
+/// ADR-0012 item 258(d): a tape whose `catalog.db` is a shape tapectl wrote
+/// before 1.1.0 (`files` for the per-file rows; before 2026-09-11 also no
+/// `tenants`, no `key_fingerprints`, no `sha256_plain`) is refused, naming
+/// what was found, and nothing of it is recorded. This tapectl reads one
+/// shape, the one it writes.
 #[test]
-fn an_old_shape_catalog_db_still_rebuilds_through_the_envelopes() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+fn an_older_shape_catalog_db_refuses_the_rebuild_naming_what_was_found() {
+    let mut vol = build_sealed_volume_editing_catalog_db(
+        CatalogDb::New,
+        "DROP TABLE file_versions; DROP TABLE paths; DROP TABLE tenants;
+         ALTER TABLE stage_sets DROP COLUMN key_fingerprints;
+         ALTER TABLE stage_slices DROP COLUMN sha256_plain;
+         CREATE TABLE files (id INTEGER PRIMARY KEY, snapshot_id INTEGER NOT NULL,
+                             path TEXT NOT NULL, size_bytes INTEGER, sha256 TEXT,
+                             modified_at TEXT, is_directory INTEGER);",
+    );
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();
     let secret = vol.operator_secret.clone();
-    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
-
-    assert!(report.had_catalog_db);
-    assert!(!report.tenants_from_catalog_db);
-    assert_eq!(report.receipts_from_tape, 0);
-    assert_eq!(
-        report.files,
-        UNITS.len() * 2,
-        "the file index still comes from catalog.db"
-    );
-
-    for (unit_name, tenant_name, _) in UNITS {
-        let got: String = conn
-            .query_row(
-                "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id WHERE u.name = ?1",
-                rusqlite::params![unit_name],
-                |r| r.get(0),
-            )
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a catalog.db of another shape is refused")
+        .to_string();
+    for needle in [
+        "catalog.db is not the shape this tapectl writes",
+        "no `tenants` table",
+        "no `stage_sets.key_fingerprints` column",
+        "no `paths` table",
+        "a `files` table",
+    ] {
+        assert!(err.contains(needle), "{needle:?} not in {err}");
+    }
+    for table in ["volumes", "units", "stage_sets"] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
-        assert_eq!(&got, tenant_name, "ownership from the tenant envelopes");
+        assert_eq!(n, 0, "nothing of a refused tape is recorded ({table})");
     }
-    for (unit_name, expected) in &vol.expected_positions {
-        let rows = restore_resolution_query(&conn, unit_name);
-        let got: Vec<i64> = rows
-            .iter()
-            .map(|(_, pos, _)| pos.parse().unwrap())
-            .collect();
-        assert_eq!(&got, expected, "unit {unit_name}");
-    }
-    let fp: Option<String> = conn
-        .query_row("SELECT key_fingerprints FROM stage_sets LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        tapectl::policy::escrow::marker(
-            fp.as_deref(),
-            tapectl::policy::escrow::Origin::Rebuilt,
-            Some(&vol.escrow_public),
-        ),
-        "?"
-    );
 }
 
 /// Register `public_key` as this catalog's escrow recipient — what
@@ -3266,11 +3167,11 @@ fn markers(conn: &rusqlite::Connection, escrow_pub: &str) -> Vec<&'static str> {
 }
 
 /// #137, grilling Q2: with the REGISTERED escrow key in hand, a rebuild of
-/// an old-shape tape proves coverage by decrypting a slice header, and
+/// a tape that carries no receipt proves coverage by decrypting a slice header, and
 /// records it. Proof, not a receipt.
 #[test]
-fn the_registered_escrow_key_attests_coverage_on_an_old_tape() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+fn the_registered_escrow_key_attests_coverage_on_a_tape_without_receipts() {
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     register_escrow(&conn, &vol.escrow_public);
@@ -3281,7 +3182,7 @@ fn the_registered_escrow_key_attests_coverage_on_an_old_tape() {
     assert!(report.key_is_escrow);
     assert_eq!(
         report.receipts_from_tape, 0,
-        "an old tape carries no receipt"
+        "premise: this tape carries no receipt"
     );
     assert_eq!(report.attested, UNITS.len());
     assert_eq!(report.unknown_remaining, 0);
@@ -3294,7 +3195,7 @@ fn the_registered_escrow_key_attests_coverage_on_an_old_tape() {
 /// coverage, which is not the claim. It must not attest.
 #[test]
 fn the_operator_key_does_not_attest() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     register_escrow(&conn, &vol.escrow_public);
@@ -3314,7 +3215,7 @@ fn the_operator_key_does_not_attest() {
 /// nothing attests — and the report says the key was not recognised.
 #[test]
 fn an_unregistered_escrow_key_does_not_attest() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path()); // nothing registered
     let scratch = tempfile::tempdir().unwrap();
@@ -3332,7 +3233,7 @@ fn an_unregistered_escrow_key_does_not_attest() {
 /// no-op again.
 #[test]
 fn a_second_run_with_the_escrow_key_fills_what_the_first_left_unknown() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     register_escrow(&conn, &vol.escrow_public);
@@ -4203,7 +4104,7 @@ impl tapectl::store::Store for LockProbeStore {
 /// run inside the rebuild's one IMMEDIATE transaction.
 #[test]
 fn a_rebuild_reads_no_tape_while_it_holds_the_write_lock() {
-    let vol = build_sealed_volume_with(CatalogDb::Old);
+    let vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("rebuilt.db");
     let conn = fresh_db(dir.path());
@@ -4715,38 +4616,10 @@ fn a_tenant_named_operator_does_not_pass_for_the_operator_envelope() {
     assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
 }
 
-/// The same, where ownership can only come from the tenant envelopes (a
-/// catalog.db from before the 2026-09-11 ownership table): the real tenant
-/// named `operator` is still a tenant, and its units are filed under it.
-#[test]
-fn a_tenant_named_operator_still_owns_its_units_when_ownership_comes_from_envelopes() {
-    let mut vol = build_sealed_volume_with_a_tenant_named_operator(CatalogDb::Old);
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_db(dir.path());
-    let scratch = tempfile::tempdir().unwrap();
-    let secret = vol.operator_secret.clone();
-
-    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
-
-    assert!(
-        !report.tenants_from_catalog_db,
-        "premise: the catalog.db carries no ownership"
-    );
-    assert_eq!(report.units, UNITS.len());
-    assert!(
-        report.units_without_tenant_envelope.is_empty(),
-        "the tenant named `operator` has an envelope that names its units: {:?}",
-        report.units_without_tenant_envelope
-    );
-    assert_eq!(tenant_of_unit(&conn, "photos/2019"), "operator");
-    assert_eq!(tenant_of_unit(&conn, "photos/2020"), "operator");
-    assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
-}
-
 // ── Issue #451: a tenant envelope unreadable in every copy ───────────────
 //
 // Every envelope has a backup (`volume-format-v2.md` §1.3). When BOTH copies
-// of a tenant's envelope are damaged, a generation 2 or 3 rebuild does not
+// of a tenant's envelope are damaged, a rebuild does not
 // need them: the operator envelope's `catalog.db` names every unit's owner
 // and carries the receipts. It used to refuse anyway.
 
@@ -4797,9 +4670,7 @@ fn a_rebuild_goes_on_without_a_tenant_envelope_unreadable_in_every_copy() {
     let secret = vol.operator_secret.clone();
 
     let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap_or_else(|e| {
-        panic!(
-            "a generation 3 catalog.db names every owner, so a lost tenant pair is not fatal: {e}"
-        )
+        panic!("catalog.db names every owner, so a lost tenant pair is not fatal: {e}")
     });
 
     assert_eq!(report.units, UNITS.len(), "every unit is rebuilt");
@@ -4821,50 +4692,8 @@ fn a_rebuild_goes_on_without_a_tenant_envelope_unreadable_in_every_copy() {
     assert!(warned.contains("tenant_envelope"), "{warned}");
 }
 
-/// Generation 2 (2026-09-11 until 1.1.0) names owners too, so it proceeds as
-/// well; `catalog.db` generation 1 and a tape with none do not, and keep
-/// refusing, now saying why and what else to do.
-#[test]
-fn a_lost_tenant_pair_is_survivable_only_where_catalog_db_names_the_owners() {
-    // Generation 2: ownership and receipts ride in catalog.db.
-    let mut vol = build_sealed_volume_with(CatalogDb::Gen2);
-    damage_envelope_pair(&mut vol, "tenant_envelope", 1);
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_db(dir.path());
-    let scratch = tempfile::tempdir().unwrap();
-    let secret = vol.operator_secret.clone();
-    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
-        .expect("generation 2 names every unit's owner");
-    assert_eq!(report.unreadable_tenant_envelopes.len(), 1);
-    assert_eq!(report.units, UNITS.len());
-    assert!(report.units_without_tenant_envelope.is_empty());
-
-    // Generation 1 and no catalog.db: the tenant envelopes are the only
-    // record of ownership, so the rebuild still needs every one.
-    for catalog_db in [CatalogDb::Old, CatalogDb::None] {
-        let mut vol = build_sealed_volume_with(catalog_db);
-        damage_envelope_pair(&mut vol, "tenant_envelope", 0);
-        let dir = tempfile::tempdir().unwrap();
-        let conn = fresh_db(dir.path());
-        let scratch = tempfile::tempdir().unwrap();
-        let secret = vol.operator_secret.clone();
-        let err = rebuild(&conn, &mut vol, &secret, scratch.path())
-            .expect_err("without catalog.db ownership a lost tenant pair refuses the rebuild")
-            .to_string();
-        assert!(err.contains("could not be opened"), "{err}");
-        assert!(
-            err.contains("does not name which tenant owns each unit"),
-            "{err}"
-        );
-        assert!(err.contains("RESTORE.sh"), "{err}");
-        for (table, n) in row_counts(&conn) {
-            assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
-        }
-    }
-}
-
 /// The operator envelope is the one a rebuild cannot do without: lose both
-/// of its copies and the rebuild refuses, whatever generation, and says so
+/// of its copies and the rebuild refuses, and says so
 /// in the words it always has.
 #[test]
 fn a_lost_operator_pair_still_refuses_the_rebuild() {
@@ -6847,7 +6676,7 @@ fn two_stage_sets_of_one_unit_on_one_tape_keep_their_own_receipts() {
 /// escrow key was given.
 #[test]
 fn a_unit_renamed_since_the_tape_was_written_is_attested() {
-    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let mut vol = build_sealed_volume_without_receipts();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     register_escrow(&conn, &vol.escrow_public);
