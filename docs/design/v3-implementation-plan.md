@@ -2,10 +2,12 @@
 
 This is the build plan for tapectl 2.0.0, written for implementing agents that were **not**
 part of the design sessions (ADR-0012 item 279: "write up all plans in detail for worker LLM
-to implement in stages"). The design is ruled in ADR-0012 items 235 to 279. A worker's job is
+to implement in stages"). The design is ruled in ADR-0012 items 235 to 289. A worker's job is
 execution. It is never redesign.
 
-**Status, 2026-11-16: no go has been given. Nothing in this plan is built.** The plan is a
+**Status, 2026-11-17: no go has been given. Nothing in this plan is built.** Items 282 to
+289 (slices that end at a member's start, each compressed alone; every unit continuing at
+the early warning) were ruled that day and are carried below. The plan is a
 document. A stage starts when its "Starts when" line is true, and every stage but Stage 0's
 container measurements needs the CTO's go first.
 
@@ -14,7 +16,7 @@ with the same numbers:
 
 | Stage | What | Lands on | Owner | Worker-ready as written? |
 |---|---|---|---|---|
-| 0 | Measure before any code | no code; a dated note | worker, operator | yes (T0.1, T0.2, T0.5, T0.6, and T0.3's second leg); T0.3's first leg and T0.4 need the operator |
+| 0 | Measure before any code | no code; a dated note | worker, operator | yes (T0.1, T0.2, T0.5, T0.6, T0.7, and T0.3's second leg); T0.3's first leg and T0.4 need the operator |
 | 1 | The normative set: the Layout 3 format document and its companions | `master` (documents) | **coordinator** | no: it is written by the coordinator, and §S1 lists what it must decide |
 | 2 | Fifteen fixes that depend on nothing else | `master` | workers, three at a time | yes, on the go |
 | 3 | Compatibility out | `layout-3` | workers | yes, on the go and after Stage 2; T3.1 also needs the CTO to have seen D9 (how a 2.x catalog is known) |
@@ -47,7 +49,7 @@ contradict each other on purpose.
 |---|---|---|
 | 2 | Layout 2 | `docs/design/volume-format-v2.md`, `docs/design/layout-session.md`, `docs/design-errata.md`, ADR-0001 to ADR-0012 |
 | 3 | Layout 2, minus compatibility | the same, with ADR-0012 item 258 |
-| 4, 5 | Layout 3 | `docs/design/volume-format-v3.md` and the session document as Stage 1 leaves them, then ADR-0012 items 239 to 279. `volume-format-v2.md` is history there: never implement against it |
+| 4, 5 | Layout 3 | `docs/design/volume-format-v3.md` and the session document as Stage 1 leaves them, then ADR-0012 items 239 to 289. `volume-format-v2.md` is history there: never implement against it |
 
 **Authority when texts disagree:** the format document for the stage, then the session
 document, then ADR-0012's items (a later item amends an earlier one), then this plan. If two
@@ -153,8 +155,11 @@ The first three are Layout 2's and are carried unchanged. The rest are Layout 3'
 3. **No plaintext file on tape carries a tenant or unit name, a file name, a plaintext hash,
    a key fingerprint, or a user or group id or name.** The leak-scan's needles are never
    weakened; the id map adds needles.
-4. **No reader zero-fills a lost slice, and none passes `--ignore-zeros`** (item 264). Readers
-   feed tar whole members, by byte range from the file table, joined at member boundaries.
+4. **No reader zero-fills a lost slice, and none passes `--ignore-zeros`** (item 264). A
+   slice holds whole members (item 283, rule 13), so a reader leaves a bad slice out and
+   gives tar the good ones, joined in order; a long member with a bad piece in its run is
+   left out, or removed again if tar had begun it. tapectl's own reader also feeds members by byte range inside a slice, to check
+   each one as it is fed and to read around a bad chunk (item 101).
 5. **No user or group name is in the stream, and no file's ACL is lost from it** (items 270,
    273, 274). tapectl's own check of the stream as it passes is the proof. The tar version is
    only the early refusal.
@@ -172,14 +177,17 @@ The first three are Layout 2's and are carried unchanged. The rest are Layout 3'
    feature hard to carry stops and reports.
 10. **The standard is not lowered to an old tool on the host that writes** (item 273). The
     heir's readers stay wide: the heir's script and File 1 are held to old and small tools.
-11. **Compression never reaches past its own piece, and it comes after every check** (item
-    280). The stream is never compressed as one whole: a lost slice costs only what lies in
-    and beside it. Every check of the stream (members, hashes, names, ACLs) is made before
-    compression, and a member's offsets in the file table are of the tar stream. Which piece
-    is compressed alone, a slice or a frame of members, is D15's question 41.
+11. **Compression never reaches past its own slice, and it comes after every check** (items
+    280, 284). Each slice is compressed alone, after the cut and before it is encrypted, so
+    a lost slice costs only the files in it. Every check of the stream (members, hashes,
+    names, ACLs) is made before compression, and a member's offsets in the file table are
+    of the tar stream.
 12. **Nothing is argued from what the present collection holds** (item 281). A task that
     finds a feature costly does not answer "the data does not need it". It stops and
     reports.
+13. **A slice begins at a member's start, or it continues exactly one member that is larger
+    than `slice_size`** (item 283). No slice begins anywhere else, and the slices joined in
+    order are the stream, byte for byte.
 
 ## 6. Commands
 
@@ -208,7 +216,7 @@ in the report. It is never a number to refresh without the coordinator's word.
 
 Item 253 was ratified with measurements owed, "and a failure reopens it". Three are done
 (GNU tar 1.30 and 1.35 as writers, bsdtar as a reader, one 96 GiB member through 96 pieces;
-`docs/research/2026-11-16-layout-3-before-the-build.md`). Four are owed. Each is a gate, and
+`docs/research/2026-11-16-layout-3-before-the-build.md`). The rest are owed. Each is a gate, and
 the table says what it holds back.
 
 | Task | Gates | Owner |
@@ -218,7 +226,8 @@ the table says what it holds back.
 | T0.3 Real scale, in two legs | Stage 4 (item 253's own condition) | first leg: coordinator, on the operator's go-ahead; second leg: worker |
 | T0.4 The escrow paper | Stage 7 (item 244) | operator |
 | T0.5 The decompressors on a slice compressed alone | Stage 1 (the format's section on compression), T4.5 | worker |
-| T0.6 The compression libraries in the static build | shape B of D15 (question 41) and question 39; T4.5 | worker |
+| T0.6 The compression libraries in the static build | item 286 (tapectl itself compresses); T4.5 | worker |
+| T0.7 The readers on a slice that ends at a member's start | Stage 1 (item 283 was ratified with this owed); T4.10 | worker |
 
 A Stage 0 task changes nothing under `src/`, `tests/` or `scripts/`. Its product is a dated
 note under `docs/research/`, which the coordinator lands, and a comment on the issue.
@@ -351,28 +360,24 @@ mints a new escrow identity. Gates Stage 7 only.
 
 **Owner:** worker. **Depends:** nothing. **Carries out:** item 280; #565's third criterion.
 It measures **all seven** algorithms dar offered (gzip, bzip2, lzo, xz, lzma, zstd, lz4), so
-that question 38 is ruled, or its ruling checked, on real data and not on the first check's
-random words. **Read:** #565, whole, and its first comment (the method and
+that item 285 (gzip, xz and zstd are carried) is confirmed or reopened on real data and not
+on the first check's random words. **Read:** #565, whole, and its first comment (the method and
 the script of the first check).
 
 **Goal:** what was measured on 2026-11-16 used this host's tools only. Before the format
 document states compression, measure the readers an heir may have.
 
 **Steps:**
-1. Make the stream and the cut as #565's script does, with the writer's flags, on a tree
+1. Make the stream as #565's script does, with the writer's flags, and cut it at member
+   starts (item 283; `aligned.py` on #567 has the rule), on a tree
    that also holds real data of several kinds (text, source code, a database dump, images
    that do not shrink). Record where the data came from; use nothing private.
 2. For each of the seven, with its own tool, at the tool's default level and at its
-   highest, make both shapes of D15: each slice compressed alone (A), and the stream in
-   frames that begin at member boundaries, joined and then cut (B; #565's second script is
-   the model). Encrypt each slice with the real `age`.
-   For B, **sweep the frame size** (1, 4, 16 and 64 MiB of the tar stream): the frame sets
-   both what a lost slice costs and how well the data packs, and neither is measured on
-   real data.
+   highest, compress each slice alone (item 284) and encrypt it with the real `age`.
 3. Read back with each reader: the newest tools on this host; Debian 10's (`debian:10-slim`:
    zstd 1.3.8, xz 5.2.4, gzip 1.9); BusyBox (`busybox` image) where it has the applet. For
    each: every slice decoded alone gives the cut; one file is restored from only its
-   slices; a member across two slices is restored.
+   slice; a file larger than a slice is restored from its run.
 4. Damage, with real `age` in the pipeline: flip one byte of a slice's ciphertext in its
    first, middle and last 64 KiB chunk. Record what `age -d` writes and how it exits, what
    the decompressor after it writes and how it exits, and which members come out whole.
@@ -384,9 +389,6 @@ document states compression, measure the readers an heir may have.
 7. For each algorithm, which readers exist: its own tool in Debian 10, in this host's
    release, and in BusyBox; whether a stock install of each has it without a package
    being added.
-   For shape B's two cuts (`tail -c +N | head -c M` before and after the decoder): GNU,
-   BusyBox and uutils `head` and `tail` (the `tapectl-u26` container has uutils; run it as
-   uid 1000). Only GNU and BusyBox are measured so far.
 8. The positive control, required: a slice stored with no compression goes through the
    same harness and every row passes. If it does not, the harness is wrong.
 
@@ -394,9 +396,9 @@ document states compression, measure the readers an heir may have.
 - Tell the broker before a pull; `--log-driver none`; nothing on a container's standard
   output; remove each image when done.
 - A decompressor's exit status is recorded, never trusted. Compare bytes.
-- If question 39 is ruled for tapectl compressing in-process, a frame made by the library
-  is not yet at hand here. Say so in the note: T4.5's tests and T4.16's gate legs prove
-  library-made frames against the real tools.
+- tapectl compresses in-process (item 286), and a slice packed by the library is not yet
+  at hand here. Say so in the note: T4.5's tests and T4.16's gate legs prove library-made
+  slices against the real tools.
 
 **Done when:** a note holds the tables (reader × algorithm), the damage rows, the growth
 bound, and size and speed by kind of data, with the method so it can be repeated; #565 has
@@ -404,26 +406,26 @@ a comment.
 
 ### T0.6 The compression libraries in the static build
 
-**Owner:** worker. **Depends:** nothing. **Carries out:** #565; question 39's
-recommendation rests on it. **Read:** `.github/workflows/release.yml` (how the static musl
+**Owner:** worker. **Depends:** nothing. **Carries out:** #565; item 286 rests on it. **Read:** `.github/workflows/release.yml` (how the static musl
 binary is built); `Cargo.toml`.
 
-**Goal:** shape B of D15 has tapectl compress in-process, because a frame ends where the
-stream reader sees a member end. That adds a library for each algorithm to a binary that is
-built static for musl, and none has been tried there. Try it outside tapectl's tree. **If
-it fails, shape B falls back to one process of the host's tool for each frame**, which is a
-second writer's tool under items 273 and 274: say so plainly in the note.
+**Goal:** item 286 has tapectl compress in-process. That adds a library for each algorithm
+carried to a binary that is built static for musl, and none has been tried there. Try it
+outside tapectl's tree. **If it fails, the fallback is one process of the host's tool for
+each slice**, which is a second writer's tool under items 273 and 274 and goes to the CTO
+before anything is built on it: say so plainly in the note.
 
 **Steps:**
 1. In a new, empty crate under `/scratch` (never in the repo), depend on one maintained
-   library for each of the seven algorithms. Record each crate, its version, its licence,
+   library for each of gzip, xz and zstd (item 285; if T0.5 reopens that item, the others
+   are tried then). Record each crate, its version, its licence,
    whether it builds C source, and its last release date.
 2. Build it in **debug** for `x86_64-unknown-linux-musl`, the way `release.yml` sets the
    target up. Record what had to be installed and every failure.
 3. Its one program compresses a file as one frame for each algorithm and decompresses it
-   again. For each: the frame is read by the algorithm's own tool on this host, and a frame
-   made by the tool is read by the program. Then the same with several frames joined: the
-   tool decodes the joined frames in one call, and from the second frame alone.
+   again, at the level D15 proposes as the algorithm's default and at one other (item
+   287). For each: the frame is read by the algorithm's own tool on this host, and a frame
+   made by the tool is read by the program.
 4. `ldd` on the binary says it is static. Record its size with and without each library.
 5. Run `cargo audit` on the crate's lock file and record the result.
 
@@ -434,6 +436,54 @@ second writer's tool under items 273 and 274: say so plainly in the note.
 
 **Done when:** a note holds the table (algorithm, crate, builds static or not, tool reads
 library frame, library reads tool frame, size added); #565 has a comment.
+
+### T0.7 The readers on a slice that ends at a member's start
+
+**Owner:** worker. **Depends:** nothing. **Carries out:** item 283's owed measurement; #567.
+**Read:** #567, whole, and its first comment (the script `aligned.py` and its output).
+
+**Goal:** item 283 was measured with GNU tar 1.35 and BusyBox tar 1.36.1 only. Before the
+format document states the cut, measure the other readers an heir may have, on a slice that
+carries no end-of-archive blocks.
+
+**Steps:**
+1. Make the unit and the cut as #567's script does, with the writer's command line (D2)
+   and `slice_size` 1 MiB. Add to its tree: a name over 255 bytes, a name with a newline in
+   it, a FIFO, and a folder with a default ACL entry.
+2. The readers: GNU tar 1.30 (`debian:10-slim`), 1.34 (`debian:12-slim`) and 1.35 (this
+   host); bsdtar (what `debian:12-slim` installs as `libarchive-tools`; record its
+   version); BusyBox tar (the `busybox` image).
+3. For each reader, with no file table, told only which slices are one long member's run:
+   - (a) each slice (a run joined) in its own run of the reader, in order, into one
+     directory;
+   - (b) the good slices joined in order in **one** run, with the fullest slice left out;
+   - (c) the last slice alone (it carries tar's end-of-archive blocks) and the one before
+     it alone (it carries none);
+   - (d) one long member's run, joined, alone;
+   - (e) one member named to the reader out of a slice of many, by its name as the file
+     table spells it: an ordinary name, the name with a newline, and a folder's own member
+     without what is under it.
+4. Record for each: the exit status, every warning, the files whole by sha256, and where
+   the reader restores them the hard link, the xattrs, the ACLs and the folders' mtimes.
+5. The controls, both required. Positive: the whole stream read by GNU tar 1.35 restores
+   every file. Negative: a plain cut at 1 MiB, read as in (a) by GNU tar 1.35, fails every
+   run, as #567 measured. If either control does not hold, the harness is wrong and
+   nothing else in the table counts.
+
+**Decision rule, fixed before the measurement:** item 283 stands if GNU tar 1.30 and bsdtar
+each exit 0 in (a) to (d) and restore every file outside a left-out slice. BusyBox tar is
+held to content only (rule 10). If GNU tar 1.30 or bsdtar fails one of these, report the
+table and stop: item 283 goes back to the CTO. Step (e) decides only how the heir's script
+restores one path (D10): by naming the member, or by cutting it out by its offsets.
+
+**Traps:**
+- Tell the broker before a pull; `--log-driver none`; nothing on a container's standard
+  output; remove each image when done and say so. Never install a package on the host.
+- A reader's warning about a missing end of archive is recorded, never hidden.
+- Run the readers as an ordinary user and as root: xattrs and ACLs differ.
+
+**Done when:** the table (reader x case) is in a note under `docs/research/`, with the
+method so it can be repeated and the decision rule's verdict stated; #567 has a comment.
 ---
 
 ## S1. Stage 1: the normative set (no code)
@@ -447,10 +497,10 @@ keeps saying that the code writes Layout 2.
 
 | Task | Product |
 |---|---|
-| T1.1 | `docs/design/volume-format-v3.md`: the byte format, whole and standing alone. Zone order; File 0; File 1; the front index; the envelopes and what each carries; the data zone (the stream, the cut, the slice); the file table's and the id map's grammar; the seal, full and short; the writer at the early warning (W1 to W9, carried word for word from `volume-format-v2.md` §4.3); a range and spanning (§4.4's writer half carried, its reader half rewritten by items 255, 260, 264, 266, 267); a tape of another layout; the heir path end to end, with the script's modes; "self-describing: what that promises". It carries every rule of #562. |
+| T1.1 | `docs/design/volume-format-v3.md`: the byte format, whole and standing alone. Zone order; File 0; File 1; the front index; the envelopes and what each carries; the data zone (the stream, the cut, the slice); the file table's and the id map's grammar; the seal, full and short; the writer at the early warning (W1 to W9, carried word for word from `volume-format-v2.md` §4.3); what follows the warning (§4.2 rewritten by item 288: no unit is `cut`); a range and every unit continuing (§4.4 rewritten: the writer's half by items 288 and 289, the reader's by items 255, 260, 264, 266, 267 and 283); a tape of another layout; the heir path end to end, with the script's modes; "self-describing: what that promises". It carries every rule of #562. |
 | T1.2 | `docs/design/layout-session.md`, amended for Layout 3: the staging's products (the file table is one, and a write refuses a unit without it), contact with a tape of another layout, "where a restore starts". |
-| T1.3 | `CONTEXT.md`: the terms *stream*, *member*, *file table*, *id map*, *the writer's floor*; *slice* redefined as a plain cut; dar's terms struck. The id map is never called "ownership", which means the tenant that owns a unit. |
-| T1.4 | ADR-0013, which gathers items 239 to 279 into one decision record for Layout 3, so that a reader does not need ADR-0012's amendments in order. ADR-0012 is not edited. |
+| T1.3 | `CONTEXT.md`: the terms *stream*, *member*, *file table*, *id map*, *the writer's floor*; *slice* redefined (whole members, item 283) and *run* added (a long member's slices); `cut` and the opt-in to spanning struck (items 288, 289); dar's terms struck. The id map is never called "ownership", which means the tenant that owns a unit. |
+| T1.4 | ADR-0013, which gathers items 239 to 289 into one decision record for Layout 3, so that a reader does not need ADR-0012's amendments in order. ADR-0012 is not edited. |
 | T1.5 | The baseline schema as a reviewed listing in the format document's appendix: every table and column of the 1.9.2 schema that is kept, the ones that go, and the new ones (D9). The SQL itself is T3.1's. |
 | T1.6 | `.claude/commands/worktree-agent.md`: guardrail 3 names the normative set by stage (this plan's section 1) in place of the Layout 2 set. `docs/design-errata.md`: `volume-format-v2.md` is superseded for Layout 3. |
 | T1.7 | This plan: every "Stage 1 decides" marker in Stages 4 and 5 replaced by the section of the format document that decides it. |
@@ -459,13 +509,16 @@ keeps saying that the code writes Layout 2.
 
 No ADR item fixes these at the level of bytes, schema or command line. Each is a proposal.
 **None is built on until the CTO has seen the list** (item 279's last reading). A worker that
-meets one of these still marked as a proposal stops.
+meets one of these still marked as a proposal stops. The list was rewritten on 2026-11-17
+after items 282 to 289: D1, D3, D4, D6, D9, D10, D11 and D15 changed, and D19 to D22 are
+new.
 
 **D1. The layout's identity.** `layout_version = 3`. The magic becomes `tapectl-volume-v3`
 in File 0, and the front index's and the seal marker's own magics move with it (#562: a
-Layout 3 File 0 carries nothing a Layout 2 script could follow). `requires` is empty on a
-plain tape and `["spanning"]` on a tape whose plan holds a slice of a spannable staging
-(item 258(a)). `short-seal` is no entry: the short seal is part of Layout 3.
+Layout 3 File 0 carries nothing a Layout 2 script could follow). `requires` is empty on
+every Layout 3 tape: the short seal and a unit that continues on another cartridge are
+both part of Layout 3 (items 258(a), 288, which superseded the `spanning` entry). The key
+stays, so that a later feature can fence an older reader.
 
 **D2. The stream.** One pax stream for each staging. The writer's command line is fixed in
 the format document, flag by flag, from the commands #555 and the research note measured:
@@ -484,22 +537,24 @@ the format document, flag by flag, from the commands #555 and the research note 
   `--files-from`: tar takes it in order, and after the list it reads the names against the
   wrong directory and exits 2 (measured)
 
-**D3. The cut, and what each size means.** A slice is `slice_size` bytes of the stream, and
-the last slice is what remains. `slice_size` is a multiple of 512. With compression (D15)
-what a slice's sizes mean depends on question 41. **Under shape B** nothing
-changes: the stored stream is cut, every slice but the last is `slice_size`, and
-`size_bytes` and `sha256_plain` are of the bytes that are encrypted, as today. **Under shape
-A** the order is cut, compress, encrypt: `size_bytes` and `sha256_plain` are of the cut
-before compression, a slice's size on tape varies, and the format states a worst case for
-each algorithm that the early warning's rules and `post_warning_bytes` are held to. In both,
-`encrypted_bytes` and `sha256_encrypted` are of the tape file.
+**D3. The cut, and what each size means** (items 283, 284). The cutter works at member
+starts. The stream reader gives it each member's start and whole length (its extension
+headers, its header and its padded data) before any of the member's bytes:
 
-*Asked on 2026-11-16 and not ruled (#567, question 43):* that a slice end at a member's
-start (whole members, as many as fit in `slice_size`; a member larger than a slice gets a
-run of slices to itself), so that each slice is an archive any tar reads alone. If it is
-ruled, this paragraph is rewritten, shape A follows for D15, and the file table states
-each member's slice. Question 44 there (every unit continues at the early warning) would
-change T5.1's policy and not W1 to W9.
+- a member that fits in what is left of the slice goes into it;
+- a member that does not fit, and is no larger than `slice_size`, ends the slice before it
+  and begins the next;
+- a member larger than `slice_size` ends the slice before it and is cut at every
+  `slice_size` bytes, its last piece ending where the member ends. Those slices are its
+  *run*, and the member after it begins a new slice;
+- the stream's tail (tar's end-of-archive blocks and its padding) is placed as a member
+  is.
+
+`slice_size` is the most a slice's cut holds, and is a multiple of 512. `size_bytes` and
+`sha256_plain` are of the cut, before compression. `encrypted_bytes` and `sha256_encrypted`
+are of the tape file. A compressed slice can be larger on tape than its cut: the format
+states the worst growth for each algorithm, and the early warning's rules and
+`post_warning_bytes` are held to `slice_size` plus that growth.
 
 **D4. The file table's text** (items 254, 264; #562). One file for each staging the tape
 holds, in that tenant's envelope, at `tables/<staging>.tsv`, named as `catalogs/` names a
@@ -509,11 +564,14 @@ after a header:
 ```
 #tapectl-file-table 1
 #stream_bytes <length of the stream>
-<kind> <start> <end> <size> <sha256> <path> [<link target>]
+<kind> <slice> <start> <end> <size> <sha256> <path> [<link target>]
 ```
 
 - `kind`: `f` file, `d` folder, `l` symbolic link, `h` hard link, `p` FIFO, `c` and `b`
   device nodes.
+- `slice`: the number of the slice in which the member begins (item 283). A member larger
+  than `slice_size` also holds the slices after it, as many as its length needs (D3). A
+  slice's own offset in the stream is the `start` of the first member that begins in it.
 - `start`: the offset in the stream of the member's first extension header. `end`: the
   offset just past the member's last padded block. A row's `start` is the row before's
   `end`; the first is 0.
@@ -535,7 +593,9 @@ table's and the id map's names in the envelope, the writer's `tar --version` lin
 reader's diagnosis only), and `compression`, which names the algorithm and is stated only
 when the staging is compressed (D15). Kept: the unit, version and tenant facts, the slice
 list with each slice's size and plaintext hash (of the cut, D3), its size on tape, its
-ciphertext sha256 and its tape position, `may_span`.
+ciphertext sha256 and its tape position. `may_span` goes (item 288): a tape that holds only
+some of a staging's slices is known by the positions the block gives and by the seal. How
+a long member's run is marked is D22.
 
 **D7. The on-tape `catalog.db`.** One generation. It carries, for each staging on the tape,
 the file table and the id map as the catalog database holds them, so that a rebuild restores
@@ -547,11 +607,14 @@ tapes. `index/paths.tsv` states no sha256 for the unit dotfile (#562, #528).
 **D9. The baseline schema** (item 258(b)). One file, `src/db/migrations/001_baseline.sql`.
 A 2.x catalog is known by SQLite's `application_id`, set by the baseline. A database that
 has tables and lacks it is a 1.x catalog and is refused by name. Two new tables:
-`stage_files` (the file table: staging, sequence, kind, path, size, sha256, start, end, link
-target) and `stage_ids` (the id map: staging, kind, id, name or NULL). Both outlive the
+`stage_files` (the file table: staging, sequence, kind, slice, path, size, sha256, start,
+end, link target) and `stage_ids` (the id map: staging, kind, id, name or NULL). Both outlive the
 release of the staging's slices (item 265). **Until `v2.0.0` is tagged the baseline is
 edited in place; no migration 002 is written.** After the tag the baseline is frozen and
-changes are numbered migrations again.
+changes are numbered migrations again. Items 284 to 289 add `stage_sets.compression_level`
+beside `compression`, and take away `allow_spanning` (an archive set's and a unit's frozen
+copy), `writes.may_span` and the write status `cut`. Those three are in the baseline T3.1
+makes, because the code still reads them then, and T5.1 removes them with that code.
 
 **D10. The heir's script.** One file on tape, `RESTORE.sh`, and one file in the tree,
 `src/volume/heir/RESTORE.sh`, the same bytes on every tape: what differs between tapes is
@@ -569,9 +632,22 @@ keeps today's spellings where the mode stays:
 | `--where UNIT`, `--where --all`, `--find TEXT` | the index modes, as today |
 | `--work DIR`, `--no-space-check`, `--overwrite`, `--no-file-check` | as today; the work directory is made inside `--to` by default (item 271) and `--work` replaces `--scratch` |
 
-One prompt: the next cartridge of a span, where "I do not have it" is an answer (items 266,
-267). Gone: `--slices-from`, `--swap-tapes`, `--stream-tapes` (a stream is the only way),
-`--fill-from`, the salvage mode. After a restore it prints the damaged-file list, the id map
+**The reader's primitive** (item 283). Each slice is checked against the front index,
+decrypted into the work directory and, where its staging is compressed, decompressed and
+checked against its `size_bytes`, all before tar sees it. The good slices go, in order, to
+one tar run. A bad slice is left out and its members are listed from the file table. A
+long member's run (D22) is fed piece by piece, each piece checked first, so that no more
+than one slice is ever held: if a piece fails, that tar run is ended, the member's partial
+file is removed and the member is listed, and the next run starts at the slice after the
+run. This needs room for one slice in the work directory, and the space check counts it. One path is restored by reading the
+slice it is in and naming the member to tar, or by cutting the member out by its offsets:
+T0.7's step (e) decides which.
+
+A unit that continues on another cartridge (item 288) is restored tape by tape into the
+same `--to`, in any order, and the script says which cartridges hold the rest. One prompt
+remains: the next cartridge, asked only when a file larger than a slice lies across two
+cartridges, where "I do not have it" is an answer (items 266, 267). Gone: `--slices-from`,
+`--swap-tapes`, `--stream-tapes`, `--fill-from`, the salvage mode. After a restore it prints the damaged-file list, the id map
 of each unit restored, and which tar it used and what that tar does not restore.
 
 **D11. The command line and the config.**
@@ -582,12 +658,16 @@ of each unit restored, and which tar it used and what that tar does not restore.
   Today the first drops ACLs too and the second does nothing.
 - `[staging] hash_threads` goes: the hash is taken from the stream, by one reader.
 - `compression` stays, in `[defaults]`, an archive set and a unit's dotfile, with the values
-  question 38 leaves (D15); a value that goes is refused as an invalid value is today. The
-  check that asks the local dar which algorithms it was built with goes. If question 40 is
-  ruled so, `compression_level` joins it in the same three layers.
+  `none`, `gzip`, `xz` and `zstd` (item 285); any other value is refused as an invalid
+  value is today. The check that asks the local dar which algorithms it was built with
+  goes. `compression_level` joins it in the same three layers (item 287; D15 has the
+  levels).
+- `allow_spanning` goes from `[defaults]`, from an archive set (its `--allow-spanning`
+  flag too) and from a unit's dotfile (items 288, 289). It is then an unknown key, refused
+  as any unknown key is. T5.1 removes it.
 - `config check`, `init`, `setup` and `stage create` probe tar and name the floor.
-- `restore unit|file|volume` lose `--spool` and the scratch directory (a stream is the only
-  way, and a one-path restore reads byte ranges). They print the id map of what they
+- `restore unit|file|volume` lose `--spool` and the scratch directory (tar is fed from
+  memory, slice by slice, and a one-path restore reads only the slices it needs). They print the id map of what they
   restored, and `--json` carries it.
 - The names that say dar change: the JSON keys `dar_version`, `total_dar_size` and
   `dar_bytes` of `stage info` and `stage create` become `tar_version` and `stream_bytes`;
@@ -613,91 +693,31 @@ with that binary and written into File 1 and the guide (#564's fifth criterion).
 exact list, so the two matchers that disagreed become one. A snapshot records what each
 pattern left out, and reports it. `init` writes an empty list.
 
-**D15. Compression** (item 280: "made available optionally for select archives"). Ruled:
-it is carried, off by default, chosen by `[defaults]`, an archive set or a unit's dotfile
-as today (the three layers are the coordinator's reading of "select archives"). #565 holds
-the measurements. **Its shape is question 41, and T0.5, T0.6 and Stage 1 come before any
-task that builds it.**
+**D15. Compression** (items 280, 284 to 287; #565 holds the measurements and the history
+of the two shapes that were weighed). **Ruled:** it is carried, off by default, chosen by
+`[defaults]`, an archive set or a unit's dotfile as today; each slice is compressed alone,
+after the cut and before it is encrypted; the algorithms are gzip, xz and zstd; tapectl
+itself compresses, with a library for each; an archive may set `compression_level`. T0.5
+confirms the three algorithms on real data or reopens item 285. T0.6 tries the libraries
+in the static build; if one fails, the fallback (the host's tool for each slice) goes to
+the CTO before anything is built on it.
 
-*Two shapes meet items 241 and 264.* The amendment of 2026-11-16 (night) named only the
-first; that deduction was too narrow, and the correction is owed to the next amendment.
+Still proposals:
 
-- **A. Each slice compressed alone.** Cut, compress, encrypt.
-- **B. The stream stored in frames, then cut as today.** The tar stream is compressed in
-  frames. A frame begins at a member's start. A member larger than a frame continues in
-  frames of its own, and the frame that holds its end closes there, so that no other member
-  begins in a frame that did not begin at a member's start. The frames, joined, are the
-  **stored stream**; it is cut into slices of `slice_size` and encrypted exactly as an
-  uncompressed stream is. The file table gains one column, `at`: where in the stored stream
-  the frame begins in which the member begins. A reader takes the stored bytes from `at` to
-  the first later frame that begins at or after the member's end, decodes them, and cuts
-  the member out by its offsets in the tar stream. A unit that is not compressed is the same
-  thing, with the tar stream as its own stored stream and no `at` column.
-
-| | A | B |
-|---|---|---|
-| Item 240's slice rules (W1 to W9, the short seal, ranges, spanning, resume, the retry, replacement by sha256, the capacity plan) | hold as written: each is defined on a slice's number, position and hash, and none on equal sizes. A slice's size on tape varies, and the format states a worst case for each algorithm | hold as written; slices stay equal |
-| A lost slice costs | the files with bytes in it | the frames with bytes in it: those files and their neighbours in each edge frame (**a widening of item 264's limit**) |
-| One slice alone, through `age` and the decompressor (measured, #565) | exactly its plain cut, so a compressed unit reads as an uncompressed one does, with any reader and any tar | nothing: it begins inside a frame |
-| A unit with a slice lost, through `age` and the decompressor (measured, #565) | exactly every other slice's plain cut | the bytes before the gap; the decompressor starts again only from the file table's `at` |
-| A bad 64 KiB chunk costs tapectl's own reader (the heir's `age` loses the slice in either shape, item 101) | everything to the slice's end (**a widening of item 101(b)**, repaired by slice replacement) | its frame |
-| One path | its slices, each decoded from its start | the slices its frame is in; one frame decoded |
-| The file table | as D4 | one more column |
-| Seen with no key | how well each slice shrank. On-tape sizes are permitted in plaintext (`volume-format-v2.md` §2), and the size channel was accepted on 2026-07-22 with compression off | nothing new |
-| Who compresses | tapectl or a host tool | tapectl (a frame ends where the stream reader sees a member end) |
-| Algorithms | any | those whose frames join and whose tool starts at any frame: zstd, xz, gzip, bzip2 measured; lz4 not measured; `lzo` and `lzma` cannot |
-
-Measured for B with a reader that was given only the table's text and the slices (#565):
-zstd, xz, gzip and bzip2 restore the whole unit through one decoder call, one small file
-from one slice of fifteen, a file over three frames, and every file outside a lost slice;
-BusyBox decodes xz, gzip and bzip2 and its `head` and `tail` make the cuts. The widening,
-MEASURED for zstd, xz and gzip: 94 to 139 small files more than the lost span itself held,
-about one frame (bzip2's count shows none only because its decoder's output comes in large
-blocks, so the span's edge could not be placed). REASONED, not measured: with a 16 MiB
-frame and a 1 GiB slice the two edge frames are about 3% of what the slice held.
-
-*What was hashed is not what goes to tape, in either shape.* Item 253 takes each file's
-sha256 "from the bytes that go to tape". With compression the bytes are packed after the
-hash, and nothing at staging would show that they unpack to what was hashed. So, proposed
-for both shapes: **staging decodes every frame (or slice) it has just packed and compares
-it with what it packed, before the bytes go on**, and a difference refuses the staging.
-That is a check made in every staging, not a test. Without it, item 253's sentence would
-have to be reworded for a compressed unit.
-
-**The questions are the CTO's** (#565; #554):
-
-- *Question 41, the shape.* Recommended: **A** (revised 2026-11-16 after the CTO's "I'm
-  skeptical that b is better than a"; first recorded as B, on this table's first row,
-  which did not hold when checked: no rule of item 240 depends on equal slices). Under A
-  a slice decodes alone to its plain cut, so a compressed unit reads exactly as an
-  uncompressed one does, and item 264's limit stands as it reads. Under B the
-  decompressor is a stage that needs the file table to pass a gap. B's advantage is that
-  nothing new shows without a key.
-  The re-weighing and its measurement are a comment on #565.
-- *Question 38, which algorithms.* Each one carried costs the same things whatever the
-  data: a decompressor an heir may have to find, a gate leg, readers to measure, a library
-  in the build. Recommended, on that cost alone: `gzip`, `xz` and `zstd`. T0.5 measures
-  every candidate on real data, and its table confirms the ruling or reopens it.
-- *Question 39, who compresses.* Under B, tapectl itself. **Not yet tried:** a library for
-  each algorithm in the static musl build (T0.6). Under A the choice is open: recommended
-  tapectl itself, with a host tool for each slice as the fallback if a library fails there.
-- *Question 40, a level.* Recommended: an optional `compression_level` beside
-  `compression`, in the same three layers, with a stated default for each algorithm.
-
-**Stage 4's tasks below are written for shape A**, the first one recorded. If question 41
-is ruled B, T1.7 rewrites them with these deltas, and nothing else in them changes:
-
-- T4.2: the stream reader reports each member's end to the compressor as it passes.
-- T4.3: `stage_files` and the table's text gain `at`; the header states the stored
-  stream's length; `filetable::ranges` works in stored offsets, with the tar-stream offsets
-  for the cut after decoding; `held_whole` is "every slice of the member's stored range".
-- T4.5: the compressor sits **between the stream reader and the cutter** and ends a frame
-  by the frame rule; the cutter and everything after it are as for an uncompressed unit.
-- T4.6: the MANIFEST's block states `compression`; no slice field changes.
-- T4.8 and the heir's script: a run of members is a stored range that begins at a frame;
-  a bad chunk or a lost slice costs the frames it touches, and the next run starts at the
-  first frame after it.
-- T5.7: the same proofs, and one more: a reader given only what the tape carries.
+- **The frame.** One complete stream of the algorithm for each slice, as the algorithm's
+  own tool writes and reads it: a gzip member, an xz stream, a zstd frame. tapectl adds
+  nothing around it, so `age -d`, then the tool, gives the cut.
+- **The levels.** `compression_level` is a whole number in the algorithm's own range. When
+  it is not set the algorithm's own default applies (gzip 6, xz 6, zstd 3). A level
+  outside the range is refused, naming the key. The level is recorded with the staging
+  and no reader needs it.
+- **The worst growth** of each algorithm, stated in the format document from T0.5's bound.
+  D3 holds the early warning's rules to `slice_size` plus it.
+- **The check at staging.** Item 253 takes each file's sha256 "from the bytes that go to
+  tape", and with compression the bytes are packed after the hash. So staging decodes
+  every slice it has just packed and compares it with the cut before the bytes go on, and
+  a difference refuses the staging. That is a check made in every staging, not a test.
+  Without it, item 253's sentence would have to be reworded for a compressed unit.
 
 **D16. tapectl's own check after a restore.** Today tapectl's restore hashes restored files
 only after damage; the heir's script hashes every file every time. For Layout 3: tapectl
@@ -715,6 +735,36 @@ go on across them as today.
 event: when, which volume, which script and tar. `audit` gains a check that warns when no
 drill is recorded or the newest is older than `[defaults] drill_interval_days`, 365 when
 absent. The spelling and the key's name are the proposal.
+
+**D19. The queue, and what a batch is** (item 289). `collection run` takes units in the
+collection's order and skips none. Units are added while the plan's end is at or below
+the cartridge's nominal capacity. The unit that carries the plan past it is the batch's
+last, and it is planned whole. A batch is still bounded by the staging area (item 85): if
+the staging area ends the batch first, the tape ends by its plan, with room left. The
+next-fit skip over a unit that does not fit, the two classes and `after_the_tail` go.
+
+**D20. The one plan bound** (item 289). On a drive that declares `post_warning_bytes` a
+plan lists slices in order to the end of the unit that passes the cartridge's nominal
+capacity, and the early warning ends the tape. On a drive without the key the plan stops
+at the last slice that fits under the fill ceiling, the tape is sealed in full there, and
+the slices after it continue on the next cartridge. An early warning before the plan's
+end seals short in both cases. A slice the tape did not take has no written position: it
+is never a copy and is never counted.
+
+**D21. A range in `volume rewrite` and in compaction** (item 133 is superseded by item
+288, and its design was owed). A rewrite or a compaction carries a volume's live slices as
+they are: the same slices of the same staging, by ciphertext, in slice order. The new
+volume's block for that staging lists every slice of it and gives positions to the ones
+this volume holds, exactly as a range written from staging does. Whether a slice is live
+is its version's state, as for a whole unit. `volume rewrite`'s typed consent names every
+version of which the volume is the only holder of some slice, and its hold stays until
+the new volume reads back.
+
+**D22. A long member's run on tape** (item 283). In the MANIFEST's slice list, a slice that
+continues a member begun in the slice before it states `continues = true`. A slice without
+it begins at a member's start. A reader joins a slice with the `continues` slices that
+follow it before tar sees any of them, and when one of them is lost the member is lost and
+listed. No plaintext file says which slices are a run.
 ---
 
 ## S2. Stage 2: fifteen fixes that depend on nothing else
@@ -722,7 +772,9 @@ absent. The spelling and the key's name are the proposal.
 **Starts when:** the CTO gives the go. **Lands on:** `master`. **Normative:** the Layout 2
 set. No task here changes a byte a tape carries, the schema, or a file under `scripts/`.
 (Earlier texts say "sixteen fixes". The count is fifteen: #527, #529, #530, #531, #533,
-#534, #535, #536, #537, #538, #539, #540, #541, #544, #546.)
+#534, #535, #536, #537, #538, #539, #540, #541, #544, #546.) Checked on 2026-11-17 against
+items 288 and 289: none of the fifteen is a fix to code those items remove (the `cut`
+unit, the opt-in, the plan's two classes), so the stage stands as written.
 
 **The issue is the specification.** Each issue's body states the defect, the cited lines and
 the acceptance criteria. This plan adds what the issue cannot know: who owns which file, the
@@ -1175,7 +1227,7 @@ what the coordinator must run (`first-run.sh`'s rehearsal on mhvtl) to prove it.
 
 ## S4. Stage 4: the data path on the tar payload
 
-**Starts when:** Stage 1's documents are landed, the CTO has seen D1 to D18, Stage 3 is on
+**Starts when:** Stage 1's documents are landed, the CTO has seen D1 to D22, Stage 3 is on
 `layout-3`, and T0.3 has passed or the CTO has moved it. **Lands on:** `layout-3`.
 **Normative:** `docs/design/volume-format-v3.md` and the session document as Stage 1 leaves
 them. Where a task below says "Stage 1 decides", the format document's section is the
@@ -1217,7 +1269,7 @@ is integrated):
 3. Add `acl` (for `setfacl` and `getfacl`) to what `.github/workflows/ci.yml` installs, and
    to `tests/test_dependencies.rs`'s named requirements, beside dar for now.
 4. Confirm the runner's tar meets the floor: `tar --version` in a CI step, kept as a step.
-5. Add the decompressor of each algorithm question 38 carries to what `ci.yml` installs and
+5. Add the decompressor of each algorithm carried (item 285: gzip, xz, zstd) to what `ci.yml` installs and
    to `tests/test_dependencies.rs`'s named requirements: T4.5's and T4.8's tests read
    library-made frames back with the real tools.
 
@@ -1280,7 +1332,8 @@ report gives the probe's output on this host.
 ### T4.2 The stream reader: members, hashes, ids, and the stream's checks
 
 **Owner:** worker. **Depends:** T4.1. **Carries out:** items 253, 254, 256, 270, 272, 274,
-277; #562 "The stream reader"; #563's stream check; D12; invariants 5 and 7.
+277, 283 (the cutter's input); #562 "The stream reader"; #563's stream check; D3, D12;
+invariants 5, 7 and 13.
 **Read:** the format document on the stream and the file table; the research note
 (`docs/research/2026-11-16-layout-3-before-the-build.md`) §5 and §6; #563's tables.
 
@@ -1310,6 +1363,10 @@ extension header.
    and the second as a link member with none. That is accepted when the link's target is a
    path listed earlier, and the row is kind `h` with the target's sha256 and the target's
    path.
+7. **For the cutter** (D3, rule 13). Before any byte of a member passes on, the reader
+   gives the member's `start` and its whole length: its extension headers, its header and
+   its padded data. It therefore holds a member's header blocks back until the member's
+   own header is read, and nothing more. The stream's tail is announced the same way.
 
 **Traps:**
 - A member's own header alone loses a long name, a nanosecond time and a size over 8 GiB.
@@ -1325,7 +1382,8 @@ extension header.
 (over 100 and over 255 bytes), a nanosecond time, a symbolic link, a hard link pair, a FIFO,
 an empty folder, a file with an ACL (`setfacl`), a file with a `user.` attribute. For every
 stream: each row's `start` is the row before's `end`; the rows' ranges are the stream less
-its tail; each sha256 equals `sha256sum` of the file. The refusals, each from a real tar run
+its tail; each sha256 equals `sha256sum` of the file; each member's announced length is
+its row's `end` less its `start`, and is given before its first byte. The refusals, each from a real tar run
 with the wrong flags put in front of the reader: without `--numeric-owner` (names); without
 `--acls` over a file that has an ACL (an ACL lost); a list with a name tar skips. A stream
 cut short. A gated test (`TAPECTL_PERF_TESTS=1`) for a member over 8 GiB.
@@ -1335,7 +1393,7 @@ without it; the suite is green.
 ### T4.3 The file table and the id map: schema, text, lookup
 
 **Owner:** worker. **Depends:** T4.0, T3.1. **Carries out:** items 254, 264, 265, 272, 276,
-277; #557; #564; D4, D5, D9, D13. **Read:** the format document on the file table's and the
+277, 283; #557; #564; #567; D4, D5, D9, D13. **Read:** the format document on the file table's and the
 id map's text; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `unescape`;
 `src/db/files.rs`.
 
@@ -1355,16 +1413,20 @@ id map's text; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `u
    deleted when a staging's slices are released; both go only with the staging's own row.
 3. `volume::filetable`: write a staging's table as the format's text, streaming, from the
    database rows or from T4.2's rows; parse it, streaming, refusing a bad header, a row
-   whose `start` is not the row before's `end`, an unknown kind, a bad hash, a bad escape.
+   whose `start` is not the row before's `end`, a `slice` lower than the row before's, an
+   unknown kind, a bad hash, a bad escape.
    One escaping rule for the whole format: call `volume::index::escape`; do not write a
    second one.
 4. `filetable::ranges(rows, wanted) -> Vec<Range>`: the byte ranges that hold the wanted
    paths' members, **joined at member boundaries** (two wanted members that touch become one
    range). A wanted hard link brings its target's member, and the target comes first. A
    wanted folder is its own member, which does not lie beside its contents. `whole(rows)`
-   is one range. `slices_of(range, slice_size)` gives the slice numbers a range touches.
-   `held_whole(rows, slices_present)` gives the members whose every slice is present (item
-   260, item 266).
+   is one range. `slices_of(rows)` gives the slices the given members need: each one's
+   `slice`, and for a member larger than `slice_size` the slices of its run (D3).
+   `slice_start(rows, n)` gives a slice's offset in the stream, so that a range becomes an
+   offset inside a slice. `held_whole(rows, slices_present)` gives the members whose every
+   slice is present (items 260, 266), and `members_of(rows, n)` the members a lost slice
+   costs.
 5. `idmap`: look a user id and a group id up through the C library; write and parse the
    map's text. An id the host cannot name has an empty name. An id never seen has no row.
 
@@ -1379,8 +1441,9 @@ id map's text; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `u
 
 **Verify:** round-trip tests of both texts, with paths that hold a tab, a newline, a
 backslash; `ranges` on the measured shape `d`, `d-x`, `d.txt`, `d/a` (a folder is two
-ranges); a hard link asked alone brings its target; `held_whole` on a range that ends inside
-a member; the lookup of this process's own uid gives a name, and of an id far above any
+ranges); a hard link asked alone brings its target; `held_whole` when one slice of a long
+member's run is missing; `members_of` for a slice of many members and for one piece of a
+run; the lookup of this process's own uid gives a name, and of an id far above any
 real one gives none.
 **Done when:** the suite is green; the report states the baseline's new tables and columns
 as SQL.
@@ -1420,11 +1483,9 @@ file and an excluded folder reports all three, shown by a test; the suite is gre
 
 ### T4.5 Staging on tar: the switch
 
-**Owner:** worker (one, alone in its wave). **Depends:** T4.1 to T4.4, T0.5, T0.6, and
-questions 41 and 38 to 40 ruled (D15). **This entry's compression steps are written for
-shape A. If question 41 is ruled B, do not start until T1.7 has rewritten them** by D15's
-deltas. **Carries out:** items 241, 253, 254, 265, 270, 272, 274, 277, 280;
-#555; #562 "The writer"; #563; #564; #565. **Read:** the format document on the stream, the cut and staging's products;
+**Owner:** worker (one, alone in its wave). **Depends:** T4.1 to T4.4, T0.5, T0.6, T0.7.
+**Carries out:** items 241, 253, 254, 265, 270, 272, 274, 277, 280, 283 to 287;
+#555; #562 "The writer"; #563; #564; #565; #567. **Read:** the format document on the stream, the cut and staging's products;
 `src/staging/mod.rs` `stage_create_inner`, top to bottom; `src/staging/validate.rs` `plan`
 and `recheck`; `src/staging/files.rs`.
 
@@ -1441,16 +1502,17 @@ redefines); `src/setup.rs` and `src/main.rs` (the tool checks only);
 3. Before tar: for each listed entry record device, inode, size, mtime, ctime, and whether
    it has an ACL (the `system.posix_acl_access` or `system.posix_acl_default` attribute).
 4. Spawn tar (T4.1). Pump its output through the stream reader (T4.2) into the cutter and
-   on to `SliceWriter` as today (age in memory, both hashes, the file made durable). The
-   cutter is a plain cut: `slice_size` bytes a slice, the last what remains. No header, no
-   trailer.
+   on to `SliceWriter` as today (age in memory, both hashes, the file made durable). **The
+   cutter follows D3**: it ends a slice at a member's start, gives a member larger than
+   `slice_size` a run of slices to itself, and begins a slice nowhere else (rule 13). No
+   header, no trailer. Each slice's row records whether it continues a member (D22).
    **Where the unit's resolved `compression` is not `none`**, each cut is compressed alone,
-   as one frame of that algorithm, between the cutter and encryption (rule 11; the format
-   document's section on compression gives the frame and who compresses, as questions 38
-   to 40 are ruled). `size_bytes` and `sha256_plain` are taken from the cut **before**
-   compression (D3). The staging's algorithm is recorded in `stage_sets.compression`.
-   **Every piece is decoded again and compared with what was packed before it goes on**
-   (D15: what was hashed is not what goes to tape); a difference refuses the staging.
+   by tapectl's library for that algorithm, as one frame, at the resolved
+   `compression_level` or the algorithm's default (items 284 to 287; D15), between the
+   cutter and encryption (rule 11). `size_bytes` and `sha256_plain` are taken from the cut
+   **before** compression (D3). The staging's algorithm and level are recorded in
+   `stage_sets`. **Every slice is decoded again and compared with its cut before it goes
+   on** (D15: what was hashed is not what goes to tape); a difference refuses the staging.
 5. After tar: `finish` must be `Clean`; the reader must have seen every entry; `recheck`
    compares each entry with step 3, and a file inside the racy window is hashed from disk
    and compared with the stream's hash, as today.
@@ -1481,6 +1543,9 @@ check); the exclusion masks handed to the archiver.
   It never counts on compression to make room: bytes that do not shrink grow a little.
 - Compression must not hold a slice's plaintext on disk, and must not hold more than one
   slice in memory for each unit being staged.
+- The cutter decides at a member's start, from the length the reader gives it. It never
+  looks ahead in the stream and never holds a member's data. A member of exactly
+  `slice_size` fits in an empty slice; one block more is a run.
 - A slice whose on-tape size would pass the stated bound (D3) refuses the staging by name.
   It is not stored uncompressed in place: a staging has one algorithm.
 - `[staging] jobs` stages several units at once: each has its own tar, list and reader.
@@ -1494,10 +1559,15 @@ check); the exclusion masks handed to the archiver.
   `#[ignore = "L3-pending T4.<n>: ..."]` with the task that will carry it, and list them in
   the report with their count for each tag. A test of staging itself is yours to make pass.
 
-**Verify:** for each algorithm carried, through `stage create`: a unit of several slices
-with a file across two of them, each slice read back with the host's real decompressor to
-the cut's `sha256_plain`; a unit of bytes that do not shrink; and a unit with `compression`
-unset beside it, whose slices are the plain cut. Then, tests through `stage create` itself:
+**Verify:** for the cut, through `stage create`: every slice that does not continue a
+member is read alone by the real tar at exit 0, and gives exactly the files the table
+says begin in it; a long member's run, joined, is read alone; the slices joined are the
+stream byte for byte; a member of exactly `slice_size`, and one a block larger; the tail
+after a run. For each algorithm carried: a unit of several slices that holds a file larger
+than a slice, each slice read back with the host's real decompressor to the cut's
+`sha256_plain`; a unit of bytes that do not shrink; a level set, and a level out of range
+refused; and a unit with `compression` unset beside it. Then, tests through `stage create`
+itself:
 a unit with a hard link pair, a symbolic
 link, a FIFO, an ACL naming an id the host knows, a `user.` attribute, a long name; the
 file table's rows match `sha256sum` of every file and their ranges restore each file with
@@ -1511,7 +1581,8 @@ under `src/staging/` names dar; the pending list is in the report; the suite is 
 ### T4.6 What a tape carries: Layout 3's identity, the MANIFEST, the envelopes, both ways
 
 **Owner:** worker (one, alone in its wave). **Depends:** T4.5. **Carries out:** items 254,
-258(a), 265, 276; #528, #547, #557, #564; #562 "The layout" and "The table"; D1, D4 to D8.
+258(a), 265, 276, 283 and 288 (what a tape states); #528, #547, #557, #564; #562 "The
+layout" and "The table"; D1, D4 to D8, D22.
 **Read:** the format document, whole (this task implements most of it);
 `src/volume/build.rs` `materialize_envelope_streaming`; `src/volume/manifest.rs`;
 `src/db/ontape_catalog.rs`'s module doc.
@@ -1525,11 +1596,12 @@ and the MANIFEST generators only; **not** File 1, RESTORE.sh or RECOVERY.md's pr
 
 **Build:**
 1. `LAYOUT_VERSION = 3`, the new magic, in File 0, the front index and the seal marker
-   (D1). `requires` is empty, or `["spanning"]`; `short-seal` is no longer a known entry.
+   (D1). `requires` is empty; `short-seal` and `spanning` are no longer known entries.
    Rule S2, §1.2's rule 6 and `may_end_early` are as the format document restates them.
 2. **#547:** File 0's `[media]` strings are escaped as TOML strings.
 3. The MANIFEST's block for a staging as D6 has it, with `compression` stated only for a
-   compressed staging. `manifest.rs` stays one type in both directions and is
+   compressed staging, no `may_span`, and `continues` on a slice that continues a member
+   (D22). `manifest.rs` stays one type in both directions and is
    `deny_unknown_fields`.
 4. Each tenant envelope carries, for each staging the tape's plan holds a slice of, that
    staging's whole file table and id map as text (D4, D5), from the catalog database. The
@@ -1547,8 +1619,11 @@ and the MANIFEST generators only; **not** File 1, RESTORE.sh or RECOVERY.md's pr
 - **Invariant 3.** The table and the map are inside envelopes. No plaintext file gains a
   field. The front index still states positions, types, sizes and ciphertext hashes only.
 - The envelopes are written before the slices, so on a tape that ends short the table lists
-  files of cut units and of slices after `ended_after`. That is the plan, and the seal
-  withdraws it (§4.2). Do not try to write the table after the slices.
+  files of slices after `ended_after`. That is the plan, and the seal withdraws it. Do not
+  try to write the table after the slices.
+- The planner keeps its two classes, and the catalog its `may_span` and its `cut` rows,
+  until T5.1. This task stops stating `may_span` and `spanning` on tape and changes no
+  plan.
 - Envelopes are built by streaming. A table of a million rows is about 121 MB of text:
   never hold it in memory.
 - File 2 on tape is still the old script until T4.10, and RECOVERY.md still speaks of dar
@@ -1594,7 +1669,7 @@ layout is parsed.
 ### T4.8 tapectl's restores, fed whole members by byte range
 
 **Owner:** worker. **Depends:** T4.6. **Carries out:** items 255 (tapectl's half), 256,
-260, 264, 266, 278; #556; D16, D17. **Read:** the format document on readers and on a
+260, 264, 266, 278, 283, 284; #556; D16, D17. **Read:** the format document on readers and on a
 range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean), 127, 264;
 `src/volume/restore/supply.rs`'s module doc; `src/volume/restore/fill.rs`.
 
@@ -1607,7 +1682,7 @@ range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean),
    standard input exactly the byte ranges `filetable::ranges` gives, then the end-of-archive
    blocks. `restore unit` asks for the whole table; `restore file` for its paths;
    `restore volume` for each unit in turn. There is no spool mode and no scratch copy of a
-   slice.
+   slice. A range lies inside one slice, or is a long member's run (rule 13).
 2. tar is run to extract with the flags the format document gives for tapectl's reader
    (numeric owners, xattrs and ACLs when the process may set them, never `--ignore-zeros`).
    An existing file is not replaced without `--overwrite`, as today.
@@ -1618,8 +1693,8 @@ range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean),
    `size_bytes`, or whose bytes do not match `sha256_plain`, is a bad slice, whatever the
    decompressor said of itself.
 4. **A bad slice.** `Supply` still replaces a slice from another copy by its sha256, asking
-   for the cartridge, as today. When no copy has it: the members that touch it are left out
-   and listed, and the restore goes on (item 264). The read around a bad 64 KiB chunk
+   for the cartridge, as today. When no copy has it: the members in it
+   (`filetable::members_of`) are left out and listed, and the restore goes on (item 264). The read around a bad 64 KiB chunk
    (`crypto::chunks`) is kept and made finer by the table: only the members that touch a
    bad chunk are left out. **Nothing is zero-filled** (invariant 4): the tolerant mode's
    holes become ranges that are skipped. In a compressed slice nothing after the bad chunk
@@ -1634,7 +1709,9 @@ range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean),
 7. The id map of each unit restored is printed, and is in `--json` (item 278). No owner is
    changed by name.
 8. A restore that starts on a tape holding only a range takes the files it holds whole and
-   lists the rest (item 266, D17), where the other cartridges are not offered.
+   lists the rest (item 266, D17), where the other cartridges are not offered. A unit held
+   across cartridges is restored cartridge by cartridge; only a long member's run that
+   lies across two cartridges is fed across the swap (items 131, 288).
 9. `--key FILE` works as today on every path above.
 
 **Removed here:** `stream_into_dar`, `spool_and_extract`, `--spool`, the choice between
@@ -1655,8 +1732,9 @@ the `restores` row (the `tar_*` columns take their place).
   deleted, and every test stages through `stage create` (invariant 8).
 
 **Verify:** through real stagings on `MemStore`: a whole unit; one path; a volume of three
-units; a slice replaced from a second copy; a slice with no copy (the members it touches
-listed, every other file whole); one bad chunk in a slice of many files (only the files
+units; a slice replaced from a second copy; a slice with no copy (the members in it
+listed, every other file whole); one piece of a long member's run with no copy (that
+member listed, every other file whole); one bad chunk in a slice of many files (only the files
 that touch it listed); the same in a compressed slice (the files from the chunk to the
 slice's end listed, the files before it whole); a compressed unit whole and by path, for
 each algorithm carried; the repair from a second copy; the repair from a range; a hard link
@@ -1687,8 +1765,11 @@ fact table; `src/volume/adopt_lost.rs`'s module doc; the format document on the 
    ciphertext hashes with the staged rows. It does not read the payload. Confirm that and
    keep it. A staging adopted this way must still have its table, or the adoption is
    refused by name.
-4. Item 144's promotion (a spanning snapshot found `staged`, every slice on a sealed
-   volume) is unchanged.
+4. Item 144's promotion (a version found `staged` with every slice on a sealed volume) is
+   unchanged, and serves any unit (item 288).
+5. A staging of which this tape holds only some slices is recorded as a range (item 130).
+   It is known by the positions the MANIFEST's block gives and by the seal's `ended_after`:
+   there is no `may_span` to read (D6).
 
 **Traps:**
 - `catalog rebuild` never changes a status, with item 144's one exception. Nothing here
@@ -1697,6 +1778,10 @@ fact table; `src/volume/adopt_lost.rs`'s module doc; the format document on the 
   task. Its test must still pass, unchanged.
 - A rebuilt staging's `origin` is `rebuilt`, and the escrow answer for it is `unknown`
   until attested, as today.
+- Until T5.1 the writer still makes `cut` units, whose slices before `ended_after` are on
+  the tape. A rebuild now records them as a range, which is the final behaviour (item
+  288). A test that expected them to be passed over changes with it: name it in the
+  report.
 
 **Done when:** the tags `L3-pending T4.9` are gone; a test rebuilds from a tape, writes a
 second copy from the rebuilt catalog, and that copy's envelopes carry the same table and
@@ -1705,8 +1790,8 @@ map; the suite is green.
 ### T4.10 The heir's script, part one: a file in the tree, the tape, whole units
 
 **Owner:** worker (the script has one worker at a time, T4.10 to T4.13). **Depends:** T4.6.
-**Carries out:** items 255, 264, 271; #553; #520, #525 (the script's low findings), #561's
-work directory; #562 "The heir's script"; D10. **Read:** the format document on the heir
+**Carries out:** items 255, 264, 271, 283, 284; #553; #520, #525 (the script's low
+findings), #561's work directory; #562 "The heir's script"; D10, D22. **Read:** the format document on the heir
 path, whole; File 1 as a reader would (the generated text, from a test); #520, #525;
 `docs/audits/2026-11-12-design-and-defect-review.md` findings A1 to A12.
 
@@ -1725,17 +1810,20 @@ helper program under `examples/`, where `short_seal_filler.rs` already is.
    told apart, a failed read forcing a rewind), and carry that.
 2. This task builds: the tool check for each mode from one table; the tape handling;
    File 0's claims (Layout 3 only; another layout refused by name); the front index and
-   the seal, full and short (R1 to R4: `ended_after` is learned first and a cut unit is
-   never restored); `--info`; `--verify`; `--find-envelope`; the envelope opened into the
+   the seal, full and short (R1 to R4: `ended_after` is learned first, and a slice past it
+   is never read); `--info`; `--verify`; `--find-envelope`; the envelope opened into the
    **work directory inside `--to`** (item 271), with the space check before it;
    `--list` from the file table; `--restore` of whole units (`--all`, `--unit`); the file
    check after it.
-3. **The reader's primitive** (item 264, #556): for each unit, the slices are decrypted in
-   order (and, where the MANIFEST's block states `compression`, each is decompressed alone
-   by that algorithm's tool) and tar is fed whole members by byte range from the file table. **Each range is
-   its own pipeline** (busybox `head -c` reads ahead on a shared pipe). A slice whose hash
-   or decryption fails ends that tar run; the next run starts at the first member after
-   the slice; the members that touch it are listed. No zero-fill, no `--ignore-zeros`.
+3. **The reader's primitive** (items 264, 283; #556; D10). Each slice is checked against
+   the front index, decrypted into the work directory and, where the MANIFEST's block
+   states `compression`, decompressed by that algorithm's tool and checked against its
+   `size_bytes`, all before tar sees any of it. The good slices go, in order, to **one**
+   tar run. A bad slice is left out and its members are listed from the file table. A long
+   member's run (D22) is fed piece by piece, each piece checked first; if a piece fails,
+   that tar run is ended, the member's partial file is removed and the member is listed,
+   and the next run starts at the slice after the run. The work directory holds one slice
+   at a time. No zero-fill, no `--ignore-zeros`.
 4. **CI lints the script** (#553): `bash -n`, `shellcheck`, and the script's awk programs
    run under `gawk`, `mawk` and busybox `awk`, in a job of `ci.yml`.
 5. The tests' fixture is a real staging and a real volume build, laid out as the directory
@@ -1780,8 +1868,9 @@ file at exit 0 (the check must catch it); the lint job passes; the suite is gree
 
 **Fence:** `src/volume/heir/RESTORE.sh`, `tests/heir_restore.rs`, `tests/common/heir/`.
 
-**Build:** `--restore --unit U --path P` and `--paths-from FILE` (only the slices the ranges
-touch are read; a hard link brings its target, target first); the damaged-file list,
+**Build:** `--restore --unit U --path P` and `--paths-from FILE` (only the slices that hold
+the wanted members are read; a hard link brings its target, target first; a member is
+taken from its slice by name or by its offsets, as T0.7's step (e) decided, D10); the damaged-file list,
 written in the index's escaping, and the repair that reads it back as `--paths-from` on
 another copy of the same version (another version or another unit is refused; a range is a
 source for the files it holds whole); `--where` and `--find` over the index, as today's
@@ -1801,32 +1890,40 @@ different files to a whole unit in two runs; the suite is green.
 ### T4.12 The heir's script, part three: a unit across cartridges
 
 **Owner:** worker. **Depends:** T4.11. **Carries out:** items 240 (R5, R8, R9 stand), 246,
-266, 267; #558; #521.
+266, 267, 283, 288; #558; #521.
 
 **Fence:** `src/volume/heir/RESTORE.sh`, `tests/heir_restore.rs`, `tests/common/heir/`.
 
-**Build:** the restore of a unit held across cartridges, as a stream, with the one prompt
-for the next cartridge (it waits without a time limit and holds no device). A cartridge is
-taken only by the next slice's sha256 at a position its seal covers (R8). A blank, foreign
-or unreadable cartridge at the prompt is named and the prompt asks again (#521). **A restore
-may start on any tape of the span** and takes the files that tape holds whole (item 266).
-**"I do not have it" is an answer**: the restore goes on with what it has and lists the
-rest. Nothing is kept in scratch between cartridges (item 267).
+**Build:** the restore of a unit held across cartridges, which any unit may be (item 288).
+Each tape is restored on its own into the same `--to`, in any order: the script restores
+what this tape holds of the unit, says from the index which cartridges hold the rest, and
+a later run on another tape adds its files and leaves alone the ones already restored and
+checked. **A restore may start on any tape** and takes the files that tape holds whole
+(item 266). **One prompt remains**, for a file larger than a slice whose run lies across
+two cartridges: the script feeds tar the pieces this tape holds, asks for the next
+cartridge (it waits without a time limit and holds no device), and takes a cartridge only
+by the next slice's sha256 at a position its seal covers (R8). A blank, foreign or
+unreadable cartridge at the prompt is named and the prompt asks again (#521). **"I do not
+have it" is an answer**: that file's partial copy is removed, the file is listed, and the
+restore goes on. Nothing is kept in the work directory between the two cartridges (item
+267).
 
 **Traps:**
-- A member that straddles two cartridges is held whole by neither alone. Started on the
+- A file that lies across two cartridges is held whole by neither alone. Started on the
   second tape without the first, it is listed, not restored.
-- Quitting at the prompt, Ctrl-C, a hangup or a kill leave no work directory behind.
+- Quitting at the prompt, Ctrl-C, a hangup or a kill leave no work directory and no
+  partial file behind.
 - Read the old tests' section "span, across cartridges" (thirteen tests) for the cases.
 
-**Done when:** a three-tape span restores across two swaps in either copy's order; a start
-on tape 2 alone restores what tape 2 holds whole and lists the rest; "I do not have it"
-does the same mid-run; the suite is green.
+**Done when:** a unit on three tapes is whole after three runs, in any order of the tapes;
+a file larger than a slice that lies across two cartridges restores through the prompt,
+and is listed with no partial file left after "I do not have it"; a start on the second
+tape alone restores what it holds whole and lists the rest; the suite is green.
 
 ### T4.13 File 1 and RECOVERY.md
 
 **Owner:** worker. **Depends:** T4.12. **Carries out:** #522, #523, #526; #563's last
-criterion; #477's and #481's standing rules for File 1; items 264, 266, 271, 278.
+criterion; #477's and #481's standing rules for File 1; items 264, 266, 271, 278, 283, 288.
 **Read:** the generated File 1 and RECOVERY.md of the current tree, whole; #522, #523, #526.
 
 **Fence:** `src/volume/layout.rs` (File 1's and RECOVERY.md's generators and the tool
@@ -1836,7 +1933,9 @@ sentences), `src/volume/build.rs` (`RECOVERY_CATALOG_DB`), their tests.
 file table, run as written in a test (the "File 1 as written" tests of the old suite are
 the model: each command in the text is executed by a test); which tars restore what; what a
 restore on another host does with an owner or an ACL entry, and that the id map says who
-the ids were; the one repair; the prompt and "I do not have it"; per-unit directories
+the ids were; the one repair; that each data file is an archive of whole files, and which files are one
+long file's run; that a unit may continue on another cartridge and each tape is restored
+on its own; the prompt and "I do not have it"; per-unit directories
 (#522); the right route for each key holder (#523); only messages `age` prints (#526); how to tell
 a compressed unit, which tool reads each algorithm, and the manual path for one, run as
 written by a test.
@@ -1895,7 +1994,7 @@ dependency served only dar.
 query; remove `[dar]`, `preserve_fsa` and the keys D11 removes; **`compression` stays** (item
 280), and what goes with dar is only the probe that asked the local dar which algorithms
 it was built with (`policy::compression_capability`, `cli::archive_set`'s check) and the
-values question 38 does not carry; rename the JSON keys; CI no longer installs dar; `tests/test_dependencies.rs` names tar at the floor, `setfacl` and
+values item 285 does not carry; rename the JSON keys; CI no longer installs dar; `tests/test_dependencies.rs` names tar at the floor, `setfacl` and
 nothing of dar.
 
 **Done when:** `grep -rniw dar src tests scripts contrib .github Cargo.toml` finds only
@@ -1913,8 +2012,8 @@ history in comments that the coordinator accepts, listed in the report; `grep -r
 **One gate leg, with the real tools, for every mode the heir's script has** (the rule from
 the review): `--info`, `--verify`, `--find-envelope`, `--list`, whole-unit `--restore`,
 `--path`, `--paths-from` as the repair from a second cartridge, `--where`, `--find`, a
-short tape, a span across cartridges with a swap, a start on a later tape, and "I do not
-have it", **and a whole-unit and a one-path restore of a compressed unit for each
+short tape, a unit on two cartridges restored tape by tape, a file larger than a slice
+across two cartridges with a swap, a start on a later tape, and "I do not have it", **and a whole-unit and a one-path restore of a compressed unit for each
 algorithm carried, with the real decompressor**. Legs that proved dar's stream (`heir_big_catalogue`, `heir_late_damage`,
 `heir_slice_boundary_read`) go with it; `heir_file_check` and `heir_slice_from_copy` are
 restated. The lifecycle suite's restore matrix keeps its twelve methods. Each run record
@@ -1932,27 +2031,67 @@ on Layout 3. Most of this stage is proof, with the fixes the proof finds.
 Waves: T5.1 alone (it touches the write plan); then T5.2, T5.3, T5.4; then T5.5, T5.6,
 T5.7.
 
-### T5.1 Spanning, end to end (item 246)
+### T5.1 Every unit continues at the early warning, and the queue is filled to it (items 246, 288, 289)
 
-**Owner:** worker, then the coordinator on tape. **Read:** the format document on a range
-and spanning; ADR-0012 items 121 to 147 with 260, 266, 267; `src/volume/span_proofs.rs`.
+**Owner:** worker, then the coordinator on tape. **Depends:** T4.16; D19 and D20 seen by
+the CTO. **Carries out:** items 288 and 289, and what stands of items 121 to 147 (the
+amendment of 2026-11-17 lists both); #567. **Read:** the format document on what follows
+the warning and on a range; ADR-0012's amendment of 2026-11-17, whole, and items 121 to
+130, 138 and 144; `src/volume/layout_model.rs` `CapacityBudget::place`;
+`src/volume/session.rs` `span_split`; `src/collection/selector.rs`.
 
-The plan order, the range's records on tape, copies counted for each slice, the per-slice
-release of staging, `audit`'s `span_in_progress` and range invariants, a rebuild of a range
-tape, and tapectl's restore across cartridges are payload-agnostic and are **proven**, not
-rewritten: every test in `src/volume/span_proofs.rs` and the span tests of
-`tests/catalog_rebuild.rs` and `tests/integration.rs` runs on real tar stagings. What is
-new is the table across tapes: every tape whose plan holds a slice of a staging carries that
-staging's whole table (#562), and "this tape holds F" means every slice from F's start to
-its end is at or before `ended_after`.
-**Fence:** `src/volume/span_proofs.rs`; the span tests of `tests/catalog_rebuild.rs`,
-`tests/integration.rs` and `tests/format_v3.rs`; `scripts/span-acceptance.sh` (the
-coordinator runs it). A source file is changed only for a defect a proof shows: report the
-defect and the file first, and the coordinator widens the fence.
-**Done when:** item 93's shape (two copies: tapes 1 and 3, or tape 2 alone) and a three-tape
-span restore whole through tapectl and through the heir's script, in tests and on mhvtl
-(`scripts/span-acceptance.sh --mhvtl`); `volume rewrite` and compaction still refuse a
-range volume.
+**This is a build task, and then a proof.** The range's records on tape, copies counted
+for each slice, the per-slice release of staging, `audit`'s `span_in_progress` and range
+invariants, a rebuild of a range tape and tapectl's restore across cartridges were built
+for units that opted in. They now serve every unit, and the policy above them changes.
+
+**Build:**
+1. **No unit is `cut`** (item 288). A unit the early warning interrupts gets a `range` row
+   for the slices written; the rest stay staged and are owed. The write status `cut`,
+   `span_split`'s cut branch, and every text and report that names a cut unit go.
+2. **No unit opts in.** `allow_spanning` goes from `[defaults]`, from the archive set (its
+   flag and its column), from the unit dotfile and its frozen copy, and `writes.may_span`
+   with it, with the policy code that resolves, shadows or subsumes the key (D11). The
+   baseline loses those columns and the status (D9).
+3. **One class in the plan.** `CapacityBudget::place` lays out the owed slices first, the
+   lowest first, as one unbroken run in slice order (item 122's first rule, which
+   stands), then the queue in order. The two classes, the early start of a unit larger
+   than a tape, and `after_the_tail` go (items 83, 94, 95, 147).
+4. **The one bound** (D20) and **the batch** (D19).
+5. `audit`'s `span_in_progress` names any version with slices owed, and its range
+   invariants hold for every unit.
+
+**Fence:** `src/volume/layout_model.rs`, `src/volume/span_proofs.rs`, `src/volume/write.rs`
+(the plan and its texts), `src/volume/session.rs` (`span_split` and the rows it writes),
+`src/collection/selector.rs`, `src/collection/plan.rs`, `src/collection/sync.rs`,
+`src/collection/fingerprint.rs`, `src/policy/*`, `src/config.rs`, `src/config_edit.rs`,
+`src/unit/*`, `src/cli/archive_set.rs`, `src/cli/unit.rs`, `src/cli/tenant.rs`,
+`src/cli/collection.rs`, `src/cli/audit.rs`, `src/for_location.rs`, `src/db/mod.rs`,
+`src/db/models.rs`, `src/db/migrations/001_baseline.sql`, their tests, the span tests of
+`tests/catalog_rebuild.rs`, `tests/integration.rs` and `tests/format_v3.rs`, the generated
+pages; `scripts/span-acceptance.sh` and `scripts/short-seal-acceptance.sh` (the
+coordinator runs them).
+
+**Traps:**
+- **W1 to W9 do not change.** Do not touch the block retry, the seal, its `ended_after` or
+  the readback past the warning.
+- `volume rewrite` and compaction still refuse a range volume until T5.3. Do not lift that
+  here.
+- Items 93, 134 and 139 stand: with a copy target of 2 at one location the plan must still
+  yield the whole middle tape. Keep the proof of it.
+- An owed run bound to a location (item 159, as built) is unchanged.
+- The budget suites pin what the planner and the selector cost. Report a moved figure. Do
+  not move a pin.
+- A `allow_spanning` left in a config or a dotfile is then an unknown key and is refused
+  as one. Do not add a refusal that names it (item 258(d)).
+
+**Done when:** a unit interrupted by the test hook's early warning has a `range` row and no
+`cut` row, and the next write lays its owed slices first; a batch queued to fill ends a
+full tape with one unit across its end; on a drive without `post_warning_bytes` the tape
+ends by its plan at the ceiling and the rest continues; item 93's shape (two copies: tapes
+1 and 3, or tape 2 alone) and a unit on three tapes restore whole through tapectl and
+through the heir's script, in tests and on mhvtl (`scripts/span-acceptance.sh --mhvtl`);
+`grep -rn 'allow_spanning\|may_span' src tests` finds nothing; the suite is green.
 
 ### T5.2 Two places, and the per-location writes (#550; items 147 to 160, 257)
 
@@ -1964,16 +2103,25 @@ range volume.
 **Done when:** #550's criteria are met; `audit` is not clean with every copy of an active
 unit on one shelf, shown by a test.
 
-### T5.3 Compaction, `volume read-slices`, `volume rewrite`
+### T5.3 Compaction, `volume read-slices`, `volume rewrite`, and a range in each
 
-**Owner:** worker. These move ciphertext and check ciphertext hashes; none reads the
-payload. Prove each on Layout 3 tapes: a compaction and a rewrite carry the file table and
-the id map into the new volume's envelopes (they re-pack envelopes from the catalog, where
-they once re-packed catalogue files from disk), and `volume rewrite`'s hold and typed
-consent are unchanged. **Fence:** `src/volume/rewrite.rs`, the compaction functions of
+**Owner:** worker. **Depends:** T5.1; D21 seen by the CTO. **Carries out:** item 288's
+supersession of item 133. These move ciphertext and check ciphertext hashes; none reads
+the payload. Prove each on Layout 3 tapes: a compaction and a rewrite carry the file table
+and the id map into the new volume's envelopes (they re-pack envelopes from the catalog,
+where they once re-packed catalogue files from disk), and `volume rewrite`'s hold and
+typed consent are unchanged.
+**New, a build:** a rewrite and a compaction carry a volume that holds a range, as D21
+has it. The slices are carried as they are, by ciphertext, in slice order; the new
+volume's block lists every slice of the staging and gives positions to the ones it holds;
+the typed consent names every version of which the volume is the only holder of some
+slice; `refuse_range_holder` goes.
+**Fence:** `src/volume/rewrite.rs`, the compaction functions and `refuse_range_holder` of
 `src/volume/write.rs`, their tests.
 **Done when:** a rewritten and a compacted volume each restore whole and rebuild to the
-same rows; the suite is green.
+same rows; a volume that holds the tail of one unit and the head of another is rewritten
+and is compacted, and each unit still restores whole from its cartridges; the suite is
+green.
 
 ### T5.4 `tapectl setup`, and the warehouse procedure
 
@@ -2019,8 +2167,9 @@ the feature whole, as the others of this stage are proven, and fixes what the pr
 
 For each algorithm carried: the three layers resolve it (`[defaults]`, an archive set, a
 unit's dotfile, the most specific winning, and `none` when none is set); a compressed and
-an uncompressed unit share one tape; a compressed unit spans cartridges and restores across
-them; a second copy of a compressed staging is the same slices, so a slice is replaced from
+an uncompressed unit share one tape; `compression_level` is resolved by the same layers
+and a level out of range is refused; a compressed unit continues on a second cartridge
+and restores from both; a second copy of a compressed staging is the same slices, so a slice is replaced from
 it by sha256; `volume rewrite` and a compaction carry a compressed unit unchanged; a
 rebuild from tape restores the staging's algorithm; the capacity plan uses each slice's
 size on tape and the early warning's rules hold with slices of unequal size.
@@ -2102,7 +2251,8 @@ static debug build and a scratch home, on a test cartridge:
 1. the new payload's acceptance: a write, a full readback, tapectl's restore, the heir's
    script, a rebuild that agrees row for row
 2. the short seal with Logical Block Protection armed, and `volume init`'s page clear (#532)
-3. spanning's acceptance on the tar payload (`scripts/span-acceptance.sh`)
+3. a unit continued at the real early warning with no opt-in, and the queue filled to it
+   (items 288, 289; `scripts/span-acceptance.sh`)
 
 The host needs a tar that meets the floor first (T4.14's step, run by the operator).
 
@@ -2170,6 +2320,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #539 | T2.3 | #563 | T0.1, T0.2, T4.1, T4.2, T4.5, T4.13, T4.14 |
 | #540 | T2.4 | #564 | T1.3, T4.3, T4.5, T4.6, T4.8, T4.9, T4.11 |
 | #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
+| #566 | closed: slices stay (item 282) | #567 | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8 to T4.13, T4.16, T5.1, T5.3 |
 
 **ADR-0012's items from 239.**
 
@@ -2177,9 +2328,9 @@ coordinator when every task named beside it has landed and the gate has run.
 |---|---|---|---|
 | 239 format changes now | the plan | 260 a range is a source | T4.3, T4.8, T4.11 |
 | 240 slices and their rules stay | T4.5 (the cut), T5.1; section 5 | 261 three behaviours as built | T5.5 |
-| 241 a plain cut of a tar stream | T4.5, T4.15 | 262 the drill and the reads gate | T6.1, Stage 7 |
+| 241 a cut of a tar stream (its "plain cut" amended by 283) | T4.5, T4.15 | 262 the drill and the reads gate | T6.1, Stage 7 |
 | 242 no reverse compatibility | Stage 3 | 263 the first run is the acceptance | Stage 7 |
-| 243 the on-tape authorization | T4.0, T6.3 | 264 whole members by byte range | T4.3, T4.8, T4.10 |
+| 243 the on-tape authorization | T4.0, T6.3 | 264 no zero-fill; whole members by byte range in tapectl's reader | T4.3, T4.8, T4.10 |
 | 244 a fresh start | Stage 7 step 2 | 265 the table in the catalog | T4.3, T4.6, T4.9 |
 | 245 the two cartridges | Stage 7 step 3 | 266 a start on any tape of a span | T4.8, T4.12 |
 | 246 spanning from the first day | T4.12, T5.1 | 267 the heir's span restore streams | T4.12 |
@@ -2197,6 +2348,10 @@ coordinator when every task named beside it has landed and the gate has run.
 | 258 what "simplify" removes | (a) T4.6; (b) T3.1; (c) T3.4; (d) T3.2, T3.3; (e), (f) T6.7 | 279 the plan in stages | this file |
 | 259 #519 closed unbuilt | done | 280 compression, optional, for select archives | T0.5, T4.5, T4.6, T4.8, T4.10, T4.13, T4.16, T5.7; section 5, rule 11 |
 | | | 281 the design is not sized to the present corpus | T0.3's second leg; section 5, rule 12 |
+| 282 slices stay | T4.5 | 286 tapectl itself compresses | T0.6, T4.5 |
+| 283 a slice ends at a member's start | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8, T4.10 to T4.13; section 5, rules 4 and 13 | 287 an archive may set a level | T4.5, T5.7 |
+| 284 each slice compressed alone | T0.5, T4.5, T4.8, T4.10; section 5, rule 11 | 288 every unit continues at the early warning | T4.6, T4.9, T4.12, T5.1, T5.3, T6.6 |
+| 285 gzip, xz and zstd are carried | T0.5, T0.6, T4.0, T4.5, T4.15 | 289 the queue is filled to the warning | T5.1, T6.6 |
 
 **#562's rules for the format document.** Each is written into the format document by T1.1
 and built where shown.
@@ -2218,8 +2373,8 @@ and built where shown.
 | The table is part of what the seal withdraws; "this tape holds F" | T4.3 (`held_whole`), T5.1 |
 | A hard link's row, its check and its repair | T4.2, T4.3, T4.8, T4.11 |
 | `index/paths.tsv` states no sha256 for the unit dotfile | T4.6 |
-| Each range is its own pipeline | T4.10 |
-| A slice that fails ends that tar run; the next starts after it | T4.10 |
+| Each range is its own pipeline | superseded by item 283: the heir's script gives tar whole slices (D10) |
+| A slice that fails ends that tar run; the next starts after it | amended by item 283: a bad slice of whole members is left out and the run goes on; only a bad piece of a long member's run ends the run (D10; T4.10) |
 | File 1 says which tars restore what | T4.13 |
 | Rule S2, rule 6 and `may_end_early` without the `short-seal` entry | T1.1, T4.6 |
 | The magic and the layout version both move | T4.6 |
@@ -2228,15 +2383,15 @@ and built where shown.
 ## Appendix B. What waits on the CTO
 
 1. **The go**, stage by stage. Stage 2 needs nothing else. Stage 3 needs nothing else but
-   D9 for T3.1. T0.1 and T0.2 are measurements in containers and change no code; they have
-   not been started.
-2. **Question 41, then 38 to 40** (D15, #565), now that compression is carried (item 280).
-   41 is the shape: each slice compressed alone (recommended since the re-weighing on
-   #565: a slice then decodes alone to its plain cut), or the stream stored in frames
-   and then cut as today. 38 (which
-   algorithms) and 39 (who compresses) largely follow from 41; 40 is whether an archive may
-   set a level. T4.5 waits on all four. T0.5 and T0.6 wait on none of them.
-3. **D1 to D18** as a list to see before Stage 1 writes them into the format document.
+   D9 for T3.1. T0.1, T0.2, T0.5, T0.6 and T0.7 are measurements in containers and change
+   no code; they have not been started.
+2. **D1 to D22** as a list to see before Stage 1 writes them into the format document.
+   Since items 282 to 289 were ruled (2026-11-17), D1, D3, D4, D6, D9, D10, D11 and D15
+   are rewritten and D19 to D22 are new: the batch and the queue, the one plan bound, a
+   range in rewrite and compaction, and how a tape marks a long member's run. T5.1 waits
+   on D19 and D20, T5.3 on D21.
+3. **If T0.6 fails**: the fallback of item 286 (the host's tool for each slice) before
+   anything is built on it. **If T0.7 fails**: item 283 itself.
 4. **T0.3**: a go-ahead for a read-only run over the production host's collection, or a
    ruling that the scale proof is taken from Stage 6's real-drive acceptance (which changes
    item 253's "before any code").
