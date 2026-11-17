@@ -8,7 +8,7 @@ tapectl\-snapshot\-delete \- Delete a snapshot no tape holds
 .SH DESCRIPTION
 Delete a snapshot no tape holds
 .PP
-Refused for a version on tape (a completed write or a range), and for one with staged data unless \-\-force.
+Refused for a version on tape (a completed write or a range), for one a write session holds (running now, interrupted, or aborted with its seal recorded, which `volume resume` can still take up), and for one with staged data unless \-\-force.
 .SH OPTIONS
 .TP
 \fB\-\-version\fR \fI<VERSION>\fR
@@ -17,7 +17,7 @@ The version to delete
 \fB\-\-force\fR
 Delete it though it is staged: its staged data goes too
 
-Never deletes a version on tape.
+Never deletes a version on tape, nor one a write session holds.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

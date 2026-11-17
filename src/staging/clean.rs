@@ -295,23 +295,31 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
     // re-confirmed by `volume resume`; name that volume so the refusal can
     // say what releasing these slices would cost. `'failed'` rows are never
     // adopted (`InterruptedSession::adopt_aborted` loads only `'aborted'`).
-    let aborted_on: Vec<(i64, String)> = conn
-        .prepare(
-            "SELECT DISTINCT v.id, v.label FROM writes w JOIN volumes v ON v.id = w.volume_id
-             WHERE w.stage_set_id = ?1 AND w.status = 'aborted'
-             ORDER BY v.id",
-        )?
-        .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (volume_id, label) in aborted_on {
-        if crate::volume::session::aborted_session_reconfirmable_after_verify(conn, volume_id)? {
-            return Ok(ReleaseBlocker::Abandoned {
-                reconfirm_on: Some(label),
-            });
-        }
-    }
-    Ok(ReleaseBlocker::Abandoned { reconfirm_on: None })
+    Ok(ReleaseBlocker::Abandoned {
+        reconfirm_on: reconfirmable_aborted_on(conn, stage_set_id)?,
+    })
 }
+
+// A test's step between what `clean_staging` chose to release and its
+// release (issue #540): another process planning a write there must never
+// have its set released under it.
+#[cfg(test)]
+thread_local! {
+    static IN_THE_WINDOW: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn in_the_window() {
+    IN_THE_WINDOW.with(|hook| {
+        if let Some(step) = hook.borrow_mut().as_mut() {
+            step();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn in_the_window() {}
 
 /// Clean staged files from disk and update DB.
 ///
@@ -486,22 +494,6 @@ pub fn clean_staging(
         )
     };
 
-    let candidates: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(&candidate_sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bind_params.iter()), |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-
-    let candidates = drop_held(conn, candidates, &mut report)?;
-
-    if candidates.is_empty() {
-        return Ok(report);
-    }
-
     struct SetPlan {
         stage_set_id: i64,
         age_files: Vec<(i64, String)>,
@@ -509,39 +501,6 @@ pub fn clean_staging(
     }
 
     let staging_dir = Path::new(&config.staging.directory);
-    let mut plans = Vec::with_capacity(candidates.len());
-
-    for (stage_set_id, _status) in &candidates {
-        let age_files: Vec<(i64, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, staging_path FROM stage_slices
-                 WHERE stage_set_id = ?1 AND staging_path IS NOT NULL",
-            )?;
-            let rows = stmt
-                .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows
-        };
-
-        // Files named for this set that no `staging_path` names (issue
-        // #402): a 'failed' set's plaintext `.dar`/`.sha512` (dar writes
-        // every slice up front) and a half-written `.dar.age` (the crash
-        // came before its row); and, for either status, a `.age` whose path
-        // an older, interrupted clean nulled without unlinking it. The
-        // prefix carries the stage set id, so nothing live can match it,
-        // and the set is released below either way.
-        let plaintext_orphans: Vec<PathBuf> =
-            find_prefix_orphans(conn, staging_dir, *stage_set_id)?
-                .into_iter()
-                .filter(|p| !age_files.iter().any(|(_, a)| Path::new(a) == p))
-                .collect();
-
-        plans.push(SetPlan {
-            stage_set_id: *stage_set_id,
-            age_files,
-            plaintext_orphans,
-        });
-    }
 
     // Commit the DB change FIRST — null every collected staging_path and
     // move the stage_set to 'cleaned' — before any file is unlinked below.
@@ -553,11 +512,69 @@ pub fn clean_staging(
     // a set is either wholly released or untouched. (A catalog half-cleaned
     // by an older build is refused by `volume write` — see
     // `volume::write::check_staged_slices`.)
-    crate::db::busy::retry(
+    //
+    // Issue #540: the choice of sets, and `drop_held`'s two facts, are made
+    // INSIDE that transaction. Chosen before it, a write planned onto a set
+    // in between (its `planned` row, its volume's lock) had the set marked
+    // `cleaned` and its slices removed under it: the immediate transaction
+    // holds the catalog's write lock, so no write can be planned between the
+    // choice and the release. A retry on a busy catalog chooses again, so
+    // only what the attempt that commits chose is released and counted.
+    let (held, plans) = crate::db::busy::retry(
         crate::db::busy::BusyPolicy::DEFAULT,
         "the staging release",
         || {
             let tx = crate::db::busy::immediate_tx(conn)?;
+            let candidates: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(&candidate_sql)?;
+                let rows = stmt
+                    .query_map(params_from_iter(bind_params.iter()), |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut held = CleanReport::default();
+            let candidates = drop_held(&tx, candidates, &mut held)?;
+            in_the_window();
+            if candidates.is_empty() {
+                return Ok((held, Vec::new()));
+            }
+
+            let mut plans = Vec::with_capacity(candidates.len());
+            for (stage_set_id, _status) in &candidates {
+                let age_files: Vec<(i64, String)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id, staging_path FROM stage_slices
+                         WHERE stage_set_id = ?1 AND staging_path IS NOT NULL",
+                    )?;
+                    let rows = stmt
+                        .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows
+                };
+
+                // Files named for this set that no `staging_path` names
+                // (issue #402): a 'failed' set's plaintext `.dar`/`.sha512`
+                // (dar writes every slice up front) and a half-written
+                // `.dar.age` (the crash came before its row); and, for either
+                // status, a `.age` whose path an older, interrupted clean
+                // nulled without unlinking it. The prefix carries the stage
+                // set id, so nothing live can match it, and the set is
+                // released below either way.
+                let plaintext_orphans: Vec<PathBuf> =
+                    find_prefix_orphans(&tx, staging_dir, *stage_set_id)?
+                        .into_iter()
+                        .filter(|p| !age_files.iter().any(|(_, a)| Path::new(a) == p))
+                        .collect();
+
+                plans.push(SetPlan {
+                    stage_set_id: *stage_set_id,
+                    age_files,
+                    plaintext_orphans,
+                });
+            }
+
             for plan in &plans {
                 for (slice_id, _) in &plan.age_files {
                     tx.execute(
@@ -591,9 +608,11 @@ pub fn clean_staging(
                 )?;
             }
             tx.commit()?;
-            Ok(())
+            Ok((held, plans))
         },
     )?;
+    report.held_by_live_session = held.held_by_live_session;
+    report.held_by_pending_rewrite = held.held_by_pending_rewrite;
     report.sets_cleaned += plans.len();
 
     // THEN unlink — the DB no longer points at any of these paths.
@@ -638,24 +657,7 @@ fn drop_held<T>(
 ) -> Result<Vec<(i64, T)>> {
     let mut candidates_free = Vec::with_capacity(candidates.len());
     for (stage_set_id, item) in candidates {
-        let live: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT v.id, v.label FROM writes w
-                 JOIN volumes v ON v.id = w.volume_id
-                 WHERE w.stage_set_id = ?1",
-            )?;
-            let rows = stmt
-                .query_map(params![stage_set_id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows.into_iter()
-                .filter(|(volume_id, _)| {
-                    crate::staging::lock::volume_session_live(conn, *volume_id)
-                })
-                .map(|(_, label)| label)
-                .collect()
-        };
+        let live = live_session_labels(conn, stage_set_id)?;
         if live.is_empty() {
             candidates_free.push((stage_set_id, item));
         } else {
@@ -679,6 +681,61 @@ fn drop_held<T>(
         }
     }
     Ok(candidates_free)
+}
+
+/// The volumes of `stage_set_id`'s writes whose session lock another
+/// process (or open file description) holds right now (issue #376): a live
+/// writer, resume, confirm or verify, which reads these staged slices next.
+/// [`drop_held`]'s first fact, and `snapshot delete`'s (issue #540).
+pub(crate) fn live_session_labels(conn: &Connection, stage_set_id: i64) -> Result<Vec<String>> {
+    let rows: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT DISTINCT v.id, v.label FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE w.stage_set_id = ?1",
+        )?
+        .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(volume_id, _)| crate::staging::lock::volume_session_live(conn, *volume_id))
+        .map(|(_, label)| label)
+        .collect())
+}
+
+/// The pending `volume rewrite` holding `stage_set_id`, if one does (issue
+/// #483): [`drop_held`]'s second fact, and `snapshot delete`'s (issue #540).
+pub(crate) fn pending_rewrite_hold(
+    conn: &Connection,
+    stage_set_id: i64,
+) -> Result<Option<crate::volume::rewrite::Hold>> {
+    Ok(crate::volume::rewrite::holds(conn)?.remove(&stage_set_id))
+}
+
+/// The first volume (by id) holding an `'aborted'` write of `stage_set_id`
+/// that `tapectl volume resume` would re-confirm once a clean full verify is
+/// recorded (issues #280, #325;
+/// `session::aborted_session_reconfirmable_after_verify`): that re-confirm
+/// revalidates against these staged slices. `'failed'` rows are never
+/// adopted.
+pub(crate) fn reconfirmable_aborted_on(
+    conn: &Connection,
+    stage_set_id: i64,
+) -> Result<Option<String>> {
+    let aborted_on: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT DISTINCT v.id, v.label FROM writes w JOIN volumes v ON v.id = w.volume_id
+             WHERE w.stage_set_id = ?1 AND w.status = 'aborted'
+             ORDER BY v.id",
+        )?
+        .query_map(params![stage_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (volume_id, label) in aborted_on {
+        if crate::volume::session::aborted_session_reconfirmable_after_verify(conn, volume_id)? {
+            return Ok(Some(label));
+        }
+    }
+    Ok(None)
 }
 
 /// The `'staged'` sets within `scope` that hold a range (1.7.0, issue #478;
@@ -1743,6 +1800,80 @@ mod tests {
         assert_eq!(report.sets_cleaned, 1, "released, --force releases it");
         assert!(report.held_by_live_session.is_empty());
         assert!(!path.exists());
+    }
+
+    /// Issue #540: a write planned by another process between the sets
+    /// `clean_staging` chose and its release (a `planned` row, and the
+    /// volume's lock for the `force` case) never has its set released under
+    /// it: either the plan waits for the release, or the release leaves the
+    /// set. On the parent the choice was made outside the release's
+    /// transaction, and the set was released with the plan on it.
+    #[test]
+    fn a_write_planned_in_the_release_window_never_loses_its_set() {
+        for force in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db_file = tmp.path().join("tapectl.db");
+            let conn = db::open(&db_file).unwrap();
+            let (set, path, dir) = seed_stage_set_rows(&conn, "staged");
+            seed_write(&conn, set, "V-DONE", "completed");
+
+            let other = Connection::open(&db_file).unwrap();
+            other.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let keep = held.clone();
+            IN_THE_WINDOW.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let planned = (|| -> rusqlite::Result<()> {
+                        let tx = other.unchecked_transaction()?;
+                        tx.execute(
+                            "INSERT INTO volumes (label, backend_type, backend_name,
+                                                  capacity_bytes, status)
+                             VALUES ('V-NEXT', 'lto', 'lto0', 2500000000000, 'initialized')",
+                            [],
+                        )?;
+                        let volume_id = tx.last_insert_rowid();
+                        tx.execute(
+                            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                             SELECT id, snapshot_id, ?2, 'planned' FROM stage_sets WHERE id = ?1",
+                            params![set, volume_id],
+                        )?;
+                        tx.commit()?;
+                        *keep.borrow_mut() = Some(
+                            crate::staging::lock::acquire_volume(&other, volume_id, "V-NEXT")
+                                .unwrap(),
+                        );
+                        Ok(())
+                    })();
+                    // Busy is the plan waiting for the release: that is fine.
+                    let _ = planned;
+                }));
+            });
+            let run = clean_staging(&conn, &config_for(dir.path()), force, CleanScope::Whole);
+            IN_THE_WINDOW.with(|hook| hook.borrow_mut().take());
+            run.unwrap();
+
+            let planned: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writes WHERE stage_set_id = ?1 AND status = 'planned'",
+                    params![set],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM stage_sets WHERE id = ?1",
+                    params![set],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                planned == 0 || (status == "staged" && path.exists()),
+                "force={force}: a write was planned on set {set} and the release took it \
+                 ({status}, slice there: {})",
+                path.exists()
+            );
+            drop(held);
+        }
     }
 
     /// A `'failed'` stage_set with NO `stage_slices` rows (the common shape

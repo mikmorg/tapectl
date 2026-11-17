@@ -3227,17 +3227,10 @@ pub fn export_unit(
     Ok(())
 }
 
-/// The volumes whose `interrupted` write rows a delete of `snap_id` will
-/// remove (issue #176 step 4).
-///
-/// Extracted so the rule can be tested directly. It used to be inline, and
-/// its test asserted on CAPTURED TRACING OUTPUT — which is not deterministic:
-/// `tracing`'s per-callsite `Interest` is process-global, so under a parallel
-/// `cargo test` whichever thread reaches the `warn!` first can decide the
-/// callsite is uninteresting for every later one, and the capture comes back
-/// empty. That flake reached master and failed a coordinator gate on
-/// 2026-09-16; `rebuild_interest_cache()` narrowed the window but did not
-/// close it. The SQL is the part worth pinning, and it needs no subscriber.
+/// The volumes holding an `interrupted` write of `snap_id` (issue #176 step
+/// 4). A delete used to remove such rows and warn; since #540 one refuses
+/// the delete ([`snapshot_write_hold_refusal`]): `volume resume` continues
+/// that session from the staged slices the delete would remove.
 fn interrupted_write_volumes(conn: &Connection, snap_id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT v.label FROM writes w
@@ -3286,6 +3279,75 @@ pub(crate) fn snapshot_on_tape_refusal(
     })
 }
 
+/// Why `snapshot delete` refuses version `version` of `unit_name` (snapshot
+/// `snap_id`) while a write session holds its staged slices (issue #540),
+/// `--force` or not: the delete removes the slices AND the `writes` rows that
+/// record the session. `stage clean --force` keeps a set from a session
+/// running now and from a pending `volume rewrite` (`staging::clean`'s
+/// `drop_held`); a delete also takes the record, so it refuses a session
+/// that can still be taken up too: an `interrupted` write (`volume resume`
+/// continues it from these slices) and an `aborted` one whose seal is
+/// recorded (`volume resume` re-confirms it after a clean full verify,
+/// #280, #325). An `aborted` session that can never be re-confirmed, a
+/// `failed` one, and a `planned` or `in_progress` row no process holds are
+/// not refused. `snapshot.rs`' dry run asks the same question through this
+/// function, so the two refuse alike.
+pub(crate) fn snapshot_write_hold_refusal(
+    conn: &Connection,
+    snap_id: i64,
+    unit_name: &str,
+    version: i64,
+) -> Result<Option<String>> {
+    use crate::staging::clean::{
+        live_session_labels, pending_rewrite_hold, reconfirmable_aborted_on,
+    };
+    let what = format!("snapshot {unit_name} v{version}");
+    let sets: Vec<i64> = conn
+        .prepare("SELECT id FROM stage_sets WHERE snapshot_id = ?1 ORDER BY id")?
+        .query_map(params![snap_id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for &set in &sets {
+        let live = live_session_labels(conn, set)?;
+        if let Some(label) = live.first() {
+            return Ok(Some(format!(
+                "{what} is being written right now: a write session on volume \"{label}\" \
+                 holds its staged slices — cannot delete. Let the session finish (or stop \
+                 it), then run this again"
+            )));
+        }
+        if let Some(hold) = pending_rewrite_hold(conn, set)? {
+            return Ok(Some(format!(
+                "{what}'s staged slices are held by the rewrite of volume \"{}\", and may be \
+                 the only copy until \"{}\" has passed a full readback — cannot delete. \
+                 Finish the rewrite with `{}`",
+                hold.source,
+                hold.destination,
+                hold.resume_command()
+            )));
+        }
+    }
+    if let Some(label) = interrupted_write_volumes(conn, snap_id)?.first() {
+        return Ok(Some(format!(
+            "{what} has an interrupted write on volume \"{label}\": `tapectl volume resume \
+             {label}` continues it from these staged slices, and deleting them would make it \
+             unrecoverable — cannot delete. Resume it, or give that write up first \
+             (`tapectl volume abort {label}`) and run this again"
+        )));
+    }
+    for &set in &sets {
+        if let Some(label) = reconfirmable_aborted_on(conn, set)? {
+            return Ok(Some(format!(
+                "{what} has an aborted write on volume \"{label}\" whose seal is recorded: \
+                 after a clean full verify (`tapectl volume verify {label}`), `tapectl volume \
+                 resume {label}` re-confirms that tape from these staged slices — cannot \
+                 delete. Verify and resume it, or give that tape up first (`tapectl volume \
+                 retire {label}`) and run this again"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Delete an unwritten snapshot.
 pub fn snapshot_delete(
     conn: &Connection,
@@ -3310,6 +3372,12 @@ pub fn snapshot_delete(
     // Check if snapshot has been written to tape: a completed write, or a
     // range of one (#478), whose slices are on its tape as surely.
     if let Some(refusal) = snapshot_on_tape_refusal(conn, snap_id, version)? {
+        return Err(TapectlError::Other(refusal));
+    }
+    // Issue #540: a write session that holds the staged slices, running now
+    // or one that can be taken up again, before the cascade and whatever
+    // `--force` says.
+    if let Some(refusal) = snapshot_write_hold_refusal(conn, snap_id, unit_name, version)? {
         return Err(TapectlError::Other(refusal));
     }
 
@@ -3358,14 +3426,6 @@ pub fn snapshot_delete(
         let rows = stmt.query_map(params![snap_id], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-
-    // Any `writes` row this delete removes that sits at `interrupted` names
-    // a write session that can never be resumed again — its Layout
-    // referenced slices this command is about to drop, and resume's
-    // revalidation would refuse it anyway. #94 settled that only the
-    // operator judges a session unrecoverable, so this collects a warning
-    // naming the volume rather than auto-aborting the row.
-    let interrupted_volumes = interrupted_write_volumes(conn, snap_id)?;
 
     // Cascade delete: verification_results -> write_positions -> writes ->
     // stage_slices -> stage_sets -> files -> snapshot
@@ -3508,27 +3568,11 @@ pub fn snapshot_delete(
         );
     }
 
-    // Issue #176 step 4: an `interrupted` write's session cannot be resumed
-    // once its slices are gone -- #94 settled that only the operator
-    // decides a session is unrecoverable, so this names the volume rather
-    // than auto-aborting the sibling `writes` row (already deleted above).
-    let mut warnings = Vec::new();
-    for label in &interrupted_volumes {
-        let msg = format!(
-            "snapshot {unit_name} v{version} had an interrupted write on volume \"{label}\" \
-             -- that session can no longer be resumed now that its slices are gone; \
-             run `tapectl volume abort {label}` before reusing the cartridge"
-        );
-        tracing::warn!(volume = %label, unit = %unit_name, version, "{msg}");
-        warnings.push(msg);
-    }
-
     if json_output {
         crate::render::print_json(&serde_json::json!({
             "unit": unit_name,
             "version": version,
             "deleted": true,
-            "warnings": warnings,
         }));
     } else {
         println!("snapshot {unit_name} v{version} deleted (was: {status})");
@@ -10985,9 +11029,15 @@ mod tests {
     /// Negative control (pre-fix HEAD): `snapshot_delete` returns
     /// `Err("FOREIGN KEY constraint failed")` for every one of these five
     /// statuses.
+    ///
+    /// Issue #540 took `interrupted` out of the list: a write `volume
+    /// resume` can still take up now refuses the delete
+    /// (`delete_is_refused_while_a_write_is_interrupted_and_abort_is_the_way`).
+    /// The other four, with no session running and no seal recorded, still
+    /// delete.
     #[test]
     fn delete_succeeds_with_a_non_completed_write_row() {
-        for status in ["planned", "in_progress", "failed", "aborted", "interrupted"] {
+        for status in ["planned", "in_progress", "failed", "aborted"] {
             let tmp = tempfile::TempDir::new().unwrap();
             let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
             let volume_id = insert_volume(&conn, &format!("VOL-{status}"));
@@ -11113,19 +11163,21 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_dir_str = session_dir.to_string_lossy().to_string();
 
+        // `aborted` rows, of a session that can never be re-confirmed (no
+        // seal recorded): an `interrupted` one refuses the delete (#540).
         let volume_id = insert_volume(&conn, "VOL-SHARED");
         insert_write(
             &conn,
             snap1_id,
             volume_id,
-            "interrupted",
+            "aborted",
             Some(&session_dir_str),
         );
         insert_write(
             &conn,
             snap2_id,
             volume_id,
-            "interrupted",
+            "aborted",
             Some(&session_dir_str),
         );
 
@@ -11174,48 +11226,180 @@ mod tests {
         );
     }
 
-    /// Issue #176 step 4: an `interrupted` write's session can never be
-    /// resumed once this delete removes the slices its Layout referenced,
-    /// so the operator needs a pointer to `tapectl volume abort <label>`.
-    /// #94 already settled that this must be a warning, never an
-    /// auto-abort of the row.
-    #[test]
-    fn delete_of_an_interrupted_session_names_the_volume() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (conn, snap_id, _slices) = setup_deletable_snapshot(tmp.path());
-        let volume_id = insert_volume(&conn, "VOL-NAMED-INTERRUPTED");
-        insert_write(&conn, snap_id, volume_id, "interrupted", None);
-
-        // Asserted against the rule itself, NOT against captured tracing
-        // output: `tracing`'s per-callsite `Interest` is process-global, so
-        // under a parallel `cargo test` whichever thread reaches the `warn!`
-        // first can decide the callsite is uninteresting for every later
-        // one and the capture comes back empty. That is a property of the
-        // test harness, not of this code, and it failed a gate on master.
-        let named = interrupted_write_volumes(&conn, snap_id).unwrap();
-        assert_eq!(
-            named,
-            vec!["VOL-NAMED-INTERRUPTED".to_string()],
-            "the interrupted write's volume must be the one the warning names"
-        );
-
-        snapshot_delete(&conn, "unit1", 1, true, false).unwrap();
-
-        // And it named it because the row was really there and is really
-        // gone — the warning is about work this delete actually did.
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM writes WHERE snapshot_id = ?1",
-                params![snap_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(remaining, 0, "the interrupted write row must be gone");
+    /// `snapshot delete --dry-run`'s verdict, for comparing with the delete's.
+    fn delete_dry_run(conn: &Connection, dir: &Path) -> Result<()> {
+        crate::cli::snapshot::run(
+            conn,
+            &crate::config::TapectlPaths::new(dir.to_path_buf()),
+            &crate::config::Config::default(),
+            &crate::cli::snapshot::SnapshotCommands::Delete {
+                name: "unit1".into(),
+                version: 1,
+                force: true,
+            },
+            false,
+            true,
+            false,
+        )
     }
 
-    /// Issue #176 step 2: the `completed` guard is the ONLY write-related
-    /// refusal and must stay that way — this pins that a `completed` row
-    /// still refuses exactly as before the fix.
+    fn snapshot_rows(conn: &Connection, snap_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+            params![snap_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #540: `snapshot delete --force` refuses while an `interrupted`
+    /// write holds the version's staged slices (`volume resume` continues it
+    /// from them), its dry run alike, and deletes nothing. The remedy it
+    /// names works: after `volume abort`, the delete goes through. On the
+    /// parent the delete went through and only warned.
+    #[test]
+    fn delete_is_refused_while_a_write_is_interrupted_and_abort_is_the_way() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, slices) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-INT");
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized' WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        insert_write(&conn, snap_id, volume_id, "interrupted", None);
+
+        let msg = snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect_err("a resumable write's slices must not be deleted")
+            .to_string();
+        assert!(
+            msg.contains("interrupted write on volume \"VOL-INT\"")
+                && msg.contains("cannot delete"),
+            "{msg}"
+        );
+        crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+            &msg,
+            &[],
+            &[
+                "tapectl volume resume VOL-INT",
+                "tapectl volume abort VOL-INT",
+            ],
+        );
+        let dry = delete_dry_run(&conn, tmp.path()).unwrap_err().to_string();
+        assert_eq!(dry, msg, "the dry run refuses as the delete does");
+        assert_eq!(snapshot_rows(&conn, snap_id), 1);
+        assert!(slices.iter().all(|f| f.exists()));
+
+        crate::volume::write::volume_abort(&conn, "VOL-INT", true).unwrap();
+        snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect("once the write is given up, the delete goes through");
+        assert_eq!(snapshot_rows(&conn, snap_id), 0);
+    }
+
+    /// Issue #540: an `aborted` write whose seal is recorded is one `volume
+    /// resume` re-confirms after a clean full verify, from these staged
+    /// slices (#280, #325), so the delete refuses it too, naming the verify,
+    /// the resume and the way to give that tape up; retired, the delete goes
+    /// through.
+    #[test]
+    fn delete_is_refused_while_an_aborted_write_can_be_reconfirmed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (conn, snap_id, slices) = setup_deletable_snapshot(tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-SEALED");
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized', sealed_at = datetime('now') WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        insert_write(&conn, snap_id, volume_id, "aborted", None);
+        crate::db::events::log_event(
+            &conn,
+            "volume",
+            volume_id,
+            Some("VOL-SEALED"),
+            "write_aborted",
+            None,
+            None,
+            Some("operator abandoned the unfinished write session (`volume abort`)"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::volume::session::aborted_session_reconfirmable_after_verify(&conn, volume_id)
+                .unwrap(),
+            "the fixture is a re-confirmable aborted session"
+        );
+
+        let msg = snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect_err("a re-confirmable write's slices must not be deleted")
+            .to_string();
+        assert!(
+            msg.contains("aborted write on volume \"VOL-SEALED\"") && msg.contains("cannot delete"),
+            "{msg}"
+        );
+        crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+            &msg,
+            &[],
+            &[
+                "tapectl volume verify VOL-SEALED",
+                "tapectl volume resume VOL-SEALED",
+                "tapectl volume retire VOL-SEALED",
+            ],
+        );
+        let dry = delete_dry_run(&conn, tmp.path()).unwrap_err().to_string();
+        assert_eq!(dry, msg);
+        assert!(slices.iter().all(|f| f.exists()));
+
+        volume_retire(&conn, &Config::default(), "VOL-SEALED", true, false, false).unwrap();
+        snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect("once that tape is given up, the delete goes through");
+        assert_eq!(snapshot_rows(&conn, snap_id), 0);
+    }
+
+    /// Issue #540: a write session running now (its volume's lock held)
+    /// keeps the snapshot it is writing, as it keeps `stage clean --force`
+    /// off its slices (#376); released, the same delete goes through.
+    #[test]
+    fn delete_is_refused_while_a_session_is_writing_the_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = crate::db::open(&db_file).unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        let (snap_id, slices) = add_unit_snapshot(&conn, tid, "unit1", tmp.path());
+        let volume_id = insert_volume(&conn, "VOL-LIVE");
+        insert_write(&conn, snap_id, volume_id, "planned", None);
+        let holder_conn = Connection::open(&db_file).unwrap();
+        let holder =
+            crate::staging::lock::acquire_volume(&holder_conn, volume_id, "VOL-LIVE").unwrap();
+
+        let msg = snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect_err("a live session's slices must not be deleted")
+            .to_string();
+        assert!(
+            msg.contains("volume \"VOL-LIVE\"")
+                && msg.contains("right now")
+                && msg.contains("cannot delete"),
+            "{msg}"
+        );
+        let dry = delete_dry_run(&conn, tmp.path()).unwrap_err().to_string();
+        assert_eq!(dry, msg);
+        assert!(slices.iter().all(|f| f.exists()));
+
+        drop(holder);
+        snapshot_delete(&conn, "unit1", 1, true, false)
+            .expect("with no session running, a planned row holds nothing");
+        assert_eq!(snapshot_rows(&conn, snap_id), 0);
+    }
+
+    /// Issue #176 step 2: a `completed` row still refuses exactly as before
+    /// the fix. (Since #540 a write session holding the staged slices
+    /// refuses too: the tests above.)
     #[test]
     fn delete_still_refuses_a_completed_write() {
         let tmp = tempfile::TempDir::new().unwrap();

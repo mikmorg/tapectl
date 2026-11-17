@@ -86,7 +86,7 @@ tapectl snapshot diff [OPTIONS] --v1 <V1> --v2 <V2> <NAME>
 
 Delete a snapshot no tape holds
 
-Refused for a version on tape (a completed write or a range), and for one with staged data unless --force.
+Refused for a version on tape (a completed write or a range), for one a write session holds (running now, interrupted, or aborted with its seal recorded, which `volume resume` can still take up), and for one with staged data unless --force.
 
 ```text
 tapectl snapshot delete [OPTIONS] --version <VERSION> <NAME>
@@ -101,7 +101,7 @@ tapectl snapshot delete [OPTIONS] --version <VERSION> <NAME>
 - `--version <VERSION>` *(required)* — The version to delete
 - `--force` — Delete it though it is staged: its staged data goes too
   
-    Never deletes a version on tape.
+    Never deletes a version on tape, nor one a write session holds.
 
 ### tapectl snapshot purge
 

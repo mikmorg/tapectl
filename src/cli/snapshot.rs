@@ -69,8 +69,10 @@ pub enum SnapshotCommands {
 
     /// Delete a snapshot no tape holds
     ///
-    /// Refused for a version on tape (a completed write or a range), and for
-    /// one with staged data unless --force.
+    /// Refused for a version on tape (a completed write or a range), for one
+    /// a write session holds (running now, interrupted, or aborted with its
+    /// seal recorded, which `volume resume` can still take up), and for one
+    /// with staged data unless --force.
     Delete {
         /// The unit
         name: String,
@@ -79,7 +81,7 @@ pub enum SnapshotCommands {
         version: i64,
         /// Delete it though it is staged: its staged data goes too
         ///
-        /// Never deletes a version on tape.
+        /// Never deletes a version on tape, nor one a write session holds.
         #[arg(long)]
         force: bool,
     },
@@ -530,9 +532,11 @@ pub fn run(
             version,
             force,
         } => {
-            // Issue #241: reproduces `snapshot_delete`'s two refusals
-            // (on tape, `operations::snapshot_on_tape_refusal`: a completed
-            // write or a range; staged data without --force) so a dry run
+            // Issue #241: reproduces `snapshot_delete`'s refusals (on tape,
+            // `operations::snapshot_on_tape_refusal`: a completed write or a
+            // range; a write session holding the staged slices, running or
+            // resumable, `operations::snapshot_write_hold_refusal`, #540;
+            // staged data without --force) so a dry run
             // refuses exactly what the real delete would refuse, without
             // touching a row or a staged file.
             if dry_run {
@@ -550,6 +554,11 @@ pub fn run(
                 if let Some(refusal) =
                     crate::cli::operations::snapshot_on_tape_refusal(conn, snap_id, *version)?
                 {
+                    return Err(TapectlError::Other(refusal));
+                }
+                if let Some(refusal) = crate::cli::operations::snapshot_write_hold_refusal(
+                    conn, snap_id, name, *version,
+                )? {
                     return Err(TapectlError::Other(refusal));
                 }
                 let staged_count: i64 = conn.query_row(
