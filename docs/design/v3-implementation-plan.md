@@ -317,13 +317,21 @@ entries by number, and write down the exact recipe the host step (T4.14) will us
 6. Run the new tar's own test suite if time allows (`make check`); record the result or that
    it was not run.
 
+**Decision rule, fixed before the measurement:** item 275's way stands if steps 4 and 5
+both hold: the tar built there writes the ACL's entries by number, and the system's tar
+writes a name. If a tar of 1.35 or later cannot be built on Debian 10 with ACL support,
+report what failed and stop: how the production host gets a tar that meets the floor
+goes back to the CTO.
+
 **Done when:** a note holds the recipe (packages, configure line, version, sha256), the proof
-and the control; #563 has a comment; #554's Phase 0 box is the coordinator's to tick.
+and the control, with the rule's verdict stated; #563 has a comment; #554's Phase 0 box is
+the coordinator's to tick.
 
 ### T0.3 Real scale: a made tree of two million files
 
-**Owner:** worker. **Depends:** nothing. **Carries out:** item 253's third measurement, as
-item 291 ruled it; #554 Phase 0.
+**Owner:** worker. **Depends:** nothing. **It does not wait for the go**: item 291
+ratified a recommendation to run it "now", and it builds nothing. **Carries out:** item
+253's third measurement, as item 291 ruled it; #554 Phase 0.
 
 **What item 291 changed.** This task had two legs. The leg over the production host's
 largest real unit is no longer run before the code: its proof is taken from the real-drive
@@ -2278,37 +2286,88 @@ today and now serves every set.
 134, 138) and *the per-slice release* (item 129) are unchanged. They were written for a
 set that may span, and every set now may.
 
+*One planner.* Today a write has two: `build_write_layout` when no set in the batch
+spans (it builds every staged unit, and refuses the whole write when they do not all
+fit), and `build_span_layout` when one does (a probe build, `place`, the build in plan
+order, and `read_back_span_plan`). The second becomes the only one. Every staged set is
+classed by `plan_span_set`'s rule, which today serves a set that allows spanning or has
+a range: `Owed` when it has a range row on a sealed volume and a slice below its floor,
+and otherwise a queued set with its whole slice list. A write is never refused because
+the staged sets do not all fit: the plan takes what the bound allows, and the rest
+waits, staged.
+
 *The batch* (D19). The selector is next-fit in the collection's order and stays so: it
 never went back for a smaller unit. What changes is where a batch closes. Today it closes
-at the first unit that does not fit. Now units are added while the plan's end is at or
-below the bound, and the unit that carries it past is the batch's last: the bound is the
-cartridge's nominal capacity on a drive that declares `post_warning_bytes`, and the fill
-ceiling on one that does not. This is what `plan_batches_spanning` does today for units
-that allow spanning, through `CapacityBudget::place`; it becomes the one path, and
-`plan_batches`, `plan_batches_prioritised`'s whole-unit branch, `OversizedUnit` and
-`after_the_tail` go. A batch is still bounded by the staging area (item 85), and the
-space that owed slices of an earlier batch still hold there counts against it. The
-selector works from estimates made before staging; the write's plan works from the staged
-sizes. Where the estimate was high (it is for every compressed unit), the tape ends by
-its plan with room left. That is accepted here: staging in rounds to fill it is not
-built.
+before the first unit that does not fit. Now units are added while the plan's end is at
+or below the bound, and the unit that carries it past is the batch's last: the bound is
+the cartridge's nominal capacity on a drive that declares `post_warning_bytes`, and the
+fill ceiling on one that does not. `plan_batches_spanning` does this today for units that
+allow spanning, through `CapacityBudget::place`; it becomes the one path, and
+`plan_batches`, `next_fit`'s close, `unit_limit`, `OversizedUnit` and `after_the_tail`
+go. "Bounded by the staging area" (D19) is what the code does today and no new bound: a
+unit larger than the staging filesystem is refused by name, and each unit's stage checks
+the free space before it starts. The room that slices already staged will take on the
+tape still comes off the batch's room (`already_staged_on_tape_bytes`), as today.
 
-**Fence:** `src/volume/layout_model.rs`, `src/volume/span_proofs.rs`, `src/volume/write.rs`
-(the plan and its texts), `src/volume/session.rs` (`span_split` and the rows it writes),
-`src/collection/selector.rs`, `src/collection/plan.rs`, `src/collection/sync.rs`,
-`src/collection/fingerprint.rs`, `src/policy/*`, `src/config.rs`, `src/config_edit.rs`,
-`src/unit/*`, `src/cli/archive_set.rs`, `src/cli/unit.rs`, `src/cli/tenant.rs`,
-`src/cli/collection.rs`, `src/cli/audit.rs`, `src/for_location.rs`, `src/db/mod.rs`,
-`src/db/models.rs`, `src/db/migrations/001_baseline.sql`, their tests, the span tests of
-`tests/catalog_rebuild.rs`, `tests/integration.rs` and `tests/format_v3.rs`, the generated
-pages; `scripts/span-acceptance.sh` and `scripts/short-seal-acceptance.sh` (the
-coordinator runs them).
+*The batch after staging* (item 289, kept for a unit that packs). The selector works from
+sizes estimated before staging, and the write's plan from the staged sizes. An estimate
+is always high for a compressed unit, so by the estimate alone its tape would end by its
+plan, short of the warning. So `collection run` stages in rounds: after it has staged the
+batch the selector chose, it asks the plan, and while the plan has no set that passes
+the bound and a pending unit remains, it stages the next one and asks again. The run
+then writes once, as today. `collection plan` shows the batch by estimate and says that
+a run may take more.
+
+*`volume rewrite`'s destination, in this task.* A rewrite plans under the fill ceiling
+and never past it (item 142's reason stands: it may hold a unit's only copy). Today its
+write is planned with `may_span` unset, and a unit the early warning interrupts is `cut`:
+the rewrite stays open on the cut sets and the hold keeps their staged slices. With no
+`cut` and no `may_span`, the interrupted set is a range on the destination, and two tests
+that read `completed` have to read slices:
+- **the hold** (`rewrite::holds`, `coverage::fully_read_back_copy`). Today a set is held
+  while its rewrite is open and no eligible volume has a `completed`, verified write of
+  it. A range is never that, so the hold would never lift. It becomes: a staged slice of
+  a set the rewrite staged is held while the rewrite is open and no eligible volume
+  holds that slice at a `written` position in a `completed` or `range` row that was read
+  back in full. `pending_rewrite_sets` still records stage sets; the test is made slice
+  by slice, and needs no new column.
+- **the close** (`destination_facts`, `cut_pending`). A rewrite closes when every slice
+  it staged passes that test, where today every set must be `completed` and verified on
+  the new volume. Until then it stays open, and the stop names the ordinary `volume
+  write` with a full readback that writes the slices not yet taken.
+A source that holds a range is still refused in this task (`refuse_range_holder`); T5.3
+lifts that.
+
+*The schema.* `writes` loses `may_span`, the status `cut`, and the check that a `range`
+row has `may_span` set. Its uniqueness on `(stage_set_id, volume_id)` stays, which is
+what keeps one range of a staging on a volume. No column is added.
+
+*One invariant more* under `audit`'s `short_seal` check, beside the range invariants: a
+`completed` row holds a `written` position of every slice of its set. Nothing checks
+that today, and a wrong `completed` row counts copies that do not exist.
+
+**Fence.** This task is alone in its wave, and its fence is drawn by what it removes:
+every file under `src/` and `tests/` that
+`grep -rlE "allow_spanning|may_span|PlanClass|Spanning::|Split::Cut|ReleaseBlocker::Cut|'cut'"`
+names, with `src/db/migrations/001_baseline.sql`, `src/collection/batch.rs` (the rounds),
+`src/policy/coverage.rs` and `src/volume/rewrite.rs` (the hold and the close), and the
+generated pages. On 2026-11-17 that was the planner (`src/volume/layout_model.rs`,
+`write.rs`, `build.rs`, `session.rs`), the catalog's readers of a row's status
+(`adopt_lost.rs`, `rebuild.rs`, `restore.rs`, `restore/span.rs`, `figures.rs`,
+`src/staging/clean.rs`, `release.rs`, `mod.rs`), the policy key (`src/config.rs`,
+`src/policy/*`, `src/unit/*`, `src/cli/archive_set.rs`), the selector and the batch
+(`src/collection/*`, `src/for_location.rs`), and the commands' output (`src/cli/volume.rs`,
+`collection.rs`, `catalog.rs`, `restore.rs`, `stage.rs`, `audit.rs`).
+`scripts/span-acceptance.sh` and `scripts/short-seal-acceptance.sh` are the
+coordinator's to run. The heir's script and File 1 are not in it: T4.10 to T4.13 wrote
+them for the rule this task builds.
 
 **Traps:**
 - **W1 to W9 do not change.** Do not touch the block retry, the seal, its `ended_after` or
   the readback past the warning.
-- `volume rewrite` and compaction still refuse a range volume until T5.3. Do not lift that
-  here.
+- `volume rewrite` and compaction still refuse a **source** that holds a range until T5.3.
+  Do not lift that here: lifting it before T5.3's selection is in place erases slices
+  (T5.3's first trap).
 - Items 93, 134 and 139 stand: with a copy target of 2 at one location the plan must still
   yield the whole middle tape. Keep the proof of it.
 - An owed run bound to a location (item 159, as built) is unchanged.
@@ -2320,7 +2379,10 @@ coordinator runs them).
 **Done when:** a unit interrupted by the test hook's early warning has a `range` row and no
 `cut` row, and the next write lays its owed slices first; a batch queued to fill ends a
 full tape with one unit across its end; on a drive without `post_warning_bytes` the tape
-ends by its plan at the ceiling and the rest continues; item 93's shape (two copies: tapes
+ends by its plan at the ceiling and the rest continues; a batch of units that pack is
+staged in rounds until its plan passes the bound; a rewrite whose destination meets the
+early warning leaves a range, stays open, and closes after an ordinary write with a full
+readback has taken the rest; item 93's shape (two copies: tapes
 1 and 3, or tape 2 alone) and a unit on three tapes restore whole through tapectl and
 through the heir's script, in tests and on mhvtl (`scripts/span-acceptance.sh --mhvtl`);
 `grep -rn 'allow_spanning\|may_span' src tests` finds nothing; the suite is green.
@@ -2330,7 +2392,12 @@ through the heir's script, in tests and on mhvtl (`scripts/span-acceptance.sh --
 **Owner:** worker. `audit` holds active units to two places through `[defaults] copies_at`
 (item 257); `min_locations` no longer binds tape-only units alone, as #550's criteria say.
 `stage for-location`, `volume write --for-location`, `report needs` and
-`--keep-staging-for-locations` are proven on tar stagings. **Fence:** `src/policy/*`,
+`--keep-staging-for-locations` are proven on tar stagings. **Determined:** `stage
+for-location` stages a version again by reading its slices back from tape, and today it
+needs one live volume that holds every slice (`src/for_location.rs`, the read-back's
+choice of a source). After T5.1 a version often lies on two cartridges, so it reads each
+slice from a volume that holds it, asking for one cartridge after another, as tapectl's
+restore does. **Fence:** `src/policy/*`,
 `src/for_location.rs`, `src/cli/audit.rs`, `src/cli/report.rs`, their tests.
 **Done when:** #550's criteria are met; `audit` is not clean with every copy of an active
 unit on one shelf, shown by a test.
@@ -2350,65 +2417,78 @@ the typed consent names every version of which the volume is the only holder of 
 slice; `refuse_range_holder` goes.
 
 **A range carried, exactly (determined).** Worked out by the coordinator on 2026-11-17
-against item 106, `layout-session.md` ("Later contacts", "Spanning") and
-`src/volume/rewrite.rs`, under D21. The same standing as T5.1's: correct it where the code
-shows it wrong, and take to the CTO a correction that would change bytes on tape, the
-schema or a spelling.
+against item 106, `layout-session.md` ("Later contacts", "Spanning"), `src/volume/rewrite.rs`
+and the compaction functions of `src/volume/write.rs`, under D21. The same standing as
+T5.1's: correct it where the code shows it wrong, and take to the CTO a correction that
+would change bytes on tape, the schema or a spelling. T5.1 has already made the hold and
+the rewrite's close tests of each slice; this task is about a **source** that holds a
+range.
 
-- *What is carried.* Today a rewrite and a compaction read "only `completed` writes".
-  Now they read every slice the source holds a `written` position of, in a `completed`
-  or a `range` row, whose version is live by today's rule. A source's `range` row is one
-  unbroken run of a staging's slices (item 122), and it is carried as that run.
-- *The destination's plan.* Each carried staging is one run in slice order, and the
-  stagings keep the order the source held them in. The plan stays at or below the fill
-  ceiling, as item 142 has it and for its reason: a rewrite may hold a unit's only copy.
-  A rewrite adds nothing the source did not hold, unless `--with-staged` is given, as
-  today.
+- *What is carried.* One query decides it, `live_recovery_slices`, shared by the
+  rewrite's plan and `compact-read`. Today it takes `written` positions of `completed`
+  rows whose snapshot is neither reclaimable nor purged. It takes those of `range` rows
+  too. A source's `range` row is one unbroken run of a staging's slices (item 122), and
+  it is carried as that run.
+- *The read's own gate.* `compact-read` promotes a stage set to `staged` only when every
+  slice of the set was read, and errors otherwise. For a range that can never hold. It
+  becomes: every slice the source holds of the set was read. `volume read-slices` already
+  stages a range's slices this way.
+- *The destination's plan.* T5.1's one planner, held under the fill ceiling. The slices
+  are written as the run they were read as; the stagings keep the order the source held
+  them in. A rewrite adds nothing the source did not hold, unless `--with-staged` is
+  given, and then too it plans under the fill ceiling.
 - *Two sources that hold runs of one staging* (a compaction onto one destination). They
   go onto one destination only when their runs join into one unbroken run. Otherwise the
   candidate planner does not pair them, and a pairing asked for by hand is refused,
   naming the staging: a volume holds at most one unbroken range of a stage set.
 - *The rows and the block.* The destination's rows come from confirm's split (T5.1):
-  `completed` when it holds the staging whole, `range` otherwise. So a carried range stays
-  a range, and two runs that join into the whole staging become a whole copy. The
+  `completed` when it holds the staging whole, `range` otherwise. So a carried range
+  stays a range, and two runs that join into the whole staging become a whole copy. The
   MANIFEST's block lists every slice of the staging and gives positions to the ones this
-  volume holds (item 125), as a range written from staging does.
-- *The hold, for each slice.* Today a stage set is held while its rewrite is open and no
-  eligible volume carries a fully read back copy of the set. A range is never a whole
-  copy of its set, so that test would hold it forever. The hold becomes: a staged slice
-  of a set the rewrite staged is held while the rewrite is open and no eligible volume
-  holds it at a `written` position in a row that was read back in full. `pending_rewrites`
-  keeps recording stage sets; the test is made slice by slice over the set's staged
-  slices. It is still a fact, so the hold lifts by the passing readback whichever command
-  ran it.
-- *The consent.* Item 106's words are already of a slice: "When some live slice has no
-  copy anywhere else". The typed consent is asked when the source is the only eligible
-  holder of any live slice it holds, in either kind of row, and it names each version so
-  held. A version still in progress counts: its slices on the source are at stake as
-  item 128 has them.
-- *An early warning on the destination.* W1 to W9, as in any write. No unit is cut (item
-  288): the staging the warning interrupted is a range on the destination, the slices not
-  taken stay staged and held, and are owed. The rewrite stays open, the stop names the
-  ordinary `volume write` with a full readback that writes them to another cartridge, and
-  `--resume` then closes it. This is today's handling of a destination that sealed short,
-  with a range where a cut unit was.
+  volume holds (item 125).
+- *`compact-finish`'s gate.* It retires the source only when every live slice the source
+  holds is held by another eligible volume. Today it compares `completed` rows on both
+  sides, so a source's range slices are not checked and a copy held elsewhere as a range
+  does not count. It asks `sole_slices`, which already reads both kinds of row.
+- *The consent* (`volume rewrite`). `sole_slices` and `versions_at_stake` already read
+  `range` rows, so the consent is asked when it should be. Its facts change: for a
+  version of which the source holds some slices, the line says which slices, and names
+  the volumes that hold the rest. "Every slice is read from the source into staging" must
+  be true of what the source holds, range slices included.
 - *One generation* (item 86). A rewrite's destination is the source's own cartridge. A
   compaction's destination that takes a run not starting at slice 1 must be of the
   generation of the volume whose range ends just before it, as any write must.
-- *What goes.* `refuse_range_holder` and the refusals of its callers (`volume rewrite`,
-  `volume compact-read`, `volume compact-finish`, `volume compact`); the sentence "a
-  spannable unit a rewrite carries is planned and recorded whole" (item 142's first
-  half; its second half, the fill ceiling, stands).
+- *The candidates.* `report compaction-candidates` and `audit`'s `compaction_candidate`
+  leave out any volume with a range row and size a volume by its `completed` rows. They
+  count both kinds of row.
+- *What goes.* `refuse_range_holder` and its five calls (`volume rewrite`'s plan,
+  `compact-read` twice, `compact-finish`, `volume compact`), and item 142's first half ("a
+  spannable unit a rewrite carries is planned and recorded whole"). Its second half, the
+  fill ceiling, stands.
 
-**Fence:** `src/volume/rewrite.rs`, the compaction functions and `refuse_range_holder` of
-`src/volume/write.rs`, `src/cli/volume.rs` (the two calls of `refuse_range_holder` and
-their texts), `src/policy/coverage.rs` (`fully_read_back_copy`, which today asks for a
-`completed` and verified write of the whole set, and the query the hold asks), their
-tests.
+**Traps:**
+- **The order of work is a safety rule.** Remove a refusal only in the commit that also
+  holds the selection of `range` rows and a test that carries a source holding only a
+  range. With the refusals gone and the selection unchanged, a rewrite would not stage a
+  range's slices, the consent would still name them, and the cartridge would be erased
+  with them on it.
+- A lead to confirm before building on it (`DEFECT NOT PRESENT` if it is not there):
+  `volume rewrite --with-staged` appears to rehearse its write with spanning off and then
+  write with the unit's own policy, which item 142 forbids. After T5.1 there is no such
+  policy; the write must still stay under the fill ceiling.
+- `compact-write` is an ordinary `volume write`. It already writes an owed run as a
+  range. What it lacks is the source's side.
+
+**Fence:** `src/volume/rewrite.rs`, the compaction functions, `live_recovery_slices` and
+`refuse_range_holder` of `src/volume/write.rs`, `src/cli/volume.rs` (the two calls of
+`refuse_range_holder` and their texts), `src/cli/report.rs` (the compaction candidates),
+`src/cli/audit.rs` (`compaction_candidate`), their tests.
 **Done when:** a rewritten and a compacted volume each restore whole and rebuild to the
 same rows; a volume that holds the tail of one unit and the head of another is rewritten
-and is compacted, and each unit still restores whole from its cartridges; the suite is
-green.
+and is compacted, and each unit still restores whole from its cartridges; a source that
+holds only a range is rewritten, with the typed consent naming the version and the
+volumes that hold its other slices; `compact-finish` refuses while a range slice of the
+source has no other holder; the suite is green.
 
 ### T5.4 `tapectl setup`, and the warehouse procedure
 
@@ -2671,9 +2751,10 @@ and built where shown.
 
 ## Appendix B. What waits on the CTO
 
-1. **The go**, stage by stage. Nothing else is open before it. On the go: Stage 0's
-   measurements (T0.1, T0.2, T0.3, T0.5, T0.6, T0.7) and Stage 2's first wave start
-   together; Stage 3 follows Stage 2; Stage 1 is written when T0.1 and T0.7 are in.
+1. **The go**, stage by stage. Nothing else is open before it. T0.3 alone does not wait
+   for it (item 291). On the go: Stage 0's other measurements (T0.1, T0.2, T0.5, T0.6,
+   T0.7) and Stage 2's first wave start together; Stage 3 follows Stage 2; Stage 1 is
+   written when T0.1 and T0.7 are in.
 2. **A measurement that fails its rule.** T0.1 (neither ACL record is restored by GNU tar
    1.30 and bsdtar), T0.3 (item 253), T0.5 (item 285), T0.6 (item 286's fallback), T0.7
    (item 283). Each task says what goes to the CTO and stops there.

@@ -3493,8 +3493,9 @@ separate question, saying that a "ratify all" would be read as the first two onl
 CTO's words, whole: "Ratify all & handoff for opus to take over; make sure complex
 decisions have been thoroughly determined".
 
-290. **The format's choices D1 to D22 are ratified as proposed.** Each is stated here, so
-     that this record holds them and not only a plan that can be edited.
+290. **The format's choices D1 to D22 are ratified as proposed.** Each is stated here in
+     short, so that this record holds them and not only a plan that can be edited. The
+     full text that was ratified is the plan's at commit `39cbc3d0`.
      - **D1, the layout's identity.** `layout_version = 3`. The magic is
        `tapectl-volume-v3` in File 0, and the front index's and the seal marker's magics
        move with it. `requires` is empty on every Layout 3 tape: the short seal and a unit
@@ -3621,6 +3622,10 @@ decisions have been thoroughly determined".
 - *This is not the go.* The coordinator had written, in the message this answers, that a
   "ratify all" would be read as the two questions above and that the go needs the word.
   The CTO's answer does not say it. Nothing is built.
+- *The made tree may be run before the go.* The recommendation item 291 ratifies said
+  to run that leg "now", and it builds nothing. The coordinator's question about the go
+  had listed it among what the go would start; the ratified words are the ones that
+  hold. Every other measurement, and every task, still waits for the go.
 - *"Handoff for opus to take over"* is read as: the coordinator's role passes to another
   session, which starts from the records and not from this session's memory. Its entry is
   `docs/coordinator-handoff.md`. The roles of the plan (worker, coordinator, operator,
@@ -3629,8 +3634,8 @@ decisions have been thoroughly determined".
   instruction to the coordinator, not as a ruling on any one point: what Stage 1 or a
   task would have had to settle by judgment is settled now and written into the plan,
   so that what follows is execution. Three kinds were found and done:
-  - every measurement task has its decision rule fixed before it runs (T0.3, T0.5 and
-    T0.6 had none, and T0.7's last step had none);
+  - every measurement task has its decision rule fixed before it runs (T0.2, T0.3, T0.5
+    and T0.6 had none, and T0.7's last step had none);
   - every place the plan left to "Stage 1 decides" is decided there (the format
     document's outline, section by section; the baseline's new tables; the fields of each
     algorithm's frame and its range of levels; the flags of tapectl's own reader; what a
@@ -3638,7 +3643,13 @@ decisions have been thoroughly determined".
     `short-seal` entry);
   - the two designs item 288 left owed are worked out against the code: the plan order
     once every unit continues (T5.1), and a range carried through `volume rewrite` and
-    compaction (T5.3, which item 133 had called "its own design").
+    compaction (T5.3, which item 133 had called "its own design"). Neither needs a new
+    column or status. Four of their points are the ones most likely to be overruled, and
+    are said to the CTO as such: a staging of which a tape took no slice leaves no write
+    row; the hold of a rewrite is tested for each slice; on a drive without
+    `post_warning_bytes` the plan cuts a staging at the fill ceiling, which no code does
+    today; and `collection run` stages in rounds, so that a batch of units that pack is
+    still filled to the warning (item 289).
 - *These are determinations, not rulings.* Each is marked "determined" in the plan. A
   coordinator may correct one that the code shows wrong, in the plan and in its report.
   One whose correction would change bytes on tape, the schema or a command's spelling
