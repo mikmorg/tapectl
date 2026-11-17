@@ -1,9 +1,9 @@
 # On-tape volume format — Layout Version 3 (normative)
 
 This is the authoritative specification of the bytes tapectl 2.0.0 writes to a
-sealed cartridge. It is governed by ADR-0007 and by ADR-0012 items 239 to 293, which
-it writes out; where this text and an item disagree, the item wins and this text is
-corrected. It pairs with `docs/design/layout-session.md`, which owns the write
+sealed cartridge. It is governed by ADR-0007 and by ADR-0012 items 239 to 295, which
+it writes out and which ADR-0014 gathers into one decision record; where this text and an
+item disagree, the item wins and this text is corrected. It pairs with `docs/design/layout-session.md`, which owns the write
 session's **state machine, transitions and operational sequence**; this file owns the
 **static format, the isolation invariant, the integrity chain and the heir path**. A
 fact that touches both is stated once, here or there, and referenced. CONTEXT.md's
@@ -18,7 +18,7 @@ tapectl 1.x wrote and is history here.
 
 Points that the ruled texts do not decide at the level of bytes are marked
 **OPEN (Stage 1):** and listed in §10. Nothing is built on an open point until the
-CTO answers it. §10 says which are open.
+CTO answers it. None remains (§10).
 
 ---
 
@@ -44,9 +44,9 @@ filemark, in this fixed order:
 ├──── MIDDLE: encrypted decryption metadata (all known pre-write) ──────────────┤
 │ File 4  Tenant envelope enc(t+op+esc) ┐ MANIFEST.toml (unit blocks, slice    │
 │  ...    Tenant envelope enc(t+op+esc) │ lists, positions), RECOVERY.md,       │
-│ File j   Operator env    enc(op+esc)  │ tables/ (file table and id map per    │
-│ File j+1 Operator backup enc(op+esc)  │ staging), index/, PLAN.toml and       │
-│ File j+2 Tenant backup  enc(t+op+esc) │ catalog.db (operator only). Order §2. │
+│ File j   Operator env    enc(op+esc)  │ index/; tenant only: tables/ (file    │
+│ File j+1 Operator backup enc(op+esc)  │ table, id map); operator only:        │
+│ File j+2 Tenant backup  enc(t+op+esc) │ PLAN.toml, catalog.db. Order §2.      │
 │  ...    Tenant backup   enc(t+op+esc) ┘ Each backup is its primary's bytes.   │
 ├──── BULK: encrypted data (the mass of the tape) ──────────────────────────────┤
 │ File k  Data slice      enc(t+op+esc) ┐ age(the slice: whole members of a     │
@@ -259,18 +259,19 @@ Every envelope on a Layout 3 tape is on it twice (ADR-0012 item 44).
 ### 1.4 The operator envelope's `catalog.db` (normative)
 
 The operator envelope and its backup carry, beside `MANIFEST.toml`, `RECOVERY.md`,
-`PLAN.toml`, `tables/` and `index/`, a tar member `catalog.db` (#83): a standalone SQLite
+`PLAN.toml` and `index/`, a tar member `catalog.db` (#83): a standalone SQLite
 database holding what the catalog knew, at staging time, about **this write's stagings
 only**, every tenant's, so it is never in a tenant envelope. `catalog rebuild
 --from-volume` reads it (`db::ontape_catalog`), and `RECOVERY.md` shows an operator with
 only `sqlite3` how to query it. Tape positions are not in it: `MANIFEST.toml` has them.
 
-**One generation** (D7; ADR-0012 item 258(d)). Its tables are the baseline schema's
-(D9, Appendix A) for the rows this write's stagings need: the tenants, units, snapshots
+**One generation** (D7; ADR-0012 item 258(d)). Its tables are Appendix A.4's, a subset of
+the baseline's tables and columns, for the rows this write's stagings need: the tenants, units, snapshots
 and versions, the stage sets with their slices and recorded recipient lists, the paths
 and file versions, and, **for each staging the tape holds, its file table
 (`stage_files`) and its id map (`stage_ids`) as the catalog database holds them**
-(ADR-0012 items 265, 276; #557, #564). So a rebuild restores both, and a copy written
+(ADR-0012 items 265, 276; #557, #564). The operator envelope carries the file tables
+and id maps only as these rows; it has no `tables/` member (§1.6). So a rebuild restores both, and a copy written
 after a rebuild carries both. `catalog rebuild` takes the file table and the id map from
 this file and from nowhere else (T4.9, determined).
 
@@ -325,6 +326,10 @@ damaged-file list use it too.
 | `state` | `sealed`, `quarantined` (sealed, but a verify proved the medium bad; it may still partly read), or `this-tape` |
 | `sealed_at` | when that volume sealed (RFC 3339, UTC); empty for `this-tape` |
 
+A stage set with no slices recorded states `num_slices`, `first_slice`, `last_slice` and
+`version_bytes` as empty fields. A version with two stage sets on one volume has one row,
+the lower stage set's.
+
 **Which versions and holders** (item 80): every current version with at least one
 `completed` or `range` write on a sealed, unretired volume, plus every version this write
 carries. Its holders are the sealed, unretired volumes holding a `completed` or `range`
@@ -333,8 +338,9 @@ current only once every slice of a stage set of it is on a sealed volume (item 1
 `layout-session.md`); until then it is listed only on a tape that carries it, with its
 earlier holders and their runs. A holder of a range holds only its run, and no row is a
 copy on its own (item 127). `units.tsv` names no stage set, so a reader never joins runs
-by the index, and takes a slice from another tape only by its hash (§5.3 R8). Where a
-cartridge is kept is never on a tape (§2).
+by the index, and takes a slice from another tape only by its hash (§5.3 R8). Unsealed,
+retired and erased volumes are not listed; reclaimable and purged versions are not listed.
+Where a cartridge is kept is never on a tape (§2).
 
 **`index/paths.tsv`** (tenant envelopes only, item 79): one row per path of each version
 listed in that tenant's `units.tsv`. Sorted by `unit`, `version`, then `path` (bytewise).
@@ -396,9 +402,10 @@ each member of the staging's tar stream, **in stream order**:
 - `size`: the file's bytes; 0 for a kind with no data.
 - `sha256`: of the file's bytes as they went to tape, 64 lowercase hex characters, for
   `f`; the target's, for `h`; `-` for the others.
-- `path`: the member's path relative to the unit's root, as the file list gave it to tar
-  without its leading `./`. A reader that names a member to tar spells it with the
-  leading `./`, as the stream has it (T0.7).
+- `path` (**determined**): written as the index's `paths.tsv` writes a path: relative to
+  the unit's root, with no leading `./`, escaped by §1.5's rule. The unit's root itself,
+  when it is a member, is written `.`. A reader that names a member to tar prefixes `./`,
+  as the stream has it (T0.7, item 293).
 - `link target`: for `h` only, the path of the name archived first, escaped the same
   way. A symbolic link's target is in the stream, not in the table.
 
@@ -426,7 +433,8 @@ g	<id>	<name>
 
 It holds, for the staging, every user id and group id its stream carries, as a member's
 owner or group and in an ACL entry, with the name the host gave that id when the stream
-was written, or an empty name when the host knew none (ADR-0012 item 277). An id the
+was written, or an empty name when the host knew none (ADR-0012 item 277). The names
+come from the C library's lookup by id (D13), each distinct id looked up once. An id the
 stream does not carry has no row. A tenant envelope's map names only that tenant's
 stagings' ids. It is in no plaintext file of the tape (item 276). **A restore shows the
 map and never acts on it**: a restore is by number, and no remap by name is built (item
@@ -434,7 +442,7 @@ map and never acts on it**: a restore is by number, and no remap by name is buil
 
 ### 1.7 The damaged-file list (written by readers, not on the tape)
 
-`.tapectl-damaged-files.txt` is written by RESTORE.sh, and by tapectl's restore, in a
+`.tapectl-damaged-files.txt` is written by RESTORE.sh in a
 unit's restored directory (`--to` for one unit, `--to/UNIT` for several), for a restore
 that left a member out or whose files failed their recorded sha256. Line 1:
 `#tapectl-damaged-files`, TAB, `1` (the format), TAB, `unit=` and the unit name, TAB,
@@ -518,9 +526,10 @@ The `#` notes above are for this document; they are not in the file.
 - **`continues = true`** is the last key of a slice's table, present only when true (item
   294): it is stated on a slice that continues a member begun in the slice before it (D22): the second and later slices of a long member's run (§3.3). A slice
   without it begins at a member's start. No plaintext file says which slices are a run.
-- `manifest.rs` is one type in both directions and refuses a key it does not know in
-  `[[units]]` and `[[units.slices]]` (`deny_unknown_fields`); `RESTORE.sh` reads the
-  keys it needs and ignores the rest.
+- **`file_table` and `id_map` appear only in a tenant envelope's block** (determined): the
+  operator envelope has no `tables/` member, and its block omits both keys (§1.4, §1.6).
+- `manifest.rs` is one type in both directions and reads on past a key it does not know,
+  as §1.2 rule 3 says (#134); `RESTORE.sh` reads the keys it needs and ignores the rest.
 
 ---
 
@@ -619,21 +628,32 @@ not held to the floor (§7.3).
 **The command line**, fixed flag by flag:
 
 ```
-tar --create --file=- --format=pax \
-    --numeric-owner --xattrs --acls --xattrs-exclude='system.posix_acl_*' \
+tar --create --file=- --format=pax --numeric-owner \
+    [--xattrs] [--acls --xattrs-exclude='system.posix_acl_*'] \
     --no-recursion --null --verbatim-files-from --files-from=<list> \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 ```
 
+The bracketed flags follow two switches, resolved like the other policy keys and both on
+by default (D11): **`preserve_xattrs`** gives tar `--xattrs`, and **`preserve_acls`**
+gives it `--acls` with T0.1's `--xattrs-exclude='system.posix_acl_*'`.
+
 - `--format=pax`: the stream is POSIX pax (item 253).
 - `--numeric-owner` (item 270): a member's owner and group are stored by number only; the
   header's user and group name fields are empty.
-- `--xattrs --acls --xattrs-exclude='system.posix_acl_*'`: extended attributes are kept,
-  and an ACL is stored **once**, in the text record (`SCHILY.acl.access`,
+- `--xattrs` (with `preserve_xattrs`): extended attributes are kept.
+- `--acls --xattrs-exclude='system.posix_acl_*'` (with `preserve_acls`): an ACL is stored
+  **once**, in the text record (`SCHILY.acl.access`,
   `SCHILY.acl.default`), with every qualifier a number (items 273, 274; measured by T0.1,
   `docs/research/2026-11-17-t01-readers-of-an-acl-stored-once.md`: GNU tar 1.30, 1.34,
   1.35 and bsdtar restore that record with their ordinary flags, and none restores the
   raw `system.posix_acl_*` record with them). The raw record is not stored.
+
+**OPEN (Stage 1):** with `preserve_xattrs` on and `preserve_acls` off, `--xattrs` alone
+stores an ACL as its raw `system.posix_acl_*` attribute (T0.1's `raw.tar`). D11 says the
+second switch "gives tar `--acls`" and nothing more. Options: (a) the exclude is given
+whenever `--xattrs` is, so no ACL is stored when `preserve_acls` is off; (b) the exclude
+follows `preserve_acls` only, and the raw record is stored in that case.
 - `--no-recursion --null --verbatim-files-from --files-from=<list>`: tar archives exactly
   the list, and a name that looks like an option is a member, never acted on (#562).
 - `--pax-option=exthdr.name=%d/PaxHeaders/%f` is fixed, so the stream's extended-header
@@ -672,14 +692,15 @@ one (#562). For each member, as it passes:
 - its header's user and group name fields are empty, and it has no `uname` or `gname` pax
   record;
 - every qualifier in its ACL record is a number;
-- a listed file that had an ACL on disk before tar ran (the `system.posix_acl_access` or
-  `system.posix_acl_default` attribute was present) carries the text ACL record;
+- with `preserve_acls` on, a listed file that had an ACL on disk before tar ran (the
+  `system.posix_acl_access` or `system.posix_acl_default` attribute was present) carries
+  the text ACL record;
 - its data is hashed (sha256) for a regular file, and every user and group id it carries,
   as owner, group or ACL qualifier, is collected for the id map.
 
 The stream is refused, naming the path and the rule, on: a member that is not the next
 entry of the list; a name in a header or a record; a non-numeric ACL qualifier; a lost
-ACL; a global extended header; a GNU long-name member; a header whose checksum is wrong; a
+ACL (with `preserve_acls` on); a global extended header; a GNU long-name member; a header whose checksum is wrong; a
 type the reader does not know; anything but zeros after the end-of-archive blocks; a stream
 that ends inside a member; a listed entry never seen.
 
@@ -688,6 +709,10 @@ entry was seen; and each file's device, inode, size, mtime and ctime are what th
 before tar ran. A file changed under tar refuses the staging, whatever tar says
 (invariant 7). **A stream hash that differs from the version's recorded sha256 refuses the
 staging, for every path but the unit's dotfile** (#562).
+
+No check asks for an extended attribute: with `preserve_xattrs` off the stream simply
+carries none, and with it on tar's own `--xattrs` decides what it reads. The ACL checks
+above apply only with `preserve_acls` on; with it off no ACL record is expected.
 
 The checks precede compression: every check of the stream is made on the stream's own
 bytes, and a member's offsets in the file table are of the stream (rule 11).
@@ -718,10 +743,12 @@ one block more is a run.
 small file, then a file just over a slice).
 
 What a slice is, measured (T0.7, `docs/research/2026-11-17-t07-readers-on-member-start-slices.md`;
-item 293): a slice that does not continue a member, read alone, is a run of whole members
-that GNU tar 1.30, 1.34 and 1.35, bsdtar 3.6.2 and BusyBox tar 1.36.1 each read at exit 0,
-except that a hard-linked name whose first name lies in another slice is not made (its
-first name is not there). A long member's run, joined, is read alone the same way. The
+item 293): a slice that holds only whole members is read alone at exit 0 by GNU tar 1.30,
+1.34 and 1.35, bsdtar 3.6.2 and BusyBox tar 1.36.1, except that a hard-linked name whose
+first name lies in another slice is not made (its first name is not there). A long
+member's run is read only with all its slices joined, the first of which states no
+`continues`; joined, it is read the same way. A reader tells the first slice of a run by
+the next slice's `continues = true`. The
 good slices of a staging joined in order, with a bad one left out, are read in one tar run
 at exit 0, losing exactly the bad slice's members.
 
@@ -741,9 +768,9 @@ ciphertext (#370). One slice is one tape file.
 The front index's `size_bytes` for a data slice is the tape file's (`encrypted_bytes`).
 
 **The bound the early warning's rules are held to.** A compressed slice can be larger on
-tape than its cut (§3.5). W8 (§5.2) holds `slice_size` plus the staging's algorithm's
-worst growth, plus age's overhead, to half the smallest post-warning room among the
-configured drives. A slice whose on-tape size would pass that bound refuses the staging by
+tape than its cut (§3.5). In W8's terms (§5.2): a slice on tape, which is at most
+`slice_size` plus the staging's algorithm's worst growth plus age's overhead, plus the
+seal, must fit in half the smallest post-warning room among the configured drives. A slice whose on-tape size would pass that bound refuses the staging by
 name; it is not stored uncompressed in place, because a staging has one algorithm.
 
 **Staging's space estimate** (T4.5, determined). Before tar runs, the space a staging
@@ -1089,8 +1116,8 @@ are unchanged. What changes is the plan above them:
 - **An early warning before the plan's end seals short in both cases.** A slice the tape
   did not take has no written position: it is never a copy and is never counted.
 
-The plan's order, the batch and the catalog's records are `layout-session.md`'s
-("Spanning", as T1.2 rewrites it from the plan's T5.1).
+The plan's order, the batch and the catalog's records are `layout-session.md`'s, in its
+"Layout 3" section.
 
 ### 5.3 A range, and every unit continuing (normative)
 
@@ -1410,7 +1437,9 @@ command either text gives is run as written by a test, or it is not in the text.
 - that a unit may continue on another cartridge, the prompt and "I do not have it", and
   what a tape read alone gives (§5.3);
 - which tars restore what (§7.3), and what a restore on another host does with an owner or
-  an ACL entry, and that the id map says who the ids were (item 278);
+  an ACL entry, and that the id map says who the ids were (item 278); and what names the
+  static binary's C library lookup can resolve (the local files, a directory service),
+  measured with that binary (D13) and written into File 1 and the guide;
 - how to tell a compressed unit, which tool reads each algorithm and which package holds
   it, and the manual path for one;
 - the one repair (§1.7); per-unit directories; the right route for each key holder; only
@@ -1497,18 +1526,19 @@ ratified, item 290; items 287 and 288; the plan's determinations under D9).
 - Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
   After the tag it is frozen and changes are numbered migrations again.
 
-**Counts.** 1.9.2 has 43 tables: 37 of its own, and `paths_fts` (a full-text virtual
-table) with the five shadow tables SQLite keeps for it. Of the 43: **37 kept as they are**,
-**6 kept with changed columns** (one of them renamed), **none gone**; **4 new**. Columns: **4
-go**, **12 are renamed**, **3 are new** on existing tables.
+**Counts.** 1.9.2's `sqlite_master` lists 43 tables: 38 of its own, and five for full-text
+search (the virtual table `paths_fts` and the four shadow tables SQLite keeps for it). Of
+the 43: **37 kept as they are** (32 of its own and the five full-text names), **6 kept with
+changed columns** (one of them renamed), **none gone**; **4 new**. Columns: **6 go** (four
+by D11 and item 288, two by item 295), **12 are renamed**, **3 are new** on existing
+tables.
 
 ### A.1 Kept as they are (37)
 
 `cartridge_contacts`, `cartridge_volumes`, `cartridges`, `cleaning_cartridges`, `drives`,
 `encryption_keys`, `events`, `file_versions`, `health_logs`, `locations`,
 `log_page_journal`, `mam_journal`, `meta`, `mtget_journal`, `paths`, `paths_fts` (and its
-shadow tables `paths_fts_config`, `paths_fts_data`, `paths_fts_docsize`, `paths_fts_idx`;
-the sixth name SQLite lists is the virtual table itself), `pending_rewrite_sets`,
+shadow tables `paths_fts_config`, `paths_fts_data`, `paths_fts_docsize`, `paths_fts_idx`), `pending_rewrite_sets`,
 `pending_rewrites`, `phase_timings`, `readback_checkpoints`, `snapshots`,
 `st_stats_journal`, `tags`, `tenants`, `unit_path_history`, `unit_tags`, `units`,
 `verification_results`, `verification_sessions`, `volume_deposits`, `volume_movements`,
