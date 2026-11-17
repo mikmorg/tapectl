@@ -3702,3 +3702,26 @@ chose "Stands".
      stays the per-file sha256 check. Recorded with it, from T0.7's step (e): the heir's
      script takes one member out of its slice by its offsets, and a name given to tar keeps
      the stream's leading `./`.
+
+## Amendment, 2026-11-17 (night, later): the format document's open points
+
+Ruled 2026-11-17. Writing Stage 1's format document (`docs/design/volume-format-v3.md`), the
+coordinator found six points that items 239 to 293 and D1 to D22 do not decide, and put them
+to the CTO in four questions, each with a recommendation. The CTO chose each recommendation.
+
+294. **The format document's open points are settled:**
+     - **A staging's texts are named by its stage set:** `tables/<uuid8>_v<version>_s<stage_set_id>.tsv`
+       and `tables/<uuid8>_v<version>_s<stage_set_id>.ids.tsv`, so two stagings of one version
+       on one tape never collide, and no plan is refused for it.
+     - **The id map's text begins with the header line `#tapectl-id-map 1`**, as the file
+       table's begins with its own.
+     - **The MANIFEST's block names its files and the writer's tar explicitly:**
+       `file_table = "..."`, `id_map = "..."` and `tar_version = "..."`. New keys follow the
+       existing ones in D6's order. `continues = true` is the last key of a slice's table and is
+       present only when true.
+     - **The on-tape `catalog.db` carries exactly the tables `catalog rebuild` reads, plus
+       `stage_files` and `stage_ids`**, and nothing else. The format document's Appendix A lists
+       them by name.
+     - **No magic key is added to File 3 or the seal.** D1's "the front index's and the seal
+       marker's magics move with it" is read as: what moves in those two files is
+       `layout_version = 3`. File 0's magic is `tapectl-volume-v3`.
