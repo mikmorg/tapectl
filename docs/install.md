@@ -961,9 +961,10 @@ is still the binary alone. The scripts are unchanged, and `config.toml` needs no
 
 **Rolling back.** Step 13 prints the commands. With the timers stopped, import
 the backup from step 2 while the NEW binary is still installed, then put the
-kept binary back and check the catalog with it. The order matters: every tapectl
-command opens the catalog first, and an older binary refuses a catalog a newer
-one has migrated, so the old binary's own `db import` would be refused. Whatever
+kept binary back and check the catalog with it. The order matters: a 1.x binary
+opens the catalog before every command, its `db import` included, and refuses a
+catalog a newer one has migrated, so the old binary's own `db import` would be
+refused. (This one's `db import` runs whatever state the catalog is in, §8a.) Whatever
 the catalog recorded after step 2 is lost, and the old binary may refuse a tape
 the new one wrote in between.
 

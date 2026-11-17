@@ -4052,8 +4052,8 @@ pub fn db_backup(
 ///    to be replaced is in.
 /// 3. **What it replaces is kept**, byte for byte, beside it as
 ///    `tapectl-replaced-<UTC stamp>.db` ([`kept_catalog_path`]), with its
-///    `-wal` (the commits not yet checkpointed into the file) as the kept
-///    copy's own `-wal`. Both are synced, and the directory, before
+///    `-wal` (the commits not yet checkpointed into the file) or a hot
+///    `-journal` as the kept copy's own. Both are synced, and the directory, before
 ///    anything is replaced: a process killed between the two leaves the
 ///    live catalog as it was and the copy whole.
 /// 4. **The replacement is a rename.** The source is copied into a new file
@@ -4235,8 +4235,11 @@ fn db_import_stepping(
     let live_wal = with_sidecar(live, "-wal");
     if live_exists {
         copy_file_synced(live, &kept)?;
-        if live_wal.exists() {
-            copy_file_synced(&live_wal, &with_sidecar(&kept, "-wal"))?;
+        for suffix in ["-wal", "-journal"] {
+            let sidecar = with_sidecar(live, suffix);
+            if sidecar.exists() {
+                copy_file_synced(&sidecar, &with_sidecar(&kept, suffix))?;
+            }
         }
         sync_parent_dir(&kept)?;
     }
@@ -4252,25 +4255,26 @@ fn db_import_stepping(
         }
     }
     precreate_private_file(&incoming)?;
-    let built = (|| -> Result<()> {
-        let src_conn = rusqlite::Connection::open_with_flags(
-            source,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+    let built = crate::db::with_read_only(source, |src_conn| {
         let mut dst_conn = rusqlite::Connection::open(&incoming)?;
-        copy_database_in_one_step(&src_conn, &mut dst_conn)?;
+        copy_database_in_one_step(src_conn, &mut dst_conn)?;
         drop(dst_conn);
         fs::File::open(&incoming)?.sync_all()?;
         Ok(())
-    })();
+    });
     if let Err(e) = built {
         let _ = fs::remove_file(&incoming);
         return Err(e);
     }
 
-    // A `-wal` or `-shm` of the old catalog beside the new file would be
-    // replayed into it: they go first (the `-wal` is in the kept copy).
-    for sidecar in [live_wal, with_sidecar(live, "-shm")] {
+    // A `-wal`, `-shm` or hot `-journal` of the old catalog beside the new
+    // file would be replayed (or rolled back) into it: they go first (the
+    // `-wal` is in the kept copy).
+    for sidecar in [
+        live_wal,
+        with_sidecar(live, "-shm"),
+        with_sidecar(live, "-journal"),
+    ] {
         match fs::remove_file(&sidecar) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

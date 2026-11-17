@@ -742,6 +742,32 @@ pub struct ImportSource {
 /// without them is not a catalog of tapectl's, whatever its `user_version` says.
 const CATALOG_TABLES: [&str; 5] = ["tenants", "units", "snapshots", "stage_sets", "volumes"];
 
+/// Run `f` on `path` opened read only, then remove the `-wal` and `-shm`
+/// SQLite made beside it to read it (issue #530). A read-only connection to
+/// a WAL-mode file (a `db backup` copy is one) creates both, and cannot
+/// remove them when it closes; `db import`'s check and copy of a backup, and
+/// its dry run, must leave the backup's directory as they found it. Only a
+/// sidecar that was not there before is removed: one that was is the
+/// source's own.
+pub fn with_read_only<T>(path: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    use rusqlite::OpenFlags;
+    let made_here: Vec<std::path::PathBuf> = ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| sidecar_path(path, suffix))
+        .filter(|sidecar| sidecar.symlink_metadata().is_err())
+        .collect();
+    let result = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(TapectlError::from)
+    .and_then(|conn| f(&conn));
+    for sidecar in made_here {
+        let _ = std::fs::remove_file(sidecar);
+    }
+    result
+}
+
 /// Check a file before `db import` puts it where the live catalog is (issue
 /// #530): it opens as an SQLite database, read only; it passes `PRAGMA
 /// integrity_check`; it is a catalog of tapectl's (the core tables, and a schema
@@ -752,21 +778,29 @@ const CATALOG_TABLES: [&str; 5] = ["tenants", "units", "snapshots", "stage_sets"
 /// newer binary left every later command failing with `DatabaseTooFarAhead`,
 /// `db import` included.
 ///
-/// Read only (`SQLITE_OPEN_READ_ONLY`): the check never writes to the
-/// source, and a file that is not a database is never turned into one.
+/// Read only (`SQLITE_OPEN_READ_ONLY`, [`with_read_only`]): the check never
+/// writes to the source, a file that is not a database is never turned into
+/// one, and the `-wal`/`-shm` SQLite makes to read it are removed again.
 pub fn check_import_source(path: &Path) -> Result<ImportSource> {
-    use rusqlite::OpenFlags;
     let refuse = |why: String| {
         TapectlError::Other(format!(
             "db import refuses {}: {why}; nothing was replaced",
             path.display()
         ))
     };
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| refuse(format!("it does not open as an SQLite database ({e})")))?;
+    with_read_only(path, |conn| check_import_conn(conn, &refuse)).map_err(|e| match e {
+        TapectlError::Database(e) => {
+            refuse(format!("it does not open as an SQLite database ({e})"))
+        }
+        other => other,
+    })
+}
+
+/// [`check_import_source`]'s checks, on the source opened read only.
+fn check_import_conn(
+    conn: &Connection,
+    refuse: &dyn Fn(String) -> TapectlError,
+) -> Result<ImportSource> {
     // The first statement is where SQLite reads the header, so a file that
     // is not a database fails here rather than at the open.
     let integrity: Vec<String> = conn

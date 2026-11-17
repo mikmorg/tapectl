@@ -3897,6 +3897,11 @@ fn db_import_runs_whatever_state_the_live_catalog_is_in_and_keeps_it() {
             }
         }
 
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", backup.display()));
+            assert!(!sidecar.exists(), "{state}: {} was left", sidecar.display());
+        }
+
         // The catalog put back is an ordinary one.
         let fsck = run_tapectl(home.path(), &["db", "fsck"]);
         assert!(
@@ -4031,6 +4036,15 @@ fn db_import_refuses_a_newer_a_damaged_or_a_foreign_source() {
         replaced.is_empty(),
         "a refused import keeps nothing: {replaced:?}"
     );
+    // The check reads each source read only and leaves nothing beside it:
+    // `newer.db` is a copy of a WAL-mode backup, which a read-only open
+    // gives a `-wal` and a `-shm` it cannot remove itself.
+    for source in [&newer, &damaged, &foreign, &backup] {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", source.display()));
+            assert!(!sidecar.exists(), "{} was left", sidecar.display());
+        }
+    }
 }
 
 // ── `init` over a config.toml with no catalog (issue #538) ─────────────────
