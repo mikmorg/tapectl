@@ -6395,9 +6395,14 @@ mod tests {
                 i + 1
             );
         }
+        // `001_baseline.sql` is the 2.x baseline (ADR-0012 item 258(b)),
+        // proven equal to these files by
+        // `the_baseline_is_the_schema_the_41_migrations_leave` and made the one
+        // migration in the next commit; until then it is not included.
         let mut on_disk: Vec<String> = std::fs::read_dir(dir.join("migrations"))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name != "001_baseline.sql")
             .collect();
         on_disk.sort();
         assert_eq!(
@@ -6409,5 +6414,173 @@ mod tests {
             included.len() as i64,
             "one migration per file"
         );
+    }
+
+    // --- The 2.x baseline (ADR-0012 item 258(b), the plan's T3.1 step 2) ---
+
+    /// A schema object's SQL as compared: comments removed (SQLite keeps a
+    /// comment inside a CREATE body in `sqlite_master`), identifier quotes
+    /// removed (a table renamed into place is stored as `CREATE TABLE
+    /// "writes"`), whitespace runs made one space, and no space beside `(`,
+    /// `)` or `,` (a column `ALTER TABLE ... ADD COLUMN` appended is stored
+    /// after `\n, `). Nothing else: keywords, literals and their order are
+    /// compared as written.
+    fn normalised_sql(sql: &str) -> String {
+        let mut no_comments = String::new();
+        for line in sql.lines() {
+            let line = match line.find("--") {
+                Some(i) => &line[..i],
+                None => line,
+            };
+            no_comments.push_str(line);
+            no_comments.push('\n');
+        }
+        let unquoted = no_comments.replace('"', "");
+        let mut flat = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
+        for punct in ["(", ")", ","] {
+            flat = flat
+                .replace(&format!(" {punct}"), punct)
+                .replace(&format!("{punct} "), punct);
+        }
+        flat
+    }
+
+    /// Every row of a PRAGMA table-valued function, rendered cell by cell.
+    fn pragma_rows(conn: &Connection, pragma: &str, arg: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM pragma_{pragma}(?1)"))
+            .unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([arg], |r| {
+            (0..n)
+                .map(|i| r.get_ref(i).map(render_cell))
+                .collect::<rusqlite::Result<Vec<String>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Everything the comparison holds equal, keyed by what it is: each
+    /// schema object (type, name, tbl_name, normalised SQL), and for each
+    /// table its `table_xinfo`, `foreign_key_list` and `index_list`, and for
+    /// each index its `index_xinfo`. `sqlite_stat*` are left out: they are
+    /// `PRAGMA optimize`'s, not the schema's.
+    fn schema_shape(conn: &Connection) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+        let mut out = std::collections::BTreeMap::new();
+        let objects: Vec<(String, String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master \
+                 WHERE name NOT LIKE 'sqlite_stat%' ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (kind, name, tbl, sql) in &objects {
+            out.insert(
+                format!("{kind} {name}"),
+                vec![vec![
+                    tbl.clone(),
+                    sql.as_deref().map(normalised_sql).unwrap_or_default(),
+                ]],
+            );
+            match kind.as_str() {
+                "table" => {
+                    for pragma in ["table_xinfo", "foreign_key_list", "index_list"] {
+                        out.insert(format!("{pragma} {name}"), pragma_rows(conn, pragma, name));
+                    }
+                }
+                "index" => {
+                    out.insert(
+                        format!("index_xinfo {name}"),
+                        pragma_rows(conn, "index_xinfo", name),
+                    );
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// T3.1 step 2: the baseline is the schema the 41 migrations of 1.x
+    /// leave, before any of them is deleted. One database is migrated by
+    /// [`migrations`] (the 41 files), the other by `001_baseline.sql` alone;
+    /// their schema objects, columns, foreign keys, indexes and index
+    /// columns must be equal, and so must their rows, but for the relic row
+    /// `meta.schema_version`, which the baseline does not write.
+    #[test]
+    fn the_baseline_is_the_schema_the_41_migrations_leave() {
+        let old = open_memory().unwrap();
+        let mut new = Connection::open_in_memory().unwrap();
+        configure(&new).unwrap();
+        Migrations::new(vec![M::up(include_str!("migrations/001_baseline.sql"))])
+            .to_latest(&mut new)
+            .unwrap();
+
+        let (old_shape, new_shape) = (schema_shape(&old), schema_shape(&new));
+        let keys: std::collections::BTreeSet<&String> =
+            old_shape.keys().chain(new_shape.keys()).collect();
+        let mut differ = Vec::new();
+        for key in &keys {
+            if old_shape.get(*key) != new_shape.get(*key) {
+                differ.push(format!(
+                    "{key}:\n  41 migrations: {:?}\n  baseline:      {:?}",
+                    old_shape.get(*key),
+                    new_shape.get(*key)
+                ));
+            }
+        }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
+
+        let mut old_rows = every_row(&old);
+        let new_rows = every_row(&new);
+        assert_eq!(
+            old_rows.get("meta"),
+            Some(&vec![vec![
+                "t:schema_version".to_string(),
+                "t:1".to_string()
+            ]]),
+            "the relic row is the 41 migrations' only row in meta"
+        );
+        old_rows.insert("meta".to_string(), Vec::new());
+        // FTS5's averages record (`paths_fts_data` row 1) is the one row the
+        // two may spell differently: migration 030's `'rebuild'` wrote it
+        // for zero rows (`X'0000'`), and a table nothing has written yet
+        // holds it empty. Both mean an index of no rows; FTS5's own
+        // integrity check says so of each side below.
+        let mut new_rows = new_rows;
+        for rows in [&mut old_rows, &mut new_rows] {
+            let data = rows.get_mut("paths_fts_data").expect("the FTS5 data table");
+            data.retain(|row| row[0] != "i:1");
+        }
+        assert_eq!(old_rows, new_rows, "the rows a fresh catalog holds");
+        for conn in [&old, &new] {
+            conn.execute(
+                "INSERT INTO paths_fts(paths_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .expect("FTS5's integrity check passes");
+        }
+
+        let count = |kind: &str| {
+            old_shape
+                .keys()
+                .filter(|k| k.starts_with(&format!("{kind} ")))
+                .count()
+        };
+        println!(
+            "baseline == 41 migrations: {} tables, {} indexes, {} triggers; {} compared \
+             entries (objects, table_xinfo, foreign_key_list, index_list, index_xinfo); rows \
+             equal in {} tables (meta.schema_version aside); user_version 41 vs {}",
+            count("table"),
+            count("index"),
+            count("trigger"),
+            keys.len(),
+            new_rows.len(),
+            user_version(&new),
+        );
+        assert_eq!(user_version(&old), 41);
     }
 }
