@@ -1522,7 +1522,10 @@ ratified, item 290; items 287 and 288; the plan's determinations under D9).
 
 - A 2.x catalog is known by SQLite's `application_id`, set by the baseline (1.9.2 sets
   none: it reads 0). A database that has tables and lacks it is a 1.x catalog and is
-  refused by name.
+  refused by name. **Determined** (T3.1): the value is `0x54504354` ("TPCT", 1414546260,
+  `db::APPLICATION_ID`); a database with another nonzero id is refused as not a catalog of
+  tapectl's. The baseline's `user_version` is 1, and the on-tape `catalog.db` copies it, so
+  that stamp reads 1 on every Layout 3 tape (it read 41 on the last Layout 2 tapes).
 - Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
   After the tag it is frozen and changes are numbered migrations again.
 
