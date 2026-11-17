@@ -57,9 +57,11 @@ paper's `age-keygen -y` check), the host's tar, T6.6's real-drive runs and Stage
 2026-11-17 (items 282 to 289; #565, #566, #567): slices stay, and a slice ends at a member's
 start; each slice is compressed alone, by tapectl itself, with gzip, xz or zstd and an
 optional level; every unit continues on the next cartridge at the early warning, with no
-opt-in and no `cut` unit, and the queue is filled to the warning. Open with the CTO: the go;
-the choices D1 to D22 that the format document must make (the plan's list, rewritten after
-those items); and T0.3.
+opt-in and no `cut` unit, and the queue is filled to the warning. Later that day (items 290,
+291): the format document's choices D1 to D22 are ratified, and real scale is measured on a
+made tree before the code and on the largest real unit at the real-drive acceptance. Open
+with the CTO: the go, and nothing else. The coordinator's own entry is
+`docs/coordinator-handoff.md`.
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

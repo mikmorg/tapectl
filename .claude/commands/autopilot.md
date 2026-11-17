@@ -65,6 +65,15 @@ the normative design set named in the Policy block below.
     four readings as the coordinator's (the order of the acceptance run, a span restore
     streams, what "sufficient" means for #535, the defaults not objected to): correct them if
     the CTO does.
+  - **2026-11-17 (later), items 290-291: "Ratify all & handoff for opus to take over; make
+    sure complex decisions have been thoroughly determined".** START AT
+    `docs/coordinator-handoff.md`. D1 TO D22 ARE RATIFIED (item 290 holds each text). Real
+    scale: a made tree of two million files before the code (T0.3), the largest real unit at
+    T6.6 (item 291). STILL NOT THE GO (the CTO was told the go needs the word). Every T0.x
+    task has its decision rule fixed; the plan order once every unit continues (T5.1) and a
+    range in rewrite and compaction (T5.3) are worked out in the plan under "determined".
+    The only thing open with the CTO is the go. On it: Stage 0's six measurements and Stage
+    2's first wave start together.
   - **2026-11-17, items 282-289: "Ratify all recommendations." QUESTIONS 38 TO 44 ARE RULED.**
     Slices stay (282). A SLICE ENDS AT A MEMBER'S START: whole members, a member larger than
     `slice_size` gets a run of slices to itself, and the size signal is accepted (283, amending

@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Coordinating the tapectl 2.0.0 build (Layout Version 3)? Start at
+`docs/coordinator-handoff.md`**: what is ruled, the one thing that needs the CTO's word (the
+go), the order of work, who settles what, and which older texts no longer hold. The tasks
+are in `docs/design/v3-implementation-plan.md`.
+
 ## Project Overview
 
 tapectl is a Rust CLI tool for managing long-term archival storage across LTO tape and exportable encrypted directories (Blu-ray, USB). It wraps `dar` for archive creation/extraction, uses the `age` crate (from the rage project) for age encryption, and SQLite for catalog/inventory/policy/audit.
@@ -361,6 +366,20 @@ carries a range; and the decision list is **D1 to D22** (D1, D3, D4, D6, D9, D10
 rewritten; D19 the batch, D20 the one plan bound, D21 a range in rewrite and compaction, D22
 how a tape marks a long member's run). **"Ratify all recommendations" was not the go, and it
 did not cover D1 to D22 or T0.3: build nothing.** Open with the CTO: the go, D1 to D22, T0.3.
+
+**2026-11-17 (later): D1 to D22 are ratified, the scale run is ruled, and the coordinator's
+role is handed on** (ADR-0012 items 290, 291; the CTO: "Ratify all & handoff for opus to take
+over; make sure complex decisions have been thoroughly determined"). The twenty-two choices
+of the format document are ratified as proposed, and item 290 holds each one's text. Real
+scale is taken in two places: a made tree of two million files before the code (the plan's
+T0.3), and the collection's largest real unit at the real-drive acceptance (T6.6); this
+amends item 253's "before any code" for that leg. The coordinator had said a "ratify all"
+would be read as those two only and that the go needs the word, so **this was not the go
+either: build nothing.** For the handoff, every measurement task has its decision rule fixed
+in the plan, and two designs the rulings left owed are worked out there under headings that
+say "determined": the plan order once every unit continues (T5.1), and a range carried
+through `volume rewrite` and compaction (T5.3). **The entry for whoever coordinates next is
+`docs/coordinator-handoff.md`.** The only thing open with the CTO is the go.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
