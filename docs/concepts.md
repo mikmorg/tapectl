@@ -819,7 +819,7 @@ stateDiagram-v2
     reclaimable --> purged : snapshot purge
     purged --> reclaimable : snapshot mark-reclaimable (status only)
     created --> [*] : snapshot delete
-    staged --> [*] : snapshot delete (needs --force while its slices are staged)
+    staged --> [*] : snapshot delete (needs --force while its slices are staged; refused while a write session holds them)
 ```
 
 | Status | Meaning |

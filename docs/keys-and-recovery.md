@@ -949,7 +949,14 @@ is the same procedure for a service-user host.
    decrypted to disk before dar reads it, and the space check asks for every unit
    plus the largest unit's slices (`--scratch DIR` puts those on another disk);
    `catalog rebuild` names such sets. One unit's failure does not stop the rest; the report names
-   it, and the command exits non-zero. tapectl's restore reads the private keys
+   it, and the command exits non-zero.
+   A unit is its uuid. If the catalog already has a unit of the same name under another
+   uuid (one renamed away and a new unit given its old name, or a catalog and a tape of
+   different generations), the rebuild refuses that unit of the tape by name: nothing of it
+   is recorded and it counts as no copy (#527, item 249). The rest of the tape is rebuilt,
+   the report lists it under "refused" with both uuids, and the run exits 2. To record it,
+   rename the catalog's unit (`tapectl unit rename <name> <new name>`) and run the same
+   `catalog rebuild` again. tapectl's restore reads the private keys
    in `<home>/keys/` (step 5) and any `--key FILE` you give it (1.4.0). With
    only the escrow secret, add it to the restore: `tapectl restore volume
    L8-0002 --to /srv/restore --device "$TAPE" --key escrow.key`. The file is used

@@ -3788,8 +3788,14 @@ missing, closing the graph in one transaction, and logs what it deleted — if
 anything is still dangling at commit the whole repair rolls back, so a failed
 repair leaves the database exactly as it was.
 
-Run it on a database you brought in with `db import` before you use it:
-`db import` is a raw page copy and validates no foreign keys of its own.
+`db import` checks what it brings in before it replaces anything (#530): the source must
+pass SQLite's integrity check, be a catalog of tapectl's, and be no newer than this
+binary. It runs even when the live catalog is missing or will not open, and it keeps the
+catalog it replaces, byte for byte with its journals, as `tapectl-replaced-<UTC>.db` beside
+the new one. It validates no foreign keys of its own, so run `db fsck` on what it brought
+in before you use it. `db fsck --repair` refuses a database that fails the integrity
+check (item 249): that one is replaced from a backup with `db import`, never repaired in
+place. A repair names each row it deletes.
 
 ### The journals are never pruned
 
@@ -3804,7 +3810,8 @@ stage reports under the home are kept the same way.
 
 Two commands do delete journal rows, and only rows the catalog can no longer
 refer to. `snapshot delete`, which deletes only a snapshot never written to tape
-(with `--force` once it is staged), takes that snapshot's own
+(with `--force` once it is staged, and never while a write session holds its staged
+slices, live, interrupted or able to be re-confirmed, #540), takes that snapshot's own
 `verification_results` rows with the slices they point at. `db fsck --repair`
 deletes any row, in any table, whose foreign-key parent is gone.
 
