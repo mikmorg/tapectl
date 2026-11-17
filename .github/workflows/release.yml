@@ -114,4 +114,5 @@ jobs:
               gh release create "$tag" --verify-tag --title "tapectl $VERSION" --notes ""
             fi
           fi
-          gh release upload "$tag" "dist/$NAME" dist/SHA256SUMS --clobber
+          # No --clobber (#546): an asset that exists fails the upload, so a release is never replaced.
+          gh release upload "$tag" "dist/$NAME" dist/SHA256SUMS

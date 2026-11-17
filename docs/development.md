@@ -116,6 +116,14 @@ move and Heir Kit. It takes an mhvtl drive by its by-id name and refuses any oth
 TAPECTL_MHVTL=1 scripts/first-run-reentry-mhvtl.sh --device /dev/tape/by-id/scsi-XYZZY_A1-nst
 ```
 
+## Releases are never replaced
+
+A release's binary and `SHA256SUMS` are the only check an heir has on a downloaded
+tapectl, so `release.yml` uploads without `--clobber` and fails when the release
+already holds the asset. A tag is never pushed twice, never deleted and pushed again.
+A bad release is withdrawn by a fix in a new release (a new patch version); the old
+one stays, marked as superseded in its notes.
+
 ## A map of the code
 
 - `src/cli/`: the commands (clap derive), thin over the library modules.
