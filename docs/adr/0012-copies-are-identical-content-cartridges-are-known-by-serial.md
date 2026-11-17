@@ -3684,3 +3684,21 @@ time beside them." The CTO's word, whole: "Go".
   bytes and ends when the drill passes on the production run (item 268).
 - *The production host* is not touched by the go. Its steps are the operator's (T0.4,
   T4.14's host step, T6.6, Stage 7), each on the CTO's go-ahead.
+
+## Amendment, 2026-11-17 (night): item 283 stands after T0.7
+
+Ruled 2026-11-17. T0.7 (`docs/research/2026-11-17-t07-readers-on-member-start-slices.md`,
+#567) did not meet the decision rule the plan had fixed for it: every reader (GNU tar 1.30,
+1.34, 1.35, bsdtar 3.6.2, BusyBox 1.36.1) exited non-zero on one case, the last slice read
+alone, because that slice held a hard link whose first name was in an earlier slice; the
+slice's other files came out whole, and with the hard link removed every reader passed every
+case. The coordinator asked whether item 283 stands, with "Stands" recommended. The CTO
+chose "Stands".
+
+293. **Item 283 stands.** T0.7's rule is read as not covering a hard-linked name whose first
+     name lies in another slice: that is the limit items 241 and 283 already record ("a
+     hard-linked name depends on the slice of the name archived first"). A reader that reads
+     a slice alone lists such a name for the repair (items 255, 256), and the readers' verdict
+     stays the per-file sha256 check. Recorded with it, from T0.7's step (e): the heir's
+     script takes one member out of its slice by its offsets, and a name given to tar keeps
+     the stream's leading `./`.
