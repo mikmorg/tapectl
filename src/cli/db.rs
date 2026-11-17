@@ -111,6 +111,7 @@ pub fn run(
                     "integrity_ok": report.integrity_ok,
                     "issues": report.issues,
                     "repaired": report.repaired,
+                    "deleted": report.deleted,
                     "schema_pending": schema_pending,
                 });
                 if report.dry_run {
@@ -135,6 +136,10 @@ pub fn run(
                 );
                 for issue in &report.issues {
                     println!("  {issue}");
+                }
+                // Issue #530: each row deleted, as the event records it.
+                for row in &report.deleted {
+                    println!("  deleted {row}");
                 }
                 if schema_pending {
                     println!(
@@ -165,7 +170,7 @@ pub fn run(
             crate::db::export::export_json(conn, &mut writer)?;
         }
         DbCommands::Import { path: import_path } => {
-            crate::cli::operations::db_import(paths, import_path, yes, dry_run, json_output)?;
+            import(paths, import_path, json_output, yes, dry_run)?;
         }
         DbCommands::Stats => {
             let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
@@ -259,6 +264,20 @@ pub fn run(
     Ok(exit_code)
 }
 
+/// `db import` (issue #530). It takes no catalog connection: `main.rs`
+/// dispatches it before the initialization gate and `db::open`, so it runs
+/// when the live catalog is missing or will not open, the two states a
+/// catalog is put back in.
+pub fn import(
+    paths: &TapectlPaths,
+    import_path: &str,
+    json_output: bool,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    crate::cli::operations::db_import(paths, import_path, yes, dry_run, json_output)
+}
+
 /// Decide the process exit code for `db fsck` from its report (issue
 /// #45/H10). Mirrors the `audit` convention: 0=clean, 1=warning,
 /// 2=violation.
@@ -293,6 +312,7 @@ mod tests {
             integrity_ok: true,
             issues: vec![],
             repaired: 0,
+            deleted: vec![],
             dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_SUCCESS);
@@ -304,6 +324,7 @@ mod tests {
             integrity_ok: false,
             issues: vec!["integrity_check: corrupted".to_string()],
             repaired: 0,
+            deleted: vec![],
             dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_ERROR);
@@ -317,6 +338,7 @@ mod tests {
             integrity_ok: false,
             issues: vec!["integrity_check: corrupted".to_string(), "1 orphan".into()],
             repaired: 1,
+            deleted: vec![],
             dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_ERROR);
@@ -328,6 +350,7 @@ mod tests {
             integrity_ok: true,
             issues: vec!["3 orphaned write records".to_string()],
             repaired: 1,
+            deleted: vec![],
             dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_WARNING);
@@ -341,6 +364,7 @@ mod tests {
             integrity_ok: true,
             issues: vec!["3 orphaned write records".to_string()],
             repaired: 0,
+            deleted: vec![],
             dry_run: false,
         };
         assert_eq!(fsck_exit_code(&report), crate::error::EXIT_WARNING);

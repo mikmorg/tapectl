@@ -15,7 +15,7 @@ tapectl db [OPTIONS] <COMMAND>
 - [`backup`](#tapectl-db-backup) — Back up the database, and optionally the private key directory
 - [`fsck`](#tapectl-db-fsck) — Check database integrity
 - [`export`](#tapectl-db-export) — Export database as JSON
-- [`import`](#tapectl-db-import) — Import database from backup
+- [`import`](#tapectl-db-import) — Put a backup in the live catalog's place, keeping the one it replaces
 - [`stats`](#tapectl-db-stats) — Show database statistics, and what each table weighs
 
 ### tapectl db backup
@@ -63,7 +63,7 @@ tapectl db fsck [OPTIONS]
 
 - `--repair` — Delete rows whose foreign-key parent is missing
   
-    Closes the graph in one transaction (children first, in effect); logged.
+    Closes the graph in one transaction (children first, in effect), and names each row it deleted, as its logged event does. Refused, deleting nothing, when the integrity check fails: put a backup back with `db import` instead.
 
 ### tapectl db export
 
@@ -75,7 +75,9 @@ tapectl db export [OPTIONS]
 
 ### tapectl db import
 
-Import database from backup
+Put a backup in the live catalog's place, keeping the one it replaces
+
+Runs when the live catalog is missing, empty, or damaged, as well as when it opens. The backup is checked first: it must pass SQLite's integrity check, be a catalog of tapectl's, and be of a schema version this tapectl can open (an older one is migrated by the next command; a newer one is refused). The catalog it replaces is kept beside it as `tapectl-replaced-<UTC stamp>.db`, and the output names it. Asks first (`--yes` answers); run `db fsck` after it.
 
 ```text
 tapectl db import [OPTIONS] <PATH>
@@ -83,7 +85,7 @@ tapectl db import [OPTIONS] <PATH>
 
 **Arguments**
 
-- `<PATH>` — Path to backup file
+- `<PATH>` — The backup file to put in the catalog's place
 
 ### tapectl db stats
 

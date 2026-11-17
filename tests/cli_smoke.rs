@@ -3707,3 +3707,328 @@ fn source_and_report_tables_and_json_keys_after_the_output_sweep() {
         }
     }
 }
+
+// ── `db import` over a catalog that will not open (issue #530) ──────────────
+
+fn live_catalog(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".tapectl").join("tapectl.db")
+}
+
+/// The tenant names in the catalog at `db`, read without migrating it.
+fn tenant_names(db: &std::path::Path) -> Vec<String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|e| panic!("open {}: {e}", db.display()));
+    let mut stmt = conn
+        .prepare("SELECT name FROM tenants ORDER BY id")
+        .unwrap();
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    names
+}
+
+/// A home whose backup holds tenant `in-backup`, and whose live catalog
+/// holds `after-backup` too, added after the backup: the row that tells
+/// the two apart. Returns the home and the backup file.
+fn home_with_a_backup() -> (TempDir, std::path::PathBuf) {
+    let home = TempDir::new().expect("tempdir");
+    for args in [&["init"][..], &["tenant", "add", "in-backup"][..]] {
+        let out = run_tapectl(home.path(), args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let backup = home.path().join("tapectl-backup.db");
+    for args in [
+        &["db", "backup", backup.to_str().unwrap()][..],
+        &["tenant", "add", "after-backup"][..],
+    ] {
+        let out = run_tapectl(home.path(), args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    (home, backup)
+}
+
+/// Make `db` fail SQLite's integrity check while it still opens: two
+/// indexes are given each other's b-tree, so each holds entries its table
+/// does not have. Every connection is closed again, so nothing is left in a
+/// `-wal`.
+fn break_integrity(db: &std::path::Path) {
+    {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE zz_a (x); CREATE INDEX zz_ai ON zz_a (x);
+             INSERT INTO zz_a VALUES (1), (2), (3);
+             CREATE TABLE zz_b (y); CREATE INDEX zz_bi ON zz_b (y);
+             INSERT INTO zz_b VALUES ('p'), ('q');",
+        )
+        .unwrap();
+        let root = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (a, b) = (root("zz_ai"), root("zz_bi"));
+        conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+        conn.execute(
+            "UPDATE sqlite_master SET rootpage = ?1 WHERE name = 'zz_ai'",
+            [b],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sqlite_master SET rootpage = ?1 WHERE name = 'zz_bi'",
+            [a],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+    }
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let first: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(first, "ok", "the fixture must fail the integrity check");
+}
+
+/// The path `db import` said it kept the replaced catalog at.
+fn kept_path_from(stdout: &str) -> Option<std::path::PathBuf> {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("the catalog it replaced is kept at "))
+        .map(std::path::PathBuf::from)
+}
+
+/// Issue #530: `db import` runs whatever state the live catalog is in —
+/// missing (the gate called the home "not initialized"), empty, not a
+/// database, failing its integrity check (`db::open` refused both) — puts
+/// the backup in its place, and keeps what it replaced, byte for byte,
+/// under the dated name it prints. On the parent the first state stopped at
+/// "not initialized" and the other three at "failed to open database".
+#[test]
+fn db_import_runs_whatever_state_the_live_catalog_is_in_and_keeps_it() {
+    for state in [
+        "missing",
+        "empty",
+        "not a database",
+        "fails its integrity check",
+    ] {
+        let (home, backup) = home_with_a_backup();
+        let live = live_catalog(home.path());
+        match state {
+            "missing" => {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", live.display()));
+                }
+            }
+            "empty" => std::fs::write(&live, b"").unwrap(),
+            "not a database" => {
+                std::fs::write(&live, b"this was a catalog once\n".repeat(400)).unwrap()
+            }
+            _ => break_integrity(&live),
+        }
+        let before = std::fs::read(&live).ok();
+
+        let out = run_tapectl(
+            home.path(),
+            &["db", "import", backup.to_str().unwrap(), "--yes"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{state}: db import must run: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let names = tenant_names(&live);
+        assert!(
+            names.contains(&"in-backup".to_string()),
+            "{state}: {names:?}"
+        );
+        assert!(
+            !names.contains(&"after-backup".to_string()),
+            "{state}: {names:?}"
+        );
+
+        match before {
+            None => {
+                assert_eq!(
+                    kept_path_from(&stdout),
+                    None,
+                    "{state}: nothing to keep: {stdout}"
+                );
+                let replaced: Vec<_> = std::fs::read_dir(home.path().join(".tapectl"))
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().contains("-replaced-"))
+                    .collect();
+                assert!(replaced.is_empty(), "{state}: {replaced:?}");
+            }
+            Some(bytes) => {
+                let kept = kept_path_from(&stdout)
+                    .unwrap_or_else(|| panic!("{state}: the output names no kept file: {stdout}"));
+                assert_eq!(
+                    kept.parent(),
+                    live.parent(),
+                    "{state}: kept beside the catalog"
+                );
+                assert!(
+                    kept.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("tapectl-replaced-"),
+                    "{state}: {}",
+                    kept.display()
+                );
+                assert_eq!(
+                    std::fs::read(&kept).unwrap(),
+                    bytes,
+                    "{state}: the kept file is the catalog it replaced, byte for byte"
+                );
+            }
+        }
+
+        // The catalog put back is an ordinary one.
+        let fsck = run_tapectl(home.path(), &["db", "fsck"]);
+        assert!(
+            fsck.status.success(),
+            "{state}: db fsck after the import: {}",
+            String::from_utf8_lossy(&fsck.stdout)
+        );
+    }
+}
+
+/// Issue #530: what is replaced is kept WHOLE, including the commits still
+/// in its `-wal`, and the old `-wal` is never left beside the new catalog
+/// (SQLite would replay it into the file it was not written for).
+#[test]
+fn db_import_keeps_the_commits_still_in_the_replaced_catalogs_wal() {
+    let (home, backup) = home_with_a_backup();
+    let live = live_catalog(home.path());
+    // A connection that never checkpoints, held open across the import, so
+    // its commit is in `tapectl.db-wal` and nowhere else.
+    let writer = rusqlite::Connection::open(&live).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('only-in-wal', 0, 'active')",
+            [],
+        )
+        .unwrap();
+    let wal = std::path::PathBuf::from(format!("{}-wal", live.display()));
+    assert!(
+        std::fs::metadata(&wal)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "the fixture's commit must be in the -wal"
+    );
+
+    let out = run_tapectl(
+        home.path(),
+        &["db", "import", backup.to_str().unwrap(), "--yes"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kept = kept_path_from(&stdout).expect("the output names the kept file");
+    std::mem::forget(writer); // never checkpoint into the replaced file
+
+    let kept_names = tenant_names(&kept);
+    assert!(
+        kept_names.contains(&"only-in-wal".to_string())
+            && kept_names.contains(&"after-backup".to_string()),
+        "the kept catalog is the replaced one with its -wal: {kept_names:?}"
+    );
+    let names = tenant_names(&live);
+    assert!(
+        !names.contains(&"only-in-wal".to_string()) && names.contains(&"in-backup".to_string()),
+        "the old -wal was replayed into the imported catalog: {names:?}"
+    );
+    let conn = rusqlite::Connection::open(&live).unwrap();
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+/// Issue #530: the source is checked before anything is replaced. A
+/// catalog of a newer schema than this tapectl's, one that fails SQLite's
+/// integrity check, and a database that is not a catalog of tapectl's are each
+/// refused by name, with and without `--dry-run`, and the live catalog is
+/// left as it was with no copy made. On the parent all three were imported.
+#[test]
+fn db_import_refuses_a_newer_a_damaged_or_a_foreign_source() {
+    let (home, backup) = home_with_a_backup();
+    let live = live_catalog(home.path());
+
+    let newer = home.path().join("newer.db");
+    std::fs::copy(&backup, &newer).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&newer).unwrap();
+        conn.pragma_update(None, "user_version", 9999).unwrap();
+    }
+    let damaged = home.path().join("damaged.db");
+    std::fs::copy(&backup, &damaged).unwrap();
+    break_integrity(&damaged);
+    let foreign = home.path().join("foreign.db");
+    {
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('hi');")
+            .unwrap();
+    }
+
+    for (source, needle) in [
+        (
+            &newer,
+            "is a catalog of schema version 9999, newer than this tapectl's",
+        ),
+        (&damaged, "fails SQLite's integrity check"),
+        (&foreign, "is not a catalog of tapectl's"),
+    ] {
+        for dry in [false, true] {
+            let mut args = vec!["db", "import", source.to_str().unwrap(), "--yes"];
+            if dry {
+                args.push("--dry-run");
+            }
+            let out = run_tapectl(home.path(), &args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "{args:?} must be refused: stdout={}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(stderr.contains(needle), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("nothing was replaced"),
+                "{args:?}: {stderr}"
+            );
+            assert!(
+                tenant_names(&live).contains(&"after-backup".to_string()),
+                "{args:?} replaced the live catalog"
+            );
+        }
+    }
+    let replaced: Vec<_> = std::fs::read_dir(home.path().join(".tapectl"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("-replaced-"))
+        .collect();
+    assert!(
+        replaced.is_empty(),
+        "a refused import keeps nothing: {replaced:?}"
+    );
+}

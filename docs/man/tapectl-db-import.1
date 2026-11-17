@@ -2,18 +2,20 @@
 .el .ds Aq '
 .TH tapectl-db-import 1  "tapectl-db-import " 
 .SH NAME
-tapectl\-db\-import \- Import database from backup
+tapectl\-db\-import \- Put a backup in the live catalog\*(Aqs place, keeping the one it replaces
 .SH SYNOPSIS
 \fBtapectl db import\fR [\fB\-\-json\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
 .SH DESCRIPTION
-Import database from backup
+Put a backup in the live catalog\*(Aqs place, keeping the one it replaces
+.PP
+Runs when the live catalog is missing, empty, or damaged, as well as when it opens. The backup is checked first: it must pass SQLite\*(Aqs integrity check, be a catalog of tapectl\*(Aqs, and be of a schema version this tapectl can open (an older one is migrated by the next command; a newer one is refused). The catalog it replaces is kept beside it as `tapectl\-replaced\-<UTC stamp>.db`, and the output names it. Asks first (`\-\-yes` answers); run `db fsck` after it.
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
 <\fIPATH\fR>
-Path to backup file
+The backup file to put in the catalog\*(Aqs place
 .SH "GLOBAL OPTIONS"
 .TP
 \fB\-\-json\fR

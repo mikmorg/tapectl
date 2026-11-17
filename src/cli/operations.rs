@@ -3979,6 +3979,27 @@ pub fn db_backup(
 /// overrides; a non-interactive session with no `--yes` refuses rather
 /// than assuming consent — see `cli::consent`). `--dry-run` reports what
 /// would happen and changes nothing.
+///
+/// Issue #530, in this order:
+/// 1. **The source is checked** ([`crate::db::check_import_source`]): it is
+///    an SQLite database that passes its integrity check, a tapectl
+///    catalog, and of a schema version this binary can open. A refusal
+///    replaces nothing, and a dry run refuses the same.
+/// 2. **The live catalog is never opened as a database.** `main.rs` lets
+///    this command past the initialization gate, the config load and
+///    `db::open`, so it runs when `tapectl.db` is missing, empty, not a
+///    database, or failing its integrity check: the four states a catalog
+///    to be replaced is in.
+/// 3. **What it replaces is kept**, byte for byte, beside it as
+///    `tapectl-replaced-<UTC stamp>.db` ([`kept_catalog_path`]), with its
+///    `-wal` (the commits not yet checkpointed into the file) as the kept
+///    copy's own `-wal`. Both are synced, and the directory, before
+///    anything is replaced: a process killed between the two leaves the
+///    live catalog as it was and the copy whole.
+/// 4. **The replacement is a rename.** The source is copied into a new file
+///    beside the catalog, synced, and renamed over it, after the old
+///    `-wal`/`-shm` are removed: a stale `-wal` beside the new file would
+///    be replayed into it.
 pub fn db_import(
     paths: &TapectlPaths,
     import_path: &str,
@@ -3986,31 +4007,156 @@ pub fn db_import(
     dry_run: bool,
     json_output: bool,
 ) -> Result<()> {
-    if !Path::new(import_path).exists() {
+    db_import_stepping(
+        paths,
+        import_path,
+        assume_yes,
+        dry_run,
+        json_output,
+        &mut || Ok(()),
+    )
+}
+
+/// The file `db import` keeps the catalog it replaces in: beside it, named
+/// `tapectl-replaced-<YYYYmmddTHHMMSSZ>.db` (`now`, UTC), in the dated form
+/// `db backup` gives a directory's copies.
+pub fn kept_catalog_path(db_file: &Path, now: chrono::DateTime<chrono::Utc>) -> std::path::PathBuf {
+    let stem = db_file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tapectl".to_string());
+    db_file.with_file_name(format!(
+        "{stem}-replaced-{}.db",
+        now.format("%Y%m%dT%H%M%SZ")
+    ))
+}
+
+/// `path` with SQLite's sidecar `suffix` (`-wal`, `-shm`) appended to the
+/// whole file name, as SQLite names them.
+fn with_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    std::path::PathBuf::from(os)
+}
+
+/// `fsync` the directory `file` is in, so a rename or a new name in it is
+/// on the disk.
+fn sync_parent_dir(file: &Path) -> Result<()> {
+    let dir = match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Copy `from` to `to`, a name that must not exist yet, created 0600, and
+/// sync it to the disk.
+fn copy_file_synced(from: &Path, to: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut src = fs::File::open(from)?;
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)
+        .map_err(|e| TapectlError::Other(format!("cannot create {}: {e}", to.display())))?;
+    std::io::copy(&mut src, &mut dst)?;
+    dst.sync_all()?;
+    Ok(())
+}
+
+/// [`db_import`] with `after_keep` run between the kept copy and the
+/// replacement — the point a test stops it at, as a killed process would
+/// stop (issue #530). An `Err` from it returns at once, as a death there
+/// would: nothing after it runs.
+fn db_import_stepping(
+    paths: &TapectlPaths,
+    import_path: &str,
+    assume_yes: bool,
+    dry_run: bool,
+    json_output: bool,
+    after_keep: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let source = Path::new(import_path);
+    if !source.exists() {
         return Err(TapectlError::Other(format!(
             "import source not found: {import_path}"
         )));
     }
+    if !paths.home.is_dir() {
+        return Err(TapectlError::Other(format!(
+            "db import refuses: there is no tapectl home at {}. It puts a catalog back into a \
+             home that exists, beside its config.toml and keys/: put the home back first \
+             (install.md §8), then import",
+            paths.home.display()
+        )));
+    }
+    let live = &paths.db_file;
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(source), fs::canonicalize(live)) {
+        if a == b {
+            return Err(TapectlError::Other(format!(
+                "db import refuses: {import_path} is the live catalog itself"
+            )));
+        }
+    }
+    let checked = crate::db::check_import_source(source)?;
+    let live_exists = live.symlink_metadata().is_ok();
+    let kept = kept_catalog_path(live, chrono::Utc::now());
+    if live_exists && kept.symlink_metadata().is_ok() {
+        return Err(TapectlError::Other(format!(
+            "db import refuses: {} exists, where the catalog it replaces would be kept; \
+             run it again in a second",
+            kept.display()
+        )));
+    }
 
-    let dest_display = paths.db_file.display().to_string();
+    let dest_display = live.display().to_string();
+    let kept_display = kept.display().to_string();
+    let version_fact = if checked.schema_version < checked.latest {
+        format!(
+            "{import_path} is a catalog of schema version {}, older than this tapectl's {}: \
+             the next command migrates it",
+            checked.schema_version, checked.latest
+        )
+    } else {
+        format!(
+            "{import_path} is a catalog of schema version {}, this tapectl's own, and passes \
+             SQLite's integrity check",
+            checked.schema_version
+        )
+    };
+    let kept_fact = if live_exists {
+        format!("the catalog it replaces is kept, as it is, at {kept_display}")
+    } else {
+        format!("there is no catalog at {dest_display} to replace")
+    };
 
     if dry_run {
         if json_output {
             crate::render::print_json(&serde_json::json!({
                 "source": import_path, "destination": dest_display, "dry_run": true,
+                "source_schema_version": checked.schema_version,
+                "kept": live_exists.then_some(&kept_display),
             }));
         } else {
             println!(
                 "would import {import_path} over the live database at {dest_display} — no changes made"
             );
+            println!("  {version_fact}");
+            println!("  {}", kept_fact.replacen("is kept", "would be kept", 1));
         }
         return Ok(());
     }
 
     let action = format!("import \"{import_path}\" over the live database");
-    let facts = vec![format!(
-        "this OVERWRITES the entire live database at {dest_display} with the contents of {import_path}"
-    )];
+    let facts = vec![
+        format!(
+            "this OVERWRITES the entire live database at {dest_display} with the contents of {import_path}"
+        ),
+        version_fact,
+        kept_fact,
+    ];
 
     if let Err(e) = crate::cli::consent::confirm(&action, &facts, assume_yes) {
         let reason = e.to_string();
@@ -4025,16 +4171,67 @@ pub fn db_import(
         return Err(e);
     }
 
-    let src_conn = rusqlite::Connection::open(import_path)?;
-    let mut dst_conn = rusqlite::Connection::open(&paths.db_file)?;
-    copy_database_in_one_step(&src_conn, &mut dst_conn)?;
+    // Keep what is replaced, synced, before anything is replaced.
+    let live_wal = with_sidecar(live, "-wal");
+    if live_exists {
+        copy_file_synced(live, &kept)?;
+        if live_wal.exists() {
+            copy_file_synced(&live_wal, &with_sidecar(&kept, "-wal"))?;
+        }
+        sync_parent_dir(&kept)?;
+    }
+    after_keep()?;
+
+    // The new catalog, whole and synced, beside the old one.
+    let incoming = with_sidecar(live, &format!(".import-{}", std::process::id()));
+    for path in [incoming.clone(), with_sidecar(&incoming, "-journal")] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    precreate_private_file(&incoming)?;
+    let built = (|| -> Result<()> {
+        let src_conn = rusqlite::Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut dst_conn = rusqlite::Connection::open(&incoming)?;
+        copy_database_in_one_step(&src_conn, &mut dst_conn)?;
+        drop(dst_conn);
+        fs::File::open(&incoming)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = built {
+        let _ = fs::remove_file(&incoming);
+        return Err(e);
+    }
+
+    // A `-wal` or `-shm` of the old catalog beside the new file would be
+    // replayed into it: they go first (the `-wal` is in the kept copy).
+    for sidecar in [live_wal, with_sidecar(live, "-shm")] {
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    fs::rename(&incoming, live)?;
+    sync_parent_dir(live)?;
+    crate::config::secure_path(live, 0o600);
 
     if json_output {
-        crate::render::print_json(
-            &serde_json::json!({"source": import_path, "status": "imported"}),
-        );
+        crate::render::print_json(&serde_json::json!({
+            "source": import_path, "status": "imported",
+            "source_schema_version": checked.schema_version,
+            "kept": live_exists.then_some(&kept_display),
+        }));
     } else {
         println!("database imported from {import_path}");
+        if live_exists {
+            println!("the catalog it replaced is kept at {kept_display}");
+        }
     }
     Ok(())
 }
@@ -4125,11 +4322,41 @@ pub fn db_fsck(conn: &Connection, repair: bool, dry_run: bool) -> Result<FsckRep
     // #177). Run regardless of the integrity_check outcome above.
     report.issues.extend(foreign_key_check_issues(conn)?);
 
+    // Issue #530 (ADR-0012 item 249): a repair deletes every row
+    // `pragma_foreign_key_check` names, and on a catalog SQLite itself calls
+    // damaged that check can name rows whose parent is there (a damaged
+    // index), so the repair would delete records of tapes that are fine.
+    // Refused, dry run included, with every finding in the refusal; nothing
+    // is deleted. The way back is a backup, which `db import` takes over a
+    // damaged catalog.
+    if repair && !report.integrity_ok {
+        let refusal = TapectlError::Other(format!(
+            "db fsck --repair refuses: the catalog fails SQLite's integrity check, and a \
+             repair that deletes rows by what a damaged catalog reports could delete the \
+             records of tapes that are fine. Nothing was deleted. Put a backup back instead \
+             (`tapectl db import <backup>`, which keeps this catalog beside it), then run \
+             `tapectl db fsck` again. Findings: {}",
+            report.issues.join("; ")
+        ));
+        return Err(TapectlError::with_json(
+            serde_json::json!({
+                "integrity_ok": false,
+                "issues": report.issues,
+                "repaired": 0,
+                "refused": true,
+            }),
+            refusal,
+        ));
+    }
+
     if repair && dry_run {
         report.dry_run = true;
     } else if repair {
         match repair_foreign_key_violations(conn) {
-            Ok((repaired, _by_table)) => report.repaired = repaired,
+            Ok((repaired, deleted)) => {
+                report.repaired = repaired;
+                report.deleted = deleted;
+            }
             Err(e) => {
                 // The pre-repair findings are already in `report.issues` —
                 // attach them so a failed repair never surfaces a bare
@@ -4244,13 +4471,14 @@ fn fk_columns(conn: &Connection, table: &str, fkid: i64) -> Result<Vec<String>> 
 
 /// Delete the rows of WITHOUT ROWID `table` whose foreign key `fkid` names a
 /// missing `parent` row: `pragma_foreign_key_check` gives such a row no
-/// rowid to delete by, so the key itself selects them.
+/// rowid to delete by, so the key itself selects them. Returns each deleted
+/// row named by its primary key (issue #530), `(col1, col2)=(v1, v2)`.
 fn delete_keyless_orphans(
     conn: &Connection,
     table: &str,
     parent: &str,
     fkid: i64,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let pairs = fk_column_pairs(conn, table, fkid)?;
     let matches = pairs
         .iter()
@@ -4262,13 +4490,27 @@ fn delete_keyless_orphans(
         .map(|(from, _)| format!("c.\"{from}\" IS NOT NULL"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    Ok(conn.execute(
-        &format!(
-            "DELETE FROM \"{table}\" AS c WHERE {not_null}
-               AND NOT EXISTS (SELECT 1 FROM \"{parent}\" p WHERE {matches})"
-        ),
-        [],
-    )?)
+    let key: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let returning = key
+        .iter()
+        .map(|c| format!("quote(\"{c}\")"))
+        .collect::<Vec<_>>()
+        .join(" || ', ' || ");
+    let mut stmt = conn.prepare(&format!(
+        "DELETE FROM \"{table}\" AS c WHERE {not_null}
+           AND NOT EXISTS (SELECT 1 FROM \"{parent}\" p WHERE {matches})
+         RETURNING {returning}"
+    ))?;
+    let values: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(values
+        .into_iter()
+        .map(|v| format!("({})=({v})", key.join(", ")))
+        .collect())
 }
 
 /// Delete every row `pragma_foreign_key_check` names, children first in
@@ -4278,18 +4520,19 @@ fn delete_keyless_orphans(
 /// immediate FK enforcement mid-transaction. Loops: check -> delete each
 /// distinct (table, rowid) it named -> check again -> until empty, then
 /// commits. A row named for three dangling columns is one row, deleted
-/// once. Returns the total distinct rows deleted and a per-table
-/// breakdown for the audit event; on any failure the transaction is
-/// dropped (rolled back) and the error is returned to the caller, who
-/// attaches the pre-repair findings.
-fn repair_foreign_key_violations(
-    conn: &Connection,
-) -> Result<(usize, std::collections::BTreeMap<String, usize>)> {
+/// once. Returns the total distinct rows deleted and each one named
+/// (`<table> rowid <n>`, or `<table> (<key>)=(<values>)` for a WITHOUT ROWID
+/// table); on any failure the transaction is dropped (rolled back) and the
+/// error is returned to the caller, who attaches the pre-repair findings.
+///
+/// Issue #530: the `db_fsck_repair` event names every row deleted, not
+/// per-table counts, so what a repair removed can be identified afterwards
+/// (and found in a backup taken before it).
+fn repair_foreign_key_violations(conn: &Connection) -> Result<(usize, Vec<String>)> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
 
-    let mut deleted_by_table: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
+    let mut deleted: Vec<String> = Vec::new();
     loop {
         // A WITHOUT ROWID table's violations come back with a NULL rowid
         // and are deleted by their foreign key instead (migration 030).
@@ -4314,27 +4557,28 @@ fn repair_foreign_key_violations(
         }
         let mut keyless_done = std::collections::BTreeSet::new();
         for (table, rowid, parent, fkid) in violations {
-            let n = match rowid {
-                Some(rowid) => tx.execute(
-                    &format!("DELETE FROM \"{table}\" WHERE rowid = ?1"),
-                    params![rowid],
-                )?,
-                None if keyless_done.insert((table.clone(), fkid)) => {
-                    delete_keyless_orphans(&tx, &table, &parent, fkid)?
+            match rowid {
+                Some(rowid) => {
+                    let n = tx.execute(
+                        &format!("DELETE FROM \"{table}\" WHERE rowid = ?1"),
+                        params![rowid],
+                    )?;
+                    if n > 0 {
+                        deleted.push(format!("{table} rowid {rowid}"));
+                    }
                 }
-                None => 0,
-            };
-            *deleted_by_table.entry(table).or_insert(0) += n;
+                None if keyless_done.insert((table.clone(), fkid)) => {
+                    for key in delete_keyless_orphans(&tx, &table, &parent, fkid)? {
+                        deleted.push(format!("{table} {key}"));
+                    }
+                }
+                None => {}
+            }
         }
     }
 
-    let repaired: usize = deleted_by_table.values().sum();
+    let repaired = deleted.len();
     if repaired > 0 {
-        let detail = deleted_by_table
-            .iter()
-            .map(|(table, count)| format!("{table}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         events::log_event(
             &tx,
             "system",
@@ -4344,12 +4588,12 @@ fn repair_foreign_key_violations(
             None,
             None,
             None,
-            Some(&format!("deleted {detail}")),
+            Some(&format!("deleted {repaired}: {}", deleted.join("; "))),
             None,
         )?;
     }
     tx.commit()?;
-    Ok((repaired, deleted_by_table))
+    Ok((repaired, deleted))
 }
 
 #[derive(Debug, Default)]
@@ -4359,6 +4603,10 @@ pub struct FsckReport {
     /// Number of rows deleted by `--repair` (0 when `--repair` was not
     /// passed, and always 0 when `dry_run` is true — see below).
     pub repaired: usize,
+    /// Each row `--repair` deleted, named (`<table> rowid <n>`, or the key
+    /// of a WITHOUT ROWID table's row), as the `db_fsck_repair` event
+    /// records them (issue #530). Empty without `--repair`.
+    pub deleted: Vec<String>,
     /// Issue #247: `--repair --dry-run` stopped at the violation report
     /// (`issues`, above) rather than calling `repair_foreign_key_violations`
     /// — `repaired` stays 0 the way it does for a plain `fsck` with no
@@ -10082,6 +10330,55 @@ mod tests {
             );
         }
 
+        /// Issue #530: the copy of what `db import` replaces is made and
+        /// synced BEFORE the replacement. Stopped between the two, as a
+        /// killed process stops there, the live catalog is as it was and
+        /// the kept copy is whole; nothing half-built is left beside them.
+        #[test]
+        fn stopped_between_the_kept_copy_and_the_replacement_loses_nothing() {
+            let (_dest_tmp, dest_paths) = temp_home_with_marker_tenant("dest-original");
+            let (_src_tmp, src_paths) = temp_home_with_marker_tenant("source-marker");
+
+            let err = db_import_stepping(
+                &dest_paths,
+                src_paths.db_file.to_str().unwrap(),
+                true,
+                false,
+                false,
+                &mut || Err(TapectlError::Other("killed here".to_string())),
+            )
+            .expect_err("the import was stopped");
+            assert!(err.to_string().contains("killed here"), "{err}");
+
+            let names: Vec<String> = fs::read_dir(&dest_paths.home)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            let kept: Vec<&String> = names
+                .iter()
+                .filter(|n| n.starts_with("tapectl-replaced-") && n.ends_with(".db"))
+                .collect();
+            assert_eq!(kept.len(), 1, "{names:?}");
+            assert!(
+                !names.iter().any(|n| n.contains(".import-")),
+                "nothing half-built: {names:?}"
+            );
+            let kept_conn = rusqlite::Connection::open_with_flags(
+                dest_paths.home.join(kept[0]),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let kept_name: String = kept_conn
+                .query_row("SELECT name FROM tenants LIMIT 1", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(kept_name, "dest-original", "the kept copy is whole");
+            assert_eq!(
+                marker_tenant_name(&dest_paths),
+                "dest-original",
+                "the live catalog is as it was"
+            );
+        }
+
         #[test]
         fn missing_source_errors_before_touching_anything() {
             let (_dest_tmp, dest_paths) = temp_home_with_marker_tenant("dest-original");
@@ -11325,6 +11622,165 @@ mod tests {
         let report = db_fsck(&conn, false, false).unwrap();
         assert!(report.integrity_ok);
         assert!(report.issues.is_empty(), "issues: {:?}", report.issues);
+    }
+
+    /// A catalog at `db_file` that opens but fails SQLite's integrity check,
+    /// holding one orphan `units` row (its tenant is gone): two indexes are
+    /// given each other's b-tree. Returned on a plain connection, as
+    /// `db::open_for_repair` gives `db fsck --repair` one.
+    fn damaged_catalog_with_an_orphan(db_file: &Path) -> (Connection, i64) {
+        {
+            let conn = crate::db::open(db_file).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u-orphan', 'orphan-unit', 99999, 'mtime_size', 1, 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE zz_a (x); CREATE INDEX zz_ai ON zz_a (x);
+                 INSERT INTO zz_a VALUES (1), (2), (3);
+                 CREATE TABLE zz_b (y); CREATE INDEX zz_bi ON zz_b (y);
+                 INSERT INTO zz_b VALUES ('p'), ('q');",
+            )
+            .unwrap();
+            let root = |name: &str| -> i64 {
+                conn.query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let (a, b) = (root("zz_ai"), root("zz_bi"));
+            conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+            conn.execute(
+                "UPDATE sqlite_master SET rootpage = ?1 WHERE name = 'zz_ai'",
+                [b],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sqlite_master SET rootpage = ?1 WHERE name = 'zz_bi'",
+                [a],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+        }
+        let conn = Connection::open(db_file).unwrap();
+        let orphan: i64 = conn
+            .query_row("SELECT id FROM units WHERE name = 'orphan-unit'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        (conn, orphan)
+    }
+
+    /// Issue #530 (ADR-0012 item 249): `db fsck --repair` refuses on a
+    /// catalog that fails SQLite's integrity check, its dry run too, and
+    /// deletes nothing: the orphan it reports is still there, and no repair
+    /// event is written. A plain `db fsck` still reports both findings. On
+    /// the parent the repair ran and deleted the orphan.
+    #[test]
+    fn fsck_repair_refuses_on_a_failed_integrity_check() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, orphan) = damaged_catalog_with_an_orphan(&tmp.path().join("tapectl.db"));
+
+        let report = db_fsck(&conn, false, false).unwrap();
+        assert!(
+            !report.integrity_ok,
+            "the fixture must fail the integrity check"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.starts_with("foreign_key_check: 1 row in units")),
+            "{:?}",
+            report.issues
+        );
+
+        for dry_run in [false, true] {
+            let err = db_fsck(&conn, true, dry_run).expect_err("a repair must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("db fsck --repair refuses")
+                    && msg.contains("fails SQLite's integrity check")
+                    && msg.contains("Nothing was deleted")
+                    && msg.contains("foreign_key_check: 1 row in units"),
+                "dry_run={dry_run}: {msg}"
+            );
+            crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+                &msg,
+                &[("<backup>", "/b/t.db")],
+                &["tapectl db import /b/t.db", "tapectl db fsck"],
+            );
+        }
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM units WHERE id = ?1",
+                params![orphan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "a refused repair deletes nothing");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = 'db_fsck_repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    /// Issue #530: what a repair deleted can be identified afterwards. The
+    /// report and the `db_fsck_repair` event name each row (the parent's
+    /// event held per-table counts only), a WITHOUT ROWID table's by its
+    /// key.
+    #[test]
+    fn fsck_repair_names_each_row_it_deleted() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        for set_id in [9001, 9002] {
+            conn.execute(
+                "INSERT INTO writes (volume_id, stage_set_id, snapshot_id, status)
+                 VALUES (9999, ?1, 9999, 'completed')",
+                params![set_id],
+            )
+            .unwrap();
+        }
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM writes ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let report = db_fsck(&conn, true, false).unwrap();
+        let mut deleted = report.deleted.clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            ids.iter()
+                .map(|id| format!("writes rowid {id}"))
+                .collect::<Vec<_>>()
+        );
+        let detail: String = conn
+            .query_row(
+                "SELECT details FROM events WHERE action = 'db_fsck_repair'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for id in &ids {
+            assert!(
+                detail.contains(&format!("writes rowid {id}")),
+                "the event names each deleted row: {detail}"
+            );
+        }
     }
 }
 

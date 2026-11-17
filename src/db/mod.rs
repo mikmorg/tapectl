@@ -715,6 +715,115 @@ pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(pending <= 0)
 }
 
+/// The schema version this binary migrates a catalog to: the number of
+/// migrations it carries, which is what `PRAGMA user_version` reads once
+/// every one has run.
+pub fn latest_schema_version() -> Result<i64> {
+    let conn = Connection::open_in_memory()?;
+    let pending = migrations()
+        .pending_migrations(&conn)
+        .map_err(|e| TapectlError::Migration(e.to_string()))?;
+    Ok(i64::from(pending))
+}
+
+/// What `db import` found when it checked the file it is about to put in
+/// the live catalog's place (issue #530).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSource {
+    /// The source's `PRAGMA user_version`: how many of this binary's
+    /// migrations it has had. Below [`ImportSource::latest`] the next
+    /// ordinary open migrates it forward.
+    pub schema_version: i64,
+    /// This binary's [`latest_schema_version`].
+    pub latest: i64,
+}
+
+/// The tables every catalog of tapectl's has had since migration 001. A file
+/// without them is not a catalog of tapectl's, whatever its `user_version` says.
+const CATALOG_TABLES: [&str; 5] = ["tenants", "units", "snapshots", "stage_sets", "volumes"];
+
+/// Check a file before `db import` puts it where the live catalog is (issue
+/// #530): it opens as an SQLite database, read only; it passes `PRAGMA
+/// integrity_check`; it is a catalog of tapectl's (the core tables, and a schema
+/// version above zero); and this binary can open it (a schema version no
+/// newer than [`latest_schema_version`]). Each failure is refused by name,
+/// before anything is replaced. `db import` used to copy any file page for
+/// page, so a damaged backup became the live catalog, and a backup from a
+/// newer binary left every later command failing with `DatabaseTooFarAhead`,
+/// `db import` included.
+///
+/// Read only (`SQLITE_OPEN_READ_ONLY`): the check never writes to the
+/// source, and a file that is not a database is never turned into one.
+pub fn check_import_source(path: &Path) -> Result<ImportSource> {
+    use rusqlite::OpenFlags;
+    let refuse = |why: String| {
+        TapectlError::Other(format!(
+            "db import refuses {}: {why}; nothing was replaced",
+            path.display()
+        ))
+    };
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| refuse(format!("it does not open as an SQLite database ({e})")))?;
+    // The first statement is where SQLite reads the header, so a file that
+    // is not a database fails here rather than at the open.
+    let integrity: Vec<String> = conn
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| refuse(format!("it does not read as an SQLite database ({e})")))?;
+    if !(integrity.len() == 1 && integrity[0] == "ok") {
+        let shown: Vec<&str> = integrity.iter().take(3).map(String::as_str).collect();
+        let more = if integrity.len() > shown.len() {
+            format!(" (and {} more)", integrity.len() - shown.len())
+        } else {
+            String::new()
+        };
+        return Err(refuse(format!(
+            "it fails SQLite's integrity check: {}{more}. Import an older backup",
+            shown.join("; ")
+        )));
+    }
+    let mut missing = Vec::new();
+    for table in CATALOG_TABLES {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !present {
+            missing.push(table);
+        }
+    }
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if !missing.is_empty() || schema_version <= 0 {
+        return Err(refuse(format!(
+            "it is not a catalog of tapectl's (schema version {schema_version}{})",
+            if missing.is_empty() {
+                String::new()
+            } else {
+                format!("; no {} table", missing.join(", no "))
+            }
+        )));
+    }
+    let latest = latest_schema_version()?;
+    if schema_version > latest {
+        return Err(refuse(format!(
+            "it is a catalog of schema version {schema_version}, newer than this tapectl's \
+             {latest}: a newer tapectl wrote it, and this one cannot open it. Import it with \
+             that tapectl (`tapectl --version` names this one)"
+        )));
+    }
+    Ok(ImportSource {
+        schema_version,
+        latest,
+    })
+}
+
 /// On startup: detect write sessions orphaned by a crash and mark them
 /// resumable, per `docs/design/layout-session.md`'s state table: "Interrupted
 /// | SIGINT (clean mark) **or** startup sweep found orphaned `in_progress`

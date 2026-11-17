@@ -182,7 +182,7 @@ definitions it parses. For what to *do* with them, start at the
 | &nbsp;&nbsp;[`db backup`](db.md#tapectl-db-backup) | Back up the database, and optionally the private key directory |
 | &nbsp;&nbsp;[`db fsck`](db.md#tapectl-db-fsck) | Check database integrity |
 | &nbsp;&nbsp;[`db export`](db.md#tapectl-db-export) | Export database as JSON |
-| &nbsp;&nbsp;[`db import`](db.md#tapectl-db-import) | Import database from backup |
+| &nbsp;&nbsp;[`db import`](db.md#tapectl-db-import) | Put a backup in the live catalog's place, keeping the one it replaces |
 | &nbsp;&nbsp;[`db stats`](db.md#tapectl-db-stats) | Show database statistics, and what each table weighs |
 | [`completions`](completions.md) | Print a shell completion script |
 

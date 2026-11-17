@@ -849,6 +849,9 @@ is the same procedure for a service-user host.
    tapectl db fsck
    ```
    `db import` asks before it overwrites the live database. `-y` answers for you.
+   It checks the file first and keeps the catalog it replaces (here, the one
+   step 3 made) beside it as `tapectl-replaced-<UTC stamp>.db`; runbook D says
+   what it refuses.
 
 7. **Rebuild from each tape.** Without the kit, that means every tape. With the
    kit imported, it means every tape sealed after the kit was made, and neither
@@ -1077,8 +1080,19 @@ tapectl db fsck
 tapectl audit
 ```
 
-- `db import` is a raw page copy and checks no foreign keys, which is why `db fsck`
-  follows. It asks before overwriting. `-y` answers for you.
+- `db import` runs whatever state the live catalog is in: missing, empty, not a
+  database, or failing its integrity check. Nothing needs moving aside first.
+  It checks the backup before it replaces anything, and refuses one that fails
+  SQLite's integrity check, one that is not a catalog of tapectl's, and one of a
+  newer schema version than this tapectl's (import that one with the tapectl
+  that wrote it; an older one is migrated by the next command). The catalog it
+  replaces is kept beside it as `tapectl-replaced-<UTC stamp>.db`, and the
+  output names it; delete it once the imported catalog has proved itself.
+  It asks before it replaces anything. `-y` answers for you.
+- `db import` copies the backup as it is and checks no foreign keys, which is
+  why `db fsck` follows. If `db fsck` reports that the integrity check fails,
+  `db fsck --repair` refuses and deletes nothing: import an older backup
+  instead.
 - If `keys/` was lost too, copy the files from the backup's key directory
   (`tapectl-20260924T030000Z.keys/` beside the file above, present only if keys
   were included) into `<home>/keys/`, keeping the private key files at mode 0600.

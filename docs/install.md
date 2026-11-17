@@ -701,8 +701,17 @@ sudo -u tapectl -H tapectl audit                                # what the resto
 ```
 
 `db import` is an ADR-0008 Tier-2 gate: it states that it overwrites the live
-database and asks; `-y` answers for a scripted run; `--dry-run` previews. It is
-a raw page copy and checks no foreign keys of its own — hence the `fsck`. A
+database and asks; `-y` answers for a scripted run; `--dry-run` previews. It
+runs whatever state the live catalog is in (missing, empty, not a database,
+failing its integrity check), so nothing is moved aside first. It checks the
+backup before it replaces anything and refuses, by name, one that fails SQLite's
+integrity check, one that is not a catalog of tapectl's, and one of a newer schema
+than this tapectl's (an older one is migrated by the next command). The catalog
+it replaces is kept beside it as `tapectl-replaced-<UTC stamp>.db`, and the
+output names it; remove it once the imported catalog has proved itself. The
+backup is copied as it is, with no foreign key checked — hence the `fsck`. If
+`fsck` reports the integrity check failing, `db fsck --repair` refuses and
+deletes nothing: import an older backup instead. A
 copy made with `TAPECTL_BACKUP_INCLUDE_KEYS=1` has a `tapectl-<stamp>.keys/`
 directory beside it; copy its files into `keys/` (owner `tapectl`, mode 0600)
 if the home's own `keys/` is what was lost.

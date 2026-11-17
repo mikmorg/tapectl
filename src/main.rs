@@ -403,6 +403,20 @@ fn run(
         return Ok(());
     }
 
+    // Issue #530: `db import` puts a catalog back, so it must run when the
+    // catalog is missing (no `tapectl.db`, which the gate below calls "not
+    // initialized") or will not open (`db::open` fails on a file that is not
+    // a database, and on one a newer tapectl migrated). It needs neither the
+    // config nor an open catalog: the source is checked and the live file is
+    // kept and replaced as files (`operations::db_import`).
+    if let Commands::Db {
+        command: cli::DbCommands::Import { ref path },
+    } = cli.command
+    {
+        cli::db::import(&paths, path, cli.json, cli.yes, cli.dry_run)?;
+        return Ok(());
+    }
+
     // Everything else requires initialization. The error names the path,
     // the rule that chose it, and `init` only for a new archive (item 213).
     if !paths.is_initialized() {
@@ -542,7 +556,8 @@ fn run(
     //
     // Every other command (`Volume`, `Collection`, `Snapshot`, the rest of
     // `Stage`, `Tenant`, `Key`, `Unit`, `Cartridge`, `ArchiveSet`,
-    // `QuickArchive`, `Drive`, `Db::{Export,Import,Stats}`, `Config::Show`)
+    // `QuickArchive`, `Drive`, `Db::{Export,Stats}`, `Config::Show`; `Db::Import`
+    // is dispatched before the initialization gate, issue #530)
     // keeps the strict loader below unconditionally —
     // several of them (`Volume`, `Collection`, `QuickArchive`) reach
     // `resolve_lto_backend` directly and must never see this door.

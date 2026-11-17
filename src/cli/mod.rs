@@ -643,16 +643,26 @@ Examples:
     Fsck {
         /// Delete rows whose foreign-key parent is missing
         ///
-        /// Closes the graph in one transaction (children first, in effect);
-        /// logged.
+        /// Closes the graph in one transaction (children first, in effect),
+        /// and names each row it deleted, as its logged event does. Refused,
+        /// deleting nothing, when the integrity check fails: put a backup
+        /// back with `db import` instead.
         #[arg(long)]
         repair: bool,
     },
     /// Export database as JSON
     Export,
-    /// Import database from backup
+    /// Put a backup in the live catalog's place, keeping the one it replaces
+    ///
+    /// Runs when the live catalog is missing, empty, or damaged, as well as
+    /// when it opens. The backup is checked first: it must pass SQLite's
+    /// integrity check, be a catalog of tapectl's, and be of a schema version this
+    /// tapectl can open (an older one is migrated by the next command; a
+    /// newer one is refused). The catalog it replaces is kept beside it as
+    /// `tapectl-replaced-<UTC stamp>.db`, and the output names it. Asks
+    /// first (`--yes` answers); run `db fsck` after it.
     Import {
-        /// Path to backup file
+        /// The backup file to put in the catalog's place
         path: String,
     },
     /// Show database statistics, and what each table weighs

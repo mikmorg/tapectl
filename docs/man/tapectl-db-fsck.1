@@ -14,7 +14,7 @@ Exit status: 0 = clean; 1 = problems found, repaired or not; 2 = the database\*(
 \fB\-\-repair\fR
 Delete rows whose foreign\-key parent is missing
 
-Closes the graph in one transaction (children first, in effect); logged.
+Closes the graph in one transaction (children first, in effect), and names each row it deleted, as its logged event does. Refused, deleting nothing, when the integrity check fails: put a backup back with `db import` instead.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
