@@ -505,10 +505,10 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    // ── migration 022, to the #227/#264 standard ──
+    // ── the journal's schema, to the #227/#264 standard ──
 
     #[test]
-    fn migration_022_creates_the_journal_with_its_columns_and_indexes() {
+    fn the_journal_has_its_columns_and_indexes() {
         let conn = crate::db::open_memory().unwrap();
         let cols: Vec<(String, String, i64)> = {
             let mut stmt = conn.prepare("PRAGMA table_info(mam_journal)").unwrap();
@@ -563,7 +563,7 @@ mod tests {
         );
 
         let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
-        assert!(report.integrity_ok, "integrity_check after 022");
+        assert!(report.integrity_ok, "integrity_check on a fresh catalog");
         assert!(report.issues.is_empty(), "{:?}", report.issues);
     }
 

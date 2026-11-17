@@ -131,14 +131,10 @@ fn exportable_tables(conn: &Connection) -> Result<Vec<String>> {
 /// list) and streams each table's rows one at a time so peak memory tracks
 /// a single row.
 ///
-/// **`schema_version` is `PRAGMA user_version`, NOT `meta.schema_version`.**
-/// `rusqlite_migration` records the applied migration level in
-/// `user_version`; the `meta` row is a relic written once by migration 001
-/// and never bumped since, so on a current database it still reads `1`
-/// while `user_version` reads `6`. An importer told "1" would conclude it
-/// was holding a pre-v2 database — exactly the wrong call, and silently
-/// wrong. The stale `meta` row is a separate pre-existing defect (it is
-/// read by nothing else); this function simply does not trust it.
+/// **`schema_version` is `PRAGMA user_version`**, the level
+/// `rusqlite_migration` records. (A 1.x catalog also carried a relic row
+/// `meta.schema_version` that was never moved; the 2.x baseline writes
+/// none, and this never read it.)
 ///
 /// FTS5 virtual tables and their shadow tables are excluded — see
 /// [`exportable_tables`].
@@ -265,40 +261,6 @@ mod tests {
         assert_eq!(locations[0]["name"], "vault");
         assert_eq!(locations[0]["blob_col"], "ab");
         assert!(locations[0]["notes"].is_null());
-    }
-
-    /// `schema_version` must be `PRAGMA user_version` (what
-    /// `rusqlite_migration` actually maintains), NOT `meta.schema_version`
-    /// — a relic written once by migration 001 and never bumped, which on a
-    /// real current database reads `1` while `user_version` reads `6`.
-    ///
-    /// This test sets the two to *different* values on purpose: an importer
-    /// told "1" would conclude it held a pre-v2 database and act on it.
-    /// Reading the wrong one is silently wrong, which is why it is pinned
-    /// rather than left to the doc comment.
-    #[test]
-    fn schema_version_comes_from_user_version_not_the_stale_meta_row() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version = 6;
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
-        )
-        .unwrap();
-
-        let mut buf = Vec::new();
-        export_json(&conn, &mut buf).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
-
-        assert_eq!(
-            parsed["schema_version"], 6,
-            "must report user_version (6), not the stale meta row (1)"
-        );
-        assert_ne!(
-            parsed["schema_version"], 1,
-            "reading meta.schema_version would report a pre-v2 database"
-        );
     }
 
     /// FTS5 virtual tables and their four shadow tables must not appear.

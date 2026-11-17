@@ -260,10 +260,10 @@ mod tests {
         }
     }
 
-    // ── migration 024, to the #227/#264 standard ──
+    // ── the table's schema, to the #227/#264 standard ──
 
     #[test]
-    fn migration_024_creates_restores_with_its_columns_and_indexes() {
+    fn restores_has_its_columns_and_indexes() {
         let conn = crate::db::open_memory().unwrap();
         let cols: Vec<(String, String, i64, Option<String>)> = {
             let mut stmt = conn.prepare("PRAGMA table_info(restores)").unwrap();
@@ -446,7 +446,7 @@ mod tests {
     }
 
     /// A non-UTF-8 file name in dar's output is stored as the exact bytes,
-    /// not rewritten (022's rule for `mam_journal.raw`).
+    /// not rewritten (the rule `mam_journal.raw` follows).
     #[test]
     fn a_non_utf8_stream_is_kept_as_its_exact_bytes() {
         let conn = crate::db::open_memory().unwrap();

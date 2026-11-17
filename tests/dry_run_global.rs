@@ -1658,29 +1658,17 @@ fn db_fsck_repair_dry_run_does_not_repair() {
 /// is useless for the exact case the repair path exists to serve. Builds
 /// the identical fixture `tests/cli_smoke.rs`'s
 /// `issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open`
-/// uses: a database stopped two migrations short of head, carrying one
-/// dangling `units.tenant_id`.
+/// uses: a catalog carrying one dangling `units.tenant_id`, one migration
+/// short of head through the debug build's test-only pending migration
+/// (`db::PENDING_TEST_MIGRATION_ENV`).
 #[test]
 fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
     let home = TempDir::new().unwrap();
     ok(home.path(), &["init"]);
 
     let db_path = home.path().join(".tapectl").join("tapectl.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
-
     {
-        use rusqlite_migration::{Migrations, M};
-        let mut conn = rusqlite::Connection::open(&db_path).expect("open fixture db");
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        Migrations::new(vec![
-            M::up(include_str!("../src/db/migrations/001_initial.sql")),
-            M::up(include_str!("../src/db/migrations/002_fts5_catalog.sql")),
-        ])
-        .to_latest(&mut conn)
-        .expect("migrate fixture db to 002");
-
+        let conn = rusqlite::Connection::open(&db_path).expect("open the catalog");
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -1691,7 +1679,13 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     }
 
-    let out = run_tapectl(home.path(), &["db", "fsck", "--repair", "--dry-run"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["db", "fsck", "--repair", "--dry-run"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env(tapectl::db::PENDING_TEST_MIGRATION_ENV, "1")
+        .output()
+        .expect("failed to spawn tapectl binary");
     assert!(
         matches!(out.status.code(), Some(0) | Some(1)),
         "a dry run must still be reachable on a database ordinary `db::open` refuses: \
@@ -1705,10 +1699,8 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
         "a dry run must not repair even on the orphan-blocked path: {text}"
     );
 
-    // Bypass `tapectl::db::open` deliberately — this database is still two
-    // migrations short of head, and re-opening it the ordinary way could
-    // itself run `migrate()`, which is exactly what this fixture must NOT
-    // have happened.
+    // Read raw: re-opening it the ordinary way runs `migrate()`, which this
+    // fixture must not have had.
     let raw = rusqlite::Connection::open(&db_path).expect("reopen fixture db raw");
     let n: i64 = raw
         .query_row(
@@ -1720,6 +1712,13 @@ fn db_fsck_repair_dry_run_is_reachable_on_a_database_ordinary_open_refuses() {
     assert_eq!(
         n, 1,
         "a dry run repaired (deleted) the orphan row it should only have previewed"
+    );
+    let version: i64 = raw
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 1,
+        "the dry run left the catalog one migration behind"
     );
 }
 

@@ -1172,8 +1172,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn migration_020_applies_from_001_forward_and_fsck_passes() {
-        // `open_memory` runs the full ordered migration chain.
+    fn a_fresh_catalog_has_the_contacts_table_and_fsck_passes() {
         let conn = crate::db::open_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -1183,10 +1182,7 @@ pub(crate) mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(
-            count, 1,
-            "migration 020 must create the cartridge_contacts table"
-        );
+        assert_eq!(count, 1, "a fresh catalog has the cartridge_contacts table");
 
         let indexes: Vec<String> = {
             let mut stmt = conn
@@ -1212,10 +1208,10 @@ pub(crate) mod tests {
         );
 
         let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
-        assert!(report.integrity_ok, "integrity_check after 020");
+        assert!(report.integrity_ok, "integrity_check on a fresh catalog");
         assert!(
             report.issues.is_empty(),
-            "db fsck must be clean after 020: {:?}",
+            "db fsck must be clean on a fresh catalog: {:?}",
             report.issues
         );
     }
@@ -2232,7 +2228,7 @@ pub(crate) mod tests {
     }
 
     /// The point of taking two readings: what the contact did is computable
-    /// from the rows alone, by the one query migration 025's header gives.
+    /// from the rows alone, by one query over its two rows.
     /// The fake counters advance between open and close exactly as the
     /// kernel's would across a write.
     #[test]

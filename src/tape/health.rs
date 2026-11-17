@@ -1222,30 +1222,17 @@ Read error counter page  [0x3]
         assert_eq!(stored, None);
     }
 
-    /// The tripwire from issue #295, **fired and rewritten** — not deleted.
-    ///
-    /// Its first life asserted the opposite: that `record(…, "resume", …)`
-    /// FAILED with `CHECK constraint failed`, because
-    /// `001_initial.sql`'s `CHECK(operation IN ('write','read','verify','clean'))`
-    /// was still in force and `collect_health_best_effort` only *warns* on an
-    /// insert failure — so writing the honest word would have silently
-    /// dropped the health row on every resume, strictly worse than the
-    /// mislabel it fixed. `volume resume` therefore recorded `'write'`, and
-    /// the test pinned why. It was written to go RED the moment migration 021
-    /// dropped the CHECK: a reminder wired into the gate rather than a
-    /// sentence in an issue.
-    ///
-    /// 021 has landed, so this is the other side of it. Two halves, because
-    /// "the schema now permits it" is only half the fix — the other half is
-    /// that `volume resume` actually says it:
+    /// Issue #295: `health_logs.operation` has no CHECK (ADR-0013 §4), so a
+    /// resume records the word it means rather than `'write'`. Two halves,
+    /// because "the schema permits it" is only half of it — the other half
+    /// is that `volume resume` actually says it:
     ///
     /// 1. `Reading::Resume` round-trips and stores the string `resume`.
-    /// 2. `volume::write::volume_resume` **passes it**. Without this, 021
-    ///    would have landed leaving the vocabulary naming a value nothing
-    ///    writes — which is precisely the `read`/`clean` defect ADR-0013 §4
-    ///    was filed against, reintroduced by its own fix.
+    /// 2. `volume::write::volume_resume` **passes it**. Without this the
+    ///    vocabulary would name a value nothing writes — which is precisely
+    ///    the `read`/`clean` defect ADR-0013 §4 was filed against.
     #[test]
-    fn resume_is_recorded_as_resume_now_that_migration_021_dropped_the_check() {
+    fn resume_is_recorded_as_resume() {
         let conn = crate::db::open_memory().unwrap();
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
@@ -1264,7 +1251,7 @@ Read error counter page  [0x3]
             &HealthCounters::default(),
             "raw",
         )
-        .expect("migration 021 drops the CHECK that used to refuse 'resume'");
+        .expect("no CHECK refuses 'resume'");
 
         let stored: String = conn
             .query_row(

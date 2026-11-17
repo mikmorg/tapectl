@@ -6506,9 +6506,8 @@ mod tests {
 
     /// The pin: each backfill UPDATE finds its row by the version's primary
     /// key, after one lookup of the path in `paths`' UNIQUE(unit_id, path)
-    /// index (migration 030). Before migration 027 the second UPDATE, into
-    /// `manifest_entries`, searched by `manifest_id` alone and scanned the
-    /// whole manifest per file.
+    /// index. In 1.x a second UPDATE, into the per-version manifest, searched
+    /// by the version alone and scanned the whole manifest per file.
     #[test]
     fn backfill_checksums_searches_the_indexes() {
         let conn = crate::db::open_memory().unwrap();
@@ -6526,7 +6525,7 @@ mod tests {
 
     /// Timing-independent linearity: the backfill never takes a full-scan
     /// step, and the virtual-machine steps it spends per file do not grow
-    /// with the snapshot's size. A per-file scan (the pre-027 shape) makes
+    /// with the snapshot's size. A per-file scan (1.x's manifest shape) makes
     /// the per-file cost proportional to the file count.
     #[test]
     fn backfill_checksums_costs_the_same_per_file_at_any_snapshot_size() {
@@ -6580,23 +6579,22 @@ mod tests {
              {large:.1} at 4000"
         );
 
-        // Positive control: the same measurement on the UPDATE this
-        // replaced (schema 26, `manifest_entries` searched by `manifest_id`
-        // alone) sees the per-file cost grow with the manifest.
+        // Positive control: the same measurement on an UPDATE that finds its
+        // row by the version alone and scans the version's files for the
+        // path (the shape of the per-version list this replaced, searched
+        // by its version only) sees the per-file cost grow with the list.
         fn old_steps_per_file(files: i64) -> f64 {
-            let conn = crate::db::open_memory_at_version(26);
+            let conn = crate::db::open_memory().unwrap();
             conn.execute_batch(
-                "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
-                 INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
-                 INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');
-                 INSERT INTO manifests (id, snapshot_id) VALUES (1, 1);",
+                "CREATE TABLE version_list (snapshot_id INTEGER NOT NULL, path TEXT NOT NULL,
+                                            sha256 TEXT);
+                 CREATE INDEX version_list_snapshot ON version_list(snapshot_id);",
             )
             .unwrap();
             let tx = conn.unchecked_transaction().unwrap();
             for f in 0..files {
                 tx.execute(
-                    "INSERT INTO manifest_entries (manifest_id, path, size_bytes, mtime)
-                     VALUES (1, ?1, 1, 'm')",
+                    "INSERT INTO version_list (snapshot_id, path) VALUES (1, ?1)",
                     params![format!("f{f:06}")],
                 )
                 .unwrap();
@@ -6604,9 +6602,8 @@ mod tests {
             tx.commit().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "UPDATE manifest_entries SET sha256 = ?1
-                     WHERE manifest_id = (SELECT id FROM manifests WHERE snapshot_id = ?2 LIMIT 1)
-                     AND path = ?3 AND sha256 IS NULL",
+                    "UPDATE version_list SET sha256 = ?1
+                     WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL",
                 )
                 .unwrap();
             for f in 0..files {
@@ -6618,7 +6615,7 @@ mod tests {
         let (old_small, old_large) = (old_steps_per_file(500), old_steps_per_file(4_000));
         assert!(
             old_large > old_small * 4.0,
-            "the measurement must see the pre-027 quadratic: {old_small:.1} vs {old_large:.1}"
+            "the measurement must see a per-file scan: {old_small:.1} vs {old_large:.1}"
         );
     }
 

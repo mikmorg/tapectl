@@ -5224,7 +5224,7 @@ pub(crate) mod tests {
     /// The pin: in every shape of the copy count (a unit's current versions,
     /// one snapshot, a unit's every snapshot), `writes` is searched by
     /// `stage_set_id` and no single-column status index drives any table.
-    /// Before migration 027 the planner started from `idx_snapshots_status`
+    /// With 1.x's status indexes the planner started from `idx_snapshots_status`
     /// and `idx_writes_status`, so each current snapshot's subquery scanned
     /// every completed write in the catalog.
     #[test]
@@ -5265,10 +5265,22 @@ pub(crate) mod tests {
             );
         }
 
-        // Positive control: on the schema before 027 the same check sees the
-        // status indexes drive the current-versions count.
+        // Positive control: give the live schema back the six single-column
+        // status indexes 1.x had until #373 and the same check sees them
+        // drive the current-versions count.
+        let with_status_indexes = crate::db::open_memory().unwrap();
+        with_status_indexes
+            .execute_batch(
+                "CREATE INDEX idx_units_status ON units(status);
+                 CREATE INDEX idx_snapshots_status ON snapshots(status);
+                 CREATE INDEX idx_stage_sets_status ON stage_sets(status);
+                 CREATE INDEX idx_writes_status ON writes(status);
+                 CREATE INDEX idx_volumes_status ON volumes(status);
+                 CREATE INDEX idx_cartridges_status ON cartridges(status);",
+            )
+            .unwrap();
         let old = query_plan_on(
-            &crate::db::open_memory_at_version(26),
+            &with_status_indexes,
             &format!(
                 "SELECT u.id, {} FROM units u",
                 copy_count_expr(&CoverageQuery::current_unit("u.id"))
@@ -5276,7 +5288,7 @@ pub(crate) mod tests {
         );
         assert!(
             old.iter().any(|l| l.contains("idx_writes_status")),
-            "the check must see the pre-027 plan: {old:#?}"
+            "the check must see a status index drive the plan: {old:#?}"
         );
     }
 

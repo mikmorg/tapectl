@@ -864,16 +864,17 @@ fn db_fsck_before_init_is_not_a_silent_success() {
 /// binary — not the lib's `#[cfg(test)]` fixtures, which are invisible from
 /// here (see this file's header comment).
 ///
-/// `.foreign_key_check()` (migrations 003/012/013/017) runs `PRAGMA
-/// foreign_key_check` with no table argument — i.e. whole-database — so a
-/// pre-existing orphan ANYWHERE makes `db::open`'s `migrate()` call fail the
-/// instant any pending migration carrying the check runs. That failure sits
-/// behind `main.rs`'s single shared `db::open()` gate, ahead of every
-/// command dispatch, including `db fsck --repair` — the one command that
-/// deletes orphans. This builds a database that never migrated past 002
-/// (one migration short of 003, the first `.foreign_key_check()`-decorated
-/// migration) and already carries one dangling `units.tenant_id`, the way a
-/// hand-edited, partially-restored, or pre-003 database would arrive.
+/// `.foreign_key_check()` runs `PRAGMA foreign_key_check` with no table
+/// argument — i.e. whole-database — so a pre-existing orphan ANYWHERE makes
+/// `db::open`'s `migrate()` call fail the instant any pending migration
+/// carrying the check runs. That failure sits behind `main.rs`'s single
+/// shared `db::open()` gate, ahead of every command dispatch, including
+/// `db fsck --repair` — the one command that deletes orphans. This builds a
+/// catalog at the baseline carrying one dangling `units.tenant_id`, and runs
+/// the binary with `TAPECTL_TEST_PENDING_MIGRATION` set
+/// (`db::PENDING_TEST_MIGRATION_ENV`), which gives a debug build one more,
+/// empty, migration with the check: with one baseline schema there is no
+/// real migration left to be behind on (T3.1 step 6).
 ///
 /// Negative control (pre-fix): `db fsck --repair` exits non-zero with a
 /// migration/foreign-key error and never runs the repair at all — the
@@ -882,11 +883,8 @@ fn db_fsck_before_init_is_not_a_silent_success() {
 fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open() {
     let home = TempDir::new().expect("tempdir");
 
-    // `init` first, purely to get a real `config.toml` and directory tree
-    // in place the way an operator's `~/.tapectl` would have one. Its
-    // freshly-created database is already at the latest migration (no
-    // pending migration means no `.foreign_key_check()` ever runs against
-    // it), so it is discarded and replaced below with the broken shape.
+    // `init` first, to get a real `config.toml`, directory tree and catalog
+    // the way an operator's `~/.tapectl` would have them.
     let init_out = run_tapectl(home.path(), &["init"]);
     assert!(
         init_out.status.success(),
@@ -895,29 +893,12 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
         String::from_utf8_lossy(&init_out.stderr)
     );
 
+    // Plant one orphan row the way issue #104's fsck tests do: FK
+    // enforcement OFF for the insert, back ON afterward (re-enabling the
+    // pragma does not retroactively validate rows already there).
     let db_path = home.path().join(".tapectl").join("tapectl.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
-
-    // Build a database at exactly the 002 schema and plant one orphan row
-    // the way issue #104's fsck tests do: FK enforcement OFF for the
-    // insert, back ON afterward (re-enabling the pragma does not
-    // retroactively validate rows already there). Runs the REAL migration
-    // files through the real `rusqlite_migration` runner — never hand-
-    // applied SQL — same as `src/db/mod.rs`'s own `open_memory_at_*`
-    // fixtures, just file-backed and stopped two migrations early.
     {
-        use rusqlite_migration::{Migrations, M};
-        let mut conn = rusqlite::Connection::open(&db_path).expect("open fixture db");
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        Migrations::new(vec![
-            M::up(include_str!("../src/db/migrations/001_initial.sql")),
-            M::up(include_str!("../src/db/migrations/002_fts5_catalog.sql")),
-        ])
-        .to_latest(&mut conn)
-        .expect("migrate fixture db to 002");
-
+        let conn = rusqlite::Connection::open(&db_path).expect("open the catalog");
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
@@ -927,12 +908,32 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
         .expect("plant the orphan row");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     }
+    let behind = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args(args)
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env(tapectl::db::PENDING_TEST_MIGRATION_ENV, "1")
+            .output()
+            .expect("failed to spawn tapectl binary")
+    };
+
+    // Positive control: an ordinary command, one migration behind, is
+    // refused by the orphan.
+    let refused = behind(&["db", "stats"]);
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("db fsck --repair"),
+        "the orphan must block an ordinary command: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
 
     // THE assertion that is red before the fix: `db fsck --repair` must be
     // able to open and fix this database even though it is behind head and
     // carrying an orphan that would otherwise block every command,
     // including this one.
-    let repair_out = run_tapectl(home.path(), &["db", "fsck", "--repair"]);
+    let repair_out = behind(&["db", "fsck", "--repair"]);
     assert!(
         matches!(repair_out.status.code(), Some(0) | Some(1)),
         "db fsck --repair must not exit with the ERROR code for a database it just fixed \
@@ -959,13 +960,21 @@ fn issue_233_db_fsck_repair_can_fix_a_database_ordinary_commands_refuse_to_open(
     // And now that it is repaired, an ordinary command must succeed --
     // proving the very next `db::open()` completed the migration the
     // repair connection deliberately never ran.
-    let stats_out = run_tapectl(home.path(), &["db", "stats"]);
+    let stats_out = behind(&["db", "stats"]);
     assert!(
         stats_out.status.success(),
         "an ordinary command must succeed against the now-repaired database: \
          stdout={}\nstderr={}",
         String::from_utf8_lossy(&stats_out.stdout),
         String::from_utf8_lossy(&stats_out.stderr)
+    );
+    let version: i64 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 2,
+        "the pending migration ran once the orphan was gone"
     );
 }
 
