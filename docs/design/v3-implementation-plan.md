@@ -9,8 +9,8 @@ execution. It is never redesign.
 289 (slices that end at a member's start, each compressed alone; every unit continuing at
 the early warning) were ruled that day and are carried below, and the choices D1 to D22
 were ratified as they read here (item 290). The plan is a
-document. A stage starts when its "Starts when" line is true, and every stage but Stage 0's
-container measurements needs the CTO's go first.
+document. A stage starts when its "Starts when" line is true, and every stage needs the
+CTO's go first. One task does not: T0.3, the made tree, which item 291 said to run "now".
 
 The stages are the phases of the epic, [#554](https://github.com/mikmorg/tapectl/issues/554),
 with the same numbers:
@@ -537,7 +537,8 @@ method so it can be repeated and the decision rule's verdict stated; #567 has a 
 
 **Owner: the coordinator. Never a worker.** A worker was not in the design sessions, and
 this stage decides bytes on tape. **Starts when:** the CTO gives the go, T0.1 has picked
-the ACL record, and T0.7 has held item 283's cut to the readers still owed. **Lands on:** `master`, as documents. Until `layout-3` is merged, `CLAUDE.md`
+the ACL record, and T0.7 has held item 283's cut to the readers still owed. Its section on
+compression is written when T0.5 and T0.6 are in; the rest does not wait for them. **Lands on:** `master`, as documents. Until `layout-3` is merged, `CLAUDE.md`
 keeps saying that the code writes Layout 2.
 
 ### What Stage 1 writes
@@ -2171,8 +2172,9 @@ this stage is done. **Normative:** the Layout 3 set. "Simplify" removed compatib
 features (items 242, 246, 248): each feature below exists in 1.9.2 and must be shown whole
 on Layout 3. Most of this stage is proof, with the fixes the proof finds.
 
-Waves: T5.1 alone (it touches the write plan); then T5.2, T5.3, T5.4; then T5.5, T5.6,
-T5.7.
+Waves: T5.1 alone (it touches the write plan); then T5.2 and T5.4; then T5.3 alone (it
+shares `src/cli/audit.rs` and `src/cli/report.rs` with T5.2, and its order of work is a
+safety rule); then T5.5, T5.6, T5.7.
 
 ### T5.1 Every unit continues at the early warning, and the queue is filled to it (items 246, 288, 289)
 
@@ -2238,8 +2240,8 @@ the plan, and what follows it is not on this tape. `Placed::Refused` and
 `Placed::Deferred` are no longer reached by a set's size, and the baseline of whole units
 (`whole_run`, `split`) goes. **One part is new work:** on a drive with no plan bound the
 code refuses a set that passes the fill ceiling (`SpanNeedsPostWarningBytes`). It must
-instead plan that set by its slices up to the ceiling, a cut the plan makes, which no
-code does today.
+instead plan that set by its slices up to the ceiling, an end the plan chooses inside
+the set, which no code does today.
 
 A volume still holds at most one unbroken range of a stage set (item 122). With a copy
 target of 2 at one place this order still gives item 93's layout: tape 1 ends in the
@@ -2753,8 +2755,9 @@ and built where shown.
 
 1. **The go**, stage by stage. Nothing else is open before it. T0.3 alone does not wait
    for it (item 291). On the go: Stage 0's other measurements (T0.1, T0.2, T0.5, T0.6,
-   T0.7) and Stage 2's first wave start together; Stage 3 follows Stage 2; Stage 1 is
-   written when T0.1 and T0.7 are in.
+   T0.7) and Stage 2's first wave start; the measurements run one at a time, T0.7 and
+   T0.1 first. Stage 3 follows Stage 2. Stage 1 is written when T0.1 and T0.7 are in,
+   its section on compression when T0.5 and T0.6 are.
 2. **A measurement that fails its rule.** T0.1 (neither ACL record is restored by GNU tar
    1.30 and bsdtar), T0.3 (item 253), T0.5 (item 285), T0.6 (item 286's fallback), T0.7
    (item 283). Each task says what goes to the CTO and stops there.

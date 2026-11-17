@@ -42,17 +42,24 @@ words and states the scope you read into them.
 ## On the go, in order
 
 1. **Read** the plan's sections 1 to 6 and Appendix B, `.claude/commands/worktree-agent.md`
-   and the top entry of the Policy block in `.claude/commands/autopilot.md`. You are ready
+   and, in the Policy block of `.claude/commands/autopilot.md`, the two entries dated
+   2026-11-17. You are ready
    when you can say, for T0.7, T2.1 and T1.1, who owns each and what each waits on.
-2. **Start Stage 0 and Stage 2's first wave together.** Stage 0 is six measurements (T0.1,
-   T0.2, T0.3, T0.5, T0.6, T0.7; T0.3 may already be running or done); each has its
-   decision rule written in its task, fixed before it runs. Stage 2's first wave is T2.1, T2.2 and T2.3, on `master`. Three workers
-   at a time; a job that pulls an image or fills disk runs alone, after the broker is told.
+2. **Start Stage 2's first wave, and the measurements beside it one at a time.** Stage
+   2's first wave is three workers on `master`: T2.1, T2.2 and T2.3. The measurements pull
+   images or fill disk, so one runs at a time, after the broker is told, in this order:
+   T0.7 and T0.1 (they gate Stage 1), T0.5 and T0.6 (they gate the format's section on
+   compression, and T4.5), T0.2 (it gates the host's step), and T0.3 if it has not run.
+   Each has its decision rule written in its task, fixed before it runs. **A measurement
+   that fails its rule stops only what it gates** (the plan's Stage 0 table says what);
+   everything else goes on while the CTO answers. T0.4, the escrow paper, is the
+   operator's and gates Stage 7 alone.
 3. **Integrate each wave** as the plan says: the full suite with `--no-fail-fast`, the
    lints, a push, and master's CI read to its end. A wave is done when CI is green on the
    commit that holds it.
 4. **Write Stage 1 yourself** (T1.1 to T1.7), once T0.1 and T0.7 are in. Stage 1 writes
-   the ruled items and D1 to D22 into the format document. It settles nothing new.
+   the ruled items and D1 to D22 into the format document. It settles nothing new. Its
+   section on compression is written when T0.5 and T0.6 are in.
 5. **Then the plan**, stage by stage, each stage on its own "Starts when" line.
 
 ## Who settles what
@@ -74,6 +81,8 @@ Anything else that would change bytes on tape, the schema or a spelling: **stop 
   cover.
 - Keep every open question consistent with every other. Two that contradict would both be
   ratified.
+- **Ask for the go as a question of its own, outside any numbered list**, with the exact
+  work it starts, and say that it needs the word.
 - Say of each claim whether it is **measured** or **reasoned**, and with which tools.
 - Findings live in GitHub issues and in the documents. A terminal message is not a record.
 
@@ -113,9 +122,23 @@ an older item, an issue body or a paragraph of `CLAUDE.md` misleads when read al
 | Item 143: a range is never a source | Amended by item 260: a range is a source for the files it holds whole. |
 | Item 243: the on-tape authorization ends at the install | It ends when the drill passes on the production run (268). |
 | Item 253: real scale "before any code" | The made tree before the code; the largest real unit at the real-drive acceptance (291). |
-| The amendment of 2026-11-16 (night) called "too narrow"; #565's body and comparison of two shapes | That amendment stands as written. Each slice is compressed alone (284). The second shape is history. |
+| `CLAUDE.md`'s paragraph of 2026-11-16 (night) and #565's body, which call that night's amendment "too narrow" and a second compression shape "recommended" | The amendment stands as written. Each slice is compressed alone (284). The second shape is history. |
 | The first default of 2026-11-14: a reader zero-fills a lost slice | Withdrawn by item 264. |
 | `CLAUDE.md`'s dated paragraphs that call a question open | The latest paragraph on that question wins. |
+
+## Where a word is defined
+
+- `CONTEXT.md` is the glossary: Slice, Range, Spanning, Stage set, Volume, Cartridge.
+- **D1 to D22**: the plan's Stage 1, "What Stage 1 writes down".
+- **W1 to W9**, the writer at the early warning, and the **fill ceiling**:
+  `docs/design/volume-format-v2.md` §4.3. They are carried to Layout 3 word for word.
+- **An owed slice, an owed run, the bound**: the plan's T5.1, "The plan, exactly".
+- **The cut** is where the stream is divided into slices (D3). **`cut`** in code font is
+  a write status of Layout 2 that item 288 removes. They are two things.
+- **The tape chain**: the plan's T6.5. **The drill**: #548. **A golden pin**:
+  `tests/on_tape_golden.rs`, and `CLAUDE.md` "Byte pins".
+- **The broker, the Policy block**: `~/.claude/CLAUDE.md`, and
+  `.claude/commands/autopilot.md`.
 
 ## Rules the plan does not carry
 
