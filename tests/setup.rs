@@ -358,13 +358,11 @@ fn an_adopted_escrow_key_prints_no_secret() {
     }
 }
 
-/// Issue #538: `setup` in a home that has a `config.toml` and no catalog
-/// keeps the file (its drive is the one setup then finds), says so, and its
-/// dry run says it would. On the parent step 1 wrote the defaults over it.
-#[test]
-fn setup_keeps_a_config_toml_it_finds() {
+/// A world whose home has a `config.toml` with a drive in it (made by
+/// `init` and `drive add` in another home) and no catalog: what an operator
+/// restores before setting up again.
+fn world_with_a_kept_config() -> World {
     let w = World::new();
-    // A config with a drive, made by `init` and `drive add` in another home.
     let donor = w.p("donor");
     let run = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
@@ -391,7 +389,32 @@ fn setup_keeps_a_config_toml_it_finds() {
     ]);
     std::fs::create_dir_all(w.home()).unwrap();
     std::fs::copy(donor.join("config.toml"), w.home().join("config.toml")).unwrap();
+    w
+}
 
+/// Issue #538: `setup` in a home that has a `config.toml` and no catalog
+/// keeps the file (its drive is the one setup then finds) and says so. On
+/// the parent step 1 wrote the defaults over it.
+#[test]
+fn setup_keeps_a_config_toml_it_finds() {
+    let w = world_with_a_kept_config();
+    let (stdout, _) = assert_ok(&w.setup(&[]), "setup --yes");
+    let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
+    assert!(config.contains("kept-drive"), "{config}");
+    assert!(
+        stdout.contains("already done: drive kept-drive"),
+        "the drive in the kept file is the one setup finds: {stdout}"
+    );
+    assert!(
+        stdout.contains("kept the config.toml that was there"),
+        "{stdout}"
+    );
+}
+
+/// Issue #538: its dry run says the file would be kept.
+#[test]
+fn setup_dry_run_says_it_would_keep_a_config_toml_it_finds() {
+    let w = world_with_a_kept_config();
     let mut args = w.setup_args();
     args.retain(|a| a != "--yes");
     args.push("--dry-run".into());
@@ -401,16 +424,4 @@ fn setup_keeps_a_config_toml_it_finds() {
         stdout.contains("would keep the config.toml there"),
         "{stdout}"
     );
-
-    let (stdout, _) = assert_ok(&w.setup(&[]), "setup --yes");
-    assert!(
-        stdout.contains("kept the config.toml that was there"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("already done: drive kept-drive"),
-        "the drive in the kept file is the one setup finds: {stdout}"
-    );
-    let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
-    assert!(config.contains("kept-drive"), "{config}");
 }

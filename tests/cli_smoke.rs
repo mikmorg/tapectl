@@ -4088,6 +4088,39 @@ fn init_keeps_a_config_toml_it_finds_and_says_so() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.toml"), &config).unwrap();
 
+    let out = run_tapectl(home.path(), &["init", "--no-escrow"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join("config.toml")).unwrap()),
+        String::from_utf8_lossy(&config),
+        "init replaced the config.toml it found"
+    );
+    let show = run_tapectl(home.path(), &["config", "show"]);
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("kept-drive"),
+        "the drive survives"
+    );
+    assert!(
+        stdout.contains("(kept: the file that was there, not replaced)"),
+        "{stdout}"
+    );
+}
+
+/// Issue #538: `init --dry-run` over such a home says the file would be
+/// kept, and makes nothing.
+#[test]
+fn init_dry_run_says_it_would_keep_a_config_toml_it_finds() {
+    let config = a_config_with_a_drive();
+    let home = TempDir::new().expect("tempdir");
+    let dir = home.path().join(".tapectl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), &config).unwrap();
+
     let dry = run_tapectl(home.path(), &["--dry-run", "init", "--no-escrow"]);
     let dry_out = String::from_utf8_lossy(&dry.stdout);
     assert!(dry.status.success(), "{dry_out}");
@@ -4096,28 +4129,7 @@ fn init_keeps_a_config_toml_it_finds_and_says_so() {
         "{dry_out}"
     );
     assert!(!dir.join("tapectl.db").exists(), "a dry run makes nothing");
-
-    let out = run_tapectl(home.path(), &["init", "--no-escrow"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.contains("(kept: the file that was there, not replaced)"),
-        "{stdout}"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("config.toml")).unwrap(),
-        config,
-        "init replaced the config.toml it found"
-    );
-    let show = run_tapectl(home.path(), &["config", "show"]);
-    assert!(
-        String::from_utf8_lossy(&show.stdout).contains("kept-drive"),
-        "the drive survives"
-    );
+    assert_eq!(std::fs::read(dir.join("config.toml")).unwrap(), config);
 }
 
 /// Issue #538: a `config.toml` that does not load is refused by name, dry
