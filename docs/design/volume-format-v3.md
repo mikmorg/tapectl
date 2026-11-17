@@ -1504,7 +1504,7 @@ ratified, item 290; items 287 and 288; the plan's determinations under D9).
 **Counts.** 1.9.2 has 43 tables: 37 of its own, and `paths_fts` (a full-text virtual
 table) with the five shadow tables SQLite keeps for it. Of the 43: **37 kept as they are**,
 **6 kept with changed columns** (one of them renamed), **none gone**; **4 new**. Columns: **4
-go**, **12 are renamed**, **5 are new** on existing tables.
+go**, **12 are renamed**, **3 are new** on existing tables.
 
 ### A.1 Kept as they are (37)
 
