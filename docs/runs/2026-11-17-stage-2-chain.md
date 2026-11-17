@@ -6,7 +6,7 @@ write path and only the tape proves that. This is that run.
 
 - **Commit:** `9e3e0829` (Stage 2 complete: fifteen fixes in three waves, ADR-0012 item 292's go).
 - **Host:** vm-desk1, mhvtl only (A1 and A2 ULT3580-TD8, A3 ULT3580-TD6); the production host and its drive were not touched.
-- **Tools:** 1.1.1, tar (GNU tar) 1.35, dar as installed on the host; a debug build.
+- **Tools:** age 1.1.1, tar (GNU tar) 1.35, dar as installed on the host; a debug build.
 - **Window:** granted by the host's broker; 2026-11-17 19:56Z to 21:05Z.
 
 | Leg | Script | Result |
