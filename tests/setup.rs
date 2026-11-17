@@ -357,3 +357,60 @@ fn an_adopted_escrow_key_prints_no_secret() {
         assert!(!out.contains("AGE-SECRET-KEY-"), "{out}");
     }
 }
+
+/// Issue #538: `setup` in a home that has a `config.toml` and no catalog
+/// keeps the file (its drive is the one setup then finds), says so, and its
+/// dry run says it would. On the parent step 1 wrote the defaults over it.
+#[test]
+fn setup_keeps_a_config_toml_it_finds() {
+    let w = World::new();
+    // A config with a drive, made by `init` and `drive add` in another home.
+    let donor = w.p("donor");
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .arg("--home")
+            .arg(&donor)
+            .args(args)
+            .env("HOME", w.p("user"))
+            .env_remove("TAPECTL_HOME")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_ok(&out, &args.join(" "));
+    };
+    run(&["init", "--no-escrow", "--operator", "friend"]);
+    run(&[
+        "drive",
+        "add",
+        "--name",
+        "kept-drive",
+        "--device-tape",
+        "/dev/nonexistent-kept-nst",
+        "--generation",
+        "LTO-6",
+    ]);
+    std::fs::create_dir_all(w.home()).unwrap();
+    std::fs::copy(donor.join("config.toml"), w.home().join("config.toml")).unwrap();
+
+    let mut args = w.setup_args();
+    args.retain(|a| a != "--yes");
+    args.push("--dry-run".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, _) = assert_ok(&w.tapectl(&args), "setup --dry-run");
+    assert!(
+        stdout.contains("would keep the config.toml there"),
+        "{stdout}"
+    );
+
+    let (stdout, _) = assert_ok(&w.setup(&[]), "setup --yes");
+    assert!(
+        stdout.contains("kept the config.toml that was there"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("already done: drive kept-drive"),
+        "the drive in the kept file is the one setup finds: {stdout}"
+    );
+    let config = std::fs::read_to_string(w.home().join("config.toml")).unwrap();
+    assert!(config.contains("kept-drive"), "{config}");
+}

@@ -812,6 +812,17 @@ is the same procedure for a service-user host.
    ```
    The `next steps:` block that follows is the list for a new archive; on a
    rebuild, the steps below take its place.
+
+   **`config.toml` comes back before this step**, if a copy survived (a home
+   tarball, or the host's own backup of it): put it in the new home first
+   (make the home directory, mode 0700, and copy the file in as
+   `<home>/config.toml`).
+   `init` keeps a `config.toml` it finds, never writing the defaults over it,
+   and says so on its `config:` line (`kept: the file that was there, not
+   replaced`), so its drives, collections, archive sets and defaults are back
+   and step 4 is already done. A file that does not load is refused by name
+   before anything is made: fix it, or move it aside for a default one. With
+   no copy, `init` writes the defaults and step 4 registers the drive.
    `init --operator-key` is not for this runbook when step 6 imports the kit's
    catalog: the import replaces every tenant and key row, so the surviving key
    files go back in step 5 instead. Adopting is for a fresh catalog
@@ -1070,7 +1081,8 @@ What a catalog rebuilt from tapes alone (step 7 without step 6) **does not have*
 
 ### D. Restore the catalog from a `db backup` copy
 
-The home and its `keys/` survive, but the database is damaged or lost. Use the
+The home and its `keys/` survive, but the database is damaged or lost. Its
+`config.toml` is still there, and `db import` leaves it alone. Use the
 newest copy (on a service-user install, the daily timer writes them to
 `/var/backups/tapectl/`):
 

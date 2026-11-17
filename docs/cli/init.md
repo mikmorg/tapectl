@@ -6,7 +6,7 @@
 
 Make a new archive: catalog, config, operator tenant, keys, escrow
 
-Creates the database, config.toml, the operator tenant with its keys, and the permanent escrow recipient (ADR-0005), whose secret it prints once. --no-escrow skips the escrow recipient; --escrow-public-key adopts an existing one instead of minting a new identity. It ends with the next steps.
+Creates the database, config.toml, the operator tenant with its keys, and the permanent escrow recipient (ADR-0005), whose secret it prints once. A config.toml already in the home (restored before init in a recovery) is kept as it is and never replaced; one that does not load is refused before anything is made. --no-escrow skips the escrow recipient; --escrow-public-key adopts an existing one instead of minting a new identity. It ends with the next steps.
 
 ```text
 tapectl init [OPTIONS]

@@ -812,6 +812,12 @@ fn cmd_init(
         },
     )?;
 
+    // Issue #538: a config.toml already in the home (restored before `init`
+    // in a recovery, or left by an `init` stopped after writing it) is kept,
+    // never written over; one that does not load is refused here, ahead of
+    // the dry run and of every side effect.
+    let config_kept = tapectl::setup::existing_config(paths)?.is_some();
+
     // Issue #247: `init` writes config, keys and the database — a dry run
     // must report all three and create NONE of them (never a half-created
     // home), so this sits above `paths.ensure_dirs()`, the first side
@@ -842,6 +848,7 @@ fn cmd_init(
                     "operator": op_name,
                     "operator_keys": operator_key_desc,
                     "config": paths.config_file.display().to_string(),
+                    "config_kept": config_kept,
                     "database": paths.db_file.display().to_string(),
                     "staging": staging_dir.display().to_string(),
                     "escrow": escrow_desc,
@@ -856,11 +863,18 @@ fn cmd_init(
             println!("  operator: {op_name}");
             println!("  keys:     {operator_key_desc}");
             println!("  database: {} (would be created)", paths.db_file.display());
-            println!(
-                "  config:   {} (would be created)",
-                paths.config_file.display()
-            );
-            println!("  staging:  {} (would be created)", staging_dir.display());
+            if config_kept {
+                println!(
+                    "  config:   {} (would be kept: the file there is not replaced)",
+                    paths.config_file.display()
+                );
+            } else {
+                println!(
+                    "  config:   {} (would be created)",
+                    paths.config_file.display()
+                );
+                println!("  staging:  {} (would be created)", staging_dir.display());
+            }
             println!("  escrow:   {escrow_desc}");
         }
         return Ok(());
@@ -869,7 +883,11 @@ fn cmd_init(
     // The directories, config.toml with the staging directory made, and the
     // catalog's schema: the skeleton `tapectl setup` makes too, through the
     // same function (ADR-0012 item 227).
-    let (cfg, conn) = tapectl::setup::make_home(paths, true)?;
+    let tapectl::setup::MadeHome {
+        config: cfg,
+        conn,
+        config_kept,
+    } = tapectl::setup::make_home(paths, true)?;
 
     // Create operator tenant with keypairs: minted, or the one adopted
     // (#424), checked again against the catalog (empty here) and against the
@@ -928,6 +946,7 @@ fn cmd_init(
                 "operator": op_name,
                 "operator_id": tenant_id,
                 "operator_key_adopted": adopted_operator_key.as_ref().map(|i| &i.public_key),
+                "config_kept": config_kept,
                 "dar_available": dar_ok,
                 "escrow_public_key": escrow_public_key,
                 "next": INIT_NEXT_STEPS.iter().map(|(_, cmd)| cmd).collect::<Vec<_>>(),
@@ -943,7 +962,14 @@ fn cmd_init(
             );
         }
         println!("  database: {}", paths.db_file.display());
-        println!("  config:   {}", paths.config_file.display());
+        if config_kept {
+            println!(
+                "  config:   {} (kept: the file that was there, not replaced)",
+                paths.config_file.display()
+            );
+        } else {
+            println!("  config:   {}", paths.config_file.display());
+        }
         match &escrow_public_key {
             Some(pk) if adopted_escrow_public_key.is_some() => {
                 println!(

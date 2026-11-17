@@ -287,7 +287,8 @@ pub enum Commands {
     /// For one person with one tape drive on their own Linux account (a host
     /// with a service user is set up by scripts/first-run.sh instead). Each
     /// step says what it is about to do, then what it did: the home
-    /// (~/.tapectl unless --home names another); a staging directory; the
+    /// (~/.tapectl unless --home names another; a config.toml already there
+    /// is kept, never replaced); a staging directory; the
     /// drive, found under /dev/tape/by-id/ with its generation read from its
     /// model (the tape is never opened); the operator's keys and a new escrow
     /// identity, whose secret is printed once on stderr, as `init` prints it
@@ -311,7 +312,9 @@ pub enum Commands {
     ///
     /// Creates the database, config.toml, the operator tenant with its keys,
     /// and the permanent escrow recipient (ADR-0005), whose secret it prints
-    /// once. --no-escrow skips the escrow recipient; --escrow-public-key
+    /// once. A config.toml already in the home (restored before init in a
+    /// recovery) is kept as it is and never replaced; one that does not load
+    /// is refused before anything is made. --no-escrow skips the escrow recipient; --escrow-public-key
     /// adopts an existing one instead of minting a new identity. It ends with
     /// the next steps.
     Init {

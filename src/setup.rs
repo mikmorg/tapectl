@@ -175,14 +175,66 @@ fn account_groups() -> Vec<String> {
     names
 }
 
+/// The `config.toml` already in a home that has no catalog yet, loaded,
+/// or `None` when there is none (issue #538). `init` and `setup` keep it
+/// rather than write the defaults over it: it is what an operator restores
+/// first in a recovery, with its drives, collections, archive sets and
+/// defaults, or what an earlier `init` stopped after writing. A file that
+/// does not load is refused by name, before anything is made, since keeping
+/// it would leave a home no command can use and replacing it would lose it.
+/// Loaded as `Config::load` does but for the backend-collision check, which
+/// guards only the write path's choice of drive (#261).
+pub fn existing_config(paths: &TapectlPaths) -> Result<Option<Config>> {
+    if paths.config_file.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    Config::load_tolerating_backend_ambiguity(&paths.config_file)
+        .map(Some)
+        .map_err(|e| {
+            TapectlError::Other(format!(
+                "{} is there already and does not load: {e}. It is kept, never replaced \
+                 (it may be the only copy of this host's drives, collections and archive \
+                 sets): fix it so it loads, or move it aside (`mv {} {}.bad`) for a new \
+                 default one, and run this again",
+                paths.config_file.display(),
+                paths.config_file.display(),
+                paths.config_file.display()
+            ))
+        })
+}
+
+/// What [`make_home`] made.
+pub struct MadeHome {
+    /// The home's configuration: the one it found, or the one it wrote.
+    pub config: Config,
+    /// The catalog, with its schema.
+    pub conn: Connection,
+    /// `true` when `config.toml` was there already and was kept as it was
+    /// ([`existing_config`], issue #538); `false` when it was written.
+    pub config_kept: bool,
+}
+
 /// `tapectl init`'s skeleton, shared by `init` and `setup`: the home's
 /// directories, `config.toml` (the defaults, the staging directory at
 /// `<home>/staging`, then the commented drive and quiet-host examples) and
 /// the catalog with its schema. `create_staging` makes the staging
 /// directory too (`init`); setup asks about it in a step of its own first.
-pub fn make_home(paths: &TapectlPaths, create_staging: bool) -> Result<(Config, Connection)> {
+///
+/// A `config.toml` already in the home is kept as it is, never written over
+/// (issue #538): its staging directory is its own, and is not made here.
+pub fn make_home(paths: &TapectlPaths, create_staging: bool) -> Result<MadeHome> {
     let other = |what: &str, e: std::io::Error| TapectlError::Other(format!("{what}: {e}"));
+    let existing = existing_config(paths)?;
     paths.ensure_dirs()?;
+
+    if let Some(config) = existing {
+        let conn = crate::db::open(&paths.db_file)?;
+        return Ok(MadeHome {
+            config,
+            conn,
+            config_kept: true,
+        });
+    }
 
     // Issue #140: the staging default is `<tapectl home>/staging`, and the
     // home a fresh init is actually using may be `--home`/`TAPECTL_HOME`
@@ -216,7 +268,11 @@ pub fn make_home(paths: &TapectlPaths, create_staging: bool) -> Result<(Config, 
             .map_err(|e| other("failed to append the host-check example", e))?;
     }
     let conn = crate::db::open(&paths.db_file)?;
-    Ok((cfg, conn))
+    Ok(MadeHome {
+        config: cfg,
+        conn,
+        config_kept: false,
+    })
 }
 
 /// Run every step for `startup`'s home, reading answers from `input`.
@@ -726,8 +782,17 @@ impl Setup<'_> {
         }
         println!("  the home will be {home} ({why})");
         println!("  (to put it elsewhere, stop here and run `tapectl --home DIR setup`)");
+        // Issue #538: a config.toml already there is kept, never written
+        // over; one that does not load is refused, dry run included.
+        let kept = existing_config(self.paths)?.is_some();
         if self.dry() {
-            println!("  would make it: config.toml, the catalog tapectl.db, keys/");
+            if kept {
+                println!(
+                    "  would keep the config.toml there and make the catalog tapectl.db, keys/"
+                );
+            } else {
+                println!("  would make it: config.toml, the catalog tapectl.db, keys/");
+            }
             return Ok(());
         }
         if !self.ask.confirm("Make the home there?", true)? {
@@ -735,10 +800,17 @@ impl Setup<'_> {
                 "nothing made: run `tapectl --home DIR setup` to put the home in DIR".to_string(),
             ));
         }
-        let (_, conn) = make_home(self.paths, false)?;
-        self.conn = Some(conn);
+        let made = make_home(self.paths, false)?;
+        self.conn = Some(made.conn);
         self.changed = true;
-        println!("  made {home}: config.toml, the catalog tapectl.db, keys/");
+        if made.config_kept {
+            println!(
+                "  made {home}: the catalog tapectl.db, keys/; kept the config.toml that was \
+                 there, as it was"
+            );
+        } else {
+            println!("  made {home}: config.toml, the catalog tapectl.db, keys/");
+        }
         Ok(())
     }
 

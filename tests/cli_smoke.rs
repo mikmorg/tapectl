@@ -4032,3 +4032,99 @@ fn db_import_refuses_a_newer_a_damaged_or_a_foreign_source() {
         "a refused import keeps nothing: {replaced:?}"
     );
 }
+
+// ── `init` over a config.toml with no catalog (issue #538) ─────────────────
+
+/// A `config.toml` with a drive in it, made by a real `init` and `drive add`
+/// in a throwaway home: what an operator restores into a home before `init`
+/// in a recovery.
+fn a_config_with_a_drive() -> Vec<u8> {
+    let donor = TempDir::new().expect("tempdir");
+    for args in [
+        &["init", "--no-escrow"][..],
+        &[
+            "drive",
+            "add",
+            "--name",
+            "kept-drive",
+            "--device-tape",
+            "/dev/nonexistent-kept-nst",
+            "--generation",
+            "LTO-6",
+        ][..],
+    ] {
+        let out = run_tapectl(donor.path(), args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::read(donor.path().join(".tapectl").join("config.toml")).unwrap()
+}
+
+/// Issue #538: `init` in a home that has a `config.toml` and no catalog
+/// keeps the file as it is (its drive survives), says so, and its dry run
+/// says it would. On the parent `init` wrote the defaults over it.
+#[test]
+fn init_keeps_a_config_toml_it_finds_and_says_so() {
+    let config = a_config_with_a_drive();
+    let home = TempDir::new().expect("tempdir");
+    let dir = home.path().join(".tapectl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), &config).unwrap();
+
+    let dry = run_tapectl(home.path(), &["--dry-run", "init", "--no-escrow"]);
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(dry.status.success(), "{dry_out}");
+    assert!(
+        dry_out.contains("(would be kept: the file there is not replaced)"),
+        "{dry_out}"
+    );
+    assert!(!dir.join("tapectl.db").exists(), "a dry run makes nothing");
+
+    let out = run_tapectl(home.path(), &["init", "--no-escrow"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("(kept: the file that was there, not replaced)"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("config.toml")).unwrap(),
+        config,
+        "init replaced the config.toml it found"
+    );
+    let show = run_tapectl(home.path(), &["config", "show"]);
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("kept-drive"),
+        "the drive survives"
+    );
+}
+
+/// Issue #538: a `config.toml` that does not load is refused by name, dry
+/// run included, before anything is made, and is left as it is.
+#[test]
+fn init_refuses_a_config_toml_it_finds_that_does_not_load() {
+    let home = TempDir::new().expect("tempdir");
+    let dir = home.path().join(".tapectl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = b"[defaults]\nno_such_key = 1\n";
+    std::fs::write(dir.join("config.toml"), bad).unwrap();
+
+    for args in [&["--dry-run", "init"][..], &["init"][..]] {
+        let out = run_tapectl(home.path(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must refuse");
+        assert!(
+            stderr.contains("config.toml is there already and does not load"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!dir.join("tapectl.db").exists(), "{args:?} made a catalog");
+        assert_eq!(std::fs::read(dir.join("config.toml")).unwrap(), bad);
+    }
+}
