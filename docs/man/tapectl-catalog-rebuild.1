@@ -10,7 +10,9 @@ Reconstruct catalog rows by reading a sealed volume.
 .PP
 The path back when the database is gone and there is no backup.
 .PP
-Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
+A unit is its uuid. A unit on the tape whose name this catalog gives a unit of another uuid is another unit: it is refused, by name, nothing of it is recorded and no copy is counted for it, while the rest of the tape is rebuilt; the run then exits 2. Rename the catalog\*(Aqs unit (`tapectl unit rename`) and rebuild the tape again to record it.
+.PP
+Exit status: 0 = done; 2 = an error or a refusal, of the tape or of one of its units; 75 = the catalog was busy.
 .SH OPTIONS
 .TP
 \fB\-\-from\-volume\fR

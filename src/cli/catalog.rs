@@ -71,7 +71,14 @@ pub enum CatalogCommands {
     ///
     /// The path back when the database is gone and there is no backup.
     ///
-    /// Exit status: 0 = done; 2 = an error or a refusal; 75 = the catalog was busy.
+    /// A unit is its uuid. A unit on the tape whose name this catalog gives a
+    /// unit of another uuid is another unit: it is refused, by name, nothing of
+    /// it is recorded and no copy is counted for it, while the rest of the tape
+    /// is rebuilt; the run then exits 2. Rename the catalog's unit
+    /// (`tapectl unit rename`) and rebuild the tape again to record it.
+    ///
+    /// Exit status: 0 = done; 2 = an error or a refusal, of the tape or of one of
+    /// its units; 75 = the catalog was busy.
     Rebuild {
         /// Rebuild from a sealed tape volume.
         ///
@@ -760,6 +767,12 @@ fn dispatch(
             );
             drop(work);
             let report = report?;
+            // #527 (ADR-0012 item 249): a unit refused as another unit of a
+            // name the catalog already gives. The rest of the tape is rebuilt
+            // and committed; the run reports it whole, then ends non-zero, as
+            // a batch that skipped something does (#539), so a script that
+            // rebuilds tape after tape cannot read the refusal as success.
+            let refused_error = refused_error(&report);
 
             if json_output {
                 let mut obj = serde_json::json!({
@@ -867,6 +880,12 @@ fn dispatch(
                 // #418 R4: additive. The tapes this tape's cross-volume index
                 // names that the catalog lacks: a to-do list, nothing added.
                 obj["cross_volume_index"] = index_json(&report);
+                // #527 (ADR-0012 item 249): additive. The tape's units refused
+                // as other units of a name the catalog already gives.
+                obj["refused_units"] = refused_units_json(&report);
+                if let Some(err) = refused_error {
+                    return Err(TapectlError::with_json(obj, err));
+                }
                 crate::render::print_json(&obj);
             } else {
                 println!(
@@ -885,8 +904,10 @@ fn dispatch(
                         report.load_count_at_write
                     )
                 );
-                if report.is_noop() {
+                if report.is_noop() && report.refused_units.is_empty() {
                     println!("  no changes — the catalog already knew this volume");
+                } else if report.is_noop() {
+                    println!("  no changes");
                 } else {
                     println!(
                         "  inserted: {}, {}, {}, {},",
@@ -970,6 +991,11 @@ fn dispatch(
                 // #420, outside the is_noop() branch for the same reason: a
                 // tape that ended early says so on every run.
                 for line in short_tape_lines(&report) {
+                    println!("{line}");
+                }
+                // #527, outside the is_noop() branch for the same reason: a
+                // re-run refuses the same unit again and says so every time.
+                for line in refused_lines(&report) {
                     println!("{line}");
                 }
                 // #478, outside the is_noop() branch for the same reason: a
@@ -1092,6 +1118,9 @@ fn dispatch(
                     for line in escrow_unknown_lines(&report, escrow_registered) {
                         println!("{line}");
                     }
+                }
+                if let Some(err) = refused_error {
+                    return Err(err);
                 }
             }
         }
@@ -1521,6 +1550,65 @@ fn index_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
+/// What `catalog rebuild` says of the tape's units it refused (ADR-0012 item
+/// 249, #527): each is another unit of a name the catalog already gives, so
+/// nothing of it was recorded and it counts as no copy. Empty when none was.
+fn refused_lines(report: &RebuildReport) -> Vec<String> {
+    if report.refused_units.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  refused: {} on this tape {} the name of a catalog unit with another uuid; the rest \
+         of the tape was rebuilt",
+        crate::render::plural(report.refused_units.len() as i64, "unit", "units"),
+        if report.refused_units.len() == 1 {
+            "has"
+        } else {
+            "have"
+        }
+    )];
+    for r in &report.refused_units {
+        lines.push(format!("    {}", r.describe()));
+    }
+    lines
+}
+
+/// [`refused_lines`] for `--json`: one object per refused unit, with both
+/// uuids and why.
+fn refused_units_json(report: &RebuildReport) -> serde_json::Value {
+    serde_json::json!(report
+        .refused_units
+        .iter()
+        .map(|r| serde_json::json!({
+            "unit": r.unit,
+            "version": r.version,
+            "tape_uuid": r.tape_uuid,
+            "catalog_uuid": r.catalog_uuid,
+            "reason": r.describe(),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// The error a rebuild that refused a unit ends with (#527): it names each
+/// refused unit, after the report has said the rest.
+fn refused_error(report: &RebuildReport) -> Option<TapectlError> {
+    if report.refused_units.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = report
+        .refused_units
+        .iter()
+        .map(|r| format!("{} v{}", r.unit, r.version))
+        .collect();
+    Some(TapectlError::Other(format!(
+        "{} refused, another unit of a name this catalog already gives, and not counted as \
+         a copy: {}; rename the catalog's unit (`tapectl unit rename`) and run the rebuild \
+         again to record it",
+        crate::render::plural(names.len() as i64, "unit was", "units were"),
+        names.join(", ")
+    )))
+}
+
 /// What `catalog rebuild` says of the spannable sets on the tape (#478,
 /// ADR-0012 items 121 and 128; `volume-format-v2.md` §4.4): each one the tape
 /// holds as a range, with its run, and each version the run made current.
@@ -1854,6 +1942,46 @@ mod tests {
         assert!(text.contains("position 4"), "{text}");
         assert!(text.contains("every unit was recorded"), "{text}");
         assert!(text.contains("RESTORE.sh"), "{text}");
+    }
+
+    /// #527 (ADR-0012 item 249): a refused unit is said in the text, in
+    /// `--json` with both uuids, and as the error the run ends with; nothing
+    /// is said when none was refused.
+    #[test]
+    fn a_rebuild_that_refused_a_unit_says_so_and_ends_non_zero() {
+        use crate::volume::rebuild::{RebuildReport, RefusedUnit};
+        let clean = RebuildReport::default();
+        assert!(super::refused_lines(&clean).is_empty());
+        assert_eq!(super::refused_units_json(&clean), serde_json::json!([]));
+        assert!(super::refused_error(&clean).is_none());
+
+        let report = RebuildReport {
+            refused_units: vec![RefusedUnit {
+                unit: "photos/2019".to_string(),
+                version: 7,
+                tape_uuid: "tape-uuid".to_string(),
+                catalog_uuid: "catalog-uuid".to_string(),
+            }],
+            ..Default::default()
+        };
+        let text = super::refused_lines(&report).join("\n");
+        assert!(text.contains("refused: 1 unit on this tape has"), "{text}");
+        assert!(text.contains("the rest of the tape was rebuilt"), "{text}");
+        assert!(
+            text.contains("tape-uuid") && text.contains("catalog-uuid"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tapectl unit rename photos/2019 <new name>"),
+            "{text}"
+        );
+        let json = super::refused_units_json(&report);
+        assert_eq!(json[0]["unit"], "photos/2019");
+        assert_eq!(json[0]["version"], 7);
+        assert_eq!(json[0]["tape_uuid"], "tape-uuid");
+        assert_eq!(json[0]["catalog_uuid"], "catalog-uuid");
+        let err = super::refused_error(&report).unwrap().to_string();
+        assert!(err.contains("photos/2019 v7"), "{err}");
     }
 
     /// #418 R4: the rebuild lists the volumes the tape's cross-volume index

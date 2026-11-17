@@ -57,6 +57,19 @@
 //! catalog. This is what makes a rebuild safe to run against a catalog that
 //! is damaged rather than absent: it can only ever add.
 //!
+//! **A unit is its uuid** (ADR-0012 item 249, #527). A tape's unit is found
+//! in the catalog by its uuid, under whatever name the catalog now gives it
+//! (`unit rename` changes the name, never the uuid). A tape's unit whose
+//! NAME the catalog already gives a unit of ANOTHER uuid is a different unit
+//! (one renamed away and a new one given its old name, or a catalog and a
+//! tape of different generations), and it is refused, by name: nothing of
+//! it is recorded and no copy is counted for it
+//! ([`RebuildReport::refused_units`]); the rest of the tape rebuilds. The
+//! one exception to "any order": when two tapes carry two units of one name
+//! into a catalog that has neither, the tape rebuilt first gives the name its
+//! unit, and the other tape's is the one refused. Renaming the catalog's
+//! unit (`unit rename`) and rebuilding the other tape again records it.
+//!
 //! **It records provenance as an `events` row, not a column.** A rebuilt row
 //! is not a different kind of row — ADR-0001 has the catalog as a ledger of
 //! claims, and "tapectl claims this because the tape said so" is exactly the
@@ -148,6 +161,13 @@ pub struct RebuildReport {
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
+    /// The tape's units this run refused (ADR-0012 item 249, #527): each
+    /// carries a name the catalog gives a unit of another uuid, so it is
+    /// another unit. Nothing of it was recorded (no unit, snapshot, stage
+    /// set, write, position or file row) and no copy is counted for it;
+    /// the rest of the tape rebuilt. Listed on every run, a re-run that
+    /// changes nothing included, until the name is free.
+    pub refused_units: Vec<RefusedUnit>,
     /// Tenant envelopes no copy of which could be read (issue #451), one
     /// description each (kind, position, the backup's position, why). The
     /// rebuild went on without them only because the operator envelope's
@@ -428,6 +448,33 @@ pub struct RebuildReport {
     /// has no row for, after this rebuild: each is a tape to bring in and
     /// rebuild from. Sorted by label.
     pub index_volumes_missing: Vec<IndexedVolume>,
+}
+
+/// A unit of the tape that `catalog rebuild` refused (ADR-0012 item 249,
+/// #527): its name is the name of a catalog unit of another uuid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedUnit {
+    /// The name both units carry.
+    pub unit: String,
+    /// The version of the tape's unit this block holds.
+    pub version: i64,
+    /// The uuid the tape's `[[units]]` block states.
+    pub tape_uuid: String,
+    /// The uuid of the catalog's unit of that name.
+    pub catalog_uuid: String,
+}
+
+impl RefusedUnit {
+    /// Why, in one sentence, and the way on.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} v{} (uuid {}) is not the catalog's unit \"{}\" (uuid {}): two units of one \
+             name, so nothing of it was recorded and it counts as no copy; to rebuild it, \
+             rename the catalog's unit (`tapectl unit rename {} <new name>`) and run this \
+             rebuild again",
+            self.unit, self.version, self.tape_uuid, self.unit, self.catalog_uuid, self.unit
+        )
+    }
 }
 
 /// A volume a tape's cross-volume index names that the catalog lacks, with
@@ -1383,12 +1430,12 @@ fn attest_escrow(
                  JOIN snapshots s ON s.id = ss.snapshot_id
                  JOIN units u ON u.id = s.unit_id
                  JOIN stage_slices sl ON sl.stage_set_id = ss.id
-                 WHERE u.name = ?1 AND s.version = ?2
+                 WHERE u.uuid = ?1 AND s.version = ?2
                    AND sl.slice_number = ?3 AND sl.sha256_encrypted = ?4
                    AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
                  LIMIT 1",
                 params![
-                    unit.name,
+                    unit.uuid,
                     unit.snapshot_version,
                     first.number,
                     first.sha256_encrypted
@@ -2274,9 +2321,23 @@ fn insert_all(
         // already knows keeps the tenant it already has, and creating that
         // tenant first would leave an orphan row behind for a unit whose
         // ownership was never in question.
+        //
+        // A unit is its uuid (ADR-0012 item 249, #527): a block whose name
+        // the catalog gives a unit of another uuid is another unit, refused
+        // here, before anything of it is written, and no copy is counted for
+        // it. Only this block: the rest of the tape rebuilds.
         let unit_id = match existing_unit(tx, unit)? {
-            Some(id) => id,
-            None => {
+            UnitMatch::Uuid(id) => id,
+            UnitMatch::NameOfAnother { catalog_uuid } => {
+                report.refused_units.push(RefusedUnit {
+                    unit: unit.name.clone(),
+                    version: unit.snapshot_version,
+                    tape_uuid: unit.uuid.clone(),
+                    catalog_uuid,
+                });
+                continue;
+            }
+            UnitMatch::None => {
                 let tenant_name = match tenant_of.get(&unit.name) {
                     Some(t) => t.clone(),
                     None => {
@@ -2394,8 +2455,8 @@ struct RebuiltSet {
     stage_set_id: i64,
     unit_name: String,
     /// The manifest's unit uuid — the one the writing catalogue named the
-    /// catalogue file by (`<uuid8>_v<version>`), which a local unit matched
-    /// by NAME may not share.
+    /// catalogue file by (`<uuid8>_v<version>`). The catalog's unit has the
+    /// same one: a unit is found by its uuid alone (#527).
     unit_uuid: String,
     version: i64,
     /// The block states `may_span` (#478).
@@ -2523,12 +2584,12 @@ fn place_catalogue(
         |r| r.get(0),
     )?;
     let dir = crate::staging::stage_set_catalogue_dir(paths, &local_uuid, set.stage_set_id);
-    // Named by the LOCAL unit's uuid too, not the tape's: the next copy's
-    // MANIFEST.toml lists the local uuid, and its RECOVERY.md and RESTORE.sh
-    // look for `catalogs/<first 8 of that uuid>_v<N>.1.dar`. The two differ
-    // only for a unit this catalog already had under the same NAME with a
-    // different uuid (`existing_unit`'s fallback). dar does not bind a
-    // catalogue to its file name.
+    // Named by the LOCAL unit's uuid too: the next copy's MANIFEST.toml lists
+    // the local uuid, and its RECOVERY.md and RESTORE.sh look for
+    // `catalogs/<first 8 of that uuid>_v<N>.1.dar`. Since #527 the two are
+    // always equal (a unit is found by its uuid alone, and a unit of the
+    // same name under another uuid is refused); the local one is still what
+    // the name must follow. dar does not bind a catalogue to its file name.
     let local_stem = format!(
         "{}_v{}",
         local_uuid.get(..8).unwrap_or(&local_uuid),
@@ -2596,26 +2657,46 @@ fn ensure_tenant(tx: &Connection, name: &str, report: &mut RebuildReport) -> Res
     Ok(tx.last_insert_rowid())
 }
 
+/// What the catalog holds of a tape's unit.
+enum UnitMatch {
+    /// The unit itself, found by its uuid.
+    Uuid(i64),
+    /// No unit of its uuid, but a unit of ANOTHER uuid has its name: two
+    /// units of one name (ADR-0012 item 249, #527).
+    NameOfAnother { catalog_uuid: String },
+    /// Neither: the unit is new to this catalog.
+    None,
+}
+
 /// Find a unit the catalog already has.
 ///
-/// Matched on uuid first: the uuid is the unit's identity, and the name can
-/// legitimately have been changed by `unit rename` since the tape was
-/// written. Falling back to name catches the reverse — a unit re-created
-/// locally under the same name with a fresh uuid — where inserting would hit
-/// the `UNIQUE(name)` constraint and abort the whole rebuild.
-fn existing_unit(tx: &Connection, unit: &envelope::ManifestUnit) -> Result<Option<i64>> {
+/// By uuid: the uuid is the unit's identity, and the name can legitimately
+/// have been changed by `unit rename` since the tape was written. A unit of
+/// another uuid that has the name is reported, never matched (ADR-0012 item
+/// 249, #527). Matching it, as a fallback once did, made two units one: the
+/// tape's version was filed under the catalog's unit of that name, its write
+/// counted as a copy of that unit, and their file lists merged. Inserting it
+/// would hit `UNIQUE(name)` and abort the whole rebuild, so the caller
+/// refuses that one unit instead.
+fn existing_unit(tx: &Connection, unit: &envelope::ManifestUnit) -> Result<UnitMatch> {
     if let Some(id) = existing_id(
         tx,
         "SELECT id FROM units WHERE uuid = ?1",
         params![unit.uuid],
     )? {
-        return Ok(Some(id));
+        return Ok(UnitMatch::Uuid(id));
     }
-    existing_id(
-        tx,
-        "SELECT id FROM units WHERE name = ?1",
-        params![unit.name],
-    )
+    let by_name: Option<String> = tx
+        .query_row(
+            "SELECT uuid FROM units WHERE name = ?1",
+            params![unit.name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match by_name {
+        Some(catalog_uuid) => UnitMatch::NameOfAnother { catalog_uuid },
+        None => UnitMatch::None,
+    })
 }
 
 fn insert_unit(
@@ -3317,10 +3398,31 @@ fn record_event(
             report.unreadable_tenant_envelopes.join(" | ")
         )
     };
+    // #527 (ADR-0012 item 249): the units refused as other units of a name
+    // the catalog already gives, with both uuids.
+    let refused_clause = if report.refused_units.is_empty() {
+        String::new()
+    } else {
+        let each: Vec<String> = report
+            .refused_units
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} v{} (tape uuid {}, catalog uuid {})",
+                    r.unit, r.version, r.tape_uuid, r.catalog_uuid
+                )
+            })
+            .collect();
+        format!(
+            "; REFUSED, another unit of a name the catalog already gives (nothing recorded, \
+             not a copy): {}",
+            each.join(", ")
+        )
+    };
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{span_clause}{unreadable_clause}{cartridge_clause}{displaced_clause}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{refused_clause}{span_clause}{unreadable_clause}{cartridge_clause}{displaced_clause}",
         report.label,
         report.uuid,
         device,

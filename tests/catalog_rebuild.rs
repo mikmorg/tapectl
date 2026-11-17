@@ -259,6 +259,15 @@ fn build_sealed_volume_editing_catalog_db(catalog_db: CatalogDb, sql: &str) -> S
     build_sealed_volume_with(catalog_db)
 }
 
+thread_local! {
+    /// When set, the first unit of [`UNITS`] carries this uuid instead of the
+    /// fixture's own: another unit that carried the same name (#527, as
+    /// `unit rename` and a new unit of the old name, or a catalog of another
+    /// generation, leave it).
+    static FIRST_UNIT_UUID: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Every existing test in this file wants a `mam`-sourced serial and does
 /// not care what it is — `"REBUILDSERIAL"` was always meant to represent one
 /// (issue #165's cartridge-binding tests are the first to need the other
@@ -391,10 +400,10 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         } else {
             &bravo
         };
-        let unit_uuid = if with_catalogues {
-            format!("c{i:07x}-0000-4000-8000-{i:012x}")
-        } else {
-            format!("unit-uuid-{i:04}")
+        let unit_uuid = match FIRST_UNIT_UUID.with(|u| u.get()).filter(|_| i == 0) {
+            Some(uuid) => uuid.to_string(),
+            None if with_catalogues => format!("c{i:07x}-0000-4000-8000-{i:012x}"),
+            None => format!("unit-uuid-{i:04}"),
         };
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, current_path, status)
@@ -4983,11 +4992,14 @@ fn a_rebuild_puts_each_stage_sets_dar_catalogue_back_where_stage_create_leaves_i
 }
 
 /// A unit this catalog already had under the same NAME but another uuid is
-/// the one the tape's sets are filed under (`existing_unit`'s fallback). The
-/// next copy's MANIFEST.toml, RECOVERY.md and RESTORE.sh name its catalogue
-/// by THAT uuid, so the files are put back under it, not the tape's.
+/// another unit (ADR-0012 item 249, #527; this test pinned `existing_unit`'s
+/// name fallback under #473, which item 249 overrules). The tape's unit is
+/// refused, so nothing of it is filed under the catalog's unit: no stage
+/// set, and no catalogue put back under the catalog's uuid, where the next
+/// copy's envelopes would have carried another unit's file list as its own.
+/// The tape's other units are rebuilt and get theirs, under their own uuids.
 #[test]
-fn a_unit_matched_by_name_gets_its_catalogue_under_its_own_uuid() {
+fn a_unit_of_the_same_name_and_another_uuid_is_refused_and_gets_no_catalogue() {
     let keys = FixtureKeys::fresh();
     let mut vol = build_tape_with_catalogues(&keys);
     let home = tempfile::tempdir().unwrap();
@@ -5009,18 +5021,18 @@ fn a_unit_matched_by_name_gets_its_catalogue_under_its_own_uuid() {
 
     let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
 
-    assert_eq!(report.catalogues_restored, UNITS.len());
-    let path = catalog_path_of(&conn, "photos/2019").expect("a catalog_path");
+    assert_eq!(report.refused_units.len(), 1, "{report:?}");
+    let refused = &report.refused_units[0];
+    assert_eq!(refused.unit, "photos/2019");
+    assert_eq!(refused.catalog_uuid, "f00dcafe-0000-4000-8000-000000000000");
     assert!(
-        path.ends_with("/f00dcafe_v7"),
-        "named by the local uuid: {path}"
+        refused.tape_uuid.starts_with(&catalogue_uuid8(0)),
+        "{refused:?}"
     );
-    assert!(path.contains("/catalogs/f00dcafe/s"), "{path}");
-    assert_eq!(
-        std::fs::read(format!("{path}.1.dar")).unwrap(),
-        catalogue_bytes("photos/2019"),
-        "the tape's catalogue bytes"
-    );
+    assert_eq!(stage_sets_of_v7(&conn, "photos/2019"), 0);
+    assert_eq!(report.catalogues_restored, UNITS.len() - 1);
+    let home_path = home.path().canonicalize().unwrap();
+    assert!(!home_path.join("catalogs/f00dcafe").exists());
     // A unit the catalog did not have keeps the tape's own uuid.
     let other = catalog_path_of(&conn, "photos/2020").expect("a catalog_path");
     assert!(
@@ -6552,4 +6564,184 @@ fn a_tape_with_no_spannable_unit_rebuilds_as_it_did_before() {
             && !detail.contains("spanning"),
         "{detail}"
     );
+}
+
+// ── Issue #527: two units that carried one name ──────────────────────────
+
+/// The uuid tape B's `photos/2019` carries: another unit than tape A's.
+const OTHER_UNIT_UUID: &str = "0b0b0b0b-0000-4000-8000-000000000527";
+
+/// [`two_tapes_of_one_version`], except that tape B's `photos/2019` is
+/// ANOTHER unit of that name (#527): the same name and version, another
+/// uuid, as a unit renamed away and a new unit given its old name leave
+/// them, or a catalog of another generation. Its other two units are the
+/// same units as tape A's, so tape B is a second copy of them.
+fn two_tapes_one_name_two_units() -> (SealedVolume, SealedVolume) {
+    let keys = FixtureKeys::fresh();
+    let a = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "SERIAL-A",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL,
+        volume_uuid: VOL_UUID,
+        keys: &keys,
+        slices_per_unit: 2,
+    });
+    FIRST_UNIT_UUID.with(|u| u.set(Some(OTHER_UNIT_UUID)));
+    let b = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "SERIAL-B",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL_B,
+        volume_uuid: VOL_UUID_B,
+        keys: &keys,
+        slices_per_unit: 2,
+    });
+    FIRST_UNIT_UUID.with(|u| u.set(None));
+    (a, b)
+}
+
+fn unit_uuids_named(conn: &rusqlite::Connection, unit_name: &str) -> Vec<String> {
+    conn.prepare("SELECT uuid FROM units WHERE name = ?1 ORDER BY id")
+        .unwrap()
+        .query_map(rusqlite::params![unit_name], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn unit_with_uuid(conn: &rusqlite::Connection, uuid: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT name FROM units WHERE uuid = ?1",
+        rusqlite::params![uuid],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+/// Rebuild the two tapes of [`two_tapes_one_name_two_units`] into an empty
+/// catalog, tape B first when `b_first`. Whichever tape comes second, its
+/// `photos/2019` is a unit the catalog does not know under a name it does:
+/// it is refused, by name, and no copy is counted for it. The rest of that
+/// tape rebuilds.
+fn two_units_of_one_name_rebuild(b_first: bool) {
+    let (mut a, mut b) = two_tapes_one_name_two_units();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+    let (first, second, first_uuid, second_uuid) = if b_first {
+        (&mut b, &mut a, OTHER_UNIT_UUID, "unit-uuid-0000")
+    } else {
+        (&mut a, &mut b, "unit-uuid-0000", OTHER_UNIT_UUID)
+    };
+
+    rebuild(&conn, first, &secret, scratch.path()).expect("rebuild the first tape");
+    // Before: one tape, one copy of each unit.
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 1, "{unit_name} before");
+    }
+
+    let report = rebuild(&conn, second, &secret, scratch.path()).expect("rebuild the second tape");
+
+    // After: the unit of the second tape's that only shares a name is not
+    // attached to the first's. One unit of that name, the first tape's, with
+    // one stage set of v7 and one copy.
+    assert_eq!(
+        unit_uuids_named(&conn, "photos/2019"),
+        vec![first_uuid.to_string()]
+    );
+    assert_eq!(stage_sets_of_v7(&conn, "photos/2019"), 1);
+    assert_eq!(
+        copies(&conn, "photos/2019"),
+        1,
+        "the second tape's photos/2019 is another unit: no copy of this one"
+    );
+    assert_eq!(unit_with_uuid(&conn, second_uuid), None);
+    // The rest of the tape rebuilt: its other units are the same units, and
+    // now have two copies.
+    for (unit_name, _, _) in &UNITS[1..] {
+        assert_eq!(copies(&conn, unit_name), 2, "{unit_name} after");
+    }
+    assert_eq!(report.stage_sets, UNITS.len() - 1, "{report:?}");
+
+    // The report says which unit was refused, with both uuids and the way on.
+    assert_eq!(
+        report.refused_units,
+        vec![rebuild::RefusedUnit {
+            unit: "photos/2019".to_string(),
+            version: 7,
+            tape_uuid: second_uuid.to_string(),
+            catalog_uuid: first_uuid.to_string(),
+        }]
+    );
+    let why = report.refused_units[0].describe();
+    assert!(
+        why.contains(second_uuid) && why.contains(first_uuid),
+        "{why}"
+    );
+    assert!(
+        why.contains("tapectl unit rename photos/2019 <new name>"),
+        "{why}"
+    );
+    let detail: String = conn
+        .query_row(
+            "SELECT details FROM events WHERE action = 'catalog_rebuild' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        detail.contains("REFUSED") && detail.contains(second_uuid),
+        "{detail}"
+    );
+
+    // A re-run refuses it again and changes nothing.
+    let again = rebuild(&conn, second, &secret, scratch.path()).unwrap();
+    assert_eq!(again.refused_units, report.refused_units);
+    assert!(again.is_noop(), "{again:?}");
+    assert_eq!(copies(&conn, "photos/2019"), 1);
+}
+
+#[test]
+fn a_unit_of_a_known_name_and_another_uuid_is_refused_a_then_b() {
+    two_units_of_one_name_rebuild(false);
+}
+
+#[test]
+fn a_unit_of_a_known_name_and_another_uuid_is_refused_b_then_a() {
+    two_units_of_one_name_rebuild(true);
+}
+
+/// The way on the refusal names: rename the catalog's unit and rebuild the
+/// tape again. The tape's unit is then recorded under its own uuid and its
+/// own name, each unit with its own one copy.
+#[test]
+fn a_refused_unit_is_rebuilt_once_the_catalogs_unit_is_renamed() {
+    let (mut a, mut b) = two_tapes_one_name_two_units();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+    rebuild(&conn, &mut a, &secret, scratch.path()).unwrap();
+    let refused = rebuild(&conn, &mut b, &secret, scratch.path()).unwrap();
+    assert_eq!(refused.refused_units.len(), 1);
+
+    tapectl::unit::rename_unit(&conn, "photos/2019", "photos/2019-a").unwrap();
+    let report = rebuild(&conn, &mut b, &secret, scratch.path()).unwrap();
+
+    assert!(report.refused_units.is_empty(), "{report:?}");
+    assert_eq!((report.units, report.stage_sets), (1, 1), "{report:?}");
+    assert_eq!(
+        unit_with_uuid(&conn, OTHER_UNIT_UUID).as_deref(),
+        Some("photos/2019")
+    );
+    assert_eq!(
+        unit_with_uuid(&conn, "unit-uuid-0000").as_deref(),
+        Some("photos/2019-a")
+    );
+    assert_eq!(copies(&conn, "photos/2019"), 1);
+    assert_eq!(copies(&conn, "photos/2019-a"), 1);
+    assert_restorable_from(&conn, &mut b);
 }
