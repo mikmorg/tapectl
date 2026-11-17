@@ -26072,6 +26072,31 @@ mod tests {
                 assert_eq!(verify_types_of(&s.conn, new_id), ["full"]);
             }
 
+            /// #544 part 4, the hard end inside a slice (its reason is built
+            /// by the session, not by the seal's abort): the line names a new
+            /// copy on another cartridge too.
+            #[test]
+            fn an_abort_at_the_medium_end_inside_a_slice_names_another_cartridge() {
+                let mut store = MemStore::new(512 * 1024).with_enospc_after(2 * 512 * 1024);
+                let s = stopped("L", &mut store, true, moving_to("vault"));
+                assert!(
+                    matches!(s.r, Err(TapectlError::WriteAborted(_))),
+                    "{:?}",
+                    s.r
+                );
+                assert_eq!(
+                    stopped_write(&s.conn, "L").unwrap(),
+                    StoppedWrite::NothingOpen
+                );
+                let line = left_initialized_line(&s.conn, "L", s.volume_id, &copy_flags());
+                assert!(
+                    line.contains(
+                        "`tapectl volume write <NEW-LABEL> --init --full-confirm --move-to vault`"
+                    ),
+                    "{line}"
+                );
+            }
+
             /// A store that changes the catalog under the confirm: `sql` runs
             /// once, at the first read after the seal.
             struct ChangedUnderConfirm<'c> {
