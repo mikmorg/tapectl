@@ -11,6 +11,102 @@ than restating it, so the two cannot drift. CONTEXT.md vocabulary (Layout, Write
 Session, Sealed, Unsealed, Contact, Evidence, Quarantine, Store) is used without
 redefinition.
 
+**For Layout 3 (tapectl 2.0.0) the byte format is `docs/design/volume-format-v3.md`**,
+and the section "Layout 3" below is normative over every paragraph of this file it
+names. The paragraphs it replaces are kept, marked, as the record of Layout 2.
+
+## Layout 3 (tapectl 2.0.0)
+
+Ruled by ADR-0012 items 239 to 294; the plan's determinations under them are marked
+"determined" (`docs/design/v3-implementation-plan.md`, T5.1 and T5.3). This section
+replaces, for Layout 3, the rules named in each paragraph.
+
+**What a staging produces.** A staging writes, for one version of one unit: its slices
+(each whole members of the unit's tar stream, compressed alone when the staging says so,
+then encrypted; `volume-format-v3.md` §3), and its **file table** and **id map**, as rows
+of the catalog database (`stage_files`, `stage_ids`; ADR-0012 items 254, 265, 272, 277).
+Both outlive the release of the staging's slices and go only with the staging's own row.
+The staging records `tar_version`, `tar_command`, `stream_bytes`, and, for a compressed
+staging, `compression` and `compression_level`.
+
+**A write refuses a unit without its file table** (item 265, #557): at validation, before
+the tape moves, by name, naming the unit and saying to stage it again. This is a further
+clause of the validation predicate below.
+
+**Contact with a tape of another layout** (item 269, #560). A tapectl volume of another
+layout is known by its File 0 label and nothing else of it is read. Every command that
+meets one says so and names the tapectl that wrote it or the RESTORE.sh in its own File 2.
+`volume init` over it is refused; `cartridge erase` with the typed label is the way
+(`volume-format-v3.md` §7.6).
+
+**The plan, exactly** (items 122, 288, 289; D19, D20; T5.1, determined). This replaces,
+for Layout 3, the validation predicate's clause 1 from "Since 1.6.0" on, "The frozen
+flag", "The plan order", "A spannable set larger than one tape" and the refusals by
+class in "Spanning" below.
+- *What the plan works from* is unchanged: per-slice shortfalls; a slice's copies are the
+  distinct eligible volumes holding a `written` position of it in a `completed` or `range`
+  row; a slice is **owed** while its copies are below its set's copy floor.
+- *Order.* On each tape: first the **owed runs** (a stage set with a `range` row on a
+  sealed volume and slices still owed: its owed slices as one unbroken run in slice order,
+  from the lowest owed slice to the highest; several in the order the write takes them);
+  then **the queue**, every other staged set, in the order the write takes them. There is
+  no second class and nothing is deferred behind another set.
+- *The bound.* On a drive that declares `post_warning_bytes`, sets are added while the
+  plan's end is at or below the cartridge's nominal capacity; the set that carries the
+  plan past it is planned to its end, and no set is planned after it. An owed run is held
+  to the same rule. On a drive without the key, slices are added in order while the plan's
+  end is at or below the fill ceiling, and the plan stops at the last slice that fits,
+  inside a set if that is where it falls. No write is refused for the missing key, and no
+  write is refused because the staged sets do not all fit: the rest waits, staged.
+- *One planner.* Every write is planned by one path (`build_span_layout`,
+  `CapacityBudget::place`); every staged set is classed `Owed` or queued.
+- *Kept:* a volume holds at most one unbroken range of a stage set (item 122); one
+  generation for one copy's span (item 86); an owed slice whose staged file was released
+  is refused, naming `volume read-slices --from`; a unit larger than the staging area is
+  refused by name (item 85). Item 93's layout follows from the order.
+- *The batch* (D19): `collection run` takes units in the collection's order and skips none;
+  units are added while the plan's end is at or below the bound, and the unit that carries
+  it past is the batch's last. It stages in rounds: after staging the batch the selector
+  chose, it asks the plan, and while the plan has no set that passes the bound and a
+  pending unit remains, it stages the next one and asks again; then it writes once.
+
+**Confirm's split, for every row of the session** (item 288; T5.1, determined). This
+replaces, for Layout 3, "Confirm of a short ending"'s `cut` rule and "A write that may
+span". On a full seal as on a short one, `ended_after` being M-1 on a full seal:
+- `completed` when every slice of the stage set, 1 to N, is `written` on this volume at or
+  before `ended_after`;
+- `range` when at least one is: the range is the row's `written` positions, and its
+  positions past the end stay `pending`;
+- **when none is, the row and its positions are deleted** in the confirm transaction. The
+  plan listed the set and the seal withdrew it; its slices have no copy from this tape, so
+  the per-slice release leaves them staged and the next write takes them in its queue. The
+  `write_completed` event names such a set as planned and not written.
+
+`catalog rebuild` and the adoption of a lost write make the same split from the tape,
+writing no row for a set none of whose slices the tape took. The status `cut`,
+`writes.may_span` and the policy key `allow_spanning` go (with T5.1). After a tape that
+ended in a range the command exits 0, names each set the tape ended in with the slices it
+holds, and says that an ordinary `volume write` onto another cartridge of the same
+generation continues it.
+
+**`volume rewrite`'s hold and close** (T5.1, determined). A rewrite still plans at or below
+the fill ceiling (item 142's reason). Its hold becomes a test for each slice: a staged
+slice of a stage set the rewrite staged is held while the rewrite is open and no eligible
+volume holds that slice at a `written` position in a `completed` or `range` row that was
+read back in full. The rewrite closes when every slice it staged passes that test; an
+early warning on its destination leaves a range there and the rewrite open. A source that
+holds a range is carried by T5.3's rules (`volume-format-v3.md` §5.4).
+
+**Resume after a crash past the warning**, step 3 (#531) is unchanged for Layout 3.
+
+**Where a restore starts** (items 131, 266, 267). A restore may start on any tape of a
+unit held across cartridges and takes the files that tape holds whole. With the other
+cartridges offered, tapectl's restore goes on across them as one stream (`--from` names
+the first); at the heir's prompt "I do not have it" is an answer, and the rest is listed.
+A restore of a tape that holds only a range of a version takes the files it holds whole
+and lists the rest (D17). This replaces, for Layout 3, the rule that a restore starts from
+the tape holding slice 1.
+
 ## The Layout (child #21)
 
 A Layout is a **value**: the complete ordered enumeration of every file a
@@ -451,6 +547,11 @@ Rules that hold in every path:
 
 ## The short ending (#420, tapectl 1.6.0)
 
+*Layout 2's text, kept as its record. For Layout 3, "Confirm of a short ending"'s `cut`
+rule, "A write that may span" and "After a short seal"'s cut units are replaced by "Layout
+3" above; "Deciding the ending", the event, and "Resume after a crash past the warning"
+stand.*
+
 Ruled 2026-10-20 (ADR-0012 items 9, 99, 110-115). What reaches the tape, and
 the writer's obligations at the early warning (W1-W9), are
 `volume-format-v2.md` §4.1-§4.3; this section is the session's side.
@@ -626,6 +727,12 @@ From 1.7.0 (ADR-0012 items 127, 130, 133):
   compact`) refuses a volume that holds a range in the same way.
 
 ## Spanning (#478, tapectl 1.7.0)
+
+*Layout 2's text, kept as its record. For Layout 3 every unit may continue on the next
+cartridge and none opts in: "The frozen flag", "The plan order", "A spannable set larger
+than one tape" and the refusals by class are replaced by "Layout 3" above. "What the plan
+works from", "Promotion and the retire floor", "Copies, places and deposits", the
+per-slice release and "Wear" stand, for every stage set.*
 
 Ruled 2026-10-16 to 2026-10-21 (ADR-0012 items 82-95 and 121-143). What
 reaches the tape, and how a reader reads a range, is `volume-format-v2.md`
