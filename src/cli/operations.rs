@@ -7577,6 +7577,87 @@ mod tests {
             assert_eq!(volume_status(&conn, vol_id), "retired");
         }
 
+        /// Issue #544 part 2, the other branch: where a newer current
+        /// version supersedes the one at stake, `snapshot mark-reclaimable`
+        /// needs no `--force`, and the line carries none, so the command
+        /// keeps its own Tier-2 question about that newer version. Here the
+        /// newer version has its copies, so the line, run as printed, needs
+        /// no answer and releases the version.
+        #[test]
+        fn tier3_release_line_has_no_force_where_a_newer_version_supersedes() {
+            use clap::Parser;
+            let (conn, vol_id) = setup_sealed("L6-OLDER", 0);
+            let unit_id: i64 = conn
+                .query_row("SELECT id FROM units WHERE name = 'unitA'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 2, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap2 = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap2],
+            )
+            .unwrap();
+            let set2 = conn.last_insert_rowid();
+            for label in ["L6-NEW-A", "L6-NEW-B"] {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    params![label],
+                )
+                .unwrap();
+                let other = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![set2, snap2, other],
+                )
+                .unwrap();
+            }
+
+            let msg = volume_retire(&conn, &Config::default(), "L6-OLDER", true, false, false)
+                .expect_err("v1's last copy is Tier 3")
+                .to_string();
+            let line = crate::cli::operations::remedy_commands::named_commands(&msg, &[])
+                .into_iter()
+                .find(|c| c.starts_with("tapectl snapshot mark-reclaimable"))
+                .unwrap_or_else(|| panic!("no release line in: {msg}"));
+            assert_eq!(line, "tapectl snapshot mark-reclaimable unitA --version 1");
+            let cli = crate::cli::Cli::try_parse_from(line.split_whitespace()).unwrap();
+            let crate::cli::Commands::Snapshot {
+                command:
+                    crate::cli::snapshot::SnapshotCommands::MarkReclaimable {
+                        name,
+                        version,
+                        force,
+                    },
+            } = cli.command
+            else {
+                panic!("{line} is not snapshot mark-reclaimable");
+            };
+            assert!(!force);
+            snapshot_mark_reclaimable(
+                &conn,
+                &Config::default(),
+                &name,
+                version,
+                force,
+                false,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("`{line}` was refused: {e}"));
+            volume_retire(&conn, &Config::default(), "L6-OLDER", true, false, false)
+                .expect("with v1 given up, nothing is at stake");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
         /// A RELEASED version is one the operator gave up on purpose. The
         /// floor does not protect it — `snapshot mark-reclaimable` IS the
         /// documented escape, so it must actually work.
