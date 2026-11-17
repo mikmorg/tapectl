@@ -1839,17 +1839,15 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
     // is confirm's too, with its `completed_at` set in the same statement, so
     // a volume holding only ranges is dated the same way.
     //
-    // A NULL `completed_at` counts as STALE. `session.rs` sets it in the same
-    // statement that sets `status = 'completed'`, so production rows always
-    // have one; but a legacy or hand-edited row without a timestamp cannot be
-    // *proven* to predate the kit, and for a custody check the safe direction
-    // is to warn. Excluding it instead would make the one case nobody can
-    // verify also the one case nobody is told about.
+    // Every `completed` or `range` row has a `completed_at`: confirm sets it in
+    // the statement that sets the status, and `catalog rebuild` stamps the
+    // rows it records. Only a 1.x catalog could hold one without, and 2.x
+    // does not open those (ADR-0012 item 258).
     let stale_count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(DISTINCT v.id) FROM volumes v
              JOIN writes w ON w.volume_id = v.id AND w.status IN ('completed', 'range')
-             WHERE {} AND (w.completed_at IS NULL OR w.completed_at > ?1)",
+             WHERE {} AND w.completed_at > ?1",
             crate::policy::coverage::eligible("v")
         ),
         rusqlite::params![last_kit],
@@ -3297,9 +3295,7 @@ mod tests {
         fn escrow_kit_check_is_silent_when_the_kit_is_newer_than_the_tapes() {
             let (conn, unit_id) = setup();
             seed_written_volume(&conn, unit_id, "SEALK2", "sealed", 1000, 900, 100);
-            // The fixture leaves `completed_at` NULL, which now counts as
-            // stale by design; stamp a real completion so this test measures
-            // the timeline rather than the NULL rule.
+            // Stamp the completion two days before the kit.
             conn.execute(
                 "UPDATE writes SET completed_at = datetime('now', '-2 day')",
                 [],
@@ -3365,34 +3361,6 @@ mod tests {
                 "the secret opens every tape; only the catalog is stale: {message}"
             );
             assert_eq!(findings[0].action, "tapectl key escrow-kit <DIR>");
-        }
-
-        /// A sealed volume whose write carries NO completion timestamp
-        /// cannot be proven to predate the kit, so it warns. `session.rs`
-        /// sets `completed_at` in the same statement as
-        /// `status = 'completed'`, so this is a legacy/hand-edited row —
-        /// exactly the case where silence would be worst, because it is the
-        /// one nobody can verify by other means.
-        #[test]
-        fn escrow_kit_check_treats_an_undated_write_as_stale_rather_than_covered() {
-            let (conn, unit_id) = setup();
-            conn.execute(
-                "INSERT INTO events (entity_type, entity_id, action, timestamp)
-                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '+1 day'))",
-                [],
-            )
-            .unwrap();
-            // Kit is dated in the FUTURE, so a dated write would be covered.
-            seed_written_volume(&conn, unit_id, "SEALK4", "sealed", 1000, 900, 100);
-            // seed leaves completed_at NULL — that is the condition under test.
-
-            let findings = escrow_kit_findings(&conn).unwrap();
-            assert_eq!(
-                findings.len(),
-                1,
-                "an undated completed write must warn, not be silently treated as covered"
-            );
-            assert_eq!(findings[0].check, "escrow_kit_stale");
         }
 
         // --- Heir Kit staleness: a tape that MOVED (issue #448 item 5) ----

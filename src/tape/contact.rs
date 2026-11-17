@@ -146,13 +146,6 @@ pub const REASON_SERIAL_UNREGISTERED: &str = "medium serial matches no registere
 
 /// Every reason, for the tests that assert the set is closed, each member
 /// distinct, and each one written by production code.
-///
-/// Removed (issue #318): `"no MAM read is attempted on this path"`, once
-/// `REASON_MAM_NOT_ATTEMPTED`, written by `restore raw-volume` until it began
-/// taking a MAM read (#316) and by nothing after. A database written before
-/// then may still hold that string; nothing validates `identity_reason`
-/// against this list (no CHECK in migration 020, no reader), so such a row
-/// stays readable exactly as stored.
 pub const IDENTITY_REASONS: &[&str] = &[
     REASON_NO_BACKEND_CONFIGURED,
     REASON_DEVICE_MATCHED_NO_BACKEND,

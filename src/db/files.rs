@@ -1,11 +1,11 @@
-//! Per-file data: `paths` and `file_versions` (migration 030; issue #380
-//! option A, issue #381; ADR-0012 amendment 2026-10-06, item 7).
+//! Per-file data: `paths` and `file_versions` (issue #380 option A, issue
+//! #381; ADR-0012 amendment 2026-10-06, item 7).
 //!
 //! A path is stored once per unit (`paths`, searched through `paths_fts`),
 //! and each version holds a narrow membership row per path
 //! (`file_versions`, keyed `(snapshot_id, path_id)`): its kind, size, mtime,
-//! sha256 as 32 raw bytes and, for a symlink, its target. The migration's
-//! header explains the shape; this module is the one place that writes it and
+//! sha256 as 32 raw bytes and, for a symlink, its target. The baseline
+//! schema holds the shape; this module is the one place that writes it and
 //! that converts between it and the text the rest of tapectl speaks (hex
 //! hashes, RFC 3339 mtimes, the walk's `file_type` names).
 //!
@@ -158,8 +158,7 @@ pub fn sha256_column(value: Option<Vec<u8>>) -> Option<String> {
 }
 
 /// Whole seconds since the epoch -> `mtime_ns`. The walks record whole
-/// seconds, as they always have, so a version recorded before migration 030
-/// and a fresh walk compare equal.
+/// seconds, so a recorded version and a fresh walk compare equal.
 pub fn mtime_ns_from_secs(secs: i64) -> Option<i64> {
     secs.checked_mul(1_000_000_000)
 }
@@ -307,8 +306,8 @@ pub fn backfill_sha256(
     Ok(())
 }
 
-/// Remove `snapshot_id`'s file list. Its paths stay interned (see migration
-/// 030's header). Returns the rows removed.
+/// Remove `snapshot_id`'s file list. Its paths stay interned: a path row is
+/// the unit's, and outlives any one version. Returns the rows removed.
 pub fn delete_version(conn: &Connection, snapshot_id: i64) -> Result<usize> {
     Ok(conn.execute(
         "DELETE FROM file_versions WHERE snapshot_id = ?1",
