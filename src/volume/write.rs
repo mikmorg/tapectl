@@ -4799,6 +4799,68 @@ fn confirm_resume_hint(label: &str, post_seal: &PostSeal) -> String {
     format!("run `{cmd}` to {confirm}{then_move}{as_asked}")
 }
 
+/// What follows a confirm that stopped before its verdict (#544), from what
+/// the catalog holds of the volume now. A session still open is resumed,
+/// continuing the readback (`resume_hint`). Confirm's guards stop it when
+/// something changed under it, and then the resume is not what follows: a
+/// volume no longer a write target (retired under it) is resumed by
+/// nothing; a session aborted under it is re-confirmed by a full verify then
+/// `volume resume`, when that would re-confirm it
+/// (`session::aborted_session_reconfirmable_after_verify`). A catalog that
+/// cannot answer gets the resume, as before.
+fn confirm_stopped_way_on(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    resume_hint: &str,
+) -> String {
+    let resume = format!(
+        "The tape IS sealed; the catalog cannot count it as a copy until its readback passes. \
+         Reload the same cartridge and {resume_hint}."
+    );
+    let state = conn
+        .query_row(
+            "SELECT status, observed_condition,
+                    (SELECT COUNT(*) FROM writes WHERE volume_id = ?1
+                       AND status IN ('planned', 'in_progress', 'interrupted'))
+             FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((status, condition, open)) = state else {
+        return resume;
+    };
+    if !coverage::is_write_target(&status, &condition) {
+        return format!(
+            "The tape IS sealed, but volume \"{label}\" is {status} now: nothing resumes it, \
+             and it does not count as a copy."
+        );
+    }
+    if open > 0 {
+        return resume;
+    }
+    match session::aborted_session_reconfirmable_after_verify(conn, volume_id) {
+        Ok(true) => format!(
+            "The tape IS sealed, and its write session was aborted under the readback; the \
+             catalog cannot count it as a copy until it is re-confirmed: run a full verify \
+             (`tapectl volume verify {label}`), then `tapectl volume resume {label}`."
+        ),
+        Ok(false) => format!(
+            "The tape IS sealed, but volume \"{label}\"'s write session is no longer open, so \
+             there is no readback to continue; `tapectl volume info {label}` shows what the \
+             catalog holds of it."
+        ),
+        Err(_) => resume,
+    }
+}
+
 /// The seal->confirm tail shared by a fresh [`ReadyToSeal`] (which calls
 /// `seal()` first, in [`finish_session`]) and a resume that met
 /// [`ResumeOutcome::Confirming`] (which never does — the tape is already
@@ -4835,10 +4897,12 @@ fn finish_confirm(
             classified if classified.write_outcome().is_some() => classified,
             // Exit 3 (issue #408): any other error stopped the confirm
             // before its verdict — as every error of `volume verify` is.
+            // #544: what follows is read from the catalog as the error
+            // leaves it; confirm's own guards stop it because the session or
+            // the volume changed under the readback.
             other => TapectlError::ConfirmInconclusive(format!(
-                "volume \"{label}\": the confirm stopped before its verdict: {other}. The tape \
-                 IS sealed; the catalog cannot count it as a copy until its readback passes. \
-                 Reload the same cartridge and {resume_hint}."
+                "volume \"{label}\": the confirm stopped before its verdict: {other}. {}",
+                confirm_stopped_way_on(conn, volume_id, label, &resume_hint)
             )),
         })?;
     match confirmed {
@@ -6121,6 +6185,27 @@ pub enum StoppedWrite {
     /// Anything else (sealed and confirmed, quarantined, a seal recorded
     /// with its session aborted): the error names its own way on.
     Other,
+}
+
+/// Whether volume `volume_id`'s newest aborted write session ended at the
+/// medium's end (#544): its recorded reason carries a full medium's own text
+/// ([`crate::error::MEDIUM_FULL`]), at the seal or inside a slice. Such a
+/// cartridge cannot take that write: written again, the volume plans the
+/// same files from the start and meets the same end. A catalog that cannot
+/// answer answers no.
+pub(crate) fn aborted_at_the_medium_end(conn: &Connection, volume_id: i64) -> bool {
+    conn.query_row(
+        "SELECT new_value FROM events
+         WHERE entity_type = 'volume' AND entity_id = ?1 AND action = 'write_aborted'
+         ORDER BY id DESC LIMIT 1",
+        params![volume_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+    .is_some_and(|reason| reason.contains(crate::error::MEDIUM_FULL))
 }
 
 /// [`StoppedWrite`] for `label`, read from the catalog alone.
@@ -25796,6 +25881,364 @@ mod tests {
                 );
             }
 
+            /// `--full-confirm --move-to vault`: the flags of the copy the
+            /// tests below stop, as `volume write` takes them.
+            fn copy_flags() -> Vec<String> {
+                WriteIntent {
+                    full_confirm: true,
+                    move_to: Some("vault".into()),
+                    ..WriteIntent::default()
+                }
+                .flags()
+            }
+
+            /// #544 part 1, tried: with no session open the line names the
+            /// write again with the copy's own flags, and that command, run
+            /// in that state once the cause is fixed, seals with the full
+            /// readback.
+            #[test]
+            fn the_write_named_with_no_session_open_runs_as_printed() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (conn, mut config, volume_id) = swept_write_fixture("L", tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                conn.execute(
+                    "INSERT INTO locations (name, kind) VALUES ('vault', 'shelf')",
+                    [],
+                )
+                .unwrap();
+                let path: String = conn
+                    .query_row("SELECT staging_path FROM stage_slices LIMIT 1", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                let good = fs::read(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let write = |store: &mut MemStore| {
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &conn,
+                        &paths,
+                        &config,
+                        "L",
+                        GENCHK_DEVICE,
+                        512 * 1024,
+                        false,
+                        false,
+                        false,
+                        true,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(store),
+                        moving_to("vault"),
+                    );
+                    slot.finish_result(r)
+                };
+                write(&mut MemStore::new(512 * 1024)).expect_err("no slice on disk");
+                assert_eq!(
+                    stopped_write(&conn, "L").unwrap(),
+                    StoppedWrite::NothingOpen
+                );
+                let line = left_initialized_line(&conn, "L", volume_id, &copy_flags());
+                let named = "tapectl volume write L --full-confirm --move-to vault";
+                assert!(line.contains(&format!("`{named}`")), "{line}");
+                crate::cli::operations::remedy_commands::assert_parses(named);
+
+                fs::write(&path, good).unwrap();
+                write(&mut MemStore::new(512 * 1024)).expect("the command as printed seals");
+                assert_eq!(verify_types_of(&conn, volume_id), ["full"]);
+            }
+
+            /// #544 part 4, traced and tried: after an abort at the medium's
+            /// end, `volume write L` again plans the same files from the
+            /// start of the same cartridge and meets the same end (aborted
+            /// again). The line names a new copy on another cartridge, and
+            /// that write, of the units still staged, seals.
+            #[test]
+            fn an_abort_at_the_medium_end_names_another_cartridge_and_that_write_seals() {
+                let mut store = Faulty {
+                    inner: MemStore::new(512 * 1024),
+                    fault: Fault::SealFull,
+                };
+                let s = stopped("L", &mut store, true, moving_to("vault"));
+                assert!(
+                    matches!(s.r, Err(TapectlError::WriteAborted(_))),
+                    "{:?}",
+                    s.r
+                );
+                let line = left_initialized_line(&s.conn, "L", s.volume_id, &copy_flags());
+                let named =
+                    "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to vault";
+                assert!(line.contains(&format!("`{named}`")), "{line}");
+                assert!(!line.contains("`tapectl volume write L"), "{line}");
+                crate::cli::operations::remedy_commands::assert_parses(
+                    &named.replace("<NEW-LABEL>", "NEW"),
+                );
+
+                // The trace: the same label, the same full cartridge (its
+                // end of data after the last file it took, as a drive
+                // reports it, and the same end at the seal).
+                struct SameEnd<'m>(&'m mut MemStore);
+                impl Store for SameEnd<'_> {
+                    fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                        self.0.capacity()
+                    }
+                    fn execute(
+                        &mut self,
+                        src: &mut dyn std::io::Read,
+                        len: u64,
+                        sync: bool,
+                    ) -> Result<u64> {
+                        if sync {
+                            return Err(TapectlError::MediumFull(
+                                "write: No space left on device (os error 28)".into(),
+                            ));
+                        }
+                        self.0.execute(src, len, sync)
+                    }
+                    fn read_file(
+                        &mut self,
+                        position: u32,
+                        sink: &mut dyn std::io::Write,
+                    ) -> Result<u64> {
+                        self.0.read_file(position, sink)
+                    }
+                    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                        self.0.reposition_for_resume(file_index)
+                    }
+                    fn blank_at_bot(&mut self) -> Result<bool> {
+                        self.0.blank_at_bot()
+                    }
+                    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                        self.0.eod_at_or_before(position)
+                    }
+                    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                        self.0.files_on_medium()
+                    }
+                }
+                let mut slot = ContactSlot::empty();
+                let again = volume_write_contacted(
+                    &s.conn,
+                    &s.paths,
+                    &s.config,
+                    "L",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut SameEnd(&mut store.inner)),
+                    moving_to("vault"),
+                );
+                let again = slot.finish_result(again);
+                assert!(
+                    matches!(&again, Err(TapectlError::WriteAborted(m)) if m.contains("tape full")),
+                    "the second plan meets the same end: {again:?}"
+                );
+
+                // The command named: a new volume (what `--init` makes) on
+                // another cartridge, written with the copy's flags.
+                s.conn
+                    .execute(
+                        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                              capacity_bytes, status)
+                         VALUES ('NEW', 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+                        [],
+                    )
+                    .unwrap();
+                let new_id = s.conn.last_insert_rowid();
+                let mut slot = ContactSlot::empty();
+                let r = volume_write_contacted(
+                    &s.conn,
+                    &s.paths,
+                    &s.config,
+                    "NEW",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut MemStore::new(512 * 1024)),
+                    moving_to("vault"),
+                );
+                slot.finish_result(r)
+                    .expect("the staged units seal on another cartridge");
+                assert_eq!(verify_types_of(&s.conn, new_id), ["full"]);
+            }
+
+            /// A store that changes the catalog under the confirm: `sql` runs
+            /// once, at the first read after the seal.
+            struct ChangedUnderConfirm<'c> {
+                inner: MemStore,
+                conn: &'c Connection,
+                sql: String,
+                done: bool,
+            }
+
+            impl Store for ChangedUnderConfirm<'_> {
+                fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                    self.inner.capacity()
+                }
+                fn execute(
+                    &mut self,
+                    src: &mut dyn std::io::Read,
+                    len: u64,
+                    sync: bool,
+                ) -> Result<u64> {
+                    self.inner.execute(src, len, sync)
+                }
+                fn read_file(
+                    &mut self,
+                    position: u32,
+                    sink: &mut dyn std::io::Write,
+                ) -> Result<u64> {
+                    if !self.done && self.inner.syncs.last() == Some(&true) {
+                        self.done = true;
+                        self.conn.execute_batch(&self.sql).unwrap();
+                    }
+                    self.inner.read_file(position, sink)
+                }
+                fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                    self.inner.reposition_for_resume(file_index)
+                }
+                fn blank_at_bot(&mut self) -> Result<bool> {
+                    self.inner.blank_at_bot()
+                }
+            }
+
+            /// One `volume write L --full-confirm --move-to vault` whose
+            /// confirm meets `sql` run under it.
+            fn changed_under_confirm(
+                sql: &dyn Fn(i64) -> String,
+            ) -> (
+                Connection,
+                Config,
+                TapectlPaths,
+                i64,
+                MemStore,
+                String,
+                tempfile::TempDir,
+            ) {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (conn, mut config, volume_id) = swept_write_fixture("L", tmp.path());
+                config.backends.lto[0].capacity_override = Some("2400G".into());
+                conn.execute(
+                    "INSERT INTO locations (name, kind) VALUES ('vault', 'shelf')",
+                    [],
+                )
+                .unwrap();
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                let mut store = ChangedUnderConfirm {
+                    inner: MemStore::new(512 * 1024),
+                    conn: &conn,
+                    sql: sql(volume_id),
+                    done: false,
+                };
+                let mut slot = ContactSlot::empty();
+                let r = volume_write_contacted(
+                    &conn,
+                    &paths,
+                    &config,
+                    "L",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(&mut store),
+                    moving_to("vault"),
+                );
+                let err = slot
+                    .finish_result(r)
+                    .expect_err("the confirm's guard refuses")
+                    .to_string();
+                assert!(store.done, "the change ran under the confirm");
+                let inner = store.inner;
+                (conn, config, paths, volume_id, inner, err, tmp)
+            }
+
+            /// #544 part 3: the session aborted under the confirm (`volume
+            /// abort` got there first). The readback had passed; continuing
+            /// it is not what follows. The error names the full verify and
+            /// the resume that re-confirm an aborted session, and those two,
+            /// run in that state, seal the volume.
+            #[test]
+            fn a_session_aborted_under_the_confirm_names_verify_then_resume_and_they_work() {
+                let (conn, config, paths, volume_id, mut store, err, tmp) =
+                    changed_under_confirm(&|v| {
+                        format!(
+                            "UPDATE writes SET status = 'aborted' WHERE volume_id = {v};
+                             INSERT INTO events (entity_type, entity_id, entity_label, action,
+                                                 new_value, timestamp)
+                             VALUES ('volume', {v}, 'L', 'write_aborted',
+                                     'operator abandoned the unfinished write session',
+                                     datetime('now', '-1 hour'));"
+                        )
+                    });
+                assert!(err.contains("changed while it ran"), "{err}");
+                assert!(!err.contains("to continue the full readback"), "{err}");
+                assert!(err.contains("`tapectl volume verify L`"), "{err}");
+                assert!(err.contains("`tapectl volume resume L`"), "{err}");
+
+                let report = volume_verify_with_store(
+                    &conn,
+                    &mut store,
+                    "L",
+                    volume_id,
+                    512 * 1024,
+                    Tier::Integrity,
+                    ContactSite::new(
+                        &config,
+                        Operation::VolumeVerify,
+                        GENCHK_DEVICE,
+                        Medium::NoBackend,
+                    ),
+                )
+                .expect("the full verify as printed");
+                assert_eq!(report.failed, 0);
+                let s = Stopped {
+                    r: Ok(()),
+                    conn,
+                    config,
+                    paths,
+                    volume_id,
+                    _tmp: tmp,
+                };
+                let (r, _) = resume(&s, "L", &mut store, &ResumeAsk::default());
+                r.expect("the resume as printed re-confirms the aborted session");
+                let status: String = s
+                    .conn
+                    .query_row(
+                        "SELECT status FROM volumes WHERE id = ?1",
+                        params![volume_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "sealed");
+            }
+
+            /// #544 part 3: the volume retired under the confirm. Nothing
+            /// resumes a retired volume, so `volume resume` is not named.
+            #[test]
+            fn a_volume_retired_under_the_confirm_names_no_resume() {
+                let (_conn, _config, _paths, _volume_id, _store, err, _tmp) =
+                    changed_under_confirm(&|v| {
+                        format!("UPDATE volumes SET status = 'retired' WHERE id = {v};")
+                    });
+                assert!(err.contains("the volume changed while it ran"), "{err}");
+                assert!(!err.contains("tapectl volume resume"), "{err}");
+                assert!(err.contains("is retired now"), "{err}");
+            }
+
             /// Item 220: after an interrupted copy (`volume write --init
             /// --full-confirm --move-to vault`), the line about the init and
             /// the write's error name ONE next command between them, chosen
@@ -25832,18 +26275,23 @@ mod tests {
                         "tapectl volume resume L",
                         "(it keeps the write's --full-confirm --move-to vault)",
                     ),
+                    // #544 part 4: the medium's end. Writing L again on
+                    // the same cartridge meets the same end; the staged
+                    // units go onto another cartridge, as a new copy.
                     (
                         Fault::SealFull,
                         None,
                         StoppedWrite::NothingOpen,
-                        "tapectl volume write L",
+                        "tapectl volume write <NEW-LABEL> --init --full-confirm --move-to vault",
                         "write aborted",
                     ),
+                    // #544 part 1 (ADR-0012 items 218 and 249): the write
+                    // again, with what the stopped write was given.
                     (
                         Fault::WriteIo,
                         Some(no_slice_on_disk),
                         StoppedWrite::NothingOpen,
-                        "tapectl volume write L",
+                        "tapectl volume write L --full-confirm --move-to vault",
                         "Nothing was written and the drive was not touched",
                     ),
                 ];
@@ -25885,7 +26333,7 @@ mod tests {
                     crate::signal::interrupt_this_thread(false);
                     let err = r.expect_err("the write stops").to_string();
                     assert_eq!(stopped_write(&conn, "L").unwrap(), state, "{err}");
-                    let line = left_initialized_line(&conn, "L", volume_id);
+                    let line = left_initialized_line(&conn, "L", volume_id, &copy_flags());
                     let all = format!("{line}\n{err}");
                     assert_eq!(next_commands(&all), [command], "{state:?}: {all}");
                     assert!(all.contains(phrase), "{state:?}: {all}");

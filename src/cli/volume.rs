@@ -2064,6 +2064,11 @@ struct WriteRequest<'a> {
     /// `--json`: a write that fails after `--init` initialised the volume
     /// says so on stdout ([`left_initialized_json`]).
     json_output: bool,
+    /// What this write asks for besides its label, as `volume write` takes
+    /// it (`--full-confirm`, `--move-to X`, …; `session::WriteIntent::flags`):
+    /// the next command after a stop names the write again with them (#544,
+    /// ADR-0012 items 218 and 249).
+    flags: Vec<String>,
 }
 
 /// What `volume init` prints (issue #482): the volume line it always
@@ -2175,6 +2180,10 @@ fn write_and_follow(
         None
     };
     let written = steps.write(req.label, req.force && !req.init);
+    // #544: with no session left open, the hint names the write again with
+    // this write's own flags (ADR-0012 items 218 and 249).
+    let written =
+        written.map_err(|e| crate::error::with_stopped_write_hint(e, conn, req.label, &req.flags));
     // Issue #445: a write that fails leaves the volume this command
     // initialised initialised, and says so before the error is printed.
     // Under `--json` the volume's document rides the error (one document on
@@ -2282,7 +2291,10 @@ fn report_left_initialized(
     init: &Initialized,
     error: &TapectlError,
 ) -> Option<serde_json::Value> {
-    eprintln!("{}", left_initialized_line(conn, req.label, init.volume_id));
+    eprintln!(
+        "{}",
+        left_initialized_line(conn, req.label, init.volume_id, &req.flags)
+    );
     req.json_output
         .then(|| left_initialized_json(req.label, init, error))
 }
@@ -2295,16 +2307,45 @@ fn report_left_initialized(
 /// would be refused: the volume exists). A session left open is the error's
 /// to name: its `volume resume` says what it will do. Anything else, the
 /// error names its own way on.
-pub(crate) fn left_initialized_line(conn: &Connection, label: &str, volume_id: i64) -> String {
+pub(crate) fn left_initialized_line(
+    conn: &Connection,
+    label: &str,
+    volume_id: i64,
+    flags: &[String],
+) -> String {
     let fact = format!(
         "volume \"{label}\" was initialized by this command (id={volume_id}) and stays \
          initialized, whatever the write that followed did: its exit code describes the write, \
          not the init."
     );
+    let with = |words: &str| {
+        let mut command = format!("tapectl volume write {words}");
+        for flag in flags {
+            command.push(' ');
+            command.push_str(flag);
+        }
+        command
+    };
     match write::stopped_write(conn, label) {
+        // #544 part 4: the medium's end. Written again, the volume plans
+        // the same files from the start of the same cartridge and meets the
+        // same end; the units it was to write are still staged, for another.
+        Ok(write::StoppedWrite::NothingOpen)
+            if write::aborted_at_the_medium_end(conn, volume_id) =>
+        {
+            format!(
+                "{fact} The write met the end of the medium before it could seal, so this \
+                 cartridge cannot take it: written again, \"{label}\" would plan the same files \
+                 and meet the same end. The units it was to write are still staged. Next: load \
+                 another cartridge and run `{}`.",
+                with("<NEW-LABEL> --init")
+            )
+        }
+        // #544 part 1 (ADR-0012 items 218 and 249): the write again, with
+        // what this one was given.
         Ok(write::StoppedWrite::NothingOpen) => format!(
-            "{fact} Next: `tapectl volume write {label}` (without --init, which would be \
-             refused: the volume exists)."
+            "{fact} Next: `{}` (without --init, which would be refused: the volume exists).",
+            with(label)
         ),
         _ => format!("{fact} The error says what to run next."),
     }
@@ -2632,6 +2673,14 @@ pub fn run(
                     move_to: move_to.as_deref(),
                     keep_staging: keep,
                     json_output,
+                    flags: crate::volume::session::WriteIntent {
+                        full_confirm: *full_confirm,
+                        move_to: steps.moved_to.clone(),
+                        for_location: steps.for_location.clone(),
+                        keep_staging: keep == StagingKeep::All,
+                        keep_staging_for_locations: keep == StagingKeep::UntilEveryLocation,
+                    }
+                    .flags(),
                 },
             )?;
             if json_output {
@@ -7000,6 +7049,7 @@ mod tests {
                 move_to,
                 keep_staging: StagingKeep::Release,
                 json_output: false,
+                flags: Vec::new(),
             }
         }
 

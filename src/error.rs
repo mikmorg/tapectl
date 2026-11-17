@@ -560,6 +560,8 @@ pub enum TapectlError {
     /// ENOSPC (its early-warning point). The one store failure a write
     /// session ABORTS on (ADR-0007: no salvage, a clean abort to an
     /// unsealed tape); every other failure leaves it resumable.
+    /// Its text begins [`MEDIUM_FULL`], which the abort's recorded reason
+    /// carries (`volume::write::aborted_at_the_medium_end`).
     #[error("tape full: {0}")]
     MediumFull(String),
 
@@ -734,6 +736,10 @@ impl TapectlError {
     }
 }
 
+/// How [`TapectlError::MediumFull`]'s text begins: the reason an abort at
+/// the medium's end records says so in these words (#544).
+pub(crate) const MEDIUM_FULL: &str = "tape full: ";
+
 /// The tail [`TapectlError::in_write_session`] gives its text: the `volume
 /// resume` that continues the session.
 fn resumable_tail(label: &str) -> String {
@@ -761,8 +767,9 @@ enum AfterStop {
     /// tape: `volume abort` clears it, then the volume is written again,
     /// with the flags the write recorded with its session.
     AbortThenWrite { flags: Vec<String> },
-    /// No session is left open: the volume is written again.
-    Write,
+    /// No session is left open: the volume is written again, with the
+    /// flags the stopped write was given (#544, ADR-0012 items 218 and 249).
+    Write { flags: Vec<String> },
 }
 
 /// The hint that replaces [`resumable_tail`] for `after`, after `cause`.
@@ -782,10 +789,10 @@ fn after_stop_text(cause: &str, label: &str, after: &AfterStop) -> String {
              volume abort {label}`, then run `{}` again",
             write(flags)
         ),
-        AfterStop::Write => format!(
+        AfterStop::Write { flags } => format!(
             "{cause} — volume \"{label}\" has no write session left open, so there is nothing \
              to resume: run `{}` again",
-            write(&[])
+            write(flags)
         ),
     }
 }
@@ -972,10 +979,63 @@ fn after_stop(conn: &rusqlite::Connection, text: &str) -> Option<String> {
         StoppedWrite::Planned => AfterStop::AbortThenWrite {
             flags: planned_session_flags(conn, label),
         },
-        StoppedWrite::NothingOpen => AfterStop::Write,
+        StoppedWrite::NothingOpen => AfterStop::Write {
+            flags: newest_session_flags(conn, label),
+        },
         StoppedWrite::Open { .. } | StoppedWrite::Other => return None,
     };
     Some(after_stop_text(cause, label, &after))
+}
+
+/// [`render`]'s hint, made by `volume write` itself (#544): it knows the
+/// flags it was given, where the catalog keeps them only once a session was
+/// planned. With no session left open, `err`'s resumable tail is replaced by
+/// the write again with `flags`; any other error, or state, is returned
+/// unchanged for [`render`] to judge.
+pub(crate) fn with_stopped_write_hint(
+    err: TapectlError,
+    conn: &rusqlite::Connection,
+    label: &str,
+    flags: &[String],
+) -> TapectlError {
+    use crate::volume::write::{stopped_write, StoppedWrite};
+    let TapectlError::WriteInterrupted(text) = &err else {
+        return err;
+    };
+    let Some((cause, named)) = split_resumable_tail(text) else {
+        return err;
+    };
+    if named != label || !matches!(stopped_write(conn, label), Ok(StoppedWrite::NothingOpen)) {
+        return err;
+    }
+    TapectlError::WriteInterrupted(after_stop_text(
+        cause,
+        label,
+        &AfterStop::Write {
+            flags: flags.to_vec(),
+        },
+    ))
+}
+
+/// The flags the newest write session of `label` recorded with it, whatever
+/// became of it (`session::WriteIntent`); none when there is no record.
+fn newest_session_flags(conn: &rusqlite::Connection, label: &str) -> Vec<String> {
+    let dir: Option<String> = conn
+        .query_row(
+            "SELECT w.session_dir FROM writes w JOIN volumes v ON v.id = w.volume_id
+             WHERE v.label = ?1 AND w.session_dir IS NOT NULL
+             ORDER BY w.id DESC LIMIT 1",
+            [label],
+            |r| r.get(0),
+        )
+        .ok();
+    dir.and_then(|d| {
+        crate::volume::session::WriteIntent::read(std::path::Path::new(&d))
+            .ok()
+            .flatten()
+    })
+    .map(|intent| intent.flags())
+    .unwrap_or_default()
 }
 
 /// The flags the write of `label`'s planned session recorded with it
@@ -1541,14 +1601,15 @@ mod tests {
             "no catalog: as it was"
         );
 
-        // No session left open: `volume write`, bare.
+        // No session left open: `volume write` again, with the flags the
+        // stopped write was given (#544, ADR-0012 items 218 and 249).
         conn.execute("UPDATE writes SET status = 'aborted'", [])
             .unwrap();
         let shown = render(&err, Some(&conn));
         assert!(
             shown.ends_with(
                 "volume \"L6-1\" has no write session left open, so there is nothing to \
-                 resume: run `tapectl volume write L6-1` again"
+                 resume: run `tapectl volume write L6-1 --full-confirm --move-to offsite` again"
             ),
             "{shown}"
         );
@@ -1568,6 +1629,37 @@ mod tests {
         assert_eq!(
             render(&other, Some(&conn)),
             "stopped: run `tapectl volume resume L6-1`"
+        );
+    }
+
+    /// #544: the reason an abort at the medium's end records is found by
+    /// [`MEDIUM_FULL`], which is how the error's own text begins.
+    #[test]
+    fn a_full_medium_says_so_in_the_words_the_abort_records() {
+        assert!(TapectlError::MediumFull("write: No space left".into())
+            .to_string()
+            .starts_with(MEDIUM_FULL));
+    }
+
+    /// #544: `volume write` names the write again with the flags it was
+    /// given, also when no session recorded them; a session still open, or
+    /// another label's text, is left for `render`.
+    #[test]
+    fn volume_writes_own_hint_carries_its_flags() {
+        let conn = catalog_of(&["L6-1"]);
+        let err = || TapectlError::CatalogBusy("planning".into()).in_write_session("L6-1");
+        let flags = vec!["--full-confirm".to_string(), "--move-to vault".to_string()];
+        let shown = with_stopped_write_hint(err(), &conn, "L6-1", &flags).to_string();
+        assert!(
+            shown.ends_with(
+                "volume \"L6-1\" has no write session left open, so there is nothing to \
+                 resume: run `tapectl volume write L6-1 --full-confirm --move-to vault` again"
+            ),
+            "{shown}"
+        );
+        assert_eq!(
+            with_stopped_write_hint(err(), &conn, "OTHER", &flags).to_string(),
+            err().to_string()
         );
     }
 
