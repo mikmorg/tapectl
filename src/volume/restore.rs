@@ -8628,13 +8628,38 @@ mod tests {
                 assert_only_file0_was_read(&m.fake.ops());
             }
 
+            /// ADR-0012 item 258(d): a File 0 that states no `requires` (every
+            /// tape before 1.1.0; every tape since states it) is refused on
+            /// both paths, naming the field, with only File 0 read. It was a
+            /// positive control below until item 258 removed the tolerance.
+            #[test]
+            fn a_tape_that_states_no_requires_is_refused() {
+                let m = one();
+                rewrite(&m, STATED, "\n");
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("states no `requires`"), "{err}");
+                assert_only_file0_was_read(&m.fake.ops());
+                assert!(!dest.path().join(SCRATCH_NAME).exists());
+
+                let m = three();
+                rewrite(&m, STATED, "\n");
+                let root = TempDir::new().unwrap();
+                let err = volume(&m, root.path()).unwrap_err().to_string();
+                assert!(err.contains("states no `requires`"), "{err}");
+                assert_only_file0_was_read(&m.fake.ops());
+                assert!(rows(&m.conn).unwrap().iter().all(|r| r.outcome == "failed"));
+            }
+
             /// The positive controls: a File 0 that states 1.6.0's
             /// `requires = ["short-seal"]`, states `requires = []` (every tape
-            /// from 1.1.0 to 1.5.0), states none (every tape before it) or
-            /// carries a key nobody requires restores exactly as before — on
-            /// the unit path and the volume path — and the slices ARE read,
-            /// so the refusals above are the fence and not a tape that
-            /// cannot be restored at all.
+            /// from 1.1.0 to 1.5.0) or carries a key nobody requires restores
+            /// exactly as before — on the unit path and the volume path — and
+            /// the slices ARE read, so the refusals above are the fence and
+            /// not a tape that cannot be restored at all.
             #[test]
             fn a_tape_that_requires_nothing_restores_as_before() {
                 for (what, to) in [
@@ -8643,7 +8668,6 @@ mod tests {
                         "states requires = [], as 1.1.0 to 1.5.0",
                         "\nrequires = []\n",
                     ),
-                    ("states no requires, as before 1.1.0", "\n"),
                     (
                         "carries a key nobody requires",
                         "\nrequires = [\"short-seal\"]\nfuture_key = \"x\"\n",

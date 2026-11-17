@@ -43,8 +43,12 @@ pub struct ParsedSeal {
     pub sealed_at: String,
     pub front_index_sha256: String,
     /// The features a reader must know to read this tape (ADR-0012
-    /// amendment item 15). Absent on every tape before 1.1.0 = none.
+    /// amendment item 15). Empty when the seal states `requires = []`.
     pub requires: Vec<String>,
+    /// Whether the seal states `requires` at all. Every seal this tapectl
+    /// writes does; one that does not (every seal before 1.1.0) is refused
+    /// ([`ParsedSeal::refusal`]; ADR-0012 item 258(d)).
+    pub requires_stated: bool,
     pub files: Vec<ParsedIndexEntry>,
 }
 
@@ -56,6 +60,7 @@ impl ParsedSeal {
             magic: None,
             layout_version: Some(self.layout_version),
             requires: self.requires.clone(),
+            requires_stated: self.requires_stated,
             tapectl_version: None,
         }
         .refusal("the seal marker")
@@ -318,8 +323,9 @@ struct SealHeader {
     ended_after: Option<i64>,
     sealed_at: String,
     front_index_sha256: String,
-    #[serde(default)]
-    requires: Vec<String>,
+    /// Absent is refused by [`ParsedSeal::refusal`], not here, so the seal
+    /// still parses and every caller refuses it by name.
+    requires: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,7 +406,8 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
         ended_after: stated_ended_after.and_then(|k| u64::try_from(k).ok()),
         sealed_at: doc.seal.sealed_at,
         front_index_sha256: doc.seal.front_index_sha256,
-        requires: doc.seal.requires,
+        requires_stated: doc.seal.requires.is_some(),
+        requires: doc.seal.requires.unwrap_or_default(),
         files: doc.files.into_iter().map(Into::into).collect(),
     };
     if seal.refusal().is_some() {
@@ -527,15 +534,18 @@ pub const KNOWN_FEATURES: &[&str] = &[SHORT_SEAL, SPANNING];
 /// `layout_version` and `requires` (the seal marker repeats the last two).
 /// Every Rust reader of a tape checks [`FormatClaims::refusal`] before it
 /// interprets anything else, so a tape a later tapectl wrote with a feature
-/// this one does not know is refused, never misread. Absent fields are
-/// ABSENT, not defaulted to something refusable: every tape before 1.1.0
-/// has no `requires`, and a damaged File 0 may lack the others; neither may
-/// be turned away for it (the same rule RESTORE.sh keeps).
+/// this one does not know is refused, never misread. An absent `magic` or
+/// `layout_version` is ABSENT, not refusable: a damaged File 0 may lack
+/// them. An absent `requires` is refused: every File 0 and seal this
+/// tapectl writes states it, and the tapes that did not (every tape before
+/// 1.1.0) are not read (ADR-0012 item 258(d)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FormatClaims {
     pub magic: Option<String>,
     pub layout_version: Option<i64>,
     pub requires: Vec<String>,
+    /// Whether the document states `requires` at all (empty or not).
+    pub requires_stated: bool,
     /// The writer's version, for the message only.
     pub tapectl_version: Option<String>,
 }
@@ -544,8 +554,7 @@ pub struct FormatClaims {
 struct ClaimsToml {
     magic: Option<String>,
     layout_version: Option<i64>,
-    #[serde(default)]
-    requires: Vec<String>,
+    requires: Option<Vec<String>>,
     tapectl_version: Option<String>,
 }
 
@@ -564,7 +573,8 @@ pub fn parse_id_thunk_claims(raw: &str) -> Result<FormatClaims> {
     Ok(FormatClaims {
         magic: doc.volume.magic,
         layout_version: doc.volume.layout_version,
-        requires: doc.volume.requires,
+        requires_stated: doc.volume.requires.is_some(),
+        requires: doc.volume.requires.unwrap_or_default(),
         tapectl_version: doc.volume.tapectl_version,
     })
 }
@@ -596,6 +606,14 @@ impl FormatClaims {
                      RESTORE.sh at the tape's own file 2"
                 ));
             }
+        }
+        if !self.requires_stated {
+            return Some(format!(
+                "{what} states no `requires`, which every tape this tapectl ({ours}) writes \
+                 states (volume-format-v2.md §1.2){writer}: a tape written before tapectl \
+                 1.1.0, or a damaged one, which this tapectl does not read. Read it with the RESTORE.sh at \
+                 the tape's own file 2"
+            ));
         }
         let unknown: Vec<&str> = self
             .requires
@@ -1278,17 +1296,29 @@ mod forward_compat_tests {
         assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
     }
 
-    /// Every tape before 1.1.0 (L6-0001 among them) has no `requires`:
-    /// absent means none required.
+    /// ADR-0012 item 258(d): every File 0 and seal this tapectl writes states
+    /// `requires`; one that states none (every tape before 1.1.0) is refused,
+    /// naming the field, by File 0's check and by the seal's own refusal. The
+    /// seal still parses, so every caller refuses it by name.
     #[test]
-    fn a_tape_without_requires_is_readable() {
+    fn a_tape_without_requires_is_refused_naming_the_field() {
         let t = set_requires(&thunk(), "requires = []").replace("requires = []\n", "");
         assert!(!t.contains("requires"));
-        check_id_thunk_readable(&t).unwrap();
+        let err = check_id_thunk_readable(&t).unwrap_err().to_string();
+        assert!(err.contains("File 0 states no `requires`"), "{err}");
+        let claims = parse_id_thunk_claims(&t).expect("the claims still parse");
+        assert!(!claims.requires_stated);
         let old = seal_1_5_0().replace("requires = []\n", "");
         assert!(!old.contains("requires"));
-        let s = parse_seal_marker(&old).unwrap();
-        assert_eq!(s.refusal(), None);
+        let s = parse_seal_marker(&old).expect("parses, to be refused by name");
+        let why = s.refusal().expect("refused");
+        assert!(
+            why.contains("the seal marker states no `requires`"),
+            "{why}"
+        );
+        // The positive control: `requires = []` is stated, and read.
+        check_id_thunk_readable(&set_requires(&thunk(), "requires = []")).unwrap();
+        assert_eq!(parse_seal_marker(&seal_1_5_0()).unwrap().refusal(), None);
     }
 
     /// An unknown required feature is refused, by name, in File 0 and in
@@ -1574,6 +1604,7 @@ mod short_seal_tests {
                     Some(SHORT) => vec![SHORT_SEAL.to_string()],
                     _ => Vec::new(),
                 },
+                requires_stated: self.requires.is_some(),
                 files: self
                     .entries
                     .iter()
@@ -1680,26 +1711,26 @@ mod short_seal_tests {
     }
 
     /// Rule S2, second half: a seal that states `ended_after` keeps S1
-    /// whatever its `requires` says — with `requires = []`, and with no
-    /// `requires` line at all. When it keeps the rules, it parses.
+    /// whatever its `requires` says, `requires = []` included. When it keeps
+    /// the rules, it parses. (A seal with no `requires` line at all is
+    /// refused before any rule: `a_tape_without_requires_is_refused_naming_the_field`.)
     #[test]
     fn s1_holds_whatever_requires_says() {
-        for requires in [Some("[]"), None] {
-            let good = Fixture {
-                requires,
-                ..Fixture::full(4)
-            };
-            let seal = parse_seal_marker(&good.text()).expect("S1 holds: it parses");
-            assert_eq!(seal.ended_after, Some(11));
-            assert!(!seal.requires_short_seal());
+        let requires = Some("[]");
+        let good = Fixture {
+            requires,
+            ..Fixture::full(4)
+        };
+        let seal = parse_seal_marker(&good.text()).expect("S1 holds: it parses");
+        assert_eq!(seal.ended_after, Some(11));
+        assert!(!seal.requires_short_seal());
 
-            Fixture {
-                requires,
-                ended_after: Some(7),
-                ..Fixture::full(4)
-            }
-            .refused_naming("rule S1");
+        Fixture {
+            requires,
+            ended_after: Some(7),
+            ..Fixture::full(4)
         }
+        .refused_naming("rule S1");
     }
 
     /// Rule S2: a seal whose `requires` names `short-seal` states
@@ -1717,16 +1748,18 @@ mod short_seal_tests {
         );
     }
 
-    /// Rule S3, and the compatibility it keeps: a seal before 1.6.0 (no
-    /// `ended_after`, `requires = []` or no `requires` at all) parses as a
-    /// full seal that ended after `file_count - 2`. It is not held to the
-    /// embedded copy's rules at parse, as no reader before 1.6.0 held it;
-    /// [`ParsedSeal::check_parse_rules`] judges it when a caller asks.
+    /// Rule S3: a seal with no `ended_after` that requires nothing
+    /// (`requires = []`) parses as a full seal that ended after
+    /// `file_count - 2`. It is not held to the embedded copy's rules at
+    /// parse, as no reader before 1.6.0 held it;
+    /// [`ParsedSeal::check_parse_rules`] judges it when a caller asks. (A
+    /// seal with no `requires` line at all is refused:
+    /// `a_tape_without_requires_is_refused_naming_the_field`.)
     #[test]
     fn s3_a_seal_before_1_6_0_still_parses_as_full() {
-        for requires in [Some("[]"), None] {
+        {
             let f = Fixture {
-                requires,
+                requires: Some("[]"),
                 ..Fixture::before_1_6_0(4)
             };
             let seal = parse_seal_marker(&f.text()).expect("a 1.5.0 seal parses");
