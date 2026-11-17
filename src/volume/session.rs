@@ -772,6 +772,11 @@ struct RecordedEnding {
     ended_after: Option<i64>,
     /// The `write_early_warning` event's K: the ending was decided.
     warning_at: Option<u32>,
+    /// A `write_lbp_refusal` event is on the volume after that warning
+    /// event (#531): item 174's retry may have left a file at or before K
+    /// not whole after the warning was recorded, so the medium alone does
+    /// not say where the seal may go.
+    refusal_after_warning: bool,
 }
 
 /// Terminal, not resumable: the tape is not a copy
@@ -2679,7 +2684,10 @@ impl InterruptedSession {
         // #420 step 3 (`layout-session.md`, "Resume after a crash past the
         // warning"): no seal is recorded or on the tape, and the early
         // warning is — the ending was decided. Resume writes no data entry:
-        // it seals at P = min(K+1, the files on the medium).
+        // it seals at P = min(K+1, the files on the medium); except (#531)
+        // when a refusal under Logical Block Protection after the warning
+        // left a position at or before K `pending`, which it writes again
+        // first and then seals at K+1.
         if let Some(warned_at) = self.recorded.warning_at {
             return self.seal_after_recorded_warning(conn, store, warned_at);
         }
@@ -2782,6 +2790,12 @@ impl InterruptedSession {
     /// states P-1, and the session log names both numbers; no second event is
     /// written. A seal torn by the crash and counted at K+1 is replaced: a
     /// write at a position ends the recorded data there.
+    ///
+    /// The one exception to "no data entry" (#531): when a refusal under
+    /// Logical Block Protection was recorded after the warning and a position
+    /// at or before K is `pending`, the seal is bounded by the first such
+    /// position as well as by the medium, and [`Self::resend_then_seal`]
+    /// writes the files from there to K again before the seal at K+1.
     fn seal_after_recorded_warning(
         self,
         conn: &Connection,
@@ -2791,9 +2805,24 @@ impl InterruptedSession {
         let planned_seal = planned_seal_position(&self.built.layout)?;
         let label = self.built.layout.label.clone();
         let in_session = |e: TapectlError| e.in_write_session(&label);
+        let decided = warned_at.saturating_add(1).min(planned_seal);
+        // #531: a refusal under Logical Block Protection after the warning
+        // (item 174's retry, at the seal or in its re-send) may have left a
+        // file at or before K not whole, and the catalog marks it `pending`.
+        // Then the medium alone does not bound the seal: the first such
+        // position does too, and the resume writes again from there before
+        // it seals (`Self::resend_then_seal`).
+        let owed = if self.recorded.refusal_after_warning {
+            first_pending_at_or_before(conn, &self.write_ids, warned_at)?
+        } else {
+            None
+        };
         let phase = crate::progress::phase("positioning", None);
-        let seal_at = store.reposition_at_most(warned_at.saturating_add(1).min(planned_seal))?;
+        let seal_at = store.reposition_at_most(owed.map_or(decided, |p| p.min(decided)))?;
         phase.done();
+        if owed.is_some() {
+            return self.resend_then_seal(conn, store, warned_at, planned_seal, seal_at);
+        }
 
         let ended_after = seal_at.checked_sub(1);
         let at = ended_after.and_then(|k| {
@@ -2862,6 +2891,124 @@ impl InterruptedSession {
             run_first_position: seal_at,
         }))
     }
+
+    /// #531, inside step 3 of "Resume after a crash past the warning": a
+    /// refusal under Logical Block Protection came after the recorded
+    /// warning in data slice K, and left tape files from `from` (the first
+    /// `pending` position at or before K, bounded by the files on the
+    /// medium; the store stands at its start) not whole. Item 174's rule
+    /// applies: the files from `from` to K are written again from staging,
+    /// each verified as a fresh write is, and only then is the session
+    /// ready to seal where the warning decided (K+1, or M when K was M-1).
+    /// The run has its own one retry (item 174's applied reading): a
+    /// refusal in the re-send returns to the file the drive's position is
+    /// in and writes on; a second, or a retry that cannot be made, leaves
+    /// the session resumable with no seal written (invariant 1). The
+    /// confirm that follows is the full one ([`tier_after_lbp_refusals`],
+    /// item 186), whatever was asked.
+    fn resend_then_seal(
+        self,
+        conn: &Connection,
+        store: &mut dyn Store,
+        warned_at: u32,
+        planned_seal: u32,
+        from: u32,
+    ) -> Result<ResumeOutcome> {
+        let label = self.built.layout.label.clone();
+        let in_session = |e: TapectlError| e.in_write_session(&label);
+        let seal_at = warned_at.saturating_add(1).min(planned_seal);
+        let ending = if seal_at == planned_seal {
+            Ending::Full
+        } else {
+            Ending::Short {
+                ended_after: warned_at,
+            }
+        };
+        crate::progress::say(&format!(
+            "the early warning was recorded in tape file {warned_at}, and a write the drive \
+             refused with Logical Block Protection armed after it left tape file {from} not \
+             whole: writing tape files {from} to {warned_at} again from staging before the seal \
+             at tape file {seal_at} (ADR-0012 item 174)"
+        ));
+        demote_positions_from(conn, &self.write_ids, from as usize).map_err(in_session)?;
+        for (write_id, _) in &self.write_ids {
+            conn.execute(
+                "UPDATE writes SET status = 'in_progress' WHERE id = ?1",
+                params![write_id],
+            )
+            .map_err(|e| in_session(e.into()))?;
+        }
+        let mut retried = false;
+        let mut start = from;
+        while let Some((at, refused)) = resend_entries(
+            conn,
+            store,
+            &self.built.layout,
+            self.volume_id,
+            &self.write_ids,
+            start,
+            seal_at,
+            !retried,
+        )
+        .map_err(in_session)?
+        {
+            if retried {
+                return Err(in_session(TapectlError::LbpRefusal(second_refusal(
+                    at, &refused,
+                ))));
+            }
+            start = retry_from_refusal(
+                conn,
+                store,
+                &self.built.layout,
+                self.volume_id,
+                &self.write_ids,
+                from,
+                at,
+            )
+            .map_err(|why| {
+                in_session(TapectlError::LbpRefusal(format!(
+                    "the write of tape file {at}: {} It was not retried: {why}. \
+                     {CHECK_THE_DRIVE_PATH}",
+                    as_sentence(&refused)
+                )))
+            })?;
+            retried = true;
+        }
+        Ok(ResumeOutcome::Ready(ReadyToSeal {
+            built: self.built,
+            volume_id: self.volume_id,
+            write_ids: self.write_ids,
+            ending,
+            warning_in_data: true,
+            lbp_retried: retried,
+            run_first_position: from,
+        }))
+    }
+}
+
+/// The first Layout position at or before `at` among this session's slice
+/// positions recorded `pending` (#531): a file the catalog does not hold
+/// whole on the tape.
+fn first_pending_at_or_before(
+    conn: &Connection,
+    write_ids: &[(i64, i64)],
+    at: u32,
+) -> Result<Option<u32>> {
+    let mut first: Option<u32> = None;
+    for (write_id, _) in write_ids {
+        let p: Option<i64> = conn.query_row(
+            "SELECT MIN(CAST(position AS INTEGER)) FROM write_positions
+             WHERE write_id = ?1 AND status = 'pending' AND CAST(position AS INTEGER) <= ?2",
+            params![write_id, i64::from(at)],
+            |r| r.get(0),
+        )?;
+        if let Some(p) = p {
+            let p = p as u32;
+            first = Some(first.map_or(p, |f| f.min(p)));
+        }
+    }
+    Ok(first)
 }
 
 impl ReadyToSeal {
@@ -2912,6 +3059,14 @@ impl ReadyToSeal {
         record_lbp_refusal(conn, self.volume_id, label, seal_at, !self.lbp_retried)?;
         if self.lbp_retried {
             // The run's one retry (item 174) went to an earlier refusal.
+            // The files from the one the drive's position is in are not
+            // whole either (#531): back to `pending`, as in every other
+            // refusal exit, so a resume writes them again.
+            if let Some(again) =
+                locate_refused_file(store, &self.built.layout, self.run_first_position, seal_at)
+            {
+                demote_positions_from(conn, &self.write_ids, again as usize)?;
+            }
             return Err(first);
         }
         let from = retry_from_refusal(
@@ -2930,7 +3085,7 @@ impl ReadyToSeal {
                 as_sentence(&first)
             ))
         })?;
-        resend_entries(
+        if let Some((_, refused)) = resend_entries(
             conn,
             store,
             &self.built.layout,
@@ -2938,7 +3093,10 @@ impl ReadyToSeal {
             &self.write_ids,
             from,
             seal_at,
-        )?;
+            false,
+        )? {
+            return Err(refused);
+        }
         match execute_seal(store, &marker) {
             Ok(()) => Ok(self.sealed(&*store)),
             Err(e @ TapectlError::LbpRefusal(_)) => {
@@ -3296,15 +3454,25 @@ fn tier_after_lbp_refusals(conn: &Connection, volume_id: i64, asked: Tier) -> Re
     Ok(Tier::Integrity)
 }
 
-/// Item 174's re-send before a retried seal: the Layout's content entries
-/// at positions `from` to `until - 1`, each through the verified write
-/// pipeline from its staged file, its slice's catalog position recorded
-/// `written` again with the hash of the bytes the store took. Any failure —
-/// a refusal, a staged file that cannot be read, a hash that no longer
-/// matches — is returned, the session left resumable; the file it stopped
-/// in stays `pending`. A refusal is recorded on `volume_id` first
-/// ([`record_lbp_refusal`], ADR-0012 item 186), its retry not due: the
-/// re-send is the run's one retry.
+/// Item 174's re-send: the Layout's content entries at positions `from` to
+/// `until - 1`, each through the verified write pipeline from its staged
+/// file, its slice's catalog position recorded `written` again with the hash
+/// of the bytes the store took. Before a retried seal it is the run's one
+/// retry; on a resume after a recorded warning it writes again what a
+/// refusal left not whole (#531).
+///
+/// A refusal under Logical Block Protection is recorded on `volume_id`
+/// first ([`record_lbp_refusal`], ADR-0012 item 186; `retry_due` is whether
+/// the run's one retry is still unspent), then every position from the file
+/// the drive's position is in (or from `from`, when the store cannot tell)
+/// goes back to `pending` — st and the drive write behind, so a refusal
+/// surfacing here may be of a block of a file this re-send already recorded
+/// `written` (#531) — and it is returned as `Ok(Some((file, error)))`, the
+/// file being the one whose write returned it. Any other failure (a staged
+/// file that cannot be read, a hash that no longer matches) is an error;
+/// either way the session is left resumable and the file it stopped in stays
+/// `pending`.
+#[allow(clippy::too_many_arguments)]
 fn resend_entries(
     conn: &Connection,
     store: &mut dyn Store,
@@ -3313,7 +3481,8 @@ fn resend_entries(
     write_ids: &[(i64, i64)],
     from: u32,
     until: u32,
-) -> Result<()> {
+    retry_due: bool,
+) -> Result<Option<(u32, TapectlError)>> {
     let mut pool =
         BufferPool::with_queue_bytes(layout.block_size.max(1) as usize, pipeline::QUEUE_BYTES);
     let mut entries: Vec<&LayoutEntry> = layout
@@ -3349,8 +3518,11 @@ fn resend_entries(
                 )))
             }
             Verdict::Failed(e @ TapectlError::LbpRefusal(_)) => {
-                record_lbp_refusal(conn, volume_id, &layout.label, entry.position as u32, false)?;
-                return Err(e);
+                let at = entry.position as u32;
+                record_lbp_refusal(conn, volume_id, &layout.label, at, retry_due)?;
+                let not_whole = locate_refused_file(store, layout, from, at).unwrap_or(from);
+                demote_positions_from(conn, write_ids, not_whole as usize)?;
+                return Ok(Some((at, e)));
             }
             Verdict::Failed(e) => return Err(e),
         };
@@ -3373,7 +3545,7 @@ fn resend_entries(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Record what a run's store decided about Logical Block Protection on the
@@ -4983,24 +5155,39 @@ fn recorded_ending(
             }
         }
     }
-    let warning_at = match started_at {
+    let warning: Option<(i64, Option<String>)> = match started_at {
         None => None,
         Some(started_at) => conn
             .query_row(
-                "SELECT new_value FROM events
+                "SELECT id, new_value FROM events
                  WHERE entity_type = 'volume' AND entity_id = ?1
                    AND action = 'write_early_warning' AND timestamp >= ?2
                  ORDER BY id DESC LIMIT 1",
                 params![volume_id, started_at],
-                |r| r.get::<_, Option<String>>(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .flatten()
-            .and_then(|k| k.parse::<u32>().ok()),
+            .optional()?,
+    };
+    let warning_at = warning
+        .as_ref()
+        .and_then(|(_, k)| k.as_deref())
+        .and_then(|k| k.parse::<u32>().ok());
+    // #531: a refusal under Logical Block Protection recorded after the
+    // warning (ADR-0012 item 186 records each one the moment it is met).
+    let refusal_after_warning = match (&warning, warning_at) {
+        (Some((warning_id, _)), Some(_)) => conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events
+                            WHERE entity_type = 'volume' AND entity_id = ?1
+                              AND action = ?2 AND id > ?3)",
+            params![volume_id, crate::db::events::WRITE_LBP_REFUSAL, warning_id],
+            |r| r.get(0),
+        )?,
+        _ => false,
     };
     Ok(RecordedEnding {
         ended_after,
         warning_at,
+        refusal_after_warning,
     })
 }
 
@@ -11223,7 +11410,7 @@ mod tests {
     // layout-session.md "The short ending") ──
     mod short_ending {
         use super::*;
-        use crate::store::{Mismatch, MismatchKind};
+        use crate::store::{LbpRefusalAt, Mismatch, MismatchKind, Protection};
 
         /// These tests' block size: small, so a slice is several blocks and
         /// File 1 more than one. The doubles model st past the early warning
@@ -13237,6 +13424,404 @@ mod tests {
                     ],
                 );
             }
+        }
+
+        // ── #531: a resume after a recorded warning, when a refusal under
+        //    Logical Block Protection came after it (ADR-0012 items 174, 186) ──
+
+        /// Each slice position's catalog status, in position order.
+        fn position_statuses(s: &Short) -> Vec<(u32, String)> {
+            s.conn
+                .prepare(
+                    "SELECT CAST(position AS INTEGER), status FROM write_positions
+                     ORDER BY CAST(position AS INTEGER)",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// The tier each of the volume's confirms recorded, in order.
+        fn confirm_tiers(s: &Short) -> Vec<String> {
+            s.conn
+                .prepare(
+                    "SELECT verify_type FROM verification_sessions WHERE volume_id = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map(params![s.volume_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// #531's run, up to the stop: `three_units` with Logical Block
+        /// Protection armed and the early warning in `b`'s first slice (K),
+        /// so the session records the warning and is ready to seal short at
+        /// K+1. The seal's write then surfaces a refusal of `a`'s first slice
+        /// (e0; st and the drive write behind), item 174 returns there and
+        /// re-sends, and the drive refuses `a`'s second slice (e) as it is
+        /// re-sent: the run's second refusal, so the session stops resumable
+        /// with e and every later position `pending`. The process is gone:
+        /// its rows are swept to `interrupted`. With `torn`, the device's
+        /// close wrote a filemark after what the drive kept of e, so the
+        /// medium counts a torn file e (the real drive's way; a MemStore
+        /// keeps only whole files). Returns the session, the cartridge, K,
+        /// e0 and e.
+        fn refused_after_the_warning(torn: bool) -> (Short, MemStore, u32, u32, u32) {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let (e0, e) = (slice_at(&s, 0, 0), slice_at(&s, 0, 1));
+            assert!(e0 < e && e < k, "premise: both refused files before K");
+            let mut store = warning_in(&s, k).with_protection(Protection::Lbp { reads: true });
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            let mut store = store
+                .with_lbp_refusal(LbpRefusalAt::deferred(e0, 0, k + 1))
+                .with_lbp_refusal(LbpRefusalAt::deferred(e, 0, e));
+            let err = match ready.seal_with_retry(&s.conn, &mut store) {
+                Err(e) => e,
+                Ok(_) => panic!("the re-send's refusal must stop the session before its seal"),
+            };
+            assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+            assert_eq!(store.files.len() as u32, e, "the drive kept files before e");
+            assert!(
+                position_statuses(&s)
+                    .iter()
+                    .all(|(p, st)| (*p < e) == (st == "written")),
+                "e and every later position pending: {:?}",
+                position_statuses(&s)
+            );
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                    params![s.volume_id],
+                )
+                .unwrap();
+            if torn {
+                store.files.push(vec![0x5a; SBS as usize]);
+                store.syncs.push(false);
+            }
+            (s, store, k, e0, e)
+        }
+
+        /// #531: the resume re-sends from the first `pending` position at or
+        /// before K (bounded by the medium too) before it seals, so the tape
+        /// seals short at K+1 as the warning decided, with every file at or
+        /// before it whole, and its confirm is the full one (item 186)
+        /// although the quick one was asked. Before, the resume sealed from
+        /// the medium alone: with a torn file e counted, short after it, and
+        /// the sealed tape never confirmed; without, short after e-1, cutting
+        /// units whose slices were staged and re-sendable.
+        #[test]
+        fn a_resume_after_a_refusal_past_the_warning_resends_before_it_seals() {
+            for torn in [true, false] {
+                let (s, mut store, k, _, e) = refused_after_the_warning(torn);
+                let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                    .unwrap()
+                    .unwrap();
+                let ResumeOutcome::Ready(ready) = interrupted
+                    .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                    .unwrap()
+                else {
+                    panic!("torn={torn}: the resume re-sends and is ready to seal");
+                };
+                assert_eq!(
+                    ready.ending(),
+                    Ending::Short { ended_after: k },
+                    "torn={torn}: the seal goes where the warning decided"
+                );
+                assert_eq!(store.files.len() as u32, k + 1, "torn={torn}: 0 to K");
+                let pending = ready.seal_with_retry(&s.conn, &mut store).unwrap();
+                assert_eq!(
+                    store.files.len() as u32,
+                    k + 2,
+                    "torn={torn}: the seal at K+1"
+                );
+                let done = sealed(
+                    pending
+                        .confirm(&s.conn, &mut store, Tier::write_confirm(false))
+                        .unwrap(),
+                );
+                assert_eq!(done.ending, Ending::Short { ended_after: k });
+                assert_eq!(confirm_tiers(&s), ["full"], "torn={torn}: item 186");
+                assert_eq!(
+                    rows(&s),
+                    [
+                        row("a", "completed", "current"),
+                        row("b", "cut", "staged"),
+                        row("c", "cut", "staged"),
+                    ],
+                    "torn={torn}"
+                );
+                assert_eq!(
+                    volume(&s),
+                    ("sealed".into(), Some(i64::from(k)), "ok".into())
+                );
+                assert!(
+                    position_statuses(&s)
+                        .iter()
+                        .filter(|(p, _)| *p >= e && *p <= k)
+                        .all(|(_, st)| st == "written"),
+                    "torn={torn}: e to K written again: {:?}",
+                    position_statuses(&s)
+                );
+            }
+        }
+
+        /// #531, item 174's applied reading: the resumed run has its own one
+        /// retry. A refusal in its re-send is retried from the file the
+        /// drive's position is in, and the tape seals; a second leaves the
+        /// session resumable with no seal on the tape (invariant 1), naming
+        /// the host-to-drive path.
+        #[test]
+        fn a_refusal_in_the_resumes_resend_is_retried_once() {
+            // One refusal: retried, then sealed.
+            let (s, store, k, _, e) = refused_after_the_warning(true);
+            let mut store = store.with_lbp_refusal(LbpRefusalAt::deferred(e, 0, e + 1));
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("one refusal in the re-send is retried");
+            };
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            let pending = ready.seal_with_retry(&s.conn, &mut store).unwrap();
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::write_confirm(false))
+                    .unwrap(),
+            );
+            assert_eq!(done.ending, Ending::Short { ended_after: k });
+
+            // Two: the second is an error, and nothing seals.
+            let (s, store, _, _, e) = refused_after_the_warning(true);
+            let mut store = store
+                .with_lbp_refusal(LbpRefusalAt::deferred(e, 0, e + 1))
+                .with_lbp_refusal(LbpRefusalAt::deferred(e, 0, e + 1));
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let err = match interrupted.resume_checking(
+                &s.conn,
+                &s.keys,
+                SliceCheck::Size,
+                &mut store,
+                || false,
+            ) {
+                Err(e) => e,
+                Ok(_) => panic!("a second refusal in the resumed run must not reach a seal"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("second write the drive refused"), "{msg}");
+            assert!(msg.contains("host-to-drive path"), "{msg}");
+            assert_eq!(
+                store.syncs.iter().filter(|s| **s).count(),
+                0,
+                "no seal on the tape"
+            );
+            assert!(
+                position_statuses(&s)
+                    .iter()
+                    .any(|(p, st)| *p == e && st == "pending"),
+                "the file the drive refused stays owed: {:?}",
+                position_statuses(&s)
+            );
+        }
+
+        /// #531: a refusal at the seal when the run's one retry is already
+        /// spent (here by the resume's re-send) is not retried, but the file
+        /// the drive's position is in goes back to `pending` with every later
+        /// one, as in every other refusal exit; so the next resume re-sends
+        /// it and seals where the warning decided. Before, every position
+        /// stayed `written`, and that resume sealed from the medium alone.
+        #[test]
+        fn a_refusal_at_the_seal_after_the_runs_retry_leaves_its_file_owed() {
+            for torn in [true, false] {
+                let (s, store, k, _, e) = refused_after_the_warning(torn);
+                let mut store = store
+                    .with_lbp_refusal(LbpRefusalAt::deferred(e, 0, e + 1))
+                    .with_lbp_refusal(LbpRefusalAt::deferred(e, 0, k + 1));
+                let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                    .unwrap()
+                    .unwrap();
+                let ResumeOutcome::Ready(ready) = interrupted
+                    .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                    .unwrap()
+                else {
+                    panic!("torn={torn}: one refusal in the re-send is retried");
+                };
+                let err = match ready.seal_with_retry(&s.conn, &mut store) {
+                    Err(e) => e,
+                    Ok(_) => panic!("torn={torn}: the retry is spent; the seal's refusal stops"),
+                };
+                assert!(matches!(err, TapectlError::LbpRefusal(_)), "{err:?}");
+                assert!(
+                    position_statuses(&s)
+                        .iter()
+                        .all(|(p, st)| (*p < e) == (st == "written")),
+                    "torn={torn}: e and every later position pending: {:?}",
+                    position_statuses(&s)
+                );
+
+                s.conn
+                    .execute(
+                        "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                        params![s.volume_id],
+                    )
+                    .unwrap();
+                if torn {
+                    store.files.push(vec![0x5a; SBS as usize]);
+                    store.syncs.push(false);
+                }
+                let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                    .unwrap()
+                    .unwrap();
+                let ResumeOutcome::Ready(ready) = interrupted
+                    .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                    .unwrap()
+                else {
+                    panic!("torn={torn}: the next resume re-sends and is ready to seal");
+                };
+                assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+                let pending = ready.seal_with_retry(&s.conn, &mut store).unwrap();
+                let done = sealed(
+                    pending
+                        .confirm(&s.conn, &mut store, Tier::write_confirm(false))
+                        .unwrap(),
+                );
+                assert_eq!(done.ending, Ending::Short { ended_after: k }, "torn={torn}");
+            }
+        }
+
+        /// #531: the resumed run's re-send starts at e, so its one retry
+        /// reaches a refusal the seal's write surfaces for a block of e
+        /// (`run_first_position` is where the run began writing, not the
+        /// seal), and the tape seals.
+        #[test]
+        fn a_resumed_run_keeps_its_one_retry_for_the_seal() {
+            let (s, store, k, _, e) = refused_after_the_warning(false);
+            let mut store = store.with_lbp_refusal(LbpRefusalAt::deferred(e, 0, k + 1));
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("the resume re-sends and is ready to seal");
+            };
+            let pending = ready.seal_with_retry(&s.conn, &mut store).unwrap();
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::write_confirm(false))
+                    .unwrap(),
+            );
+            assert_eq!(done.ending, Ending::Short { ended_after: k });
+            assert_eq!(confirm_tiers(&s), ["full"]);
+        }
+
+        /// #531: st and the drive write behind, so the refusal that stops a
+        /// re-send can be of a block of a file the re-send already wrote and
+        /// recorded `written` (here `a`'s first slice, e0, surfacing in the
+        /// write of e). That file is not whole either: it goes back to
+        /// `pending` with every later one, so a resume writes it again even
+        /// when the device's close left a torn copy of it counted on the
+        /// medium. Before, it stayed `written` and the resume began after it.
+        #[test]
+        fn a_refusal_of_an_earlier_resent_file_sends_it_back_to_pending() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let (e0, e) = (slice_at(&s, 0, 0), slice_at(&s, 0, 1));
+            let mut store = warning_in(&s, k).with_protection(Protection::Lbp { reads: true });
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            let mut store = store
+                .with_lbp_refusal(LbpRefusalAt::deferred(e0, 0, k + 1))
+                .with_lbp_refusal(LbpRefusalAt::deferred(e0, 1, e));
+            assert!(ready.seal_with_retry(&s.conn, &mut store).is_err());
+            assert_eq!(
+                position_statuses(&s)
+                    .into_iter()
+                    .filter(|(p, _)| *p >= e0)
+                    .map(|(_, st)| st)
+                    .collect::<Vec<_>>(),
+                ["pending"; 5],
+                "e0, whose block the drive refused, and every later position"
+            );
+
+            // The close's filemark counted what the drive kept of e0.
+            store.files.push(vec![0x5a; SBS as usize]);
+            store.syncs.push(false);
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                    params![s.volume_id],
+                )
+                .unwrap();
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("the resume re-sends and is ready to seal");
+            };
+            let pending = ready.seal_with_retry(&s.conn, &mut store).unwrap();
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::write_confirm(false))
+                    .unwrap(),
+            );
+            assert_eq!(done.ending, Ending::Short { ended_after: k });
+        }
+
+        /// #531's gate: without a refusal after the warning, the resume
+        /// still writes no data entry (`layout-session.md`, "Resume after a
+        /// crash past the warning", step 3). A `pending` position at or
+        /// before K left by the medium's own loss (#403) seals at the
+        /// medium, as before.
+        #[test]
+        fn without_a_refusal_after_the_warning_the_resume_writes_no_data_entry() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let _ = ready(outcome);
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                    params![s.volume_id],
+                )
+                .unwrap();
+            // The medium lost file K; a position before it is owed too.
+            store.files.truncate(k as usize);
+            store.syncs.truncate(k as usize);
+            s.conn
+                .execute(
+                    "UPDATE write_positions SET status = 'pending'
+                     WHERE CAST(position AS INTEGER) >= ?1",
+                    params![k - 1],
+                )
+                .unwrap();
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let ResumeOutcome::Ready(ready) = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            else {
+                panic!("the resume seals at the medium");
+            };
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k - 1 });
+            assert_eq!(store.files.len() as u32, k, "no data entry written");
         }
     }
 
