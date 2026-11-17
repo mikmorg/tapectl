@@ -1267,3 +1267,225 @@ and clears it on every exit; st carries each block with its 4-byte CRC, the driv
 before writing, and on a read the drive sends its own, which tapectl checks. The CRC is
 never stored: the medium's blocks are the same with or without it. A block the drive
 refuses is written again, once, from its file's planned start (item 174).
+
+---
+
+## 7. Readers
+
+Every reader judges a restore by the **per-file sha256 check** against the file table,
+never by tar's exit status or a decompressor's (invariant 6): BusyBox tar exits 0 with
+files missing, and BusyBox `unxz` exits 0 after writing wrong bytes (both measured). **No
+reader zero-fills a lost slice, and none passes `--ignore-zeros`** (item 264).
+
+### 7.1 tapectl's own reader (D16, D17; items 101, 131, 264, 266, 278)
+
+- **One reader.** A restore decrypts the slices it needs, in order (and decompresses each
+  alone for a compressed staging, checking its decoded length against `size_bytes` and its
+  bytes against `sha256_plain`), and writes to tar's standard input exactly the byte
+  ranges of the members asked for, joined at member boundaries, then the end-of-archive
+  blocks. A range lies inside one slice, or is a long member's run (§3.3). There is no
+  spool mode and no scratch copy of a slice.
+- **Every member is checked as it is fed**: its bytes are hashed against the file table's
+  sha256; a member that fails is not fed and is listed as damaged. **After tar ends,
+  every restored regular file is hashed on disk** against the table, unless
+  `--no-file-check` (D16).
+- **tar's command line** (T4.8, determined): `--extract --file=- --directory=<destination>
+  --numeric-owner --preserve-permissions --xattrs --acls`, and `--keep-old-files`, or
+  `--overwrite` when the restore was given `--overwrite`; never `--ignore-zeros`, never
+  `--absolute-names`; with `LC_ALL=C` and without `TAR_OPTIONS` or `POSIXLY_CORRECT`. What
+  tar could not set it says, and tapectl repeats it. The reader's tar is not held to the
+  writer's floor.
+- **A bad slice** is replaced from another copy by its sha256 (item 101(a)): tapectl asks
+  for the cartridge by label, sticker and chip serial. With no copy, the members in it are
+  left out and listed, and the restore goes on (item 264). tapectl reads around a bad 64
+  KiB age chunk (item 101(b)), leaving out only the members that touch it; in a compressed
+  slice nothing after the bad chunk decodes, so the members from the chunk to the slice's
+  end are left out (item 284).
+- **The repair.** The damaged paths are restored from another copy of the same version
+  through that copy's file table; a range is a source for the files whose slices it holds
+  (item 260).
+- **A unit across cartridges** is read as one stream across the swaps when the other
+  cartridges are offered (item 131); `--from` names the first. A restore that starts on a
+  tape holding only a range takes the files it holds whole and lists the rest (item 266,
+  D17).
+- **The id map** of each unit restored is printed, and is in `--json` (item 278). No owner
+  is changed by name.
+
+### 7.2 The heir path, end to end, with `mt`, `dd`, `age`, `tar` and `sha256sum`
+
+No database, no tapectl, no operator. This is the normative Heir Path (CONTEXT.md);
+RESTORE.sh and File 1 implement it literally. **The tape is read forward from one rewind**:
+a read leaves the head at the start of the next file, so a reader spaces forward from
+where it is and rewinds only for a file behind it. Besides those five tools the path uses
+`head`, `tail`, `tar` (for the envelopes as well as the data), and the compression tool
+(`gzip`, `xz` or `zstd`) of a compressed staging.
+
+1. `mt -f /dev/nst0 setblk 524288 && mt -f /dev/nst0 rewind && dd if=/dev/nst0 bs=512k`:
+   File 0, its identity, `requires` (§1.2), and "the map is File 3".
+2. `mt -f /dev/nst0 fsf 2 && dd if=/dev/nst0 bs=512k`: the **front index**: every file's
+   position, type, size and ciphertext hash.
+3. *(Completeness, before any slice.)* Space to the last file (`mt eod`, `mt bsfm 2`, §1.2
+   rule 6) and read the **seal marker**: its `ended_after` says where the tape ended, and
+   its `front_index_sha256` must match File 3's hash. Absent or mismatched: the tape is
+   unsealed or damaged; proceed knowing trailing slices may be missing. If File 3 is
+   unreadable, the seal's embedded copy is the same map (validate its hashes against the
+   files before trusting it).
+4. For each envelope position: `dd` it out, check its hash against the front index, `age
+   -d -i KEY`. The one that decrypts is yours: `MANIFEST.toml`, `RECOVERY.md`, `tables/`
+   (each staging's file table and id map, §1.6) and `index/`. age's "no identity matched"
+   means the key is not a recipient; any other failure after a key matched means the
+   envelope is damaged, and its backup (§1.3, the `*_backup` entry with the same
+   `sha256_encrypted`) is read instead.
+5. For a unit, from its block in `MANIFEST.toml`: the slices with a `tape_position` at or
+   before `ended_after` are on this tape (§5.3). For each such slice, in order: `dd bs=512k`
+   it out; `head -c size_bytes` (the front index's) to trim padding; `sha256sum` against the
+   front index's `sha256_encrypted`; `age -d -i KEY`; for a compressed staging, the
+   algorithm's tool (`gzip -dc`, `xz -dc`, `zstd -dc`). The result is the slice's cut: its
+   length is the manifest's `size_bytes`, and its sha256 the manifest's `sha256_plain`.
+6. Give the good slices, in order, to **one** `tar -x` run into an empty directory (a
+   slice that continues a member, `continues = true`, is joined to the slices before it
+   before tar sees it). A slice that is not on this tape, or fails its hash, is left out,
+   and its members are the damaged ones (the file table's `slice` column says which).
+7. Check every restored regular file against the file table's sha256 (`sha256sum -c`),
+   and write the paths that fail or are missing to the damaged-file list (§1.7).
+
+**One file.** Find its row in the file table (`grep` or `awk` on the path). Read its slice
+(or its run) as in step 5 into the work directory, cut the member out of it by its offsets
+(`tail -c +$((start - slice_start + 1)) | head -c $((end - start))`, where `slice_start` is
+the `start` of the first member of that slice, §1.6), each cut its own pipeline, and give
+the member to `tar -x`. A hard link brings its target's member first (item 256). (T0.7 step
+(e), item 293: by offsets, because BusyBox tar extracts a named folder with everything under
+it.)
+
+### 7.3 Which tars restore what (measured; #562)
+
+| Reader | Content | Owner and group (numeric) | xattrs | ACLs (text record) | Folders' mtimes | Hard links |
+|---|---|---|---|---|---|---|
+| GNU tar 1.30, 1.34, 1.35 | yes | yes, as root | yes | yes, access and default | yes, in one run | yes, when the first name is read first |
+| bsdtar 3.6.2 (`-p`) | yes | yes, as root | yes | yes | yes, in one run | the same |
+| BusyBox tar 1.36.1 | yes | — | no | no | no | the same |
+
+Sources: T0.1 and T0.7 (`docs/research/2026-11-17-t01-…`, `…-t07-…`). The heir's readers
+stay wide (item 273's reading): GNU tar of any version, bsdtar and BusyBox tar, which is
+held to content only. File 1 says which tar the heir has and what it does not restore, and
+RESTORE.sh says which tar it found.
+
+### 7.4 RESTORE.sh (D10)
+
+One file in the tree, `src/volume/heir/RESTORE.sh`, put on tape byte for byte as File 2,
+the same bytes on every tape: what differs between tapes is read from File 0 and the
+MANIFEST when it runs. Its awk programs are in the same file. It exports `LC_ALL=C` and
+clears a `TAR_OPTIONS` in the heir's environment.
+
+| Mode | What it does |
+|---|---|
+| `--info` | what the tape is, with no key |
+| `--verify` | reads and hashes every file of the tape at or before `ended_after` against the front index, with no key; one `NOT ON TAPE` line names the planned files after it |
+| `--find-envelope --key K` | which envelope the key opens, and its units |
+| `--list --key K [--unit U] [--version N]` | a unit's files, from the file table |
+| `--restore --key K --to DIR` with `--all`, or `--unit U` (repeatable) and `--version N` | whole units |
+| `--restore ... --unit U --path P` (repeatable), or `--paths-from FILE` | the named paths of one unit, by the file table; with the damaged-file list as FILE this is the one repair (item 255) |
+| `--where UNIT`, `--where --all`, `--find TEXT` | the index modes (§1.5) |
+| `--work DIR`, `--no-space-check`, `--overwrite`, `--no-file-check` | the work directory is made inside `--to` by default (item 271), and `--work` replaces `--scratch` |
+
+- **The reader's primitive** (items 264, 283; D10). Each slice is checked against the
+  front index, decrypted into the work directory and, where its staging is compressed,
+  decompressed and checked against its `size_bytes`, all before tar sees it. The good
+  slices go, in order, to **one** tar run. A bad slice is left out and its members are
+  listed from the file table. A long member's run is fed piece by piece, each piece checked
+  first: if a piece fails, that tar run is ended, the member's partial file is removed and
+  the member is listed, and the next run starts at the slice after the run. One decrypted
+  slice at a time rests in the work directory, and the space check counts it.
+- **One prompt**, for the next cartridge of a unit that continues there, where "I do not
+  have it" is an answer (items 255, 266, 267; §5.3 R7). It waits without a time limit and
+  holds no device. A cartridge is taken only by R8. A blank, foreign or unreadable
+  cartridge at the prompt is named and the prompt asks again (#521). Nothing is kept in the
+  work directory between cartridges.
+- **The tool check** for each mode is drawn from one table, before the first tape read. The
+  decompressor is checked for a unit that states compression, and only for such a unit.
+- **After a restore** it prints the damaged-file list, the id map of each unit restored,
+  and which tar it used and what that tar does not restore.
+- A full or unwritable work directory is said to be that, never "a damaged envelope"
+  (#520). Quitting at the prompt, Ctrl-C, a hangup or a kill leave no work directory and no
+  partial file behind.
+
+### 7.5 File 1 and RECOVERY.md
+
+**File 1** (the system guide, plaintext) and each envelope's **RECOVERY.md** (encrypted)
+carry no unit name, file name, id or key fingerprint in File 1 (invariant 3). Every
+command either text gives is run as written by a test, or it is not in the text. They say:
+- the manual path of §7.2 with `age`, `tar` and the file table, for whole units and for one
+  file; that each data file is an archive of whole files, and which files are one long
+  file's run (`continues`);
+- how to read the seal's `ended_after` by hand, and that a file listed after it is not on
+  this tape:
+
+  ```bash
+  mt -f /dev/nst0 setblk 524288
+  mt -f /dev/nst0 eod          # GNU mt: eom
+  mt -f /dev/nst0 bsfm 2
+  dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
+  ```
+
+- that a unit may continue on another cartridge, the prompt and "I do not have it", and
+  what a tape read alone gives (§5.3);
+- which tars restore what (§7.3), and what a restore on another host does with an owner or
+  an ACL entry, and that the id map says who the ids were (item 278);
+- how to tell a compressed unit, which tool reads each algorithm and which package holds
+  it, and the manual path for one;
+- the one repair (§1.7); per-unit directories; the right route for each key holder; only
+  messages `age` prints (#522, #523, #526).
+
+A literal of tapectl's current version goes stale at the next release: the texts write
+`tapectl-X.Y.Z` and "such as 2.0.0".
+
+### 7.6 A tapectl volume of another layout (item 269; #560)
+
+tapectl 2.0.0 knows a tapectl volume of another layout when it meets one: it reads the
+label from File 0 and nothing else. Every command that meets one says: this is a tapectl
+volume of Layout N, label L; read it with the tapectl that wrote it or with the RESTORE.sh
+in its own File 2. `volume init` over it is refused; `cartridge erase` with the typed label
+is the way, and it works on such a tape. No envelope, index or seal of another layout is
+parsed. This is consent, not compatibility (item 242).
+
+---
+
+## 8. Block mode
+
+Fixed-block mode, 512 KiB. Plan-first depends on deterministic block padding: the
+Layout's `pad_to_blocks` and RESTORE.sh's trim-to-`size_bytes` contract both require a
+fixed block size, and variable-block mode buys nothing when every size is planned. 512 KiB
+is safe under both st's ~2 MB memory ceiling and the drive's 8 MB encrypted-block ceiling.
+
+---
+
+## 9. What Layout 3 removes
+
+From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
+
+- **dar** leaves the data zone and the host's dependencies (item 241): dar's slice framing
+  (a re-created dar slice header and the one-byte `N`/`T` trailer on every slice), the
+  `dar_version` and `dar_command` keys of a unit block, the isolated dar catalogue in each
+  envelope (`catalogs/<uuid8>_v<version>.1.dar`) and the `catalogs/` member, the seccomp
+  filter on `dar -c` (#441), and the per-slice FIFO and one-stream join into `dar -x -`
+  (items 176 to 184).
+- **The plain cut** of item 241: a slice is no longer `slice_size` bytes wherever members
+  fall; it ends at a member's start (item 283).
+- **`requires` entries**: `short-seal` and `spanning` are not features of Layout 3 (item
+  258(a), item 288); every Layout 3 tape's `requires` is empty.
+- **The `cut` unit** (items 9, 99, 112): no staging is cut and written again whole; a
+  staging the early warning divides is a range (item 288).
+- **The opt-in to spanning** (item 82): `allow_spanning`, `writes.may_span` and the block's
+  `may_span = true` line; and with them a spannable set as a kind of staging and a "span
+  tape" as a kind of tape (items 121, 124, 125).
+- **Item 133's refusal** of a volume that holds a range in `volume rewrite` and compaction
+  (§5.4).
+- **The three generations of the on-tape `catalog.db`** (item 258(d)): one generation
+  (§1.4).
+- **Layout 2's seal rule S3**, a seal with no `ended_after` read as full (§5).
+- **The heir's** `--slices-from`, `--swap-tapes`, `--stream-tapes`, `--fill-from` and
+  salvage mode, and item 132's default of each tape's range kept in scratch (items 255,
+  267). `--scratch` becomes `--work` (item 271).
+- **A zero-filled lost slice and `--ignore-zeros`** (item 264).
+- **Compatibility**: a Layout 2 tape is read with tapectl 1.9.2 or its own RESTORE.sh
+  (item 242); tapectl 2.0.0 reads only its label (§7.6).
