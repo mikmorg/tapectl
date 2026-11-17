@@ -369,8 +369,8 @@ whichever slices it holds (#562). The catalog database holds the same rows
 carries them (§1.4).
 
 **Names.** `tables/<staging>.tsv` (the file table) and `tables/<staging>.ids.tsv` (the id
-map), where `<staging>` names a staging as the dar catalogue's member name named it in
-Layout 2: the unit's uuid's first eight hex characters, `_v`, and the version
+map), where `<staging>` names a staging as Layout 2's `catalogs/` member named it (D4):
+the unit's uuid's first eight hex characters, `_v`, and the version
 (`tables/1a2b3c4d_v3.tsv`).
 
 **OPEN (Stage 1):** two stagings of one version on one tape (ADR-0012 item 102 allows a
@@ -622,7 +622,7 @@ A unit's version is archived as **one pax stream per staging**, written by GNU t
 host from tapectl's exact file list (ADR-0012 item 253). tapectl reads the stream as it
 passes, checks it, cuts it into **slices** that each hold whole members (item 283), and
 age-encrypts each slice alone, after compressing it alone when the staging is compressed
-(item 284). No dar is anywhere in the data zone (item 241).
+(item 284). tar's stream is the only archive format in the data zone (item 241; §9).
 
 ### 3.1 The stream (D2)
 
@@ -1136,7 +1136,8 @@ drive's early warning ends a range as it ends any tape (§5.2).
 
 **On tape, a range is known by positions.** Every block lists every slice of its staging
 (§1.9) and gives `tape_position` only to the slices this tape's plan holds. There is no
-`may_span` key and no `requires` entry (item 288, D1, D6). With a key, a reader takes the
+key that marks a staging as one that may continue, and no `requires` entry (item 288, D1,
+D6). With a key, a reader takes the
 staging's slices that have a `tape_position` at or before the seal's `ended_after`. Then:
 - **All N slices:** the tape holds the version **whole** and is a copy of it
   (`writes.status = 'completed'`).
@@ -1529,11 +1530,12 @@ the plan's determination under it):
   (D18). Both `stage_files` and `stage_ids` outlive the release of the staging's slices
   and go only with the staging's own row (item 265).
 - **Changed:** `stage_sets` gains `tar_version`, `tar_command`, `stream_bytes` and
-  `compression_level`, and loses dar's columns and `catalog_path`; `stage_slices` gains
-  `continues`; `dar_create_reports` becomes `tar_create_reports`; the `dar_*` columns of
-  `restores` become `tar_*` (D11).
-- **Gone with T5.1:** `allow_spanning` (an archive set's and a unit's frozen copy),
-  `writes.may_span`, and the write status `cut` (items 288, 289).
+  `compression_level`, and loses the old archiver's columns and `catalog_path`;
+  `stage_slices` gains `continues`; the old archiver's report table becomes
+  `tar_create_reports`, and its columns of `restores` become `tar_*` (D11; §9).
+- **Gone with T5.1:** the policy key that opted a staging in to spanning (an archive set's
+  and a unit's frozen copy), the write's frozen copy of it, and the write status `cut`
+  (items 288, 289; §9).
 - Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
 
 The full listing is written by T1.5 into this appendix.
