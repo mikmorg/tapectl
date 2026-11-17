@@ -14,9 +14,8 @@ sets, volumes, cartridges, locations, tenants and every event. It is what a
 backup of tapectl copies, and what a rebuild reconstructs from tape when it is
 lost. The tape is the truth about what a tape holds; the catalog is the truth
 about everything else.
-_Avoid_: database (the storage it happens to use), catalogue (dar's own listing
-of the files in one archive, spelled that way on purpose), index (the
-cross-volume index each tape carries)
+_Avoid_: database (the storage it happens to use), file table (one staging's
+listing of its members), index (the cross-volume index each tape carries)
 
 **Claim**:
 A catalog row asserting something about a tape's contents (e.g., "slice 7 of
@@ -115,9 +114,11 @@ full
 
 **Fill ceiling**:
 The fraction of a cartridge's capacity a write may plan to fill, 97% by default.
-A drive whose room past the Early warning has been measured may plan beyond it,
-up to the cartridge's whole capacity; what the drive does not reach before its
-Early warning is cut off by a Short seal.
+On a drive that declares its room past the Early warning (`post_warning_bytes`) a
+write plans beyond it, to the end of the unit that passes the cartridge's
+nominal capacity, and the Early warning ends the tape; without that key the plan
+stops at the ceiling, inside a unit if that is where it falls, and the rest
+continues on the next cartridge (ADR-0012 item 289).
 _Avoid_: usable capacity, `usable_capacity_factor` (its name before #391)
 
 **Short seal**:
@@ -126,25 +127,14 @@ at position K is finished and the seal goes at K+1 instead of the planned
 position, stating `ended_after = K`. The tape is Sealed: every unit whose
 slices all lie at or before K is a Copy, and every planned position after K is
 not on the tape. The front index still lists the whole plan, and the short seal
-still binds it by hash. A seal at the planned position is a **full seal**.
-Every tape written by 1.6.0 carries `requires = ["short-seal"]`, whichever seal
-it ends with, so an older reader refuses it by name.
+still binds it by hash. A seal at the planned position is a **full seal**. Every
+Layout 3 tape may end early; that is part of the layout, not a feature it
+requires. A stage set the tape holds some slices of is a Range there; one it
+holds none of is not on it, and its slices go to the next cartridge.
 _Avoid_: partial seal, truncated tape, salvage (the rejected v4 design
-overwrote or sacrificed slices; a short seal does neither)
-
-**Cut**:
-What a Short seal does to a unit it does not hold whole: a unit with any slice
-planned after `ended_after` is cut. That is the unit the Early warning
-interrupted, and every unit planned after it. A cut unit counts as nothing on
-that tape: its `writes` row is `cut`, never a Copy, though its slices that
-reached the tape stay recorded. It stays staged and is written whole to the next
-cartridge as an ordinary write. Only the drive cuts a unit, and only on a
-sealed tape: an aborted session's rows are `aborted`, never `cut`. A unit that
-allows Spanning, interrupted with slices already on the tape, is not cut: that
-tape holds a Range of it (1.7.0, ADR-0012 item 121).
-_Avoid_: split (a cut unit is not divided between tapes: it is written whole
-again; dividing a version is Spanning, and only a unit that allows it spans),
-truncated, partial copy, aborted
+overwrote or sacrificed slices; a short seal does neither), cut unit (Layout 2's
+name for a unit a short seal did not hold whole, written again whole; in Layout 3
+no unit is cut, ADR-0012 item 288)
 
 **Copy**:
 A claim to the same bytes on another medium: one snapshot Version of a unit,
@@ -173,8 +163,9 @@ never hold identical content: a version number names content, not a moment.
 _Avoid_: revision, generation (reserved for LTO media)
 
 **Stage set**:
-One staging of one Version: a single dar archive of the unit's files, cut into
-Slices and age-encrypted, recorded with each slice's size and hash. It is
+One staging of one Version: a single tar Stream of the unit's files, cut into
+Slices (each compressed alone when the staging says so) and age-encrypted,
+recorded with each slice's size and hash, its File table and its Id map. It is
 staged once and written unchanged to every volume that carries a copy, which is
 why copies are identical content.
 _Avoid_: archive set (a policy grouping), backup set
@@ -188,25 +179,62 @@ _Avoid_: pending (the unit-level parent of Never Archived and Dirty), queued,
 unwritten (a staged version may already have some of its copies)
 
 **Slice**:
-A fixed-size byte range of a stage set's dar archive (dar's own word, its `-s`;
-1 GiB by default), age-encrypted and written as one tape file. Slices cut bytes,
-not files: a file may straddle two slices, and a slice is never restored alone
-(dar reads a run of slices, using the archive's catalogue to pick the ones a
-path needs).
+A piece of a stage set's Stream that holds whole Members, as many as fit in
+`slice_size` (1 GiB by default), compressed alone when its staging says so,
+age-encrypted and written as one tape file (ADR-0012 items 282-284). A member
+larger than `slice_size` has a Run of slices to itself. A slice that does not
+continue a member is an archive any tar reads alone.
 _Avoid_: chunk (age encrypts in 64 KiB chunks), block (the tape's 512 KiB unit),
-part
+part, plain cut (Layout 2's slice: bytes of the stream wherever members fell)
+
+**Run**:
+The consecutive slices of one Member larger than `slice_size`: each holds
+`slice_size` bytes of it and the last what remains, and the member after it
+begins a new slice. Every slice of a run but the first states `continues = true`.
+_Avoid_: range (a stage set's slices on one volume), span
+
+**Stream**:
+The one pax archive GNU tar writes for a staging, from tapectl's exact file
+list (ADR-0012 item 253). tapectl reads it as it passes, checks every member,
+hashes every file, and cuts it into Slices. The slices joined are the stream.
+_Avoid_: archive (ambiguous with an archive set), tarball
+
+**Member**:
+One entry of a Stream: a file, folder, link, FIFO or device node, from its first
+extension header to the end of its last padded block. A socket is never a member.
+_Avoid_: file (a member may be a folder or a link), entry (the Layout's word for
+a tape file)
+
+**File table**:
+One staging's listing of its Members, in stream order: each one's kind, the slice
+it begins in, where it starts and ends in the stream, its size, its sha256 and its
+path (ADR-0012 items 254, 265). It is kept in the catalog, outlives its slices,
+and rides every tape that holds a slice of the staging. A listing, a one-path
+restore and the per-file check read it.
+_Avoid_: catalogue (Layout 2's dar listing, gone), manifest (the envelope's list
+of units and slices), index (the cross-volume listing by version)
+
+**Id map**:
+For one staging, every user and group id its Stream carries, with the name the
+host gave it when the stream was written (ADR-0012 items 272, 276-278). A restore
+shows it and never acts on it.
+_Avoid_: ownership (which tenant owns a unit), owner list, passwd
+
+**Writer's floor**:
+The oldest tar tapectl stages with: GNU tar 1.35 built with ACL support (ADR-0012
+item 274). The version is the early refusal; tapectl's own check of the stream
+is the proof. It binds every host that writes, never the heir's readers.
+_Avoid_: minimum tar (say which side: the writer's)
 
 **Spanning**:
-A Version whose slices run across more than one volume (ADR-0012 items 82-87
-and 121-144; built in 1.7.0 on #420's short seal). Only a unit that allows it
-(`allow_spanning`) may span, and only on a drive that declares
-`post_warning_bytes`; it is packed last on a volume and cut where the drive
-reports early warning, the slice in flight finishing first, and its remaining
-slices continue on the next cartridge of the same generation. A spanning
-version is as covered as its least-covered slice (item 127).
-_Avoid_: partition (LTO cartridges have partitions), member (envelopes have tar
-members), volume set (tapectl has stage sets and archive sets), split (a unit
-is never split by hand)
+A Version whose slices run across more than one volume. In Layout 3 any unit
+may span and none opts in (ADR-0012 items 288, 289): the drive's early warning
+ends the tape, the slice in flight finishing first, and the remaining slices are
+written first on the next cartridge of the same generation. A spanning version
+is as covered as its least-covered slice (item 127).
+_Avoid_: partition (LTO cartridges have partitions), volume set (tapectl has
+stage sets and archive sets), split (a unit is never split by hand), allow
+spanning (Layout 2's opt-in, gone)
 
 **Range**:
 The run of one stage set's slices on one volume (1.7.0, ADR-0012 items
