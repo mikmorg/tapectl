@@ -72,8 +72,12 @@ the normative design set named in the Policy block below.
     T6.6 (item 291). STILL NOT THE GO (the CTO was told the go needs the word). Every T0.x
     task has its decision rule fixed; the plan order once every unit continues (T5.1) and a
     range in rewrite and compaction (T5.3) are worked out in the plan under "determined".
-    The only thing open with the CTO is the go. On it: Stage 0's six measurements and Stage
-    2's first wave start together.
+    The only thing open with the CTO is the go. On it: Stage 0's measurements and Stage 2's
+    first wave start together. T0.3 (the made tree) ALONE MAY RUN BEFORE THE GO: the ratified
+    recommendation said "now"; not started. Four determinations the CTO was told they may
+    overrule: an unwritten set's row is deleted; the rewrite's hold is per slice; the plan
+    cuts a set at the fill ceiling on a drive without `post_warning_bytes` (new work);
+    `collection run` stages in rounds so a batch that packs still fills to the warning.
   - **2026-11-17, items 282-289: "Ratify all recommendations." QUESTIONS 38 TO 44 ARE RULED.**
     Slices stay (282). A SLICE ENDS AT A MEMBER'S START: whole members, a member larger than
     `slice_size` gets a run of slices to itself, and the size signal is accepted (283, amending

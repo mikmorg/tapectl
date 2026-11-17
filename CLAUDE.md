@@ -375,7 +375,8 @@ scale is taken in two places: a made tree of two million files before the code (
 T0.3), and the collection's largest real unit at the real-drive acceptance (T6.6); this
 amends item 253's "before any code" for that leg. The coordinator had said a "ratify all"
 would be read as those two only and that the go needs the word, so **this was not the go
-either: build nothing.** For the handoff, every measurement task has its decision rule fixed
+either: build nothing.** One measurement may run before the go: T0.3, the made tree, because
+the ratified recommendation said "now" (a reading in the amendment); it has not been started. For the handoff, every measurement task has its decision rule fixed
 in the plan, and two designs the rulings left owed are worked out there under headings that
 say "determined": the plan order once every unit continues (T5.1), and a range carried
 through `volume rewrite` and compaction (T5.3). **The entry for whoever coordinates next is

@@ -32,6 +32,10 @@ word.
 the coordinator's work is to answer what the CTO asks (a megabyte-scale measurement on
 this host is part of an answer) and to keep the records in step.
 
+**One task does not wait: T0.3**, the made tree of two million files. Item 291 ratified a
+recommendation to run it "now", and it builds nothing. It has not been started. It is a
+worker's task with its decision rule in the plan; tell the broker first.
+
 When the go comes, record it first: an ADR-0012 amendment item that quotes the CTO's
 words and states the scope you read into them.
 
@@ -41,8 +45,8 @@ words and states the scope you read into them.
    and the top entry of the Policy block in `.claude/commands/autopilot.md`. You are ready
    when you can say, for T0.7, T2.1 and T1.1, who owns each and what each waits on.
 2. **Start Stage 0 and Stage 2's first wave together.** Stage 0 is six measurements (T0.1,
-   T0.2, T0.3, T0.5, T0.6, T0.7); each has its decision rule written in its task, fixed
-   before it runs. Stage 2's first wave is T2.1, T2.2 and T2.3, on `master`. Three workers
+   T0.2, T0.3, T0.5, T0.6, T0.7; T0.3 may already be running or done); each has its
+   decision rule written in its task, fixed before it runs. Stage 2's first wave is T2.1, T2.2 and T2.3, on `master`. Three workers
    at a time; a job that pulls an image or fills disk runs alone, after the broker is told.
 3. **Integrate each wave** as the plan says: the full suite with `--no-fail-fast`, the
    lints, a push, and master's CI read to its end. A wave is done when CI is green on the
@@ -58,7 +62,7 @@ words and states the scope you read into them.
 | **Ruling** | the CTO's words | an ADR-0012 item | Never. Only a later item amends it. |
 | **Ratified choice** | D1 to D22 | ADR-0012 item 290, restated in the plan's Stage 1 | Never. |
 | **Decision rule** | what a measurement's result means, fixed before it runs | the plan's T0.x tasks | No. Run it; the result is the answer. A failed rule goes to the CTO. |
-| **Determination** | the coordinator's working-out under a ruling | the plan, wherever a heading or a sentence says "determined": the format document's outline, D9's tables, T4.5, T4.6, T4.8 and T4.9's points, the plan order (T5.1), a range carried (T5.3) | Yes, when the code shows it wrong: correct it in the plan and say so in the report. If the correction would change bytes on tape, the schema or a command's spelling, it goes to the CTO first. |
+| **Determination** | the coordinator's working-out under a ruling | the plan, wherever a heading or a sentence says "determined": the format document's outline, D9's tables, D15's frames and levels, T4.5, T4.6, T4.8 and T4.9's points, the plan order and the rewrite's hold (T5.1), `stage for-location`'s read-back (T5.2), a source that holds a range (T5.3) | Yes, when the code shows it wrong: correct it in the plan and say so in the report. If the correction would change bytes on tape, the schema or a command's spelling, it goes to the CTO first. |
 | **Reading** | the coordinator's sense of the CTO's words | an amendment's "Readings" list | A reading never withdraws a ruled default. In doubt, ask. |
 
 Anything else that would change bytes on tape, the schema or a spelling: **stop and ask.**
