@@ -3660,3 +3660,27 @@ decisions have been thoroughly determined".
 Not ruled:
 
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-17 (evening): the go
+
+Given 2026-11-17. The coordinator had asked for the go as a question of its own: "say the
+word and Opus starts the first three fixes on `master`, with the measurements one at a
+time beside them." The CTO's word, whole: "Go".
+
+292. **The go for the tapectl 2.0.0 build is given.** The build proceeds through
+     `docs/design/v3-implementation-plan.md` stage by stage, each stage starting when its
+     own "Starts when" line is true. What the plan reserves for the CTO stays the CTO's:
+     a measurement that fails its decision rule, a question a task stops on, each
+     real-drive run of T6.6, the tag, and a serious finding of a read (the plan's
+     Appendix B).
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *The scope.* "Go" is read as the go for the whole plan, not for its first wave alone:
+  the question named the first wave as what the go starts, and the plan's gates, not a
+  fresh word from the CTO, decide each later stage. Each item Appendix B reserves still
+  comes back.
+- *The on-tape authorization* (item 243) is unchanged by this: it covers the Layout 3
+  bytes and ends when the drill passes on the production run (item 268).
+- *The production host* is not touched by the go. Its steps are the operator's (T0.4,
+  T4.14's host step, T6.6, Stage 7), each on the CTO's go-ahead.
