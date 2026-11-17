@@ -3735,3 +3735,9 @@ to the CTO in four questions, each with a recommendation. The CTO chose each rec
        (`compression`, `compression_level`, `tar_version`, `continues`), so that a rebuild
        reads every fact of a staging from the on-tape `catalog.db` alone. The MANIFEST
        still states `compression`, `tar_version` and `continues`, for the heir.
+
+296. **With `preserve_acls` off, no ACL is stored** (asked the same night, from the format
+     document's §3.1; the CTO chose the recommendation). The writer passes
+     `--xattrs-exclude='system.posix_acl_*'` whenever it passes `--xattrs`, whatever
+     `preserve_acls` says, so an ACL is stored only as the text record that `--acls` writes,
+     and only when `preserve_acls` is on (items 273, 274; T0.1).

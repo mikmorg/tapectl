@@ -1,7 +1,7 @@
 # Layout 3: a tar stream in slices of whole members, every unit able to continue, no compatibility
 
 The decisions behind tapectl 2.0.0 and its on-tape format, Layout Version 3, were ruled by
-the CTO between 2026-11-13 and 2026-11-17 as ADR-0012 items 235 to 295, one amendment at a
+the CTO between 2026-11-13 and 2026-11-17 as ADR-0012 items 235 to 296, one amendment at a
 time, each amending the ones before. This record gathers them into one decision, so that a
 reader of Layout 3 does not have to read ADR-0012's amendments in order. ADR-0012 is not
 edited, and where this record and an item differ, the item wins.
@@ -101,7 +101,7 @@ failure means a new release and another fresh start. The go was given on 2026-11
 
 ## Items gathered
 
-ADR-0012 items 239 to 295, with 235 to 238 as their context. Superseded within ADR-0012 by
+ADR-0012 items 239 to 296, with 235 to 238 as their context. Superseded within ADR-0012 by
 later items, and read only through them: the zero-fill of item 255 (by 264), item 143 (by
 260), items 88 and 132's scratch mode (by 267), item 243's end at the install (by 268), the
 plain cut of item 241 (by 283), item 9's "never split by the drive", item 82's opt-in, the

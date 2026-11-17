@@ -17,7 +17,7 @@ names. The paragraphs it replaces are kept, marked, as the record of Layout 2.
 
 ## Layout 3 (tapectl 2.0.0)
 
-Ruled by ADR-0012 items 239 to 295 (gathered in ADR-0014); the plan's determinations under them are marked
+Ruled by ADR-0012 items 239 to 296 (gathered in ADR-0014); the plan's determinations under them are marked
 "determined" (`docs/design/v3-implementation-plan.md`, T5.1 and T5.3). This section
 replaces, for Layout 3, the rules named in each paragraph.
 

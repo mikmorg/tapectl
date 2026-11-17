@@ -1,7 +1,7 @@
 # On-tape volume format — Layout Version 3 (normative)
 
 This is the authoritative specification of the bytes tapectl 2.0.0 writes to a
-sealed cartridge. It is governed by ADR-0007 and by ADR-0012 items 239 to 295, which
+sealed cartridge. It is governed by ADR-0007 and by ADR-0012 items 239 to 296, which
 it writes out and which ADR-0014 gathers into one decision record; where this text and an
 item disagree, the item wins and this text is corrected. It pairs with `docs/design/layout-session.md`, which owns the write
 session's **state machine, transitions and operational sequence**; this file owns the
@@ -17,7 +17,7 @@ nothing else of it is read (§7.6). This document replaces
 tapectl 1.x wrote and is history here.
 
 Points that the ruled texts do not decide at the level of bytes are marked
-**OPEN (Stage 1):** and listed in §10. Nothing is built on an open point until the
+**OPEN (Stage 1):** and listed in §10 (none remain). Nothing is built on an open point until the
 CTO answers it. §10 lists those that remain.
 
 ---
@@ -649,11 +649,9 @@ gives it `--acls` with T0.1's `--xattrs-exclude='system.posix_acl_*'`.
   1.35 and bsdtar restore that record with their ordinary flags, and none restores the
   raw `system.posix_acl_*` record with them). The raw record is not stored.
 
-**OPEN (Stage 1):** with `preserve_xattrs` on and `preserve_acls` off, `--xattrs` alone
-stores an ACL as its raw `system.posix_acl_*` attribute (T0.1's `raw.tar`). D11 says the
-second switch "gives tar `--acls`" and nothing more. Options: (a) the exclude is given
-whenever `--xattrs` is, so no ACL is stored when `preserve_acls` is off; (b) the exclude
-follows `preserve_acls` only, and the raw record is stored in that case.
+`--xattrs-exclude='system.posix_acl_*'` is given whenever `--xattrs` is (ADR-0012 item
+296): with `preserve_acls` off no ACL reaches the tape in any form, and an ACL is never
+stored in the raw record no reader restores with its ordinary flags (T0.1).
 - `--no-recursion --null --verbatim-files-from --files-from=<list>`: tar archives exactly
   the list, and a name that looks like an option is a member, never acted on (#562).
 - `--pax-option=exthdr.name=%d/PaxHeaders/%f` is fixed, so the stream's extended-header
@@ -1503,11 +1501,7 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 
 ## 10. Open points (Stage 1)
 
-One:
-
-1. **§3.1** With `preserve_xattrs` on and `preserve_acls` off, is T0.1's exclude
-   (`--xattrs-exclude='system.posix_acl_*'`) given anyway, so that no ACL is stored, or
-   does it follow `preserve_acls` only, so that the raw ACL attribute is stored?
+None. The point §3.1 raised (an ACL with `preserve_acls` off) was ruled by item 296.
 
 The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings
 of one version on one tape; the id map's header; the MANIFEST's new keys and their order; a
