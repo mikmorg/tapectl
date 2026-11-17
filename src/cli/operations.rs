@@ -953,13 +953,28 @@ pub(crate) fn refuse_last_eligible_copy(
         .map(|unit| format!("    tapectl volume read-slices {unit} --from {volume_label}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let release = doomed
-        .iter()
-        .map(|(unit, version)| {
+    // Issue #544 part 2 (ADR-0012 item 249): each line is the command that
+    // works in this state. `snapshot mark-reclaimable` releases a version no
+    // current version supersedes (precondition 1 of
+    // `policy::reclaimable::assess`) only under its own `--force`, so that
+    // line carries it; where a newer current version exists, the line has
+    // none and the command keeps its Tier-2 question about that version.
+    // The retire itself stays without a --force, as the text says.
+    let mut release_lines = Vec::with_capacity(doomed.len());
+    for (unit, version) in &doomed {
+        let superseded: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM snapshots s JOIN units u ON u.id = s.unit_id
+                             WHERE u.name = ?1 AND s.version > ?2 AND s.status = 'current')",
+            params![unit, version],
+            |row| row.get(0),
+        )?;
+        release_lines.push(if superseded {
             format!("    tapectl snapshot mark-reclaimable {unit} --version {version}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        } else {
+            format!("    tapectl snapshot mark-reclaimable {unit} --version {version} --force")
+        });
+    }
+    let release = release_lines.join("\n");
     // Per (unit, VERSION), not per unit: the doomed version need not be the
     // newest — v2 only here while v3 sits elsewhere is a perfectly legal
     // at-stake row — and `stage create` without `--version` takes the
@@ -1122,7 +1137,8 @@ pub(crate) fn refuse_last_eligible_copy(
          {copy_section}\
          {span_section}\
          Or give the version up on purpose — a different statement, with its own command \
-         and its own preconditions:\n\
+         and its own preconditions (its --force, where a line has one, is that command's \
+         consent to release a unit's only current version, never this one's):\n\
          {release}\n\
          \n\
          If you are discarding this tape BECAUSE it no longer reads, say that with the drive \
@@ -7374,7 +7390,7 @@ mod tests {
                 &[("<OTHER-LABEL>", "SPAN-2"), ("<location>", "offsite")],
                 &[
                     "tapectl volume write SPAN-2 --init --full-confirm --move-to offsite",
-                    "tapectl snapshot mark-reclaimable span --version 1",
+                    "tapectl snapshot mark-reclaimable span --version 1 --force",
                     "tapectl volume verify SPAN-1",
                 ],
             );
@@ -7509,6 +7525,52 @@ mod tests {
         #[test]
         fn tier3_does_not_fire_for_an_already_retired_volume() {
             tier3_does_not_fire_for_status("retired", "L6-ALREADY");
+        }
+
+        /// Issue #544 part 2 (ADR-0012 item 249): the refusal's "give the
+        /// version up" line is run, as printed, in the state that printed
+        /// it. The version at stake is the unit's only current version, which
+        /// `snapshot mark-reclaimable` releases only under `--force`; the
+        /// line used to leave it out, so the command it named was refused.
+        /// Run, it releases the version, and the retire then goes through.
+        #[test]
+        fn tier3_release_line_runs_in_the_state_that_printed_it() {
+            use clap::Parser;
+            let (conn, vol_id) = setup_sealed("L6-GIVEUP", 0);
+            let msg = volume_retire(&conn, &Config::default(), "L6-GIVEUP", true, false, false)
+                .expect_err("Tier 3 must fire")
+                .to_string();
+            assert!(msg.contains("There is no --force for this"), "{msg}");
+            let line = crate::cli::operations::remedy_commands::named_commands(&msg, &[])
+                .into_iter()
+                .find(|c| c.starts_with("tapectl snapshot mark-reclaimable"))
+                .unwrap_or_else(|| panic!("no release line in: {msg}"));
+            let cli = crate::cli::Cli::try_parse_from(line.split_whitespace())
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+            let crate::cli::Commands::Snapshot {
+                command:
+                    crate::cli::snapshot::SnapshotCommands::MarkReclaimable {
+                        name,
+                        version,
+                        force,
+                    },
+            } = cli.command
+            else {
+                panic!("{line} is not snapshot mark-reclaimable");
+            };
+            snapshot_mark_reclaimable(
+                &conn,
+                &Config::default(),
+                &name,
+                version,
+                force,
+                false,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("`{line}` was refused: {e}"));
+            volume_retire(&conn, &Config::default(), "L6-GIVEUP", true, false, false)
+                .expect("with the version given up, nothing is at stake");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
         }
 
         /// A RELEASED version is one the operator gave up on purpose. The
