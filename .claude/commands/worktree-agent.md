@@ -72,12 +72,20 @@ thinking all proceed in parallel — only linking is serialized.
    (point --config into a tempdir).
 3. Never modify tapectl-design-v4_0.md, docs/adr/, CONTEXT.md, the design
    notes under docs/design/, or the gate's EXPECTED_FAIL manifest — those are
-   coordinator/human-gated. The normative reference set is: CLAUDE.md,
-   docs/design-errata.md (never implement against a superseded section),
-   docs/design/volume-format-v2.md (on-tape bytes),
-   docs/design/layout-session.md (session state machine),
-   docs/design/v2-open-questions.md (resolved decisions), and
-   docs/design/v2-implementation-plan.md (the task playbook).
+   coordinator/human-gated. The normative reference set depends on the
+   stage of `docs/design/v3-implementation-plan.md` the task is in (that
+   plan's section 1 table); always CLAUDE.md and docs/design-errata.md
+   (never implement against a superseded section):
+   - **Stages 2 and 3** (the code still writes Layout 2):
+     docs/design/volume-format-v2.md (on-tape bytes),
+     docs/design/layout-session.md (session state machine),
+     docs/design/v2-open-questions.md (resolved decisions), ADR-0001 to
+     ADR-0012 (Stage 3 also ADR-0012 item 258).
+   - **Stages 4 and 5** (Layout 3): docs/design/volume-format-v3.md (on-tape
+     bytes), docs/design/layout-session.md with its "Layout 3" section, then
+     ADR-0014 and ADR-0012 items 239 to 294. volume-format-v2.md is history
+     there: never implement against it.
+   - The task playbook is docs/design/v3-implementation-plan.md.
 4. Do not create files under docs/audits/. Do not file GitHub issues.
    **Never put a GitHub closing keyword in a commit message** — no
    `Fixes #N`, `Closes #N`, `Resolves #N`. Cite the issue as `(issue #N)` or

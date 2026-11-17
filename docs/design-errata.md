@@ -20,6 +20,7 @@ layered on.
 
 | Design section | Status | Authority | What changed |
 |---|---|---|---|
+| `docs/design/volume-format-v2.md` (the whole document) and the Layout 2 rules of `layout-session.md` | **Superseded for Layout 3** | ADR-0012 items 239-294; ADR-0014 | tapectl 2.0.0 reads and writes Layout 3 only: its byte format is `docs/design/volume-format-v3.md`, and `layout-session.md`'s "Layout 3" section replaces the rules it names. `volume-format-v2.md` stays the description of the tapes tapectl 1.x wrote, and is history for any Layout 3 work: a task of Stage 4 or 5 never implements against it. |
 | Appendix D — Tape append | **Rejected** | ADR-0003 | Sealed volumes are immutable; append is rejected, not deferred. `volume write` refuses non-blank tapes (#27). Resuming an *interrupted, never-sealed* session is not append and remains allowed. |
 | §5 CLI — `volume append` | **Rejected** | ADR-0003, #27 | Never implemented; the read-ID-thunk-and-refuse behavior replaces it. |
 | §8.1–§8.8 + §2.6 — Volume file formats & zone list | **Superseded** | ADR-0007; `volume-format-v2.md` | The whole on-tape format is redefined as Layout Version 2: a plaintext **front index** (File 3) with per-file position/type/size + ciphertext hashes, **envelopes before slices**, and a trailing plaintext **seal marker**. The v1 mid-tape mini-index and the "8/10-file" labels are gone. `volume-format-v2.md` is authoritative for the bytes. |
