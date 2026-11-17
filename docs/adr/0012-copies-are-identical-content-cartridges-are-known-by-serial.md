@@ -3291,3 +3291,184 @@ Not ruled, and asked in #554:
   is a second writer's tool, under items 273 and 274.
 - Question 40: whether an archive may set a level.
 - The go. No build has been asked for, and nothing is built.
+
+## Amendment, 2026-11-17: slices stay and end at a member's start, compression's shape, and every unit continues at the early warning
+
+Ruled 2026-11-17. On 2026-11-16 the CTO put three things to the design as it stood, and the
+coordinator answered each with a measurement and a recommendation (#566, #565, #567). The
+CTO's words, whole:
+
+- "Reconsider the utility vs cost of our "slices"; should we drop this and find a different
+  way of spanning?"
+- "I'm skeptical that b is better than a, re q41"
+- "I'm ok changing the EOT/spanning logic for optimal overall design"
+
+On 2026-11-17, to the questions then standing with a recommendation (43, 42, 44a, 44b, 41,
+38, 39 and 40): "Ratify all recommendations."
+
+282. **Slices stay** (question 42). A unit's stream is stored in pieces, each an age file
+     and a tape file, made once at staging and the same on every copy. The reason does not
+     depend on how a tape ends: a unit's ciphertext is made once at staging, and the stock
+     `age` an heir holds begins only at a header, so a tape of a span ends on a staged age
+     file or ends where no reader can begin.
+283. **A slice ends at a member's start** (question 43). A slice holds whole members of the
+     tar stream, as many as fit in `slice_size`. A member larger than `slice_size` has a run
+     of slices to itself, `slice_size` each, the last what remains. The slices joined are
+     the stream, as before. This amends item 241's "plain cut" and nothing else of items
+     240 and 241. Accepted with it:
+     - **A slice's size on tape follows the files in it.** A file larger than `slice_size`
+       shows its size as the length of its run. A smaller file shows its size when it is
+       alone in its slice. Otherwise a slice shows the total of a group of files. The front
+       index states each tape file's size in plaintext, as it always has; this is a finer
+       signal than the one accepted on 2026-07-22 (`volume-format-v2.md` §2), which was at
+       the grain of a unit.
+     - **More slices**: at worst three for each `slice_size` of stream (a small file, then
+       a file just over a slice). Each short slice costs a tape block and a filemark.
+     - Item 241's other limit stands: a hard-linked name depends on the slice of the name
+       archived first.
+     Item 264's two prohibitions stand: no reader zero-fills a lost slice, and none uses
+     `--ignore-zeros`. Its "whole members by byte range from the file table" stands for
+     tapectl's own reader, and is no longer what takes a reader past a lost slice: a lost
+     slice is left out, and what remains is whole members.
+284. **Each slice is compressed alone, after the cut and before it is encrypted** (question
+     41, shape A). It follows from item 283: shape B's frame was a piece of the stream that
+     begins at a member's start, and the slice is now that piece. The deduction the
+     amendment of 2026-11-16 (night) wrote ("each slice must decompress alone") stands as
+     written, and the correction #565 and the state documents called owed to this amendment
+     is not owed. Accepted with it, as that amendment already said: tapectl's read around a
+     bad chunk (item 101(b)) is coarser inside a compressed slice, where nothing after the
+     chunk can be decompressed, and replacement of the slice from another copy (item
+     101(a)) is the repair; and a compressed slice's size on tape follows how well it
+     packed.
+285. **Layout 3 carries gzip, xz and zstd** (question 38), chosen on what each algorithm
+     carried costs whatever the data: a decompressor an heir may have to find, a gate leg,
+     readers to measure, a library in the build. The plan's T0.5 measures every candidate
+     on real data, and its table confirms this item or reopens it.
+286. **tapectl itself compresses** (question 39), with a library for each algorithm carried
+     built into the binary. If a library cannot be built into the static binary (the
+     plan's T0.6), the fallback is the host's tool, run once for each slice.
+287. **An archive may set a level** (question 40): an optional `compression_level` beside
+     `compression`, in the same three layers, with a stated default for each algorithm.
+288. **Every unit continues on the next cartridge at the early warning** (question 44a). A
+     tape is written in the queue's order. At the early warning the slice in flight
+     finishes and the seal says where the tape ended: W1 to W9 of `volume-format-v2.md`
+     §4.3, unchanged. The slices not written stay staged and are written first on the next
+     cartridge. This holds for every unit: none is `cut` and written again whole, and none
+     opts in. It reverses item 9 of 2026-10-07 ("Units are never split by the drive") and
+     the opt-in of item 82. Item 9's reason was what a partial unit costs a reader; under
+     item 283 a partial unit on a tape is whole files.
+289. **The queue is filled to the warning** (question 44b). The next unit is started even
+     when it does not fit, and the plan lists it past the cartridge's nominal capacity:
+     item 123's bound, made the bound for every unit, on a drive that declares
+     `post_warning_bytes`. Without that key the plan stops at the fill ceiling and the rest
+     continues. Accepted with it: one unit lies across the end of every full tape, so one
+     tape no longer holds only whole units, and that unit's copy rests on two cartridges
+     where it rested on one.
+
+**What these supersede, named.**
+
+- Item 9 of 2026-10-07: "Mid-write handover to a second cartridge ... is rejected" and
+  "Units are never split by the drive". With it go the `cut` unit of items 99 and 112
+  ("the one the cut interrupts counts as nothing on that tape and is written whole on the
+  next") and §4.2's account of it. W4's cases in §4.3 stand as they read.
+- Item 82's opt-in: the policy key and its three layers, item 121's freezing of whether a
+  set may span, and `may_span` in item 125's block.
+- The plan's order by class: items 83 and 95, and the second half of item 122's rule
+  ("then whole units, then spannable units last"). Item 122's first rule stands: owed
+  slices first, the lowest first, as one unbroken run in slice order.
+- Items 94 and 147: the early start of a unit larger than a tape, and the whole units
+  displaced after its tail. Such a unit is started where the queue has it and continues.
+- Item 113's bound at nominal capacity, and item 123's refusal of a spannable unit on a
+  drive without `post_warning_bytes`. Item 289 has the one bound and what happens without
+  the key.
+- Item 124 and the last clause of item 258(a): there is no longer a kind of tape that
+  holds a spannable set. What `requires` states on a Layout 3 tape is a proposal of the
+  plan's (D1).
+- Item 133: `volume rewrite` and compaction refused a volume holding a range, and most
+  full tapes will now hold one. Item 133 called carrying a range forward "its own design".
+  That design is owed (the plan's D21) and is not made by this amendment.
+- Items 131, 132 and 267, a restore that crosses cartridges as one stream: needed only
+  for one file larger than a slice that lies across a cartridge boundary. Everything else
+  on a tape is read from that tape alone. Items 260 and 266 stand, and the cut is what
+  now meets them.
+- Item 241's "plain cut", and in the amendment of 2026-11-16 (night) the sentence that a
+  reader "decrypts a slice, decompresses it, and then cuts its ranges": a member's offsets
+  in the file table are still of the stream, and `slice_size` is now the most a slice's
+  cut holds.
+
+**What stands**, said because the changes sit beside it.
+
+- W1 to W9 and the readback past the warning (items 110, 114); the seal and its
+  `ended_after`; Logical Block Protection and the retry after a refusal (items 161 to 166,
+  174, 175, 185, 186).
+- Item 240: every rule defined on a slice. A slice's record on tape and a range's block
+  listing every slice of its staging (items 121, 125), less `may_span`.
+- Copies counted for each slice (items 76, 127, 138); a version current once every slice
+  is on a sealed volume (items 128, 144); staging released slice by slice (item 129); a
+  rebuild recording what a tape shows (item 130), which now knows a range by the positions
+  the block gives.
+- A unit staged whole (item 85), and one generation for one copy's span (item 86).
+- Item 93 and items 134 and 139 with it. #567 wrote of item 93 "kept or dropped in the
+  plan". A plan cannot drop a ruled item, and nothing ruled here touches it: its layout is
+  what item 122's first rule yields.
+- The stream, the file table, the one repair and hard links (items 253 to 256); the
+  table kept in the catalog (item 265); compression carried, and nothing argued from the
+  present corpus (items 280, 281).
+
+**Measured and reasoned.** #566, #565 and #567 hold the methods, the scripts and the
+tables. This host's tools only (age 1.1.1, GNU tar 1.35, BusyBox 1.36.1, zstd 1.5.5, xz
+5.4.5, gzip 1.12), megabytes, made trees.
+
+- *Item 282, MEASURED.* One age stream for a unit, cut where a warning would fall: the
+  second tape gives the stock `age` nothing, with or without the header copied onto it,
+  and one flipped bit costs everything after it in that copy (119 of 401 files whole,
+  where slices gave 353).
+- *Item 283, MEASURED.* A 2,428-file unit made with the writer's command line as the
+  plan's D2 proposes it, read with no file table, the reader told only which slices are
+  one long member's run. With each slice in its own tar run a plain cut fails every run
+  (GNU tar 2,396 files whole, BusyBox tar 168); a cut at member starts fails none (2,428
+  with both; the hard link, the xattrs and the ACLs kept by GNU tar). With the fullest
+  slice lost and the rest in one tar run, the plain cut gives exit 2 and 136 files lost
+  with GNU tar, exit 1 and 1,611 lost with BusyBox tar; the cut at member starts gives
+  exit 0 and exactly the slice's 134 files lost with both. In separate runs GNU tar kept
+  folder mtimes on 3 of 7 and a shuffled order lost the hard link, so the reader of
+  record is one tar run over the good slices in order.
+- *Item 283, NOT MEASURED:* bsdtar and GNU tar 1.30 on a slice with no end-of-archive
+  blocks; gigabytes; the slice count and the size signal on real trees. The plan's T0.7
+  measures the first before the format document is written, and a failure there reopens
+  item 283, as item 253 was ratified with measurements owed.
+- *Item 284, MEASURED.* A slice compressed alone decodes, through `age` and the stock
+  decompressor, to exactly its cut (zstd, xz, gzip; two trees). Under shape B a slice
+  alone gave nothing, and after a lost slice the decompressor stopped at the gap. No rule
+  of item 240 depends on slices of equal size: the write path computes nothing as a count
+  times `slice_size` (grep at `ba7a1408`).
+- *Items 285 to 287:* not measured beyond #565's first check on made data. T0.5 and T0.6
+  are the measurements.
+- *Items 288 and 289, REASONED* from this record's text. Nothing in them is measured. The
+  real-drive acceptances of 1.6.0, 1.7.0 and 1.8.0 prove W1 to W9, the seal and a range,
+  which stand; they do not prove the new plan, which the plan's T5.1 and T6.6 must.
+
+**Readings, not rulings, said so that they can be corrected:**
+
+- *This is not the go.* Nothing is built on it.
+- *What "all recommendations" covers.* The questions that stood with a recommendation
+  beside them: 43, 42, 44a, 44b, 41, 38, 39 and 40. It is not read as covering the
+  eighteen choices D1 to D18, which were named as open and never shown to the CTO as a
+  list; nor the real-scale run on the production host (the plan's T0.3), for which no
+  recommendation had been made.
+- *The detail under items 283, 288 and 289 is not ruled.* The plan restates it as
+  proposals: D1, D3, D4, D6, D9, D10, D11 and D15 are rewritten, and four are new (the
+  selector's rule, the one plan bound, a range in rewrite and compaction, and how a tape
+  marks a long member's run).
+- *Item 285's values.* `compression` takes `none`, `gzip`, `xz` or `zstd`, and the default
+  stays `none` (item 280's reading).
+- *Item 286's fallback.* It adds a tool to the writer's floor (items 273, 274). If T0.6
+  fails, that is reported to the CTO before anything is built on the fallback.
+- *Stage 2 of the plan is not touched.* Its fifteen fixes were checked against items 288
+  and 289, and none is to code those items remove.
+
+Not ruled:
+
+- D1 to D22 of the plan, as a list for the CTO to see.
+- The real-scale run on the production host (T0.3), or its move to Stage 6.
+- The go. No build has been asked for, and nothing is built.
