@@ -3554,7 +3554,11 @@ hands. In order, it:
    File 0's label, uuid, layout version, the tapectl that wrote it and when;
    the seal and its front-index totals. A tape tapectl did not write is
    reported as such. A blank tape is reported blank, and the command stops
-   there: there is nothing to erase.
+   there, with nothing to erase, once the catalog has been checked by the chip
+   serial (#536): a live volume the catalog still counts on that cartridge is
+   refused, naming the `cartridge mark-erased` (or `volume retire`) that records
+   it; a given-up volume there is erased again and recorded, so that `volume
+   init` has a real erase to rely on.
 2. **checks the catalog**, by File 0's uuid and by the chip serial. A volume
    the catalog still holds is refused, naming `volume retire`: retiring is the
    only way to give a volume up, and the retire is where its last-copy floor

@@ -513,7 +513,13 @@ whose `timestamp` is at or after the session's `started_at`. Then, in order:
    - P-1 = M-1 (only when the event's K was M-1): the full seal at M.
    - Otherwise the short seal at P.
 
-   Resume writes no data entry. When P-1 is below the event's K (the medium
+   Resume writes no data entry, with one exception (#531): when a
+   `write_lbp_refusal` event is newer than the session's `write_early_warning`
+   event and a position at or before K is still `pending`, the seal is bounded
+   by that first pending position as well, the files from it through K are sent
+   again from their planned start (ADR-0012 item 174) before the seal, the
+   re-send has its own one retry, and the confirm is full (item 186). A second
+   refusal leaves the session resumable with no seal written. When P-1 is below the event's K (the medium
    lost files the catalog had recorded written, #403), the seal and
    `volumes.ended_after` state P-1 and the session log names both numbers; no
    second event is written. A seal torn by the crash may have been closed by
