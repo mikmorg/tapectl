@@ -489,8 +489,8 @@ method so it can be repeated and the decision rule's verdict stated; #567 has a 
 ## S1. Stage 1: the normative set (no code)
 
 **Owner: the coordinator. Never a worker.** A worker was not in the design sessions, and
-this stage decides bytes on tape. **Starts when:** the CTO gives the go, and T0.1 has picked
-the ACL record. **Lands on:** `master`, as documents. Until `layout-3` is merged, `CLAUDE.md`
+this stage decides bytes on tape. **Starts when:** the CTO gives the go, T0.1 has picked
+the ACL record, and T0.7 has held item 283's cut to the readers still owed. **Lands on:** `master`, as documents. Until `layout-3` is merged, `CLAUDE.md`
 keeps saying that the code writes Layout 2.
 
 ### What Stage 1 writes
@@ -643,11 +643,14 @@ run. This needs room for one slice in the work directory, and the space check co
 slice it is in and naming the member to tar, or by cutting the member out by its offsets:
 T0.7's step (e) decides which.
 
-A unit that continues on another cartridge (item 288) is restored tape by tape into the
-same `--to`, in any order, and the script says which cartridges hold the rest. One prompt
-remains: the next cartridge, asked only when a file larger than a slice lies across two
-cartridges, where "I do not have it" is an answer (items 266, 267). Gone: `--slices-from`,
-`--swap-tapes`, `--stream-tapes`, `--fill-from`, the salvage mode. After a restore it prints the damaged-file list, the id map
+One prompt, as items 266 and 267 have it: the next cartridge of a unit that continues
+there (any unit may, item 288), where "I do not have it" is an answer. The restore goes on
+across the swap as one tar run. With that answer, or on a tape read alone, every whole file
+the tape holds is restored (item 283) and the script says which cartridges hold the rest;
+only a file larger than a slice that lies across the two cartridges needs both. A unit
+read in more than one run can lose folder times, and a hard-linked name whose first name
+is on a tape not yet read is not restored: the script lists those names for the repair.
+Gone: `--slices-from`, `--swap-tapes`, `--stream-tapes`, `--fill-from`, the salvage mode. After a restore it prints the damaged-file list, the id map
 of each unit restored, and which tar it used and what that tar does not restore.
 
 **D11. The command line and the config.**
@@ -1709,9 +1712,9 @@ range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean),
 7. The id map of each unit restored is printed, and is in `--json` (item 278). No owner is
    changed by name.
 8. A restore that starts on a tape holding only a range takes the files it holds whole and
-   lists the rest (item 266, D17), where the other cartridges are not offered. A unit held
-   across cartridges is restored cartridge by cartridge; only a long member's run that
-   lies across two cartridges is fed across the swap (items 131, 288).
+   lists the rest (item 266, D17), where the other cartridges are not offered. With them
+   offered it goes on across the swap as one tar run, as today (item 131); any unit may now
+   lie across cartridges (item 288).
 9. `--key FILE` works as today on every path above.
 
 **Removed here:** `stream_into_dar`, `spool_and_extract`, `--spool`, the choice between
@@ -1769,7 +1772,8 @@ fact table; `src/volume/adopt_lost.rs`'s module doc; the format document on the 
    unchanged, and serves any unit (item 288).
 5. A staging of which this tape holds only some slices is recorded as a range (item 130).
    It is known by the positions the MANIFEST's block gives and by the seal's `ended_after`:
-   there is no `may_span` to read (D6).
+   there is no `may_span` to read (D6). Until T5.1 removes the catalog's `writes.may_span`,
+   a rebuild sets it for a range row and clears it for any other.
 
 **Traps:**
 - `catalog rebuild` never changes a status, with item 144's one exception. Nothing here
@@ -1894,19 +1898,24 @@ different files to a whole unit in two runs; the suite is green.
 
 **Fence:** `src/volume/heir/RESTORE.sh`, `tests/heir_restore.rs`, `tests/common/heir/`.
 
-**Build:** the restore of a unit held across cartridges, which any unit may be (item 288).
-Each tape is restored on its own into the same `--to`, in any order: the script restores
-what this tape holds of the unit, says from the index which cartridges hold the rest, and
-a later run on another tape adds its files and leaves alone the ones already restored and
-checked. **A restore may start on any tape** and takes the files that tape holds whole
-(item 266). **One prompt remains**, for a file larger than a slice whose run lies across
-two cartridges: the script feeds tar the pieces this tape holds, asks for the next
-cartridge (it waits without a time limit and holds no device), and takes a cartridge only
-by the next slice's sha256 at a position its seal covers (R8). A blank, foreign or
-unreadable cartridge at the prompt is named and the prompt asks again (#521). **"I do not
-have it" is an answer**: that file's partial copy is removed, the file is listed, and the
-restore goes on. Nothing is kept in the work directory between the two cartridges (item
-267).
+**Build:** the restore of a unit held across cartridges, which any unit may be (item 288),
+as items 266 and 267 have it: one tar run across the swap, with the one prompt for the
+next cartridge (it waits without a time limit and holds no device). A cartridge is taken
+only by the next slice's sha256 at a position its seal covers (R8). A blank, foreign or
+unreadable cartridge at the prompt is named and the prompt asks again (#521). **A restore
+may start on any tape** and takes the files that tape holds whole (item 266), which under
+item 283 is every file on it but one larger than a slice that lies across the boundary.
+**"I do not have it" is an answer**: the restore goes on with what it has, and lists the
+rest with the cartridges that hold it. A file whose run lies across the two cartridges is
+then removed again if tar had begun it, and is listed. Nothing is kept in the work
+directory between cartridges (item 267).
+
+A later run on another tape of the same unit, into the same `--to`, adds that tape's files
+and leaves alone the ones already restored and checked. Two things are said to the heir
+when a unit is read in more than one run (both measured, #567): folder times are those of
+the last run that touched the folder, and a hard-linked name whose first name is on a tape
+not yet read is not restored. Such a name is listed with the cartridge that holds its
+first name, and the repair restores it once that tape has been read.
 
 **Traps:**
 - A file that lies across two cartridges is held whole by neither alone. Started on the
@@ -1915,10 +1924,12 @@ restore goes on. Nothing is kept in the work directory between the two cartridge
   partial file behind.
 - Read the old tests' section "span, across cartridges" (thirteen tests) for the cases.
 
-**Done when:** a unit on three tapes is whole after three runs, in any order of the tapes;
-a file larger than a slice that lies across two cartridges restores through the prompt,
-and is listed with no partial file left after "I do not have it"; a start on the second
-tape alone restores what it holds whole and lists the rest; the suite is green.
+**Done when:** a unit on three tapes restores across two swaps as one run, in either
+copy's order; a file larger than a slice that lies across two cartridges restores through
+the prompt, and is listed with no partial file left after "I do not have it"; a start on
+the second tape alone restores what it holds whole and lists the rest; a second run on the
+first tape then completes the unit, a hard-linked name listed by the first run and
+restored by the repair; the suite is green.
 
 ### T4.13 File 1 and RECOVERY.md
 
@@ -1934,8 +1945,8 @@ file table, run as written in a test (the "File 1 as written" tests of the old s
 the model: each command in the text is executed by a test); which tars restore what; what a
 restore on another host does with an owner or an ACL entry, and that the id map says who
 the ids were; the one repair; that each data file is an archive of whole files, and which files are one
-long file's run; that a unit may continue on another cartridge and each tape is restored
-on its own; the prompt and "I do not have it"; per-unit directories
+long file's run; that a unit may continue on another cartridge, the prompt and "I do not
+have it", and what a tape read alone gives; per-unit directories
 (#522); the right route for each key holder (#523); only messages `age` prints (#526); how to tell
 a compressed unit, which tool reads each algorithm, and the manual path for one, run as
 written by a test.
@@ -2012,8 +2023,9 @@ history in comments that the coordinator accepts, listed in the report; `grep -r
 **One gate leg, with the real tools, for every mode the heir's script has** (the rule from
 the review): `--info`, `--verify`, `--find-envelope`, `--list`, whole-unit `--restore`,
 `--path`, `--paths-from` as the repair from a second cartridge, `--where`, `--find`, a
-short tape, a unit on two cartridges restored tape by tape, a file larger than a slice
-across two cartridges with a swap, a start on a later tape, and "I do not have it", **and a whole-unit and a one-path restore of a compressed unit for each
+short tape, a unit across cartridges with a swap, a file larger than a slice across the
+boundary, a start on a later tape, a second run that completes the unit, and "I do not
+have it", **and a whole-unit and a one-path restore of a compressed unit for each
 algorithm carried, with the real decompressor**. Legs that proved dar's stream (`heir_big_catalogue`, `heir_late_damage`,
 `heir_slice_boundary_read`) go with it; `heir_file_check` and `heir_slice_from_copy` are
 restated. The lifecycle suite's restore matrix keeps its twelve methods. Each run record

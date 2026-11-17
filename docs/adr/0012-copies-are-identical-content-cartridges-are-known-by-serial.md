@@ -3354,7 +3354,7 @@ On 2026-11-17, to the questions then standing with a recommendation (43, 42, 44a
      finishes and the seal says where the tape ended: W1 to W9 of `volume-format-v2.md`
      §4.3, unchanged. The slices not written stay staged and are written first on the next
      cartridge. This holds for every unit: none is `cut` and written again whole, and none
-     opts in. It reverses item 9 of 2026-10-07 ("Units are never split by the drive") and
+     opts in. It reverses item 9 of 2026-10-06 ("Units are never split by the drive") and
      the opt-in of item 82. Item 9's reason was what a partial unit costs a reader; under
      item 283 a partial unit on a tape is whole files.
 289. **The queue is filled to the warning** (question 44b). The next unit is started even
@@ -3362,15 +3362,19 @@ On 2026-11-17, to the questions then standing with a recommendation (43, 42, 44a
      item 123's bound, made the bound for every unit, on a drive that declares
      `post_warning_bytes`. Without that key the plan stops at the fill ceiling and the rest
      continues. Accepted with it: one unit lies across the end of every full tape, so one
-     tape no longer holds only whole units, and that unit's copy rests on two cartridges
-     where it rested on one.
+     tape no longer holds only whole units; that unit's copy rests on two cartridges where
+     it rested on one; and its version is not current, and its tail stays staged, until
+     the next cartridge is written (items 128, 129).
 
 **What these supersede, named.**
 
-- Item 9 of 2026-10-07: "Mid-write handover to a second cartridge ... is rejected" and
+- Item 9 of 2026-10-06: "Mid-write handover to a second cartridge ... is rejected" and
   "Units are never split by the drive". With it go the `cut` unit of items 99 and 112
   ("the one the cut interrupts counts as nothing on that tape and is written whole on the
   next") and §4.2's account of it. W4's cases in §4.3 stand as they read.
+- Item 240's "do not change", for two of the texts it lists: §4.2 (the `cut` unit) and the
+  writer's half of §4.4 (the opt-in and the order by class). Every rule item 240 lists is
+  still defined on a slice.
 - Item 82's opt-in: the policy key and its three layers, item 121's freezing of whether a
   set may span, and `may_span` in item 125's block.
 - The plan's order by class: items 83 and 95, and the second half of item 122's rule
@@ -3387,10 +3391,6 @@ On 2026-11-17, to the questions then standing with a recommendation (43, 42, 44a
 - Item 133: `volume rewrite` and compaction refused a volume holding a range, and most
   full tapes will now hold one. Item 133 called carrying a range forward "its own design".
   That design is owed (the plan's D21) and is not made by this amendment.
-- Items 131, 132 and 267, a restore that crosses cartridges as one stream: needed only
-  for one file larger than a slice that lies across a cartridge boundary. Everything else
-  on a tape is read from that tape alone. Items 260 and 266 stand, and the cut is what
-  now meets them.
 - Item 241's "plain cut", and in the amendment of 2026-11-16 (night) the sentence that a
   reader "decrypts a slice, decompresses it, and then cuts its ranges": a member's offsets
   in the file table are still of the stream, and `slice_size` is now the most a slice's
@@ -3401,8 +3401,17 @@ On 2026-11-17, to the questions then standing with a recommendation (43, 42, 44a
 - W1 to W9 and the readback past the warning (items 110, 114); the seal and its
   `ended_after`; Logical Block Protection and the retry after a refusal (items 161 to 166,
   174, 175, 185, 186).
-- Item 240: every rule defined on a slice. A slice's record on tape and a range's block
-  listing every slice of its staging (items 121, 125), less `may_span`.
+- Item 240, but for the clause named above: every rule it lists is defined on a slice. A
+  slice's record on tape and a range's block listing every slice of its staging (items
+  121, 125), less `may_span`.
+- A restore of a unit held across cartridges: items 131 and 267 (one stream across the
+  swap, with the one prompt), item 266 (a start on any tape, and "I do not have it" as an
+  answer) and item 260. What item 283 changes is what a tape read alone gives: every
+  whole file on it, where before it was the files that happened to lie inside its slices.
+  Only a file larger than a slice that lies across the cartridge boundary needs both
+  tapes. The stream stays the way to read a unit whole, because a unit read in more than
+  one tar run can lose folder mtimes, and a hard-linked name read before its first name
+  is not restored as a link (both measured, below).
 - Copies counted for each slice (items 76, 127, 138); a version current once every slice
   is on a sealed volume (items 128, 144); staging released slice by slice (item 129); a
   rebuild recording what a tape shows (item 130), which now knows a range by the positions
@@ -3465,7 +3474,9 @@ tables. This host's tools only (age 1.1.1, GNU tar 1.35, BusyBox 1.36.1, zstd 1.
 - *Item 286's fallback.* It adds a tool to the writer's floor (items 273, 274). If T0.6
   fails, that is reported to the CTO before anything is built on the fallback.
 - *Stage 2 of the plan is not touched.* Its fifteen fixes were checked against items 288
-  and 289, and none is to code those items remove.
+  and 289, by their issues' titles and the plan's entries, and by the body of #544, whose
+  remedy texts are where a `cut` unit's wording could have been. None is a fix to code
+  those items remove.
 
 Not ruled:
 
