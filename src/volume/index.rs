@@ -567,8 +567,8 @@ pub struct PathsRow {
     pub kind: String,
     pub size_bytes: Option<i64>,
     /// The file's recorded content hash, 64 lowercase hex characters; empty
-    /// for a directory, a symlink, a special file, an older writer's tape
-    /// (the column is new in 1.3.0) or where none was recorded.
+    /// for a directory, a symlink, a special file, or where none was
+    /// recorded. A file with no `sha256` column is refused ([`parse_paths`]).
     pub sha256: String,
     pub path: String,
 }
@@ -677,11 +677,14 @@ pub fn parse_units(text: &str) -> Result<Vec<UnitsRow>> {
     Ok(out)
 }
 
-/// Parse a `paths.tsv`. `unit`, `version` and `path` must be there.
+/// Parse a `paths.tsv`. `unit`, `version`, `sha256` and `path` must be
+/// there: every `paths.tsv` this tapectl writes has the `sha256` column, and
+/// one without it (an older writer's) is refused, naming it (ADR-0012 item
+/// 258(d)).
 pub fn parse_paths(text: &str) -> Result<Vec<PathsRow>> {
     const FILE: &str = "index/paths.tsv";
     let header = text.split('\n').next().unwrap_or("");
-    let cols = header_columns(FILE, header, &["unit", "version", "path"])?;
+    let cols = header_columns(FILE, header, &["unit", "version", "sha256", "path"])?;
     let width = header.split('\t').count();
     let mut out = Vec::new();
     for row in rows_of(FILE, text, width) {
@@ -965,11 +968,15 @@ mod tests {
         assert_eq!(rows[1].sha256, hash);
         assert_eq!(rows[0].sha256, "");
         assert_eq!(rows[2].kind, "l");
-        // A tape written before 1.3.0 has no such column: the parser reads it
-        // as "not recorded", it does not refuse the file.
-        let old = parse_paths("unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t3\ta\n").unwrap();
-        assert_eq!(old[0].sha256, "");
-        assert_eq!(old[0].path, "a");
+        // ADR-0012 item 258(d): a `paths.tsv` with no `sha256` column (an
+        // older writer's) is refused, naming the column.
+        let err = parse_paths("unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t3\ta\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("index/paths.tsv: the header has no `sha256` column"),
+            "{err}"
+        );
     }
     // ── over a catalog ──
 
