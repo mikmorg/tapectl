@@ -18,7 +18,7 @@ tapectl 1.x wrote and is history here.
 
 Points that the ruled texts do not decide at the level of bytes are marked
 **OPEN (Stage 1):** and listed in §10. Nothing is built on an open point until the
-CTO answers it.
+CTO answers it. §10 says which are open.
 
 ---
 
@@ -274,11 +274,10 @@ and file versions, and, **for each staging the tape holds, its file table
 after a rebuild carries both. `catalog rebuild` takes the file table and the id map from
 this file and from nowhere else (T4.9, determined).
 
-**OPEN (Stage 1):** which baseline tables and columns `catalog.db` carries, by name
-(T1.5's listing decides the baseline; this file's subset is not named in the ruled
-texts). Options: (a) the same tables as the 1.x generation-3 file (`paths`,
-`file_versions`, `tenants`, `units`, `snapshots`, `stage_sets`, `stage_slices`) plus
-`stage_files` and `stage_ids`; (b) a subset named table by table in Appendix A.
+**Its tables are exactly those `catalog rebuild` reads, plus `stage_files` and
+`stage_ids`, and nothing else** (ADR-0012 item 294): `tenants`, `units`, `snapshots`,
+`stage_sets`, `stage_slices`, `paths`, `file_versions`, `stage_files`, `stage_ids`.
+Appendix A lists their columns.
 
 A reader refuses, naming the row, a value outside a column's allowed set; it does not
 guess.
@@ -368,15 +367,11 @@ whichever slices it holds (#562). The catalog database holds the same rows
 (`stage_files`, `stage_ids`, Appendix A), and the operator envelope's `catalog.db`
 carries them (§1.4).
 
-**Names.** `tables/<staging>.tsv` (the file table) and `tables/<staging>.ids.tsv` (the id
-map), where `<staging>` names a staging as Layout 2's `catalogs/` member named it (D4):
-the unit's uuid's first eight hex characters, `_v`, and the version
-(`tables/1a2b3c4d_v3.tsv`).
-
-**OPEN (Stage 1):** two stagings of one version on one tape (ADR-0012 item 102 allows a
-re-stage of a version; item 138 speaks of "a version with two stage sets on one volume")
-would share `<staging>`. Options: (a) add the stage set id, `<uuid8>_v<version>_s<stage_set_id>`;
-(b) refuse to plan two stagings of one version on one tape.
+**Names** (ADR-0012 item 294). `tables/<uuid8>_v<version>_s<stage_set_id>.tsv` (the file
+table) and `tables/<uuid8>_v<version>_s<stage_set_id>.ids.tsv` (the id map): the unit's
+uuid's first eight hex characters, `_v` and the version, `_s` and the stage set's id
+(`tables/1a2b3c4d_v3_s42.tsv`). Two stagings of one version on one tape never collide, and
+no plan is refused for it.
 
 #### The file table
 
@@ -420,8 +415,8 @@ describes a member that is not on this tape (§5.1).
 
 #### The id map
 
-UTF-8 text, the index's escaping. One header line, then rows sorted by kind (`u` before
-`g`) and then by number:
+UTF-8 text, the index's escaping. The header line `#tapectl-id-map 1` (item 294), then rows
+sorted by kind (`u` before `g`) and then by number:
 
 ```
 #tapectl-id-map 1
@@ -436,10 +431,6 @@ stream does not carry has no row. A tenant envelope's map names only that tenant
 stagings' ids. It is in no plaintext file of the tape (item 276). **A restore shows the
 map and never acts on it**: a restore is by number, and no remap by name is built (item
 278).
-
-**OPEN (Stage 1):** the id map's header line. D5 gives the rows and no header; the file
-table's header is `#tapectl-file-table 1`. Options: (a) `#tapectl-id-map 1`, as written
-above; (b) no header line.
 
 ### 1.7 The damaged-file list (written by readers, not on the tape)
 
@@ -491,26 +482,29 @@ snapshot_version = {version}
 stage_set_id = {stage_set_id}
 payload = "tar"
 stream_bytes = {stream_bytes}
-compression = "{gzip|xz|zstd}"      # only for a compressed staging
+file_table = "tables/{uuid8}_v{version}_s{stage_set_id}.tsv"
+id_map = "tables/{uuid8}_v{version}_s{stage_set_id}.ids.tsv"
 tar_version = "{the writer's tar --version first line}"
+compression = "{gzip|xz|zstd}"      # only for a compressed staging
 
 [[units.slices]]
 number = 1
 tape_position = {position}           # only for a slice this tape plans
-continues = true                     # only for a slice that continues a member
 size_bytes = {size_bytes}
 encrypted_bytes = {encrypted_bytes}
 sha256_plain = "{sha256_plain}"
 sha256_encrypted = "{sha256_encrypted}"
+continues = true                     # only for a slice that continues a member
 ```
 
 The `#` notes above are for this document; they are not in the file.
 
 - **The block of a staging** (D6). Kept: `name`, `uuid`, `snapshot_version`,
-  `stage_set_id`, and the slice list. New: `payload = "tar"`; `stream_bytes`, the length
-  of the staging's tar stream; `compression`, named only when the staging is compressed
-  (§3.5); the writer's `tar --version` first line, for a reader's diagnosis only; and the
-  file table's and id map's names in the envelope.
+  `stage_set_id`, and the slice list. New, after them in D6's order (item 294):
+  `payload = "tar"`; `stream_bytes`, the length of the staging's tar stream; `file_table`
+  and `id_map`, the names of the staging's two texts in the envelope (§1.6); `tar_version`,
+  the writer's `tar --version` first line, for a reader's diagnosis only; and
+  `compression`, named only when the staging is compressed (§3.5).
 - **The slice list lists every slice of the staging**, 1 to N, in slice order, each with
   `size_bytes` (the plaintext length of the slice's cut, before compression, §3.4),
   `encrypted_bytes` (the tape file's length), `sha256_plain` (of the cut) and
@@ -521,24 +515,12 @@ The `#` notes above are for this document; they are not in the file.
   second key. For every other slice the line is absent: never `0` and never empty. The
   slices given a position are one unbroken run in slice order, at consecutive tape
   positions.
-- **`continues = true`** is stated on a slice that continues a member begun in the slice
-  before it (D22): the second and later slices of a long member's run (§3.3). A slice
+- **`continues = true`** is the last key of a slice's table, present only when true (item
+  294): it is stated on a slice that continues a member begun in the slice before it (D22): the second and later slices of a long member's run (§3.3). A slice
   without it begins at a member's start. No plaintext file says which slices are a run.
 - `manifest.rs` is one type in both directions and refuses a key it does not know in
   `[[units]]` and `[[units.slices]]` (`deny_unknown_fields`); `RESTORE.sh` reads the
   keys it needs and ignores the rest.
-
-**OPEN (Stage 1):** the key names of D6's "the table's and the id map's names in the
-envelope" and of the writer's `tar --version` line. Options for the names: (a) none (a
-reader derives `tables/<staging>.tsv` and `.ids.tsv` from `uuid` and
-`snapshot_version`, §1.6); (b) `file_table = "tables/…tsv"` and `id_map =
-"tables/…ids.tsv"`. For the version line: `tar_version` (as written above) or
-`writer_tar`.
-
-**OPEN (Stage 1):** the order of the new keys in `[[units]]` and of `continues` in
-`[[units.slices]]`. RESTORE.sh's `toml_val` is table-blind and first-match-wins; none of
-the new names collides with another key of the manifest. Options: the order written
-above, or `continues` after `sha256_encrypted`.
 
 ---
 
@@ -797,8 +779,9 @@ in `[defaults]`, an archive set or a unit's dotfile, the most specific winning, 
   real images, 4 MiB and 1 GiB slices;
   `docs/research/2026-11-17-t05-decompressors-on-a-slice-compressed-alone.md`): gzip
   +0.0162%, xz +0.0065%, zstd +0.0026% of the slice, with a fixed part of a few dozen
-  bytes. The format states the worst growth of each algorithm, with a margin over that
-  measurement, as **0.1% of `slice_size` plus 64 KiB**, for each of gzip, xz and zstd.
+  bytes. **Determined** (the coordinator's, from T0.5's measurement, with a margin): the
+  format states the worst growth of each of gzip, xz and zstd as **0.1% of `slice_size`
+  plus 64 KiB**.
 - **The check at staging.** Staging decodes every slice it has just packed and compares
   the sha256 of the decoded bytes with the cut's `sha256_plain`, both taken as the bytes
   pass, before the bytes go on; a difference refuses the staging. Item 253's "each file's
@@ -912,12 +895,8 @@ front_index_sha256 = "{front_index_sha256}"
   a full one would have.
 - `sealed_at` is fixed-width (`YYYY-MM-DDTHH:MM:SSZ`, 20 bytes).
 
-**OPEN (Stage 1):** D1 says that "the front index's and the seal marker's own magics move
-with" File 0's. Neither file has a `magic` key in Layout 2: only File 0 states
-`magic = "tapectl-volume-v2"`; File 3 and the seal state `layout_version`. Options: (a)
-only File 0 carries a magic, and File 3 and the seal are fenced by `layout_version = 3`,
-as written above; (b) add `magic = "tapectl-volume-v3"` to `[index]` and `[seal]`, the
-line before `layout_version`.
+**No magic key in File 3 or the seal** (ADR-0012 item 294): what moves in those two files
+is `layout_version = 3`. Only File 0 states `magic = "tapectl-volume-v3"`.
 
 **The embedded copy.**
 - **Full seal:** entries 0 to M. File 3's own entry carries its `size_bytes` and
@@ -1495,21 +1474,10 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 
 ## 10. Open points (Stage 1)
 
-Each is a point at the level of bytes, a field name or a schema column that the ruled
-texts (ADR-0012 items 239 to 293, D1 to D22, the plan's determinations, Stage 0's results)
-do not decide. Nothing is built on one until the CTO answers it.
-
-1. **§1.4** Which baseline tables and columns the on-tape `catalog.db` carries, by name.
-2. **§1.6** Two stagings of one version on one tape share `tables/<uuid8>_v<version>`: add
-   the stage set id to the name, or refuse to plan two stagings of one version on one tape.
-3. **§1.6** The id map's header line: `#tapectl-id-map 1`, or none.
-4. **§1.9** The MANIFEST keys for D6's "the table's and the id map's names in the
-   envelope" (none, derived from `uuid` and `snapshot_version`; or `file_table` and
-   `id_map`), and for the writer's `tar --version` line (`tar_version` or another name).
-5. **§1.9** The order of the new keys in `[[units]]`, and the place of `continues` in
-   `[[units.slices]]`.
-6. **§5** Whether File 3's `[index]` and the seal's `[seal]` gain a `magic` key (D1 speaks
-   of their magics; Layout 2 gives them none).
+None. The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two
+stagings of one version on one tape; the id map's header; the MANIFEST's new keys and their
+order; a magic in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into
+§1.4, §1.6, §1.9 and §5.
 
 ---
 
