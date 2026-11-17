@@ -65,6 +65,21 @@ the normative design set named in the Policy block below.
     four readings as the coordinator's (the order of the acceptance run, a span restore
     streams, what "sufficient" means for #535, the defaults not objected to): correct them if
     the CTO does.
+  - **2026-11-17, items 282-289: "Ratify all recommendations." QUESTIONS 38 TO 44 ARE RULED.**
+    Slices stay (282). A SLICE ENDS AT A MEMBER'S START: whole members, a member larger than
+    `slice_size` gets a run of slices to itself, and the size signal is accepted (283, amending
+    item 241). Each slice is compressed alone (284), with gzip, xz or zstd (285; T0.5 confirms
+    or reopens), by tapectl's own libraries (286; a failed T0.6 goes to the CTO before the
+    host-tool fallback), with an optional `compression_level` (287). EVERY UNIT CONTINUES ON
+    THE NEXT CARTRIDGE AT THE EARLY WARNING (288: no `cut` unit, no opt-in; W1 to W9 unchanged;
+    reverses item 9 and item 82's opt-in), and the queue is filled to the warning (289). The
+    plan carries it: rule 13; T0.7 (bsdtar and GNU tar 1.30 on a slice with no end-of-archive
+    blocks, owed to item 283, with a decision rule); T5.1 is a BUILD task now and T5.3 carries a
+    range; the decision list is D1 TO D22. Item 283 is measured on two tars only; 288 and 289
+    are reasoned. NOT THE GO (the fourth message read so), and D1 to D22 and T0.3 are not
+    covered. Where the entries below call questions 38 to 44 open, they are history. This
+    CTO answers with "Ratify all": never leave two open questions that contradict each
+    other, and say in each ask exactly what a "ratify all" will be read to cover.
   - **2026-11-16 (later): QUESTIONS 26 TO 33 ARE RULED AS RECOMMENDED, AND AN ID MAP IS ADDED**
     (ADR-0012 items 264-272; "Ratify all. We should also store a user, group id mapping in
     our catalog"). So the entry below is history where it says the two things no longer stand:

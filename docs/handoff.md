@@ -53,15 +53,13 @@ container first, the plan's T0.2). The floor binds every host that writes (item 
 id map's shape is ruled (items 276-278). **The build is planned task by task in
 `docs/design/v3-implementation-plan.md`** (item 279), with an owner for each task; what is the
 operator's there is T0.3 (a read-only scale run on home2, on a go-ahead), T0.4 (the escrow
-paper's `age-keygen -y` check), the host's tar, T6.6's real-drive runs and Stage 7. Open with
-the CTO: the go; the eighteen choices D1 to D18 that the format document must make; T0.3;
-and, since item 280 ruled that compression is carried (optional, for select archives; #565),
-question 41 (its shape: each slice compressed alone, which is recommended since the
-re-weighing on #565, or the stream stored in frames and cut as today), question 42 (do
-slices stay; recommended yes, #566), and, since the CTO allowed the EOT and spanning logic to
-change, questions 43 and 44 (#567: a slice that ends at a member's start, and every unit
-continuing at the early warning; both recommended) and questions 38 to 40 (which algorithms, who compresses,
-whether an archive may set a level).
+paper's `age-keygen -y` check), the host's tar, T6.6's real-drive runs and Stage 7. Ruled on
+2026-11-17 (items 282 to 289; #565, #566, #567): slices stay, and a slice ends at a member's
+start; each slice is compressed alone, by tapectl itself, with gzip, xz or zstd and an
+optional level; every unit continues on the next cartridge at the early warning, with no
+opt-in and no `cut` unit, and the queue is filled to the warning. Open with the CTO: the go;
+the choices D1 to D22 that the format document must make (the plan's list, rewritten after
+those items); and T0.3.
 
 **(i) is done, except its tidy (step 10): home2 runs 1.9.2, and `keepsake` is on L6-0001 (`home2-rack`) and L6-0002 (`offsite`), each sealed with its full readback passed** (2026-11-09 to 11-11; `docs/runs/2026-11-09-handoff-i-1.9.2-and-copies.md`). home2 went 1.8.1 → 1.9.1 → 1.9.2 by `--upgrade` (each rehearsal 53/53), registered the 27 keepsake units, then wrote copy 1 on cartridge EW6XY4HGNV and copy 2 on EW81WMR8VC, 1.20 TiB each at about 151 MiB/s; `audit` is clean. Open for the operator: the Heir Kit's new COVER.txt in each envelope, (i) step 10's deletion of the old state, and the new key files for `parents` and `family`. Steps 0 to 6 are in `docs/runs/2026-11-02-1.8.1-handoff-i.md`. What follows is the history before it.
 

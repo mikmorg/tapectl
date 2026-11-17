@@ -338,6 +338,30 @@ tape no longer holds only whole units; with 44a alone a unit crosses only where 
 today. All three are recommended and **none is ruled; the permission is not the go.** Not yet run: bsdtar and
 GNU tar 1.30 on a slice with no end-of-archive blocks, needed before the format document.
 
+**2026-11-17: questions 38 to 44 are ruled** (ADR-0012 items 282-289; the CTO: "Ratify all
+recommendations."). The paragraphs above that call these open, or call shape B recommended,
+are history. Slices stay (282). **A slice ends at a member's start**: it holds whole members,
+a member larger than `slice_size` has a run of slices to itself, and the slices joined are
+the stream; that a slice's size on tape follows the files in it is accepted (283, amending
+item 241's "plain cut"). Each slice is compressed alone, after the cut and before it is
+encrypted (284); gzip, xz and zstd are carried (285; T0.5 confirms or reopens it); tapectl
+itself compresses, with a library for each (286; if T0.6 fails, the fallback of a host tool
+goes to the CTO first); an archive may set `compression_level` (287). **Every unit continues
+on the next cartridge at the early warning** (288): none is `cut`, none opts in, and W1 to
+W9 are unchanged; this reverses item 9 and item 82's opt-in. **The queue is filled to the
+warning** (289), so one unit lies across the end of every full tape. The amendment names what
+goes (the `cut` unit, `allow_spanning`, `may_span`, the plan's two classes, items 94 and 147,
+item 133's refusal of a range in rewrite and compaction) and what stands (W1 to W9, copies
+counted for each slice, items 85, 86 and 93). Item 283 is measured on GNU tar 1.35 and BusyBox
+only, and items 288 and 289 are reasoned, not measured. **The plan carries all of it**: rule
+13 (a slice begins at a member's start or continues one long member); T0.7, the readers
+still owed to item 283 (bsdtar, GNU tar 1.30), with a decision rule, and a failure reopens
+the item; T5.1 is now a build task (no `cut`, no opt-in, one class, one bound) and T5.3
+carries a range; and the decision list is **D1 to D22** (D1, D3, D4, D6, D9, D10, D11 and D15
+rewritten; D19 the batch, D20 the one plan bound, D21 a range in rewrite and compaction, D22
+how a tape marks a long member's run). **"Ratify all recommendations" was not the go, and it
+did not cover D1 to D22 or T0.3: build nothing.** Open with the CTO: the go, D1 to D22, T0.3.
+
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
