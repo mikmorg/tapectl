@@ -83,6 +83,12 @@ pub struct EraseOptions<'a> {
     /// `--dry-run`: identify and cross-check, then stop.
     pub dry_run: bool,
     pub block_size: usize,
+    /// The chip serial a caller recorded of the cartridge it means to erase
+    /// (`volume rewrite`, which took its own consent before it retired the
+    /// source): the word for a tape that reads blank or EMPTY, which carries
+    /// no label to confirm (issue #537). `cartridge erase` passes `None`: the
+    /// operator types the word.
+    pub cartridge_serial: Option<&'a str>,
 }
 
 /// What File 0 of the loaded tape is.
@@ -967,7 +973,15 @@ fn erase_in_contact(
         .confirm_label
         .clone()
         .unwrap_or_else(|| serial.to_string());
-    crate::cli::consent::confirm_typed(&report.consent_action(), &[], &word, opts.confirm_label)?;
+    // Issue #537: a tape that reads blank or EMPTY carries no label, and a
+    // caller that recorded the cartridge's chip serial (`volume rewrite`)
+    // gives that as the word. It is still compared with the serial read
+    // now: a different cartridge is refused as any wrong word is.
+    let given = match (report.medium, opts.cartridge_serial) {
+        (MediumKind::Blank | MediumKind::Empty, Some(recorded)) => Some(recorded),
+        _ => opts.confirm_label,
+    };
+    crate::cli::consent::confirm_typed(&report.consent_action(), &[], &word, given)?;
 
     // ── 4. erase ──
     let mut store = TapeStore::open(device, opts.block_size, 0)?;
@@ -1085,12 +1099,29 @@ fn erase_in_contact(
         }
         Err(e) => {
             // ADR-0012 2026-10-07 item 33: the erase stands; say which step
-            // did not finish and what finishes it.
+            // did not finish and what finishes it. Issue #537: for a volume
+            // on the cartridge, that is this command again: the tape then
+            // reads EMPTY and the catalog still owes the record, so the
+            // erase runs again, is read back and is recorded, and `volume
+            // init` (and `volume rewrite --resume`) takes it as the proof
+            // `cartridge mark-erased` would not leave.
+            let owed = checked.volumes.iter().any(|v| v.status != "erased");
+            let finish = if owed {
+                format!(
+                    "To record it, run `tapectl cartridge erase --device {device} \
+                     --confirm-label {serial}` again: the tape reads EMPTY and the catalog still \
+                     owes the record, so the erase runs again, is read back and is recorded \
+                     (`volume rewrite --resume` does this itself)."
+                )
+            } else {
+                "Nothing in the catalog is owed this erase but the cartridge's own record: \
+                 `volume init` registers it when it is next written, with `--force` (an EMPTY \
+                 File 0 nothing recorded is no proof of an erase)."
+                    .to_string()
+            };
             report.warnings.push(format!(
                 "warning: the tape is erased and verified, but recording it in the catalog did \
-                 not finish: {e}. Nothing was changed in the catalog. To record it: `tapectl \
-                 cartridge mark-erased <barcode>` for a registered cartridge (`volume init` \
-                 registers an unknown one when it is next written)."
+                 not finish: {e}. Nothing was changed in the catalog. {finish}"
             ));
         }
     }
@@ -1375,6 +1406,7 @@ mod tests {
             confirm_label: confirm,
             dry_run,
             block_size: BS,
+            cartridge_serial: None,
         }
     }
 

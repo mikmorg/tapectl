@@ -1010,8 +1010,10 @@ pub trait RewriteSteps {
     fn read(&self, source: &str) -> Result<CompactReadReport>;
     /// `cartridge erase` (short) of the cartridge in the drive, confirmed
     /// with `confirm_label` — the source's label, which must be the label on
-    /// the tape's File 0.
-    fn erase(&self, confirm_label: &str) -> Result<EraseReport>;
+    /// the tape's File 0 — or, for a tape that reads blank or EMPTY (an
+    /// earlier run's erase the catalog never recorded, issue #537), with
+    /// `cartridge_serial`, the chip serial the rewrite recorded.
+    fn erase(&self, confirm_label: &str, cartridge_serial: Option<&str>) -> Result<EraseReport>;
     /// `volume init LABEL` on the loaded cartridge.
     fn init(&self, label: &str) -> Result<Initialized>;
     /// `volume write LABEL` with the FULL confirm, writing only
@@ -1094,7 +1096,7 @@ impl RewriteSteps for DriveRewriteSteps<'_> {
         )
     }
 
-    fn erase(&self, confirm_label: &str) -> Result<EraseReport> {
+    fn erase(&self, confirm_label: &str, cartridge_serial: Option<&str>) -> Result<EraseReport> {
         crate::volume::erase::cartridge_erase(
             self.conn,
             self.config,
@@ -1104,6 +1106,7 @@ impl RewriteSteps for DriveRewriteSteps<'_> {
                 confirm_label: Some(confirm_label),
                 dry_run: false,
                 block_size: crate::cli::volume::DEFAULT_BLOCK_SIZE,
+                cartridge_serial,
             },
         )
     }
@@ -1275,14 +1278,46 @@ fn restore_staging(
         }
     }
     for (set, status) in prior_status {
+        // Issue #537's concern: a set read as `staged` before this run may
+        // have been staged only by an earlier run of this rewrite that was
+        // killed after its read promoted it, into this same directory. Its
+        // slices' prior path is then the file just removed, so it is not
+        // staged: it is what it was before that run, released, its copy the
+        // untouched source. A set whose slices are all still on disk keeps
+        // the status it had.
+        let status = if status == "staged" && !every_slice_on_disk(conn, *set) {
+            "cleaned"
+        } else {
+            status.as_str()
+        };
         if let Err(e) = conn.execute(
-            "UPDATE stage_sets SET status = ?2 WHERE id = ?1 AND status = 'staged'",
+            "UPDATE stage_sets SET status = ?2,
+                 cleaned_at = CASE WHEN ?2 = 'cleaned' THEN COALESCE(cleaned_at, datetime('now'))
+                                   ELSE cleaned_at END
+             WHERE id = ?1 AND status = 'staged'",
             params![set, status],
         ) {
             warn!(stage_set_id = set, error = %e, "could not restore a stage set's status");
         }
     }
     let _ = std::fs::remove_dir(compact_dir);
+}
+
+/// Every slice of stage set `set` has a staging path that names a file on
+/// disk. A catalog that cannot answer answers no.
+fn every_slice_on_disk(conn: &Connection, set: i64) -> bool {
+    let paths: rusqlite::Result<Vec<Option<String>>> = conn
+        .prepare("SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![set], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match paths {
+        Ok(paths) => paths
+            .iter()
+            .all(|p| p.as_deref().is_some_and(|p| Path::new(p).is_file())),
+        Err(_) => false,
+    }
 }
 
 // ── The command ─────────────────────────────────────────────────────────────
@@ -1928,7 +1963,7 @@ fn finish_from(
             &destination,
         );
         mark_window_open(conn, &pending, &window)?;
-        let erased = steps.erase(&source);
+        let erased = steps.erase(&source, pending.cartridge_serial.as_deref());
         let erase_report = match erased {
             Ok(r) => r,
             // `true` whatever the erase said: the source is already retired
@@ -2602,7 +2637,11 @@ mod tests {
             Ok(report)
         }
 
-        fn erase(&self, confirm_label: &str) -> Result<EraseReport> {
+        fn erase(
+            &self,
+            confirm_label: &str,
+            _cartridge_serial: Option<&str>,
+        ) -> Result<EraseReport> {
             self.log.borrow_mut().push(format!("erase {confirm_label}"));
             // The real erase refuses a volume the catalog has not given up.
             if !coverage::is_given_up(&self.w.conn, self.source_id)? {
@@ -4455,5 +4494,265 @@ mod tests {
             fake.asked.borrow()[1],
             "write_preflight NEW scoped LTO-6 50000000"
         );
+    }
+
+    // ── #537: an erase the catalog never recorded, then `--resume` ──
+
+    /// The drive of [`Fake`], except the erase and the init, which are the
+    /// REAL `cartridge erase` and the REAL `volume init` over one in-memory
+    /// tape, the chip answering [`SERIAL`]. The first erase is what a killed
+    /// process, or a record that failed, leaves: the tape erased (File 0
+    /// EMPTY) and nothing recorded, the warning the real erase then prints.
+    struct RealEraseAndInit<'a> {
+        fake: Fake<'a>,
+        tape: crate::tape::fake::FakeTape,
+        erases: Cell<usize>,
+    }
+
+    const REAL_BS: usize = 4096;
+
+    fn chip_reading() -> crate::tape::media_detect::Detected {
+        crate::tape::media_detect::Detected {
+            generation: Some(crate::media::Generation::Lto6),
+            code: Some(0x5a),
+            source: crate::tape::media_detect::DetectSource::MamMedium,
+            mam: crate::tape::mam::MamInfo {
+                serial: Some(SERIAL.into()),
+                load_count: Some(3),
+                manufacturer: Some("TESTCO".into()),
+                ..crate::tape::mam::MamInfo::default()
+            },
+            capture: crate::tape::mam::MamCapture::default(),
+        }
+    }
+
+    impl RewriteSteps for RealEraseAndInit<'_> {
+        fn host_preflight(&self, what: &str) -> Result<()> {
+            self.fake.host_preflight(what)
+        }
+        fn write_preflight(
+            &self,
+            expected: &ExpectedVolume,
+            only: Option<&[i64]>,
+        ) -> Result<Option<write::CapacityNumbers>> {
+            self.fake.write_preflight(expected, only)
+        }
+        fn read(&self, source: &str) -> Result<CompactReadReport> {
+            self.fake.read(source)
+        }
+        fn erase(
+            &self,
+            confirm_label: &str,
+            cartridge_serial: Option<&str>,
+        ) -> Result<EraseReport> {
+            self.fake
+                .log
+                .borrow_mut()
+                .push(format!("erase {confirm_label}"));
+            self.erases.set(self.erases.get() + 1);
+            if self.erases.get() == 1 {
+                // Erased on the tape; the record never made.
+                self.tape.state().files = vec![Vec::new()];
+                let mut report = erase_report(SERIAL);
+                report.recorded = None;
+                report.warnings.push(
+                    "warning: the tape is erased and verified, but recording it in the catalog \
+                     did not finish"
+                        .into(),
+                );
+                return Ok(report);
+            }
+            let _drive = crate::store::injected::InjectedDrive::install(&self.tape);
+            let mut chip = chip_reading;
+            let mut slot = crate::tape::contact::ContactSlot::empty();
+            let r = crate::volume::erase::erase_with(
+                &self.fake.w.conn,
+                &self.fake.w.config,
+                DEVICE,
+                crate::volume::erase::EraseOptions {
+                    mode: crate::store::EraseMode::Short,
+                    confirm_label: Some(confirm_label),
+                    cartridge_serial,
+                    dry_run: false,
+                    block_size: REAL_BS,
+                },
+                &mut slot,
+                &mut chip,
+            );
+            slot.finish_result(r)
+        }
+        fn init(&self, label: &str) -> Result<Initialized> {
+            self.fake.log.borrow_mut().push(format!("init {label}"));
+            let _drive = crate::store::injected::InjectedDrive::install(&self.tape);
+            let config = &self.fake.w.config;
+            let backend = crate::config::resolve_lto_backend(config, Some(DEVICE))?;
+            let drive_gen = backend.native_generation()?;
+            let det = chip_reading();
+            let mut slot = crate::tape::contact::ContactSlot::empty();
+            let contact = slot.open(
+                &self.fake.w.conn,
+                config,
+                Operation::VolumeInit,
+                DEVICE,
+                None,
+                Medium::Observed {
+                    backend,
+                    mam: &det.mam,
+                },
+            );
+            // No `--force`, as `DriveRewriteSteps::init`.
+            let r = write::volume_init_in_contact(
+                &self.fake.w.conn,
+                label,
+                DEVICE,
+                REAL_BS,
+                false,
+                None,
+                None,
+                None,
+                backend,
+                drive_gen,
+                &det,
+                contact,
+                write::ContactStore::Device,
+            );
+            slot.finish_result(r)
+        }
+        fn write(&self, label: &str, only: Option<&[i64]>) -> Result<()> {
+            self.fake.write(label, only)
+        }
+        fn resume_write(&self, label: &str) -> Result<()> {
+            self.fake.resume_write(label)
+        }
+        fn chip_serial(&self) -> Option<String> {
+            self.fake.chip_serial()
+        }
+    }
+
+    /// #537: the tape was erased and the catalog never recorded it (the
+    /// process killed between the erase and its record, or the record
+    /// failed). The rewrite stops naming `--resume`; the resume finds the
+    /// tape EMPTY with the source still `retired`, and must not loop: the
+    /// real erase runs again (the rewrite gives the chip serial it recorded,
+    /// the word for a tape with no label), reads back and records, and the
+    /// real init takes that record as its proof without `--force`, so the
+    /// resume reaches the rewritten volume.
+    #[test]
+    fn a_resume_after_an_erase_the_catalog_never_recorded_records_it_and_finishes() {
+        let s = scene(1);
+        let steps = RealEraseAndInit {
+            fake: Fake::new(&s),
+            tape: crate::tape::fake::FakeTape::with_files(
+                vec![b"SRC's File 0, then its slices".to_vec()],
+                REAL_BS,
+            ),
+            erases: Cell::new(0),
+        };
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let err = rewrite(&s.w.conn, &s.w.config, &steps, &o).unwrap_err();
+        assert!(err.to_string().contains("--resume NEW"), "{err}");
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "retired");
+
+        let report = resume(&s.w.conn, &s.w.config, &steps, "NEW", false)
+            .expect("the resume records the erase and finishes");
+        assert!(report.resumed);
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let created: String = scalar(
+            &s.w.conn,
+            "SELECT details FROM events WHERE action = 'created' AND entity_label = 'NEW'",
+        );
+        assert!(
+            created.contains("verified_erase"),
+            "the init took the erase's record as its proof: {created}"
+        );
+    }
+
+    /// #537's open question, traced: `cartridge mark-erased` accepts the
+    /// source a rewrite has retired, still mounted on its `pending_erase`
+    /// cartridge, unattended and without a flag (the floor sees no copy on a
+    /// retired volume, and `pending_erase` asks no consent). It records no
+    /// verified erase, so the rewrite's own init would then need `--force`:
+    /// the way out a resume takes is the erase again, as above.
+    #[test]
+    fn mark_erased_accepts_a_retired_still_mounted_source() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.fail_erase.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap_err();
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "retired");
+        assert_eq!(
+            scalar::<String>(&s.w.conn, "SELECT status FROM cartridges"),
+            "pending_erase"
+        );
+        assert_eq!(
+            scalar::<i64>(
+                &s.w.conn,
+                "SELECT COUNT(*) FROM cartridge_volumes WHERE unmounted_at IS NULL"
+            ),
+            1
+        );
+        crate::cli::operations::cartridge_mark_erased(
+            &s.w.conn, "CART-1", false, false, false, false,
+        )
+        .expect("accepted");
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+    }
+
+    /// #537's concern, settled: a rewrite killed after `compact-read`
+    /// promoted the sets (the record left at `staged`), then a retry that is
+    /// refused before the erase. The retry's "put staging back" must not
+    /// leave a set `staged` with no slice files: that set was released
+    /// before the killed run, its copy is the untouched source.
+    #[test]
+    fn a_refused_retry_after_a_killed_rewrite_leaves_no_set_staged_without_its_files() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        // The killed run: the read promoted the sets and the record exists.
+        let read = fake.read("SRC").unwrap();
+        insert_pending(
+            &s.w.conn,
+            s.src,
+            "NEW",
+            Some(SERIAL),
+            Consent::TypedFlag,
+            false,
+            &read.staged_sets,
+        )
+        .unwrap();
+        // The retry, refused after its read and before anything destructive.
+        fake.fail_write_preflight.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap_err();
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        let staged_without_files: Vec<(i64, Option<String>)> =
+            s.w.conn
+                .prepare(
+                    "SELECT ss.id, sl.staging_path FROM stage_sets ss
+                 JOIN stage_slices sl ON sl.stage_set_id = ss.id
+                 WHERE ss.status = 'staged'",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, p)| p.as_ref().is_none_or(|p| !Path::new(p).exists()))
+                .collect();
+        assert!(
+            staged_without_files.is_empty(),
+            "sets left `staged` with no slice file: {staged_without_files:?}"
+        );
+        for v in [&s.keepsake, &s.docs] {
+            assert_eq!(set_status(&s.w.conn, v.stage_set_id), "cleaned");
+        }
     }
 }

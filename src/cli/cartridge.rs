@@ -1237,6 +1237,7 @@ fn cartridge_erase_command(
             confirm_label,
             dry_run,
             block_size: crate::cli::volume::DEFAULT_BLOCK_SIZE,
+            cartridge_serial: None,
         },
         &mut show,
     )?;

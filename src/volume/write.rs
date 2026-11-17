@@ -447,7 +447,7 @@ pub(crate) fn volume_init_contacted_barcoded<'c>(
 /// store, `check_fresh_write_contact`, the one transaction that creates and
 /// binds the volume, and the provisional ID thunk.
 #[allow(clippy::too_many_arguments)]
-fn volume_init_in_contact<'c>(
+pub(crate) fn volume_init_in_contact<'c>(
     conn: &'c Connection,
     label: &str,
     device: &str,
@@ -28889,6 +28889,7 @@ mod tests {
                     confirm_label: Some(serial),
                     dry_run: false,
                     block_size: BS,
+                    cartridge_serial: None,
                 },
                 &mut slot,
                 &mut chip_fn,
@@ -28924,6 +28925,7 @@ mod tests {
                     confirm_label: Some(serial),
                     dry_run: false,
                     block_size: BS,
+                    cartridge_serial: None,
                 },
                 &mut slot,
                 &mut chip_fn,
@@ -29530,6 +29532,7 @@ mod tests {
                         confirm_label: Some(SERIAL),
                         dry_run: false,
                         block_size: BS,
+                        cartridge_serial: None,
                     },
                     &mut slot,
                     &mut chip_fn,
