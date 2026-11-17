@@ -835,7 +835,8 @@ fn owed_on_a_tape_with_nothing_on_it(
              disagree, and the catalog goes on counting what the tape does not hold until it \
              is told. If the volume's bytes are gone (the tape was erased by hand, or never \
              held them), say so: {remedy}; it refuses while the volume holds the last copy of \
-             a unit, and names what to do first. If they are not gone (another tape wears \
+             a unit, and names how to make another first (from staging, or from the source \
+             on disk: a copy-out from this tape cannot read a blank one). If they are not gone (another tape wears \
              this cartridge's chip, or the drive cannot read it), `tapectl volume identify \
              --device {device}` shows the tape. Nothing was written.",
             v.label, v.status, v.condition
@@ -2510,6 +2511,58 @@ mod tests {
         .expect("nothing owed now");
         assert_eq!(report.outcome, EraseOutcome::NothingToErase);
         assert!(writes(&fake).is_empty());
+    }
+
+    /// #536, the issue's own state: the live volume on the blank tape holds
+    /// the only copy of a version. The refusal still names `mark-erased`;
+    /// run as printed it stops at the Tier-3 floor (no flag reaches it),
+    /// whose refusal names a way to make another copy that does not read
+    /// this tape: the version staged again from its source, then written.
+    #[test]
+    fn a_live_sole_copy_on_a_blank_tape_is_refused_and_the_floor_names_a_way_on() {
+        let conn = crate::db::open_memory().unwrap();
+        let c = add_cartridge(&conn, "L6-0009", SERIAL, "in_use");
+        let v = add_volume(&conn, "L6-0009", UUID, "sealed");
+        mount(&conn, c, v);
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u1', 'photos', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path)
+                 VALUES (1, 1, 1, 'full', 'current', '/srv/photos');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size)
+                 VALUES (1, 1, 'cleaned', 524288);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (1, 1, ?1, 'completed')",
+            params![v],
+        )
+        .unwrap();
+        let fake = FakeTape::with_files(Vec::new(), BS);
+        let msg = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, false),
+            &[Some(SERIAL)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("it counts as a live copy"), "{msg}");
+        assert!(msg.contains("mark-erased L6-0009 --force"), "{msg}");
+
+        let floor = crate::cli::operations::cartridge_mark_erased(
+            &conn, "L6-0009", true, false, false, false,
+        )
+        .expect_err("the floor refuses the only copy")
+        .to_string();
+        assert!(floor.contains("no --force for this"), "{floor}");
+        assert!(
+            floor.contains("tapectl stage create photos --version 1"),
+            "a way on that does not read this tape: {floor}"
+        );
+        assert_eq!(status_of(&conn, "volumes", v), "sealed");
     }
 
     /// #536 and #537: a volume the catalog has GIVEN UP (retired) on a
