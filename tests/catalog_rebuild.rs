@@ -77,7 +77,8 @@ const UNITS: &[(&str, &str, &[u8])] = &[
 /// Which `catalog.db` the operator envelope carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CatalogDb {
-    /// None at all — a tape written before #83.
+    /// None at all: a shape the writer never makes (tapes before #83 had
+    /// it), for the test of its refusal.
     None,
     /// What `build_catalog_snapshot` writes.
     New,
@@ -155,8 +156,13 @@ fn catalogue_bytes(unit_name: &str) -> Vec<u8> {
 /// How the next fixture tape's cross-volume index (§1.5, #418 R4) is made.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IndexKind {
-    /// None: a tape written before 1.3.0.
-    None,
+    /// None at all: a shape the writer never makes (tapes before 1.3.0 had
+    /// it), for the test of its refusal.
+    Absent,
+    /// What `volume write` makes when the catalog knows no other tape: the
+    /// index names this tape alone. Every fixture tape's, unless a test asks
+    /// for another.
+    ThisTapeOnly,
     /// The catalog also holds two OTHER sealed tapes, `HIST-A` (a later
     /// version of one alpha unit and one bravo unit) and `HIST-Q`
     /// (quarantined, a still later version of the alpha unit); the index
@@ -168,14 +174,15 @@ enum IndexKind {
 }
 
 thread_local! {
-    static INDEX_KIND: std::cell::Cell<IndexKind> = const { std::cell::Cell::new(IndexKind::None) };
+    static INDEX_KIND: std::cell::Cell<IndexKind> =
+        const { std::cell::Cell::new(IndexKind::ThisTapeOnly) };
 }
 
 /// [`build_sealed_volume_with`] with `kind`'s cross-volume index.
 fn build_sealed_volume_with_index(kind: IndexKind) -> SealedVolume {
     INDEX_KIND.with(|k| k.set(kind));
     let vol = build_sealed_volume_with(CatalogDb::New);
-    INDEX_KIND.with(|k| k.set(IndexKind::None));
+    INDEX_KIND.with(|k| k.set(IndexKind::ThisTapeOnly));
     vol
 }
 
@@ -291,11 +298,10 @@ fn build_sealed_volume_with(catalog_db: CatalogDb) -> SealedVolume {
 ///
 /// - `(serial, Some("mam"))` — a chip-reported serial.
 /// - `(barcode, Some("operator"))` — an operator-typed barcode.
-/// - `(serial_or_empty, None)` — UNKNOWN: either the ADR-0010-to-#192 window
-///   (a non-empty serial with no identity source recorded) or a fully legacy
-///   write (`""`, standing in for a File 0 with no `[media]` table at all —
-///   `classify_media` treats both the same way, so this fixture does not
-///   need to fabricate a thunk with the whole table missing to exercise it).
+/// - `(serial_or_empty, None)` — UNKNOWN: a non-empty serial with no identity
+///   source recorded, or `""`: what the writer records for a volume whose
+///   binding recorded no identity source. A File 0 with no `[media]` table
+///   at all is refused (`a_file_0_without_a_media_table_refuses_the_rebuild`).
 fn build_sealed_volume_full(
     catalog_db: CatalogDb,
     mam_serial: &str,
@@ -590,7 +596,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     // The cross-volume index, generated where `volume write` generates it.
     let index_kind = INDEX_KIND.with(|k| k.get());
     let index_work = tempfile::tempdir().unwrap();
-    let index = (index_kind != IndexKind::None).then(|| {
+    let index = (index_kind != IndexKind::Absent).then(|| {
         // Two other sealed tapes the catalog knows about. Versions 8 and 9
         // are later than the 7 this tape carries.
         let history = |label: &str, condition: &str, unit: usize, version: i64| {
@@ -633,15 +639,23 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             )
             .unwrap();
         };
-        history("HIST-A", "ok", 0, 8);
-        history("HIST-A", "ok", 2, 8);
-        history("HIST-Q", "quarantined", 0, 9);
+        if index_kind != IndexKind::ThisTapeOnly {
+            history("HIST-A", "ok", 0, 8);
+            history("HIST-A", "ok", 2, 8);
+            history("HIST-Q", "quarantined", 0, 9);
+        }
         let files = tapectl::volume::index::generate_files(
             &conn,
             &tapectl::policy::coverage::IndexThisTape {
                 label,
                 uuid: volume_uuid,
-                cartridge_serial: mam_serial,
+                // As `volume write` says it: an operator-named cartridge's
+                // barcode is not a chip serial.
+                cartridge_serial: if cartridge_identity_source == Some("operator") {
+                    ""
+                } else {
+                    mam_serial
+                },
                 generation: "LTO-6",
             },
             &stage_set_ids,
@@ -1674,42 +1688,30 @@ fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
     }
 }
 
-/// A tape written before #83 carries no `catalog.db`. The restore path must
-/// still come back whole — what degrades is the searchable index.
+/// ADR-0012 item 258(d): every operator envelope this tapectl writes carries
+/// `catalog.db` (§1.4). A tape whose envelope has none (tapes before #83) is
+/// refused, naming what is missing, and nothing of it is recorded.
 #[test]
-fn a_tape_without_a_catalog_db_still_rebuilds_the_restore_path() {
+fn a_tape_without_a_catalog_db_refuses_the_rebuild() {
     let mut vol = build_sealed_volume(false);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
     let scratch = tempfile::tempdir().unwrap();
     let secret = vol.operator_secret.clone();
-    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
-
-    assert!(!report.had_catalog_db);
-    assert_eq!(report.files, 0);
-    assert_eq!(report.units, UNITS.len());
-
-    for (unit_name, expected) in &vol.expected_positions {
-        let rows = restore_resolution_query(&conn, unit_name);
-        let got: Vec<i64> = rows
-            .iter()
-            .map(|(_, pos, _)| pos.parse().unwrap())
-            .collect();
-        assert_eq!(&got, expected, "unit {unit_name}");
-    }
-
-    let source: String = conn
-        .query_row(
-            "SELECT s.source_path FROM snapshots s JOIN units u ON u.id = s.unit_id
-             WHERE u.name = ?1",
-            rusqlite::params![UNITS[0].0],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a tape without catalog.db is refused")
+        .to_string();
     assert!(
-        source.contains("unknown"),
-        "an unknown source path must say so, not be invented: got {source:?}"
+        err.contains("carries no catalog.db") && err.contains("§1.4"),
+        "{err}"
     );
+    assert!(
+        !err.contains("cross-volume index"),
+        "only what is missing is named: {err}"
+    );
+    for (table, n) in row_counts(&conn) {
+        assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
+    }
 }
 
 /// The front index of a `MemStore` tape, parsed from its recorded bytes.
@@ -1727,13 +1729,11 @@ fn damage_file(vol: &mut SealedVolume, pos: i32, size: u64) {
 }
 
 /// `volume-format-v2.md` §1.3 (#418 item 2): a damaged tenant envelope falls
-/// back to its backup copy. On a tape without `catalog.db` the tenant
-/// envelopes are where ownership comes from, so a rebuild that gave up on the
-/// damaged primary (as it did before the backup existed) could not file the
-/// tenant's units under it.
+/// back to its backup copy, so the rebuild lists no envelope as unreadable
+/// and finds every unit's tenant envelope.
 #[test]
 fn a_damaged_tenant_envelope_is_read_from_its_backup() {
-    let mut vol = build_sealed_volume(false);
+    let mut vol = build_sealed_volume(true);
     let fi = front_index_of(&vol);
     let primaries: Vec<_> = fi
         .iter()
@@ -1759,6 +1759,11 @@ fn a_damaged_tenant_envelope_is_read_from_its_backup() {
     let report = rebuild(&conn, &mut vol, &secret, scratch.path())
         .expect("both tenant envelopes are damaged, and both backups are whole");
     assert!(
+        report.unreadable_tenant_envelopes.is_empty(),
+        "every backup was read: {:?}",
+        report.unreadable_tenant_envelopes
+    );
+    assert!(
         report.units_without_tenant_envelope.is_empty(),
         "{:?}",
         report.units_without_tenant_envelope
@@ -1774,45 +1779,6 @@ fn a_damaged_tenant_envelope_is_read_from_its_backup() {
             .unwrap();
         assert_eq!(&got, tenant_name, "unit {unit_name}");
     }
-}
-
-/// Positive control for the test above: with BOTH copies of a tenant
-/// envelope damaged there is nothing to fall back to, and the rebuild says
-/// so rather than carrying on without that tenant's envelope.
-#[test]
-fn a_tenant_envelope_damaged_in_both_copies_fails_the_rebuild() {
-    let mut vol = build_sealed_volume(false);
-    let fi = front_index_of(&vol);
-    let primary = fi
-        .iter()
-        .find(|e| e.type_label == "tenant_envelope")
-        .unwrap()
-        .clone();
-    let backup = fi
-        .iter()
-        .find(|e| {
-            e.type_label == "tenant_envelope_backup"
-                && e.sha256_encrypted == primary.sha256_encrypted
-        })
-        .unwrap()
-        .clone();
-    damage_file(&mut vol, primary.position, primary.size_bytes.unwrap());
-    damage_file(&mut vol, backup.position, backup.size_bytes.unwrap());
-
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_db(dir.path());
-    let scratch = tempfile::tempdir().unwrap();
-    let secret = vol.operator_secret.clone();
-    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
-        .expect_err("no whole copy of the envelope is left");
-    let msg = err.to_string();
-    assert!(
-        msg.contains(&format!(
-            "the tenant_envelope at position {} could not be opened, and neither could its backup copy",
-            primary.position
-        )),
-        "the error names the damaged envelope and its backup: {msg}"
-    );
 }
 
 /// Damage every `-> X25519` recipient stanza in tape file `pos`'s age
@@ -1911,13 +1877,12 @@ fn an_operator_envelope_damaged_in_its_stanzas_is_read_from_its_backup() {
     assert_restorable_from(&conn, &mut vol);
 }
 
-/// The same stanza damage on every tenant envelope's primary, on a tape
-/// without `catalog.db` (so the tenant envelopes are where ownership comes
-/// from): each is read from its backup, not quietly counted as an envelope
-/// the operator key does not open.
+/// The same stanza damage on every tenant envelope's primary: each is read
+/// from its backup, not quietly counted as an envelope the operator key does
+/// not open, nor listed as unreadable.
 #[test]
 fn a_tenant_envelope_damaged_in_its_stanzas_is_read_from_its_backup() {
-    let mut vol = build_sealed_volume(false);
+    let mut vol = build_sealed_volume(true);
     let primaries: Vec<_> = front_index_of(&vol)
         .into_iter()
         .filter(|e| e.type_label == "tenant_envelope")
@@ -1933,6 +1898,11 @@ fn a_tenant_envelope_damaged_in_its_stanzas_is_read_from_its_backup() {
     let secret = vol.operator_secret.clone();
     let report = rebuild(&conn, &mut vol, &secret, scratch.path())
         .expect("both primaries' stanzas are damaged, and both backups are whole");
+    assert!(
+        report.unreadable_tenant_envelopes.is_empty(),
+        "every backup was read: {:?}",
+        report.unreadable_tenant_envelopes
+    );
     assert!(
         report.units_without_tenant_envelope.is_empty(),
         "{:?}",
@@ -2522,8 +2492,39 @@ fn a_rebuild_refuses_a_volume_the_catalog_mounts_elsewhere() {
     assert_eq!(before, row_counts(&conn), "a refusal must write nothing");
 }
 
-/// The explicit trap (item 3): a legacy File 0 recording NO cartridge
-/// identity at all (`cartridge_serial = ""`) must not fail the rebuild. The
+/// ADR-0012 item 258(d): every File 0 this tapectl writes carries a
+/// `[media]` table (§1.1). A File 0 without one (tapes before ADR-0010) is
+/// refused, naming the table, and nothing of the tape is recorded.
+#[test]
+fn a_file_0_without_a_media_table_refuses_the_rebuild() {
+    let mut vol = build_sealed_volume(true);
+    let file0 = String::from_utf8(vol.store.files[0].clone()).unwrap();
+    let at = file0
+        .find("\n[media]\n")
+        .expect("premise: File 0 has [media]");
+    let end = at + file0[at..].trim_end_matches('\0').len();
+    let mut without = file0[..at].to_string();
+    without.push('\n');
+    without.push_str(&file0[end..]);
+    assert!(!without.contains("[media]") && without.contains("[layout]"));
+    vol.store.files[0] = without.into_bytes();
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a File 0 without [media] is refused")
+        .to_string();
+    assert!(err.contains("no readable [media] table"), "{err}");
+    for (table, n) in row_counts(&conn) {
+        assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
+    }
+}
+
+/// The explicit trap (item 3): a File 0 recording NO cartridge identity at
+/// all (`cartridge_serial = ""`, what the writer records for a volume bound
+/// to no cartridge with no chip serial read) must not fail the rebuild. The
 /// volume rebuilds unbound, and the report says why.
 #[test]
 fn a_legacy_file_0_with_no_serial_rebuilds_unbound_and_says_so() {
@@ -2547,10 +2548,11 @@ fn a_legacy_file_0_with_no_serial_rebuilds_unbound_and_says_so() {
     assert_eq!(open_mount_cartridge(&conn, LABEL), None);
 }
 
-/// The SAME legacy outcome, but for the OTHER shape `classify_media`
-/// treats as unknown: a non-empty `cartridge_serial` with no
-/// `cartridge_identity_source` recorded at all — the ADR-0010-to-#192
-/// window. Distinct code path from the empty-serial case above; both must
+/// The SAME outcome, but for the OTHER shape `classify_media` treats as
+/// unknown: a non-empty `cartridge_serial` with no
+/// `cartridge_identity_source` recorded at all — what the writer still
+/// records for a volume whose binding recorded no identity source (and what
+/// tapes of the ADR-0010-to-#192 window carry). Distinct code path from the empty-serial case above; both must
 /// land here, and the report should say which.
 #[test]
 fn a_serial_with_no_identity_source_also_rebuilds_unbound_and_says_so() {
@@ -5291,13 +5293,14 @@ fn rebuild_table_counts(conn: &rusqlite::Connection) -> Vec<(&'static str, i64)>
 
 /// `catalog rebuild` reads the operator envelope's `units.tsv` and lists the
 /// volumes it names that the catalog lacks, with what the index says of each;
-/// and creates nothing from it. The control is the same tape without an index,
-/// rebuilt into its own fresh catalog: every table the rebuild writes ends with
-/// the same number of rows, so the index added no row of any kind.
+/// and creates nothing from it. The control is the same tape with an index that
+/// names this tape alone, rebuilt into its own fresh catalog: every table the
+/// rebuild writes ends with the same number of rows, so the index's other
+/// tapes added no row of any kind.
 #[test]
 fn the_rebuild_lists_the_tapes_the_index_names_and_creates_no_row_for_them() {
     let mut with = build_sealed_volume_with_index(IndexKind::History);
-    let mut without = build_sealed_volume_with_index(IndexKind::None);
+    let mut without = build_sealed_volume_with_index(IndexKind::ThisTapeOnly);
     let secret = with.operator_secret.clone();
     let scratch = tempfile::tempdir().unwrap();
 
@@ -5353,7 +5356,7 @@ fn the_rebuild_lists_the_tapes_the_index_names_and_creates_no_row_for_them() {
 
     // Nothing was created from the index: only this tape's volume is in the
     // catalog, no version 8 or 9, and every table the rebuild writes is the
-    // size it is when the same tape carries no index.
+    // size it is when the same tape's index names no other tape.
     let labels: Vec<String> = with_conn
         .prepare("SELECT label FROM volumes ORDER BY label")
         .unwrap()
@@ -5375,7 +5378,7 @@ fn the_rebuild_lists_the_tapes_the_index_names_and_creates_no_row_for_them() {
     let without_conn = fresh_db(without_dir.path());
     let secret = without.operator_secret.clone();
     let control = rebuild(&without_conn, &mut without, &secret, scratch.path()).unwrap();
-    assert!(!control.had_index && control.index_volumes_missing.is_empty());
+    assert!(control.had_index && control.index_volumes_missing.is_empty());
     assert_eq!(
         rebuild_table_counts(&with_conn),
         rebuild_table_counts(&without_conn),
@@ -5438,20 +5441,31 @@ fn a_volume_the_catalog_has_is_not_on_the_list() {
     );
 }
 
-/// A tape written before 1.3.0 has no index: read exactly as before, with
-/// nothing to say about it.
+/// ADR-0012 item 258(d): every operator envelope this tapectl writes carries
+/// the cross-volume index (§1.5). A tape whose envelope has none (tapes
+/// before 1.3.0) is refused, naming what is missing, and nothing of it is
+/// recorded.
 #[test]
-fn a_tape_without_an_index_is_read_as_before() {
-    let mut vol = build_sealed_volume_with_index(IndexKind::None);
+fn a_tape_without_an_index_refuses_the_rebuild() {
+    let mut vol = build_sealed_volume_with_index(IndexKind::Absent);
     let secret = vol.operator_secret.clone();
     let scratch = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
-    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
-    assert!(!report.had_index);
-    assert!(report.index_problem.is_none());
-    assert!(report.index_volumes_missing.is_empty());
-    assert_eq!(report.units, 3, "{report:?}");
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a tape without the index is refused")
+        .to_string();
+    assert!(
+        err.contains("carries no cross-volume index (index/units.tsv"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("catalog.db"),
+        "only what is missing is named: {err}"
+    );
+    for (table, n) in row_counts(&conn) {
+        assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
+    }
 }
 
 /// A damaged aid does not stop the recovery it exists to speed: the rebuild

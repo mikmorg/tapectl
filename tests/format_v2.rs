@@ -122,6 +122,11 @@ struct HarnessSpec<'a> {
     /// as staging makes them). 1 for every tape but the short one, whose cut
     /// unit has a slice on the tape and a slice past its end (#420).
     slices_per_unit: usize,
+    /// Carry the on-tape `catalog.db` in the operator envelope, as `volume
+    /// write` always does: a tape that `catalog rebuild` reads must, since a
+    /// rebuild refuses one without it (ADR-0012 item 258(d)). Off for the
+    /// tapes no test rebuilds, whose envelopes' members are pinned without it.
+    catalog_db: bool,
 }
 
 impl Default for HarnessSpec<'_> {
@@ -133,6 +138,7 @@ impl Default for HarnessSpec<'_> {
             escrow: false,
             history: ["T7HIST-ALPHA", "T7HIST-BRAVO"],
             slices_per_unit: 1,
+            catalog_db: false,
         }
     }
 }
@@ -705,7 +711,7 @@ fn prepare_harness(
     )
     .unwrap();
 
-    let inputs = harness_inputs(
+    let mut inputs = harness_inputs(
         "T7MICRO",
         volume_uuid,
         "T7SERIAL",
@@ -715,6 +721,12 @@ fn prepare_harness(
         escrow_public_key.clone(),
         Some(index_files),
     );
+    let catalog_db_work = tempfile::tempdir().unwrap();
+    if spec.catalog_db {
+        let path = catalog_db_work.path().join("catalog.db");
+        db::ontape_catalog::write(&conn, &stage_set_ids, &path).unwrap();
+        inputs.catalog_db_path = Some(path);
+    }
 
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
@@ -2647,6 +2659,7 @@ fn shared_short() -> &'static ShortHarness {
         );
         let spec = HarnessSpec {
             slices_per_unit: 2,
+            catalog_db: true,
             ..HarnessSpec::default()
         };
         build_short_harness(&fixtures, &spec, VOLUME_UUID_SHORT, CUT_UNIT)
@@ -3282,6 +3295,7 @@ fn no_plaintext_zone_of_a_short_tape_reveals_a_tenant_unit_file_hash_or_key() {
         escrow: true,
         history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
         slices_per_unit: 2,
+        catalog_db: false,
     };
     let sh = build_short_harness(&fixtures, &spec, VOLUME_UUID_NEEDLES_SHORT, 1);
     let h = &sh.tape;

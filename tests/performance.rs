@@ -633,6 +633,20 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
     let catalog_db = root.path().join("catalog.db");
     db::catalog_snapshot::build_catalog_snapshot(&src, &[1], &catalog_db).unwrap();
     let catalog_db_bytes = fs::metadata(&catalog_db).unwrap().len();
+    // The cross-volume index, as `volume write` makes it (a rebuild refuses a
+    // tape without one).
+    let index = tapectl::volume::index::generate_files(
+        &src,
+        &tapectl::policy::coverage::IndexThisTape {
+            label: LABEL,
+            uuid: "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+            cartridge_serial: "PERFSERIAL",
+            generation: "LTO-6",
+        },
+        &[1],
+        &root.path().join("index"),
+    )
+    .unwrap();
 
     let inputs = BuildInputs {
         label: LABEL.to_string(),
@@ -659,7 +673,7 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path: Some(catalog_db),
-        index: None,
+        index: Some(index),
     };
     let session_dir = root.path().join("session");
     fs::create_dir_all(&session_dir).unwrap();

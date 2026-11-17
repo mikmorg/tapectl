@@ -182,6 +182,25 @@ fn written() -> Written {
         stage_unit(&conn, slices_dir.path(), tenant_id, "wide", WIDE),
         stage_unit(&conn, slices_dir.path(), tenant_id, "narrow", NARROW),
     ];
+    // What every write's operator envelope carries, made as `volume write`
+    // makes it: the on-tape `catalog.db` and the cross-volume index (a
+    // rebuild refuses a tape without them).
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    let extras_dir = tempfile::tempdir().unwrap();
+    let catalog_db = extras_dir.path().join("catalog.db");
+    db::ontape_catalog::write(&conn, &stage_set_ids, &catalog_db).unwrap();
+    let index = crate::volume::index::generate_files(
+        &conn,
+        &crate::policy::coverage::IndexThisTape {
+            label: LABEL,
+            uuid: VOL_UUID,
+            cartridge_serial: "",
+            generation: "LTO-6",
+        },
+        &stage_set_ids,
+        &extras_dir.path().join("index"),
+    )
+    .unwrap();
     let inputs = BuildInputs {
         label: LABEL.to_string(),
         volume_uuid: VOL_UUID.to_string(),
@@ -206,8 +225,8 @@ fn written() -> Written {
         }],
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: None,
-        catalog_db_path: None,
-        index: None,
+        catalog_db_path: Some(catalog_db),
+        index: Some(index),
     };
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).unwrap();

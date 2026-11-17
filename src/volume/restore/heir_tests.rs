@@ -226,6 +226,20 @@ mod tests {
         let catalog_db = catalog_dir.path().join("catalog.db");
         crate::db::catalog_snapshot::build_catalog_snapshot(&src, &[stage_set_id], &catalog_db)
             .unwrap();
+        // The cross-volume index, as `volume write` makes it (a rebuild
+        // refuses a tape without one).
+        let index = crate::volume::index::generate_files(
+            &src,
+            &crate::policy::coverage::IndexThisTape {
+                label: LABEL,
+                uuid: VOL_UUID,
+                cartridge_serial: "",
+                generation: "LTO-6",
+            },
+            &[stage_set_id],
+            &catalog_dir.path().join("index"),
+        )
+        .unwrap();
         let inputs = BuildInputs {
             label: LABEL.to_string(),
             volume_uuid: VOL_UUID.to_string(),
@@ -251,7 +265,7 @@ mod tests {
             operator_public_keys: vec![operator.public_key.clone()],
             escrow_public_key: Some(escrow.public_key.clone()),
             catalog_db_path: Some(catalog_db),
-            index: None,
+            index: Some(index),
         };
         let session_dir = tempfile::tempdir().unwrap();
         let built = build::build(&inputs, session_dir.path()).unwrap();

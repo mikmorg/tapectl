@@ -113,14 +113,14 @@ pub struct RebuildReport {
     pub positions: usize,
     pub files: usize,
     pub volume_inserted: bool,
-    /// False when the operator envelope carried no `catalog.db` — a tape
-    /// written before #83. The restore path is fully rebuilt either way;
-    /// what is lost is the per-file index (`catalog list`/`search`) and each
-    /// snapshot's original `source_path`.
+    /// Whether the operator envelope carried `catalog.db`. True on every
+    /// report: a tape without one is refused (ADR-0012 item 258(d)). Kept
+    /// because `catalog rebuild --json` states it.
     pub had_catalog_db: bool,
-    /// True when `catalog.db` carried a `tenants` table (written after the
-    /// 2026-09-11 decision), so ownership came from one file rather than from
-    /// decrypting every tenant envelope.
+    /// Whether ownership came from `catalog.db`'s `tenants` table rather than
+    /// from decrypting every tenant envelope. True on every report: the one
+    /// shape of `catalog.db` this tapectl reads carries it. Kept because
+    /// `catalog rebuild --json` states it.
     pub tenants_from_catalog_db: bool,
     /// Stage sets whose escrow receipt (`key_fingerprints`) rode the tape in
     /// `catalog.db`. For those, #137 does not arise: coverage is recorded,
@@ -346,8 +346,8 @@ pub struct RebuildReport {
     /// A `cartridge_volumes` mount was opened this run. `false` on an
     /// idempotent re-run that found the volume already mounted to the same
     /// cartridge, and `false` when [`Self::unbound_reason`] is set — a
-    /// legacy tape whose identity File 0 cannot attest is inserted unbound,
-    /// on purpose (do not force one).
+    /// tape whose identity File 0 cannot attest is inserted unbound, on
+    /// purpose (do not force one).
     pub cartridge_bound: bool,
     /// The bound cartridge row had no `serial_number` recorded, and this
     /// contact separately observed one and recorded it (`NULL` → value,
@@ -407,11 +407,12 @@ pub struct RebuildReport {
     /// never flips the status back to `in_use`: no amount of contact makes a
     /// medium declared permanently unfit fit again (ADR-0011).
     pub cartridge_retired: bool,
-    /// Why the volume was inserted with NO cartridge binding at all: File 0
-    /// carries no `[media]` table (pre-ADR-0010), an empty `cartridge_serial`
-    /// (a legacy write with nothing to attest), or a non-empty serial with no
-    /// `cartridge_identity_source` (written in the ADR-0010-to-#192 window —
+    /// Why the volume was inserted with NO cartridge binding at all: File 0's
+    /// `[media]` records an empty `cartridge_serial` (a write with nothing to
+    /// attest), or a non-empty serial with no `cartridge_identity_source`
+    /// (the writer omits it when the volume's binding recorded none —
     /// UNKNOWN, and never assumed to be `"mam"`; `volume-format-v2.md` §1.1).
+    /// A File 0 with no `[media]` table is refused, never inserted.
     /// `None` whenever a cartridge WAS resolved (bound, registered, or
     /// refused outright).
     pub unbound_reason: Option<String>,
@@ -435,9 +436,9 @@ pub struct RebuildReport {
     // A to-do list, never a source of rows: ADR-0001 has a claim about a tape
     // need contact with that tape, and this tape's index is a claim about
     // other tapes. Nothing below creates or changes a catalog row.
-    /// True when the operator envelope carried the index's `index/units.tsv`
-    /// (a tape written by 1.3.0 or later). A tape without it is read as it
-    /// always was.
+    /// Whether the operator envelope carried the index's `index/units.tsv`.
+    /// True on every report: a tape without it is refused (ADR-0012 item
+    /// 258(d)). Kept because `catalog rebuild --json` states it.
     pub had_index: bool,
     /// Why the index could not be used, when it was there and unreadable. The
     /// rebuild itself is not affected: the index is an aid, and a damaged
@@ -542,8 +543,8 @@ pub struct SpanInProgress {
     pub missing: Vec<i64>,
     /// The volumes other than this tape that this tape's cross-volume index
     /// (`index/units.tsv`, §1.5) names as holding one of [`Self::missing`],
-    /// with the run each holds. Empty when the tape has no index or its
-    /// index names none (a tape never names a tape written after it,
+    /// with the run each holds. Empty when the tape's index is unreadable or
+    /// names none (a tape never names a tape written after it,
     /// ADR-0001).
     pub holders: Vec<SpanHolder>,
 }
@@ -848,12 +849,19 @@ fn rebuild_contacted(
     let ident = format::parse_id_thunk_identity(&thunk_text)?;
     let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
     let meta = format::parse_id_thunk_volume_meta(&thunk_text)?;
-    // Absent/malformed `[media]` is an ABSENCE (`format::parse_id_thunk_media`'s
-    // own fail-safe convention), never a reason to fail the rebuild — the
-    // legacy tapes this covers are exactly what issue #165's "insert unbound"
-    // path exists for.
-    let media = format::parse_id_thunk_media(&thunk_text).ok();
-    let identity = classify_media(media.as_ref());
+    // Every File 0 this tapectl writes carries `[media]` (ADR-0010); one
+    // without it, or with one that does not parse, is not a tape this
+    // tapectl reads (ADR-0012 item 258(d)), and is refused before anything
+    // is recorded.
+    let media = format::parse_id_thunk_media(&thunk_text).map_err(|e| {
+        TapectlError::Other(format!(
+            "this tape's File 0 has no readable [media] table ({e}), which every tape this \
+             tapectl writes carries (volume-format-v2.md §1.1): this tapectl does not read \
+             it. RESTORE.sh (tape file 2) with a tenant key or the escrow key still restores \
+             what opens"
+        ))
+    })?;
+    let identity = classify_media(&media);
 
     // Item 4 (issue #165): a `mam`-sourced File 0 that disagrees with a
     // serial THIS CONTACT actually observed is refused before any write.
@@ -959,12 +967,42 @@ fn rebuild_contacted(
                 .to_string(),
         )
     })?;
+    // Every operator envelope this tapectl writes carries `catalog.db` (§1.4)
+    // and the cross-volume index (§1.5). One that lacks either is not a tape
+    // this tapectl reads (ADR-0012 item 258(d)): refused, naming what is
+    // missing, before anything is recorded.
+    let missing: Vec<&str> = [
+        (
+            operator.catalog_db.is_none(),
+            "catalog.db (volume-format-v2.md §1.4)",
+        ),
+        (
+            operator.index_units.is_none(),
+            "cross-volume index (index/units.tsv, volume-format-v2.md §1.5)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(absent, what)| absent.then_some(what))
+    .collect();
+    let Some(catalog_db) = operator
+        .catalog_db
+        .as_deref()
+        .filter(|_| missing.is_empty())
+    else {
+        return Err(TapectlError::Other(format!(
+            "this tape's operator envelope (tape file {}) carries no {}, which every tape this \
+             tapectl writes carries: this tapectl does not read it. RESTORE.sh (tape file 2) \
+             with a tenant key or the escrow key still restores what opens",
+            operator.position,
+            missing.join(" and no ")
+        )));
+    };
 
     let mut report = RebuildReport {
         label: ident.label.clone(),
         uuid: ident.uuid.clone(),
         envelopes_opened: opened.len(),
-        had_catalog_db: operator.catalog_db.is_some(),
+        had_catalog_db: true,
         serial_checked: medium_serial.is_some(),
         // Issue #221: a serial can be learnt at the pre-transaction
         // corroboration above, before `resolve_operator_identity` (which
@@ -983,27 +1021,12 @@ fn rebuild_contacted(
         ..Default::default()
     };
 
-    let supplement = match operator.catalog_db.as_deref() {
-        Some(path) => Supplement::load(path)?,
-        None => Supplement::default(),
-    };
+    let supplement = Supplement::load(catalog_db)?;
     // Issue #451: a tenant envelope that no copy of could be read is not
-    // needed when the operator envelope's `catalog.db` names each unit's
-    // owner (generation 2 or 3): the operator manifest lists every unit and
-    // every slice, and the receipts ride in `catalog.db`. Without that
-    // table the tenant envelopes are the only record of ownership, and the
-    // rebuild would silently file those units under `--tenant`: refuse, as
-    // before.
-    if let Some(first) = unreadable.first() {
-        if !supplement.has_tenants {
-            return Err(TapectlError::Other(format!(
-                "{} A catalog.db this old (or none at all) does not name which tenant owns \
-                 each unit, so the tenant envelopes are the only record of it and the rebuild \
-                 needs every one. Use another copy of this volume; RESTORE.sh (tape file 2) \
-                 with a tenant key or the escrow key still restores what opens.",
-                first.message
-            )));
-        }
+    // needed: the operator envelope's `catalog.db` names each unit's owner,
+    // the operator manifest lists every unit and every slice, and the
+    // receipts ride in `catalog.db`.
+    if !unreadable.is_empty() {
         for u in &unreadable {
             tracing::warn!(
                 position = u.position,
@@ -1016,7 +1039,7 @@ fn rebuild_contacted(
         report.unreadable_tenant_envelopes = unreadable.iter().map(|u| u.describe()).collect();
     }
     let tenant_of = tenant_index(&opened, &supplement);
-    report.tenants_from_catalog_db = supplement.has_tenants;
+    report.tenants_from_catalog_db = true;
 
     // `unchecked_transaction` matches the codebase's convention (session,
     // write, key, operations): the CLI holds a shared `Connection`, and
@@ -1049,7 +1072,7 @@ fn rebuild_contacted(
         &identity,
         medium_serial,
         &meta,
-        media.as_ref(),
+        &media,
         &mut report,
     )?;
     tx.commit()?;
@@ -1142,6 +1165,8 @@ fn index_to_do(
     this_uuid: &str,
     report: &mut RebuildReport,
 ) -> Vec<crate::volume::index::UnitsRow> {
+    // Present on every tape this reads: one without is refused before it
+    // gets here.
     let Some(path) = &operator.index_units else {
         return Vec::new();
     };
@@ -1741,12 +1766,11 @@ fn open_all_envelopes(
 /// Map each unit's uuid to the tenant that owns it (#527: a unit is its
 /// uuid, never its name).
 ///
-/// From `catalog.db` when it carries `tenants` (tapes written after
-/// 2026-09-11), else from the tenant envelopes — the operator envelope files
-/// every unit under the placeholder tenant `"operator"` and so cannot answer
-/// this. On a new-shape tape the envelopes are still opened (they are how a
-/// tenant key would be refused, and they are cheap), but ownership is taken
-/// from the one file that states it.
+/// From `catalog.db`'s `tenants`, the one file that states it; a unit it
+/// does not name is taken from the tenant envelopes (the operator envelope
+/// files every unit under the placeholder tenant `"operator"` and so cannot
+/// answer this). The envelopes are still opened: they are how a tenant key
+/// would be refused, and they are cheap.
 fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<String, String> {
     let mut map = supplement.tenant_of.clone();
     for env in opened {
@@ -1791,9 +1815,6 @@ struct Supplement {
     /// (unit uuid, stage_set_id) -> that stage set's recorded recipient list
     /// JSON, when `catalog.db` carries `stage_sets.key_fingerprints`.
     key_fingerprints: HashMap<(String, i64), String>,
-    /// Whether the `tenants` table was present at all — distinguishes "no
-    /// tenants on this write" from "an older catalog.db".
-    has_tenants: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1879,7 +1900,6 @@ impl Supplement {
             .collect();
         out.db = Some((db, spans));
 
-        out.has_tenants = true;
         for u in &cat.units {
             if let Some(tname) = tenant_name.get(&u.tenant_id) {
                 out.tenant_of.insert(u.uuid.clone(), tname.clone());
@@ -2757,12 +2777,13 @@ fn ensure_snapshot(
     let facts = supplement
         .snapshots
         .get(&(unit.uuid.clone(), unit.snapshot_version));
-    // `source_path` is NOT NULL and is only in `catalog.db`. On a pre-#83
-    // tape it is genuinely unknown, and an invented path would be a lie a
-    // later `snapshot create` could act on — so say so in the column.
-    let source_path = facts
-        .map(|f| f.source_path.clone())
-        .unwrap_or_else(|| "(unknown: rebuilt from a tape carrying no catalog.db)".to_string());
+    // `source_path` is NOT NULL and is only in `catalog.db`. A version the
+    // manifest names and `catalog.db` has no row for has it genuinely
+    // unknown, and an invented path would be a lie a later `snapshot create`
+    // could act on — so say so in the column.
+    let source_path = facts.map(|f| f.source_path.clone()).unwrap_or_else(|| {
+        "(unknown: this tape's catalog.db has no row for this version)".to_string()
+    });
     let snapshot_type = facts
         .map(|f| f.snapshot_type.clone())
         .unwrap_or_else(|| "full".to_string());
@@ -3445,11 +3466,8 @@ fn record_event(
         report.files,
         report.receipts_from_tape,
         report.attested,
-        if report.had_catalog_db {
-            "present"
-        } else {
-            "absent (a tape written before catalog.db rode on tape): no file index, no source paths"
-        },
+        // A tape without one is refused before anything is recorded.
+        "present",
     );
     crate::db::events::log_event(
         tx,
@@ -3502,18 +3520,10 @@ enum RebuildIdentity {
     Unknown(String),
 }
 
-/// Classify File 0's `[media]` claim. `media = None` covers both "no
-/// `[media]` table at all" (pre-ADR-0010) and "the table was unparseable" —
-/// `rebuild_from_store` folds `parse_id_thunk_media`'s `Err` into `None` via
-/// `.ok()` before calling this, matching every other absence in this format
-/// (`format.rs`'s fail-safe convention: absent/malformed is an `Err`, and the
-/// caller decides what absence means).
-fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
-    let Some(media) = media else {
-        return RebuildIdentity::Unknown(
-            "this tape's File 0 carries no [media] table (written before ADR-0010)".to_string(),
-        );
-    };
+/// Classify File 0's `[media]` claim. A File 0 with no `[media]` table, or
+/// one that does not parse, never reaches here: `rebuild_from_store` refuses
+/// it first.
+fn classify_media(media: &format::IdThunkMedia) -> RebuildIdentity {
     if media.cartridge_serial.is_empty() {
         return RebuildIdentity::Unknown(
             "this tape's File 0 [media] table records no cartridge identity \
@@ -3526,7 +3536,7 @@ fn classify_media(media: Option<&format::IdThunkMedia>) -> RebuildIdentity {
         Some("operator") => RebuildIdentity::Operator(media.cartridge_serial.clone()),
         _ => RebuildIdentity::Unknown(format!(
             "this tape's File 0 records cartridge_serial \"{}\" but no \
-             cartridge_identity_source (written by an older tapectl) — it cannot be told \
+             cartridge_identity_source (the volume's binding recorded none) — it cannot be told \
              apart from an operator-typed barcode, so it is not assumed to be a \
              chip-verified serial",
             media.cartridge_serial
@@ -3579,7 +3589,7 @@ fn resolve_and_bind_cartridge(
     identity: &RebuildIdentity,
     observed_serial: Option<&str>,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<()> {
     let unknown_reason = match identity {
@@ -3587,8 +3597,8 @@ fn resolve_and_bind_cartridge(
         _ => None,
     };
     if let Some(reason) = unknown_reason {
-        // The explicit trap this item calls out: a legacy File 0 must not
-        // fail the rebuild. The volume `insert_all` just wrote stays
+        // The explicit trap this item calls out: a File 0 with no identity to
+        // attest must not fail the rebuild. The volume `insert_all` just wrote stays
         // unbound; warn (via the report — `cli::catalog` prints it) and say
         // why. A later run that observes a real identity binds it, because
         // rebuild "only inserts what is missing" (this module's own "What it
@@ -3824,7 +3834,7 @@ fn resolve_mam_identity(
     serial: &str,
     label: &str,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<ResolvedCartridge> {
     if let Some(row) = crate::volume::binding::select_cartridge(tx, "serial_number", serial)? {
@@ -3936,8 +3946,8 @@ fn resolve_mam_identity(
         )));
     }
 
-    let manufacturer = media.and_then(|m| m.cartridge_manufacturer.as_deref());
-    let length = media.and_then(|m| m.tape_length_meters);
+    let manufacturer = media.cartridge_manufacturer.as_deref();
+    let length = media.tape_length_meters;
     // `total_load_count` bound explicitly to `NULL`, not left to the
     // schema's `DEFAULT 0` (issue #184): rebuild has no live load-count
     // reading at all, and the schema default would assert a false "zero
@@ -4000,7 +4010,7 @@ fn resolve_operator_identity(
     barcode: &str,
     observed_serial: Option<&str>,
     meta: &format::IdThunkVolumeMeta,
-    media: Option<&format::IdThunkMedia>,
+    media: &format::IdThunkMedia,
     report: &mut RebuildReport,
 ) -> Result<ResolvedCartridge> {
     if let Some(observed) = observed_serial {
@@ -4071,9 +4081,9 @@ fn resolve_operator_identity(
                 params![
                     barcode,
                     meta.media_type,
-                    media.and_then(|m| m.cartridge_manufacturer.as_deref()),
+                    media.cartridge_manufacturer.as_deref(),
                     observed_serial,
-                    media.and_then(|m| m.tape_length_meters),
+                    media.tape_length_meters,
                     cartridge_capacity_bytes(meta),
                 ],
             )?;
@@ -4173,6 +4183,17 @@ mod tests {
             "the wrong identity must be refused at the header: {:?}",
             no.as_ref().err()
         );
+    }
+
+    /// A File 0 `[media]` table with nothing for a drill to register from:
+    /// no manufacturer, no length.
+    fn no_facts_media() -> format::IdThunkMedia {
+        format::IdThunkMedia {
+            cartridge_serial: "HU1234ABCD".to_string(),
+            cartridge_identity_source: Some("mam".to_string()),
+            cartridge_manufacturer: None,
+            tape_length_meters: None,
+        }
     }
 
     /// The File 0 `[volume]` meta every `resolve_mam_identity` drill below
@@ -4456,7 +4477,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         );
         let err = match err {
@@ -4501,7 +4522,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         )
         .unwrap();
@@ -4539,7 +4560,7 @@ mod tests {
             "HU1234ABCD",
             "L6-0001",
             &mam_drill_meta(),
-            None,
+            &no_facts_media(),
             &mut report,
         );
         let err = match err {

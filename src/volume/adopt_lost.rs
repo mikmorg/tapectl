@@ -954,6 +954,24 @@ mod tests {
             slices,
             span: None,
         };
+        // What every write's operator envelope carries, made as `volume
+        // write` makes it: the on-tape `catalog.db` and the cross-volume
+        // index (a rebuild refuses a tape without them).
+        let extras_dir = tempfile::tempdir().unwrap();
+        let catalog_db = extras_dir.path().join("catalog.db");
+        db::ontape_catalog::write(&src, &[stage_set_id], &catalog_db).unwrap();
+        let index = crate::volume::index::generate_files(
+            &src,
+            &crate::policy::coverage::IndexThisTape {
+                label: LABEL,
+                uuid: VOL_UUID,
+                cartridge_serial: "",
+                generation: "LTO-6",
+            },
+            &[stage_set_id],
+            &extras_dir.path().join("index"),
+        )
+        .unwrap();
         let inputs = BuildInputs {
             label: LABEL.to_string(),
             volume_uuid: VOL_UUID.to_string(),
@@ -978,8 +996,8 @@ mod tests {
             }],
             operator_public_keys: vec![operator.public_key.clone()],
             escrow_public_key: None,
-            catalog_db_path: None,
-            index: None,
+            catalog_db_path: Some(catalog_db),
+            index: Some(index),
         };
         let session_dir = tempfile::tempdir().unwrap();
         let built = build::build(&inputs, session_dir.path()).unwrap();
@@ -1724,6 +1742,32 @@ mod tests {
                 slices: w.unit.slices[planned].to_vec(),
                 ..w.unit.clone()
             };
+            // What every write's operator envelope carries, made as `volume
+            // write` makes it: the on-tape `catalog.db` and the cross-volume
+            // index with this tape's run of the set (a rebuild refuses a tape
+            // without them).
+            let extras_dir = tempfile::tempdir().unwrap();
+            let catalog_db = extras_dir.path().join("catalog.db");
+            db::ontape_catalog::write(&w.src, &[unit.stage_set_id], &catalog_db).unwrap();
+            let run = crate::policy::coverage::IndexRun {
+                stage_set_id: unit.stage_set_id,
+                slices: Some((
+                    unit.slices.first().unwrap().slice_number,
+                    unit.slices.last().unwrap().slice_number,
+                )),
+            };
+            let index = crate::volume::index::generate_files_for_runs(
+                &w.src,
+                &crate::policy::coverage::IndexThisTape {
+                    label,
+                    uuid,
+                    cartridge_serial: "",
+                    generation: "LTO-6",
+                },
+                &[run],
+                &extras_dir.path().join("index"),
+            )
+            .unwrap();
             let inputs = BuildInputs {
                 label: label.to_string(),
                 volume_uuid: uuid.to_string(),
@@ -1748,8 +1792,8 @@ mod tests {
                 }],
                 operator_public_keys: vec![w.operator.public_key.clone()],
                 escrow_public_key: None,
-                catalog_db_path: None,
-                index: None,
+                catalog_db_path: Some(catalog_db),
+                index: Some(index),
             };
             let session_dir = tempfile::tempdir().unwrap();
             let built = build::build(&inputs, session_dir.path()).unwrap();
