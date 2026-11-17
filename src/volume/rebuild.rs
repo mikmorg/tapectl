@@ -1739,7 +1739,8 @@ fn open_all_envelopes(
     })
 }
 
-/// Map each unit name to the tenant that owns it.
+/// Map each unit's uuid to the tenant that owns it (#527: a unit is its
+/// uuid, never its name).
 ///
 /// From `catalog.db` when it carries `tenants` (tapes written after
 /// 2026-09-11), else from the tenant envelopes — the operator envelope files
@@ -1756,7 +1757,7 @@ fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<S
             continue;
         }
         for unit in &env.manifest.units {
-            map.entry(unit.name.clone())
+            map.entry(unit.uuid.clone())
                 .or_insert_with(|| env.manifest.manifest.tenant.clone());
         }
     }
@@ -1764,25 +1765,33 @@ fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<S
 }
 
 /// The facts only the operator envelope's `catalog.db` (#83) carries.
+///
+/// Keyed by what identifies them (#527, B14): a unit by its uuid, a version
+/// by the unit's uuid and its number, and a staging by the unit's uuid and
+/// the `stage_set_id` its `[[units]]` block states, which is the on-tape
+/// `catalog.db`'s `stage_sets.id` (both are the writing catalog's id). Never
+/// by name: keyed by name, a tape holding one unit in two stage sets gave
+/// both the higher-id set's escrow receipt and slice size, so a set staged
+/// before the escrow recipient was registered (a gap) read `covered`.
 #[derive(Debug, Default)]
 struct Supplement {
-    /// unit name -> (source_path, total_size, file_count) of each snapshot
-    /// version, keyed by version.
+    /// (unit uuid, version) -> (source_path, total_size, file_count) of that
+    /// snapshot.
     snapshots: HashMap<(String, i64), SnapshotFacts>,
-    /// unit name -> slice_size for the stage set.
-    slice_size: HashMap<String, i64>,
-    /// (unit name, version) -> that snapshot's id in `db`, whose file rows
+    /// (unit uuid, stage_set_id) -> that stage set's slice_size.
+    slice_size: HashMap<(String, i64), i64>,
+    /// (unit uuid, version) -> that snapshot's id in `db`, whose file rows
     /// `ensure_files` streams one version at a time through `file_spans`
     /// (issue #413). A version with no rows on tape has no entry.
     file_snapshot: HashMap<(String, i64), i64>,
     /// The open `catalog.db`, when the tape carries one, and where each
     /// version's file rows lie in it, whatever its generation.
     db: Option<(Connection, ontape_catalog::FileSpans)>,
-    /// unit name -> owning tenant name, when `catalog.db` carries `tenants`.
+    /// unit uuid -> owning tenant name, when `catalog.db` carries `tenants`.
     tenant_of: HashMap<String, String>,
-    /// unit name -> recorded recipient list JSON, when `catalog.db` carries
-    /// `stage_sets.key_fingerprints`.
-    key_fingerprints: HashMap<String, String>,
+    /// (unit uuid, stage_set_id) -> that stage set's recorded recipient list
+    /// JSON, when `catalog.db` carries `stage_sets.key_fingerprints`.
+    key_fingerprints: HashMap<(String, i64), String>,
     /// Whether the `tenants` table was present at all — distinguishes "no
     /// tenants on this write" from "an older catalog.db".
     has_tenants: bool,
@@ -1799,8 +1808,8 @@ struct SnapshotFacts {
 impl Supplement {
     /// Read every table but `files` via `ontape_catalog::read_all_but_files`,
     /// then derive exactly the maps `insert_all`/`tenant_index`/`ensure_*`
-    /// already consume, keyed by unit name (and version, where a fact is
-    /// per-snapshot) the way the hand-written joins used to key them. The
+    /// consume, keyed by unit uuid (and version, or stage set id, where a
+    /// fact is per-snapshot or per-staging; see [`Supplement`]). The
     /// `files` rows, nearly all of the file (about 250 MB of rows for a
     /// million-file tape), stay on disk until `ensure_files` streams each
     /// version's (issue #413).
@@ -1808,19 +1817,19 @@ impl Supplement {
         let (db, cat) = ontape_catalog::read_all_but_files(path)?;
         let mut out = Supplement::default();
 
-        let unit_name: HashMap<i64, String> =
-            cat.units.iter().map(|u| (u.id, u.name.clone())).collect();
+        let unit_uuid: HashMap<i64, String> =
+            cat.units.iter().map(|u| (u.id, u.uuid.clone())).collect();
         let tenant_name: HashMap<i64, String> =
             cat.tenants.iter().map(|t| (t.id, t.name.clone())).collect();
-        // snapshot id -> (owning unit's name, version), the stable key every
+        // snapshot id -> (owning unit's uuid, version), the stable key every
         // consumer below joins on.
         let snapshot_key: HashMap<i64, (String, i64)> = cat
             .snapshots
             .iter()
             .filter_map(|s| {
-                unit_name
+                unit_uuid
                     .get(&s.unit_id)
-                    .map(|n| (s.id, (n.clone(), s.version)))
+                    .map(|u| (s.id, (u.clone(), s.version)))
             })
             .collect();
 
@@ -1846,7 +1855,7 @@ impl Supplement {
         }
 
         for ss in &cat.stage_sets {
-            let Some((name, _version)) = snapshot_key.get(&ss.snapshot_id) else {
+            let Some((uuid, _version)) = snapshot_key.get(&ss.snapshot_id) else {
                 continue;
             };
             let slice_size = ss.slice_size.ok_or_else(|| {
@@ -1855,9 +1864,10 @@ impl Supplement {
                     ss.id
                 ))
             })?;
-            out.slice_size.insert(name.clone(), slice_size);
+            out.slice_size.insert((uuid.clone(), ss.id), slice_size);
             if let Some(fp) = &ss.key_fingerprints {
-                out.key_fingerprints.insert(name.clone(), fp.clone());
+                out.key_fingerprints
+                    .insert((uuid.clone(), ss.id), fp.clone());
             }
         }
 
@@ -1873,10 +1883,8 @@ impl Supplement {
         out.has_tenants = cat.generation.carries_ownership_and_receipts();
         if out.has_tenants {
             for u in &cat.units {
-                if let (Some(uname), Some(tname)) =
-                    (unit_name.get(&u.id), tenant_name.get(&u.tenant_id))
-                {
-                    out.tenant_of.insert(uname.clone(), tname.clone());
+                if let Some(tname) = tenant_name.get(&u.tenant_id) {
+                    out.tenant_of.insert(u.uuid.clone(), tname.clone());
                 }
             }
         }
@@ -2338,7 +2346,7 @@ fn insert_all(
                 continue;
             }
             UnitMatch::None => {
-                let tenant_name = match tenant_of.get(&unit.name) {
+                let tenant_name = match tenant_of.get(&unit.uuid) {
                     Some(t) => t.clone(),
                     None => {
                         report.units_without_tenant_envelope.push(unit.name.clone());
@@ -2751,7 +2759,7 @@ fn ensure_snapshot(
     }
     let facts = supplement
         .snapshots
-        .get(&(unit.name.clone(), unit.snapshot_version));
+        .get(&(unit.uuid.clone(), unit.snapshot_version));
     // `source_path` is NOT NULL and is only in `catalog.db`. On a pre-#83
     // tape it is genuinely unknown, and an invented path would be a lie a
     // later `snapshot create` could act on — so say so in the column.
@@ -2935,9 +2943,12 @@ fn ensure_stage_set(
             return Ok(id);
         }
     }
+    // The block's own staging (#527, B14): its unit's uuid and the
+    // `stage_set_id` it states, never the unit's name.
+    let staging = (unit.uuid.clone(), unit.stage_set_id);
     let slice_size = supplement
         .slice_size
-        .get(&unit.name)
+        .get(&staging)
         .copied()
         .or_else(|| unit.slices.iter().map(|s| s.size_bytes).max())
         .unwrap_or(0);
@@ -2945,7 +2956,7 @@ fn ensure_stage_set(
     // after 2026-09-11 (review finding 2); for older tapes it is NULL and
     // `origin = 'rebuilt'` lets `policy::escrow` say "unknown — attest it"
     // rather than "no recorded recipient list" (#137).
-    let receipt = supplement.key_fingerprints.get(&unit.name).cloned();
+    let receipt = supplement.key_fingerprints.get(&staging).cloned();
     if receipt.is_some() {
         report.receipts_from_tape += 1;
     }
@@ -3234,7 +3245,7 @@ fn ensure_files(
         supplement.db.as_ref(),
         supplement
             .file_snapshot
-            .get(&(unit.name.clone(), unit.snapshot_version)),
+            .get(&(unit.uuid.clone(), unit.snapshot_version)),
     ) else {
         return Ok(());
     };

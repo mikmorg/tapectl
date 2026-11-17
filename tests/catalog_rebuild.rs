@@ -268,6 +268,16 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// When set, the second entry of [`UNITS`] is written as version 8 of the
+    /// FIRST unit, not as a unit of its own: one unit in two stage sets on one
+    /// tape (#527, B14). The two sets differ in what the catalog records of
+    /// them: version 7's receipt lacks the escrow key (staged before one was
+    /// registered) and its slice size is another.
+    static TWO_VERSIONS_OF_ONE_UNIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Every existing test in this file wants a `mam`-sourced serial and does
 /// not care what it is — `"REBUILDSERIAL"` was always meant to represent one
 /// (issue #165's cartridge-binding tests are the first to need the other
@@ -393,31 +403,52 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let mut stage_set_ids = Vec::new();
     let mut expected_plain_hashes = Vec::new();
     let mut unit_ids = Vec::new();
+    let mut unit_uuids: Vec<String> = Vec::new();
+    let two_versions = TWO_VERSIONS_OF_ONE_UNIT.with(|t| t.get());
 
     for (i, (unit_name, tenant_name, content)) in UNITS.iter().enumerate() {
+        // [`TWO_VERSIONS_OF_ONE_UNIT`]: the second entry is the first unit's v8.
+        let second_version = two_versions && i == 1;
+        let (unit_name, tenant_name) = if second_version {
+            (&UNITS[0].0, &UNITS[0].1)
+        } else {
+            (unit_name, tenant_name)
+        };
+        let version: i64 = if second_version { 8 } else { 7 };
         let tenant = if *tenant_name == "alpha" {
             &alpha
         } else {
             &bravo
         };
         let unit_uuid = match FIRST_UNIT_UUID.with(|u| u.get()).filter(|_| i == 0) {
+            _ if second_version => unit_uuids[0].clone(),
             Some(uuid) => uuid.to_string(),
             None if with_catalogues => format!("c{i:07x}-0000-4000-8000-{i:012x}"),
             None => format!("unit-uuid-{i:04}"),
         };
-        conn.execute(
-            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
-             VALUES (?1, ?2, ?3, ?4, 'active')",
-            rusqlite::params![unit_uuid, unit_name, tenant.tenant_id, "/src/data"],
-        )
-        .unwrap();
-        let unit_id = conn.last_insert_rowid();
+        let unit_id = if second_version {
+            unit_ids[0]
+        } else {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                rusqlite::params![unit_uuid, unit_name, tenant.tenant_id, "/src/data"],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
         unit_ids.push(unit_id);
+        unit_uuids.push(unit_uuid.clone());
 
         conn.execute(
             "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
-             VALUES (?1, 7, 'staged', ?2, 2, ?3)",
-            rusqlite::params![unit_id, format!("/src/{unit_name}"), content.len() as i64],
+             VALUES (?1, ?4, 'staged', ?2, 2, ?3)",
+            rusqlite::params![
+                unit_id,
+                format!("/src/{unit_name}"),
+                content.len() as i64,
+                version
+            ],
         )
         .unwrap();
         let snapshot_id = conn.last_insert_rowid();
@@ -440,24 +471,25 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             }
         }
 
+        let slice_size: i64 = if second_version {
+            20_971_520
+        } else {
+            10_485_760
+        };
         conn.execute(
-            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 10485760)",
-            rusqlite::params![snapshot_id],
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', ?2)",
+            rusqlite::params![snapshot_id, slice_size],
         )
         .unwrap();
         let stage_set_id = conn.last_insert_rowid();
         stage_set_ids.push(stage_set_id);
+        let mut receipt = vec![tenant.public_key.as_str(), operator.public_key.as_str()];
+        if !(two_versions && i == 0) {
+            receipt.push(escrow.public_key.as_str());
+        }
         conn.execute(
             "UPDATE stage_sets SET key_fingerprints = ?1 WHERE id = ?2",
-            rusqlite::params![
-                serde_json::to_string(&[
-                    tenant.public_key.as_str(),
-                    operator.public_key.as_str(),
-                    escrow.public_key.as_str(),
-                ])
-                .unwrap(),
-                stage_set_id
-            ],
+            rusqlite::params![serde_json::to_string(&receipt).unwrap(), stage_set_id],
         )
         .unwrap();
 
@@ -515,7 +547,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
 
         let catalog_path = with_catalogues.then(|| {
             // `stage create`'s layout: <catalogs>/<uuid8>/s<id>/<uuid8>_v<N>
-            let stem = format!("{}_v7", &unit_uuid[..8]);
+            let stem = format!("{}_v{version}", &unit_uuid[..8]);
             let dir = catalogues_dir.path().join(format!("s{stage_set_id}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -534,7 +566,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             dar_version: Some("2.7.20".to_string()),
             dar_command: None,
             catalog_path,
-            snapshot_version: 7,
+            snapshot_version: version,
             slices,
             span: None,
         });
@@ -6744,4 +6776,66 @@ fn a_refused_unit_is_rebuilt_once_the_catalogs_unit_is_renamed() {
     assert_eq!(copies(&conn, "photos/2019"), 1);
     assert_eq!(copies(&conn, "photos/2019-a"), 1);
     assert_restorable_from(&conn, &mut b);
+}
+
+// ── Issue #527, B14: one unit in two stage sets on one tape ──────────────
+
+/// `(version, key_fingerprints, slice_size)` of every stage set of the unit
+/// of `uuid`, by version.
+fn sets_of_unit(conn: &rusqlite::Connection, uuid: &str) -> Vec<(i64, Option<String>, i64)> {
+    conn.prepare(
+        "SELECT s.version, ss.key_fingerprints, ss.slice_size FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE u.uuid = ?1 ORDER BY s.version",
+    )
+    .unwrap()
+    .query_map(rusqlite::params![uuid], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// The facts only `catalog.db` carries of a stage set (its escrow receipt
+/// and its slice size) are the facts of THAT stage set, found by the
+/// block's `stage_set_id` and the unit's uuid, never by the unit's name. By
+/// name, both of a unit's sets took the higher-id set's: version 7, staged
+/// before the escrow recipient was registered (a real gap), read `covered`.
+#[test]
+fn two_stage_sets_of_one_unit_on_one_tape_keep_their_own_receipts() {
+    TWO_VERSIONS_OF_ONE_UNIT.with(|t| t.set(true));
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    TWO_VERSIONS_OF_ONE_UNIT.with(|t| t.set(false));
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let written = sets_of_unit(&vol.source_conn, "unit-uuid-0000");
+    assert_eq!(
+        written.iter().map(|s| s.0).collect::<Vec<_>>(),
+        vec![7, 8],
+        "the fixture writes one unit in two stage sets"
+    );
+    assert_ne!(written[0].1, written[1].1, "two receipts");
+    assert_ne!(written[0].2, written[1].2, "two slice sizes");
+    assert_eq!(sets_of_unit(&conn, "unit-uuid-0000"), written);
+
+    // The verdict the receipts give: v7 is a gap, v8 covered.
+    let escrow_pub = vol.escrow_public.clone();
+    let verdict = |receipt: &Option<String>| {
+        tapectl::policy::escrow::marker(
+            receipt.as_deref(),
+            tapectl::policy::escrow::Origin::parse("rebuilt"),
+            Some(&escrow_pub),
+        )
+    };
+    let rebuilt = sets_of_unit(&conn, "unit-uuid-0000");
+    assert_ne!(verdict(&rebuilt[0].1), verdict(&rebuilt[1].1));
+    assert_eq!(verdict(&rebuilt[1].1), verdict(&written[1].1));
+    assert_eq!(verdict(&rebuilt[0].1), verdict(&written[0].1));
 }
