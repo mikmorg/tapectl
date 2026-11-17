@@ -12,7 +12,11 @@
 //!    or not a tapectl ID thunk at all. A blank tape is reported blank and the
 //!    command succeeds having done nothing — and so does an EMPTY File 0
 //!    under the default short erase, which is exactly the state that erase
-//!    leaves.
+//!    leaves — once the catalog half of step 2 agrees (issue #536): a volume
+//!    the catalog still has on that cartridge (by the chip serial) is
+//!    refused if it is live, naming `cartridge mark-erased`, and if it is
+//!    given up is owed its record, so the erase runs as for any recorded
+//!    tape and is recorded.
 //! 2. **Cross-check the catalog** by File 0's uuid and by the chip serial
 //!    (the cartridge it names, and the volumes mounted on it). A volume the
 //!    catalog has not given up ([`coverage::given_up`]: anything but
@@ -310,6 +314,18 @@ impl EraseReport {
                         format!("{label}, another catalog's volume")
                     }
                     None => format!("{label}, {}", self.medium.describe()),
+                }
+            }
+            (kind @ (MediumKind::Blank | MediumKind::Empty), _) => {
+                match self.catalog_volumes.first() {
+                    // #536: the record a given-up volume is owed.
+                    Some(v) => format!(
+                        "{}; the catalog's {} volume {} is on this cartridge",
+                        kind.describe(),
+                        v.status,
+                        v.label
+                    ),
+                    None => kind.describe().to_string(),
                 }
             }
             (kind, _) => kind.describe().to_string(),
@@ -663,24 +679,7 @@ fn cross_check(
         }
     }
     if let Some(c) = &cartridge {
-        let mut stmt = conn.prepare(
-            "SELECT v.id, v.label, v.uuid, v.status, v.observed_condition
-             FROM cartridge_volumes cv JOIN volumes v ON v.id = cv.volume_id
-             WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL ORDER BY v.id",
-        )?;
-        let mounted = stmt
-            .query_map(params![c.id], |r| {
-                Ok(CatalogVolume {
-                    id: r.get(0)?,
-                    label: r.get(1)?,
-                    uuid: r.get(2)?,
-                    status: r.get(3)?,
-                    condition: r.get(4)?,
-                    matched_by: "chip serial",
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for v in mounted {
+        for v in mounted_on(conn, c.id)? {
             if !volumes.iter().any(|known| known.id == v.id) {
                 volumes.push(v);
             }
@@ -744,6 +743,105 @@ fn cross_check(
     })
 }
 
+/// The open mounts on cartridge `cartridge_id`, as the cross-check reports
+/// them: matched by the chip serial.
+fn mounted_on(conn: &Connection, cartridge_id: i64) -> Result<Vec<CatalogVolume>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.label, v.uuid, v.status, v.observed_condition
+         FROM cartridge_volumes cv JOIN volumes v ON v.id = cv.volume_id
+         WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL ORDER BY v.id",
+    )?;
+    let mounted = stmt
+        .query_map(params![cartridge_id], |r| {
+            Ok(CatalogVolume {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                uuid: r.get(2)?,
+                status: r.get(3)?,
+                condition: r.get(4)?,
+                matched_by: "chip serial",
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(mounted)
+}
+
+/// Issue #536: what the catalog still has on the cartridge whose tape reads
+/// blank or EMPTY, read-only, before "nothing to erase" is said. Found by the
+/// chip serial alone (such a tape has no File 0 to name a uuid), so with no
+/// serial, or a serial no cartridge carries, nothing is found and nothing
+/// changes. Fills the report's catalog lines. A volume the catalog has not
+/// given up refuses, naming `cartridge mark-erased` with the flag it needs
+/// from the cartridge's status (the tape untouched, exit 2). Returns the
+/// given-up volumes still to be recorded erased: empty when nothing is owed.
+fn owed_on_a_tape_with_nothing_on_it(
+    conn: &Connection,
+    device: &str,
+    report: &mut EraseReport,
+    serial: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(serial) = serial else {
+        return Ok(Vec::new());
+    };
+    let Some(cartridge) = binding::select_cartridge(conn, "serial_number", serial)? else {
+        return Ok(Vec::new());
+    };
+    report.catalog_cartridge = Some(CatalogCartridge {
+        barcode: cartridge.barcode.clone(),
+        status: cartridge.status.clone(),
+    });
+    let volumes = mounted_on(conn, cartridge.id)?;
+    report.catalog_volumes = volumes.clone();
+    let reads = match report.medium {
+        MediumKind::Blank => "blank",
+        _ => "EMPTY (a filemark at its beginning)",
+    };
+    for v in &volumes {
+        if coverage::is_given_up(conn, v.id)? {
+            continue;
+        }
+        let copy = if coverage::counts_as_copy(conn, &v.label)? {
+            "it counts as a live copy"
+        } else {
+            "the catalog has not given it up"
+        };
+        let barcode = &cartridge.barcode;
+        let remedy = match cartridge.status.as_str() {
+            // `mark-erased` refuses a retired_permanent cartridge outright
+            // (ADR-0011): the volume is given up by `volume retire`.
+            "retired_permanent" => format!(
+                "`tapectl volume retire {}` (the cartridge is retired_permanent, which \
+                 `cartridge mark-erased` refuses)",
+                v.label
+            ),
+            // The end of the retire -> erase -> mark-erased lifecycle: no
+            // consent asked.
+            "pending_erase" => format!("`tapectl cartridge mark-erased {barcode}`"),
+            other => format!(
+                "`tapectl cartridge mark-erased {barcode} --force` (from cartridge status \
+                 {other} it asks consent: --force, or the global --yes)"
+            ),
+        };
+        return Err(TapectlError::Other(format!(
+            "cartridge erase refused: the tape in {device} reads {reads}, so there is nothing \
+             on it to erase, but the catalog has volume \"{}\" on this cartridge ({barcode}, \
+             matched by chip serial) as {} (condition {}) — {copy}. The tape and the catalog \
+             disagree, and the catalog goes on counting what the tape does not hold until it \
+             is told. If the volume's bytes are gone (the tape was erased by hand, or never \
+             held them), say so: {remedy}; it refuses while the volume holds the last copy of \
+             a unit, and names what to do first. If they are not gone (another tape wears \
+             this cartridge's chip, or the drive cannot read it), `tapectl volume identify \
+             --device {device}` shows the tape. Nothing was written.",
+            v.label, v.status, v.condition
+        )));
+    }
+    Ok(volumes
+        .into_iter()
+        .filter(|v| v.status != "erased")
+        .map(|v| v.label)
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn erase_in_contact(
     conn: &Connection,
@@ -784,14 +882,43 @@ fn erase_in_contact(
         _ => false,
     };
     if nothing_to_do {
-        report.notes.push(match report.medium {
-            MediumKind::Blank => "the tape is blank: there is nothing to erase".to_string(),
-            _ => "File 0 is already EMPTY, which is what the short erase leaves: nothing to \
-                  erase (--long erases the whole medium)"
-                .to_string(),
-        });
-        report.outcome = EraseOutcome::NothingToErase;
-        return Ok(report);
+        // Issue #536: the catalog half first, read-only. A tape with nothing
+        // on it is "nothing to erase" only while the catalog agrees: a volume
+        // it still has on this cartridge (by the chip serial; a blank or
+        // EMPTY tape names no uuid) is refused if live, and if given up is
+        // owed the record its erase never got, which the erase below makes.
+        let owed = match owed_on_a_tape_with_nothing_on_it(conn, device, &mut report, serial) {
+            Ok(owed) => owed,
+            Err(e) => {
+                show(&report.lines());
+                return Err(e);
+            }
+        };
+        if owed.is_empty() {
+            report.notes.push(match report.medium {
+                MediumKind::Blank => "the tape is blank: there is nothing to erase".to_string(),
+                _ => "File 0 is already EMPTY, which is what the short erase leaves: nothing to \
+                      erase (--long erases the whole medium)"
+                    .to_string(),
+            });
+            report.outcome = EraseOutcome::NothingToErase;
+            return Ok(report);
+        }
+        report.notes.push(format!(
+            "the tape reads {}, but the catalog still has {} on this cartridge, given up and \
+             never recorded erased (an erase by hand, or one whose record did not finish): \
+             the {} erase runs again, so that what is recorded is an erase this command made \
+             and read back",
+            match report.medium {
+                MediumKind::Blank => "blank",
+                _ => "EMPTY",
+            },
+            owed.iter()
+                .map(|l| format!("volume \"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            opts.mode.as_str()
+        ));
     }
 
     // ── 2. cross-check the catalog ──
@@ -2232,5 +2359,211 @@ mod tests {
         let err = consent(&conn, &foreign);
         assert!(err.contains("(not written by tapectl)"), "{err}");
         assert!(err.contains(&format!("--confirm-label {SERIAL}")), "{err}");
+    }
+
+    // ── #536: a tape that reads blank or EMPTY, and a catalog that still
+    //    has a volume on that cartridge ──
+
+    /// The blank tape and the EMPTY File 0 (under the short erase) the
+    /// cross-check used to be skipped for.
+    fn nothing_on_it() -> [(&'static str, FakeTape); 2] {
+        [
+            ("blank", FakeTape::with_files(Vec::new(), BS)),
+            ("EMPTY", FakeTape::with_files(vec![Vec::new()], BS)),
+        ]
+    }
+
+    /// #536: a live sealed volume the catalog binds (by the chip serial) to
+    /// a cartridge whose tape reads blank or EMPTY is no longer "nothing to
+    /// erase", exit 0: the command refuses, the tape untouched, names the
+    /// volume, and names `cartridge mark-erased <barcode>` with the flag it
+    /// needs from the cartridge's status. A dry run refuses the same way.
+    #[test]
+    fn a_live_volume_on_a_cartridge_that_reads_blank_or_empty_is_refused_naming_mark_erased() {
+        for (what, fake) in nothing_on_it() {
+            for dry_run in [false, true] {
+                let conn = crate::db::open_memory().unwrap();
+                let c = add_cartridge(&conn, "L6-0009", SERIAL, "in_use");
+                let v = add_volume(&conn, "L6-0009", UUID, "sealed");
+                mount(&conn, c, v);
+                let (r, shown) = run_showing(
+                    &conn,
+                    &fake,
+                    opts(EraseMode::Short, None, dry_run),
+                    &[Some(SERIAL)],
+                    None,
+                );
+                let err = r.expect_err("a live volume on the cartridge is refused");
+                let msg = err.to_string();
+                assert!(msg.contains("volume \"L6-0009\""), "{what}: {msg}");
+                assert!(
+                    msg.contains("`tapectl cartridge mark-erased L6-0009 --force`"),
+                    "{what}: {msg}"
+                );
+                assert!(msg.contains("Nothing was written"), "{what}: {msg}");
+                assert_eq!(exit_code(err), 2, "{what}");
+                assert!(writes(&fake).is_empty(), "{what}");
+                assert_eq!(status_of(&conn, "volumes", v), "sealed", "{what}");
+                assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0, "{what}");
+                assert_eq!(shown.len(), 1, "{what}: the facts, once: {shown:?}");
+                assert!(
+                    shown[0]
+                        .iter()
+                        .any(|l| l.contains("volume L6-0009 — sealed")),
+                    "{what}: {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// From `pending_erase` the remedy needs no flag: `mark-erased` asks no
+    /// consent there.
+    #[test]
+    fn the_remedy_names_no_flag_from_pending_erase() {
+        let conn = crate::db::open_memory().unwrap();
+        let c = add_cartridge(&conn, "L6-0009", SERIAL, "pending_erase");
+        let v = add_volume(&conn, "L6-0009", UUID, "sealed");
+        mount(&conn, c, v);
+        let fake = FakeTape::with_files(Vec::new(), BS);
+        let msg = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, false),
+            &[Some(SERIAL)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("`tapectl cartridge mark-erased L6-0009`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--force"), "{msg}");
+    }
+
+    /// The remedy, tried in the state that printed it: `cartridge
+    /// mark-erased L6-0009` refuses unattended without `--force`, and with
+    /// it records the volume erased; `cartridge erase` then has nothing to
+    /// erase and nothing owed, and succeeds.
+    #[test]
+    fn the_named_mark_erased_works_and_the_erase_then_succeeds() {
+        let conn = crate::db::open_memory().unwrap();
+        let c = add_cartridge(&conn, "L6-0009", SERIAL, "in_use");
+        let v = add_volume(&conn, "L6-0009", UUID, "sealed");
+        mount(&conn, c, v);
+        let fake = FakeTape::with_files(Vec::new(), BS);
+        let msg = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, false),
+            &[Some(SERIAL)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("mark-erased L6-0009 --force"), "{msg}");
+
+        let unforced = crate::cli::operations::cartridge_mark_erased(
+            &conn, "L6-0009", false, false, false, false,
+        );
+        assert!(unforced.is_err(), "the flag is needed from in_use");
+        crate::cli::operations::cartridge_mark_erased(&conn, "L6-0009", true, false, false, false)
+            .expect("the remedy as printed");
+        assert_eq!(status_of(&conn, "volumes", v), "erased");
+
+        let report = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, false),
+            &[Some(SERIAL)],
+        )
+        .expect("nothing owed now");
+        assert_eq!(report.outcome, EraseOutcome::NothingToErase);
+        assert!(writes(&fake).is_empty());
+    }
+
+    /// #536 and #537: a volume the catalog has GIVEN UP (retired) on a
+    /// cartridge whose tape reads blank or EMPTY — an erase by hand, or one
+    /// whose record did not finish — is owed its record. The short erase
+    /// runs again (seconds), is read back and is recorded, so the record is
+    /// true and `volume init` takes its proof (item 57). The word is the
+    /// chip serial: the tape carries no label.
+    #[test]
+    fn a_retired_volume_on_a_cartridge_that_reads_blank_or_empty_is_erased_again_and_recorded() {
+        for (what, fake) in nothing_on_it() {
+            let conn = crate::db::open_memory().unwrap();
+            let c = add_cartridge(&conn, "L6-0001", SERIAL, "pending_erase");
+            let v = add_volume(&conn, "L6-0001", UUID, "retired");
+            mount(&conn, c, v);
+
+            let probe = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, None, true),
+                &[Some(SERIAL)],
+            )
+            .expect("a dry run");
+            assert_eq!(probe.outcome, EraseOutcome::WouldErase, "{what}");
+            assert_eq!(probe.confirm_label.as_deref(), Some(SERIAL), "{what}");
+            assert!(
+                probe
+                    .lines()
+                    .iter()
+                    .any(|l| l.contains("volume L6-0001 — retired")),
+                "{what}: {:?}",
+                probe.lines()
+            );
+
+            // The volume's label is not the word: the tape does not carry it.
+            let refused = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, Some("L6-0001"), false),
+                &[Some(SERIAL)],
+            );
+            assert!(refused.is_err(), "{what}");
+            assert!(writes(&fake).is_empty(), "{what}");
+
+            let report = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, Some(SERIAL), false),
+                &[Some(SERIAL)],
+            )
+            .expect("erased again and recorded");
+            assert_eq!(report.outcome, EraseOutcome::Erased, "{what}");
+            assert_eq!(report.medium_after, Some(MediumKind::Empty), "{what}");
+            let r = report.recorded.expect("recorded");
+            assert_eq!(r.volumes_erased, vec!["L6-0001".to_string()], "{what}");
+            assert_eq!(status_of(&conn, "volumes", v), "erased", "{what}");
+            assert_eq!(status_of(&conn, "cartridges", c), "available", "{what}");
+            assert_eq!(contact(&conn).2, Some(c), "{what}");
+        }
+    }
+
+    /// The control: a blank or EMPTY tape on a cartridge the catalog knows
+    /// with nothing left on it (its volume already erased) is still nothing
+    /// to erase, and a success.
+    #[test]
+    fn a_known_cartridge_with_nothing_owed_is_still_nothing_to_erase() {
+        for (what, fake) in nothing_on_it() {
+            let conn = crate::db::open_memory().unwrap();
+            let c = add_cartridge(&conn, "L6-0001", SERIAL, "available");
+            let v = add_volume(&conn, "L6-0001", UUID, "erased");
+            mount(&conn, c, v);
+            conn.execute(
+                "UPDATE cartridge_volumes SET unmounted_at = datetime('now')",
+                [],
+            )
+            .unwrap();
+            let report = run(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, None, false),
+                &[Some(SERIAL)],
+            )
+            .expect("nothing to erase");
+            assert_eq!(report.outcome, EraseOutcome::NothingToErase, "{what}");
+            assert!(writes(&fake).is_empty(), "{what}");
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0, "{what}");
+        }
     }
 }

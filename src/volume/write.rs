@@ -6184,11 +6184,23 @@ fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Resu
              (`tapectl volume verify {label}`), then `tapectl volume resume {label}`."
         ));
     }
+    // #536: `mark-erased` takes the cartridge's barcode. Once `volume
+    // retire` has given up the last live volume on it, the cartridge is
+    // `pending_erase`, where `mark-erased` asks no consent.
+    let barcode: Option<String> = conn
+        .query_row(
+            "SELECT c.barcode FROM cartridge_volumes cv JOIN cartridges c ON c.id = cv.cartridge_id
+             WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let barcode = barcode.unwrap_or_else(|| "<barcode>".to_string());
     msg.push_str(&format!(
         " To reuse the cartridge instead: retire this volume (`tapectl volume retire {label}`), \
          then `tapectl cartridge erase`, which erases the tape in the drive, reads it back and \
-         records it — or {ERASE_IN_THE_DRIVE} yourself and run `tapectl cartridge mark-erased` \
-         before writing to it again. {NEVER_DEGAUSS}"
+         records it — or {ERASE_IN_THE_DRIVE} yourself and run `tapectl cartridge mark-erased \
+         {barcode}` before writing to it again. {NEVER_DEGAUSS}"
     ));
     Ok(msg)
 }
@@ -18695,9 +18707,11 @@ mod tests {
         );
         assert!(recorded.contains("`mt -f <device> erase`"), "{recorded}");
         assert!(recorded.contains("weof 1"), "{recorded}");
+        // #536: named with the cartridge, ready to run once `volume
+        // retire` has left the cartridge `pending_erase`.
         assert!(
-            recorded.contains("`tapectl cartridge mark-erased`"),
-            "{recorded}"
+            recorded.contains("`tapectl cartridge mark-erased <barcode>`"),
+            "no cartridge recorded for the volume: {recorded}"
         );
         assert!(
             !contact.contains("mt -f"),
@@ -28443,6 +28457,52 @@ mod tests {
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err()
+    }
+
+    /// #536: the seal-recorded refusal's `mark-erased` names the cartridge
+    /// the volume is on, and the recipe runs as printed: `volume retire`
+    /// gives the volume up and leaves the cartridge `pending_erase`, where
+    /// `cartridge mark-erased <barcode>` asks no consent.
+    #[test]
+    fn the_seal_recorded_refusal_names_the_cartridge_to_mark_erased_and_it_works() {
+        let (conn, volume_id) = seal_recorded_fixture(true, None);
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status, serial_number)
+             VALUES ('L6-CART', 'LTO-6', 2500000000000, 'in_use', 'CHIP-1')",
+            [],
+        )
+        .unwrap();
+        let cartridge_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+            params![cartridge_id, volume_id],
+        )
+        .unwrap();
+        let msg = seal_recorded_refusal(&conn, "L6-SEALED", volume_id).unwrap();
+        assert!(
+            msg.contains("`tapectl cartridge mark-erased L6-CART`"),
+            "{msg}"
+        );
+
+        crate::cli::operations::volume_retire(
+            &conn,
+            &Config::default(),
+            "L6-SEALED",
+            true,
+            false,
+            false,
+        )
+        .expect("the first step as printed");
+        crate::cli::operations::cartridge_mark_erased(&conn, "L6-CART", false, false, false, false)
+            .expect("the second step as printed, unattended and without a flag");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "erased");
     }
 
     /// Issue #330: a volume whose seal the catalog RECORDS is never written

@@ -526,6 +526,21 @@ pub(crate) fn refuse_unwitnessed_displacement(
             only_copies.join(" and ")
         )
     };
+    // #536: `cartridge mark-erased` asks its own consent from any status
+    // but `pending_erase` (`--force`, or the global `--yes`), and an
+    // unattended run without it is refused; the remedy carries the flag.
+    let (mark_erased_flag, mark_erased_why) = if row.status == "pending_erase" {
+        (String::new(), String::new())
+    } else {
+        (
+            " --force".to_string(),
+            format!(
+                "(its --force is mark-erased's own consent, asked from cartridge status {}; \
+                 it does not reach the floor below)\n",
+                row.status
+            ),
+        )
+    };
     // Which way the "different tape" half goes depends on whether the drive
     // can name the medium it holds.
     let own_cartridge = match serial {
@@ -560,11 +575,12 @@ pub(crate) fn refuse_unwitnessed_displacement(
          overwritten, so say they are gone first, then re-run this init:\n\
          {retires}\n\
          or, if the whole cartridge is wiped:\n    \
-         tapectl cartridge mark-erased {barcode}\n\
+         tapectl cartridge mark-erased {barcode}{mark_erased_flag}\n\
+         {mark_erased_why}\
          \n\
          {copy_first}\
-         There is no --force for this — it is a fact tapectl cannot resolve on its own, \
-         not a risk to accept."
+         There is no --force for this init — it is a fact tapectl cannot resolve on its \
+         own, not a risk to accept."
     )))
 }
 
@@ -3337,6 +3353,39 @@ mod tests {
             err.contains("no --force for this"),
             "the refusal must close the --force door explicitly; got: {err}"
         );
+
+        // #536: the mark-erased remedy carries the flag it needs from the
+        // cartridge's status, and in that state it works as printed, while
+        // the bare spelling is refused unattended.
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cartridges WHERE barcode = 'BC002'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(status, "pending_erase");
+        assert!(
+            err.contains("tapectl cartridge mark-erased BC002 --force\n"),
+            "{err}"
+        );
+        assert!(
+            crate::cli::operations::cartridge_mark_erased(
+                &conn, "BC002", false, false, false, false
+            )
+            .is_err(),
+            "unattended, the bare spelling is refused"
+        );
+        crate::cli::operations::cartridge_mark_erased(&conn, "BC002", true, false, false, false)
+            .expect("the remedy as printed");
+        let volume: String = conn
+            .query_row(
+                "SELECT status FROM volumes WHERE label = 'L6-SEALED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume, "erased");
     }
 
     /// #468: the refusal's remedy offered only `volume retire` and `cartridge
@@ -3401,7 +3450,7 @@ mod tests {
             &[
                 "tapectl cartridge register --barcode BC009 --generation LTO-6",
                 "tapectl volume retire L6-SEALED",
-                "tapectl cartridge mark-erased BC002",
+                "tapectl cartridge mark-erased BC002 --force",
             ],
         );
         assert!(

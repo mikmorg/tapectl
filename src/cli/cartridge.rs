@@ -143,7 +143,11 @@ pub enum CartridgeCommands {
     ///    the seal and its front-index totals — or that the tape is blank,
     ///    that File 0 is EMPTY, unreadable, or not written by tapectl. A
     ///    blank tape (and an EMPTY File 0, under the short erase) is left
-    ///    alone: there is nothing to erase, and the command succeeds.
+    ///    alone: there is nothing to erase, and the command succeeds —
+    ///    unless the catalog still has a volume on that cartridge (by its
+    ///    chip serial). A live one is refused, naming `cartridge
+    ///    mark-erased`; a `retired` one is owed the record of its erase, so
+    ///    the erase runs as below, confirmed by the chip serial.
     /// 2. Cross-checks the catalog by File 0's uuid and by the chip serial.
     ///    A volume the catalog still holds — anything not `retired` or
     ///    `erased`, a live copy above all — is refused, naming `volume
@@ -178,7 +182,8 @@ pub enum CartridgeCommands {
     ///
     /// Exit status: 0 = erased and verified (also: nothing to erase, and
     /// `--dry-run`). 2 = refused, the tape untouched (among others: the chip
-    /// serial unreadable; or a usage error). 3 = erased, but the read-back
+    /// serial unreadable; a blank or EMPTY tape the catalog still has a live
+    /// volume on; or a usage error). 3 = erased, but the read-back
     /// reached no verdict (or the tape could not be reopened for it);
     /// nothing recorded —
     /// run it again. 4 = the erase failed part-way; nothing recorded — run it

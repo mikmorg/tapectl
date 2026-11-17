@@ -219,16 +219,25 @@ where the meaning is the same:
 
 | Exit | Meaning | What to do |
 |---|---|---|
-| 0 | **erased and verified**: File 0 reads back EMPTY (the default short erase) or blank (`--long`), the chip serial is unchanged, and the catalog records it. Also: a blank tape, or an EMPTY File 0 under the short erase (nothing to erase), and `--dry-run` | nothing; `volume init` comes next and needs no `--force`: this catalog's record of the verified erase is the proof (ADR-0012 item 57) |
-| 2 | **refused, the tape untouched**: no cartridge, a write-protected one, a volume the catalog still holds (it names `volume retire`), a label that was not confirmed or does not match, a tape and catalog that disagree about which cartridge this is, the chip serial unreadable (the MAM read on `device_sg` failed: `tapectl volume identify` shows what the chip reports, `tapectl config check` checks the drive's `device_sg`), the chip naming a different cartridge just before the erase (one swapped while consent was asked), or a usage error | read the `error:` line, act on it, run the command again |
+| 0 | **erased and verified**: File 0 reads back EMPTY (the default short erase) or blank (`--long`), the chip serial is unchanged, and the catalog records it. A tape that already reads blank or EMPTY is erased again when the catalog still has a given-up (`retired`) volume on that cartridge, so that the erase it never recorded is recorded; the word to confirm it with is then the chip serial | nothing; `volume init` comes next and needs no `--force`: this catalog's record of the verified erase is the proof (ADR-0012 item 57) |
+| 0 | **nothing to erase, the tape blank** (end of data at its beginning), and the catalog has nothing on the cartridge | nothing; `volume init` needs no `--force`: a blank tape proves itself |
+| 0 | **nothing to erase, File 0 EMPTY** under the short erase, and the catalog has nothing on the cartridge | `volume init` needs no `--force` only when this catalog erased and verified this cartridge itself and nothing was written to it since (the record of that erase is the proof). An EMPTY File 0 nothing recorded (a filemark written by hand, `mt weof 1`) is not proof: `volume init --force`, or `cartridge erase --long` first |
+| 0 | `--dry-run` | nothing |
+| 2 | **refused, the tape untouched**: no cartridge, a write-protected one, a volume the catalog still holds (it names `volume retire`), a tape that reads blank or EMPTY while the catalog still has a live volume on that cartridge (it names `cartridge mark-erased <barcode>`, with `--force` unless the cartridge is `pending_erase`), a label that was not confirmed or does not match, a tape and catalog that disagree about which cartridge this is, the chip serial unreadable (the MAM read on `device_sg` failed: `tapectl volume identify` shows what the chip reports, `tapectl config check` checks the drive's `device_sg`), the chip naming a different cartridge just before the erase (one swapped while consent was asked), or a usage error | read the `error:` line, act on it, run the command again |
 | 3 | **unverified**: the erase ran, but the tape could not be reopened to read it back, File 0 could not be read back and the tape does not prove itself blank, or the chip could not be read after it. Nothing was recorded | check the drive, run `cartridge erase` again |
 | 4 | **the erase failed part-way**: the tape may be partly erased. Nothing was recorded | check the drive, run `cartridge erase` again |
 | 6 | **the read-back contradicts the erase**: File 0 still holds what was there, or the chip reports a different serial. Nothing was recorded | check which cartridge is loaded and the drive (clean it), then run it again |
 | 75 | the catalog was busy ([above](#75-catalog-busy)) | run it again once the other command has finished |
 
 A verified erase whose catalog record does not finish (a database error)
-still exits 0: the tape is erased. The command prints a `warning:` line, and
-`tapectl cartridge mark-erased <barcode>` records it.
+still exits 0: the tape is erased. The command prints a `warning:` line. When
+the catalog has a volume on that cartridge, `tapectl cartridge erase` run
+again records it: the tape reads EMPTY, the catalog still owes the record,
+and the erase runs again, is read back and is recorded, so `volume init` then
+needs no `--force`.
+`tapectl cartridge mark-erased <barcode>` (`--force` unless the cartridge is
+`pending_erase`) records it too, but records no verified erase: `volume init`
+then needs `--force`.
 
 ---
 
