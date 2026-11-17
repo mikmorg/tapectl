@@ -33,6 +33,7 @@ use crate::error::{Result, TapectlError};
 /// break every command that touches it.
 pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
+    refuse_another_catalog(&conn, path)?;
     configure(&conn)?;
     migrate(&mut conn)?;
     recover_orphaned_sessions(&conn, path)?;
@@ -50,6 +51,50 @@ pub fn open(path: &Path) -> Result<Connection> {
         }
     }
     Ok(conn)
+}
+
+/// The mark of a 2.x catalog: SQLite's `application_id`, set by the
+/// baseline schema (the plan's D9), 0x54504354, the bytes "TPCT". tapectl
+/// 1.x set none, so its catalogs read 0.
+pub const APPLICATION_ID: i64 = 0x5450_4354;
+
+/// Why a catalog of tapectl 1.x is not opened (ADR-0012 item 258): there is
+/// no upgrade from 1.x, and the release that reads it is named.
+const MADE_BY_1X: &str = "made by tapectl 1.x; tapectl 2.0.0 does not upgrade it \
+                          (ADR-0012 item 258): start a new catalog, or use tapectl 1.9.2 \
+                          for this one";
+
+/// Refuse a database this tapectl did not make, before anything writes to
+/// it (`configure()` would set WAL mode, a migration would create tables):
+/// one that has tables and does not carry [`APPLICATION_ID`] is a 1.x
+/// catalog (or no catalog of tapectl's) and is named, never migrated. A file
+/// with no table is a new catalog. Two plain reads, so an open still never
+/// needs the write lock (issue #377).
+fn refuse_another_catalog(conn: &Connection, path: &Path) -> Result<()> {
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    if application_id == APPLICATION_ID || !has_tables(conn)? {
+        return Ok(());
+    }
+    Err(TapectlError::Migration(if application_id == 0 {
+        format!("the catalog at {} was {MADE_BY_1X}", path.display())
+    } else {
+        format!(
+            "{} is not a catalog of tapectl's (its SQLite application_id is {application_id:#x}, \
+             a 2.x catalog's is {APPLICATION_ID:#x})",
+            path.display()
+        )
+    }))
+}
+
+/// Whether the database holds any table of its own (SQLite's `sqlite_*`
+/// tables aside).
+fn has_tables(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\')",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// Build `<path>-wal` / `<path>-shm` the way SQLite itself names them —
@@ -269,6 +314,7 @@ fn migrate_to(conn: &mut Connection, target: Option<usize>) -> Result<()> {
 /// exit — never hand it to any other command body.
 pub fn open_for_repair(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    refuse_another_catalog(&conn, path)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(conn)
@@ -417,6 +463,19 @@ fn check_import_conn(
                 format!("; no {} table", missing.join(", no "))
             }
         )));
+    }
+    // Before the version check, which would call a 1.x catalog (version 41)
+    // a newer tapectl's.
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    if application_id != APPLICATION_ID {
+        return Err(refuse(if application_id == 0 {
+            format!("it is a catalog {MADE_BY_1X}")
+        } else {
+            format!(
+                "it is not a catalog of tapectl's (its SQLite application_id is \
+                 {application_id:#x}, a 2.x catalog's is {APPLICATION_ID:#x})"
+            )
+        }));
     }
     let latest = latest_schema_version()?;
     if schema_version > latest {
@@ -913,6 +972,124 @@ mod tests {
             assert_eq!(latest_schema_version().unwrap(), 2);
         });
         assert!(schema_is_current(&conn).unwrap());
+    }
+
+    // --- A 1.x catalog is refused by name (ADR-0012 item 258, the plan's D9) ---
+
+    /// The 2.x catalog's mark: SQLite's `application_id`, "TPCT".
+    const TAPECTL_2X_APPLICATION_ID: i64 = 0x5450_4354;
+
+    fn application_id(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA application_id", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A file shaped as 1.x left a catalog: tables, `user_version` 41, no
+    /// `application_id` (1.x set none), WAL mode.
+    fn write_1x_catalog(db_path: &std::path::Path) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+             CREATE TABLE tenants (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+             INSERT INTO tenants (name) VALUES ('operator');
+             PRAGMA user_version = 41;",
+        )
+        .unwrap();
+    }
+
+    fn assert_names_1x(text: &str) {
+        for needle in [
+            "made by tapectl 1.x",
+            "tapectl 2.0.0 does not upgrade it (ADR-0012 item 258)",
+            "start a new catalog, or use tapectl 1.9.2 for this one",
+        ] {
+            assert!(text.contains(needle), "{needle:?} not in: {text}");
+        }
+    }
+
+    #[test]
+    fn a_new_catalog_carries_the_2x_application_id() {
+        assert_eq!(
+            application_id(&open_memory().unwrap()),
+            TAPECTL_2X_APPLICATION_ID
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        drop(open(&db_path).unwrap());
+        let conn = open(&db_path).expect("a 2.x catalog opens again");
+        assert_eq!(application_id(&conn), TAPECTL_2X_APPLICATION_ID);
+        // An empty file (no tables) is a new catalog, not a 1.x one.
+        let empty = tmp.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            application_id(&open(&empty).unwrap()),
+            TAPECTL_2X_APPLICATION_ID
+        );
+    }
+
+    /// A 1.x catalog is refused by name on open, as a `Migration` error (the
+    /// exit code of every other catalog that cannot be opened), and the file
+    /// is left exactly as it was: no migration, no `application_id`, no row.
+    #[test]
+    fn a_1x_catalog_is_refused_by_name_and_left_as_it_was() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        write_1x_catalog(&db_path);
+
+        let err = open(&db_path).expect_err("a 1.x catalog must not open");
+        assert!(matches!(err, TapectlError::Migration(_)), "{err:?}");
+        assert_names_1x(&err.to_string());
+        assert!(
+            err.to_string().contains(&db_path.display().to_string()),
+            "{err}"
+        );
+
+        let err = open_for_repair(&db_path).expect_err("nor open for repair");
+        assert_names_1x(&err.to_string());
+
+        let raw = Connection::open(&db_path).unwrap();
+        assert_eq!(user_version(&raw), 41);
+        assert_eq!(application_id(&raw), 0);
+        let tables: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2, "nothing was created in it");
+    }
+
+    /// `db import` of a 1.x backup is refused the same way, before the
+    /// newer-schema check could call it a newer tapectl's.
+    #[test]
+    fn db_import_refuses_a_1x_catalog_by_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("backup.db");
+        write_1x_catalog(&src);
+        // The core tables, so it reads as a catalog of tapectl's.
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE units (id INTEGER PRIMARY KEY);
+                 CREATE TABLE snapshots (id INTEGER PRIMARY KEY);
+                 CREATE TABLE stage_sets (id INTEGER PRIMARY KEY);
+                 CREATE TABLE volumes (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+        let err = check_import_source(&src).expect_err("a 1.x backup must not import");
+        let text = err.to_string();
+        assert_names_1x(&text);
+        assert!(text.contains("nothing was replaced"), "{text}");
+        assert!(!text.contains("newer"), "{text}");
+
+        // Positive control: a 2.x catalog's file passes the same check.
+        let ok = tmp.path().join("ok.db");
+        drop(open(&ok).unwrap());
+        check_import_source(&ok).expect("a 2.x catalog imports");
     }
 
     // --- The schema's own rules ---

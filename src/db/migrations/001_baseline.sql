@@ -20,6 +20,14 @@
 -- shown by `.schema`; a comment between statements is not.
 
 -- ---------------------------------------------------------------------------
+-- The mark of a 2.x catalog (D9): SQLite's `application_id`, 0x54504354, the
+-- bytes "TPCT". 1.x set none (it reads 0), so `db::open` refuses a database
+-- that has tables and lacks it as a 1.x catalog, by name.
+-- ---------------------------------------------------------------------------
+
+PRAGMA application_id = 1414546260;
+
+-- ---------------------------------------------------------------------------
 -- The catalog's own key-value table. Nothing reads or writes it today.
 -- ---------------------------------------------------------------------------
 
