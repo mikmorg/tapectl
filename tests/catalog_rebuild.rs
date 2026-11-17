@@ -6839,3 +6839,28 @@ fn two_stage_sets_of_one_unit_on_one_tape_keep_their_own_receipts() {
     assert_eq!(verdict(&rebuilt[1].1), verdict(&written[1].1));
     assert_eq!(verdict(&rebuilt[0].1), verdict(&written[0].1));
 }
+
+/// Attestation finds the stage set whose slice header it reads by the unit's
+/// uuid (#527: a unit is its uuid). By name, a unit renamed since the tape
+/// was written (`unit rename` mints no version and the tape keeps the old
+/// name) was never found, so its coverage stayed unknown however often the
+/// escrow key was given.
+#[test]
+fn a_unit_renamed_since_the_tape_was_written_is_attested() {
+    let mut vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+
+    let op = vol.operator_secret.clone();
+    let first = rebuild(&conn, &mut vol, &op, scratch.path()).unwrap();
+    assert_eq!(first.unknown_remaining, UNITS.len() as i64);
+
+    tapectl::unit::rename_unit(&conn, "photos/2019", "photos/2019-renamed").unwrap();
+    let esc = vol.escrow_secret.clone();
+    let second = rebuild(&conn, &mut vol, &esc, scratch.path()).unwrap();
+    assert_eq!(second.units, 0, "the renamed unit is found by its uuid");
+    assert_eq!(second.attested, UNITS.len(), "{second:?}");
+    assert_eq!(second.unknown_remaining, 0);
+}
