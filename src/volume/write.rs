@@ -4971,6 +4971,31 @@ fn finish_confirm(
                      event failed: {e}); {resume_hint}."
                 ))
             })?;
+            // #531 (T2.1's text): after the drive refused a write with
+            // Logical Block Protection armed in this session, a tape file
+            // the readback could not read in full may be one the refusal
+            // left torn, which no resume mends.
+            let torn = if events::lbp_refusal_seen(conn, volume_id)? {
+                inc.evidence
+                    .mismatches
+                    .iter()
+                    .find(|m| m.kind == crate::store::MismatchKind::ContentUnreadable)
+                    .map(|m| m.position)
+            } else {
+                None
+            };
+            if let Some(p) = torn {
+                return Err(TapectlError::ConfirmInconclusive(format!(
+                    "volume \"{label}\": confirm could not complete — {detail}. The drive refused a write \
+                     with Logical Block Protection armed in this session, so a file it was writing may not \
+                     be whole on the tape: tape file {p} could not be read back in full. A resume reads the \
+                     tape again and passes only if that was the drive's read and not the tape: {resume_hint}. \
+                     If tape file {p} fails again, this tape cannot count as a copy, and no resume changes \
+                     that (a seal is never undone). Its units are still staged, so nothing is lost: retire \
+                     it with `tapectl volume retire {label}`, and write them to another cartridge with \
+                     `tapectl volume write <LABEL> --init --full-confirm --move-to <LOCATION>`."
+                )));
+            }
             // Exit 3 (issue #408).
             Err(TapectlError::ConfirmInconclusive(format!(
                 "volume \"{label}\": confirm could not complete — {detail}. The tape is \
@@ -26095,6 +26120,143 @@ mod tests {
                     ),
                     "{line}"
                 );
+            }
+
+            /// #531's third criterion (T2.1's text): after the drive refused a
+            /// write with Logical Block Protection armed in the session, an
+            /// inconclusive confirm whose readback could not read a tape file
+            /// in full says that file may be torn, what a resume can and
+            /// cannot change, and the way on if it fails again. Every other
+            /// inconclusive confirm keeps its text.
+            #[test]
+            fn an_inconclusive_confirm_after_an_lbp_refusal_names_the_file_it_may_have_torn() {
+                for refused in [true, false] {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let (conn, mut config, volume_id) = swept_write_fixture("L", tmp.path());
+                    config.backends.lto[0].capacity_override = Some("2400G".into());
+                    if refused {
+                        events::log_event(
+                            &conn,
+                            "volume",
+                            volume_id,
+                            Some("L"),
+                            events::WRITE_LBP_REFUSAL,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    let paths = TapectlPaths::new(tmp.path().join("home"));
+                    // Content files (after File 3, before the seal) read
+                    // back short once the tape is sealed; File 0 to 3 and
+                    // the seal read whole.
+                    struct ShortContent(MemStore);
+                    impl Store for ShortContent {
+                        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                            self.0.capacity()
+                        }
+                        fn execute(
+                            &mut self,
+                            src: &mut dyn std::io::Read,
+                            len: u64,
+                            sync: bool,
+                        ) -> Result<u64> {
+                            self.0.execute(src, len, sync)
+                        }
+                        fn read_file(
+                            &mut self,
+                            position: u32,
+                            sink: &mut dyn std::io::Write,
+                        ) -> Result<u64> {
+                            let sealed = self.0.syncs.last() == Some(&true);
+                            let last = self.0.files.len().saturating_sub(1) as u32;
+                            if sealed && position > 3 && position < last {
+                                let mut bytes = Vec::new();
+                                self.0.read_file(position, &mut bytes)?;
+                                bytes.truncate(5);
+                                sink.write_all(&bytes)?;
+                                return Ok(bytes.len() as u64);
+                            }
+                            self.0.read_file(position, sink)
+                        }
+                        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                            self.0.reposition_for_resume(file_index)
+                        }
+                        fn blank_at_bot(&mut self) -> Result<bool> {
+                            self.0.blank_at_bot()
+                        }
+                    }
+                    let mut store = ShortContent(MemStore::new(512 * 1024));
+                    let mut slot = ContactSlot::empty();
+                    let r = volume_write_contacted(
+                        &conn,
+                        &paths,
+                        &config,
+                        "L",
+                        GENCHK_DEVICE,
+                        512 * 1024,
+                        false,
+                        false,
+                        false,
+                        true,
+                        true,
+                        &mut slot,
+                        ContactStore::Injected(&mut store),
+                        WriteScope::from(None::<&[i64]>),
+                    );
+                    let err = slot.finish_result(r).expect_err("inconclusive");
+                    assert!(
+                        matches!(err, TapectlError::ConfirmInconclusive(_)),
+                        "{err:?}"
+                    );
+                    let msg = err.to_string();
+                    if !refused {
+                        assert!(
+                            msg.contains(
+                                "The tape is physically unharmed and the write is not lost"
+                            ),
+                            "{msg}"
+                        );
+                        assert!(!msg.contains("Logical Block Protection"), "{msg}");
+                        continue;
+                    }
+                    assert!(
+                        msg.contains(
+                            "The drive refused a write with Logical Block Protection armed in \
+                             this session, so a file it was writing may not be whole on the tape: \
+                             tape file "
+                        ) && msg.contains(" could not be read back in full."),
+                        "{msg}"
+                    );
+                    assert!(msg.contains("`tapectl volume resume L`"), "{msg}");
+                    assert!(msg.contains("`tapectl volume retire L`"), "{msg}");
+                    assert!(
+                        msg.contains(
+                            "`tapectl volume write <LABEL> --init --full-confirm --move-to \
+                             <LOCATION>`"
+                        ),
+                        "{msg}"
+                    );
+                    assert!(!msg.contains("physically unharmed"), "{msg}");
+                    crate::cli::operations::remedy_commands::assert_parses(
+                        "tapectl volume write NEW --init --full-confirm --move-to vault",
+                    );
+
+                    // The retire it names, run in that state, does not refuse.
+                    crate::cli::operations::volume_retire(&conn, &config, "L", true, false, false)
+                        .expect("`volume retire L` as printed");
+                    let status: String = conn
+                        .query_row(
+                            "SELECT status FROM volumes WHERE id = ?1",
+                            params![volume_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(status, "retired");
+                }
             }
 
             /// A store that changes the catalog under the confirm: `sql` runs
