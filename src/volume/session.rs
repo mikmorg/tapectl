@@ -2107,6 +2107,61 @@ impl InterruptedSession {
         ))
     }
 
+    /// [`Self::load`]'s refusal of a split session (#541): the `status` rows
+    /// it would adopt own none of the slices the frozen Layout plans at
+    /// `unowned`, and the volume's other rows are in another state — the
+    /// session's rows did not move together. `None` when every row is in
+    /// `status` (not a split; nothing here to refuse). The counts of every
+    /// state the volume's rows are in are named, and the way on: `volume
+    /// abort` makes the unfinished rows `aborted` too, and the next `volume
+    /// write` of the label replaces that attempt (#401).
+    fn split_session(
+        conn: &Connection,
+        volume_id: i64,
+        label: &str,
+        status: &str,
+        unowned: &[u32],
+    ) -> Result<Option<TapectlError>> {
+        let counts: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT status, COUNT(*) FROM writes WHERE volume_id = ?1
+                 GROUP BY status ORDER BY status",
+            )?
+            .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if counts.iter().all(|(s, _)| s == status) {
+            return Ok(None);
+        }
+        let states = counts
+            .iter()
+            .map(|(s, n)| format!("{n} `{s}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let files = match unowned {
+            [one] => format!("tape file {one}"),
+            [first, .., last] => {
+                format!("{} tape files from {first} to {last}", unowned.len())
+            }
+            [] => "no tape file".to_string(),
+        };
+        let way_on = if status == "interrupted" {
+            format!(
+                "Abandon the session with `tapectl volume abort {label}`, then write its units \
+                 again with `tapectl volume write {label}`, which replaces the abandoned attempt."
+            )
+        } else {
+            "Resolve the rows by hand before retrying.".to_string()
+        };
+        Ok(Some(TapectlError::Other(format!(
+            "volume \"{label}\": its write session is split: its `writes` rows are {states}, \
+             where one session's rows always move together (a stop part-way through marking \
+             them). The `{status}` rows a resume would adopt own none of the slices the \
+             session planned at {files}, so it cannot be continued, and tapectl does not \
+             guess which part is right. Nothing was written and the cartridge was not \
+             touched. {way_on}"
+        ))))
+    }
+
     /// The shared loader behind [`Self::rehydrate`] and
     /// [`Self::adopt_aborted`]: every `writes` row of `volume_id` in
     /// `status`, their one shared session directory, and the frozen Layout
@@ -2185,6 +2240,32 @@ impl InterruptedSession {
                 .collect::<rusqlite::Result<_>>()?;
             for slice_id in ids {
                 slice_write_id.insert(slice_id, *write_id);
+            }
+        }
+
+        // Issue #541: every slice the frozen Layout plans must belong to a
+        // row adopted here, or `run_entries` meets one it has no row for
+        // (its `.expect`, on every resume) or, past the cursor, seals with
+        // those units on the tape and not counted. A session's rows move
+        // together; when they do not, the session is split, and it is
+        // refused by name rather than continued as a subset.
+        let unowned: Vec<u32> = layout
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                ZoneKind::Slice { stage_slice_id }
+                    if !slice_write_id.contains_key(&stage_slice_id) =>
+                {
+                    Some(e.position as u32)
+                }
+                _ => None,
+            })
+            .collect();
+        if !unowned.is_empty() {
+            if let Some(split) =
+                Self::split_session(conn, volume_id, &layout.label, status, &unowned)?
+            {
+                return Err(split);
             }
         }
 
@@ -4647,7 +4728,7 @@ fn record_quarantine(
             "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
             params![volume_id],
         )?;
-        mark_writes(&tx, write_ids, "aborted")?;
+        mark_writes_on(&tx, write_ids, "aborted")?;
         super::write::log_quarantine(&tx, volume_id, label, &reason)?;
         tx.commit()?;
         Ok(())
@@ -4668,20 +4749,35 @@ fn record_quarantine(
 /// 112 and 121): both are terminal and are written only inside a passing
 /// confirm's transaction, so an Inconclusive confirm's `interrupted` (or any
 /// later mark) leaves them as they are.
+///
+/// Every row moves, or none does (#541): one IMMEDIATE transaction, retried
+/// whole on a busy catalog, as #461 made the execute's `planned` flip. A
+/// row-by-row UPDATE stopped part-way left a split session (some rows
+/// `aborted`, the rest swept to `interrupted`) that `volume resume` adopted
+/// as a subset. Inside a caller's own transaction, use [`mark_writes_on`].
 fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
+    busy::retry(BusyPolicy::DEFAULT, "a write session's status", || {
+        let tx = busy::immediate_tx(conn)?;
+        mark_writes_on(&tx, write_ids, status)?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// [`mark_writes`]'s statements, on a transaction the caller holds and
+/// commits ([`record_quarantine`]'s).
+fn mark_writes_on(tx: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
     debug_assert!(
         status != "cut" && status != "range",
         "cut and range are written only by a passing confirm"
     );
     for (write_id, _) in write_ids {
-        busy::retry(BusyPolicy::DEFAULT, "a write session's status", || {
-            // `cut` (#420) and `range` (#478, ADR-0012 item 121) are terminal
-            // outcomes of a passing confirm: nothing after it moves them.
-            Ok(conn.execute(
-                "UPDATE writes SET status = ?1 WHERE id = ?2 AND status NOT IN ('cut', 'range')",
-                params![status, write_id],
-            )?)
-        })?;
+        // `cut` (#420) and `range` (#478, ADR-0012 item 121) are terminal
+        // outcomes of a passing confirm: nothing after it moves them.
+        tx.execute(
+            "UPDATE writes SET status = ?1 WHERE id = ?2 AND status NOT IN ('cut', 'range')",
+            params![status, write_id],
+        )?;
     }
     Ok(())
 }
@@ -5578,6 +5674,102 @@ mod tests {
         assert_eq!(
             resume_admission(&f.conn, f.volume_id).unwrap(),
             ResumeAdmission::Nothing
+        );
+    }
+
+    /// Issue #541: `mark_writes` moves a session's rows in one transaction,
+    /// as #461 made the `planned` flip. A per-row UPDATE stopped part-way
+    /// (a kill, a catalog busy past its budget; here a trigger failing the
+    /// second row's UPDATE) left the first row `aborted` and the rest
+    /// `in_progress`, which the next open sweeps to `interrupted`: a split
+    /// session, adopted by `volume resume` as a subset that then panicked.
+    #[test]
+    fn a_failure_part_way_through_marking_a_session_leaves_no_row_marked() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let mut write_ids = planned.write_ids.clone();
+        let first_write_id = write_ids[0].0;
+
+        // A second unit's write, planned on the same volume, in progress.
+        let unit_id: i64 = f
+            .conn
+            .query_row("SELECT id FROM units WHERE name = 'unit-alpha'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        f.conn
+            .execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 2, 'staged', '/tmp/unit-alpha', 1, 32)",
+                params![unit_id],
+            )
+            .unwrap();
+        let snapshot_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snapshot_id],
+            )
+            .unwrap();
+        let stage_set_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'in_progress')",
+                params![stage_set_id, snapshot_id, f.volume_id],
+            )
+            .unwrap();
+        let second_write_id = f.conn.last_insert_rowid();
+        write_ids.push((second_write_id, snapshot_id));
+        f.conn
+            .execute(
+                "UPDATE writes SET status = 'in_progress' WHERE id = ?1",
+                params![first_write_id],
+            )
+            .unwrap();
+        f.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_the_second_mark BEFORE UPDATE OF status ON main.writes
+                 WHEN NEW.id = {second_write_id} AND NEW.status = 'aborted'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure on the second row'); END;"
+            ))
+            .unwrap();
+
+        let err = mark_writes(&f.conn, &write_ids, "aborted")
+            .expect_err("the second row's failure fails the marking");
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the injected failure is what stopped it: {err}"
+        );
+        let status_of = |id: i64| -> String {
+            f.conn
+                .query_row(
+                    "SELECT status FROM writes WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            [status_of(first_write_id), status_of(second_write_id)],
+            ["in_progress", "in_progress"],
+            "all rows or none: the first row's mark rolled back with the second's failure"
+        );
+
+        // Positive control: without the trigger the same call marks both.
+        f.conn
+            .execute_batch("DROP TRIGGER temp.fail_the_second_mark;")
+            .unwrap();
+        mark_writes(&f.conn, &write_ids, "aborted").unwrap();
+        assert_eq!(
+            [status_of(first_write_id), status_of(second_write_id)],
+            ["aborted", "aborted"]
         );
     }
 
@@ -12983,6 +13175,68 @@ mod tests {
                 parsed_seal(&store.files[m as usize]).requires,
                 layout::REQUIRES_SPAN
             );
+        }
+
+        /// Issue #541: a session whose `writes` rows are split, some
+        /// `aborted` and the rest `interrupted` (what a stop part-way
+        /// through a per-row abort marking left, after the sweep), seeded
+        /// directly. `rehydrate` adopted the `interrupted` subset with the
+        /// whole frozen Layout: a slice of an `aborted` row before the
+        /// cursor panicked at `run_entries`' `.expect`, on every resume, and
+        /// one after it let the session seal with those units on the tape
+        /// and not counted. Now the resume refuses the split by name, with
+        /// the way on, before the tape is touched.
+        #[test]
+        fn a_split_session_is_refused_by_name_never_adopted_as_a_subset() {
+            for aborted in [0usize, 2] {
+                let s = three_units();
+                let mut store = MemStore::new(SBS as usize);
+                let (s, outcome) = execute(s, &mut store);
+                let _ = ready(outcome);
+                for (n, unit) in s.units.iter().enumerate() {
+                    s.conn
+                        .execute(
+                            "UPDATE writes SET status = ?1 WHERE stage_set_id = ?2",
+                            params![
+                                if n == aborted {
+                                    "aborted"
+                                } else {
+                                    "interrupted"
+                                },
+                                unit.stage_set_id
+                            ],
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    resume_admission(&s.conn, s.volume_id).unwrap(),
+                    ResumeAdmission::Interrupted,
+                    "premise: resume would try to adopt it"
+                );
+
+                let msg = match InterruptedSession::rehydrate(&s.conn, s.volume_id) {
+                    Err(e) => e.to_string(),
+                    Ok(Some(_)) => {
+                        panic!("a split session (row {aborted} aborted) was adopted as a subset")
+                    }
+                    Ok(None) => panic!("a split session must be refused, not ignored"),
+                };
+                assert!(msg.contains("SHORT01"), "{msg}");
+                assert!(msg.contains("split"), "{msg}");
+                assert!(
+                    msg.contains("aborted") && msg.contains("interrupted"),
+                    "{msg}"
+                );
+                assert!(msg.contains("Nothing was written"), "{msg}");
+                crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+                    &msg,
+                    &[],
+                    &[
+                        "tapectl volume abort SHORT01",
+                        "tapectl volume write SHORT01",
+                    ],
+                );
+            }
         }
     }
 
