@@ -548,7 +548,7 @@ keeps saying that the code writes Layout 2.
 | T1.1 | `docs/design/volume-format-v3.md`: the byte format, whole and standing alone. Zone order; File 0; File 1; the front index; the envelopes and what each carries; the data zone (the stream, the cut, the slice); the file table's and the id map's grammar; the seal, full and short; the writer at the early warning (W1 to W9, carried word for word from `volume-format-v2.md` §4.3); what follows the warning (§4.2 rewritten by item 288: no unit is `cut`); a range and every unit continuing (§4.4 rewritten: the writer's half by items 288 and 289, the reader's by items 255, 260, 264, 266, 267 and 283); a tape of another layout; the heir path end to end, with the script's modes; "self-describing: what that promises". It carries every rule of #562. |
 | T1.2 | `docs/design/layout-session.md`, amended for Layout 3: the staging's products (the file table is one, and a write refuses a unit without it), contact with a tape of another layout, "where a restore starts". |
 | T1.3 | `CONTEXT.md`: the terms *stream*, *member*, *file table*, *id map*, *the writer's floor*; *slice* redefined (whole members, item 283) and *run* added (a long member's slices); `cut` and the opt-in to spanning struck (items 288, 289); dar's terms struck. The id map is never called "ownership", which means the tenant that owns a unit. |
-| T1.4 | ADR-0013, which gathers items 239 to 289 into one decision record for Layout 3, so that a reader does not need ADR-0012's amendments in order. ADR-0012 is not edited. |
+| T1.4 | ADR-0014 (0013 was taken by the forensics record), which gathers items 239 to 289 into one decision record for Layout 3, so that a reader does not need ADR-0012's amendments in order. ADR-0012 is not edited. |
 | T1.5 | The baseline schema as a reviewed listing in the format document's appendix: every table and column of the 1.9.2 schema that is kept, the ones that go, and the new ones (D9). The SQL itself is T3.1's. |
 | T1.6 | `.claude/commands/worktree-agent.md`: guardrail 3 names the normative set by stage (this plan's section 1) in place of the Layout 2 set. `docs/design-errata.md`: `volume-format-v2.md` is superseded for Layout 3. |
 | T1.7 | This plan: every "Stage 1 decides" marker in Stages 4 and 5 replaced by the section of the format document that decides it. |
@@ -1347,8 +1347,9 @@ what the coordinator must run (`first-run.sh`'s rehearsal on mhvtl) to prove it.
 **Starts when:** Stage 1's documents are landed (D1 to D22 are ratified, item 290), Stage 3 is on
 `layout-3`, and T0.3's leg of made files has passed (item 291 moved its other leg to T6.6). **Lands on:** `layout-3`.
 **Normative:** `docs/design/volume-format-v3.md` and the session document as Stage 1 leaves
-them. Where a task below says "Stage 1 decides", the format document's section is the
-answer and T1.7 will have put its number there. If it has not, stop.
+them. Each reference below to the format document names its section of
+`docs/design/volume-format-v3.md` (T1.7). Where a section marks a point **OPEN (Stage 1)**,
+stop: it is the CTO's.
 
 **What the code does today, in one paragraph** (so that a worker knows what it is
 replacing). `stage create` runs `dar -c -`, hashes every source file itself beside dar's
@@ -1393,8 +1394,8 @@ is integrated):
 ### T4.1 The writer: GNU tar run with the format's exact command line, and the floor
 
 **Owner:** worker. **Depends:** T4.0. **Carries out:** items 253, 270, 273, 274; #563's
-early refusal; #562 "The writer"; D2. **Read:** the format document's section on the stream
-(the literal command line is D2's, with the flags T0.1 picked for the ACL record);
+early refusal; #562 "The writer"; D2. **Read:** `volume-format-v3.md` §3.1 and §3.2
+(the literal command line is §3.1's: D2's, with the flag T0.1 picked for the ACL record);
 `src/dar/mod.rs` `command` and
 `src/dar/create.rs` `spawn_archive`, as the shape to follow, not to copy; #563.
 
@@ -1409,7 +1410,7 @@ early refusal; #562 "The writer"; D2. **Read:** the format document's section on
    `./`, in the order given, mode 0600, in the directory the caller names (the caller gives
    the home's work directory: file names are plaintext and never touch the staging device).
 3. `CreateParams { binary, root, list, xattrs, acls }` and `create_command(&params)`: the
-   argument vector, exactly the format document's, in its order. `recorded_command` is the
+   argument vector, exactly `volume-format-v3.md` §3.1's, in its order. `recorded_command` is the
    same line as text for the catalog.
 4. `spawn_archive(&params) -> TarStream`: stdin null, stdout piped, stderr drained on a
    thread into a bounded buffer. `TarStream::finish() -> TarFinish`: exit 0 is `Clean`;
@@ -1430,7 +1431,7 @@ early refusal; #562 "The writer"; D2. **Read:** the format document's section on
 - No test-only helper that makes a staged unit or slices from tar. Later tasks stage through
   the real path (invariant 8).
 - No `--sparse`, no compression flag, no `--one-file-system`, no `--ignore-failed-read`.
-  If the format document's command line and D2 differ, the document wins. Compression is
+  If `volume-format-v3.md` §3.1's command line and D2 differ, the document wins. Compression is
   never tar's: it is applied to each slice after the cut (rule 11).
 - Run tar in the unit's root. If `--directory` is used it comes before `--files-from`:
   after the list, tar reads the names against the wrong directory and exits 2 (measured).
@@ -1452,7 +1453,7 @@ report gives the probe's output on this host.
 **Owner:** worker. **Depends:** T4.1. **Carries out:** items 253, 254, 256, 270, 272, 274,
 277, 283 (the cutter's input); #562 "The stream reader"; #563's stream check; D3, D12;
 invariants 5, 7 and 13.
-**Read:** the format document on the stream and the file table; the research note
+**Read:** `volume-format-v3.md` §3.2 (the stream's checks) and §1.6 (the file table); the research note
 (`docs/research/2026-11-16-layout-3-before-the-build.md`) §5 and §6; #563's tables.
 
 **Fence:** new `src/tar/stream.rs`, `src/tar/pax.rs`; `src/tar/mod.rs` (exports only).
@@ -1511,8 +1512,8 @@ without it; the suite is green.
 ### T4.3 The file table and the id map: schema, text, lookup
 
 **Owner:** worker. **Depends:** T4.0, T3.1. **Carries out:** items 254, 264, 265, 272, 276,
-277, 283; #557; #564; #567; D4, D5, D9, D13. **Read:** the format document on the file table's and the
-id map's text; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `unescape`;
+277, 283; #557; #564; #567; D4, D5, D9, D13. **Read:** `volume-format-v3.md` §1.6 (the file table's and the
+id map's text) and Appendix A.3; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `unescape`;
 `src/db/files.rs`.
 
 **Fence:** `src/db/migrations/001_baseline.sql`; new `src/db/stage_files.rs`,
@@ -1521,7 +1522,7 @@ id map's text; ADR-0012 items 264 and 265; `src/volume/index.rs` `escape` and `u
 
 **Build:**
 1. **The baseline is edited in place; no migration 002** (D9). Add `stage_files` and
-   `stage_ids` as the format document's appendix lists them. Add, to existing tables, the
+   `stage_ids` as `volume-format-v3.md` Appendix A.3 lists them. Add, to existing tables, the
    new columns D11 names (`stage_sets.tar_version`, `tar_command`, `stream_bytes`;
    `tar_create_reports`; `restores.tar_*`). **Do not drop a dar-named column or table
    here**: their users are other tasks' files. T4.15 drops them.
@@ -1603,7 +1604,7 @@ file and an excluded folder reports all three, shown by a test; the suite is gre
 
 **Owner:** worker (one, alone in its wave). **Depends:** T4.1 to T4.4, T0.5, T0.6, T0.7.
 **Carries out:** items 241, 253, 254, 265, 270, 272, 274, 277, 280, 283 to 287;
-#555; #562 "The writer"; #563; #564; #565; #567. **Read:** the format document on the stream, the cut and staging's products;
+#555; #562 "The writer"; #563; #564; #565; #567. **Read:** `volume-format-v3.md` §3 whole (the stream, the cut, a slice on tape, compression) and `layout-session.md` "Layout 3" (what a staging produces);
 `src/staging/mod.rs` `stage_create_inner`, top to bottom; `src/staging/validate.rs` `plan`
 and `recheck`; `src/staging/files.rs`.
 
@@ -1708,7 +1709,7 @@ under `src/staging/` names dar; the pending list is in the report; the suite is 
 **Owner:** worker (one, alone in its wave). **Depends:** T4.5. **Carries out:** items 254,
 258(a), 265, 276, 283 and 288 (what a tape states); #528, #547, #557, #564; #562 "The
 layout" and "The table"; D1, D4 to D8, D22.
-**Read:** the format document, whole (this task implements most of it);
+**Read:** `volume-format-v3.md`, whole (this task implements most of it: §1, §2, §4 and §5);
 `src/volume/build.rs` `materialize_envelope_streaming`; `src/volume/manifest.rs`;
 `src/db/ontape_catalog.rs`'s module doc.
 
@@ -1798,8 +1799,8 @@ layout is parsed.
 ### T4.8 tapectl's restores, fed whole members by byte range
 
 **Owner:** worker. **Depends:** T4.6. **Carries out:** items 255 (tapectl's half), 256,
-260, 264, 266, 278, 283, 284; #556; D16, D17. **Read:** the format document on readers and on a
-range; ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean), 127, 264;
+260, 264, 266, 278, 283, 284; #556; D16, D17. **Read:** `volume-format-v3.md` §7.1 (tapectl's reader) and §5.3
+(a range); ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean), 127, 264;
 `src/volume/restore/supply.rs`'s module doc; `src/volume/restore/fill.rs`.
 
 **Fence:** `src/volume/restore.rs`, `src/volume/restore/*`, `src/volume/slice_holders.rs`,
@@ -1883,8 +1884,8 @@ src/cli/restore.rs` finds nothing; the suite is green.
 
 **Owner:** worker. **Depends:** T4.6. **Carries out:** items 144, 265, 272; #557, #564;
 ADR-0012 amendment 2026-09-29 on #360. **Read:** `src/volume/rebuild.rs`'s module doc and
-fact table; `src/volume/adopt_lost.rs`'s module doc; the format document on the on-tape
-`catalog.db`.
+fact table; `src/volume/adopt_lost.rs`'s module doc; `volume-format-v3.md` §1.4 and
+Appendix A.4 (the on-tape `catalog.db`).
 
 **Fence:** `src/volume/rebuild.rs`, `src/volume/adopt_lost.rs`, `src/cli/catalog.rs`,
 `tests/catalog_rebuild.rs`.
@@ -1927,8 +1928,8 @@ map; the suite is green.
 
 **Owner:** worker (the script has one worker at a time, T4.10 to T4.13). **Depends:** T4.6.
 **Carries out:** items 255, 264, 271, 283, 284; #553; #520, #525 (the script's low
-findings), #561's work directory; #562 "The heir's script"; D10, D22. **Read:** the format document on the heir
-path, whole; File 1 as a reader would (the generated text, from a test); #520, #525;
+findings), #561's work directory; #562 "The heir's script"; D10, D22. **Read:** `volume-format-v3.md` §7.2 to §7.5 (the heir
+path), whole; File 1 as a reader would (the generated text, from a test); #520, #525;
 `docs/audits/2026-11-12-design-and-defect-review.md` findings A1 to A12.
 
 **Fence:** new `src/volume/heir/RESTORE.sh` and `src/volume/heir/mod.rs`;
@@ -2179,8 +2180,8 @@ safety rule); then T5.5, T5.6, T5.7.
 ### T5.1 Every unit continues at the early warning, and the queue is filled to it (items 246, 288, 289)
 
 **Owner:** worker, then the coordinator on tape. **Depends:** T4.16. **Carries out:** items 288 and 289, and what stands of items 121 to 147 (the
-amendment of 2026-11-17 lists both); #567. **Read:** the format document on what follows
-the warning and on a range; ADR-0012's amendment of 2026-11-17, whole, and items 121 to
+amendment of 2026-11-17 lists both); #567. **Read:** `volume-format-v3.md` §5.1 to §5.3
+(what follows the warning, the one bound, a range) and `layout-session.md` "Layout 3"; ADR-0012's amendment of 2026-11-17, whole, and items 121 to
 130, 138 and 144; `src/volume/layout_model.rs` `CapacityBudget::place`;
 `src/volume/session.rs` `span_split`; `src/collection/selector.rs`.
 
