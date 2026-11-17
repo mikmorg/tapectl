@@ -613,3 +613,201 @@ and withholds a third:
    each write's feed ratio, and any fact the catalog knows only because the operator did
    something after the write. Those survive a lost database only through `db backup` and
    the Heir Kit (ADR-0009).
+
+---
+
+## 3. The data zone: the stream, its checks, the cut, a run, a slice on tape, compression
+
+A unit's version is archived as **one pax stream per staging**, written by GNU tar on the
+host from tapectl's exact file list (ADR-0012 item 253). tapectl reads the stream as it
+passes, checks it, cuts it into **slices** that each hold whole members (item 283), and
+age-encrypts each slice alone, after compressing it alone when the staging is compressed
+(item 284). No dar is anywhere in the data zone (item 241).
+
+### 3.1 The stream (D2)
+
+**The writer.** GNU tar, at or above **the writer's floor: GNU tar 1.35 built with ACL
+support** (item 274). tapectl refuses to stage with a GNU tar below the floor and names
+it; the version is only the early refusal, and the proof, on any version, is tapectl's own
+check of the stream (§3.2). The floor binds every host that writes (item 274); a host's
+tar is built from the upstream release where its system's is older (item 275; the recipe
+is `docs/research/2026-11-17-t02-gnu-tar-built-on-debian-10.md`). The heir's readers are
+not held to the floor (§7.3).
+
+**The command line**, fixed flag by flag:
+
+```
+tar --create --file=- --format=pax \
+    --numeric-owner --xattrs --acls --xattrs-exclude='system.posix_acl_*' \
+    --no-recursion --null --verbatim-files-from --files-from=<list> \
+    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
+```
+
+- `--format=pax`: the stream is POSIX pax (item 253).
+- `--numeric-owner` (item 270): a member's owner and group are stored by number only; the
+  header's user and group name fields are empty.
+- `--xattrs --acls --xattrs-exclude='system.posix_acl_*'`: extended attributes are kept,
+  and an ACL is stored **once**, in the text record (`SCHILY.acl.access`,
+  `SCHILY.acl.default`), with every qualifier a number (items 273, 274; measured by T0.1,
+  `docs/research/2026-11-17-t01-readers-of-an-acl-stored-once.md`: GNU tar 1.30, 1.34,
+  1.35 and bsdtar restore that record with their ordinary flags, and none restores the
+  raw `system.posix_acl_*` record with them). The raw record is not stored.
+- `--no-recursion --null --verbatim-files-from --files-from=<list>`: tar archives exactly
+  the list, and a name that looks like an option is a member, never acted on (#562).
+- `--pax-option=exthdr.name=%d/PaxHeaders/%f` is fixed, so the stream's extended-header
+  names do not depend on tar's process id (#562). Access and change times are not stored.
+- No `--sparse`: a sparse file is stored as its bytes. No compression by tar.
+
+**The list** is tapectl's: the snapshot's own entries, NUL-separated, every name prefixed
+`./`, sorted bytewise, folders listed as their own entries, the unit's dotfile included.
+
+**The environment.** tar runs in the unit's root, with `LC_ALL=C`, and with `TAR_OPTIONS`
+and `POSIXLY_CORRECT` removed from its environment. If `--directory` is used in place of
+the working directory it comes **before** `--files-from`: tar takes it in order, and after
+the list it reads the names against the wrong directory and exits 2 (measured).
+
+**What the snapshot leaves out** (D14; items 252, 270). tapectl's matcher is the only one:
+tar is given the exact list. A snapshot records and reports what each exclusion pattern
+left out, and `init` writes an empty list. **Sockets are left out of every unit** and
+reported with the reason "socket": tar skips a socket at exit 0, so a listed socket would
+have no member. FIFOs and device nodes are kept.
+
+**Hard links are kept as links** (item 256). The list holds every name; the stream holds
+the first name with its data and each later name as a link member. A later name depends on
+the slice of the name archived first (items 241, 293).
+
+**No pin or fixture holds data-zone bytes across tar versions** (#562): the streams of two
+tar versions differ in bytes. Pins cover the plaintext files and the envelopes' texts
+(T6.3), never a slice.
+
+### 3.2 The stream's checks (D12; invariants 5 and 7)
+
+tapectl reads the stream as it passes and changes none of its bytes. **A member starts at
+its first extension header**, and its size comes from the pax `size` record when there is
+one (#562). For each member, as it passes:
+
+- it is the next entry of the list, by path, kind and size (#562);
+- its header's user and group name fields are empty, and it has no `uname` or `gname` pax
+  record;
+- every qualifier in its ACL record is a number;
+- a listed file that had an ACL on disk before tar ran (the `system.posix_acl_access` or
+  `system.posix_acl_default` attribute was present) carries the text ACL record;
+- its data is hashed (sha256) for a regular file, and every user and group id it carries,
+  as owner, group or ACL qualifier, is collected for the id map.
+
+The stream is refused, naming the path and the rule, on: a member that is not the next
+entry of the list; a name in a header or a record; a non-numeric ACL qualifier; a lost
+ACL; a global extended header; a GNU long-name member; a header whose checksum is wrong; a
+type the reader does not know; anything but zeros after the end-of-archive blocks; a stream
+that ends inside a member; a listed entry never seen.
+
+After tar exits: **status 0** (tar's exit 1 or 2 refuses the staging, #562); every listed
+entry was seen; and each file's device, inode, size, mtime and ctime are what they were
+before tar ran. A file changed under tar refuses the staging, whatever tar says
+(invariant 7). **A stream hash that differs from the version's recorded sha256 refuses the
+staging, for every path but the unit's dotfile** (#562).
+
+The checks precede compression: every check of the stream is made on the stream's own
+bytes, and a member's offsets in the file table are of the stream (rule 11).
+
+### 3.3 The cut, and a long member's run (D3; item 283)
+
+The cutter is given each member's `start` and whole length (its extension headers, its
+header and its padded data) before any of the member's bytes. It places members in stream
+order:
+
+- a member that fits in what is left of the slice goes into it;
+- a member that does not fit, and is no larger than `slice_size`, ends the slice before it
+  and begins the next;
+- a member larger than `slice_size` ends the slice before it and is cut at every
+  `slice_size` bytes, its last piece ending where the member ends. Those slices are its
+  **run**, and the member after it begins a new slice;
+- the stream's tail (tar's end-of-archive blocks and its padding) is placed as a member
+  is.
+
+**A slice begins at a member's start, or it continues exactly one member that is larger
+than `slice_size`.** No slice begins anywhere else, and the slices joined in order are the
+stream, byte for byte (rule 13). A member of exactly `slice_size` fits in an empty slice;
+one block more is a run.
+
+`slice_size` is the most a slice's cut holds. It is a multiple of 512 wherever it is set
+(`[defaults]`, an archive set, a unit's dotfile; #562). A slice may be shorter than
+`slice_size`; the number of slices is at most three for each `slice_size` of stream (a
+small file, then a file just over a slice).
+
+What a slice is, measured (T0.7, `docs/research/2026-11-17-t07-readers-on-member-start-slices.md`;
+item 293): a slice that does not continue a member, read alone, is a run of whole members
+that GNU tar 1.30, 1.34 and 1.35, bsdtar 3.6.2 and BusyBox tar 1.36.1 each read at exit 0,
+except that a hard-linked name whose first name lies in another slice is not made (its
+first name is not there). A long member's run, joined, is read alone the same way. The
+good slices of a staging joined in order, with a bad one left out, are read in one tar run
+at exit 0, losing exactly the bad slice's members.
+
+### 3.4 A slice on tape
+
+Each slice is, in order: the cut (§3.3); compressed alone, as one frame, when the staging
+is compressed (§3.5); then age-encrypted alone, to the tenant's, the operator's and the
+escrow recipients (§1). tapectl does all three in memory; the staging directory holds only
+ciphertext (#370). One slice is one tape file.
+
+| Field | Of what |
+|---|---|
+| `size_bytes`, `sha256_plain` | the cut, before compression |
+| `encrypted_bytes`, `sha256_encrypted` | the tape file |
+| `continues` | whether the slice continues a member begun in the slice before it (§1.9) |
+
+The front index's `size_bytes` for a data slice is the tape file's (`encrypted_bytes`).
+
+**The bound the early warning's rules are held to.** A compressed slice can be larger on
+tape than its cut (§3.5). W8 (§5.2) holds `slice_size` plus the staging's algorithm's
+worst growth, plus age's overhead, to half the smallest post-warning room among the
+configured drives. A slice whose on-tape size would pass that bound refuses the staging by
+name; it is not stored uncompressed in place, because a staging has one algorithm.
+
+**Staging's space estimate** (T4.5, determined). Before tar runs, the space a staging
+needs is estimated as the files' bytes plus, for each entry, 2,560 bytes, plus twice the
+length of its path in bytes rounded up to 512, plus 4,096 for an entry that has an ACL or
+an extended attribute, plus 1,024 for each slice the estimate comes to (measured: about
+1,951 bytes of stream for a small file). It never counts on compression to make room.
+The space accounting while the stage runs still catches a stream that outgrows it.
+
+### 3.5 Compression (D15; items 280, 284 to 287)
+
+Compression is offered, optionally, for select archives (item 280): `compression` is set
+in `[defaults]`, an archive set or a unit's dotfile, the most specific winning, and is
+`none` when none is set. Its values are `none`, `gzip`, `xz` and `zstd` (item 285).
+`compression_level` sits beside it in the same three layers (item 287).
+
+- **Each slice is compressed alone, after the cut and before it is encrypted** (item 284).
+  The stream is never compressed as one whole: a lost slice costs only the files in it.
+- **tapectl itself compresses**, with a library for each algorithm built into the binary
+  (item 286; T0.6 accepted `flate2`, `liblzma` and `zstd` in the static build,
+  `docs/research/2026-11-17-t06-compression-libraries-in-the-static-build.md`).
+- **The frame** (D15, determined): one complete stream of the algorithm for each slice, as
+  the algorithm's own tool writes and reads it, so that `age -d`, then the tool, gives the
+  cut. gzip: one member, with no file name and a zero time in its header. xz: one `.xz`
+  stream with the CRC64 check. zstd: one frame with its content checksum on and the content
+  size stated. tapectl adds nothing around the frame. A slice is compressed on one thread.
+- **The level** is a whole number in the algorithm's own range (gzip 1 to 9, xz 0 to 9,
+  zstd 1 to 19). When it is not set the algorithm's own default applies (gzip 6, xz 6,
+  zstd 3). A level outside the range is refused, naming the key. The level is recorded
+  with the staging in the catalog; no reader needs it, and the MANIFEST does not state it.
+- **The MANIFEST names the algorithm** (`compression`, §1.9) for a compressed staging only.
+- **The worst growth.** Measured by T0.5 on bytes that do not shrink (random bytes and
+  real images, 4 MiB and 1 GiB slices;
+  `docs/research/2026-11-17-t05-decompressors-on-a-slice-compressed-alone.md`): gzip
+  +0.0162%, xz +0.0065%, zstd +0.0026% of the slice, with a fixed part of a few dozen
+  bytes. The format states the worst growth of each algorithm, with a margin over that
+  measurement, as **0.1% of `slice_size` plus 64 KiB**, for each of gzip, xz and zstd.
+- **The check at staging.** Staging decodes every slice it has just packed and compares
+  the sha256 of the decoded bytes with the cut's `sha256_plain`, both taken as the bytes
+  pass, before the bytes go on; a difference refuses the staging. Item 253's "each file's
+  sha256 from the bytes that go to tape" holds through it.
+- **A decompressor's exit status is never the verdict** (invariant 6): BusyBox `unxz`
+  exits 0 after writing wrong bytes, and on a slice whose first age chunk is damaged it
+  exits 0 on empty input (T0.5). A slice's decoded length against `size_bytes`, its
+  `sha256_plain`, and then the per-file check, decide.
+- **What an heir needs.** A unit that states `compression` needs that algorithm's tool:
+  `gzip`, `xz` (Debian's `xz-utils`) or `zstd`. A stock Debian 10 install holds only gzip;
+  xz and zstd are its packages (T0.5). BusyBox reads gzip and xz and has no zstd. An heir
+  restoring an uncompressed unit is never asked for one.
