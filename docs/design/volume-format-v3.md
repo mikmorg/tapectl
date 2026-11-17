@@ -1489,3 +1489,78 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 - **A zero-filled lost slice and `--ignore-zeros`** (item 264).
 - **Compatibility**: a Layout 2 tape is read with tapectl 1.9.2 or its own RESTORE.sh
   (item 242); tapectl 2.0.0 reads only its label (§7.6).
+
+---
+
+## 10. Open points (Stage 1)
+
+Each is a point at the level of bytes, a field name or a schema column that the ruled
+texts (ADR-0012 items 239 to 293, D1 to D22, the plan's determinations, Stage 0's results)
+do not decide. Nothing is built on one until the CTO answers it.
+
+1. **§1.4** Which baseline tables and columns the on-tape `catalog.db` carries, by name.
+2. **§1.6** Two stagings of one version on one tape share `tables/<uuid8>_v<version>`: add
+   the stage set id to the name, or refuse to plan two stagings of one version on one tape.
+3. **§1.6** The id map's header line: `#tapectl-id-map 1`, or none.
+4. **§1.9** The MANIFEST keys for D6's "the table's and the id map's names in the
+   envelope" (none, derived from `uuid` and `snapshot_version`; or `file_table` and
+   `id_map`), and for the writer's `tar --version` line (`tar_version` or another name).
+5. **§1.9** The order of the new keys in `[[units]]`, and the place of `continues` in
+   `[[units.slices]]`.
+6. **§5** Whether File 3's `[index]` and the seal's `[seal]` gain a `magic` key (D1 speaks
+   of their magics; Layout 2 gives them none).
+
+---
+
+## Appendix A. The baseline schema
+
+T1.5's product: the reviewed listing of every table and column of the 1.9.2 schema that is
+kept, the ones that go, and the new ones, from which T3.1 writes
+`src/db/migrations/001_baseline.sql` (D9). Decided so far (D9 as ratified, item 290, and
+the plan's determination under it):
+
+- A 2.x catalog is known by SQLite's `application_id`, set by the baseline. A database that
+  has tables and lacks it is a 1.x catalog and is refused by name.
+- **New:** `stage_files` (the file table: `stage_set_id`, `seq`, `kind`, `slice`,
+  `path_id` into `paths`, `size`, `sha256` as 32 raw bytes or NULL, `start`, `end`,
+  `link_path_id`; primary key `(stage_set_id, seq)`, an index on `(stage_set_id,
+  path_id)`); `stage_ids` (the id map: `stage_set_id`, `kind`, `id`, `name` or NULL;
+  primary key `(stage_set_id, kind, id)`); `snapshot_left_out` (D14); a `drills` table
+  (D18). Both `stage_files` and `stage_ids` outlive the release of the staging's slices
+  and go only with the staging's own row (item 265).
+- **Changed:** `stage_sets` gains `tar_version`, `tar_command`, `stream_bytes` and
+  `compression_level`, and loses dar's columns and `catalog_path`; `stage_slices` gains
+  `continues`; `dar_create_reports` becomes `tar_create_reports`; the `dar_*` columns of
+  `restores` become `tar_*` (D11).
+- **Gone with T5.1:** `allow_spanning` (an archive set's and a unit's frozen copy),
+  `writes.may_span`, and the write status `cut` (items 288, 289).
+- Until `v2.0.0` is tagged the baseline is edited in place; no migration 002 is written.
+
+The full listing is written by T1.5 into this appendix.
+
+## Appendix B. #562's rules, each with the section that carries it
+
+| Rule (#562) | Section |
+|---|---|
+| The file list is NUL-separated, `--null --verbatim-files-from`, names prefixed `./` | §3.1 |
+| `--pax-option=exthdr.name=%d/PaxHeaders/%f` is fixed | §3.1 |
+| No pin and no fixture holds data-zone bytes made by one tar version against another's | §3.1 |
+| An ACL is stored once | §3.1 (the text record, T0.1) |
+| tar's exit 1 and exit 2 refuse the stage, and tapectl's own before-and-after check decides | §3.2 |
+| A stream hash that differs from the version's recorded sha256 is refused, but for the unit dotfile | §3.2 |
+| The seccomp filter of #441 goes | §9 |
+| `slice_size` is a multiple of 512 | §3.3 |
+| A row states where the member starts and ends; a member starts at its first extension header | §1.6, §3.2 |
+| The size comes from the pax `size` record when there is one | §3.2 |
+| The stream's members are the snapshot's list, in order, with those sizes | §3.2 |
+| Rows are in stream order; a folder is two ranges | §1.6 |
+| Every tape whose plan holds a slice of a staging carries that staging's whole table | §1.6 |
+| The table is part of what the seal withdraws; "this tape holds F" | §1.6, §5.1 |
+| A hard link's row, its check and its repair | §1.6, §3.1, §7.1, §7.2 |
+| `index/paths.tsv` states no sha256 for the unit dotfile | §1.5 |
+| Each range is its own pipeline | superseded by item 283 for whole slices (§7.4); kept for a member cut out by its offsets (§7.2 "One file") |
+| A slice that fails ends that tar run; the next starts after it | amended by item 283: a bad slice of whole members is left out and the run goes on; only a bad piece of a long member's run ends the run (§7.4) |
+| busybox tar restores no xattr, no ACL and no sub-second time; File 1 says which tars restore what | §7.3, §7.5 |
+| Rule S2, rule 6 and `may_end_early` restated without the `short-seal` entry | §5 (S2), §1.2 rule 6, §1.8 |
+| The magic and the layout version both move; a Layout 3 File 0 carries nothing a Layout 2 script could follow | §1.1, §1.2 |
+| The upgrade tool's harness has no 2.x predecessor until a second 2.x release exists | not a format rule: the plan's T3.4 |
