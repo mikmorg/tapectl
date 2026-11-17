@@ -3,8 +3,9 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 **Coordinating the tapectl 2.0.0 build (Layout Version 3)? Start at
-`docs/coordinator-handoff.md`**: what is ruled, the one thing that needs the CTO's word (the
-go), the order of work, who settles what, and which older texts no longer hold. The tasks
+`docs/coordinator-handoff.md`**: what is ruled, the order of work, who settles what, and which
+older texts no longer hold. **The go was given on 2026-11-17 (ADR-0012 item 292): the build is
+under way**, stage by stage on each stage's "Starts when" line. The tasks
 are in `docs/design/v3-implementation-plan.md`.
 
 ## Project Overview

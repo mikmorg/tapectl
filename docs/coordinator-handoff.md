@@ -24,6 +24,9 @@ This page is the entry. Everything it names holds the detail, and is not repeate
 
 ## The gate: the go
 
+**Given on 2026-11-17 (ADR-0012 item 292; the CTO: "Go").** Stage 2's first wave (T2.1,
+T2.2, T2.3) and T0.7 started that day. What follows is kept for how the gate was held.
+
 The CTO has answered several lists with "ratify all". Each ratified what was recommended.
 **None was the go**, each record says so, and the CTO has been told that the go needs the
 word.
