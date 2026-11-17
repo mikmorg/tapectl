@@ -117,9 +117,9 @@ struct ManifestHeaderDoc {
 
 /// The whole `MANIFEST.toml` document shape, for parsing only.
 ///
-/// Deliberately NOT `#[serde(deny_unknown_fields)]`: tapes written before
-/// #134 carry a `layout_version = 1` key in `[manifest]` that no longer
-/// exists, and a rebuild must still read those tapes. Pinned by a test.
+/// Deliberately NOT `#[serde(deny_unknown_fields)]`: a reader reads on past
+/// a key it does not know (`volume-format-v2.md` §1.2 rule 3, #134). Pinned
+/// by a test.
 #[derive(Debug, Deserialize)]
 struct ManifestDoc {
     manifest: ManifestHeaderDoc,
@@ -199,7 +199,7 @@ created_at = "{now}"
     /// Parse an envelope `MANIFEST.toml`.
     ///
     /// Deliberately tolerant of unknown keys (see [`ManifestDoc`]), and of
-    /// an absent `may_end_early` (every envelope before 1.6.0).
+    /// an absent `may_end_early`.
     pub fn from_toml(text: &str) -> Result<Manifest> {
         let doc = parse_doc(text)?;
         Ok(Manifest {
@@ -296,12 +296,11 @@ mod tests {
         assert_eq!(parsed, m);
     }
 
-    /// (b) Tapes written before #134 carry `layout_version = 1` in
-    /// `[manifest]`. Those are exactly the tapes a disaster rebuild will be
-    /// reading, so the parser must ignore the key rather than reject the
-    /// manifest.
+    /// (b) `volume-format-v2.md` §1.2 rule 3 (#134): a reader reads on past a
+    /// key it does not know, in every table of the manifest, rather than
+    /// reject the manifest. A later writer may add one.
     #[test]
-    fn a_manifest_from_before_the_layout_version_removal_still_parses() {
+    fn a_manifest_reads_on_past_a_key_it_does_not_know() {
         let m = Manifest {
             volume: "LAB01".to_string(),
             tenant: "alice".to_string(),
@@ -310,9 +309,17 @@ mod tests {
             units: two_units(),
         };
         let current = m.to_toml();
-        let legacy = current.replace("[manifest]\n", "[manifest]\nlayout_version = 1\n");
-        assert_ne!(legacy, current, "the legacy key was not injected");
-        let parsed = Manifest::from_toml(&legacy).expect("a pre-#134 manifest must still parse");
+        let later = current
+            .replace("[manifest]\n", "[manifest]\nfuture_key = 1\n")
+            .replace("[[units]]\n", "[[units]]\nfuture_unit_key = \"x\"\n")
+            .replace(
+                "[[units.slices]]\n",
+                "[[units.slices]]\nfuture_slice_key = true\n",
+            );
+        for key in ["future_key", "future_unit_key", "future_slice_key"] {
+            assert!(later.contains(key), "{key} was not injected:\n{later}");
+        }
+        let parsed = Manifest::from_toml(&later).expect("unknown keys are read past");
         assert_eq!(parsed, m);
     }
 

@@ -86,7 +86,8 @@ pub struct OpenedEnvelope {
     pub type_label: String,
     pub manifest: EnvelopeManifest,
     /// The operator envelope's `catalog.db` (issue #83), extracted to disk.
-    /// `None` for tenant envelopes, which never carry it.
+    /// `None` for tenant envelopes, which never carry it, and for an
+    /// operator envelope without one, which `catalog rebuild` refuses.
     pub catalog_db: Option<PathBuf>,
     /// The dar catalogue files (`catalogs/<uuid8>_v<N>.<k>.dar`) of the
     /// operator envelope, extracted to disk (issue #473). Empty for tenant
@@ -97,8 +98,8 @@ pub struct OpenedEnvelope {
     /// The operator envelope's cross-volume `index/units.tsv` (§1.5, #418
     /// R4), extracted to disk. `None` for a tenant envelope (whose index
     /// files `catalog rebuild` does not need: the operator map covers every
-    /// tenant, and a tenant's `paths.tsv` is as large as its files) and for
-    /// an operator envelope from before 1.3.0.
+    /// tenant, and a tenant's `paths.tsv` is as large as its files), and
+    /// for an operator envelope without one, which `catalog rebuild` refuses.
     pub index_units: Option<PathBuf>,
 }
 
@@ -477,15 +478,15 @@ mod tests {
         assert!(!opened("tenant_envelope", "alpha").is_operator());
     }
 
-    /// Tapes written before #134 carry `layout_version = 1` in `[manifest]`.
-    /// Those are exactly the tapes a disaster rebuild will be reading, so
-    /// the parser must ignore the key rather than reject the manifest.
+    /// `volume-format-v2.md` §1.2 rule 3 (#134): the envelope's manifest
+    /// reader reads on past a key it does not know rather than reject the
+    /// manifest. A later writer may add one.
     #[test]
-    fn a_manifest_from_before_the_layout_version_removal_still_parses() {
+    fn a_manifest_reads_on_past_a_key_it_does_not_know() {
         let current = generated_manifest("alpha");
-        let legacy = current.replace("[manifest]\n", "[manifest]\nlayout_version = 1\n");
-        assert_ne!(legacy, current, "the legacy key was not injected");
-        let m = parse_manifest(&legacy).expect("a pre-#134 manifest must still parse");
+        let later = current.replace("[manifest]\n", "[manifest]\nfuture_key = 1\n");
+        assert_ne!(later, current, "the key was not injected");
+        let m = parse_manifest(&later).expect("an unknown key is read past");
         assert_eq!(m.units.len(), 1);
         assert_eq!(m.units[0].slices[0].tape_position, Some(9));
     }

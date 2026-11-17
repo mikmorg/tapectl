@@ -204,8 +204,9 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 ///
 /// Frozen into the session's `layout.json` with the rest of the Layout, so a
 /// resume revalidates against the bound the plan was made with. Absent from
-/// that file when `None` — a sidecar written before 1.6.0 reads as `None`,
-/// and one written without the key is byte for byte what 1.5.0 wrote.
+/// that file when `None`, which is how it reads back when absent: the
+/// writer omits the key, so its absence is the current shape, not an older
+/// one.
 ///
 /// **The span's tail** (ADR-0012 item 123; `layout-session.md` "Spanning").
 /// `span_tail_from` is the position of the first slice of the plan's last
@@ -214,9 +215,8 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 /// tail last ([`CapacityBudget::place`]), so the last unit of a span tape
 /// is the only one that can be it. Frozen with the bound, so a resume
 /// revalidates the tail the plan was made with. Absent from `layout.json`
-/// when `None`, so a tape with no unit that may span writes the 1.6.0
-/// sidecar byte for byte, and a sidecar written before 1.7.0 reads as no
-/// tail.
+/// when `None`, as the bound is: a plan with no unit that may span writes
+/// no key, and reads back as no tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityBudget {
     pub available_bytes: u64,
@@ -1750,8 +1750,8 @@ mod tests {
 
     #[test]
     fn the_plan_bound_is_absent_from_a_frozen_layout_without_one() {
-        // A session's `layout.json` without the bound is what 1.5.0 wrote,
-        // and one written before 1.6.0 reads back as no bound.
+        // A session's `layout.json` without the bound omits the key, and
+        // reads back as no bound.
         let none = budget(7, 1, None);
         let json = serde_json::to_string(&none).unwrap();
         assert_eq!(json, r#"{"available_bytes":7,"reserve_bytes":1}"#);
@@ -1763,7 +1763,8 @@ mod tests {
         assert!(!json.contains("span_tail_from"), "{json}");
         assert_eq!(serde_json::from_str::<CapacityBudget>(&json).unwrap(), some);
         // A span tape's tail (ADR-0012 item 123) round-trips with the bound,
-        // and a sidecar written before 1.7.0 reads as no tail.
+        // and a plan with a bound and no tail (the writer omits the key)
+        // reads as no tail.
         let span = CapacityBudget {
             span_tail_from: Some(12),
             ..some
@@ -1774,10 +1775,10 @@ mod tests {
             r#"{"available_bytes":7,"reserve_bytes":1,"plan_bound_bytes":9,"span_tail_from":12}"#
         );
         assert_eq!(serde_json::from_str::<CapacityBudget>(&json).unwrap(), span);
-        let pre_1_7: CapacityBudget =
+        let no_tail: CapacityBudget =
             serde_json::from_str(r#"{"available_bytes":7,"reserve_bytes":1,"plan_bound_bytes":9}"#)
                 .unwrap();
-        assert_eq!(pre_1_7.span_tail_from, None);
+        assert_eq!(no_tail.span_tail_from, None);
     }
 
     /// The gate is wired to the frozen tail: a span Layout whose tail crosses
