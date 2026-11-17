@@ -182,8 +182,9 @@ unwritten (a staged version may already have some of its copies)
 A piece of a stage set's Stream that holds whole Members, as many as fit in
 `slice_size` (1 GiB by default), compressed alone when its staging says so,
 age-encrypted and written as one tape file (ADR-0012 items 282-284). A member
-larger than `slice_size` has a Run of slices to itself. A slice that does not
-continue a member is an archive any tar reads alone.
+larger than `slice_size` has a Run of slices to itself. A slice that holds only
+whole members is an archive any tar reads alone; a run is read only with all its
+slices joined.
 _Avoid_: chunk (age encrypts in 64 KiB chunks), block (the tape's 512 KiB unit),
 part, plain cut (Layout 2's slice: bytes of the stream wherever members fell)
 
@@ -200,8 +201,8 @@ hashes every file, and cuts it into Slices. The slices joined are the stream.
 _Avoid_: archive (ambiguous with an archive set), tarball
 
 **Member**:
-One entry of a Stream: a file, folder, link, FIFO or device node, from its first
-extension header to the end of its last padded block. A socket is never a member.
+One member of a Stream: its extension headers, its header and its padded data,
+for a file, folder, link, FIFO or device node. A socket is never a member.
 _Avoid_: file (a member may be a folder or a link), entry (the Layout's word for
 a tape file)
 

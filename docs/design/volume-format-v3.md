@@ -18,7 +18,7 @@ tapectl 1.x wrote and is history here.
 
 Points that the ruled texts do not decide at the level of bytes are marked
 **OPEN (Stage 1):** and listed in §10. Nothing is built on an open point until the
-CTO answers it. None remains (§10).
+CTO answers it. §10 lists those that remain.
 
 ---
 
@@ -1503,7 +1503,13 @@ From Layout 2, by ADR-0012 items 241, 242, 258, 264, 267, 283 and 288, and D10:
 
 ## 10. Open points (Stage 1)
 
-None. The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings
+One:
+
+1. **§3.1** With `preserve_xattrs` on and `preserve_acls` off, is T0.1's exclude
+   (`--xattrs-exclude='system.posix_acl_*'`) given anyway, so that no ACL is stored, or
+   does it follow `preserve_acls` only, so that the raw ACL attribute is stored?
+
+The six points Stage 1 first found (the on-tape `catalog.db`'s tables; two stagings
 of one version on one tape; the id map's header; the MANIFEST's new keys and their order; a
 magic in File 3 and the seal) were ruled by ADR-0012 item 294 and are written into §1.4,
 §1.6, §1.9 and §5. The two T1.5's listing found (two inert columns of `writes`; the new

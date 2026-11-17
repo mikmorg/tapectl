@@ -41,8 +41,9 @@ zone.
 age-encrypted tape file, made once at staging and the same on every copy, with every rule
 defined on a slice (the early warning W1 to W9, the seals, resume, the retry after a refusal,
 replacement by sha256). A slice ends at a member's start; a member larger than `slice_size`
-has a run of slices to itself. So each slice that does not continue a member is an archive any
-tar reads alone. That a slice's size on tape follows the files in it is accepted. A hard-linked
+has a run of slices to itself. So a slice that holds only whole members is an archive any tar
+reads alone; a long member's run is read only with all its slices joined, the first of which
+states no `continues`, and a reader tells it by the next slice's `continues = true`. That a slice's size on tape follows the files in it is accepted. A hard-linked
 name depends on the slice of the name archived first, and is listed for the repair when that
 slice is not read.
 
@@ -71,14 +72,15 @@ start on any tape and takes the files that tape holds whole; across cartridges t
 script streams with one prompt, where "I do not have it" is an answer. The heir's work
 directory is inside the destination.
 
-**The format document's choices** D1 to D22 are ratified as proposed (item 290), and its open
-points settled (item 294): no `requires` entry on a Layout 3 tape; `tables/<uuid8>_v<version>_s<stage_set_id>`
+**The format document's choices** D1 to D22 are ratified as proposed (item 290), among them
+no `requires` entry on a Layout 3 tape (D1); its open points are settled (items 294, 295): `tables/<uuid8>_v<version>_s<stage_set_id>`
 names; `file_table`, `id_map`, `tar_version` and `continues` in the MANIFEST; the on-tape
 `catalog.db` carries what `catalog rebuild` reads plus the file table and the id map; no magic
-key beside File 0's.
+key beside File 0's; Layout 2's inert salvage columns of `writes` dropped; the on-tape
+`stage_sets` and `stage_slices` carrying the columns the catalog gains.
 
 **How production starts** (items 243, 244, 247, 248, 251, 262, 263, 268, 291, 292). The on-tape
-authorization for Layout 3 runs until a drill passes on the production run. The build is gated
+authorization for Layout 3 runs until a drill passes on the production run. Production is gated
 on total completion of every feature and fix, the drill and the adversarial reads; a second
 drive does not gate. Real scale is measured on a made tree before the code and on the largest
 real unit at the real-drive acceptance. `v2.0.0` is tagged first, installed by a fresh start
@@ -103,5 +105,7 @@ ADR-0012 items 239 to 295, with 235 to 238 as their context. Superseded within A
 later items, and read only through them: the zero-fill of item 255 (by 264), item 143 (by
 260), items 88 and 132's scratch mode (by 267), item 243's end at the install (by 268), the
 plain cut of item 241 (by 283), item 9's "never split by the drive", item 82's opt-in, the
-`cut` unit of items 99 and 112, items 83, 94, 95, 123, 124, 133 and 147 (by 288 and 289), and
+`cut` unit of items 99 and 112, item 113's bound, the second half of item 122's order, item
+121's freeze of whether a set may span, item 125's `may_span`, items 83, 94, 95, 123, 124, 133
+and 147 (by 288 and 289), and
 item 253's "before any code" for the largest real unit (by 291).

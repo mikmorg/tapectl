@@ -590,7 +590,8 @@ rewritten by the item named and nothing else in the section moves.
 
 T1.1 is done when every row above has its section, every rule of #562 is in Appendix B
 with a section number, and a search of the document for `dar`, `cut unit`, `may_span`,
-`spannable` and `plain cut` finds only the list in section 9.
+`spannable` and `plain cut` finds them only outside the running text: in section 9 and in
+Appendix A, which name what goes.
 
 ### What Stage 1 writes down: D1 to D22, ratified
 
@@ -1242,7 +1243,9 @@ tapes), `tests/fixtures/restore_sh_1_5_0/`, `tests/fixtures/restore_sh_1_6_0/`.
 2. `rebuild`: remove the branches for a tape with no `catalog.db`, with no tenant ownership,
    with no `[media]` table, with no index, and "written by an older tapectl". A tape that
    lacks what the current writer always writes is refused, naming what is missing.
-3. Readers: `Manifest` becomes `deny_unknown_fields` (it was not, for tapes before #134).
+3. Readers: `Manifest` reads on past a key it does not know (`volume-format-v3.md` §1.2
+   rule 3, #134). *(Corrected 2026-11-17: this step first asked for
+   `deny_unknown_fields`, against rule 3.)*
    File 0 without `[media]` or without `cartridge_identity_source`, `requires` absent, a
    `paths.tsv` with no sha256 column, a `layout.json` sidecar from before 1.7.0: each is
    refused, naming the field, where it was tolerated.
@@ -1731,8 +1734,9 @@ and the MANIFEST generators only; **not** File 1, RESTORE.sh or RECOVERY.md's pr
 2. **#547:** File 0's `[media]` strings are escaped as TOML strings.
 3. The MANIFEST's block for a staging as D6 has it, with `compression` stated only for a
    compressed staging, no `may_span`, and `continues` on a slice that continues a member
-   (D22). `manifest.rs` stays one type in both directions and is
-   `deny_unknown_fields`.
+   (D22). `manifest.rs` stays one type in both directions and reads on past a key it does
+   not know (§1.2 rule 3, #134). *(Corrected 2026-11-17: this step first asked for
+   `deny_unknown_fields`, against rule 3.)*
 4. Each tenant envelope carries, for each staging the tape's plan holds a slice of, that
    staging's whole file table and id map as text (D4, D5), from the catalog database. The
    operator envelope's `catalog.db` carries both as rows (D7). `catalogs/` is gone.
