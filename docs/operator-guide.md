@@ -2764,6 +2764,40 @@ endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2 and on any code
 but 75, no second ping on 75, catalog busy). It is off unless set, and a missing `curl` or a failed
 ping never changes the run's own result.
 
+### What a reporting tool reads
+
+tapectl builds in no notification: no address, no mail, no `OnFailure=` (ADR-0012
+item 250). A failed scheduled job reaches nobody until a tool written on top
+tells someone. That tool needs four facts, each from the command line alone,
+in JSON and by exit code. Every `--json` command prints one document on
+stdout, and an error is one JSON document with the command's exit code.
+
+| fact | command | what to read | exit code |
+|---|---|---|---|
+| the audit's verdict | `tapectl --json audit` | `exit_code`, `violations`, `warnings`, and each of `findings` (`check`, `unit`, `message`) | 0 clean, 1 warnings only, 2 violations, 70 no verdict, 75 catalog busy |
+| the newest catalog backup's age | the newest `tapectl-<UTC stamp>.db` in the backup directory | the stamp in the name (`YYYYmmddTHHMMSSZ`, the time it was made) | not applicable |
+| whether it passed its check | `tapectl --json db import FILE --dry-run` | `dry_run` and `source_schema_version` | 0 the file passes (an SQLite database, passes its integrity check, a tapectl catalog of a schema this tapectl opens), non-zero it does not; nothing is changed |
+| the drive's last health reading | `tapectl --json report health` | `readings[0]` (newest first: `at`, `operation`, `tape_alerts`, `corrected`, `uncorrected`, `drive_serial`, `cartridge_barcode`) and `tape_alerts_raised` | always 0 |
+| what is pending | `tapectl --json status` | `units.pending`, and the lists `units.never_archived`, `dirty`, `unstaged`, `not_scanned`, the count `units.unsynced_folders`, `units.under_copied`, `due_verify`, `interrupted` and `next` (the commands to run) | 0 |
+
+Things to know when writing the tool:
+
+- `drive poll` writes the health reading the scheduled drive poll takes; `report
+  health` only reads the catalog and never opens the drive, so a tool may run it
+  at any time. `drive status` touches the drive and is not for a tool to poll.
+  The reading's age is its `at`; a drive poll that stops running shows as an old
+  `at`, not as an error.
+- The catalog records no backup. A backup's age and its check come from the
+  file the backup wrote (the dated name above, and the dry-run import), in the
+  directory the tool already knows (the scheduled backup's
+  `TAPECTL_BACKUP_DIR`). The newest by name is the newest by time.
+- Exit 75 means the catalog was busy: no answer this time, not a finding.
+  Ask again; a tool that sees it on several runs in a row has its own news.
+- A pending unit is advice, not a failure: `status` exits 0 whatever is
+  pending, as `audit` exits 1 for a warning. Judge by the lists, and keep
+  to ADR-0004: the audit advises and never blocks.
+- Keys may be added to these documents; none is renamed or removed.
+
 Two things the timers do **not** change:
 
 - **They never write.** No tape command is scheduled, ever. The audit and
