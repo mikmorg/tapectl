@@ -4369,7 +4369,7 @@ fn copy_database_in_one_step(
 ///    hand-rolled `writes`/`stage_slices` scans, and `--repair`'s DELETEs
 ///    ran under immediate FK enforcement, so any orphan with children of
 ///    its own (a `writes` row with `write_positions`, a `stage_slices` row
-///    with `write_positions`/`sacrificed_slice_id`/`verification_results`)
+///    with `write_positions`/`verification_results`)
 ///    tripped the very constraint it was trying to close and rolled the
 ///    whole repair back. Reporting now runs `pragma_foreign_key_check`,
 ///    which is schema-derived and covers every edge without hand-keeping
@@ -11720,8 +11720,7 @@ mod tests {
     /// row orphaned on `volumes` with a `write_positions` child and a
     /// `verification_results` grandchild (via that child), plus a
     /// `stage_slices` row orphaned on `stage_sets` referenced by a second
-    /// `write_positions` row and by the orphan write's
-    /// `sacrificed_slice_id`.
+    /// `write_positions` row.
     ///
     /// Negative control (pre-fix HEAD): `db_fsck(&conn, true)` returns
     /// `Err` whose text contains `FOREIGN KEY constraint failed`, and every
@@ -11789,13 +11788,11 @@ mod tests {
         .unwrap();
         let slice_orphan_id = conn.last_insert_rowid();
 
-        // An orphan writes row -- its OWN volume_id dangles -- that also
-        // references the orphan slice via `sacrificed_slice_id` (that
-        // reference is not itself dangling: the row exists).
+        // An orphan writes row -- its OWN volume_id dangles.
         conn.execute(
-            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, sacrificed_slice_id)
-             VALUES (?1, ?2, 99999, 'completed', ?3)",
-            params![stage_set_id, snap_id, slice_orphan_id],
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, 99999, 'completed')",
+            params![stage_set_id, snap_id],
         )
         .unwrap();
         let write_orphan_id = conn.last_insert_rowid();

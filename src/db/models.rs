@@ -221,8 +221,6 @@ pub struct Write {
     /// set by an Integrity-tier confirm that passes and by a passing full
     /// `volume verify` of the volume; a quick confirm leaves it unset.
     pub write_verified: bool,
-    pub eot_recovery: Option<String>,
-    pub sacrificed_slice_id: Option<i64>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub notes: Option<String>,

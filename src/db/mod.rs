@@ -1167,6 +1167,24 @@ mod tests {
         );
     }
 
+    /// ADR-0012 item 295: `writes` carries no column of Layout 2's rejected
+    /// end-of-tape salvage. The control reads a column it does carry.
+    #[test]
+    fn writes_carries_no_end_of_tape_salvage_column() {
+        let conn = open_memory().unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('writes')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(columns.iter().any(|c| c == "write_verified"), "{columns:?}");
+        for gone in ["eot_recovery", "sacrificed_slice_id"] {
+            assert!(!columns.iter().any(|c| c == gone), "{gone}: {columns:?}");
+        }
+    }
+
     /// The live `writes.status` vocabulary, pinned to the schema rather than
     /// to a schema file's text (`live_status_check`'s reason).
     #[test]

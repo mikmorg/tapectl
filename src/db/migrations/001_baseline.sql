@@ -383,7 +383,10 @@ CREATE TABLE cleaning_cartridges (
 );
 
 -- ---------------------------------------------------------------------------
--- Writes: one stage set on one volume, and where each of its slices went
+-- Writes: one stage set on one volume, and where each of its slices went.
+-- 1.x's `writes.eot_recovery` and `writes.sacrificed_slice_id` are not
+-- carried: they belonged to the end-of-tape salvage, which was rejected, and
+-- meant nothing (ADR-0012 item 295).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE writes (
@@ -396,9 +399,6 @@ CREATE TABLE writes (
                                          'failed','aborted','interrupted',
                                          'cut','range')),
     write_verified      INTEGER NOT NULL DEFAULT 0,
-    eot_recovery        TEXT CHECK(eot_recovery IN (NULL, 'normal',
-                                   'overwrite_incomplete', 'sacrifice_last_slice')),
-    sacrificed_slice_id INTEGER REFERENCES stage_slices(id),
     started_at          TEXT,
     completed_at        TEXT,
     notes               TEXT,
