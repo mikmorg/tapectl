@@ -65,10 +65,29 @@ pub fn save_secret_key(path: &Path, secret_key: &str) -> Result<()> {
 /// validation (and its error) when the value doesn't look like a literal key.
 pub fn read_or_parse_public_key(value: &str) -> Result<String> {
     let trimmed = value.trim();
-    if trimmed.starts_with("age1") {
-        return Ok(trimmed.to_string());
+    if trimmed.starts_with("AGE-SECRET-KEY-") {
+        // Never echo it: it is a secret.
+        return Err(TapectlError::Encryption(
+            "that is a secret key, not a public key (a recipient starts age1)".into(),
+        ));
     }
-    read_public_key(Path::new(value))
+    if trimmed.starts_with("age1") {
+        return parse_recipient(trimmed, "the value given");
+    }
+    let key = read_public_key(Path::new(value))?;
+    parse_recipient(&key, &format!("the key in {value}"))
+}
+
+/// Parse `key` as an age X25519 recipient (#533): the prefix alone accepts a
+/// mistyped key, which ADR-0005 then makes permanent as the escrow row.
+fn parse_recipient(key: &str, what: &str) -> Result<String> {
+    key.parse::<x25519::Recipient>().map_err(|e| {
+        TapectlError::Encryption(format!(
+            "{what} is not an age recipient ({e}): a public key is age1 followed by 58 \
+             characters, with a checksum; check it against the printed copy"
+        ))
+    })?;
+    Ok(key.to_string())
 }
 
 /// Read a public key from a file.

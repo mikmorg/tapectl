@@ -479,3 +479,88 @@ fn init_adopts_the_operator_key_and_a_refused_init_creates_no_home() {
         ("op-primary", public.as_str(), true)
     );
 }
+
+/// #533: an escrow public key is parsed as an age recipient before anything
+/// is stored. Each of these starts `age1` (or is a secret key pasted by
+/// mistake) and is not a recipient; `init` and `key import --escrow` refuse
+/// them by name and leave nothing behind. `setup` stores through the same
+/// `adopt_escrow_recipient` as `key import --escrow`.
+fn bad_escrow_values() -> Vec<(&'static str, String)> {
+    let id = age::x25519::Identity::generate();
+    let good = id.to_public().to_string();
+    // One character in the middle changed: the bech32 checksum fails.
+    let mut chars: Vec<char> = good.chars().collect();
+    let mid = chars.len() / 2;
+    chars[mid] = if chars[mid] == 'q' { 'p' } else { 'q' };
+    let one_changed: String = chars.into_iter().collect();
+    assert_ne!(one_changed, good);
+    vec![
+        ("one character changed", one_changed),
+        ("truncated", good[..good.len() - 10].to_string()),
+        (
+            "a secret key pasted",
+            id.to_string().expose_secret().to_string(),
+        ),
+        ("only the prefix", "age1".to_string()),
+    ]
+}
+
+#[test]
+fn init_refuses_an_escrow_key_that_is_not_a_recipient_and_creates_nothing() {
+    for (what, value) in bad_escrow_values() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let err = refused(
+            &home,
+            &["init", "--operator", "op", "--escrow-public-key", &value],
+        );
+        assert!(err.contains("invalid --escrow-public-key"), "{what}: {err}");
+        assert!(!home.exists(), "{what}: init left a home behind");
+    }
+}
+
+#[test]
+fn key_import_escrow_refuses_a_key_that_is_not_a_recipient_and_stores_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    ok(&home, &["init", "--operator", "op", "--no-escrow"]);
+    for (what, value) in bad_escrow_values() {
+        let err = refused(&home, &["key", "import", "--escrow", &value]);
+        assert!(
+            err.contains("recipient") || err.contains("secret key"),
+            "{what}: {err}"
+        );
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM encryption_keys WHERE is_escrow = 1"
+            ),
+            0,
+            "{what}: a refused key was stored"
+        );
+    }
+    // The control: a real recipient still goes in.
+    let good = age::x25519::Identity::generate().to_public().to_string();
+    ok(&home, &["key", "import", "--escrow", &good]);
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM encryption_keys WHERE is_escrow = 1"
+        ),
+        1
+    );
+}
+
+#[test]
+fn the_escrow_parser_refuses_what_setup_and_a_pub_file_would_hand_it() {
+    for (what, value) in bad_escrow_values() {
+        let literal = tapectl::crypto::keys::read_or_parse_public_key(&value);
+        assert!(literal.is_err(), "{what}: literal accepted");
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("k.pub");
+        std::fs::write(&path, format!("{value}\n")).unwrap();
+        let file = tapectl::crypto::keys::read_or_parse_public_key(path.to_str().unwrap());
+        // A file of a secret key is not a public key either.
+        assert!(file.is_err(), "{what}: file form accepted");
+    }
+}
