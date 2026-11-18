@@ -80,11 +80,16 @@ fn check_mention(mention: &str) -> Option<String> {
     for word in mention.split_whitespace().skip(1) {
         match node.find_subcommand(word) {
             Some(sub) => {
-                if sub.is_hide_set() {
-                    return Some(format!("{mention:?} names a removed spelling"));
-                }
                 node = sub;
                 matched += 1;
+            }
+            // A command-shaped word a group does not have is a removed or
+            // misspelt spelling (`report summary`), not an argument.
+            None if node.has_subcommands()
+                && matched > 0
+                && word.chars().all(|c| c.is_ascii_lowercase() || c == '-') =>
+            {
+                return Some(format!("{mention:?} names no command `{word}`"));
             }
             None => break,
         }

@@ -506,9 +506,8 @@ fn a_collections_or_archive_sets_table_appended_to_a_fresh_init_config_loads() {
 
 /// Issue #348 (CTO ruling 2026-09-28): `init` writes the renamed `[defaults]`
 /// keys `min_copies` / `min_locations`, and a config still carrying the old
-/// `*_for_tape_only` names is refused by `config check` with the new names
-/// in the message — the operator's own copy of an older config must say
-/// what to change, not just "unknown field".
+/// `*_for_tape_only` names is refused by `config check` as an unknown key
+/// (ADR-0012 item 258(d): 2.0 keeps no remediation text for a 1.x key).
 #[test]
 fn init_writes_min_copies_and_min_locations_and_the_old_names_are_refused() {
     let home = TempDir::new().expect("tempdir");
@@ -539,9 +538,14 @@ fn init_writes_min_copies_and_min_locations_and_the_old_names_are_refused() {
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(stdout.contains("config: INVALID"), "{stdout}");
     assert!(
-        stdout.contains("defaults.min_copies and defaults.min_locations"),
-        "the refusal must name both new keys: {stdout}"
+        stdout.contains("unknown field `min_copies_for_tape_only`"),
+        "the old name must be refused as unknown: {stdout}"
     );
+    assert!(
+        stdout.contains("unknown key: defaults.min_locations_for_tape_only"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("renamed"), "{stdout}");
 }
 
 /// Acceptance criterion (issue #172): "`logging.level = \"debug\"` actually
