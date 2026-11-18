@@ -71,6 +71,97 @@ pub(crate) struct Packing {
     pub(crate) level: u32,
 }
 
+impl Packing {
+    /// What packing a slice at this algorithm and level holds beside the
+    /// staging's own buffers (#570): the encoder's working memory plus the
+    /// check's decoder, which runs beside it ([`Packer`] decodes every
+    /// packed byte as it passes). A level the table does not list is
+    /// counted at the algorithm's largest figure, never a smaller one.
+    pub(crate) fn memory(self) -> u64 {
+        let (pack, decode) = match self.algorithm {
+            Algorithm::Gzip => (GZIP_PACK_BYTES, GZIP_DECODE_BYTES),
+            Algorithm::Xz => (
+                pick(&XZ_PACK_BYTES, 0, self.level),
+                pick(&XZ_DECODE_BYTES, 0, self.level),
+            ),
+            Algorithm::Zstd => (
+                pick(&ZSTD_PACK_BYTES, 1, self.level),
+                pick(&ZSTD_DECODE_BYTES, 1, self.level),
+            ),
+        };
+        pack + decode
+    }
+}
+
+/// The figure for `level` in a table that starts at `first`, or the table's
+/// largest when the level is outside it.
+fn pick(table: &[u64], first: u32, level: u32) -> u64 {
+    level
+        .checked_sub(first)
+        .and_then(|i| table.get(i as usize))
+        .or_else(|| table.iter().max())
+        .copied()
+        .unwrap_or(0)
+}
+
+// The memory table (#570). Each figure is from the library's own function or
+// documentation, in bytes, for the version tapectl bundles; none is a guess.
+//
+// xz, levels 0 to 9: `lzma_easy_encoder_memusage(level)` and
+// `lzma_easy_decoder_memusage(level)` of liblzma 5.4 (the presets the
+// `liblzma` crate's `XzEncoder::new(.., level)` and `XzDecoder` use), read
+// through the C API on 2026-11-18. They agree with the table of presets in
+// the `xz(1)` man page, which rounds up to MiB: compressor 3, 9, 17, 32, 48,
+// 94, 94, 186, 370 and 674 MiB; decompressor 1, 2, 3, 5, 5, 9, 9, 17, 33 and
+// 65 MiB.
+const XZ_PACK_BYTES: [u64; 10] = [
+    2_855_431,
+    9_015_815,
+    16_880_135,
+    32_608_775,
+    49_385_995,
+    97_620_491,
+    97_620_491,
+    194_089_483,
+    387_027_467,
+    705_794_571,
+];
+const XZ_DECODE_BYTES: [u64; 10] = [
+    327_736, 1_114_168, 2_162_744, 4_259_896, 4_259_896, 8_454_200, 8_454_200, 16_842_808,
+    33_620_024, 67_174_456,
+];
+
+// zstd, levels 1 to 19: `ZSTD_estimateCStreamSize(level)` (the encoder's
+// memory for a stream of unknown, arbitrarily large size: the window and the
+// match tables of the level's row in lib/compress/clevels.h, plus the stream
+// buffers) and `ZSTD_estimateDStreamSize(1 << windowLog)` for that row's
+// window (a frame written without a content size states its whole window),
+// from the zstd 1.5.7 that `zstd-sys` 2.1.3 bundles, read on 2026-11-18. The
+// functions are in zstd's experimental section, which the `zstd` crate's
+// default features do not expose, so the figures are carried here.
+const ZSTD_PACK_BYTES: [u64; 19] = [
+    1_369_625, 2_090_521, 3_663_385, 4_974_105, 6_022_681, 6_022_681, 9_168_409, 9_168_409,
+    17_557_017, 30_139_929, 30_139_929, 55_305_753, 55_305_753, 55_305_753, 72_082_969, 72_082_969,
+    72_082_969, 72_082_969, 93_848_215,
+];
+const ZSTD_DECODE_BYTES: [u64; 19] = [
+    1_013_544, 1_537_832, 2_586_408, 2_586_408, 2_586_408, 2_586_408, 2_586_408, 2_586_408,
+    4_683_560, 4_683_560, 4_683_560, 4_683_560, 4_683_560, 4_683_560, 4_683_560, 4_683_560,
+    8_877_864, 8_877_864, 8_877_864,
+];
+
+// gzip: the level does not change the state. zlib's documented memory for
+// deflate is (1 << (windowBits + 2)) + (1 << (memLevel + 9)) bytes (zlib.h,
+// "deflateInit2"), 384 KiB at windowBits 15 and memLevel 8; flate2's
+// miniz_oxide backend, measured with a counting allocator on 2026-11-18
+// (levels 1, 6 and 9, an 8 MB input in 64 KiB writes), peaked at 352,104
+// bytes in the encoder, the same for every level, and 76,072 bytes in the
+// decoder (zlib's inflate: a 32 KiB window, `1 << windowBits`). The figures
+// are the larger of the formula and the measurement, the decoder's rounded
+// up to 128 KiB.
+const GZIP_PACK_BYTES: u64 = 384 * 1024;
+const GZIP_DECODE_BYTES: u64 = 128 * 1024;
+
 /// The values of `compression` Layout 3 carries.
 pub(crate) const CARRIED: &str = "none, gzip, xz or zstd";
 

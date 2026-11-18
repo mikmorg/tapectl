@@ -38,14 +38,15 @@ pub const DEFAULT_JOBS: usize = 1;
 /// The most units `[staging] jobs` or `--jobs` may stage at once.
 pub const MAX_JOBS: usize = 16;
 
-/// What one stage in flight may hold of the host's memory: the stream
-/// reader's (a member's extension headers, at most `tar::stream::MAX_EXTENDED`
-/// = 64 MiB, and a 64 KiB chunk), the slice file's 1 MiB buffer and the
-/// bounded hash queues, with room to spare: 192 MiB in all. Packing holds
-/// no slice whole (`staging::pack` writes each frame as the cut comes); a
-/// compressed staging adds its encoder's and decoder's memory, which its
-/// level decides and which is not counted here: at its defaults a few tens
-/// of MiB, but xz's own table gives 674 MiB (+65 MiB to decode) at level 9.
+/// What one stage in flight may hold of the host's memory apart from its
+/// compressor: the stream reader's (a member's extension headers, at most
+/// `tar::stream::MAX_EXTENDED` = 64 MiB, and a 64 KiB chunk), the slice
+/// file's 1 MiB buffer and the bounded hash queues, with room to spare:
+/// 192 MiB in all. Packing holds no slice whole (`staging::pack` writes each
+/// frame as the cut comes), but a compressed staging adds its encoder's and
+/// decoder's memory, which its level decides (#570): [`job_memory`] adds
+/// `Packing::memory`, xz's own table giving 674 MiB (+65 MiB to decode) at
+/// level 9.
 pub const MEMORY_PER_JOB: u64 = 192 << 20;
 
 /// One unit to stage: its name, for the operator, and the snapshot to stage.
@@ -95,31 +96,103 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// How many of `units` units to stage at once for `requested`: at least 1,
-/// at most [`MAX_JOBS`] and the number of units, and no more than
-/// `available` bytes of memory hold at [`MEMORY_PER_JOB`] each. A request
-/// cut down by memory is said on `notices`.
+/// What one job holds of the host's memory, and how it packs, for the
+/// notice that names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobMemory {
+    pub(crate) bytes: u64,
+    /// `"zstd level 19"`, or `None` for a job that packs nothing.
+    pub(crate) packs: Option<String>,
+}
+
+/// A job packing `packing`, or nothing: [`MEMORY_PER_JOB`] plus the
+/// compressor's pack and decode memory at its level (#570).
+pub(crate) fn job_memory(packing: Option<super::pack::Packing>) -> JobMemory {
+    match packing {
+        None => JobMemory {
+            bytes: MEMORY_PER_JOB,
+            packs: None,
+        },
+        Some(p) => JobMemory {
+            bytes: MEMORY_PER_JOB + p.memory(),
+            packs: Some(format!("{} level {}", p.algorithm.name(), p.level)),
+        },
+    }
+}
+
+/// One job's memory from its resolved policy. A job whose policy cannot be
+/// resolved, or whose compression is refused, is counted as packing nothing:
+/// its own `stage_create` refuses it by name before it holds anything.
+fn memory_of(conn: &Connection, config: &Config, job: &StageJob) -> JobMemory {
+    let resolved = (|| -> Result<Option<super::pack::Packing>> {
+        let unit_id: i64 = conn.query_row(
+            "SELECT unit_id FROM snapshots WHERE id = ?1",
+            params![job.snapshot_id],
+            |r| r.get(0),
+        )?;
+        let name: String = conn.query_row(
+            "SELECT name FROM units WHERE id = ?1",
+            params![unit_id],
+            |r| r.get(0),
+        )?;
+        let unit = crate::db::queries::get_unit_by_name(conn, &name)?
+            .ok_or_else(|| TapectlError::Other("unit not found".into()))?;
+        let resolved = crate::policy::resolve(conn, config, &unit)?;
+        super::pack::packing(&resolved.compression, resolved.compression_level)
+    })();
+    job_memory(resolved.unwrap_or(None))
+}
+
+/// How many of `jobs` to stage at once for `requested`: at least 1, at most
+/// [`MAX_JOBS`] and the number of jobs, and no more than the largest count
+/// whose heaviest jobs together fit in `available` bytes of memory: each job
+/// is judged by its own figure ([`job_memory`]), and any `n` of them may
+/// run together, so the `n` largest must fit. A request cut down by memory
+/// is said on `notices`, naming the compression and level of the heaviest
+/// jobs when they pack.
 pub(crate) fn effective_jobs(
     requested: usize,
-    units: usize,
+    jobs: &[JobMemory],
     available: Option<u64>,
     notices: &mut dyn Write,
 ) -> usize {
-    let wanted = requested.clamp(1, MAX_JOBS).min(units.max(1));
+    let wanted = requested.clamp(1, MAX_JOBS).min(jobs.len().max(1));
     let Some(available) = available else {
         return wanted;
     };
-    let fits = usize::try_from(available / MEMORY_PER_JOB)
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let mut heaviest: Vec<&JobMemory> = jobs.iter().collect();
+    heaviest.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    let mut fits = 0;
+    let mut total = 0u64;
+    for job in heaviest.iter().take(wanted) {
+        total = total.saturating_add(job.bytes);
+        if total > available {
+            break;
+        }
+        fits += 1;
+    }
+    let fits = fits.max(1);
     if fits < wanted {
+        let each = heaviest.first().map_or(MEMORY_PER_JOB, |j| j.bytes);
+        let how = match heaviest.first().and_then(|j| j.packs.as_deref()) {
+            Some(packs) => format!(
+                "each stage in flight keeps up to {} of its source in the page cache plus its \
+                 own buffers, and the heaviest, packing at {packs}, needs {} in all with its \
+                 compressor",
+                crate::util::format_bytes_binary(MEMORY_PER_JOB as i64),
+                crate::util::format_bytes_binary(i64::try_from(each).unwrap_or(i64::MAX)),
+            ),
+            None => format!(
+                "each stage in flight keeps up to {} of its source in the page cache plus its \
+                 own buffers",
+                crate::util::format_bytes_binary(MEMORY_PER_JOB as i64),
+            ),
+        };
         let _ = writeln!(
             notices,
             "note: staging {fits} unit(s) at once, not {wanted}: the host has {} of memory \
-             available, and each stage in flight keeps up to {} of its source in the page \
-             cache plus its own buffers",
+             available, and {how}",
             crate::util::format_bytes_binary(i64::try_from(available).unwrap_or(i64::MAX)),
-            crate::util::format_bytes_binary(MEMORY_PER_JOB as i64),
         );
         return fits;
     }
@@ -170,7 +243,8 @@ pub fn stage_many(
 ) -> Result<Vec<StageOutcome>> {
     let db_file = super::lock::db_file_of(conn);
     let parallel = if db_file.is_some() && jobs.len() > 1 && requested_jobs > 1 {
-        effective_jobs(requested_jobs, jobs.len(), mem_available(), notices)
+        let memory: Vec<JobMemory> = jobs.iter().map(|j| memory_of(conn, config, j)).collect();
+        effective_jobs(requested_jobs, &memory, mem_available(), notices)
     } else {
         1
     };
@@ -670,22 +744,116 @@ mod tests {
 
     #[test]
     fn jobs_are_bounded_by_the_units_the_limit_and_the_memory() {
+        let plain = |n: usize| vec![job_memory(None); n];
         let mut notices = Vec::new();
-        assert_eq!(effective_jobs(0, 5, None, &mut notices), 1);
-        assert_eq!(effective_jobs(4, 2, None, &mut notices), 2);
-        assert_eq!(effective_jobs(100, 100, None, &mut notices), MAX_JOBS);
+        assert_eq!(effective_jobs(0, &plain(5), None, &mut notices), 1);
+        assert_eq!(effective_jobs(4, &plain(2), None, &mut notices), 2);
+        assert_eq!(
+            effective_jobs(100, &plain(100), None, &mut notices),
+            MAX_JOBS
+        );
         assert!(notices.is_empty());
         assert_eq!(
-            effective_jobs(8, 10, Some(3 * MEMORY_PER_JOB + 1), &mut notices),
+            effective_jobs(8, &plain(10), Some(3 * MEMORY_PER_JOB + 1), &mut notices),
             3
         );
         let said = String::from_utf8(notices).unwrap();
         assert!(said.contains("staging 3 unit(s) at once, not 8"), "{said}");
         let mut quiet = Vec::new();
         assert_eq!(
-            effective_jobs(2, 10, Some(1), &mut quiet),
+            effective_jobs(2, &plain(10), Some(1), &mut quiet),
             1,
             "never fewer than one"
+        );
+    }
+
+    /// #570: at xz 9 the memory that holds three jobs at `none` holds one,
+    /// the notice names the compression and level, and a mixed queue is
+    /// judged by its heaviest jobs.
+    #[test]
+    fn xz_level_nine_holds_fewer_jobs_and_the_notice_names_it() {
+        let xz9 = job_memory(super::super::pack::packing("xz", Some(9)).unwrap());
+        assert!(
+            xz9.bytes >= MEMORY_PER_JOB + (673 + 64) * (1 << 20),
+            "xz's documented 674 MiB to pack and 65 MiB to decode (the man page rounds \
+             up) are counted"
+        );
+        let memory = 3 * MEMORY_PER_JOB + 1;
+        let mut quiet = Vec::new();
+        let none = vec![job_memory(None); 3];
+        assert_eq!(effective_jobs(3, &none, Some(memory), &mut quiet), 3);
+        assert!(quiet.is_empty());
+        let mut notices = Vec::new();
+        let heavy = vec![xz9.clone(); 3];
+        assert_eq!(effective_jobs(3, &heavy, Some(memory), &mut notices), 1);
+        let said = String::from_utf8(notices).unwrap();
+        assert!(
+            said.contains("not 3") && said.contains("xz level 9"),
+            "{said}"
+        );
+        // One xz job among plain ones: the plain ones are not held back by
+        // it unless the heaviest set no longer fits.
+        let mixed = vec![job_memory(None), xz9, job_memory(None)];
+        let mut notices = Vec::new();
+        assert_eq!(effective_jobs(3, &mixed, Some(memory), &mut notices), 1);
+        assert!(String::from_utf8(notices).unwrap().contains("xz level 9"));
+    }
+
+    /// Every table figure grows with the level and never falls below the
+    /// documented ones the plan names.
+    #[test]
+    fn the_memory_table_covers_every_level_and_never_shrinks_with_one() {
+        use super::super::pack::{packing, Algorithm};
+        for alg in [Algorithm::Gzip, Algorithm::Xz, Algorithm::Zstd] {
+            let (low, high) = alg.levels();
+            let mut last = 0;
+            for level in low..=high {
+                let p = packing(alg.name(), Some(i64::from(level)))
+                    .unwrap()
+                    .unwrap();
+                assert!(p.memory() >= last, "{} level {level}", alg.name());
+                assert!(p.memory() > 0);
+                last = p.memory();
+            }
+        }
+    }
+
+    /// #570: the memory that holds three jobs at `none` holds fewer when the
+    /// jobs pack at zstd 19 (its own window and tables), and the notice names
+    /// the compression and the level. Three small units are staged through
+    /// `stage_many`, so what reaches admission is each job's resolved policy.
+    #[test]
+    fn the_memory_that_holds_three_jobs_at_none_holds_fewer_when_they_pack() {
+        let units = [("m-a", 2, 3000), ("m-b", 2, 3000), ("m-c", 2, 3000)];
+        let memory = 3 * MEMORY_PER_JOB + 1;
+        let run = |compression: &str, level: Option<i64>| {
+            let (mut h, jobs) = home(&units);
+            h.config.defaults.compression = compression.to_string();
+            h.config.defaults.compression_level = level;
+            MEMORY_OVERRIDE.with(|m| m.set(Some(memory)));
+            let mut notices = Vec::new();
+            let out = stage_many(
+                &h.conn,
+                &h.paths,
+                &h.config,
+                &jobs,
+                3,
+                false,
+                &mut notices,
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!(first_failure(out).unwrap().len(), 3);
+            let db = super::super::lock::db_file_of(&h.conn).unwrap();
+            (String::from_utf8(notices).unwrap(), in_flight::most(&db))
+        };
+        let (said, _) = run("none", None);
+        assert!(said.is_empty(), "three at none fit: {said}");
+        let (said, most) = run("zstd", Some(19));
+        assert!(most < 3, "fewer than three ran at once: {most}");
+        assert!(
+            said.contains("zstd level 19") && said.contains("not 3"),
+            "the notice names the compression and level: {said}"
         );
     }
 
