@@ -1620,6 +1620,21 @@ impl Config {
                 }
             }
         }
+        let origin = format!("{}: defaults.global_excludes", path.display());
+        problems.extend(
+            self.defaults
+                .global_excludes
+                .iter()
+                .filter_map(|p| crate::staging::exclude::pattern_problem(p, &origin)),
+        );
+        for c in &self.collections {
+            let origin = format!("{}: collections \"{}\" exclude", path.display(), c.name);
+            problems.extend(
+                c.exclude
+                    .iter()
+                    .filter_map(|p| crate::staging::exclude::pattern_problem(p, &origin)),
+            );
+        }
         problems
     }
 
@@ -3577,6 +3592,30 @@ mod tests {
             Config::load(&path).unwrap().defaults.global_excludes,
             vec!["*.nfo".to_string(), ".cache/".to_string()]
         );
+    }
+
+    /// #542: a pattern the matcher rejects is refused at load, naming the
+    /// pattern and the key, for `[defaults] global_excludes` and a
+    /// collection's `exclude`.
+    #[test]
+    fn a_rejected_exclusion_pattern_is_refused_at_load_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let err = Config::from_text("[defaults]\nglobal_excludes = [\"*.ok\", \"[\"]\n", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("global_excludes") && err.contains("\"[\""),
+            "{err}"
+        );
+
+        let err = Config::from_text(
+            "[[collections]]\nname = \"c\"\nroot = \"/x\"\ntenant = \"t\"\nexclude = [\"[x\"]\n",
+            &path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exclude") && err.contains("\"[x\""), "{err}");
     }
 
     #[test]

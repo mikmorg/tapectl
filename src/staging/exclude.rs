@@ -102,6 +102,29 @@ fn classify(pattern: &str) -> Option<Classified<'_>> {
     }
 }
 
+/// What is wrong with `pattern`, if the matcher rejects it (#542). Such a
+/// pattern would be dropped by [`Excludes::new`] and leave out nothing, so
+/// every place a list is read refuses it by name instead, with `origin`
+/// saying where it was set. A pattern that is valid but matches nothing
+/// (module doc comment) is not a rejection.
+pub fn pattern_problem(pattern: &str, origin: &str) -> Option<String> {
+    let glob = match classify(pattern)? {
+        Classified::Plain(g) | Classified::Directory(g) => g,
+    };
+    Pattern::new(glob)
+        .err()
+        .map(|e| format!("{origin}: the exclusion pattern \"{pattern}\" is not a valid glob ({e})"))
+}
+
+/// The first rejected pattern of `patterns`, as a refusal naming it and
+/// `origin`.
+pub fn check_patterns(patterns: &[String], origin: &str) -> Result<()> {
+    match patterns.iter().find_map(|p| pattern_problem(p, origin)) {
+        Some(msg) => Err(crate::error::TapectlError::Other(msg)),
+        None => Ok(()),
+    }
+}
+
 /// A compiled exclude set for one walk root (a unit's directory, or a
 /// collection's root). Build it with `effective_compiled` (a unit: globals +
 /// dotfile) or `Excludes::new` (any explicit pattern list).
@@ -334,7 +357,12 @@ pub fn dotfile_patterns(dir_path: &Path) -> Result<Vec<String>> {
     if !dotfile_path.exists() {
         return Ok(Vec::new());
     }
-    crate::unit::dotfile::read_dotfile(&dotfile_path).map(|d| d.exclude_patterns)
+    let patterns = crate::unit::dotfile::read_dotfile(&dotfile_path).map(|d| d.exclude_patterns)?;
+    check_patterns(
+        &patterns,
+        &format!("{} [excludes] patterns", dotfile_path.display()),
+    )?;
+    Ok(patterns)
 }
 
 /// The full, compiled "effective excludes" set for `dir_path`: the caller's
@@ -357,6 +385,7 @@ pub fn dotfile_patterns(dir_path: &Path) -> Result<Vec<String>> {
 /// `Config` (or the test already has whatever list it wants to assert on)
 /// and passes the slice in explicitly.
 pub fn effective_compiled(dir_path: &Path, global_excludes: &[String]) -> Result<Excludes> {
+    check_patterns(global_excludes, "[defaults] global_excludes")?;
     let mut patterns = global_excludes.to_vec();
     patterns.extend(dotfile_patterns(dir_path)?);
     Ok(Excludes::new(dir_path, &patterns))
@@ -398,17 +427,48 @@ mod tests {
         assert!(is_excluded(Path::new("THUMBS.DB"), &compiled));
     }
 
+    /// #542: a pattern the matcher rejects is refused by name, never
+    /// dropped. A walk that dropped it would archive what the operator meant
+    /// to leave out, and say nothing.
     #[test]
-    fn an_invalid_pattern_is_silently_dropped_not_an_error() {
-        // Mirrors collection::sync::candidate_unit_dirs's existing
-        // precedent for a malformed glob pattern.
-        let compiled = compile(&["[".to_string(), "*.tmp".to_string()]);
-        assert_eq!(
-            compiled.names.len(),
-            1,
-            "the malformed pattern must be dropped, not error"
+    fn an_invalid_pattern_is_refused_by_name_where_it_was_set() {
+        let tmp = TempDir::new().unwrap();
+
+        let err = effective_compiled(tmp.path(), &["[".to_string(), "*.tmp".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"[\"") && err.contains("global_excludes"),
+            "a global pattern is named with where it was set: {err}"
         );
-        assert!(is_excluded(Path::new("j.tmp"), &compiled));
+        // A directory pattern's name is checked too.
+        assert!(effective_compiled(tmp.path(), &["[a/".to_string()]).is_err());
+
+        let dotfile = tmp.path().join(".tapectl-unit.toml");
+        crate::unit::dotfile::write_dotfile(
+            &dotfile,
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u".into(),
+                name: "n".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec![],
+                tenant: "t".into(),
+                archive_set: None,
+                checksum_mode: Some("mtime_size".into()),
+                compression: Some("none".into()),
+                slice_size: None,
+                warehouse_copies: None,
+                allow_spanning: None,
+                copies_at: None,
+                exclude_patterns: vec!["*.ok".into(), "[".into()],
+            },
+        )
+        .unwrap();
+        let err = effective_compiled(tmp.path(), &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("\"[\"") && err.contains(&dotfile.display().to_string()),
+            "a dotfile pattern names the pattern and the dotfile: {err}"
+        );
     }
 
     #[test]
