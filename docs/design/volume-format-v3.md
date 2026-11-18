@@ -399,7 +399,9 @@ each member of the staging's tar stream, **in stream order**:
 - `start`: the offset in the stream of the member's first extension header. `end`: the
   offset just past the member's last padded block. A row's `start` is the row before's
   `end`; the first is 0 (#562).
-- `size`: the file's bytes; 0 for a kind with no data.
+- `size`: the file's bytes; 0 for a kind with no data. **Determined** (T4.3): an `h` row
+  states its target's size, as it states its target's sha256: both describe the file the
+  restore makes at that path.
 - `sha256`: of the file's bytes as they went to tape, 64 lowercase hex characters, for
   `f`; the target's, for `h`; `-` for the others.
 - `path` (**determined**): written as the index's `paths.tsv` writes a path: relative to
@@ -408,6 +410,10 @@ each member of the staging's tar stream, **in stream order**:
   as the stream has it (T0.7, item 293).
 - `link target`: for `h` only, the path of the name archived first, escaped the same
   way. A symbolic link's target is in the stream, not in the table.
+
+**Every row has eight fields** (**determined**, read from the template's bytes): the tab
+before `link target` is always written, so a row that is not `h` ends in a tab and an empty
+field. A writer writes, and a reader requires, eight fields.
 
 **Rows in stream order; a folder is two ranges** (#562): a folder's own member comes
 where the sorted list put it, and its contents follow later members; restoring a folder
@@ -629,20 +635,25 @@ not held to the floor (§7.3).
 
 ```
 tar --create --file=- --format=pax --numeric-owner \
-    [--xattrs] [--acls --xattrs-exclude='system.posix_acl_*'] \
+    [--xattrs --xattrs-exclude='system.posix_acl_*'] [--acls] \
     --no-recursion --null --verbatim-files-from --files-from=<list> \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 ```
 
 The bracketed flags follow two switches, resolved like the other policy keys and both on
-by default (D11): **`preserve_xattrs`** gives tar `--xattrs`, and **`preserve_acls`**
-gives it `--acls` with T0.1's `--xattrs-exclude='system.posix_acl_*'`.
+by default (D11): **`preserve_xattrs`** gives tar `--xattrs` with T0.1's
+`--xattrs-exclude='system.posix_acl_*'`, and **`preserve_acls`** gives it `--acls`. The
+exclude goes with `--xattrs` only (item 296's own words), because it turns `--xattrs` on:
+measured with GNU tar 1.35 (T4.1, 2026-11-18), `--acls --xattrs-exclude=…` stores user
+xattrs too, while `--acls` alone stores the text ACL record and no xattr record. *Corrected
+2026-11-18: the bracket first put the exclude beside `--acls`.*
 
 - `--format=pax`: the stream is POSIX pax (item 253).
 - `--numeric-owner` (item 270): a member's owner and group are stored by number only; the
   header's user and group name fields are empty.
-- `--xattrs` (with `preserve_xattrs`): extended attributes are kept.
-- `--acls --xattrs-exclude='system.posix_acl_*'` (with `preserve_acls`): an ACL is stored
+- `--xattrs --xattrs-exclude='system.posix_acl_*'` (with `preserve_xattrs`): extended
+  attributes are kept, and the raw ACL attribute is not among them.
+- `--acls` (with `preserve_acls`): an ACL is stored
   **once**, in the text record (`SCHILY.acl.access`,
   `SCHILY.acl.default`), with every qualifier a number (items 273, 274; measured by T0.1,
   `docs/research/2026-11-17-t01-readers-of-an-acl-stored-once.md`: GNU tar 1.30, 1.34,

@@ -1612,6 +1612,9 @@ file and an excluded folder reports all three, shown by a test; the suite is gre
 and `recheck`; `src/staging/files.rs`.
 
 **Fence:** `src/staging/*` (all of it); `src/cli/stage.rs`; `src/cli/config.rs`;
+`src/db/migrations/001_baseline.sql` (`archive_sets.compression_level`,
+`stage_sets.compression_level` and `stage_slices.continues` only: format Appendix A.2;
+*added 2026-11-18*, T4.3's fence held only D11's columns);
 `src/policy/depth_check.rs`; `src/config.rs` (`[tar]`, and the keys D11 removes or
 redefines); `src/setup.rs` and `src/main.rs` (the tool checks only);
 `tests/pass_budget.rs`, `tests/cli_smoke.rs`, `tests/test_dependencies.rs`, `tests/setup.rs`.
@@ -1807,7 +1810,10 @@ layout is parsed.
 (a range); ADR-0012 items 101 to 103 (what a damaged slice and a damaged file mean), 127, 264;
 `src/volume/restore/supply.rs`'s module doc; `src/volume/restore/fill.rs`.
 
-**Fence:** `src/volume/restore.rs`, `src/volume/restore/*`, `src/volume/slice_holders.rs`,
+**Fence:** `src/db/migrations/001_baseline.sql` (`restores.tar_argv`, `tar_exit_code`,
+`tar_stdout`, `tar_stderr`, `tar_version`, each after its `dar_*` twin, with the pin in
+`restore_record.rs`'s `restores_has_its_columns_and_indexes`; *added 2026-11-18*: T4.3 could
+not add them without that pin), `src/volume/restore.rs`, `src/volume/restore/*`, `src/volume/slice_holders.rs`,
 `src/volume/restore_record.rs`, `src/cli/restore.rs`, `tests/restore_key.rs`,
 `tests/integration.rs` (restore tests only).
 
