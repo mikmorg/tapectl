@@ -1124,7 +1124,7 @@ fn config_check_notes_what_a_loadable_config_lacks_at_exit_0() {
         "problems",
         "tape_devices",
         "staging",
-        "dar",
+        "tar",
         "defaults",
         "ops",
     ] {

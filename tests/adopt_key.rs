@@ -121,8 +121,8 @@ fn key_files(home: &Path) -> Vec<String> {
     v
 }
 
-fn dar_available() -> bool {
-    Command::new("dar")
+fn tar_available() -> bool {
+    Command::new("tar")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -137,8 +137,8 @@ fn dar_available() -> bool {
 #[test]
 fn an_adopted_tenant_decrypts_what_is_staged_after_adoption() {
     assert!(
-        dar_available(),
-        "`dar` not on PATH — see tests/test_dependencies.rs"
+        tar_available(),
+        "`tar` not on PATH — see tests/test_dependencies.rs"
     );
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("h");
@@ -220,7 +220,7 @@ fn an_adopted_tenant_decrypts_what_is_staged_after_adoption() {
         .into_iter()
         .flatten()
         .map(|e| e.into_path())
-        .filter(|p| p.to_string_lossy().ends_with(".dar.age"))
+        .filter(|p| p.to_string_lossy().ends_with(".tar.age"))
         .collect();
     assert!(!slices.is_empty(), "stage create wrote no slice");
     for slice in slices {

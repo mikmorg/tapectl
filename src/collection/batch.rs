@@ -1769,10 +1769,10 @@ mod tests {
 
     /// Acceptance (b): every path the run RECORDS is the unit's real one. The
     /// unit's path, the snapshot's source path, the file list's relative
-    /// paths, `stage_sets.dar_command` (MANIFEST.toml carries it to tape) and
-    /// the stage report never name the snapshot's directory. dar's own report
-    /// keeps the command as it ran, and does: that is the one place the
-    /// operator can see what dar read.
+    /// paths, `stage_sets.tar_command` (MANIFEST.toml carries it to tape),
+    /// the file table and the stage report never name the snapshot's
+    /// directory. tar's own report keeps the folder it ran in, and does: that
+    /// is the one place the operator can see what tar read.
     #[test]
     fn every_recorded_path_stays_the_units_real_one() {
         let w = HookWorld::new();
@@ -1792,26 +1792,33 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(current, live);
-            let (source, dar_command): (String, String) = w
+            let (source, tar_command, stage_set_id): (String, String, i64) = w
                 .conn
                 .query_row(
-                    "SELECT s.source_path, ss.dar_command FROM snapshots s
+                    "SELECT s.source_path, ss.tar_command, ss.id FROM snapshots s
                        JOIN units u ON u.id = s.unit_id
                        JOIN stage_sets ss ON ss.snapshot_id = s.id
                       WHERE u.name = ?1",
                     [unit],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
             assert_eq!(source, live, "{unit}: snapshots.source_path");
             assert!(
-                dar_command.contains(&format!("\"-R\" {live:?}")),
-                "{unit}: dar -R names the real folder: {dar_command}"
+                tar_command.contains("\"--create\""),
+                "{unit}: positive control: {tar_command}"
             );
             assert!(
-                !dar_command.contains(snapshot_dir),
-                "{unit}: dar_command: {dar_command}"
+                !tar_command.contains(snapshot_dir) && !tar_command.contains(&live),
+                "{unit}: tar_command names no folder: {tar_command}"
             );
+            for row in crate::db::stage_files::load(&w.conn, stage_set_id).unwrap() {
+                assert!(
+                    !row.path.starts_with('/') && !row.path.contains(snapshot_dir),
+                    "{unit}: a relative path in the file table: {}",
+                    row.path
+                );
+            }
             let files = crate::db::files::fixture::non_dirs(&w.conn, w.snapshot_id_of(unit));
             assert!(!files.is_empty());
             for (path, _) in &files {
@@ -1844,12 +1851,12 @@ mod tests {
         let ran: String = w
             .conn
             .query_row(
-                "SELECT dar_command FROM dar_create_reports ORDER BY id LIMIT 1",
+                "SELECT tar_command FROM tar_create_reports ORDER BY id LIMIT 1",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(ran.contains(snapshot_dir), "dar's own record: {ran}");
+        assert!(ran.contains(snapshot_dir), "tar's own record: {ran}");
     }
 
     /// Acceptance (c): `release_command` runs once the staging is over, with
@@ -2025,7 +2032,7 @@ mod tests {
         let ran: String = w
             .conn
             .query_row(
-                "SELECT dar_command FROM dar_create_reports ORDER BY id LIMIT 1",
+                "SELECT tar_command FROM tar_create_reports ORDER BY id LIMIT 1",
                 [],
                 |r| r.get(0),
             )

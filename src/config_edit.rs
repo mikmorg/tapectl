@@ -430,6 +430,7 @@ enum Shape {
 const TABLES: &[(&str, Shape)] = &[
     ("", Shape::Table),
     ("dar", Shape::Table),
+    ("tar", Shape::Table),
     ("backends", Shape::Table),
     ("backends.lto", Shape::List),
     ("archive_sets", Shape::List),

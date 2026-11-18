@@ -1092,10 +1092,14 @@ fn stage_create_inner(
         crate::idmap::Collector::new(),
         &mut sink,
     );
+    // tar's own report keeps the folder it ran in beside its command (issue
+    // #455: the one place the operator sees what tar read, a snapshot's copy
+    // of the folder included); `stage_sets.tar_command` names no folder.
+    let ran_in = format!("{tar_command} (run in {read_root:?})");
     let report = |outcome: &'static str, finish: Option<&crate::tar::TarFinish>| {
         tar_report::TarCreateReport {
             outcome,
-            command: tar_command.clone(),
+            command: ran_in.clone(),
             exit_code: finish.and_then(|f| f.code()),
             stderr: finish.map(|f| f.stderr().kept.clone()).unwrap_or_default(),
             tar_version: tar_version.clone(),

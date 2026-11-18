@@ -274,16 +274,15 @@ fn spawned_programs(text: &str) -> Vec<String> {
 /// asks. `sg_raw` runs through `lbp.rs`'s `&argv[0]` for one pinned READ
 /// POSITION (ADR-0012 item 185).
 const SPAWNS: &[(&str, &str)] = &[
-    ("src/main.rs", "dar_path"),                  // the dar version probe
-    ("src/dar/mod.rs", "binary"),                 // dar itself (create, restore, isolate)
-    ("src/tar/mod.rs", "binary"),                 // GNU tar, the Layout 3 writer; no device
-    ("src/volume/build.rs", "\"bash\""),          // `bash -n` over the generated RESTORE.sh
-    ("src/host_check.rs", "\"systemctl\""),       // whether contending units are active
+    ("src/dar/mod.rs", "binary"), // dar itself (create, restore, isolate)
+    ("src/tar/mod.rs", "binary"), // GNU tar, the Layout 3 writer; no device
+    ("src/volume/build.rs", "\"bash\""), // `bash -n` over the generated RESTORE.sh
+    ("src/host_check.rs", "\"systemctl\""), // whether contending units are active
     ("src/tape/drive_identity.rs", "\"sg_inq\""), // INQUIRY: the drive's identity
-    ("src/tape/log_pages.rs", "\"sg_inq\""),      // INQUIRY: a health record's header
-    ("src/tape/log_pages.rs", "LOG_TOOL"),        // `sg_logs -V`
-    ("src/tape/log_pages.rs", "&argv[0]"),        // SgLogs::read_argv / decode_argv, pinned above
-    ("src/tape/mam.rs", "MAM_TOOL"),              // sg_read_attr: READ ATTRIBUTE
+    ("src/tape/log_pages.rs", "\"sg_inq\""), // INQUIRY: a health record's header
+    ("src/tape/log_pages.rs", "LOG_TOOL"), // `sg_logs -V`
+    ("src/tape/log_pages.rs", "&argv[0]"), // SgLogs::read_argv / decode_argv, pinned above
+    ("src/tape/mam.rs", "MAM_TOOL"), // sg_read_attr: READ ATTRIBUTE
     // sg_modes / sg_wr_mode: the Control Data Protection page (#388, ADR-0012
     // item 163), lbp::sense_argv / select_argv, pinned below; sg_raw: READ
     // POSITION's short form (item 185), lbp::read_position_argv, pinned below.

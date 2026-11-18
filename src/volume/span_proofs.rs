@@ -738,8 +738,11 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// cut; its positive control says so if the tape's own files ever grow. They
 /// grew by five blocks with 1.8.0's RESTORE.sh (#498, ADR-0012 items 181, 182
 /// and 184), and the figure by the same 20,480 bytes, which keeps every cut
-/// where it was.
-const CAP94: u64 = 2_749_480;
+/// where it was. With staging on tar (T4.5) `S`'s slices hold whole members
+/// (its dotfile alone in slice 1, each file a run of 128K slices), so the
+/// figure is three blocks into tape 1's slice 17 at nominal and about three
+/// and a half blocks before slice 16 ends at 1% sooner.
+const CAP94: u64 = 2_723_840;
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may
