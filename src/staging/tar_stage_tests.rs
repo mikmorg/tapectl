@@ -543,3 +543,312 @@ fn a_level_out_of_range_is_refused_naming_the_key() {
         Some(9)
     );
 }
+
+fn run_ok(cmd: &str, args: &[&std::ffi::OsStr]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Through `stage create`: a unit holding a hard-link pair, a symbolic
+/// link, a FIFO, a file with an ACL naming an id the host knows (0,
+/// `root`), a file with a `user.` attribute, and a long name. The file
+/// table's rows match the sha256 of every file on disk; each file's range
+/// of the stream, given to the real tar with tar's two zero blocks, makes
+/// that file; the id map holds the owner, the group and the ACL's id with
+/// the names the host gives them.
+#[test]
+fn a_unit_of_every_kind_stages_and_its_table_restores_each_file_by_range() {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+    config.defaults.slice_size = (32 * 1024).to_string();
+    fs::create_dir_all(src.join("d/e")).unwrap();
+    fs::write(src.join("d/first.txt"), mixed_bytes(9000, 11)).unwrap();
+    fs::hard_link(src.join("d/first.txt"), src.join("z-second.txt")).unwrap();
+    std::os::unix::fs::symlink("d/first.txt", src.join("link")).unwrap();
+    nix::unistd::mkfifo(&src.join("d/e/fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let long = format!("d/e/{}.bin", "n".repeat(180));
+    fs::write(src.join(&long), mixed_bytes(70_000, 12)).unwrap();
+    fs::write(src.join("acl.txt"), b"a file with an ACL").unwrap();
+    fs::write(src.join("xattr.txt"), b"a file with a user attribute").unwrap();
+    let acl = run_ok(
+        "setfacl",
+        &[
+            OsStr::new("-m"),
+            OsStr::new("u:0:r"),
+            src.join("acl.txt").as_os_str(),
+        ],
+    );
+    let xattr = run_ok(
+        "setfattr",
+        &[
+            OsStr::new("-n"),
+            OsStr::new("user.tapectl-test"),
+            OsStr::new("-v"),
+            OsStr::new("v1"),
+            src.join("xattr.txt").as_os_str(),
+        ],
+    );
+    assert!(acl, "setfacl must work on the test's file system");
+    assert!(xattr, "setfattr must work on the test's file system");
+
+    let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+    let id = stage_create(&conn, &paths, &config, snap, false).unwrap();
+    let rows = crate::db::stage_files::load(&conn, id).unwrap();
+    let get = |p: &str| -> Row {
+        rows.iter()
+            .find(|r| r.path == p)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{p} in {:?}",
+                    rows.iter().map(|r| &r.path).collect::<Vec<_>>()
+                )
+            })
+            .clone()
+    };
+    assert_eq!(get("d").kind, Kind::Folder);
+    assert_eq!(get("link").kind, Kind::Symlink);
+    assert_eq!(get("d/e/fifo").kind, Kind::Fifo);
+    let link = get("z-second.txt");
+    assert_eq!(link.kind, Kind::HardLink);
+    assert_eq!(link.link.as_deref(), Some("d/first.txt"));
+    assert_eq!(get(&long).kind, Kind::File);
+
+    // Every hashed row is the sha256 of the file on disk.
+    let mut checked = 0;
+    for r in rows.iter().filter(|r| r.kind.hashed()) {
+        let on_disk = fs::read(src.join(&r.path)).unwrap();
+        assert_eq!(
+            r.sha256.unwrap(),
+            <[u8; 32]>::from(sha2::Sha256::digest(&on_disk)),
+            "{}",
+            r.path
+        );
+        assert_eq!(r.size, on_disk.len() as u64, "{}", r.path);
+        checked += 1;
+    }
+    assert!(checked >= 6, "positive control: {checked} files checked");
+
+    // Each file from its own range of the stream, with the real tar.
+    let stream: Vec<u8> = slices_of(&conn, id)
+        .iter()
+        .map(|s| decrypt(&conn, &paths, &s.path))
+        .collect::<Vec<_>>()
+        .concat();
+    for r in rows.iter().filter(|r| r.kind == Kind::File) {
+        let mut piece = stream[r.start as usize..r.end as usize].to_vec();
+        piece.extend_from_slice(&[0u8; 1024]);
+        let dest = tmp.path().join(format!("one-{}", r.start));
+        let (code, said) = tar_extract(&piece, &dest);
+        assert_eq!(code, 0, "{}: {said}", r.path);
+        assert_eq!(
+            sha_hex(&fs::read(dest.join(&r.path)).unwrap()),
+            sha_hex(&fs::read(src.join(&r.path)).unwrap()),
+            "{} from its range",
+            r.path
+        );
+    }
+    // The whole stream keeps the ACL, the attribute, the link and the pair.
+    let all = tmp.path().join("all");
+    let mut child = std::process::Command::new("tar")
+        .args([
+            "-x",
+            "--acls",
+            "--xattrs",
+            "--xattrs-include=user.*",
+            "-f",
+            "-",
+            "-C",
+        ])
+        .arg({
+            fs::create_dir_all(&all).unwrap();
+            &all
+        })
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&stream).unwrap();
+    assert!(child.wait().unwrap().success());
+    let getfacl = std::process::Command::new("getfacl")
+        .args(["-n", "-p"])
+        .arg(all.join("acl.txt"))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&getfacl.stdout).contains("user:0:r--"),
+        "the ACL is restored: {}",
+        String::from_utf8_lossy(&getfacl.stdout)
+    );
+    let getfattr = std::process::Command::new("getfattr")
+        .args(["--only-values", "-n", "user.tapectl-test"])
+        .arg(all.join("xattr.txt"))
+        .output()
+        .unwrap();
+    assert_eq!(getfattr.stdout, b"v1", "the user attribute is restored");
+    assert_eq!(
+        fs::metadata(all.join("d/first.txt")).unwrap().ino(),
+        fs::metadata(all.join("z-second.txt")).unwrap().ino(),
+        "the hard link is a link"
+    );
+    assert_eq!(
+        fs::read_link(all.join("link")).unwrap(),
+        Path::new("d/first.txt")
+    );
+
+    // The id map: the owner, the group and the ACL's id, named.
+    let ids = crate::db::stage_ids::load(&conn, id).unwrap();
+    let me = fs::metadata(src.join("acl.txt")).unwrap();
+    let has = |kind: crate::idmap::IdKind, n: u32| {
+        ids.iter()
+            .find(|r| r.kind == kind && r.id == n)
+            .unwrap_or_else(|| panic!("{kind:?} {n} in {ids:?}"))
+            .clone()
+    };
+    let owner = has(crate::idmap::IdKind::User, me.uid());
+    assert_eq!(owner.name, crate::idmap::user_name(me.uid()));
+    has(crate::idmap::IdKind::Group, me.gid());
+    let root = has(crate::idmap::IdKind::User, 0);
+    assert_eq!(root.name.as_deref(), Some("root"), "the ACL's id, named");
+}
+
+/// Invariant 7: a file replaced (a new file renamed over it) once tar has
+/// read it refuses the staging, by tapectl's own before-and-after
+/// comparison; nothing is left in staging and no slice is recorded staged.
+#[test]
+fn a_file_replaced_while_tar_reads_the_unit_refuses_the_staging() {
+    let tmp = TempDir::new().unwrap();
+    let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+    fs::write(src.join("a.txt"), b"the first a").unwrap();
+    fs::write(src.join("b.txt"), b"the first b").unwrap();
+    let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+    let a = src.join("a.txt");
+    let fresh = src.join(".fresh");
+    super::archive::row_hook::on("a.txt", move || {
+        fs::write(&fresh, b"the other a").unwrap();
+        fs::rename(&fresh, &a).unwrap();
+    });
+    let err = stage_create(&conn, &paths, &config, snap, false)
+        .expect_err("a file replaced under tar refuses the staging")
+        .to_string();
+    assert!(err.contains("DIRTY") && err.contains("a.txt"), "{err}");
+    assert_eq!(
+        fs::read(src.join("a.txt")).unwrap(),
+        b"the other a",
+        "positive control: the hook replaced the file"
+    );
+    assert!(
+        fs::read_dir(&config.staging.directory)
+            .unwrap()
+            .next()
+            .is_none(),
+        "nothing is left in staging"
+    );
+}
+
+/// A stand-in for tar: `--version` says `version`; an archive run execs
+/// the real tar, but outside the probe's own directory (whose file is
+/// `acl-probe`) it drops `drop` from its arguments. So the probe sees an
+/// honest tar, and the stream is what tapectl's own check must refuse.
+fn stand_in_tar(dir: &Path, version: &str, drop: Option<&str>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v tar"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    let p = dir.join("tar-stand-in");
+    let filter = match drop {
+        None => String::new(),
+        Some(arg) => format!(
+            "if [ ! -e acl-probe ]; then\n  for a in \"$@\"; do shift; [ \"$a\" = \"{arg}\" ] || set -- \"$@\" \"$a\"; done\nfi\n"
+        ),
+    };
+    fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"tar (GNU tar) {version}\"; exit 0; fi\n{filter}exec {real} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// Stage with the stand-in at `tar`, retrying a fork's ETXTBSY.
+fn stage_with_tar(tar: &Path, with_acl: bool) -> (String, i64) {
+    let tmp = TempDir::new().unwrap();
+    let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+    config.tar.binary = tar.to_string_lossy().into_owned();
+    fs::write(src.join("f.txt"), b"content").unwrap();
+    if with_acl {
+        assert!(run_ok(
+            "setfacl",
+            &[
+                std::ffi::OsStr::new("-m"),
+                std::ffi::OsStr::new("u:0:r"),
+                src.join("f.txt").as_os_str()
+            ]
+        ));
+    }
+    let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+    let mut tries = 0;
+    let err = loop {
+        match stage_create(&conn, &paths, &config, snap, false) {
+            Ok(_) => panic!("the stand-in tar must be refused"),
+            Err(e) if e.to_string().contains("Text file busy") && tries < 20 => tries += 1,
+            Err(e) => break e.to_string(),
+        }
+    };
+    let staged: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    (err, staged)
+}
+
+/// Item 274: a GNU tar below the floor is refused by name, before anything
+/// is staged.
+#[test]
+fn a_tar_below_the_floor_is_refused_by_name() {
+    let dir = TempDir::new().unwrap();
+    let tar = stand_in_tar(dir.path(), "1.30", None);
+    let (err, staged) = stage_with_tar(&tar, false);
+    assert!(
+        err.contains("GNU tar 1.30") && err.contains("below the writer's floor"),
+        "{err}"
+    );
+    assert!(err.contains("1.35"), "names the floor: {err}");
+    assert_eq!(staged, 0);
+}
+
+/// Items 270, 274 (the proof, one way): a tar that writes owners' names
+/// passes the version and the probe, and its stream is refused by
+/// tapectl's own check, naming the rule.
+#[test]
+fn a_tar_that_writes_names_is_refused_by_the_streams_check() {
+    let dir = TempDir::new().unwrap();
+    let tar = stand_in_tar(dir.path(), "1.35", Some("--numeric-owner"));
+    let (err, staged) = stage_with_tar(&tar, false);
+    assert!(err.contains("names a user or group"), "{err}");
+    assert_eq!(staged, 0);
+}
+
+/// Item 274 (the proof, the other way): a tar that writes no ACL record
+/// for a file that has an ACL on disk is refused by the stream's check.
+#[test]
+fn a_tar_that_writes_no_acl_record_is_refused_by_the_streams_check() {
+    let dir = TempDir::new().unwrap();
+    let tar = stand_in_tar(dir.path(), "1.35", Some("--acls"));
+    let (err, staged) = stage_with_tar(&tar, true);
+    assert!(
+        err.contains("ACL is missing from the stream") && err.contains("f.txt"),
+        "{err}"
+    );
+    assert_eq!(staged, 0);
+}
