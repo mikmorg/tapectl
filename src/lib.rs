@@ -42,6 +42,7 @@ pub mod dar;
 pub mod for_location;
 pub mod staging;
 pub mod tape;
+pub mod tar;
 pub mod volume;
 
 pub mod media;
