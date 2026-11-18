@@ -823,7 +823,10 @@ The detail, ratified with the rest of this list (item 290):
   adds nothing around the frame. **Determined** (the frame's fields): gzip is one
   member, with no file name and a zero time in its header; xz is one `.xz` stream with
   the CRC64 check, as the `xz` tool writes by default; zstd is one frame with its content
-  checksum on and the content size stated. A slice is compressed on one thread, so that
+  checksum on and the content size not stated, written as the cut comes (corrected
+  2026-11-18 at T4.5's integration: a stated size needs the whole cut first, which held up
+  to `slice_size` in memory per slice; the size is not a ruled byte, item 290 names only
+  the frame). A slice is compressed on one thread, so that
   memory is bounded by the level.
 - **The levels.** `compression_level` is a whole number in the algorithm's own range
   (**determined:** gzip 1 to 9, xz 0 to 9, zstd 1 to 19). When it is not set the

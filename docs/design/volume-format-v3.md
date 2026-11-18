@@ -805,7 +805,8 @@ in `[defaults]`, an archive set or a unit's dotfile, the most specific winning, 
   the algorithm's own tool writes and reads it, so that `age -d`, then the tool, gives the
   cut. gzip: one member, with no file name and a zero time in its header. xz: one `.xz`
   stream with the CRC64 check. zstd: one frame with its content checksum on and the content
-  size stated. tapectl adds nothing around the frame. A slice is compressed on one thread.
+  size not stated, written as the cut comes (corrected 2026-11-18: stating the size would
+  hold a whole slice in memory before it is packed). tapectl adds nothing around the frame. A slice is compressed on one thread.
 - **The level** is a whole number in the algorithm's own range (gzip 1 to 9, xz 0 to 9,
   zstd 1 to 19). When it is not set the algorithm's own default applies (gzip 6, xz 6,
   zstd 3). A level outside the range is refused, naming the key. The level is recorded
