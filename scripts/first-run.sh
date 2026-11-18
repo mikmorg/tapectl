@@ -218,8 +218,9 @@ Options:
                     to rehearse: step 14 installs no timers for a --home.
   --tapectl-home DIR
                     the host's own tapectl home when it is not the service user's ~/.tapectl (the
-                    profile's TAPECTL_HOME_DIR): an installed home, unlike --home. Refused while a
-                    ~/.tapectl exists in the service user's home, which tapectl would find first
+                    profile's TAPECTL_HOME_DIR): an installed home, unlike --home. Step 14 refuses
+                    to install timers while a ~/.tapectl exists in the service user's home, which
+                    tapectl would find first
   --from N          start at step N (0-14)
   --to N            stop after step N (0-14; e.g. --to 9: everything up to and including the printed kit)
   --upgrade         upgrade this installed host in place to the checkout's release tag (ADR-0012
