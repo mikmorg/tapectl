@@ -45,8 +45,11 @@ use super::pax;
 /// A tar block.
 pub const BLOCK: usize = 512;
 
-/// The buffer a member's data passes through, and the most one
-/// [`Sink::bytes`] call is given.
+/// The buffer a member's data passes through: each [`Sink::bytes`] call
+/// of a member's data, or of the tail, is at most this long. A member's
+/// header blocks and extension records go to the sink in one call of
+/// their own, as long as they are (at most [`MAX_EXTENDED`] and the
+/// header blocks around it).
 pub const CHUNK: usize = 64 * 1024;
 
 /// The most an extended header's records may hold. GNU tar writes a few
@@ -56,7 +59,8 @@ pub const MAX_EXTENDED: u64 = 64 << 20;
 
 /// What the ACL of a listed entry was on disk before tar ran: whether its
 /// `system.posix_acl_access` and `system.posix_acl_default` attributes were
-/// present (§3.2).
+/// present (§3.2). Read without following a symbolic link (`lgetxattr`),
+/// as tar archives the link itself: a link to a file with an ACL has none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AclOnDisk {
     pub access: bool,
@@ -1348,7 +1352,8 @@ mod tests {
     const LONG_ONE: usize = 120;
 
     /// A tree of every kind the plan's Verify names: long names (over 100
-    /// and over 255 bytes, and one split into the prefix field), a
+    /// and over 255 bytes, and one of short parts over 100 bytes, which
+    /// GNU tar's pax format also gives a `path` record), a
     /// nanosecond time, a symbolic link, a hard link pair whose first name
     /// has an ACL, a FIFO, an empty folder, a file with an ACL, a folder
     /// with a default ACL, a file with a `user.` attribute.
@@ -1387,12 +1392,18 @@ mod tests {
             .set_modified(when)
             .unwrap();
         std::fs::write(r.join("x-attr"), b"attributes\n").unwrap();
-        let st = std::process::Command::new("setfattr")
-            .args(["-n", "user.k", "-v", "v"])
-            .arg(r.join("x-attr"))
-            .status()
-            .unwrap();
-        assert!(st.success());
+        let path = CString::new(r.join("x-attr").as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-terminated strings and a buffer of the length given.
+        let rc = unsafe {
+            nix::libc::setxattr(
+                path.as_ptr(),
+                c"user.k".as_ptr(),
+                b"v".as_ptr().cast(),
+                1,
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
         let mut names: Vec<String> = vec![
             ".".into(),
             "a".into(),
@@ -1522,7 +1533,8 @@ mod tests {
         assert_eq!(fin.members, names.len() as u64);
     }
 
-    /// A long-named member, a split name and a nanosecond time come back
+    /// A long-named member, a name of short parts and a nanosecond time
+    /// come back
     /// from the member's `start..end` alone, with the real tar; from its
     /// own header alone (the trap) the long name is lost.
     #[test]
@@ -1959,20 +1971,7 @@ mod tests {
         let t = tree();
         let long = "n".repeat(LONG_ONE);
         std::fs::write(t.root.join(&long), b"1").unwrap();
-        // `--xattrs` and `--acls` make GNU tar write pax whatever the
-        // format asked, and `--pax-option` is refused outside pax
-        // (measured), so they go too.
-        let stream = tar_with(&t, &[long.as_str()], |args| {
-            args.retain(|a| {
-                let a = a.to_string_lossy();
-                !(a.starts_with("--xattrs") || a == "--acls" || a.starts_with("--pax-option"))
-            });
-            for a in args.iter_mut() {
-                if a == "--format=pax" {
-                    *a = OsString::from("--format=gnu");
-                }
-            }
-        });
+        let stream = tar_with(&t, &[long.as_str()], gnu_format);
         assert_eq!(
             stream[156], b'L',
             "the control: tar wrote a long-name member"
@@ -1980,6 +1979,78 @@ mod tests {
         assert_refused(
             read_with(&stream, list_of(&t, &[long.as_str()]), true),
             Rule::GnuLongName,
+            None,
+        );
+        // A symbolic link with a long target: a GNU long-link member (`K`).
+        let t = tree();
+        std::os::unix::fs::symlink("q".repeat(LONG_ONE), t.root.join("s")).unwrap();
+        let stream = tar_with(&t, &["s"], gnu_format);
+        assert_eq!(
+            stream[156], b'K',
+            "the control: tar wrote a long-link member"
+        );
+        assert_refused(
+            read_with(&stream, list_of(&t, &["s"]), true),
+            Rule::GnuLongName,
+            None,
+        );
+    }
+
+    /// The writer's line with `--format=ustar`: the flags only pax takes
+    /// go (`--xattrs` and `--acls` make GNU tar write pax whatever the
+    /// format asked, and `--pax-option` is refused outside pax; measured).
+    fn ustar_format(args: &mut Vec<OsString>) {
+        args.retain(|a| {
+            let a = a.to_string_lossy();
+            !(a.starts_with("--xattrs") || a == "--acls" || a.starts_with("--pax-option"))
+        });
+        for a in args.iter_mut() {
+            if a == "--format=pax" {
+                *a = OsString::from("--format=ustar");
+            }
+        }
+    }
+
+    /// The writer's line with `--format=gnu`, likewise.
+    fn gnu_format(args: &mut Vec<OsString>) {
+        ustar_format(args);
+        for a in args.iter_mut() {
+            if a == "--format=ustar" {
+                *a = OsString::from("--format=gnu");
+            }
+        }
+    }
+
+    /// A name of short parts over 100 bytes in a ustar header with no
+    /// extension header (GNU tar's pax format gives it a `path` record
+    /// instead, measured): the reader joins the prefix field to the name.
+    #[test]
+    fn a_name_in_the_prefix_field_is_joined() {
+        let t = tree();
+        let dir = format!("{}/{}", "m".repeat(60), "k".repeat(60));
+        let file = format!("{dir}/{}", "z".repeat(60));
+        std::fs::create_dir_all(t.root.join(&dir)).unwrap();
+        std::fs::write(t.root.join(&file), b"split\n").unwrap();
+        let stream = tar_with(&t, &[file.as_str()], ustar_format);
+        assert_ne!(stream[345], 0, "the control: the prefix field is filled");
+        let (fin, rec) = read_with(&stream, list_of(&t, &[file.as_str()]), false).unwrap();
+        assert_shape(&stream, &fin, &rec);
+        assert_eq!(rec.row(&file).sha256, Some(sha256sum(&t.root.join(&file))));
+    }
+
+    /// An extension header whose own user name field is filled (checksum
+    /// made right) is refused as a name in a header.
+    #[test]
+    fn a_name_in_an_extension_header_is_refused() {
+        let (t, stream, rows) = two_files();
+        let x = rows[1].start as usize;
+        assert_eq!(stream[x + 156], b'x');
+        let mut bad = stream.clone();
+        bad[x + 265..x + 268].copy_from_slice(b"bob");
+        fix_checksum(&mut bad[x..x + BLOCK]);
+        assert_refused(
+            read_with(&bad, list_of(&t, &["a", "b", "p"]), true),
+            Rule::NameInHeader,
             None,
         );
     }

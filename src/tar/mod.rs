@@ -2,12 +2,13 @@
 //! ADR-0012 items 253, 270, 273, 274).
 //!
 //! tapectl gives tar its exact file list and reads the pax stream tar writes
-//! on its standard output. This module runs tar and nothing else: the list
+//! on its standard output. This module runs tar: the list
 //! ([`writer::write_list`]), the command line, fixed flag by flag
 //! ([`writer::create_args`]), the run and its exit ([`writer::spawn_archive`],
-//! [`writer::TarFinish`]), and the writer's floor ([`probe::probe`]). The
-//! checks of the stream as it passes (§3.2) are the stream reader's
-//! ([`stream::read`], with the pax records read by length in [`pax`]).
+//! [`writer::TarFinish`]), and the writer's floor ([`probe::probe`]). It
+//! also reads the stream as it passes and checks it (§3.2): the stream
+//! reader ([`stream::read`], with the pax records read by length in
+//! [`pax`]).
 //!
 //! Inside this module the `tar` crate is spelled `::tar`, since this module
 //! is `crate::tar`.
