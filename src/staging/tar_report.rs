@@ -100,6 +100,7 @@ mod tests {
         let id = record(&conn, 7, "photos", 3, &report).expect("recorded");
         conn.execute("DELETE FROM stage_sets WHERE id = 7", [])
             .expect("a report never blocks the delete");
+        #[allow(clippy::type_complexity)]
         let row: (
             Option<i64>,
             String,

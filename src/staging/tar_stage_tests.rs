@@ -225,7 +225,7 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            if x % 4 == 0 {
+            if x.is_multiple_of(4) {
                 v.extend_from_slice(b"some words that repeat, ");
             } else {
                 v.push(x as u8);

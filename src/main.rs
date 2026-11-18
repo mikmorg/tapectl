@@ -918,7 +918,7 @@ fn cmd_init(
     // The writer's floor (ADR-0012 item 274), probed as `stage create`
     // probes it (non-fatal: a warning, with the probe's own text).
     let tar_check = {
-        let work = tapectl::staging::home_work_dir(&paths, ".tar-probe-")?;
+        let work = tapectl::staging::home_work_dir(paths, ".tar-probe-")?;
         tapectl::policy::depth_check::check_tar(&cfg.tar.binary, work.path())
     };
     let tar_ok = matches!(

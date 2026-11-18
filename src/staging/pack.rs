@@ -342,7 +342,7 @@ mod tests {
         let mut x: u32 = 7;
         while v.len() < n {
             x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
-            if (x >> 20) % 3 == 0 {
+            if (x >> 20).is_multiple_of(3) {
                 v.extend_from_slice(b"the same words again and again ");
             } else {
                 v.push((x >> 16) as u8);
