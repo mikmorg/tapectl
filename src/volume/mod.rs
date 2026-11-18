@@ -6,6 +6,7 @@ mod cost_budget;
 pub mod envelope;
 pub mod erase;
 pub mod figures;
+pub mod filetable;
 pub mod format;
 pub mod index;
 pub mod layout;
