@@ -904,6 +904,19 @@ fn stage_create_inner(
         )));
     }
 
+    // Step 1: the early refusal (ADR-0012 item 274). The writer's floor is
+    // GNU tar 1.35 built with ACL support; the proof is the stream's own
+    // check below, and this is the refusal before anything is made.
+    let tar_check = {
+        let work = home_work_dir(paths, ".tar-probe-")?;
+        crate::tar::probe(&config.tar.binary, work.path())?
+    };
+    if let Some(refusal) = tar_check.refusal() {
+        return Err(TapectlError::Other(format!(
+            "{refusal}. Nothing was staged."
+        )));
+    }
+
     // #542: what the version left out is said here too, so a file on no tape
     // is never silent.
     let left_out = crate::db::snapshot_left_out::load(conn, snapshot_id)?;
@@ -934,20 +947,6 @@ fn stage_create_inner(
         },
         notices,
     )?;
-
-    // Step 1: the early refusal (ADR-0012 item 274). The writer's floor is
-    // GNU tar 1.35 built with ACL support; the proof is the stream's own
-    // check below, and this is the refusal before anything is made: the
-    // stage set's row is the first thing a stage makes.
-    let tar_check = {
-        let work = home_work_dir(paths, ".tar-probe-")?;
-        crate::tar::probe(&config.tar.binary, work.path())?
-    };
-    if let Some(refusal) = tar_check.refusal() {
-        return Err(TapectlError::Other(format!(
-            "{refusal}. Nothing was staged."
-        )));
-    }
 
     // ADR-0005's escrow recipient participates in every write, and
     // pre-write validation refuses without one — encryption cannot be made
@@ -4050,6 +4049,35 @@ mod tests {
         )
     }
 
+    /// A tar that passes `--version` and the probe (its archive of one file
+    /// in the probe's own directory) through to the real tar, and refuses a
+    /// real archive run, saying `tar-must-never-run`: how a test shows a
+    /// refusal came before tar archived anything, now that the probe runs
+    /// before anything is made.
+    pub(super) fn never_archiving_tar() -> String {
+        static TAR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TAR.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::Builder::new()
+                .prefix("never-archiving-tar-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let p = dir.join("tar");
+            fs::write(
+                &p,
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --create ] && [ ! -e acl-probe ]; then \
+                 echo tar-must-never-run >&2; exit 2; fi\n\
+                 exec tar \"$@\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        })
+        .clone()
+    }
+
     pub(super) fn setup_unit_with_excludes(
         tmp: &TempDir,
         exclude_patterns: Vec<String>,
@@ -4115,7 +4143,7 @@ mod tests {
         // that must run without one.
         conn.execute("DELETE FROM encryption_keys WHERE is_escrow = 1", [])
             .unwrap();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content that must never reach tar").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4179,7 +4207,7 @@ mod tests {
             [],
         )
         .unwrap();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content that must never reach tar").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4248,7 +4276,7 @@ mod tests {
         fs::write(&not_a_dir, b"x").unwrap();
         let staging = not_a_dir.join("staging");
         config.staging.directory = staging.to_string_lossy().into_owned();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4292,7 +4320,7 @@ mod tests {
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         let staging = PathBuf::from(&config.staging.directory);
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o500)).unwrap();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         fs::write(src.join("f.txt"), b"content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
@@ -4583,7 +4611,7 @@ mod tests {
         )
         .unwrap();
         let sibling = conn.last_insert_rowid();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
             .expect_err("v1 is already staged")
@@ -4720,7 +4748,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.compression = "gzip".to_string();
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         write_dense_file(&src.join("big.bin"), 64 * 1024);
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let _free = FreeSpaceOverride::set(1024);
@@ -4756,7 +4784,7 @@ mod tests {
         use crate::util::format_bytes_binary as fmt;
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         write_dense_file(&src.join("a.bin"), 64 * 1024);
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let upper = upper_bound(&conn, &get_snapshot(&conn, snap_id).unwrap());
@@ -6546,7 +6574,7 @@ mod tests {
     fn stage_create_refuses_a_snapshot_with_a_short_file_list() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         for i in 0..4 {
             fs::write(src.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
         }
@@ -6611,10 +6639,7 @@ mod tests {
             post_warning_bytes: None,
         };
         config.backends.lto.push(drive("small", "/dev/null", "1M"));
-        let real_tar = std::mem::replace(
-            &mut config.tar.binary,
-            "/nonexistent/tar-must-never-run".to_string(),
-        );
+        let real_tar = std::mem::replace(&mut config.tar.binary, never_archiving_tar());
 
         let msg = stage_create(&conn, &paths, &config, snap_id, false)
             .unwrap_err()
@@ -6766,7 +6791,7 @@ mod tests {
         fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         one_small_drive(&mut config);
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
 
         let msg = stage_create(&conn, &paths, &config, snap_id, false)
             .unwrap_err()
@@ -6938,7 +6963,7 @@ mod tests {
         fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         config.defaults.allow_spanning = true;
-        config.tar.binary = "/nonexistent/tar-must-never-run".to_string();
+        config.tar.binary = never_archiving_tar();
         let size: u64 = conn
             .query_row(
                 "SELECT total_size FROM snapshots WHERE id = ?1",
@@ -7027,10 +7052,7 @@ mod tests {
         // 16 MiB; a 100 MiB slice cannot be sealed after the warning.
         config.backends.lto.push(drive(Some("60M")));
         config.defaults.slice_size = "100M".into();
-        let real_tar = std::mem::replace(
-            &mut config.tar.binary,
-            "/nonexistent/tar-must-never-run".to_string(),
-        );
+        let real_tar = std::mem::replace(&mut config.tar.binary, never_archiving_tar());
 
         let msg = stage_create(&conn, &paths, &config, snap_id, false)
             .unwrap_err()

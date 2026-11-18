@@ -960,4 +960,85 @@ mod tests {
             "{e}"
         );
     }
+
+    /// §3.4 (a slice whose on-tape size would pass the stated bound): a
+    /// packed slice past the bound refuses the staging by name, and leaves
+    /// no slice file and no staged set. The bound is held low by a test hook;
+    /// no real frame grows that much.
+    #[test]
+    fn a_packed_slice_past_the_bound_refuses_the_staging_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.compression = "zstd".to_string();
+        fs::write(src.join("f.bin"), mixed_bytes(40_000, 9)).unwrap();
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        super::super::archive::bound_hook::set(Some(100));
+        let result = stage_create(&conn, &paths, &config, snap, false);
+        super::super::archive::bound_hook::set(None);
+        let err = result.expect_err("a frame past the bound").to_string();
+        assert!(
+            err.contains("unit1") && err.contains("zstd") && err.contains("past the bound"),
+            "{err}"
+        );
+        let staged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(staged, 0);
+        assert!(
+            fs::read_dir(&config.staging.directory)
+                .unwrap()
+                .next()
+                .is_none(),
+            "no slice file is left"
+        );
+        // Positive control: at the format's own bound the same unit stages.
+        let id = stage_create(&conn, &paths, &config, snap, false).unwrap();
+        assert!(!slices_of(&conn, id).is_empty());
+    }
+
+    /// T4.5's space estimate, computed by hand for a small tree: the files'
+    /// bytes, then for each entry 2,560 bytes and twice its path rounded up to
+    /// 512, 4,096 for the one entry with an extended attribute, then 1,024
+    /// for each slice the figure comes to, and age's overhead on the whole.
+    #[test]
+    fn the_space_estimate_is_the_determined_figures() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::create_dir_all(src.join("d")).unwrap();
+        fs::write(src.join("d/a.txt"), vec![b'a'; 1000]).unwrap();
+        fs::write(src.join("d/bb.txt"), vec![b'b'; 2000]).unwrap();
+        assert!(run_ok(
+            "setfattr",
+            &[
+                std::ffi::OsStr::new("-n"),
+                std::ffi::OsStr::new("user.t"),
+                std::ffi::OsStr::new("-v"),
+                std::ffi::OsStr::new("1"),
+                src.join("d/a.txt").as_os_str()
+            ]
+        ));
+        let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+        let dotfile = fs::metadata(src.join(".tapectl-unit.toml")).unwrap().len();
+        let entry = |path: &str| 2560 + (2 * path.len() as u64).div_ceil(512) * 512;
+        let mut bytes = 1000 + 2000 + dotfile;
+        for p in [".tapectl-unit.toml", "d", "d/a.txt", "d/bb.txt"] {
+            bytes += entry(p);
+        }
+        bytes += 4096;
+        let s: u64 = 4096;
+        bytes += bytes.div_ceil(s) * 1024;
+        let want = bytes + bytes / 4096 + 4096;
+        let got =
+            super::super::stream_estimate(&conn, snap, src.to_str().unwrap(), s, None).unwrap();
+        assert_eq!(got as u64, want);
+        // Packed, each slice also carries the algorithm's worst growth.
+        let p = super::super::pack::packing("gzip", None).unwrap();
+        let packed =
+            super::super::stream_estimate(&conn, snap, src.to_str().unwrap(), s, p).unwrap();
+        assert!(packed > got, "never counts on compression to make room");
+    }
 }

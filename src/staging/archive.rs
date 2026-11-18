@@ -280,6 +280,8 @@ impl Slices for StagedSlices<'_> {
         let info = w.finish()?;
         if let (Some(p), Some(packed)) = (self.packing, info.packed_size) {
             let bound = packed_bound(self.slice_size);
+            #[cfg(test)]
+            let bound = bound_hook::get().unwrap_or(bound);
             if packed > bound {
                 let _ = std::fs::remove_file(&path);
                 return Err(TapectlError::Other(format!(
@@ -344,6 +346,26 @@ impl<S: Slices> Sink for StageSink<S> {
 
     fn tail(&mut self, start: u64, len: u64) -> Result<()> {
         self.cutter.tail(start, len).map(|_| ())
+    }
+}
+
+/// Test-only: hold the packed-slice bound to a figure a test chooses, on
+/// this thread, so its refusal can be reached (the format's worst growth is
+/// far above what any real frame adds).
+#[cfg(test)]
+pub(crate) mod bound_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BOUND: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn set(bound: Option<u64>) {
+        BOUND.with(|b| b.set(bound));
+    }
+
+    pub(super) fn get() -> Option<u64> {
+        BOUND.with(|b| b.get())
     }
 }
 
