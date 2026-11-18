@@ -4,7 +4,11 @@
 -- One file replaces the 41 migrations of tapectl 1.x. It is the schema those
 -- migrations left behind, written as plain CREATE statements: every table,
 -- column (in its old order), default, CHECK, foreign key, index and trigger
--- is what a 1.9.2 catalog carries, and nothing else. The relic row
+-- is what a 1.9.2 catalog carries, with what Layout 3 adds as Stage 4 builds
+-- it (`volume-format-v3.md` Appendix A.2 and A.3): the file table
+-- (`stage_files`) and the id map (`stage_ids`), and the `tar_*` columns and
+-- `tar_create_reports` that D11 renames dar's to. Until T4.15 removes dar,
+-- each `tar_*` column stands beside the `dar_*` one it replaces. The relic row
 -- `meta.schema_version` (written once by the first 1.x migration and never
 -- moved) is not written; `PRAGMA user_version`, which the migration runner
 -- keeps, is the schema's version.
@@ -213,8 +217,11 @@ END;
 
 -- ---------------------------------------------------------------------------
 -- Staging: a stage set is one version staged once, its slices the encrypted
--- pieces waiting on the staging device; `dar_create_reports` keeps what the
--- archiver said about each staging.
+-- pieces waiting on the staging device; `dar_create_reports` (and, on the
+-- tar payload, `tar_create_reports`) keeps what the archiver said about each
+-- staging. `stage_files` and `stage_ids` are a staging's file table and id
+-- map (`volume-format-v3.md` §1.6, Appendix A.3; ADR-0012 items 265, 272,
+-- 277): they outlive the release of its slices and go only with its row.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE stage_sets (
@@ -223,7 +230,9 @@ CREATE TABLE stage_sets (
     status               TEXT NOT NULL DEFAULT 'staging'
                          CHECK(status IN ('staging','staged','failed','cleaned')),
     dar_version          TEXT,
+    tar_version          TEXT,
     dar_command          TEXT,
+    tar_command          TEXT,
     catalog_path         TEXT,
     slice_size           INTEGER NOT NULL,
     compression          TEXT,
@@ -231,6 +240,8 @@ CREATE TABLE stage_sets (
     key_fingerprints     TEXT,
     num_slices           INTEGER,
     total_dar_size       INTEGER,
+    -- The tar stream's length in bytes, its tail included (D11).
+    stream_bytes         INTEGER,
     total_encrypted_size INTEGER,
     source_validated_at  TEXT,
     staged_at            TEXT,
@@ -273,6 +284,59 @@ CREATE TABLE dar_create_reports (
 );
 
 CREATE INDEX idx_dar_create_reports_stage_set ON dar_create_reports(stage_set_id);
+
+CREATE TABLE tar_create_reports (
+    id                INTEGER PRIMARY KEY,
+    captured_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    stage_set_id      INTEGER REFERENCES stage_sets(id) ON DELETE SET NULL,
+    unit_name         TEXT,
+    snapshot_version  INTEGER,
+    outcome           TEXT NOT NULL,
+    tar_command       TEXT NOT NULL,
+    tar_exit_code     INTEGER,
+    tar_stderr        BLOB,
+    tar_version       TEXT,
+    tapectl_version   TEXT NOT NULL
+);
+
+CREATE INDEX idx_tar_create_reports_stage_set ON tar_create_reports(stage_set_id);
+
+-- The file table: one row for each member of the staging's tar stream, in
+-- stream order (`seq` from 0). `kind`: the text's letter. `slice`: the slice
+-- the member begins in. `start`/`end`: the member's offsets in the stream,
+-- its extension headers through its last padded block. `size`: the file's
+-- bytes. `sha256`: 32 raw bytes for `f` and `h`, NULL where the text has
+-- `-`. A path is interned in `paths` and named by its id, never stored as
+-- text twice; `link_path_id` is the first name of a hard link (`h`) only.
+CREATE TABLE stage_files (
+    stage_set_id INTEGER NOT NULL REFERENCES stage_sets(id) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL CHECK(seq >= 0),
+    kind         TEXT NOT NULL CHECK(kind IN ('f','d','l','h','p','c','b')),
+    slice        INTEGER NOT NULL CHECK(slice >= 1),
+    path_id      INTEGER NOT NULL REFERENCES paths(id),
+    size         INTEGER NOT NULL CHECK(size >= 0),
+    sha256       BLOB CHECK(sha256 IS NULL
+                            OR (typeof(sha256) = 'blob' AND length(sha256) = 32)),
+    start        INTEGER NOT NULL CHECK(start >= 0),
+    "end"        INTEGER NOT NULL CHECK("end" > start),
+    link_path_id INTEGER REFERENCES paths(id),
+    CHECK((kind = 'h') = (link_path_id IS NOT NULL)),
+    CHECK((kind IN ('f','h')) = (sha256 IS NOT NULL)),
+    PRIMARY KEY (stage_set_id, seq)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_stage_files_path ON stage_files(stage_set_id, path_id);
+
+-- The id map: every user (`u`) and group (`g`) id the staging's stream
+-- carries, with the name the host gave it when the stream was written, NULL
+-- where the host knew none. An id the stream does not carry has no row.
+CREATE TABLE stage_ids (
+    stage_set_id INTEGER NOT NULL REFERENCES stage_sets(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK(kind IN ('u','g')),
+    id           INTEGER NOT NULL CHECK(id >= 0 AND id <= 4294967295),
+    name         TEXT CHECK(name IS NULL OR name <> ''),
+    PRIMARY KEY (stage_set_id, kind, id)
+) WITHOUT ROWID;
 
 -- ---------------------------------------------------------------------------
 -- Cartridges (the physical medium, known by its chip serial) and volumes
@@ -743,10 +807,16 @@ CREATE TABLE restores (
     files_restored   INTEGER,
     -- JSON array, program first: ["dar", "-x", "/dest/.tapectl-restore-tmp/restore", ...].
     dar_argv         TEXT,
+    -- JSON array, program first, as `dar_argv` (D11: tar's, on Layout 3).
+    tar_argv         TEXT,
     dar_exit_code    INTEGER,
+    tar_exit_code    INTEGER,
     dar_stdout       TEXT,
+    tar_stdout       TEXT,
     dar_stderr       TEXT,
+    tar_stderr       TEXT,
     dar_version      TEXT,
+    tar_version      TEXT,
     tapectl_version  TEXT NOT NULL
 );
 
