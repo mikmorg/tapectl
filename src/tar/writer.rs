@@ -577,7 +577,10 @@ mod tests {
             PathBuf::from("/etc/passwd"),
             PathBuf::from(OsStr::from_bytes(b"a\0b")),
         ] {
-            assert!(write_list(dir.path(), &[bad.clone()]).is_err(), "{bad:?}");
+            assert!(
+                write_list(dir.path(), std::slice::from_ref(&bad)).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
