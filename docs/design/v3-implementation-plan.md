@@ -1713,6 +1713,35 @@ name.
 **Done when:** `stage create`, `quick-archive` and `collection run` stage on tar; nothing
 under `src/staging/` names dar; the pending list is in the report; the suite is green.
 
+### T4.5b A staging job's memory counts its compressor (#570)
+
+Added 2026-11-18 at T4.5's integration. **Owner:** worker. **Depends on:** T4.5. **Runs
+beside** T4.6 (disjoint files).
+
+**Build.** `staging::jobs::effective_jobs` admits jobs at a flat `MEMORY_PER_JOB` (192 MiB),
+which does not count the compressor's own working memory: xz at level 9 takes about 674 MiB
+to pack and 65 MiB to decode again (the decode-and-compare check runs beside the packer).
+Give each job its own figure, from its resolved compression and level: 192 MiB plus the
+algorithm's pack and decode memory at that level, read from a table in `staging::pack`
+beside the level ranges (gzip, xz and zstd, each level; the figures from each library's
+own documentation, cited in the table's comment, never guessed). `effective_jobs` judges
+the queue by the jobs' own figures, and its notice names the compression and level when
+it lowers the count.
+
+**Fence:** `src/staging/jobs.rs`, `src/staging/pack.rs` (the table only).
+
+**Done when:** a test shows that the memory which holds three jobs at `none` holds fewer at
+xz 9, and the notice names the level; each figure in the table cites its source; the suite
+is green.
+
+**For T4.6 to T4.10 (binding, found at T4.5's integration).** T4.5 needed only two
+`L3-pending` marks, because most restore, rebuild, heir and write tests build their
+archives by hand (`dar::create`, fixture stage sets), and the write path accepts a NULL
+`catalog_path`. Those tests will not go red when their path is ported wrongly. Each of
+T4.6 to T4.10 therefore drives its own tests from a **real staging** (`stage create` on a
+made tree, as `src/staging/tar_stage_tests.rs` does) and ports or deletes every test of its
+path that builds a dar archive by hand; the report lists each.
+
 ### T4.6 What a tape carries: Layout 3's identity, the MANIFEST, the envelopes, both ways
 
 **Owner:** worker (one, alone in its wave). **Depends:** T4.5. **Carries out:** items 254,
