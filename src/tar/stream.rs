@@ -1765,6 +1765,18 @@ mod tests {
         let t = tree();
         std::fs::write(t.root.join("a"), b"first\n").unwrap();
         std::fs::write(t.root.join("b"), vec![9u8; 700]).unwrap();
+        // A fixed time with nine nanosecond digits: GNU tar drops trailing
+        // zeros from the `mtime` record, so a time read off the clock made
+        // its length, and every offset a test computes from it, vary.
+        let at = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        for name in ["a", "b"] {
+            std::fs::File::options()
+                .write(true)
+                .open(t.root.join(name))
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        }
         nix::unistd::mkfifo(
             &t.root.join("p"),
             nix::sys::stat::Mode::from_bits_truncate(0o644),
