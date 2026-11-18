@@ -65,7 +65,7 @@ jobs:
         # read library-made slices back. dar stays until Stage 4's T4.15.
         run: |
           sudo apt-get update
-          sudo apt-get install -y dar acl gzip xz-utils zstd
+          sudo apt-get install -y dar acl attr gzip xz-utils zstd
           dar --version | head -2
           getfacl --version | head -1
           gzip --version | head -1
