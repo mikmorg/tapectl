@@ -131,8 +131,11 @@ mod tests {
     #[test]
     fn rows_round_trip_with_an_escaped_path_and_in_order() {
         let conn = crate::db::open_memory().unwrap();
-        conn.execute("INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, current_path, checksum_mode, encrypt, status)
              VALUES ('u', 'u', 1, '/x', 'mtime_size', 1, 'active')",
@@ -165,7 +168,11 @@ mod tests {
         ];
         assert_eq!(insert(&conn, 1, &rows).unwrap(), 2);
         let stored: String = conn
-            .query_row("SELECT path FROM snapshot_left_out WHERE seq = 0", [], |r| r.get(0))
+            .query_row(
+                "SELECT path FROM snapshot_left_out WHERE seq = 0",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stored, "a\\tb\\\\c");
         assert_eq!(load(&conn, 1).unwrap(), rows);

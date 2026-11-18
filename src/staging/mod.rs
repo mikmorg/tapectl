@@ -3404,14 +3404,19 @@ mod tests {
                 0
             )]
         );
-        let (count, size): (i64, i64) = conn
+        // keep.txt and the unit's own dotfile; the socket is not counted.
+        let count: i64 = conn
             .query_row(
-                "SELECT file_count, total_size FROM snapshots WHERE id = ?1",
+                "SELECT file_count FROM snapshots WHERE id = ?1",
                 params![outcome.snapshot_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!((count, size), (1, 4), "the socket is not counted");
+        assert_eq!(count, 2, "the socket is not counted");
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, outcome.snapshot_id, Some("d/s.sock")),
+            0
+        );
     }
 
     // ── issue #53: archive_base is per-stage-set, not per-snapshot ──
@@ -5248,8 +5253,10 @@ mod tests {
         // arguments)" — stage_sets.dar_command records the exact
         // Command::Debug-formatted string create_archive ran.
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) =
+        let (conn, paths, mut config, src) =
             setup_unit_with_excludes(&tmp, vec!["*.unusual-dotfile-pattern".to_string()]);
+        // Item 252: `init` no longer writes a default list; the test names one.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
 
@@ -5676,7 +5683,9 @@ mod tests {
     #[test]
     fn global_default_excluded_file_content_drift_at_stable_size_does_not_false_positive_bitrot() {
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"real archival content, kept").unwrap();
         fs::write(src.join("Thumbs.db"), b"AAAA").unwrap();
@@ -5699,7 +5708,9 @@ mod tests {
     #[test]
     fn global_default_excluded_files_do_not_appear_in_files_table() {
         let tmp = TempDir::new().unwrap();
-        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, _paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();
@@ -5720,7 +5731,9 @@ mod tests {
     #[test]
     fn global_default_excluded_files_never_receive_a_sha256_baseline() {
         let tmp = TempDir::new().unwrap();
-        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        // Item 252: `init` no longer writes these; the test names its own.
+        config.defaults.global_excludes = vec!["Thumbs.db".to_string()];
 
         fs::write(src.join("keep.txt"), b"kept content, baselined").unwrap();
         fs::write(src.join("Thumbs.db"), b"thumbnail cache junk").unwrap();

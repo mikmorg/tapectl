@@ -849,7 +849,11 @@ mod tests {
                 "{pass}"
             );
             for needle in ["a.nfo", ".cache", "s.sock", "*.nfo", "socket"] {
-                assert!(created.line.contains(needle), "{pass}: {needle} in {}", created.line);
+                assert!(
+                    created.line.contains(needle),
+                    "{pass}: {needle} in {}",
+                    created.line
+                );
             }
         }
     }

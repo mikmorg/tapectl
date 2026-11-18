@@ -3562,9 +3562,17 @@ mod tests {
         Config::default().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("global_excludes = []"), "{text}");
-        assert!(Config::load(&path).unwrap().defaults.global_excludes.is_empty());
+        assert!(Config::load(&path)
+            .unwrap()
+            .defaults
+            .global_excludes
+            .is_empty());
 
-        std::fs::write(&path, "[defaults]\nglobal_excludes = [\"*.nfo\", \".cache/\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "[defaults]\nglobal_excludes = [\"*.nfo\", \".cache/\"]\n",
+        )
+        .unwrap();
         assert_eq!(
             Config::load(&path).unwrap().defaults.global_excludes,
             vec!["*.nfo".to_string(), ".cache/".to_string()]
