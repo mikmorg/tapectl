@@ -8,6 +8,8 @@ pub mod models;
 pub mod ontape_catalog;
 pub mod phase_timings;
 pub mod queries;
+pub mod stage_files;
+pub mod stage_ids;
 pub mod stats;
 
 use std::path::Path;
