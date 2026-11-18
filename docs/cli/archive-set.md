@@ -37,7 +37,12 @@ tapectl archive-set create [OPTIONS] <NAME>
   
     Each must be a registered location (`tapectl location add`).
 - `--encrypt <BOOL>` *(one of `true`, `false`)* — Encryption enabled (true/false)
-- `--compression <MODE>` — Compression mode
+- `--compression <MODE>` — Compression mode: none, gzip, xz or zstd
+  
+    Each slice is packed alone, after the cut and before it is encrypted.
+- `--compression-level <N>` — Compression level (gzip 1-9, xz 0-9, zstd 1-19)
+  
+    Never set means the algorithm's own default (gzip 6, xz 6, zstd 3).
 - `--checksum-mode <MODE>` — Checksum mode
 - `--slice-size <SIZE>` — Slice size, e.g. "1G" (the default)
 - `--verify-interval-days <DAYS>` — Verify interval in days
@@ -46,10 +51,10 @@ tapectl archive-set create [OPTIONS] <NAME>
     Never set means "defer to the system default".
 - `--preserve-xattrs <BOOL>` *(one of `true`, `false`)* — Keep extended attributes (true/false)
   
-    And the POSIX ACLs stored as them; false drops them all.
-- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false; with --preserve-xattrs)
+    tar's --xattrs; the raw POSIX ACL attribute is never among them.
+- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false)
   
-    No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
+    tar's --acls: the text ACL record, every entry by number.
 - `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   
@@ -81,7 +86,12 @@ tapectl archive-set edit [OPTIONS] <NAME>
   
     Each must be a registered location (`tapectl location add`).
 - `--encrypt <BOOL>` *(one of `true`, `false`)* — Encryption enabled (true/false)
-- `--compression <MODE>` — Compression mode
+- `--compression <MODE>` — Compression mode: none, gzip, xz or zstd
+  
+    Each slice is packed alone, after the cut and before it is encrypted.
+- `--compression-level <N>` — Compression level (gzip 1-9, xz 0-9, zstd 1-19)
+  
+    Never set means the algorithm's own default (gzip 6, xz 6, zstd 3).
 - `--checksum-mode <MODE>` — Checksum mode
 - `--slice-size <SIZE>` — Slice size, e.g. "1G" (the default)
 - `--verify-interval-days <DAYS>` — Verify interval in days
@@ -90,10 +100,10 @@ tapectl archive-set edit [OPTIONS] <NAME>
     Never set means "defer to the system default".
 - `--preserve-xattrs <BOOL>` *(one of `true`, `false`)* — Keep extended attributes (true/false)
   
-    And the POSIX ACLs stored as them; false drops them all.
-- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false; with --preserve-xattrs)
+    tar's --xattrs; the raw POSIX ACL attribute is never among them.
+- `--preserve-acls <BOOL>` *(one of `true`, `false`)* — Keep POSIX ACLs (true/false)
   
-    No effect of its own: ACLs are kept or dropped with the extended attributes they are stored as.
+    tar's --acls: the text ACL record, every entry by number.
 - `--preserve-fsa <BOOL>` *(one of `true`, `false`)* — Keep filesystem attributes, chattr flags (true/false)
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   

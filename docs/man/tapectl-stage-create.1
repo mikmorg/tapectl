@@ -8,7 +8,7 @@ tapectl\-stage\-create \- Archive and encrypt each unit\*(Aqs newest snapshot in
 .SH DESCRIPTION
 Archive and encrypt each unit\*(Aqs newest snapshot into staging
 .PP
-Each unit\*(Aqs sources are hashed as dar reads them once, and dar\*(Aqs archive is cut into slices and age\-encrypted in memory: no plaintext reaches staging. Several units may be named; `\-\-jobs` stages that many at once. Every name is checked before any unit is staged. Under \-\-json, an array of one object per unit, printed only when every unit was staged.
+GNU tar archives each unit\*(Aqs files from its snapshot\*(Aqs exact list; its stream is checked and hashed as it passes, cut into slices of whole files, packed alone when compressed and age\-encrypted in memory: no plaintext reaches staging. Several units may be named; `\-\-jobs` stages that many at once. Every name is checked before any unit is staged. Under \-\-json, an array of one object per unit, printed only when every unit was staged.
 .PP
 Exit status: 0 = every unit staged; 2 = a unit failed or was refused (the error names each unit staged, failed and not started).
 .SH OPTIONS

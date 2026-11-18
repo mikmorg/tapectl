@@ -89,7 +89,7 @@ definitions it parses. For what to *do* with them, start at the
 | &nbsp;&nbsp;[`stage for-location`](stage.md#tapectl-stage-for-location) | Stage what a location needs, packed into one volume bound there |
 | &nbsp;&nbsp;[`stage list`](stage.md#tapectl-stage-list) | List the stage sets held in staging, with each version's copies |
 | &nbsp;&nbsp;[`stage clean`](stage.md#tapectl-stage-clean) | Release staged slices from disk |
-| &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show a version's newest stage set: its dar, sizes and slices |
+| &nbsp;&nbsp;[`stage info`](stage.md#tapectl-stage-info) | Show a version's newest stage set: its tar, sizes and slices |
 | [`volume`](volume.md) | Manage volumes and tape operations |
 | &nbsp;&nbsp;[`volume init`](volume.md#tapectl-volume-init) | Initialize a new volume (write ID thunk to tape) |
 | &nbsp;&nbsp;[`volume write`](volume.md#tapectl-volume-write) | Write staged data to volume |
