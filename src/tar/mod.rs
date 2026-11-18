@@ -11,6 +11,7 @@
 //! Inside this module the `tar` crate is spelled `::tar`, since this module
 //! is `crate::tar`.
 
+pub mod pax;
 pub mod probe;
 pub mod writer;
 
