@@ -32,6 +32,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod host_check;
+pub mod idmap;
 pub mod signal;
 pub mod startup;
 pub mod tenant;
