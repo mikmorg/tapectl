@@ -243,7 +243,7 @@ directory = "/mnt/staging"  # Peak need: one unit's encrypted slices (no plainte
 
 [defaults]
 slice_size = "1G"
-global_excludes = ["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]   # keep: a [defaults] table without it excludes nothing
+global_excludes = ["*.nfo", "*.tmp"]   # what you choose to leave out; init writes []
 min_copies = 2              # copies every unit needs (an archive set may ask for more)
 min_locations = 2           # distinct locations those copies must be in
 
@@ -958,7 +958,7 @@ registering any the catalog does not know and updating the path of any that
 moved (for example after the catalog was lost, or on a new host).
 
 **Leaving files out.** Exclude patterns come from `[defaults] global_excludes`
-in config.toml (`init` writes `*.nfo`, `Thumbs.db`, `.DS_Store` and `*.tmp`)
+in config.toml (`init` writes an empty list: nothing is left out by default, ADR-0012 item 252)
 plus the `[excludes] patterns` list in a unit's dotfile. Matching ignores case.
 A plain pattern such as `*.iso` matches a file's name, anywhere in the unit. A
 pattern ending in `/`, such as `.cache/` or `node_modules/`, drops everything
