@@ -6,13 +6,15 @@
 //! ([`writer::write_list`]), the command line, fixed flag by flag
 //! ([`writer::create_args`]), the run and its exit ([`writer::spawn_archive`],
 //! [`writer::TarFinish`]), and the writer's floor ([`probe::probe`]). The
-//! checks of the stream as it passes (§3.2) are the stream reader's.
+//! checks of the stream as it passes (§3.2) are the stream reader's
+//! ([`stream::read`], with the pax records read by length in [`pax`]).
 //!
 //! Inside this module the `tar` crate is spelled `::tar`, since this module
 //! is `crate::tar`.
 
 pub mod pax;
 pub mod probe;
+pub mod stream;
 pub mod writer;
 
 use std::ffi::OsStr;
@@ -22,6 +24,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub use probe::{probe, AclSupport, TarCheck, TarVersion, FLOOR};
+pub use stream::{
+    read as read_stream, AclOnDisk, Finished, Listed, Refusal, Rule, Rules, Sink, StreamError,
+};
 pub use writer::{
     create_args, create_command, recorded_command, spawn_archive, write_list, CreateParams,
     TarFinish, TarOutput, TarStream,
