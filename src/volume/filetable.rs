@@ -599,7 +599,7 @@ mod tests {
                 start: at,
                 end: at + len,
                 size: len.saturating_sub(512),
-                sha256: kind.hashed().then(|| [path.len() as u8; 32]),
+                sha256: kind.hashed().then_some([path.len() as u8; 32]),
                 path: path.to_string(),
                 link: link.map(str::to_string),
             });
