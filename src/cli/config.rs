@@ -10,7 +10,7 @@
 //!
 //! Every `config check` scan below (shadowing, subsumed, decorative keys,
 //! unknown `[defaults]` keys, unsupported compression, and the
-//! dar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
+//! tar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
 //! operator-owned files, and never touches the exit code. That contract is load-bearing
 //! (ADR-0004 and the #50/#92 "surface, do not delete" precedent); preserve
 //! it.
@@ -310,7 +310,24 @@ fn run_check(
     // Depth checks (issue #62): does the config actually work, not just
     // parse? Warnings only — never touch the exit code, never open a tape
     // device.
-    let dar_check = loaded.map(|cfg| crate::policy::depth_check::check_dar(&cfg.dar.binary));
+    // The writer's floor (ADR-0012 item 274), probed as `stage create`
+    // probes it: its one file with an ACL is made in the home's work
+    // directory when there is a home, else in the system's.
+    let tar_check = match loaded {
+        Some(cfg) => {
+            let scratch = if paths.home.is_dir() {
+                Some(crate::staging::home_work_dir(paths, ".tar-probe-")?)
+            } else {
+                None
+            };
+            let dir = scratch
+                .as_ref()
+                .map(|d| d.path().to_path_buf())
+                .unwrap_or_else(std::env::temp_dir);
+            Some(crate::policy::depth_check::check_tar(&cfg.tar.binary, &dir))
+        }
+        None => None,
+    };
     let staging_check =
         loaded.map(|cfg| crate::policy::depth_check::check_staging(&cfg.staging.directory));
     // Issue #140: the third staging check — is it big enough for one
@@ -369,7 +386,7 @@ fn run_check(
             &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
-            dar_check.as_ref(),
+            tar_check.as_ref(),
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
@@ -390,7 +407,7 @@ fn run_check(
             &subsumed_hits,
             &decorative_hits,
             &unknown_key_hits,
-            dar_check.as_ref(),
+            tar_check.as_ref(),
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
@@ -448,7 +465,7 @@ fn print_json(
     subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
-    dar_check: Option<&crate::policy::depth_check::DarCheck>,
+    tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
@@ -501,26 +518,28 @@ fn print_json(
             })
         })
         .collect();
-    let dar_json = match dar_check {
+    let tar_json = match tar_check {
         None => serde_json::Value::Null,
-        Some(crate::policy::depth_check::DarCheck::Missing { path }) => {
+        Some(crate::policy::depth_check::TarToolCheck::Missing { path }) => {
             serde_json::json!({"status": "missing", "path": path})
         }
-        Some(crate::policy::depth_check::DarCheck::NotExecutable { path }) => {
-            serde_json::json!({"status": "not_executable", "path": path})
-        }
-        Some(crate::policy::depth_check::DarCheck::Unreadable { path, detail }) => {
+        Some(crate::policy::depth_check::TarToolCheck::Unreadable { path, detail }) => {
             serde_json::json!({"status": "unreadable", "path": path, "detail": detail})
         }
-        Some(crate::policy::depth_check::DarCheck::TooOld {
+        Some(crate::policy::depth_check::TarToolCheck::Refused {
             path,
-            found,
-            minimum,
+            first_line,
+            refusal,
         }) => {
-            serde_json::json!({"status": "too_old", "path": path, "found": found, "minimum": minimum})
+            serde_json::json!({"status": "refused", "path": path, "version": first_line,
+                               "refusal": refusal})
         }
-        Some(crate::policy::depth_check::DarCheck::Ok { path, version }) => {
-            serde_json::json!({"status": "ok", "path": path, "version": version})
+        Some(crate::policy::depth_check::TarToolCheck::Ok {
+            path,
+            first_line,
+            acl,
+        }) => {
+            serde_json::json!({"status": "ok", "path": path, "version": first_line, "acl": acl})
         }
     };
     let staging_json = match staging_check {
@@ -590,7 +609,7 @@ fn print_json(
         "subsumed_policy_fields": subsumed_json,
         "decorative_keys": decorative_json,
         "unknown_keys": unknown_key_json,
-        "dar": dar_json,
+        "tar": tar_json,
         "staging": staging_json,
         "staging_space": staging_space_json,
         "tape_devices": tape_devices_json,
@@ -617,7 +636,7 @@ fn print_human(
     subsumed_hits: &[crate::policy::subsumed::SubsumedAcls],
     decorative_hits: &[crate::policy::decorative::DecorativeHit],
     unknown_key_hits: &[crate::policy::unknown_keys::UnknownKeyHit],
-    dar_check: Option<&crate::policy::depth_check::DarCheck>,
+    tar_check: Option<&crate::policy::depth_check::TarToolCheck>,
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
@@ -687,9 +706,9 @@ fn print_human(
     for hit in subsumed_hits {
         println!("{}", crate::policy::subsumed::describe(hit));
     }
-    match dar_check {
-        Some(check) => println!("{}", crate::policy::depth_check::describe_dar(check)),
-        None => println!("note: dar could not be checked — the config did not parse well enough"),
+    match tar_check {
+        Some(check) => println!("{}", crate::policy::depth_check::describe_tar(check)),
+        None => println!("note: tar could not be checked — the config did not parse well enough"),
     }
     match staging_check {
         Some(check) => println!("{}", crate::policy::depth_check::describe_staging(check)),

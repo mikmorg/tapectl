@@ -1439,7 +1439,7 @@ pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i
 /// moment (tar's file list and probe, the write's `catalog.db`), which must not
 /// go under staging (ADR-0012 2026-10-06 item 4) nor to a world-readable
 /// `/tmp`.
-pub(crate) fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfile::TempDir> {
+pub fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfile::TempDir> {
     let tmp = paths.home.join("tmp");
     fs::create_dir_all(&tmp).map_err(|e| staging_io_error("cannot create", &tmp, e))?;
     crate::config::secure_path(&tmp, 0o700);
@@ -4428,14 +4428,6 @@ mod tests {
         let mut f = fs::File::create(path).unwrap();
         f.write_all(&data).unwrap();
         f.sync_all().unwrap();
-    }
-
-    /// A file's allocation on disk, capped at its length — what a bound read
-    /// off `st_blocks` would count for it.
-    fn allocated(path: &Path) -> i64 {
-        use std::os::unix::fs::MetadataExt;
-        let m = fs::metadata(path).unwrap();
-        m.len().min(m.blocks() * 512) as i64
     }
 
     /// The figure the space check states (`stream_estimate`), at the

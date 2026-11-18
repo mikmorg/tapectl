@@ -690,8 +690,8 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
     // stream) with the exit code unchanged (asserted above via
     // `.success()`, i.e. still 0 with these fields added).
     assert!(
-        parsed.get("dar").is_some(),
-        "config check --json missing 'dar' depth-check field: {parsed}"
+        parsed.get("tar").is_some(),
+        "config check --json missing 'tar' depth-check field: {parsed}"
     );
     assert!(
         parsed.get("staging").is_some(),
@@ -714,23 +714,16 @@ fn cli_smoke_sequence_against_a_throwaway_home() {
         Some(&serde_json::json!([])),
         "config check --json missing/non-empty 'unsupported_compression' field on a fresh db: {parsed}"
     );
-    // Fresh init's default dar.binary is now the bare, PATH-resolved "dar"
-    // (issue #124 — the old shipped default /opt/dar/bin/dar existed on no
-    // mainstream distro). `dar` is a hard runtime dependency guaranteed on
-    // PATH for this whole suite (CLAUDE.md; enforced by
-    // tests/test_dependencies.rs), and `config check` now resolves a bare
-    // name via PATH the same way the runtime does (issue #119), so a fresh
-    // init's dar status must come back "ok", not "missing" — the field
-    // still must be present and reported either way, and must not fail the
-    // command. Coverage for the "reported, not silently absent, when
-    // actually missing" case moved to depth_check.rs's own unit tests.
+    // A fresh init's tar is the bare, PATH-resolved "tar" (D11). GNU tar at
+    // the writer's floor is on PATH for this suite (tests/test_dependencies.rs),
+    // and `config check` probes it as `stage create` does, so it must pass.
     assert_eq!(
-        parsed["dar"]["status"],
+        parsed["tar"]["status"],
         serde_json::json!("ok"),
-        "expected a fresh init's default dar.binary ('dar') to resolve via PATH: {parsed}"
+        "expected a fresh init's default tar.binary ('tar') to pass the probe: {parsed}"
     );
     assert!(
-        parsed["dar"]["path"]
+        parsed["tar"]["path"]
             .as_str()
             .is_some_and(|p| p.starts_with('/')),
         "expected config check to report the PATH-resolved absolute path, not the bare name: {parsed}"
@@ -2505,7 +2498,7 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
         [
             "num_slices",
             "stage_set_id",
-            "total_dar_size",
+            "stream_bytes",
             "total_encrypted_size",
             "unit"
         ]
@@ -2518,7 +2511,6 @@ fn stage_create_json_is_one_array_and_its_session_is_logged() {
         "phase end: check",
         "phase start: archive",
         "phase end: recheck",
-        "phase end: catalog",
         "phase end: finalize",
         "session end after",
     ] {

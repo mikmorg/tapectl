@@ -915,9 +915,16 @@ fn cmd_init(
         Some(created.keypair.public_key)
     };
 
-    // Validate dar availability (non-fatal warning)
-    let dar_path = &cfg.dar.binary;
-    let dar_ok = check_dar(dar_path);
+    // The writer's floor (ADR-0012 item 274), probed as `stage create`
+    // probes it (non-fatal: a warning, with the probe's own text).
+    let tar_check = {
+        let work = tapectl::staging::home_work_dir(&paths, ".tar-probe-")?;
+        tapectl::policy::depth_check::check_tar(&cfg.tar.binary, work.path())
+    };
+    let tar_ok = matches!(
+        tar_check,
+        tapectl::policy::depth_check::TarToolCheck::Ok { .. }
+    );
 
     if json_output {
         println!(
@@ -928,7 +935,7 @@ fn cmd_init(
                 "operator_id": tenant_id,
                 "operator_key_adopted": adopted_operator_key.as_ref().map(|i| &i.public_key),
                 "config_kept": config_kept,
-                "dar_available": dar_ok,
+                "tar_available": tar_ok,
                 "escrow_public_key": escrow_public_key,
                 "next": INIT_NEXT_STEPS.iter().map(|(_, cmd)| cmd).collect::<Vec<_>>(),
             })
@@ -967,28 +974,15 @@ fn cmd_init(
                 "  escrow:   not created (--no-escrow) — register one with `key generate --escrow` or `key import --escrow` before staging"
             ),
         }
-        if dar_ok {
-            // Issue #119/#124: use the same PATH-resolution helper `config
-            // check` uses, so a bare, PATH-resolved dar.binary (the default
-            // as of issue #124) shows the operator where it actually
-            // resolved to, not just the bare name they configured.
-            let found_at = if dar_path.contains('/') {
-                None
-            } else {
-                std::env::var_os("PATH")
-                    .and_then(|path_var| {
-                        tapectl::policy::depth_check::resolve_on_path(dar_path, &path_var)
-                    })
-                    .map(|p| p.display().to_string())
-            };
-            match found_at {
-                Some(found) => println!("  dar:      {dar_path} (found at {found})"),
-                None => println!("  dar:      {dar_path} (ok)"),
-            }
-        } else if dar_path.contains('/') {
-            println!("  dar:      {dar_path} (NOT FOUND — install before staging)");
-        } else {
-            println!("  dar:      {dar_path} (NOT FOUND on PATH — install before staging)");
+        match &tar_check {
+            tapectl::policy::depth_check::TarToolCheck::Ok {
+                path, first_line, ..
+            } => println!("  tar:      {first_line} (found at {path})"),
+            other => println!(
+                "  tar:      {} — {}",
+                cfg.tar.binary,
+                tapectl::policy::depth_check::describe_tar(other)
+            ),
         }
         print!("{}", init_next_steps());
     }
@@ -1036,15 +1030,4 @@ fn init_next_steps() -> String {
     }
     out.push_str("`tapectl status` shows where things stand and the next command at every step.\n");
     out
-}
-
-/// Check if dar is available at the configured path.
-fn check_dar(dar_path: &str) -> bool {
-    std::process::Command::new(dar_path)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }

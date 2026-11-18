@@ -852,3 +852,104 @@ fn a_tar_that_writes_no_acl_record_is_refused_by_the_streams_check() {
     );
     assert_eq!(staged, 0);
 }
+
+/// Item 287: `compression_level` is resolved through the three layers as
+/// `compression` is, the most specific winning: an archive set's level
+/// over `[defaults]`, a unit's dotfile over its archive set.
+#[test]
+fn compression_level_resolves_dotfile_over_archive_set_over_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+    config.defaults.compression = "zstd".to_string();
+    config.defaults.compression_level = Some(2);
+    conn.execute(
+        "INSERT INTO archive_sets (name, compression_level) VALUES ('packed', 5)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE units SET archive_set_id = (SELECT id FROM archive_sets WHERE name = 'packed')
+          WHERE name = 'unit1'",
+        [],
+    )
+    .unwrap();
+    fs::write(src.join("f.txt"), b"content to pack").unwrap();
+    let level_of = |id: i64| -> Option<i64> {
+        conn.query_row(
+            "SELECT compression_level FROM stage_sets WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let snap = snapshot_create(&conn, "unit1", &config).unwrap();
+    let id = stage_create(&conn, &paths, &config, snap, false).unwrap();
+    assert_eq!(
+        level_of(id),
+        Some(5),
+        "the archive set's level over [defaults]"
+    );
+
+    let dotfile = src.join(".tapectl-unit.toml");
+    let mut df = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+    df.compression_level = Some(7);
+    crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
+    assert_eq!(
+        crate::unit::dotfile::read_dotfile(&dotfile)
+            .unwrap()
+            .compression_level,
+        Some(7),
+        "a dotfile round trip keeps the level"
+    );
+    fs::write(src.join("g.txt"), b"a second version").unwrap();
+    let snap2 = snapshot_create(&conn, "unit1", &config).unwrap();
+    let id2 = stage_create(&conn, &paths, &config, snap2, false).unwrap();
+    assert_eq!(
+        level_of(id2),
+        Some(7),
+        "the dotfile's level over its archive set"
+    );
+}
+
+/// #562: `slice_size` is a multiple of 512 wherever it is set: an
+/// `[[archive_sets]]` entry and `[defaults]` at config load, and a unit's
+/// dotfile where its policy is resolved, each naming the key.
+#[test]
+fn a_slice_size_not_a_multiple_of_512_is_refused_at_every_layer() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(&cfg, "[defaults]\nslice_size = \"1000\"\n").unwrap();
+    let e = crate::config::Config::load(&cfg).unwrap_err().to_string();
+    assert!(
+        e.contains("defaults.slice_size") && e.contains("512"),
+        "{e}"
+    );
+    fs::write(
+        &cfg,
+        "[[archive_sets]]\nname = \"odd\"\nslice_size = \"100000\"\n",
+    )
+    .unwrap();
+    let e = crate::config::Config::load(&cfg).unwrap_err().to_string();
+    assert!(
+        e.contains("archive_sets[0]") && e.contains("slice_size") && e.contains("512"),
+        "{e}"
+    );
+    fs::write(&cfg, "[defaults]\nslice_size = \"1M\"\n").unwrap();
+    crate::config::Config::load(&cfg).expect("a multiple of 512 loads");
+
+    let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+    let dotfile = src.join(".tapectl-unit.toml");
+    let mut df = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+    df.slice_size = Some("1000".to_string());
+    crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
+    let unit = crate::db::queries::get_unit_by_name(&conn, "unit1")
+        .unwrap()
+        .unwrap();
+    let e = crate::policy::resolve(&conn, &config, &unit)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("[policy] slice_size") && e.contains("512"),
+        "{e}"
+    );
+}

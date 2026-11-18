@@ -85,7 +85,7 @@ config: INVALID
   |
 7 | slize_size = "5G"
   | ^^^^^^^^^^
-unknown field `slize_size`, expected one of `slice_size`, `compression`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`, `copies_at`
+unknown field `slize_size`, expected one of `slice_size`, `compression`, `compression_level`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`, `copies_at`
 
   - unknown key: defaults.slize_size
   - ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4
@@ -245,8 +245,7 @@ by" names the commands whose behaviour the key changes.
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
 | `directory` | string (path) | `<home>/staging` as written by `init` | Where `stage create` puts the encrypted slices waiting for tape, and where write sessions keep their working files. It must be writable and, ideally, big enough for a full cartridge. `config check` warns when it is not. | [`stage create`](cli/stage.md#tapectl-stage-create), [`volume write`](cli/volume.md#tapectl-volume-write), [`volume read-slices`](cli/volume.md#tapectl-volume-read-slices), [`volume compact-read`](cli/volume.md#tapectl-volume-compact-read), [`stage list/clean`](cli/stage.md), [`collection run`](cli/collection.md#tapectl-collection-run) |
-| `hash_threads` | integer, 1 to 64 | `1` | How many source files one `stage create` reads and hashes at once, beside dar. Files are handed out in dar's read order and their hashes recorded in that order, so the result is the same at any setting; only the speed changes. It never runs more threads than the host has cores. Every file is still read within 128 MiB of where dar reads (the source leaves its disk once), so threads run at once only over files that fit in that window: a unit of many small files gains, one of a few large files is hashed about a file at a time. Each thread reads its own file, so on a single spinning disk more threads can mean more seeking. The default, `1`, is the one-file-at-a-time pass; it stays the default until a many-file unit has been measured on the production host at 1, 2, 4 and 8 threads (ADR-0012, 2026-10-07). If you raise it and a stage reads the source slower than before, lower it again. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run), [`quick-archive`](cli/quick-archive.md) |
-| `jobs` | integer, 1 to 16 | `1` | How many units are staged at once when several are staged together: `stage create` with several unit names, `collection run`, and first-run's staging step. `--jobs` on `stage create` and `collection run` overrides it for one run. The largest units start first, each prints a line as it starts and ends, and after a failure no further unit is started (the ones running finish). Each stage in flight keeps up to 128 MiB of its source in the page cache, so fewer run when the host's available memory cannot hold that many, and it says so. The stages share the cores: each hashes with its share of `hash_threads`. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run) |
+| `jobs` | integer, 1 to 16 | `1` | How many units are staged at once when several are staged together: `stage create` with several unit names, `collection run`, and first-run's staging step. `--jobs` on `stage create` and `collection run` overrides it for one run. The largest units start first, each prints a line as it starts and ends, and after a failure no further unit is started (the ones running finish). Each stage in flight keeps up to 128 MiB of its source in the page cache, so fewer run when the host's available memory cannot hold that many, and it says so. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run) |
 
 `init` always writes the real path. If you delete the key while using a
 non-default home, the fallback is `$HOME/.tapectl/staging`, not `<home>/staging`,
@@ -273,6 +272,7 @@ These are the system-wide defaults. They form the bottom layer of
 |---|---|---|---|---|
 | `slice_size` | size (binary) | `"1G"` | Maximum size of one dar slice. A slice is the unit that is encrypted, written, retried and restored. Can be overridden by an archive set or a dotfile. | `stage create`, `collection run` |
 | `compression` | `none` \| `gzip` \| `bzip2` \| `lzo` \| `xz` \| `lzma` \| `zstd` \| `lz4` | `"none"` | dar compression. Must also be supported by your dar build, and for this key (and a dotfile's `compression`) nothing checks that in advance. Loading checks only the spelling, and `config check` says `config: valid`. A codec your dar lacks is found only when `stage create` runs dar. An archive set's value is checked against the real binary: `archive-set create/edit/sync` refuse a codec it cannot perform, and `config check` warns about a stored set that has one. | `stage create` |
+| `compression_level` | integer | the algorithm's own | The level `compression` packs each slice at: gzip 1 to 9 (default 6), xz 0 to 9 (default 6), zstd 1 to 19 (default 3). A value outside the algorithm's range is refused, naming the key, when config.toml is loaded and when `stage create` resolves the unit's policy. Resolved like `compression`: a unit's dotfile, then its archive set, then here. The level is recorded with the staging; no reader needs it. | `stage create` |
 | `checksum_mode` | `mtime_size` \| `sha256` \| `sha256_on_archive` | `"mtime_size"` | How a unit's files are compared with its last snapshot to decide whether it is dirty. `mtime_size` compares each file's path, size and modification time. `sha256` also compares a content hash when those match. `sha256_on_archive` detects changes as `mtime_size` does. A new unit takes the resolved mode (dotfile, then archive set, then `[defaults]`) **when it is registered**, and keeps it. A later change here does not reach units already registered. See [below](#keys-that-are-accepted-but-do-less-than-their-name-says). | `unit init`, `unit init-bulk`, `collection sync`, `unit discover`, `quick-archive` (at registration) |
 | `encrypt` | bool | `true` | Encryption **cannot** be turned off: the escrow recipient takes part in every write. When a unit's *resolved* `encrypt` is `false`, `stage create` prints a warning for it that `[logging] level` cannot silence, and encrypts anyway. `false` here is overridden by an archive set that sets `encrypt = true`, so that set's units stage with no warning. `audit` checks that a unit's stage sets on tape are encrypted, but only while the unit's resolved `encrypt` is `true`: `false` turns that check off for the unit. | `stage create`, `audit` |
 | `preserve_xattrs` | bool | `true` | `true` archives every extended attribute, and with them the POSIX ACLs that Linux stores as extended attributes. `false` passes dar `-u "*"`, which drops them all, ACLs included. | `stage create` |
@@ -421,6 +421,7 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | `copies_at` | table: location name = count | This set's copy targets per location (from 1.7.1; see [`[defaults] copies_at`](#defaults)), laid over `required_locations` name by name: `required_locations = ["home-rack", "offsite"]` with `copies_at = { home-rack = 2 }` is `{ home-rack = 2, offsite = 1 }`. Either key makes this set's layer set the map, which then hides `[defaults] copies_at`; a unit's dotfile `[policy.copies_at]` replaces it in turn. Each name must be a registered location and each count 0 or more: `create`, `edit` and `sync` refuse otherwise, by name. `--copies-at` replaces the set's whole map; it takes `NAME=N` and is repeated for each location. | `--copies-at NAME=N` (repeatable) |
 | `encrypt` | bool | See `[defaults] encrypt`: `false` is warned about and the data is encrypted anyway, but `audit` stops checking this set's units for unencrypted stage sets. | `--encrypt true\|false` |
 | `compression` | closed set, as in `[defaults]` | Overrides `[defaults] compression`. | `--compression` |
+| `compression_level` | integer | Overrides `[defaults] compression_level`, in the range of the algorithm in force. | `--compression-level` |
 | `checksum_mode` | closed set, as in `[defaults]` | Overrides `[defaults] checksum_mode` for units registered into this set. Units already registered keep their mode. | `--checksum-mode` |
 | `slice_size` | size (binary) | Overrides `[defaults] slice_size`. | `--slice-size` |
 | `verify_interval_days` | integer | `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit with copies has had no passing full `volume verify` within this many days. Overrides `[defaults] verify_interval_days` (365 days when that is absent). It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). It must be at least 1: `archive-set create`, `edit` and `sync` refuse a smaller value by name, and so do loading config.toml and `config check` (#422). A catalog row written with one before then keeps working; at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
@@ -859,12 +860,13 @@ are not kept.
 `unit init` never writes this table. Add it by hand to give one unit its own
 policy. It is read from disk every time the unit's policy is resolved, which happens
 at `stage create`, `audit`, `collection status/plan/run` and elsewhere. So a change
-takes effect straight away. It accepts exactly six keys:
+takes effect straight away. It accepts exactly seven keys:
 
 | Key | Type | Overrides |
 |---|---|---|
 | `slice_size` | size (binary) | the archive set, then `[defaults]` |
 | `compression` | closed set, as in `[defaults]` | the archive set, then `[defaults]` |
+| `compression_level` | integer | the archive set, then `[defaults]` |
 | `checksum_mode` | closed set, as in `[defaults]` | Read when a unit is registered from this dotfile (`unit discover`, `collection sync`), where it wins over the archive set and `[defaults]`. Changing it later does not change the registered unit's mode (see [above](#keys-that-are-accepted-but-do-less-than-their-name-says)). It is still validated every time the policy is resolved, so a bad value makes every command that resolves the unit's policy refuse it. |
 | `warehouse_copies` | integer | the archive set, then `[defaults]` |
 | `allow_spanning` | bool | the archive set, then `[defaults]`. From tapectl 1.7.0, `true` lets this unit span tapes (see [`[defaults] allow_spanning`](#defaults)), and `false` keeps it whole on one tape even when its archive set allows spanning. |
@@ -884,7 +886,7 @@ warning: unit 'family/letters' dotfile cannot be read, so every command that res
    |
 12 | min_copies = 3
    | ^^^^^^^^^^
-unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `slice_size`, `warehouse_copies`, `allow_spanning`, `copies_at`
+unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `compression_level`, `slice_size`, `warehouse_copies`, `allow_spanning`, `copies_at`
  (…/letters/.tapectl-unit.toml)
   hint: an unrecognised key under [policy] is refused by name; an ABSENT key is always fine and defers to the archive set or defaults
 ```
@@ -976,6 +978,7 @@ shows which layer can carry which field:
 | verify interval | — | `verify_interval_days` | `verify_interval_days` (365 when absent) |
 | slice size | `slice_size` | `slice_size` | `slice_size` |
 | compression | `compression` | `compression` | `compression` |
+| compression level | `compression_level` | `compression_level` | `compression_level` |
 | checksum mode (at registration) | `checksum_mode` | `checksum_mode` | `checksum_mode` |
 | warehouse deposits | `warehouse_copies` | `warehouse_copies` (CLI only) | `warehouse_copies` |
 | spanning tapes (from 1.7.0) | `allow_spanning` | `allow_spanning` | `allow_spanning` (off) |

@@ -14,11 +14,12 @@
 //! ## Why this fails rather than skips
 //!
 //! Skipping would be the obvious "honest skips" reading of #43, and it is
-//! the wrong one here. The tests that need dar are the staging-pipeline
+//! the wrong one here. The tests that need tar are the staging-pipeline
 //! regression guards — `stage_create_uses_archive_set_resolved_slice_size_
 //! not_global_default` (#48), `two_stage_sets_of_the_same_snapshot_do_not_
-//! collide_on_disk` (#53), `dotfile_exclude_patterns_reach_dars_
-//! constructed_arguments` (#49), the bitrot false-positive guards (#36).
+//! collide_on_disk` (#53), `dotfile_and_global_exclude_patterns_keep_files_
+//! out_of_the_stream` (#49), the bitrot false-positive guards (#36); dar's
+//! own (the restore path, until T4.8 and T4.15) need dar.
 //! Silently skipping them hands a contributor a green suite that verified
 //! none of the staging pipeline: precisely the silent-pass class this
 //! project keeps having to dig out. #43's title says *honest* skips,
@@ -40,21 +41,51 @@ const DAR: &str = "dar";
 /// Tests known to require a working `dar`. Kept as a list rather than a
 /// bare count so the failure message tells a contributor exactly what they
 /// lose, and so adding a dar-dependent test without noticing is harder.
-const DAR_DEPENDENT_TESTS: &[&str] = &[
+const DAR_DEPENDENT_TESTS: &[&str] =
+    &["dar::restore::tests::real_dar_collision_is_reported_as_a_failed_restore"];
+
+/// Tests known to require GNU tar at the writer's floor (`stage create`
+/// stages on tar since 2.0.0's T4.5; ADR-0012 items 253, 274).
+const TAR_DEPENDENT_TESTS: &[&str] = &[
     "staging::tests::a_unit_with_no_excludes_configured_behaves_exactly_as_before",
-    "staging::tests::dotfile_exclude_patterns_reach_dars_constructed_arguments",
+    "staging::tests::dotfile_and_global_exclude_patterns_keep_files_out_of_the_stream",
     "staging::tests::excluded_junk_file_content_drift_at_stable_size_does_not_false_positive_bitrot",
     "staging::tests::global_default_excluded_file_content_drift_at_stable_size_does_not_false_positive_bitrot",
     "staging::tests::stage_create_uses_archive_set_resolved_slice_size_not_global_default",
     "staging::tests::two_stage_sets_of_the_same_snapshot_do_not_collide_on_disk",
+    "staging::tar_stage_tests::the_cut_through_stage_create_holds_whole_members_and_a_run",
+    "staging::tar_stage_tests::a_unit_of_every_kind_stages_and_its_table_restores_each_file_by_range",
     "cli::stage::tests::create_without_version_behaves_exactly_as_before",
     "cli::stage::tests::create_with_version_refuses_when_a_stage_set_is_staged",
     "cli::stage::tests::create_with_version_succeeds_once_the_only_stage_set_is_cleaned",
     "cli::stage::tests::info_query_counts_sibling_stage_sets_after_a_restage",
-    "dar::restore::tests::real_dar_collision_is_reported_as_a_failed_restore",
     "cli_smoke::crashed_stage_is_detected_and_then_cleanable",
     "cli_smoke::live_stage_is_not_disturbed_by_a_concurrent_read_only_command",
 ];
+
+/// GNU tar on `PATH` meets the writer's floor, GNU tar 1.35 built with ACL
+/// support (ADR-0012 item 274): `stage create` refuses any other, so every
+/// staging test needs it. Probed as `stage create` probes it.
+#[test]
+fn gnu_tar_at_the_writers_floor_is_on_path_because_staging_runs_it() {
+    let scratch = tempfile::tempdir().unwrap();
+    let refusal = match tapectl::tar::probe("tar", scratch.path()) {
+        Ok(check) => check.refusal(),
+        Err(e) => Some(e.to_string()),
+    };
+    assert!(
+        refusal.is_none(),
+        "`tar` on PATH is not the writer's tar: {}\n\n\
+         {} tests stage a unit with the real tar and will fail with a confusing \
+         error instead of this message:\n  {}\n\n\
+         Install GNU tar 1.35 or later built with ACL support (Ubuntu 24.04's `tar` \
+         is; on Debian 10 build it from the upstream release into /usr/local, \
+         docs/research/2026-11-17-t02-gnu-tar-built-on-debian-10.md).",
+        refusal.unwrap_or_default(),
+        TAR_DEPENDENT_TESTS.len(),
+        TAR_DEPENDENT_TESTS.join("\n  "),
+    );
+}
 
 /// True when a usable `dar` is on `PATH`. Shared with `cli_smoke.rs`'s
 /// fail-fast check via duplication rather than a helper crate — integration
