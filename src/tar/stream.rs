@@ -1018,7 +1018,7 @@ where
             self.offset += n as u64;
         }
         let len = self.offset - start;
-        if len % BLOCK as u64 != 0 {
+        if !len.is_multiple_of(BLOCK as u64) {
             return Err(self.refuse(Rule::CutShort, None, "the tail ends inside a block"));
         }
         if let Some(missing) = self.list.next() {
