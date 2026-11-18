@@ -69,10 +69,6 @@ pub enum UnitCommands {
         dirty: bool,
     },
 
-    /// Removed in 1.9.0: `unit info` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Status(crate::cli::renamed::Removed),
-
     /// Copy a unit's staged slices, still encrypted, to a directory
     ///
     /// The slices of the unit's newest staged stage set, as they lie in the
@@ -390,8 +386,6 @@ pub fn run(
                 println!("{}", unit_table(&rows, crate::render::terminal_width()));
             }
         }
-
-        UnitCommands::Status(_) => return Err(crate::cli::renamed::refused(&["unit", "status"])),
 
         UnitCommands::Export { unit, to } => {
             crate::cli::operations::export_unit(conn, unit, to, json_output, dry_run)?;

@@ -34,9 +34,7 @@
 //!
 //! [`Config::load`]'s own error is always `problems[0]` when the config is
 //! invalid — it carries context this module's blunter "unknown key: x"
-//! breakdown does not (exact line/column, and the friendly stale-field
-//! remediation text from `stale_lto_fields_message` for a renamed/removed
-//! key). The remaining entries are the exhaustive breakdown this module
+//! breakdown does not (the file's name, and serde's line and column). The remaining entries are the exhaustive breakdown this module
 //! adds. The two can read like near-duplicates for a config with exactly
 //! one problem — that is intentional (see [`check`]'s doc), not a bug to
 //! dedupe away.
@@ -467,10 +465,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_renamed_key_still_gets_config_loads_friendly_remediation_as_the_first_line() {
-        // config::stale_lto_fields_message's whole point: a serde "unknown
-        // field" message alone would not say WHERE media_type/nominal_capacity
-        // went. That text must survive as problems[0].
+    fn an_old_renamed_key_is_an_unknown_key_and_config_loads_error_is_the_first_line() {
+        // ADR-0012 item 258(d): 1.x named where media_type/nominal_capacity
+        // went; 2.0 keeps no such list, so they are refused as unknown, and
+        // Config::load's own error is still problems[0].
         let content = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
                         device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
                         nominal_capacity = \"2.5TB\"\n";
@@ -478,10 +476,11 @@ mod tests {
         let report = check(content, &path);
         assert!(!report.valid);
         assert!(
-            report[0].contains("ADR-0010"),
-            "expected the friendly remediation as problems[0]: {:?}",
+            report[0].contains("unknown field") && report[0].contains("media_type"),
+            "expected Config::load's own error as problems[0]: {:?}",
             report.problems
         );
+        assert!(!report[0].contains("ADR-0010"), "{:?}", report.problems);
         assert_matches_config_load(content, &path);
     }
 

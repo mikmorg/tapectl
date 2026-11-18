@@ -278,9 +278,7 @@ fn run_check(
     // fails to strictly load — at which point `report.problems` already
     // names the same key via its own "unknown key: …" entries. This scan is
     // no longer reachable on a config that loads cleanly; kept for its
-    // `[defaults]`-specific remediation text (e.g. the issue #348 renames,
-    // "min_copies_for_tape_only was renamed to min_copies") which
-    // `report.problems`'s generic message does not carry.
+    // `[defaults]`-scoped wording.
     let unknown_key_hits = crate::policy::unknown_keys::scan(&toml_str);
 
     // Advisory scan (issue #50/#92 precedent): a `preserve_acls` that

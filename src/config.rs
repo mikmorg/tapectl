@@ -1498,15 +1498,6 @@ impl Config {
     /// [`Config::load_tolerating_backend_ambiguity`] and
     /// [`Config::from_text`] share.
     fn from_text_without_backend_check(content: &str, path: &Path) -> Result<Self> {
-        // ADR-0010 renamed `backends.lto[].media_type`/`.nominal_capacity` to
-        // `.generation`/`.capacity_override`, and `LtoBackendConfig` now
-        // rejects unknown fields — a stale config with either old key would
-        // otherwise fail with serde's generic "unknown field" message. Catch
-        // it here, before serde ever sees it, so the operator gets the exact
-        // remediation instead.
-        if let Some(msg) = stale_lto_fields_message(content) {
-            return Err(TapectlError::Config(format!("{}: {msg}", path.display())));
-        }
         // Issue #171 / ADR-0012: every section now carries
         // `#[serde(deny_unknown_fields)]`, so a typo anywhere in the file —
         // not just `[[backends.lto]]` — fails here by name, naming the FILE
@@ -2111,215 +2102,6 @@ fn config_file_named(config_file: Option<&Path>) -> String {
     )
 }
 
-/// If `content` (raw, unparsed config TOML) still carries a key with a
-/// known history — renamed, deleted outright, or merely confusable with a
-/// different real setting — return the exact remediation message for it,
-/// rather than serde's generic "unknown field" line.
-///
-/// Several cases feed this. ADR-0010 RENAMED `backends.lto[].media_type` /
-/// `.nominal_capacity`, so their message says where the fact went. Spec W4
-/// DELETED `backends.lto[].block_size`, `.hardware_compression` and
-/// `packing.min_free_for_append` outright because nothing ever read them;
-/// issue #172 deletes four more the same way — `packing.strategy`,
-/// `packing.fill_threshold`, `labels.format`, `defaults.hash` — which is
-/// also why the WHOLE `[packing]` and `[labels]` sections are gone rather
-/// than just those fields: with `min_free_for_append` already deleted,
-/// `strategy`/`fill_threshold` were `PackingConfig`'s only members, and
-/// `format` was `LabelsConfig`'s only member. Every "deleted outright"
-/// message says why there is nowhere for the value to go. Issue #348
-/// RENAMED `defaults.min_copies_for_tape_only` / `.min_locations_for_tape_only`
-/// to `defaults.min_copies` / `.min_locations`, so their message names the
-/// new keys. As of issue #171 / ADR-0012,
-/// EVERY section carries `#[serde(deny_unknown_fields)]`, so serde alone
-/// would already reject all of these — this pre-scan exists to say
-/// something more useful than "unknown field" for the keys whose history we
-/// actually know, not to catch what serde otherwise misses.
-///
-/// Parses `content` as generic `toml::Value` rather than scanning lines by
-/// hand, so comments and quoting are handled the way TOML actually defines
-/// them, not approximately. Returns `None` (letting the normal parse error
-/// surface unchanged) when `content` is not even syntactically valid TOML —
-/// this check only ever *sharpens* an error that was going to happen anyway,
-/// never introduces a new failure mode of its own.
-///
-/// The `[[backends.lto]]`, `[packing]`, `[labels]` and `[defaults]` scans
-/// are INDEPENDENT: a config missing any three of the four sections must
-/// still be told about a stale key in the fourth, so none may short-circuit
-/// the others.
-fn stale_lto_fields_message(content: &str) -> Option<String> {
-    let value: toml::Value = toml::from_str(content).ok()?;
-    if let Some(msg) = stale_backend_fields_message(&value) {
-        return Some(msg);
-    }
-    if let Some(msg) = stale_packing_fields_message(&value) {
-        return Some(msg);
-    }
-    if let Some(msg) = stale_labels_fields_message(&value) {
-        return Some(msg);
-    }
-    stale_defaults_fields_message(&value)
-}
-
-/// The `[[backends.lto]]` half of [`stale_lto_fields_message`].
-fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
-    let backends = value.get("backends")?.get("lto")?.as_array()?;
-    for entry in backends {
-        let table = entry.as_table()?;
-        let name = table.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        if table.contains_key("media_type") || table.contains_key("nominal_capacity") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"media_type\" and \"nominal_capacity\" moved — \
-                 declare the DRIVE's generation as generation = \"LTO-6\"; capacity now \
-                 follows the cartridge's generation (ADR-0010); capacity_override is for \
-                 virtual drives only"
-            ));
-        }
-        if table.contains_key("block_size") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"block_size\" was removed — the write path's block \
-                 size is a FORMAT CONSTANT (512 KiB, volume-format-v2.md §1/D7), not a drive \
-                 setting: the on-tape recovery text an heir reads has it baked in, so a \
-                 per-drive value could only ever disagree with the tape. Delete the line."
-            ));
-        }
-        if table.contains_key("hardware_compression") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"hardware_compression\" was removed — the write \
-                 path disables drive compression unconditionally on every open \
-                 (TapeStore::open -> MTCOMPRESSION 0), so the knob could never re-enable it \
-                 and a true value was silently ignored. Delete the line."
-            ));
-        }
-        // Issue #391 (ADR-0012, 2026-10-06 item 16): renamed, same meaning —
-        // the fraction of a cartridge's capacity a write may fill. Refused
-        // by name rather than silently reinterpreted, as #348's renames were.
-        if table.contains_key("usable_capacity_factor") {
-            return Some(format!(
-                "backends.lto[\"{name}\"]: \"usable_capacity_factor\" was renamed \
-                 \"fill_ceiling\", with the same meaning: the fraction of a cartridge's \
-                 capacity a write may fill (ADR-0012, 2026-10-06; the default is now 0.97). \
-                 Rename the line to keep your value, or delete it to take the default."
-            ));
-        }
-    }
-    None
-}
-
-/// The `[packing]` half of [`stale_lto_fields_message`].
-///
-/// The whole `[packing]` table is gone as of issue #172: `min_free_for_append`
-/// was already deleted (spec W4, ADR-0003 — append is rejected outright), and
-/// `strategy`/`fill_threshold` were `PackingConfig`'s only other fields, with
-/// no reader anywhere (`grep -rn 'packing\.' src/ --include=*.rs` outside this
-/// file returns nothing) — the real batch selector is alphabetical next-fit
-/// (`src/collection/`), never a configurable best-fit-decreasing strategy,
-/// and no code ever consulted a fill threshold.
-fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
-    let packing = value.get("packing")?.as_table()?;
-    if packing.contains_key("min_free_for_append") {
-        return Some(
-            "packing.min_free_for_append was removed — append is rejected outright \
-             (ADR-0003), so there has never been an append path for this to gate. \
-             Delete the line."
-                .to_string(),
-        );
-    }
-    if packing.contains_key("strategy") || packing.contains_key("fill_threshold") {
-        return Some(
-            "the [packing] section was removed (ADR-0012) — `strategy` and \
-             `fill_threshold` were parsed but never read: the real batch selector is \
-             alphabetical next-fit (src/collection/), not a configurable best-fit \
-             strategy, and no code ever consulted a fill threshold. Delete the \
-             [packing] table."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// The `[labels]` half of [`stale_lto_fields_message`] (issue #172):
-/// `format` was `LabelsConfig`'s only field and had no reader — volume
-/// labels are always operator-supplied (`--label`), never generated from a
-/// template, so the whole `[labels]` section is gone.
-fn stale_labels_fields_message(value: &toml::Value) -> Option<String> {
-    let labels = value.get("labels")?.as_table()?;
-    if labels.contains_key("format") {
-        return Some(
-            "the [labels] section was removed (ADR-0012) — `format` was \
-             parsed but never read: volume labels are always operator-supplied \
-             (`--label`), not generated from a template. Delete the [labels] table."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// The `[defaults]` half of [`stale_lto_fields_message`].
-///
-/// Issue #348 (CTO ruling 2026-09-28; no ADR records it — ADR-0012's
-/// 2026-09-28 amendment is the home2 move only):
-/// `min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
-/// `min_copies` / `min_locations`. The old names said "tape-only", but the
-/// copy requirement is the bottom layer of every unit's policy
-/// (`policy::resolve`), not a tape-only rule — the name misled operators.
-/// Same meaning, same values: a stale config is refused with the rename to
-/// make, never silently reinterpreted. This inverts issue #129's refusal,
-/// which turned `defaults.min_copies` away because it was then NOT the real
-/// knob; it now is.
-///
-/// Both old names get the one message, naming both new keys, because a
-/// config written by an older `init` carries both.
-///
-/// `hash` is issue #172's fourth deletion: every checksum path is sha256,
-/// hardcoded (`sha2` crate, `checksum_mode` governs WHEN it runs, never
-/// which algorithm), so the field had no reader to disagree with a
-/// non-default value in the first place.
-fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
-    let defaults = value.get("defaults")?.as_table()?;
-    let renamed: Vec<&str> = RENAMED_DEFAULTS_KEYS
-        .iter()
-        .filter(|(old, _)| defaults.contains_key(*old))
-        .map(|(old, _)| *old)
-        .collect();
-    if !renamed.is_empty() {
-        return Some(format!(
-            "defaults.{} renamed: the keys are now defaults.min_copies and \
-             defaults.min_locations, with the same meaning — the copy requirement every \
-             unit starts from (an [[archive_sets]] entry's min_copies overrides it) and \
-             the number of distinct locations a tape-only unit's copies must span. Rename \
-             {}; the values carry over unchanged.",
-            match renamed.as_slice() {
-                [one] => format!("{one} was"),
-                _ => format!("{} were", renamed.join(" and defaults.")),
-            },
-            if renamed.len() == 1 {
-                "the line"
-            } else {
-                "the lines"
-            },
-        ));
-    }
-    if defaults.contains_key("hash") {
-        return Some(
-            "defaults.hash was removed (ADR-0012) — nothing ever read it: \
-             every checksum tapectl computes is sha256, hardcoded; `defaults.checksum_mode` \
-             is the real knob (it governs WHEN a checksum is taken, not which algorithm). \
-             Delete the line."
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// `[defaults]` keys renamed by issue #348, old name first. Shared by the
-/// load-time refusal ([`stale_defaults_fields_message`]) and `config
-/// check`'s `[defaults]` scan (`policy::unknown_keys`), so the two cannot
-/// disagree about what the new names are.
-pub const RENAMED_DEFAULTS_KEYS: &[(&str, &str)] = &[
-    ("min_copies_for_tape_only", "min_copies"),
-    ("min_locations_for_tape_only", "min_locations"),
-];
-
 /// Membership check shared by every ADR-0012 boundary validator (issue
 /// #171): compression, checksum mode, and each `--status` filter across the
 /// CLI (`cli::cartridge`, `cli::unit`, `cli::stage`, `cli::snapshot`,
@@ -2727,10 +2509,6 @@ pub struct TapectlPaths {
     pub logs_dir: PathBuf,
 }
 
-/// The directory stage reports lived in before issue #361, moved to
-/// [`TapectlPaths::stage_reports_dir`] once by [`TapectlPaths::ensure_dirs`].
-const LEGACY_STAGE_REPORTS_DIR: &str = "receipts";
-
 impl TapectlPaths {
     pub fn new(home: PathBuf) -> Self {
         Self {
@@ -2786,10 +2564,6 @@ impl TapectlPaths {
     /// not give the group stays 0700 — fail closed, never open to the group
     /// it happened to have.
     pub fn ensure_dirs_shared(&self, ops_group: Option<&str>) -> Result<()> {
-        // Before the create loop, or it would create an empty
-        // stage-reports/ first and the "both exist" rule below would then
-        // block the move for good.
-        self.move_legacy_stage_reports_dir();
         let gid = ops_group.and_then(|name| {
             let found = nix::unistd::Group::from_name(name).ok().flatten();
             if found.is_none() {
@@ -2876,33 +2650,6 @@ impl TapectlPaths {
             if mode & 0o077 != 0 {
                 secure_path(&path, mode & 0o7700);
             }
-        }
-    }
-
-    /// Issue #361: a home created before the rename keeps its stage
-    /// reports in `<home>/receipts/`. Move that directory to
-    /// `stage_reports_dir` once — only when the new one does not exist yet.
-    /// When both exist, both are left exactly as they are (nothing is
-    /// merged) and new reports go to `stage-reports/`.
-    ///
-    /// Never fails the caller, like the rest of `ensure_dirs`: a rename
-    /// that cannot happen (permissions, a read-only home) is a warning, and
-    /// the create loop then makes an empty `stage-reports/` beside the old
-    /// directory — the same "both exist" state an operator can resolve by
-    /// hand.
-    fn move_legacy_stage_reports_dir(&self) {
-        let legacy = self.home.join(LEGACY_STAGE_REPORTS_DIR);
-        if !legacy.is_dir() || self.stage_reports_dir.exists() {
-            return;
-        }
-        if let Err(e) = std::fs::rename(&legacy, &self.stage_reports_dir) {
-            tracing::warn!(
-                from = %legacy.display(),
-                to = %self.stage_reports_dir.display(),
-                error = %e,
-                "could not move the stage-report directory to its new name; \
-                 new stage reports go to the new directory, the old ones stay where they are"
-            );
         }
     }
 
@@ -3146,12 +2893,12 @@ mod tests {
         );
     }
 
-    // --- receipts/ -> stage-reports/ (issue #361) ---------------------------
+    // --- stage-reports/ (issue #361) ----------------------------------------
     //
     // "Receipt" means the recipient list a stage set was encrypted to
     // (CONTEXT.md); the per-stage-set text files are stage reports, in
-    // <home>/stage-reports/. An existing home's <home>/receipts/ is moved
-    // there once, by `ensure_dirs` (every initialized command runs it).
+    // <home>/stage-reports/. A 1.x home's receipts/ is not moved (ADR-0012
+    // item 258(d)).
 
     #[test]
     fn ensure_dirs_creates_stage_reports_not_receipts() {
@@ -3160,52 +2907,6 @@ mod tests {
         TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
         assert!(home.join("stage-reports").is_dir());
         assert!(!home.join("receipts").exists());
-    }
-
-    #[test]
-    fn ensure_dirs_moves_a_legacy_receipts_dir_to_stage_reports_once() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join(".tapectl");
-        let legacy = home.join("receipts");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("20260901_7.txt"), b"old report").unwrap();
-
-        let paths = TapectlPaths::new(home.clone());
-        paths.ensure_dirs().unwrap();
-
-        let moved = home.join("stage-reports").join("20260901_7.txt");
-        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
-        assert!(
-            !legacy.exists(),
-            "the legacy directory was moved, not copied"
-        );
-        assert_eq!(mode_of(&home.join("stage-reports")), 0o700);
-
-        // Idempotent: a second run finds nothing to move and changes nothing.
-        paths.ensure_dirs().unwrap();
-        assert_eq!(std::fs::read(&moved).unwrap(), b"old report");
-        assert!(!legacy.exists());
-    }
-
-    #[test]
-    fn ensure_dirs_leaves_both_when_stage_reports_already_exists() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join(".tapectl");
-        let legacy = home.join("receipts");
-        let current = home.join("stage-reports");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(legacy.join("old.txt"), b"old").unwrap();
-        std::fs::write(current.join("new.txt"), b"new").unwrap();
-
-        TapectlPaths::new(home.clone()).ensure_dirs().unwrap();
-
-        assert_eq!(std::fs::read(legacy.join("old.txt")).unwrap(), b"old");
-        assert_eq!(std::fs::read(current.join("new.txt")).unwrap(), b"new");
-        assert!(
-            !current.join("old.txt").exists(),
-            "nothing is merged when both exist"
-        );
     }
 
     #[test]
@@ -3349,189 +3050,85 @@ mod tests {
         assert_ne!(dir, "/mnt/staging");
     }
 
-    // ---- ADR-0010: stale-field pre-scan ----
-
-    #[test]
-    fn stale_media_type_is_named_with_the_exact_remediation() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
-                     nominal_capacity = \"2.5TB\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("backends.lto[\"lto1\"]"), "{msg}");
-        assert!(
-            msg.contains("media_type") && msg.contains("nominal_capacity"),
-            "{msg}"
-        );
-        assert!(msg.contains("ADR-0010"), "{msg}");
-    }
-
-    #[test]
-    fn stale_nominal_capacity_alone_is_also_flagged() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     nominal_capacity = \"2.5TB\"\n";
-        assert!(stale_lto_fields_message(text).is_some());
-    }
-
-    #[test]
-    fn a_clean_generation_only_backend_is_not_flagged() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n";
-        assert!(stale_lto_fields_message(text).is_none());
-    }
-
-    // ---- Spec W4: removed keys are named, with the reason ----
-
-    #[test]
-    fn a_removed_block_size_is_named_with_the_format_constant_reason() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     block_size = \"512K\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("block_size"), "{msg}");
-        assert!(msg.contains("FORMAT CONSTANT"), "{msg}");
-        assert!(msg.contains("volume-format-v2.md"), "{msg}");
-    }
-
-    #[test]
-    fn a_removed_hardware_compression_is_named_with_the_always_off_reason() {
-        let text = "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-                     device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-                     hardware_compression = false\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("hardware_compression"), "{msg}");
-        assert!(msg.contains("MTCOMPRESSION"), "{msg}");
-    }
-
-    /// `PackingConfig` now carries `#[serde(deny_unknown_fields)]` too
-    /// (issue #171), so serde alone would already reject a stale
-    /// `min_free_for_append` — this pre-scan exists to give the ADR-0003
-    /// reason instead of serde's generic "unknown field" line.
-    #[test]
-    fn a_removed_min_free_for_append_is_named_with_adr_0003() {
-        let text = "[packing]\nmin_free_for_append = \"50G\"\n";
-        let msg = stale_lto_fields_message(text).expect("must be flagged");
-        assert!(msg.contains("min_free_for_append"), "{msg}");
-        assert!(msg.contains("ADR-0003"), "{msg}");
-    }
-
-    /// The scans must not short-circuit each other: a config with a
-    /// stale `[packing]` key and no `[[backends.lto]]` at all is the exact
-    /// shape a naive single-expression scan would miss.
-    #[test]
-    fn a_stale_packing_key_is_found_with_no_backends_configured() {
-        let text = "[packing]\nstrategy = \"best_fit_decreasing\"\n\
-                     min_free_for_append = \"50G\"\n";
-        assert!(stale_lto_fields_message(text).is_some());
-    }
-
-    #[test]
-    fn config_load_rejects_a_removed_key_with_the_friendly_message() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-             device_sg = \"/dev/sg0\"\ngeneration = \"LTO-6\"\n\
-             block_size = \"512K\"\nhardware_compression = false\n",
-        )
-        .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("block_size"), "{msg}");
-        assert!(msg.contains("was removed"), "{msg}");
-    }
-
-    /// Issue #172 item 4's pin, and ADR-0012's ratified acceptance
-    /// criterion verbatim: "a config carrying `packing.fill_threshold`
-    /// fails to load naming the key". This is INTENTIONAL, not a
-    /// regression to soften later — #171's ruling on `deny_unknown_fields`
-    /// is explicit that a key which silently reads as its default is the
-    /// failure that never gets noticed. Before #172 this exact fixture
-    /// (`[packing] strategy = ...` / `fill_threshold = ...`) was the
-    /// positive control proving `[packing]` still had LIVE, non-stale keys
-    /// — it flips here because #172 establishes that it never did.
-    #[test]
-    fn a_config_carrying_packing_fill_threshold_fails_to_load_naming_the_key() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n",
-        )
-        .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("fill_threshold"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
-
-    #[test]
-    fn a_config_carrying_labels_format_fails_to_load_naming_the_key() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[labels]\nformat = \"L{gen}-{seq:04}\"\n").unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("format"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
-
-    /// Issue #348 (CTO ruling 2026-09-28): `[defaults]
-    /// min_copies_for_tape_only` / `min_locations_for_tape_only` were renamed
-    /// `min_copies` / `min_locations` — same meaning, the bottom policy layer
-    /// for every unit. A config still carrying either old name is refused
-    /// with a message naming the new ones, one key at a time or both at once.
-    #[test]
-    fn a_config_carrying_the_old_tape_only_names_is_refused_naming_the_new_keys() {
-        for body in [
-            "[defaults]\nmin_copies_for_tape_only = 3\n",
-            "[defaults]\nmin_locations_for_tape_only = 1\n",
-            "[defaults]\nmin_copies_for_tape_only = 3\nmin_locations_for_tape_only = 1\n",
-        ] {
-            let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("config.toml");
-            std::fs::write(&path, body).unwrap();
-            let msg = Config::load(&path).unwrap_err().to_string();
-            assert!(msg.contains("renamed"), "{body:?} -> {msg}");
-            assert!(
-                msg.contains("defaults.min_copies ") || msg.contains("defaults.min_copies,"),
-                "must name the new copy key: {body:?} -> {msg}"
-            );
-            assert!(
-                msg.contains("defaults.min_locations"),
-                "must name the new location key: {body:?} -> {msg}"
-            );
-            // #468: only the copy requirement starts every unit; the place
-            // floor binds a tape-only unit alone.
-            assert!(
-                msg.contains("distinct locations a tape-only unit's copies must span"),
-                "must say whom min_locations binds: {body:?} -> {msg}"
-            );
-            assert!(
-                !msg.contains("copy and location requirement every unit starts from"),
-                "min_locations is not every unit's requirement: {body:?} -> {msg}"
-            );
-        }
-    }
-
     // ---- issue #391: the fill ceiling ----
 
     const LTO_BLOCK: &str = "[[backends.lto]]\nname = \"d\"\ndevice_tape = \"/dev/null\"\n\
                              device_sg = \"/dev/null\"\ngeneration = \"LTO-6\"\n";
 
-    /// `usable_capacity_factor` was renamed `fill_ceiling` (ADR-0012,
-    /// 2026-10-06 item 16): a config still carrying it is refused by name,
-    /// with the new key, never silently read as the old 0.92 or dropped.
-    #[test]
-    fn a_config_carrying_usable_capacity_factor_is_refused_naming_fill_ceiling() {
+    // ---- ADR-0012 item 258(d): an old key is an unknown key ----
+    //
+    // 1.x refused these by name, with a remediation; 2.0 keeps no list of
+    // them. Each is refused by the same `deny_unknown_fields` as a typo, and
+    // none may ever load.
+
+    /// `Config::load` of `body`, which must fail as an unknown field naming
+    /// `key`.
+    fn assert_refused_as_unknown(body: &str, key: &str) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, format!("{LTO_BLOCK}usable_capacity_factor = 0.92\n")).unwrap();
-        let msg = Config::load(&path).unwrap_err().to_string();
-        assert!(msg.contains("usable_capacity_factor"), "{msg}");
-        assert!(msg.contains("renamed"), "{msg}");
-        assert!(msg.contains("fill_ceiling"), "{msg}");
+        std::fs::write(&path, body).unwrap();
+        let msg = Config::load(&path)
+            .expect_err(&format!("{body:?} must not load"))
+            .to_string();
+        assert!(msg.contains("unknown field"), "{body:?} -> {msg}");
+        assert!(msg.contains(key), "{body:?} -> {msg}");
+        assert!(
+            !msg.contains("renamed") && !msg.contains("was removed"),
+            "{msg}"
+        );
+    }
+
+    /// `[[backends.lto]]`: ADR-0010's `media_type`/`nominal_capacity`, spec
+    /// W4's `block_size`/`hardware_compression`, #391's
+    /// `usable_capacity_factor`.
+    #[test]
+    fn the_old_backend_keys_are_refused_as_unknown() {
+        for key in [
+            "media_type = \"LTO-6\"",
+            "nominal_capacity = \"2.5TB\"",
+            "block_size = \"512K\"",
+            "hardware_compression = false",
+            "usable_capacity_factor = 0.92",
+        ] {
+            let name = key.split(' ').next().unwrap();
+            assert_refused_as_unknown(&format!("{LTO_BLOCK}{key}\n"), name);
+        }
+    }
+
+    /// `[packing]` is gone (#172): `min_free_for_append`, `strategy` and
+    /// `fill_threshold` were its only members.
+    #[test]
+    fn the_packing_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[packing]\nmin_free_for_append = \"50G\"\n", "packing");
+        assert_refused_as_unknown(
+            "[packing]\nstrategy = \"best_fit_decreasing\"\nfill_threshold = 0.95\n",
+            "packing",
+        );
+    }
+
+    /// `[labels]` is gone (#172): `format` was its only member.
+    #[test]
+    fn the_labels_table_is_refused_as_unknown() {
+        assert_refused_as_unknown("[labels]\nformat = \"L{gen}-{seq:04}\"\n", "labels");
+    }
+
+    /// `[defaults]`: #348's `min_copies_for_tape_only` and
+    /// `min_locations_for_tape_only`, #172's `hash`.
+    #[test]
+    fn the_old_defaults_keys_are_refused_as_unknown() {
+        for (body, key) in [
+            (
+                "[defaults]\nmin_copies_for_tape_only = 3\n",
+                "min_copies_for_tape_only",
+            ),
+            (
+                "[defaults]\nmin_locations_for_tape_only = 1\n",
+                "min_locations_for_tape_only",
+            ),
+            ("[defaults]\nhash = \"sha256\"\n", "hash"),
+        ] {
+            assert_refused_as_unknown(body, key);
+        }
     }
 
     /// The default is the ruled 97%, and an explicit value loads and is the
@@ -3940,7 +3537,7 @@ mod tests {
         );
     }
 
-    /// The positive control for the refusal above: the new names load, and
+    /// The positive control for the refusals above: the new names load, and
     /// the values reach the fields every policy reader uses.
     #[test]
     fn a_config_with_the_new_min_copies_and_min_locations_names_loads() {
@@ -3955,41 +3552,6 @@ mod tests {
         assert!(serialized.contains("min_copies = 2"), "{serialized}");
         assert!(serialized.contains("min_locations = 2"), "{serialized}");
         assert!(!serialized.contains("_for_tape_only"), "{serialized}");
-    }
-
-    #[test]
-    fn a_config_carrying_defaults_hash_fails_to_load_naming_the_key() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[defaults]\nhash = \"sha256\"\n").unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("defaults.hash"), "{msg}");
-        assert!(msg.contains("removed"), "{msg}");
-    }
-
-    #[test]
-    fn syntactically_invalid_toml_is_not_flagged_here() {
-        // Not this function's job — the normal toml::from_str error surfaces
-        // unchanged for a genuinely broken file.
-        assert!(stale_lto_fields_message("this is not [ toml").is_none());
-    }
-
-    #[test]
-    fn config_load_rejects_a_stale_backend_with_the_friendly_message() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[[backends.lto]]\nname = \"lto1\"\ndevice_tape = \"/dev/nst0\"\n\
-             device_sg = \"/dev/sg0\"\nmedia_type = \"LTO-6\"\n\
-             nominal_capacity = \"2.5TB\"\n",
-        )
-        .unwrap();
-        let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("moved"), "{msg}");
-        assert!(msg.contains("ADR-0010"), "{msg}");
     }
 
     #[test]

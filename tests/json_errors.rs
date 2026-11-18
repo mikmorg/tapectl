@@ -1,8 +1,9 @@
 //! ADR-0012 item 212 (OQ7): under `--json` every error is one JSON document
 //! on stdout, `{"error": …, "exit_code": N}`, with the exit code the command
 //! would have exited with anyway: clap's own usage errors (read from the
-//! command line before clap parses it), a removed spelling's refusal (before
-//! clap too), and an error the command itself returned. Without `--json`,
+//! command line before clap parses it; a spelling 1.x removed is one of
+//! them, since 2.0 keeps no stub of it), and an error the command itself
+//! returned. Without `--json`,
 //! nothing changes: `error: …` on stderr and nothing on stdout.
 
 use std::process::{Command, Output};
@@ -73,23 +74,39 @@ fn a_usage_error_under_json_is_a_json_error_with_clap_s_code() {
     json_error(&out);
 }
 
+/// ADR-0012 item 258(d): a spelling 1.9.0 removed is an ordinary clap error
+/// now: exit 2 with clap's own message, as text and as the JSON error, and
+/// nothing is made.
 #[test]
-fn a_removed_spelling_under_json_is_a_json_error() {
+fn a_removed_spelling_is_clap_s_own_usage_error() {
     let home = TempDir::new().unwrap();
-    for args in [
-        &["--json", "staging", "clean"][..],
-        &["db", "backup", "--to", "/x/t.db", "--json"],
+    for (args, says) in [
+        (&["backend", "add"][..], "unrecognized subcommand 'backend'"),
+        (
+            &["staging", "clean"][..],
+            "unrecognized subcommand 'staging'",
+        ),
+        (
+            &["db", "backup", "--to", "/x/t.db"][..],
+            "unexpected argument '--to'",
+        ),
     ] {
         let out = tapectl(home.path(), args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+        assert!(!stderr.contains("renamed"), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+
+        let mut json_args = vec!["--json"];
+        json_args.extend_from_slice(args);
+        let out = tapectl(home.path(), &json_args);
+        assert_eq!(out.status.code(), Some(2), "{json_args:?}");
         let error = json_error(&out);
-        assert!(
-            error.contains("was renamed in 1.9.0: use `tapectl "),
-            "{error}"
-        );
+        assert!(error.contains(says), "{json_args:?}: {error}");
     }
     assert!(
-        !home.path().join("tapectl.db").exists(),
+        std::fs::read_dir(home.path()).unwrap().next().is_none(),
         "the refusal made nothing"
     );
 }

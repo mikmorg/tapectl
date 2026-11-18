@@ -9,19 +9,18 @@
 //! command line is read out of the text the generators make (File 1 and
 //! File 2 from `volume::layout`, which this test only calls, never edits;
 //! the cover sheet from `crypto::escrow_kit`), and each must parse against
-//! the real clap tree and resolve to a live command, never to a stub of a
-//! removed spelling. Each mention in running text (`` `tapectl volume
+//! the real clap tree. Each mention in running text (`` `tapectl volume
 //! identify` ``) must name a live command too.
 
 use std::process::Command;
 
 use clap::{CommandFactory, Parser};
-use tapectl::cli::{renamed, Cli};
+use tapectl::cli::Cli;
 use tempfile::TempDir;
 
 /// The `tapectl …` command lines of `text`: a line (after joining a
 /// trailing `\` continuation) that is `tapectl` and a top-level command,
-/// hidden ones included, so a removed spelling is caught and not skipped.
+/// so a line naming a removed spelling is caught by `check_line`.
 fn command_lines(text: &str) -> Vec<String> {
     let top: Vec<String> = Cli::command()
         .get_subcommands()
@@ -65,25 +64,15 @@ fn inline_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `line` parses as a whole command line and is no stub of a removed
-/// spelling, or what is wrong with it.
+/// `line` parses as a whole command line, or what is wrong with it.
 fn check_line(line: &str) -> Option<String> {
     let argv: Vec<&str> = line.split_whitespace().collect();
-    let os: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
-    if let Some(r) = renamed::find(&os) {
-        return Some(format!(
-            "{line:?} types `tapectl {}`, removed in 1.9.0",
-            r.old()
-        ));
-    }
-    match Cli::try_parse_from(&argv) {
-        Err(e) => Some(format!("{line:?} does not parse: {e}")),
-        Ok(cli) => renamed::parsed(&cli.command)
-            .map(|r| format!("{line:?} resolves to the stub of `tapectl {}`", r.old())),
-    }
+    Cli::try_parse_from(&argv)
+        .err()
+        .map(|e| format!("{line:?} does not parse: {e}"))
 }
 
-/// The command words of `mention` name a live (not hidden) command.
+/// The command words of `mention` name a live command.
 fn check_mention(mention: &str) -> Option<String> {
     let cli = Cli::command();
     let mut node = &cli;
@@ -138,6 +127,80 @@ fn cover_sheet() -> String {
 
 fn assert_all_live(what: &str, text: &str) -> (Vec<String>, Vec<String>) {
     let lines = command_lines(text);
+    let mentions = inline_mentions(text);
+    let failures: Vec<String> = lines
+        .iter()
+        .filter_map(|l| check_line(l))
+        .chain(mentions.iter().filter_map(|m| check_mention(m)))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{what} names a command that does not run:\n{}",
+        failures.join("\n")
+    );
+    (lines, mentions)
+}
+
+#[test]
+fn file_1s_three_commands_parse_and_are_live() {
+    let (lines, _) = assert_all_live("File 1", &file_1());
+    // The positive control: the extraction found the three commands that
+    // work for good, word for word.
+    for frozen in [
+        "tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC",
+        "tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key",
+        "tapectl restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key",
+    ] {
+        assert!(lines.iter().any(|l| l == frozen), "{frozen:?} not in {lines:#?}");
+    }
+}
+
+#[test]
+fn file_2s_commands_parse_and_are_live() {
+    assert_all_live("File 2 (RESTORE.sh)", &file_2());
+}
+
+#[test]
+fn the_heir_kits_cover_sheet_commands_parse_and_are_live() {
+    let (lines, _) = assert_all_live("the Heir Kit's cover sheet", &cover_sheet());
+    for named in [
+        "tapectl catalog rebuild --from-volume --device /dev/nst0 --key escrow.key",
+        "tapectl restore volume --device /dev/nst0 --to ./out --key escrow.key",
+        "tapectl restore raw-volume --device /dev/nst0 --to ./out",
+        "tapectl volume identify --device /dev/nst0",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == named),
+            "{named:?} not in {lines:#?}"
+        );
+    }
+}
+
+/// The checks catch what they are for: a removed nested spelling and a
+/// misspelt command, in a line and in running text. (A removed top-level
+/// word, `staging` or `backend`, is no top-level command any more, so
+/// `command_lines` does not take it for a command line at all.)
+#[test]
+fn the_checks_catch_a_removed_spelling() {
+    let text = "    tapectl unit status UNIT\n    tapectl catalog ls \\\n        \
+                --unit U\n    tapectl stage clean --force\n\
+                see `tapectl report summary` and `tapectl status`";
+    let lines = command_lines(text);
+    assert_eq!(
+        lines,
+        vec![
+            "tapectl unit status UNIT",
+            "tapectl catalog ls --unit U",
+            "tapectl stage clean --force",
+        ]
+    );
+    assert!(check_line(&lines[0]).is_some());
+    assert!(check_line(&lines[1]).is_some());
+    assert!(
+        check_line(&lines[2]).is_none(),
+        "{:?}",
+        check_line(&lines[2])
+    );
     let mentions = inline_mentions(text);
     let failures: Vec<String> = lines
         .iter()

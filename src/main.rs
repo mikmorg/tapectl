@@ -39,13 +39,6 @@ fn main() {
     // document on stdout, those raised before clap has parsed the line
     // included, so whether it was asked for is read from the line first.
     let json = cli::json_requested(&args);
-    // ADR-0012 item 203: a spelling 1.9.0 removed is refused by name,
-    // however it is typed (`--help` and `help <old>` included), before clap
-    // parses the line and before any home is resolved, so the refusal reads
-    // nothing and creates nothing.
-    if let Some(renamed) = cli::renamed::find(&args) {
-        error::exit_reporting(&renamed.message(), error::EXIT_ERROR, json);
-    }
     // The grouped top-level help (ADR-0012 item 211) is `cli::command()`'s.
     let cli = match cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -296,16 +289,8 @@ fn run(
     // is now a refusal, and `tapectl completions bash` in the very cron,
     // systemd or container shell that lacks one must keep working — it
     // reads nothing and writes nothing but the script.
-    // ADR-0012 item 203: the second line behind `main`'s scan of the raw
-    // command line. A removed command's hidden stub that clap matched is
-    // refused with the same words, still before any home is resolved.
-    if let Some(renamed) = cli::renamed::parsed(&cli.command) {
-        return Err(renamed.refusal().into());
-    }
-
     if let Commands::Completions { shell } = cli.command {
-        // Without the hidden stubs of removed spellings (ADR-0012 item 203).
-        let mut cmd = cli::completion_command();
+        let mut cmd = <cli::Cli as clap::CommandFactory>::command();
         // ADR-0012 item 220: `clap_complete` `expect`s its own writes, so
         // given stdout itself `completions zsh | head -3` panicked (exit 101)
         // once `head` had gone. Generated into memory, written once through
@@ -736,11 +721,7 @@ fn run(
         | Commands::Completions { .. }
         | Commands::Host { .. }
         | Commands::Drive { .. }
-        | Commands::Status { .. }
-        | Commands::Staging { .. }
-        | Commands::Backend { .. }
-        | Commands::Export(_)
-        | Commands::Import(_) => {
+        | Commands::Status { .. } => {
             unreachable!()
         }
     }

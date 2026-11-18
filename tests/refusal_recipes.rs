@@ -63,10 +63,6 @@ use std::path::Path;
 struct Node {
     flags: HashSet<String>,
     subcommands: HashSet<String>,
-    /// A hidden command, or one under a hidden group: a stub of a spelling
-    /// 1.9.0 removed (ADR-0012 item 203), which only refuses. A mention
-    /// that resolves to one names a command that does not run.
-    hidden: bool,
 }
 
 /// Build a `path words -> Node` index of the whole clap tree, `path`
@@ -88,24 +84,21 @@ fn index_tree() -> HashMap<Vec<String>, Node> {
                 .get_subcommands()
                 .map(|c| c.get_name().to_string())
                 .collect(),
-            hidden: false,
         },
     );
-    walk(&root, Vec::new(), false, &global_flags, &mut out);
+    walk(&root, Vec::new(), &global_flags, &mut out);
     out
 }
 
 fn walk(
     cmd: &clap::Command,
     path: Vec<String>,
-    hidden: bool,
     global_flags: &HashSet<String>,
     out: &mut HashMap<Vec<String>, Node>,
 ) {
     for sub in cmd.get_subcommands() {
         let mut p = path.clone();
         p.push(sub.get_name().to_string());
-        let hidden = hidden || sub.is_hide_set();
 
         let mut flags = global_flags.clone();
         flags.extend(
@@ -117,15 +110,8 @@ fn walk(
             .map(|c| c.get_name().to_string())
             .collect();
 
-        out.insert(
-            p.clone(),
-            Node {
-                flags,
-                subcommands,
-                hidden,
-            },
-        );
-        walk(sub, p, hidden, global_flags, out);
+        out.insert(p.clone(), Node { flags, subcommands });
+        walk(sub, p, global_flags, out);
     }
 }
 
@@ -300,12 +286,6 @@ fn find_mentions(text: &str, index: &HashMap<Vec<String>, Node>) -> Vec<Mention>
             i += 1;
             continue; // not a real command mention ("tapectl sweeps...", etc.)
         }
-        if problem.is_none() && index.get(&path).is_some_and(|n| n.hidden) {
-            problem = Some(format!(
-                "`tapectl {}` is a spelling 1.9.0 removed: it only refuses, naming the new one",
-                path.join(" ")
-            ));
-        }
         if problem.is_none() {
             if let Some(raw) = tokens.get(j) {
                 let flag_tok =
@@ -432,16 +412,18 @@ fn the_scan_flags_a_bogus_subcommand() {
     );
 }
 
-/// The 1.9.0 extension (ADR-0012 item 203): a mention of a removed
-/// spelling resolves to its hidden stub, which only refuses, so it fails.
+/// A mention of a spelling 1.9.0 removed names a subcommand its parent no
+/// longer has, so it fails: the removed spellings are gone, not stubbed
+/// (ADR-0012 item 258(d)). A removed top-level word is not a mention at all
+/// (the scan skips a word that is no command), so only the nested ones are
+/// shown here.
 #[test]
 fn the_scan_flags_a_removed_spelling() {
     let index = index_tree();
     for text in [
-        "run `tapectl staging clean --force` to release it",
-        "`tapectl backend add` first",
         "see `tapectl report summary`",
-        "`tapectl export --unit u --to d`",
+        "run `tapectl unit status u`",
+        "`tapectl catalog ls`",
     ] {
         let mentions = find_mentions(text, &index);
         assert_eq!(mentions.len(), 1, "{text}");

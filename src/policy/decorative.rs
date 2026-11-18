@@ -64,10 +64,10 @@
 //!   sha256, hardcoded; `checksum_mode` is the real knob, and it governs
 //!   WHEN a checksum runs, never which algorithm.
 //!
-//! A config file still carrying any of these is now REJECTED by name, with
-//! the reason, by `config::stale_lto_fields_message` — a sharper answer
-//! than an advisory note, and the reason deleting them is not a loss of
-//! operator-facing surface.
+//! A config file still carrying any of these is REJECTED as an unknown key
+//! (`deny_unknown_fields`; since 2.0 with no remediation text of its own,
+//! ADR-0012 item 258(d)) — a sharper answer than an advisory note, and the
+//! reason deleting them is not a loss of operator-facing surface.
 
 use rusqlite::Connection;
 

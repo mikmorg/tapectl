@@ -24,10 +24,6 @@ pub enum CatalogCommands {
         version: Option<i64>,
     },
 
-    /// Removed in 1.9.0: `catalog list` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Ls(crate::cli::renamed::Removed),
-
     /// Search for files by pattern, in each unit's newest version
     ///
     /// Exit status: 0 = shown; 2 = an error; 75 = the catalog was busy.
@@ -557,8 +553,6 @@ fn dispatch(
     dry_run: bool,
 ) -> Result<()> {
     match command {
-        CatalogCommands::Ls(_) => return Err(crate::cli::renamed::refused(&["catalog", "ls"])),
-
         CatalogCommands::List { unit, version } => {
             let unit_row = crate::db::queries::get_unit_by_name(conn, unit)?
                 .ok_or_else(|| TapectlError::UnitNotFound(unit.clone()))?;
@@ -1060,13 +1054,6 @@ fn dispatch(
                         report.sealed_at.as_deref().unwrap_or("?"),
                     );
                 }
-                if !report.had_catalog_db {
-                    println!(
-                        "  note: this tape carries no catalog.db (it was written by an older tapectl) — \
-                         the restore path is complete, but there is no per-file index and \
-                         each snapshot's original source path is unknown"
-                    );
-                }
                 for line in unreadable_envelope_lines(&report) {
                     println!("{line}");
                 }
@@ -1503,9 +1490,6 @@ fn index_lines(report: &RebuildReport) -> Vec<String> {
             "  note: this tape's cross-volume index could not be used ({why}); the rebuild \
              above is complete without it"
         )];
-    }
-    if !report.had_index {
-        return Vec::new();
     }
     if report.index_volumes_missing.is_empty() {
         return vec![
@@ -1990,15 +1974,6 @@ mod tests {
     #[test]
     fn the_rebuild_reports_the_volumes_the_index_names_as_a_to_do_list() {
         use crate::volume::rebuild::{IndexedUnit, IndexedVolume, RebuildReport};
-        let none = RebuildReport::default();
-        assert!(
-            super::index_lines(&none).is_empty(),
-            "no index: nothing to say"
-        );
-        let json = super::index_json(&none);
-        assert_eq!(json["present"], false);
-        assert_eq!(json["volumes_missing"], serde_json::json!([]));
-
         let known = RebuildReport {
             had_index: true,
             ..Default::default()

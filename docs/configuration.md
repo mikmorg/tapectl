@@ -66,10 +66,6 @@ default. It also appends two commented-out examples: a `[[backends.lto]]` block 
 stands. Every other command needs an initialised home. The two exceptions are
 `completions` and `host check`, which run without one. See [`init`](cli/init.md).
 
-A home made by an older version may still have a `receipts/` directory. The first
-command you run moves it to `stage-reports/`. If both directories exist, both are
-kept, and new stage reports go to `stage-reports/`.
-
 ## Rules for the whole file
 
 **Unknown keys are errors.** Every table rejects keys it does not declare. A typo
@@ -99,52 +95,6 @@ staging: '~/.tapectl/staging' exists and is writable
 [defaults].slize_size is not a recognised setting — the config will not load while it is present; check the spelling, or remove it.
 ...
 ```
-
-**Keys that older versions wrote and this one refuses.** When one of these is
-present, the load fails with a message that says where the setting went. Delete the
-line, or rename the key as the table shows.
-
-| Key | What happened | What to do |
-|---|---|---|
-| `backends.lto[].media_type` | Renamed. A drive declares only its own `generation`. The generation of the *cartridge* is detected at `volume init` ([ADR-0010](adr/0010-media-generation-is-a-cartridge-property.md)). | Replace it with `generation = "LTO-6"` (the drive's generation). |
-| `backends.lto[].nominal_capacity` | Renamed. Capacity follows the loaded cartridge's generation. | Delete it. Use `capacity_override` only for a virtual drive. For one unusual cartridge, use `cartridge register --capacity`. |
-| `backends.lto[].block_size` | Removed. The block size (512 KiB) is a constant of the tape format and is written into the recovery text on every tape. | Delete the line. |
-| `backends.lto[].hardware_compression` | Removed. The write path always turns drive compression off. | Delete the line. |
-| `[packing]` (`strategy`, `fill_threshold`, `min_free_for_append`) | Whole table removed. Batches are chosen alphabetically, next-fit in name order (`collection plan --policy-aware` packs first the units the audit finds short of copies or locations), and tapes are never appended to. | Delete the table. |
-| `[labels]` (`format`) | Whole table removed. Volume labels always come from `--label`. | Delete the table. |
-| `defaults.hash` | Removed. Every checksum tapectl takes is sha256. | Delete the line. `checksum_mode` is the real setting. |
-| `defaults.min_copies_for_tape_only` | Renamed `min_copies`. The meaning and the default (2) are unchanged: it is the copy requirement every unit starts from. | Rename the key and keep the value. |
-| `defaults.min_locations_for_tape_only` | Renamed `min_locations`. The meaning and the default (2) are unchanged. | Rename the key and keep the value. |
-
-The removed keys fail with a message that names them:
-
-```text
-config: INVALID
-  - configuration error: ~/.tapectl/config.toml: backends.lto["lto6"]: "media_type" and "nominal_capacity" moved — declare the DRIVE's generation as generation = "LTO-6"; capacity now follows the cartridge's generation (ADR-0010); capacity_override is for virtual drives only
-  - unknown key: backends.lto[0].media_type
-```
-
-Every `config.toml` written by `init` before the rename carries both old
-`[defaults]` names, so a home that predates it stops loading until you rename them.
-`config check` says what to do:
-
-```text
-config: INVALID
-  - configuration error: ~/.tapectl/config.toml: defaults.min_copies_for_tape_only and defaults.min_locations_for_tape_only were renamed: the keys are now defaults.min_copies and defaults.min_locations, with the same meaning — the copy requirement every unit starts from (an [[archive_sets]] entry's min_copies overrides it) and the number of distinct locations a tape-only unit's copies must span. Rename the lines; the values carry over unchanged.
-  - unknown key: defaults.min_copies_for_tape_only
-  - unknown key: defaults.min_locations_for_tape_only
-home: ~/.tapectl (this account's ~/.tapectl)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
-staging: '~/.tapectl/staging' exists and is writable
-[defaults].min_copies_for_tape_only was renamed to [defaults].min_copies — the config will not load while the old name is present. Rename the key; its meaning and value are unchanged.
-[defaults].min_locations_for_tape_only was renamed to [defaults].min_locations — the config will not load while the old name is present. Rename the key; its meaning and value are unchanged.
-...
-```
-
-Every other command refuses with the first problem only, the `configuration error:`
-line, and exits 2. For the service-user install, `scripts/first-run.sh` checks for the
-old names at step 0 and offers to rename them in place. It keeps a copy of the old
-file beside it.
 
 **Size units.** Two parsers are used, and they differ on purpose:
 
@@ -392,7 +342,7 @@ tapectl config check
 | `device_sg` | path | derived from `device_tape` | The SCSI generic node of the **same** drive. It is used to read the cartridge memory chip (serial, generation) and the drive's health log pages. When the line is absent, tapectl derives it from `device_tape` (the node the kernel binds to that tape node, read from sysfs) every time the config loads, so a `/dev/sgN` renumbering never matters (issue #431). Set it only to override; a write refuses a configured node that is provably a different drive from `device_tape`. Absent and not derivable (the drive is not attached, or `device_tape` is not a tape node) is refused by name where a drive is needed, and `config check` warns. `device_sg = ""` is refused. To go back to deriving: `tapectl config remove 'backends.lto[NAME].device_sg'`. |
 | `generation` | string | *required* | The generation the drive natively writes, such as `"LTO-6"` or `"LTO-8"`. `LTO-5`, `L5` and `lto5` are all accepted. `"LTO-7-M8"` is refused here: it is a cartridge format, and the drive that writes it declares `LTO-8`. |
 | `capacity_override` | size (**decimal**; `KiB`…`TiB` binary) | unset | **Virtual drives only** (mhvtl, test harnesses). It overrides the capacity for every cartridge this drive touches. A real drive gets its capacity from the loaded cartridge's detected generation, so leave this unset. `config check` warns whenever it is set. |
-| `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). It was called `usable_capacity_factor` (default `0.92`) until issue #391; a config that still uses that name is refused, naming the new key. Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
+| `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
 | `post_warning_bytes` | size (**decimal**; `KiB`…`TiB` binary) | unset | The room, measured by `scripts/lto-profile.sh`, from this drive's early warning to the hard end of the medium: the lower of the walk it makes to the hard end and the drive's own page 0x0c figure ("minimum native capacity from EW to EOP"). With it set on any drive, a slice plus the seal must fit in **half of the smallest such room** (ADR-0012 item 100): `config check` reports a `[defaults]` or archive-set `slice_size` that does not as an `error:` line and exits non-zero, `config set` refuses an edit that breaks it, and `stage create` refuses the slice size in force for the unit, naming the key, the drive and the numbers. Every other command still loads the file. Above zero. Absent means nothing is checked. See [`docs/lto-profiling.md`](lto-profiling.md). |
 | `enospc_buffer` | size (binary) | `"50M"` | Headroom kept free before end of tape. The pre-write capacity check reserves it, and `collection plan` and `collection run` subtract it from each tape's budget. |
 
@@ -1209,7 +1159,6 @@ How to read it:
 | `warning: archive set "…" has compression "…", which the local dar binary cannot perform …` | A stored archive set names a codec your dar build lacks, so staging its units will fail. Change the set with `archive-set edit`, or install a dar that has the codec. `[defaults]` and dotfile values get no such check (see [`[defaults] compression`](#defaults)). |
 | `note: … preserve_acls = …, which cannot take effect …` | `preserve_acls` disagrees with `preserve_xattrs` in `[defaults]` or an archive set. See [above](#keys-that-are-accepted-but-do-less-than-their-name-says). |
 | `note: ….dirty_on_metadata_change = true is parsed but not consumed …` | That key does nothing in this version. See [above](#keys-that-are-accepted-but-do-less-than-their-name-says). |
-| `[defaults].… was renamed to [defaults].… — the config will not load …` | An old key name. Rename it, as the line says ([refused keys](#rules-for-the-whole-file)). |
 | `[defaults].… is not a recognised setting …` | A misspelled or unknown `[defaults]` key. |
 | `host check (…)` | The quiet-host limits in force, and whether they came from a `[host_check]` table or the defaults. |
 | `ops: …` / `warning: ops: …` | Only with an [`[ops]`](#ops) table: the group that may read the session logs, and anything about the group, its membership or the home's modes that is not yet as it needs to be. |

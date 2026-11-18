@@ -62,7 +62,7 @@ tapectl cartridge list [OPTIONS]
 
 - `--status <STATUS>` — Filter by status (available, in_use, pending_erase, retired_permanent).
   
-    `offsite` was removed by ADR-0011 -- a cartridge's place is a location now; use --location.
+    A cartridge's place is a location (ADR-0011), not a status; use --location.
 - `--location <LOCATION>` — Filter by physical location name -- the sibling of `--status`
 
 ### tapectl cartridge info

@@ -8,9 +8,6 @@ use crate::error::Result;
 
 #[derive(Subcommand, Debug)]
 pub enum ReportCommands {
-    /// Removed in 1.9.0: `status` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Summary(crate::cli::renamed::Removed),
     /// Units below their copy floor, judged by copies only
     ///
     /// A unit is listed when it has fewer copies than its copy floor (the
@@ -66,9 +63,6 @@ pub enum ReportCommands {
         #[arg(long)]
         unit: Option<String>,
     },
-    /// Removed in 1.9.0: `stage list --owing` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Pending(crate::cli::renamed::Removed),
     /// Each volume's verifications, oldest evidence first
     ///
     /// Every verification session of every volume holding data, a volume
@@ -138,9 +132,6 @@ pub enum ReportCommands {
     /// Superseded snapshot versions that could be marked reclaimable
     #[command(after_long_help = EXIT_REPORT)]
     Reclaimable,
-    /// Removed in 1.9.0: `report reclaimable` (ADR-0012 item 209)
-    #[command(hide = true, disable_help_flag = true)]
-    Supersedable(crate::cli::renamed::Removed),
     /// Stage attempts that failed, and the hours each lost
     ///
     /// Every `stage create` that ended without staging its unit, from the
@@ -174,11 +165,6 @@ pub fn run(
     json_output: bool,
 ) -> Result<()> {
     match command {
-        ReportCommands::Summary(_) => Err(crate::cli::renamed::refused(&["report", "summary"])),
-        ReportCommands::Pending(_) => Err(crate::cli::renamed::refused(&["report", "pending"])),
-        ReportCommands::Supersedable(_) => {
-            Err(crate::cli::renamed::refused(&["report", "supersedable"]))
-        }
         ReportCommands::FireRisk => report_fire_risk(conn, config, json_output),
         ReportCommands::Needs { location, all } => {
             report_needs(conn, config, location.as_deref(), *all, json_output)
