@@ -596,6 +596,63 @@ mod tests {
         assert_eq!(pax_record(b"99 mtime=1\n", b"mtime"), None);
     }
 
+    /// A pax stream of one member, `./acl-probe`, after an extended header
+    /// holding `acl` as its text record when given.
+    fn stream_with(acl: Option<&str>, name: &str) -> Vec<u8> {
+        let mut b = ::tar::Builder::new(Vec::new());
+        if let Some(acl) = acl {
+            let body = format!("SCHILY.acl.access={acl}\n");
+            let mut n = body.len() + 3;
+            if format!("{n} {body}").len() != n {
+                n += 1;
+            }
+            let records = format!("{n} {body}");
+            let mut h = ::tar::Header::new_ustar();
+            h.set_entry_type(::tar::EntryType::XHeader);
+            h.set_path("./PaxHeaders/acl-probe").unwrap();
+            h.set_size(records.len() as u64);
+            h.set_cksum();
+            b.append(&h, records.as_bytes()).unwrap();
+        }
+        let mut h = ::tar::Header::new_ustar();
+        // Raw name bytes: the crate's `set_path` drops a leading `./`,
+        // which GNU tar's members keep.
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_size(6);
+        h.set_cksum();
+        b.append(&h, &b"probe\n"[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// The verdict from a stream: numbers Yes; a name or no record No; no
+    /// member for the probe file Unknown.
+    #[test]
+    fn judge_stream_reads_the_members_text_record() {
+        let clean = TarFinish::Clean {
+            stderr: Default::default(),
+        };
+        let numbers = "user::rw-\nuser:0:r--\ngroup::r--\ngroup:0:r--\nmask::r--\nother::---";
+        let names = "user::rw-\nuser:root:r--\ngroup::r--\ngroup:root:r--\nmask::r--\nother::---";
+        assert_eq!(
+            judge_stream(&stream_with(Some(numbers), "./acl-probe"), &clean),
+            AclSupport::Yes
+        );
+        let named = judge_stream(&stream_with(Some(names), "./acl-probe"), &clean);
+        assert!(
+            matches!(&named, AclSupport::No(w) if w.contains("user:root:r--")),
+            "{named:?}"
+        );
+        assert!(matches!(
+            judge_stream(&stream_with(None, "./acl-probe"), &clean),
+            AclSupport::No(_)
+        ));
+        assert!(matches!(
+            judge_stream(&stream_with(Some(numbers), "./other"), &clean),
+            AclSupport::Unknown(_)
+        ));
+        assert!(matches!(judge_stream(b"", &clean), AclSupport::Unknown(_)));
+    }
+
     /// Probe through a stand-in, retrying the ETXTBSY a sibling test
     /// thread's fork can cause.
     fn probe_retrying(binary: &Path, scratch: &Path) -> TarCheck {
