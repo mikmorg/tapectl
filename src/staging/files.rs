@@ -6,17 +6,20 @@
 //!
 //! - [`StagingDir::prepare`]'s writability probe, `.tapectl-stage-probe-<pid>`,
 //!   holding a fixed string and removed at once;
-//! - [`StagingDir::create_slice`], a `{base}.{N}.dar.age` whose bytes are
-//!   age ciphertext from its first byte: the plaintext slice is written into
-//!   an age stream in memory and only its ciphertext reaches the file.
+//! - [`StagingDir::create_slice`], a `{base}.{N}.tar.age` whose bytes are
+//!   age ciphertext from its first byte: the slice's cut of the tar stream
+//!   is written into an age stream in memory (packed first, in memory, when
+//!   the staging is compressed: `staging::pack`) and only its ciphertext
+//!   reaches the file.
 //!
-//! dar never writes under the staging directory either: it writes its
-//! archive to standard output (`dar::create::DarStream`), and its on-the-fly
-//! catalogue into the tapectl home. So plaintext on the staging device is
-//! not something this module avoids writing, it is something it has no way
-//! to write. The proof has three layers (ADR-0012, 2026-10-06 amendment
-//! item 4): this construction, pinned by the tests below (`stage_create`
-//! creates no file but through here, and dar's argv names no staging path);
+//! tar never writes under the staging directory either: it writes its
+//! stream to standard output (`tar::writer::spawn_archive`, `--file=-`),
+//! and its file list is in the tapectl home. So plaintext on the staging
+//! device is not something this module avoids writing, it is something it
+//! has no way to write. The proof has three layers (ADR-0012, 2026-10-06
+//! amendment item 4): this construction, pinned by the tests below
+//! (`stage_create` creates no file but through here, and tar's argv names
+//! its archive as standard output);
 //! an inotify audit of a real stage (`staging::plaintext_audit`); and a
 //! raw-image scan with a deleted canary (`scripts/plaintext-scan.sh`).
 //!
@@ -31,8 +34,8 @@
 //! | `clone-<label>-<unit uuid>/slice_<id>.dat`, `compact-<label>/slice_<id>.dat` | `volume read-slices`, `volume compact-read` | `.age` slices copied off tape: ciphertext |
 //! | the `TAPECTL_TEST_PAUSE_AFTER_SEAL` marker | a test hook, at the path the variable names | the word `parked` |
 //!
-//! The write's `catalog.db` and dar's slice template, both plaintext, are
-//! made under `<home>/tmp` (`staging::home_work_dir`), never here.
+//! The write's `catalog.db` and tar's file list, both plaintext, are made
+//! under `<home>/tmp` (`staging::home_work_dir`), never here.
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -43,6 +46,7 @@ use std::thread::JoinHandle;
 use crate::pass_count::Sha256;
 use sha2::Digest;
 
+use super::pack::{self, Packer, Packing};
 use super::{build_encryptor, make_durable, staging_io_error, EncryptedSliceInfo};
 use crate::error::{Result, TapectlError};
 
@@ -72,22 +76,23 @@ impl StagingDir {
         })
     }
 
-    /// Create slice `n` of the archive `base` (`staging::archive_base_name`)
-    /// as `{base}.{n}.dar.age`, encrypted to `recipients`. Everything written
-    /// to the returned writer is the plaintext slice; the file receives
-    /// only its age ciphertext.
+    /// Create slice `n` of the staging `base` (`staging::archive_base_name`)
+    /// as `{base}.{n}.tar.age`, encrypted to `recipients`, packed first when
+    /// `packing` says so. Everything written to the returned writer is the
+    /// slice's cut; the file receives only its age ciphertext.
     pub(crate) fn create_slice(
         &self,
         base: &str,
-        n: u32,
+        n: u64,
         recipients: &[String],
+        packing: Option<Packing>,
     ) -> Result<SliceWriter> {
         if base.is_empty() || base.contains('/') || base.starts_with('.') {
             return Err(TapectlError::Other(format!(
                 "refusing a staged slice name built from {base:?}"
             )));
         }
-        let path = self.root.join(format!("{base}.{n}.dar.age"));
+        let path = self.root.join(slice_file_name(base, n));
         // The recipients are parsed before the file exists, so a bad key
         // leaves nothing behind.
         let encryptor = build_encryptor(recipients)?;
@@ -96,8 +101,17 @@ impl StagingDir {
             .create_new(true)
             .open(&path)
             .map_err(|e| staging_io_error("cannot create staged slice", &path, e))?;
-        SliceWriter::over(path, file, encryptor)
+        SliceWriter::over(path, file, encryptor, packing)
     }
+}
+
+/// The suffix of every staged slice's file: a cut of the tar stream, age
+/// ciphertext (`staging::clean` finds leftovers by it).
+pub(crate) const SLICE_SUFFIX: &str = ".tar.age";
+
+/// `{base}.{n}.tar.age`.
+pub(crate) fn slice_file_name(base: &str, n: u64) -> String {
+    format!("{base}.{n}{SLICE_SUFFIX}")
 }
 
 fn slice_io_error(path: &Path, e: io::Error) -> TapectlError {
@@ -185,22 +199,39 @@ impl Write for CipherSink {
     }
 }
 
-/// One staged slice being written: plaintext in, age ciphertext to the
-/// file. [`SliceWriter::finish`] completes the age stream, syncs the file
-/// and its directory entry (issue #409), and returns the slice's sizes and
-/// hashes. A writer dropped without finishing — or whose finish fails —
+/// The age stream of one slice.
+type AgeStream = age::stream::StreamWriter<CipherSink>;
+
+/// What a slice's cut goes into: the age stream itself, or a packer whose
+/// frame goes into it (`staging::pack`).
+enum Body {
+    Plain(AgeStream),
+    Packed(Box<Packer<AgeStream>>, Packing),
+}
+
+/// One staged slice being written: its cut in, age ciphertext to the file.
+/// [`SliceWriter::finish`] completes the frame (when packed) and the age
+/// stream, syncs the file and its directory entry (issue #409), and returns
+/// the slice's sizes and hashes. A packed slice is decoded again as it is
+/// packed, and a slice whose frame does not decode to its cut is refused
+/// (D15). A writer dropped without finishing, or whose finish fails,
 /// removes its file, so a stage that fails partway leaves no half-written
 /// `.age` behind.
 pub(crate) struct SliceWriter {
     path: PathBuf,
-    stream: Option<age::stream::StreamWriter<CipherSink>>,
+    body: Option<Body>,
     plain: Option<HashThread>,
     plain_len: u64,
 }
 
 impl SliceWriter {
     /// A slice named `path` whose ciphertext goes to `file`, already open.
-    fn over(path: PathBuf, file: fs::File, encryptor: age::Encryptor) -> Result<Self> {
+    fn over(
+        path: PathBuf,
+        file: fs::File,
+        encryptor: age::Encryptor,
+        packing: Option<Packing>,
+    ) -> Result<Self> {
         let sink = CipherSink {
             file: BufWriter::with_capacity(1 << 20, file),
             hasher: HashThread::spawn(),
@@ -213,9 +244,19 @@ impl SliceWriter {
                 return Err(slice_io_error(&path, e));
             }
         };
+        let body = match packing {
+            None => Body::Plain(stream),
+            Some(p) => match Packer::new(p, stream) {
+                Ok(packer) => Body::Packed(Box::new(packer), p),
+                Err(e) => {
+                    let _ = fs::remove_file(&path);
+                    return Err(slice_io_error(&path, e));
+                }
+            },
+        };
         Ok(SliceWriter {
             path,
-            stream: Some(stream),
+            body: Some(body),
             plain: Some(HashThread::spawn()),
             plain_len: 0,
         })
@@ -225,13 +266,40 @@ impl SliceWriter {
         &self.path
     }
 
-    /// Finish the slice: the age stream's last chunk (without it the file
-    /// hashes fine but cannot be decrypted), then a sync of the file and of
-    /// the directory entry that names it.
+    /// Finish the slice: the frame's end when it is packed, then the age
+    /// stream's last chunk (without it the file hashes fine but cannot be
+    /// decrypted), then a sync of the file and of the directory entry that
+    /// names it.
     pub(crate) fn finish(mut self) -> Result<EncryptedSliceInfo> {
-        let stream = self.stream.take().expect("a SliceWriter finishes once");
+        let body = self.body.take().expect("a SliceWriter finishes once");
         let plain = self.plain.take().expect("a SliceWriter finishes once");
         let finished = (|| {
+            let (stream, decoded) = match body {
+                Body::Plain(stream) => (stream, None),
+                Body::Packed(packer, p) => {
+                    let (stream, decoded) =
+                        packer.finish().map_err(|e| slice_io_error(&self.path, e))?;
+                    (stream, Some((decoded, p)))
+                }
+            };
+            let sha256_plain = plain.finish();
+            let mut packed_bytes = None;
+            if let Some((decoded, p)) = decoded {
+                // D15: what was hashed is what goes to tape.
+                if decoded.len != self.plain_len || decoded.sha256 != sha256_plain {
+                    return Err(TapectlError::Other(format!(
+                        "staged slice {}: packed with {} at level {}, it decodes to {} bytes                          of sha256 {}, and its cut was {} bytes of sha256 {}. A slice whose                          packed bytes are not its cut is never kept; nothing was staged.",
+                        self.path.display(),
+                        p.algorithm.name(),
+                        p.level,
+                        decoded.len,
+                        decoded.sha256,
+                        self.plain_len,
+                        sha256_plain
+                    )));
+                }
+                packed_bytes = Some(decoded.packed_len);
+            }
             let mut sink = stream.finish().map_err(|e| slice_io_error(&self.path, e))?;
             sink.flush().map_err(|e| slice_io_error(&self.path, e))?;
             let CipherSink { file, hasher, len } = sink;
@@ -245,9 +313,10 @@ impl SliceWriter {
             crate::util::drop_cached(&file, &self.path);
             Ok(EncryptedSliceInfo {
                 plain_size: self.plain_len as i64,
-                sha256_plain: plain.finish(),
+                sha256_plain,
                 encrypted_size: len as i64,
                 sha256_encrypted: hasher.finish(),
+                packed_size: packed_bytes,
             })
         })();
         if finished.is_err() {
@@ -259,15 +328,28 @@ impl SliceWriter {
 
 impl Write for SliceWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let stream = self
-            .stream
+        let body = self
+            .body
             .as_mut()
             .ok_or_else(|| io::Error::other("slice already finished"))?;
         // Past the 1 MiB buffer the disk filling up surfaces here, mid-slice
         // (issue #465): name the slice, as `finish` does.
-        let n = stream
-            .write(buf)
-            .map_err(|e| slice_write_error(&self.path, e))?;
+        let n = match body {
+            Body::Plain(stream) => stream.write(buf),
+            Body::Packed(packer, _) => {
+                #[cfg(test)]
+                if let Some(bent) = pack_hook::bend(buf) {
+                    packer.write_all(&bent)?;
+                    if let Some(plain) = self.plain.as_mut() {
+                        plain.feed(buf);
+                    }
+                    self.plain_len += buf.len() as u64;
+                    return Ok(buf.len());
+                }
+                packer.write(buf)
+            }
+        }
+        .map_err(|e| slice_write_error(&self.path, e))?;
         if let Some(plain) = self.plain.as_mut() {
             plain.feed(&buf[..n]);
         }
@@ -276,8 +358,9 @@ impl Write for SliceWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.stream.as_mut() {
-            Some(s) => s.flush().map_err(|e| slice_write_error(&self.path, e)),
+        match self.body.as_mut() {
+            Some(Body::Plain(s)) => s.flush().map_err(|e| slice_write_error(&self.path, e)),
+            Some(Body::Packed(p, _)) => p.flush().map_err(|e| slice_write_error(&self.path, e)),
             None => Ok(()),
         }
     }
@@ -285,10 +368,42 @@ impl Write for SliceWriter {
 
 impl Drop for SliceWriter {
     fn drop(&mut self) {
-        if self.stream.take().is_some() {
+        if self.body.take().is_some() {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+/// Test-only: bend the bytes a packed slice's packer is given (never the
+/// cut's own hash), the way a packer that lost a byte would: the positive
+/// control of D15's check.
+#[cfg(test)]
+pub(crate) mod pack_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Flip one bit of the next write a packer on this thread is given.
+    pub(crate) fn arm() {
+        ARMED.with(|a| a.set(true));
+    }
+
+    pub(super) fn bend(buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.is_empty() || !ARMED.with(|a| a.replace(false)) {
+            return None;
+        }
+        let mut v = buf.to_vec();
+        v[0] ^= 1;
+        Some(v)
+    }
+}
+
+/// The most a slice's packed frame may hold: `slice_size` plus the
+/// algorithm's stated worst growth (`volume-format-v3.md` §3.4, §3.5).
+pub(crate) fn packed_bound(slice_size: u64) -> u64 {
+    slice_size + pack::worst_growth(slice_size)
 }
 
 #[cfg(test)]
@@ -308,7 +423,7 @@ mod tests {
         let dir = StagingDir::prepare(tmp.path()).unwrap();
         let (id, recipients) = recipient();
         let plain: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients).unwrap();
+        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients, None).unwrap();
         w.write_all(&plain[..1000]).unwrap();
         w.write_all(&plain[1000..]).unwrap();
         let path = w.path().to_path_buf();
@@ -346,7 +461,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StagingDir::prepare(tmp.path()).unwrap();
         let (_id, recipients) = recipient();
-        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients).unwrap();
+        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients, None).unwrap();
         w.write_all(b"slice bytes").unwrap();
         let path = w.path().to_path_buf();
         crate::util::page_cache_log::take();
@@ -359,7 +474,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StagingDir::prepare(tmp.path()).unwrap();
         let (_, recipients) = recipient();
-        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients).unwrap();
+        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients, None).unwrap();
         w.write_all(b"half a slice").unwrap();
         let path = w.path().to_path_buf();
         assert!(path.exists());
@@ -372,7 +487,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StagingDir::prepare(tmp.path()).unwrap();
         let err = dir
-            .create_slice("abc_v1_s1", 1, &["not-an-age-key".to_string()])
+            .create_slice("abc_v1_s1", 1, &["not-an-age-key".to_string()], None)
             .err()
             .expect("a malformed recipient is refused");
         assert!(err.to_string().contains("invalid public key"), "{err}");
@@ -391,10 +506,15 @@ mod tests {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("abc_v1_s1.1.dar.age");
+        let path = tmp.path().join("abc_v1_s1.1.tar.age");
         let (_, recipients) = recipient();
-        let mut w =
-            SliceWriter::over(path.clone(), full, build_encryptor(&recipients).unwrap()).unwrap();
+        let mut w = SliceWriter::over(
+            path.clone(),
+            full,
+            build_encryptor(&recipients).unwrap(),
+            None,
+        )
+        .unwrap();
         w.write_all(&[7u8; 200_000]).unwrap();
         let err = w.finish().err().expect("every write to /dev/full fails");
         let msg = err.to_string();
@@ -422,10 +542,15 @@ mod tests {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("abc_v1_s1.1.dar.age");
+        let path = tmp.path().join("abc_v1_s1.1.tar.age");
         let (_, recipients) = recipient();
-        let mut w =
-            SliceWriter::over(path.clone(), full, build_encryptor(&recipients).unwrap()).unwrap();
+        let mut w = SliceWriter::over(
+            path.clone(),
+            full,
+            build_encryptor(&recipients).unwrap(),
+            None,
+        )
+        .unwrap();
         // Random-looking bytes: age does not compress, so 4 MiB in is more
         // than the buffer holds whatever the framing adds.
         let chunk: Vec<u8> = (0..65_536u32)
@@ -481,8 +606,21 @@ mod tests {
                  from StagingDir only"
             );
         }
+        // The slices come from the cutter's sink (`staging::archive`), which
+        // creates nothing itself either.
+        let archive = include_str!("archive.rs");
+        let archive = archive.split("#[cfg(test)]").next().unwrap();
+        for call in CREATES {
+            assert!(
+                !archive.contains(call),
+                "staging::archive must not call {call}: files under staging come \
+                 from StagingDir only"
+            );
+        }
         assert!(
-            stage.contains("files::StagingDir::prepare(") && stage.contains("create_slice("),
+            stage.contains("files::StagingDir::prepare(")
+                && stage.contains("archive::StagedSlices")
+                && archive.contains(".create_slice("),
             "positive control: stage_create_inner goes through StagingDir"
         );
         let src = include_str!("files.rs");
@@ -503,17 +641,97 @@ mod tests {
         );
     }
 
-    /// Issue #370, by construction: dar's argv for the archive names no path
-    /// under the staging directory — the archive is `-`, standard output.
+    /// Issue #370, by construction: tar's argv for the archive names no path
+    /// under the staging directory: the archive is `--file=-`, standard
+    /// output, and it is named once.
     #[test]
-    fn dar_is_given_standard_output_as_its_archive() {
-        let body = body_of(include_str!("../dar/create.rs"), "pub fn create_command(");
-        assert!(body.contains(r#"cmd.arg("-c").arg("-");"#), "{body}");
-        assert_eq!(
-            body.matches(r#".arg("-c")"#).count(),
-            1,
-            "one archive argument"
-        );
+    fn tar_is_given_standard_output_as_its_archive() {
+        let body = body_of(include_str!("../tar/writer.rs"), "pub fn create_args(");
+        assert!(body.contains(r#""--file=-""#), "{body}");
+        assert_eq!(body.matches("\"--file=").count(), 1, "one archive argument");
+    }
+
+    /// D15's check, its positive control: a packer given a bent byte makes
+    /// a frame that decodes to something other than the cut, and the slice
+    /// is refused and removed.
+    #[test]
+    fn a_packed_slice_that_does_not_decode_to_its_cut_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StagingDir::prepare(tmp.path()).unwrap();
+        let (_, recipients) = recipient();
+        for algorithm in [
+            pack::Algorithm::Gzip,
+            pack::Algorithm::Xz,
+            pack::Algorithm::Zstd,
+        ] {
+            let p = Packing {
+                algorithm,
+                level: algorithm.default_level(),
+            };
+            let mut w = dir
+                .create_slice("abc_v1_s1", 1, &recipients, Some(p))
+                .unwrap();
+            w.write_all(b"a cut whose bytes are packed as they are")
+                .unwrap();
+            let info = w.finish().unwrap();
+            assert!(info.packed_size.is_some());
+            fs::remove_file(tmp.path().join("abc_v1_s1.1.tar.age")).unwrap();
+
+            let mut w = dir
+                .create_slice("abc_v1_s1", 1, &recipients, Some(p))
+                .unwrap();
+            let path = w.path().to_path_buf();
+            pack_hook::arm();
+            w.write_all(b"a cut whose bytes are bent on their way into the packer")
+                .unwrap();
+            let err = w
+                .finish()
+                .err()
+                .expect("the frame does not decode to the cut");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(algorithm.name()) && msg.contains("decodes to"),
+                "{msg}"
+            );
+            assert!(!path.exists(), "the refused slice is removed");
+        }
+    }
+
+    /// A packed slice decrypts to a frame the algorithm's own tool reads.
+    #[test]
+    fn a_packed_slice_decrypts_to_one_frame_of_its_cut() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StagingDir::prepare(tmp.path()).unwrap();
+        let (id, recipients) = recipient();
+        let cut: Vec<u8> = b"words again "
+            .iter()
+            .cycle()
+            .take(200_000)
+            .copied()
+            .collect();
+        let p = Packing {
+            algorithm: pack::Algorithm::Zstd,
+            level: 3,
+        };
+        let mut w = dir
+            .create_slice("abc_v1_s1", 1, &recipients, Some(p))
+            .unwrap();
+        w.write_all(&cut).unwrap();
+        let path = w.path().to_path_buf();
+        let info = w.finish().unwrap();
+        assert_eq!(info.plain_size, cut.len() as i64);
+        assert_eq!(info.sha256_plain, format!("{:x}", Sha256::digest(&cut)));
+        let bytes = fs::read(&path).unwrap();
+        let mut frame = Vec::new();
+        age::Decryptor::new(&bytes[..])
+            .unwrap()
+            .decrypt(std::iter::once(&id as &dyn age::Identity))
+            .unwrap()
+            .read_to_end(&mut frame)
+            .unwrap();
+        assert_eq!(info.packed_size, Some(frame.len() as u64));
+        assert!(frame.len() < cut.len() / 10);
+        assert_eq!(zstd::decode_all(&frame[..]).unwrap(), cut);
     }
 
     #[test]
@@ -522,7 +740,10 @@ mod tests {
         let dir = StagingDir::prepare(tmp.path()).unwrap();
         let (_, recipients) = recipient();
         for base in ["../x", "a/b", "", ".hidden"] {
-            assert!(dir.create_slice(base, 1, &recipients).is_err(), "{base:?}");
+            assert!(
+                dir.create_slice(base, 1, &recipients, None).is_err(),
+                "{base:?}"
+            );
         }
     }
 }

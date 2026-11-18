@@ -190,6 +190,7 @@ mod tests {
             required_locations: None,
             encrypt: None,
             compression: None,
+            compression_level: None,
             checksum_mode: None,
             verify_interval_days: None,
             slice_size: None,

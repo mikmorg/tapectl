@@ -1412,9 +1412,7 @@ fn mib_per_s(bytes: u64, over: Duration) -> f64 {
 ///
 /// Knobs: `TAPECTL_PERF_STAGE_MIB` (source size, 4096),
 /// `TAPECTL_PERF_STAGE_SMALL` (small files, 4000, in a quarter of it),
-/// `TAPECTL_PERF_STAGE_SLICE` (dar `-s`, 1G, the 1.1 default) and
-/// `TAPECTL_PERF_HASH_THREADS` (`[staging] hash_threads`; the shipped
-/// default is 1, which leaves #366's pool idle).
+/// `TAPECTL_PERF_STAGE_SLICE` (dar `-s`, 1G, the 1.1 default).
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_staging_throughput_per_pass() {
@@ -1437,12 +1435,6 @@ fn perf_staging_throughput_per_pass() {
     let mut h = setup("stage-throughput");
     h.config.defaults.slice_size =
         std::env::var("TAPECTL_PERF_STAGE_SLICE").unwrap_or_else(|_| "1G".into());
-    if let Some(threads) = std::env::var("TAPECTL_PERF_HASH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        h.config.staging.hash_threads = threads;
-    }
     tenant::add_tenant(&h.conn, &h.paths, "op", None, true).unwrap();
 
     // `init_unit` writes the unit's dotfile into the source; take a previous
@@ -1461,11 +1453,10 @@ fn perf_staging_throughput_per_pass() {
     )
     .unwrap();
     eprintln!(
-        "[perf] stage_throughput source {:.1} MiB in {} files, slice {}, hash_threads {}",
+        "[perf] stage_throughput source {:.1} MiB in {} files, slice {}",
         mib(source_bytes),
         stage_fixture_plan(total_mib, small_files).len(),
         h.config.defaults.slice_size,
-        h.config.staging.hash_threads,
     );
 
     evict_from_page_cache(&source);

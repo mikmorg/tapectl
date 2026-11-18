@@ -105,7 +105,10 @@ CREATE TABLE archive_sets (
     updated_at               TEXT NOT NULL DEFAULT (datetime('now')),
     warehouse_copies         INTEGER,
     allow_spanning           INTEGER,
-    copies_at                TEXT
+    copies_at                TEXT,
+    -- The level `compression` is packed at (item 287; D15): NULL for the
+    -- algorithm's own default.
+    compression_level        INTEGER
 );
 
 -- ---------------------------------------------------------------------------
@@ -251,7 +254,10 @@ CREATE TABLE stage_sets (
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
     notes                TEXT,
     origin               TEXT NOT NULL DEFAULT 'staged'
-                         CHECK(origin IN ('staged', 'rebuilt'))
+                         CHECK(origin IN ('staged', 'rebuilt')),
+    -- The level each slice was packed at (items 286, 287): NULL for a
+    -- staging that is not compressed, or one a rebuild made.
+    compression_level    INTEGER
 );
 
 CREATE INDEX idx_stage_sets_snapshot ON stage_sets(snapshot_id);
@@ -266,6 +272,9 @@ CREATE TABLE stage_slices (
     sha256_encrypted TEXT NOT NULL,
     staging_path     TEXT,
     released_at      TEXT,
+    -- 1 for a slice that continues a member begun in the slice before it:
+    -- the second and later slices of a long member's run (D22; §3.3).
+    continues        INTEGER NOT NULL DEFAULT 0 CHECK(continues IN (0, 1)),
     UNIQUE(stage_set_id, slice_number)
 );
 

@@ -149,6 +149,33 @@ fn check_registered_locations(conn: &Connection, field: &str, names: &[String]) 
     Ok(())
 }
 
+/// Item 287: a level is a whole number in its algorithm's range (gzip 1-9,
+/// xz 0-9, zstd 1-19). Beside an algorithm it is judged against that one;
+/// alone, against the widest range, and again against the resolved
+/// algorithm when a slice is packed.
+fn check_compression_level(compression: Option<&str>, level: i64) -> Result<()> {
+    match compression {
+        Some(c) => match crate::config::level_problem(c, Some(level)) {
+            Some(e) => Err(TapectlError::Other(e)),
+            None => Ok(()),
+        },
+        None if (0..=19).contains(&level) => Ok(()),
+        None => Err(TapectlError::Other(format!(
+            "compression_level = {level} is outside every algorithm's levels (gzip 1 to 9, \
+             xz 0 to 9, zstd 1 to 19)"
+        ))),
+    }
+}
+
+/// A slice size: parsed, and a positive multiple of 512 bytes (#562).
+fn parse_slice_size(s: &str) -> Result<i64> {
+    let bytes = crate::staging::parse_size_to_bytes(s)?;
+    match crate::config::slice_size_block_problem(bytes) {
+        Some(e) => Err(TapectlError::Other(format!("{s:?}: {e}"))),
+        None => Ok(bytes),
+    }
+}
+
 /// The policy columns `archive-set create` and `edit` take as flags — one
 /// definition for both (issue #346), so a column one command can set is a
 /// column the other can too. Every flag is optional: `create` leaves an
@@ -166,9 +193,16 @@ pub struct PolicyArgs {
     /// Encryption enabled (true/false)
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub encrypt: Option<bool>,
-    /// Compression mode
+    /// Compression mode: none, gzip, xz or zstd
+    ///
+    /// Each slice is packed alone, after the cut and before it is encrypted.
     #[arg(long, value_name = "MODE")]
     pub compression: Option<String>,
+    /// Compression level (gzip 1-9, xz 0-9, zstd 1-19)
+    ///
+    /// Never set means the algorithm's own default (gzip 6, xz 6, zstd 3).
+    #[arg(long, value_name = "N")]
+    pub compression_level: Option<i64>,
     /// Checksum mode
     #[arg(long, value_name = "MODE")]
     pub checksum_mode: Option<String>,
@@ -185,13 +219,12 @@ pub struct PolicyArgs {
     pub warehouse_copies: Option<i64>,
     /// Keep extended attributes (true/false)
     ///
-    /// And the POSIX ACLs stored as them; false drops them all.
+    /// tar's --xattrs; the raw POSIX ACL attribute is never among them.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_xattrs: Option<bool>,
-    /// Keep POSIX ACLs (true/false; with --preserve-xattrs)
+    /// Keep POSIX ACLs (true/false)
     ///
-    /// No effect of its own: ACLs are kept or dropped with the extended
-    /// attributes they are stored as.
+    /// tar's --acls: the text ACL record, every entry by number.
     #[arg(long, value_name = "BOOL", hide_possible_values = true)]
     pub preserve_acls: Option<bool>,
     /// Keep filesystem attributes, chattr flags (true/false)
@@ -311,6 +344,7 @@ struct PolicyWrite {
     required_locations: Option<Vec<String>>,
     encrypt: Option<bool>,
     compression: Option<String>,
+    compression_level: Option<i64>,
     checksum_mode: Option<String>,
     /// Bytes, already parsed.
     slice_size: Option<i64>,
@@ -334,6 +368,7 @@ impl PolicyWrite {
             required_locations,
             encrypt,
             compression,
+            compression_level,
             checksum_mode,
             slice_size,
             verify_interval_days,
@@ -351,6 +386,7 @@ impl PolicyWrite {
             && required_locations.is_none()
             && encrypt.is_none()
             && compression.is_none()
+            && compression_level.is_none()
             && checksum_mode.is_none()
             && slice_size.is_none()
             && verify_interval_days.is_none()
@@ -370,6 +406,10 @@ impl PolicyWrite {
     fn from_args(conn: &Connection, config: &Config, args: &PolicyArgs) -> Result<Self> {
         if let Some(c) = &args.compression {
             validate_compression_capability(c, config)?;
+        }
+        if let Some(level) = args.compression_level {
+            check_compression_level(args.compression.as_deref(), level)
+                .map_err(|e| TapectlError::Other(format!("--compression-level: {e}")))?;
         }
         if let Some(m) = &args.checksum_mode {
             // ADR-0012 "same treatment" as compression (issue #171): was
@@ -399,8 +439,9 @@ impl PolicyWrite {
         let slice_size = args
             .slice_size
             .as_ref()
-            .map(|s| crate::staging::parse_size_to_bytes(s))
-            .transpose()?;
+            .map(|s| parse_slice_size(s))
+            .transpose()
+            .map_err(|e| TapectlError::Other(format!("--slice-size: {e}")))?;
         // No flag is "not given", never an empty map.
         let copies_at = (!args.copies_at.is_empty())
             .then(|| parse_copies_at(conn, &args.copies_at))
@@ -410,6 +451,7 @@ impl PolicyWrite {
             required_locations,
             encrypt: args.encrypt,
             compression: args.compression.clone(),
+            compression_level: args.compression_level,
             checksum_mode: args.checksum_mode.clone(),
             slice_size,
             verify_interval_days: args.verify_interval_days,
@@ -444,17 +486,22 @@ impl PolicyWrite {
             crate::config::validate_copies_at(map)
                 .map_err(|e| TapectlError::Other(format!("copies_at {e}")))?;
         }
+        if let Some(level) = as_cfg.compression_level {
+            check_compression_level(as_cfg.compression.as_deref(), level)?;
+        }
         Ok(Self {
             min_copies: as_cfg.min_copies.map(i64::from),
             required_locations: as_cfg.required_locations.clone(),
             encrypt: as_cfg.encrypt,
             compression: as_cfg.compression.clone(),
+            compression_level: as_cfg.compression_level,
             checksum_mode: as_cfg.checksum_mode.clone(),
             slice_size: as_cfg
                 .slice_size
                 .as_ref()
-                .map(|s| crate::staging::parse_size_to_bytes(s))
-                .transpose()?,
+                .map(|s| parse_slice_size(s))
+                .transpose()
+                .map_err(|e| TapectlError::Other(format!("slice_size {e}")))?,
             verify_interval_days: as_cfg.verify_interval_days.map(i64::from),
             warehouse_copies: None,
             preserve_xattrs: as_cfg.preserve_xattrs,
@@ -487,6 +534,10 @@ impl PolicyWrite {
         push(
             "compression",
             self.compression.clone().map(ColumnValue::Text),
+        );
+        push(
+            "compression_level",
+            self.compression_level.map(ColumnValue::Int),
         );
         push(
             "checksum_mode",
@@ -661,6 +712,7 @@ struct ArchiveSetInfo {
     required_locations: Option<String>,
     encrypt: Option<i64>,
     compression: Option<String>,
+    compression_level: Option<i64>,
     checksum_mode: Option<String>,
     slice_size: Option<i64>,
     verify_days: Option<i64>,
@@ -686,7 +738,7 @@ impl ArchiveSetInfo {
                         a.warehouse_copies, a.preserve_xattrs, a.preserve_acls, a.preserve_fsa,
                         a.dirty_on_metadata_change, a.created_at, a.updated_at,
                         (SELECT COUNT(*) FROM units u WHERE u.archive_set_id = a.id),
-                        a.allow_spanning, a.copies_at
+                        a.allow_spanning, a.copies_at, a.compression_level
                  FROM archive_sets a WHERE a.name = ?1",
                 params![name],
                 |row| {
@@ -710,6 +762,7 @@ impl ArchiveSetInfo {
                         unit_count: row.get(15)?,
                         allow_spanning: row.get(16)?,
                         copies_at: row.get(17)?,
+                        compression_level: row.get(18)?,
                     })
                 },
             )
@@ -749,7 +802,8 @@ fn info_json(info: &ArchiveSetInfo) -> serde_json::Value {
     serde_json::json!({
         "name": info.name, "description": info.description, "min_copies": info.min_copies,
         "locations": locations, "encrypt": flag(info.encrypt),
-        "compression": info.compression, "checksum_mode": info.checksum_mode,
+        "compression": info.compression, "compression_level": info.compression_level,
+        "checksum_mode": info.checksum_mode,
         "slice_size": info.slice_size, "verify_days": info.verify_days,
         "warehouse_copies": info.warehouse_copies,
         "preserve_xattrs": flag(info.preserve_xattrs),
@@ -785,6 +839,10 @@ fn info_text(info: &ArchiveSetInfo) -> String {
     out.push_str(&format!(
         "  Compression:      {}\n",
         text(&info.compression)
+    ));
+    out.push_str(&format!(
+        "  Compr. level:     {}\n",
+        int(info.compression_level)
     ));
     out.push_str(&format!(
         "  Checksum mode:    {}\n",
@@ -1597,6 +1655,7 @@ fi
             required_locations: None,
             encrypt: None,
             compression: None,
+            compression_level: None,
             checksum_mode: None,
             verify_interval_days: None,
             slice_size: None,

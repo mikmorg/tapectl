@@ -487,6 +487,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: None,
                 compression: Some("gzip".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,

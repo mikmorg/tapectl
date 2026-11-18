@@ -6,62 +6,45 @@
 //! about the same fact — exactly the failure shape issues #33 (walk vs
 //! validator on symlinks), #36 (a near-duplicate dirty scanner), and #48
 //! (two registration paths reading one dotfile field differently) each
-//! hit once already. `staging::stage_create`'s dar arguments are built
-//! from the same effective pattern list (globals + dotfile), and
-//! `collection::sync` matches a collection's own `exclude` here too.
+//! hit once already. `collection::sync` matches a collection's own
+//! `exclude` here too.
 //!
-//! `stage_create` hands dar these patterns split by [`dar_masks`] (`-X`
-//! for plain patterns, `-P` prunes for directory patterns), and
-//! `walk_directory` prunes with `Excludes::excludes_dir_entry`, so a
-//! directory pattern (`name/`) keeps the subtree out of the dar archive as
-//! well as out of the manifest, the `files` table and the dirty scan
-//! (issue #359).
+//! It is the only matcher (D14; ADR-0012 item 252): tar is given the
+//! snapshot's exact list (`volume-format-v3.md` §3.1), so what the walk
+//! records is what is archived, and the two matchers that once disagreed
+//! (#542) are one.
 //!
 //! ## The one exclude rule (issue #359)
 //!
 //! Every exclude pattern — `[defaults] global_excludes`, a unit dotfile's
 //! `[excludes] patterns`, and a collection's `exclude` — follows the same
-//! rule. Deliberately mirrors dar's own real, **empirically verified**
-//! behaviour (dar 2.7.13, `dar -c -an -D -X … -P …` then `dar -l`/`-x`),
-//! because dar is what actually decides what reaches tape:
+//! rule:
 //!
-//!  - **Case never matters.** `dar::create::create_command` unconditionally
-//!    passes `-an` (`--alter=no-case`) before its masks, so every mask dar
-//!    receives is case-insensitive — a case-sensitive matcher here would
-//!    silently disagree with dar. A collection's `exclude` was the one
+//!  - **Case never matters.** A collection's `exclude` was the one
 //!    case-sensitive matcher until #359; making it case-insensitive only
 //!    ever excludes MORE, so no directory an existing config excluded is
 //!    newly registered.
 //!  - **A plain pattern** (`*.tmp`, `Thumbs.db`) matches an entry's
-//!    **basename** only, never its path, and never a directory — dar's own
-//!    `-X` rule ("the mask … is applied to filenames which are not
-//!    directories", `man dar`). A file nested inside a directory is excluded
-//!    on its own basename's merits. (In a collection's `exclude`, where every
-//!    candidate IS a directory, a plain pattern matches the candidate
-//!    directory's own name, as it always has.)
+//!    **basename** only, never its path, and never a directory. A file
+//!    nested inside a directory is excluded on its own basename's merits.
+//!    (In a collection's `exclude`, where every candidate IS a directory, a
+//!    plain pattern matches the candidate directory's own name, as it always
+//!    has.)
 //!  - **A directory pattern** (`name/`, e.g. `.cache/`, `node_modules/`)
 //!    excludes that directory's **whole subtree**, at any depth below the
 //!    walk root: an entry is excluded when any component of its path below
-//!    the root matches `name`. dar receives it as the prune masks
-//!    `-P name` and `-P */name` (`dar_masks`, passed by `stage_create`):
-//!    `-P` matches the path relative to `-R`,
-//!    its `*` spans `/`, and `-D` keeps the pruned directory itself as an
-//!    empty directory — so `excludes_dir_entry` keeps that directory's own
-//!    entry and drops only what is inside it. Like `-P`, the rule does not
-//!    distinguish a file from a directory: a FILE named `.cache` is excluded
-//!    by `.cache/` too, so the manifest and the archive can agree. Components
-//!    ABOVE the walk root are never consulted (a unit living under
-//!    `~/.cache/` is not excluded wholesale). Before #359 a `name/` pattern
-//!    matched nothing at all (a basename never contains `/`), so honouring
-//!    it only ever excludes more.
-//!  - **Matches nothing:** a pattern that is not a valid glob (mirrors
-//!    `collection::sync`'s long-standing precedent — a malformed pattern must
-//!    never crash a walk), a plain pattern containing `/`, and a directory
-//!    pattern whose name contains `/` or is empty (`a/b/`, `/`). dar is not
-//!    handed a prune mask for those either. (dar's `*` spans `/`, so a
-//!    directory pattern with a wildcard INSIDE its name, `a*b/`, can reach
-//!    further in dar than here; plain names and leading/trailing wildcards,
-//!    the realistic forms, agree exactly.)
+//!    the root matches `name`. The pruned directory itself is kept, as an
+//!    empty directory, so `excludes_dir_entry` keeps that directory's own
+//!    entry and drops only what is inside it. The rule does not distinguish
+//!    a file from a directory: a FILE named `.cache` is excluded by
+//!    `.cache/` too. Components ABOVE the walk root are never consulted (a
+//!    unit living under `~/.cache/` is not excluded wholesale). Before #359 a
+//!    `name/` pattern matched nothing at all (a basename never contains
+//!    `/`), so honouring it only ever excludes more.
+//!  - **Matches nothing:** a pattern that is not a valid glob (refused by
+//!    name where a list is read, #542; a walk never crashes on one), a plain
+//!    pattern containing `/`, and a directory pattern whose name contains
+//!    `/` or is empty (`a/b/`, `/`).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -219,7 +202,7 @@ impl Excludes {
 
     /// A NON-directory entry of a walk: excluded when its basename matches a
     /// plain pattern, or any component of its path below the root (its own
-    /// name included, as dar's `-P` does) matches a directory pattern.
+    /// name included) matches a directory pattern.
     pub fn excludes_file(&self, path: &Path) -> bool {
         self.file_pattern(path).is_some()
     }
@@ -250,8 +233,8 @@ impl Excludes {
 
     /// A DIRECTORY entry of a walk: excluded when it lies INSIDE a pruned
     /// subtree (a component strictly above it matches a directory pattern).
-    /// The pruned directory itself is kept — dar's `-D` stores it as an
-    /// empty directory — and a plain pattern never matches a directory.
+    /// The pruned directory itself is kept, as an empty directory, and a
+    /// plain pattern never matches a directory.
     pub fn excludes_dir_entry(&self, path: &Path) -> bool {
         let parts = self.components_below_root(path);
         match parts.split_last() {
@@ -295,45 +278,11 @@ pub fn is_socket(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
 }
 
-/// The masks dar must receive for an effective pattern list, so that what
-/// dar archives is exactly what the walks record (module doc comment).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct DarMasks {
-    /// `-X` masks: the plain patterns, verbatim (dar's own basename rule).
-    pub exclude: Vec<String>,
-    /// `-P` prune masks: each directory pattern `name/` as `name` (the
-    /// directory at the root) and `*/name` (at any depth below it).
-    pub prune: Vec<String>,
-}
-
-/// Split an effective pattern list (globals + dotfile, as `stage_create`
-/// builds it) into dar's `-X` and `-P` masks. A plain pattern is passed to
-/// `-X` verbatim, exactly as before #359; a directory pattern becomes two
-/// `-P` masks (the relative path at the root, and at any depth — dar's `*`
-/// spans `/`); a pattern that matches nothing in the walks gets no prune
-/// mask either.
-pub fn dar_masks(patterns: &[String]) -> DarMasks {
-    let mut masks = DarMasks::default();
-    for p in patterns {
-        match classify(p) {
-            Some(Classified::Plain(g)) => masks.exclude.push(g.to_string()),
-            Some(Classified::Directory(name)) => {
-                if Pattern::new(name).is_ok() {
-                    masks.prune.push(name.to_string());
-                    masks.prune.push(format!("*/{name}"));
-                }
-            }
-            None => {}
-        }
-    }
-    masks
-}
-
 /// The unit dotfile's own `[excludes] patterns` for the unit rooted at
 /// `dir_path` — issue #49 item 2's per-unit half of "effective excludes =
 /// globals + dotfile". Reads `dir_path/.tapectl-unit.toml` directly (the
-/// same file `staging::stage_create`'s `resolve_slice_size_string` reads
-/// ad hoc, and `dotfile::read_dotfile` reads structurally elsewhere), so
+/// same file `policy::resolve` reads ad hoc, and `dotfile::read_dotfile`
+/// reads structurally elsewhere), so
 /// both `staging::walk_directory` and
 /// `collection::fingerprint::walk_fingerprint` can call this with just the
 /// directory they are already walking — neither needs a new parameter.
@@ -347,7 +296,7 @@ pub fn dar_masks(patterns: &[String]) -> DarMasks {
 /// to collapse to the same empty Vec via `unwrap_or_default()` — silently
 /// indistinguishable from "no excludes configured." That is exactly how a
 /// misspelled `[excludes] pattern` (singular) key let material an operator
-/// meant to exclude reach dar's `-X` masks as zero entries, get archived
+/// meant to exclude reach the archive as zero exclusions, get archived
 /// and encrypted, and land on write-once media anyway. A dotfile present
 /// but unparseable is now a loud, named `Err` that reaches the caller —
 /// including the TOCTOU case where it is removed between the `exists()`
@@ -367,7 +316,7 @@ pub fn dotfile_patterns(dir_path: &Path) -> Result<Vec<String>> {
 
 /// The full, compiled "effective excludes" set for `dir_path`: the caller's
 /// `global_excludes` (`config.defaults.global_excludes` — issue #49 item
-/// 5's other half, previously reaching dar only, never either walk) plus
+/// 5's other half, previously reaching the archiver only, never either walk) plus
 /// this directory's own dotfile `[excludes] patterns` (`dotfile_patterns`,
 /// item 2, already wired).
 ///
@@ -418,10 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_is_case_insensitive_like_dars_an_flag() {
-        // dar's create_command unconditionally passes -an before its -X
-        // loop (src/dar/create.rs) — a case-sensitive matcher here would
-        // silently disagree with what dar actually excludes.
+    fn matching_is_case_insensitive() {
         let compiled = compile(&["thumbs.db".to_string()]);
         assert!(is_excluded(Path::new("Thumbs.db"), &compiled));
         assert!(is_excluded(Path::new("THUMBS.DB"), &compiled));
@@ -456,6 +402,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
@@ -491,6 +438,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
@@ -510,7 +458,7 @@ mod tests {
     /// Vec. That was pinning issue #263's own defect: a PRESENT-but-
     /// unparseable dotfile is indistinguishable from "no excludes
     /// configured," which is exactly how a misspelled `[excludes] pattern`
-    /// key let material reach dar's `-X` masks as zero entries and get
+    /// key let material reach the archive as zero exclusions and get
     /// archived onto write-once media. Inverted to assert the loud `Err`
     /// this function must now return instead — absent still stays silent
     /// (`dotfile_patterns_is_empty_when_no_dotfile_exists`, unchanged
@@ -550,6 +498,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: Some("mtime_size".into()),
                 compression: Some("none".into()),
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
@@ -650,6 +599,7 @@ mod tests {
                 archive_set: None,
                 checksum_mode: None,
                 compression: None,
+                compression_level: None,
                 slice_size: None,
                 warehouse_copies: None,
                 allow_spanning: None,
@@ -675,18 +625,17 @@ mod tests {
         assert!(!is_excluded(&root.join("a.txt"), &set));
     }
 
-    /// dar's `-P` (what a directory pattern becomes for dar, `dar_masks`)
-    /// prunes a FILE of that name as well as a directory -- the walks match
-    /// it, so the manifest and the archive agree.
+    /// A directory pattern leaves out a FILE of that name as well as a
+    /// directory.
     #[test]
-    fn a_directory_pattern_also_excludes_a_file_of_that_name_as_dar_prune_does() {
+    fn a_directory_pattern_also_excludes_a_file_of_that_name() {
         let tmp = TempDir::new().unwrap();
         let set = effective_compiled(tmp.path(), &[".cache/".to_string()]).unwrap();
         assert!(is_excluded(&tmp.path().join("sub/.cache"), &set));
     }
 
     /// A directory ENTRY inside a pruned subtree is excluded; the pruned
-    /// directory itself is kept, as dar's `-D` keeps it (an empty directory).
+    /// directory itself is kept (an empty directory).
     #[test]
     fn excludes_dir_entry_keeps_the_pruned_directory_but_not_its_descendants() {
         let tmp = TempDir::new().unwrap();
@@ -697,97 +646,7 @@ mod tests {
         assert!(set.excludes_dir_entry(&root.join(".cache/deep")));
         assert!(set.excludes_dir_entry(&root.join("a/.cache/deep/deeper")));
         assert!(!set.excludes_dir_entry(&root.join("a/b")));
-        // A plain pattern never matches a directory (dar's own -X rule).
+        // A plain pattern never matches a directory.
         assert!(!set.excludes_dir_entry(&root.join("x.tmp/inner")));
-    }
-
-    #[test]
-    fn dar_masks_split_plain_patterns_from_directory_prunes() {
-        let masks = dar_masks(&[
-            "*.tmp".to_string(),
-            ".cache/".to_string(),
-            "node_modules//".to_string(),
-            "a/b/".to_string(),
-            "/".to_string(),
-        ]);
-        assert_eq!(masks.exclude, vec!["*.tmp".to_string()]);
-        assert_eq!(
-            masks.prune,
-            vec![
-                ".cache".to_string(),
-                "*/.cache".to_string(),
-                "node_modules".to_string(),
-                "*/node_modules".to_string(),
-            ],
-            "a directory pattern prunes by name at any depth; one with an interior \
-             slash (or no name at all) matches nothing, in dar as in the walks"
-        );
-    }
-
-    /// The end-to-end parity proof for the masks `stage_create` hands
-    /// dar: an archive made with `dar_masks` holds exactly the regular files
-    /// `staging::walk_directory` records under the same patterns. Runs the
-    /// real dar (a hard dependency of the ungated suite, issue #43).
-    #[test]
-    fn dar_with_dar_masks_archives_exactly_what_the_walk_records() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("unit");
-        cache_fixture(&root);
-        std::fs::write(root.join("junk.TMP"), b"j").unwrap();
-        let patterns = vec![".cache/".to_string(), "*.tmp".to_string()];
-
-        let mut walked =
-            super::super::walk_directory_relative_paths_for_test(root.to_str().unwrap(), &patterns)
-                .unwrap();
-        walked.sort();
-
-        let masks = dar_masks(&patterns);
-        let out = tmp.path().join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let base = out.join("a");
-        crate::dar::create::archive_to_files(
-            &crate::dar::create::DarCreateParams {
-                dar_binary: "dar",
-                source_path: &root,
-                compression: "none",
-                exclude_patterns: &masks.exclude,
-                exclude_paths: &masks.prune,
-                preserve_xattrs: false,
-                preserve_fsa: false,
-                on_fly_catalogue: &out.join("onfly"),
-            },
-            &base,
-            "1G",
-        )
-        .unwrap();
-        let dest = tmp.path().join("restored");
-        crate::dar::restore::extract("dar", &base, &dest).unwrap();
-        let mut archived: Vec<String> = walkdir::WalkDir::new(&dest)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| {
-                e.path()
-                    .strip_prefix(&dest)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-        archived.sort();
-
-        assert_eq!(
-            archived, walked,
-            "dar (given dar_masks) and walk_directory must agree on the file set"
-        );
-        assert_eq!(
-            walked,
-            vec![
-                "a/b/ok".to_string(),
-                "sub/.cachefile".to_string(),
-                "sub/keep/k".to_string(),
-                "top.txt".to_string(),
-            ]
-        );
     }
 }

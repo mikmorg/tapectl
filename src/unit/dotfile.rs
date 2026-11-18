@@ -16,6 +16,10 @@ pub struct UnitDotfile {
     pub archive_set: Option<String>,
     pub checksum_mode: Option<String>,
     pub compression: Option<String>,
+    /// Item 287: `[policy] compression_level`. Modeled here so a round trip
+    /// (`unit tag`, `unit rename`) keeps it, as issue #212 had to for
+    /// `slice_size`. `None`: the dotfile is silent.
+    pub compression_level: Option<i64>,
     /// Issue #212: `[policy] slice_size` was read and honoured (by
     /// `policy::resolve` and `staging::resolve_slice_size_string`) since
     /// issue #47, but was never modeled here -- so `read_dotfile` dropped it
@@ -128,6 +132,10 @@ pub(crate) struct PolicySection {
     pub(crate) checksum_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) compression: Option<String>,
+    /// Item 287: the level `compression` packs at. Skipped when unset, so a
+    /// dotfile that never named it is rewritten byte for byte as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compression_level: Option<i64>,
     /// Issue #212. No `#[serde(default)]` -- see `warehouse_copies` below.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) slice_size: Option<String>,
@@ -199,6 +207,7 @@ pub fn is_unit_dotfile(rel_path: &str) -> bool {
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
     let policy = if data.checksum_mode.is_none()
         && data.compression.is_none()
+        && data.compression_level.is_none()
         && data.slice_size.is_none()
         && data.warehouse_copies.is_none()
         && data.allow_spanning.is_none()
@@ -209,6 +218,7 @@ pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
         Some(PolicySection {
             checksum_mode: data.checksum_mode.clone(),
             compression: data.compression.clone(),
+            compression_level: data.compression_level,
             slice_size: data.slice_size.clone(),
             warehouse_copies: data.warehouse_copies,
             allow_spanning: data.allow_spanning,
@@ -265,6 +275,7 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
             .as_ref()
             .and_then(|p| p.checksum_mode.clone()),
         compression: wrapper.policy.as_ref().and_then(|p| p.compression.clone()),
+        compression_level: wrapper.policy.as_ref().and_then(|p| p.compression_level),
         slice_size: wrapper.policy.as_ref().and_then(|p| p.slice_size.clone()),
         warehouse_copies: wrapper.policy.as_ref().and_then(|p| p.warehouse_copies),
         allow_spanning: wrapper.policy.as_ref().and_then(|p| p.allow_spanning),
@@ -295,6 +306,7 @@ mod tests {
             archive_set: Some("cold".into()),
             checksum_mode: Some("sha256".into()),
             compression: Some("lzma".into()),
+            compression_level: None,
             slice_size: None,
             warehouse_copies: None,
             allow_spanning: None,

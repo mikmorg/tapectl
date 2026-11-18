@@ -38,13 +38,13 @@ pub const DEFAULT_JOBS: usize = 1;
 /// The most units `[staging] jobs` or `--jobs` may stage at once.
 pub const MAX_JOBS: usize = 16;
 
-/// What one stage in flight may hold of the host's memory: the source it
-/// keeps in the page cache between dar's read and the hasher's
-/// (`validate::READ_AHEAD_BYTES`, 128 MiB) and behind both until it is
-/// dropped (a 16 MiB window, issue #441), and its own buffers and queues —
-/// dar's stream buffer, the slice file's, and the bounded hash queues — with
-/// room to spare: 192 MiB in all.
-pub const MEMORY_PER_JOB: u64 = super::validate::READ_AHEAD_BYTES + (64 << 20);
+/// What one stage in flight may hold of the host's memory: the stream
+/// reader's (a member's extension headers, at most `tar::stream::MAX_EXTENDED`
+/// = 64 MiB, and a 64 KiB chunk), the slice file's 1 MiB buffer and the
+/// bounded hash queues, with room to spare: 192 MiB in all. A zstd staging
+/// also holds one slice's cut while that slice is packed (`staging::pack`:
+/// the frame states its size); that is not counted here.
+pub const MEMORY_PER_JOB: u64 = 192 << 20;
 
 /// One unit to stage: its name, for the operator, and the snapshot to stage.
 #[derive(Debug, Clone)]
@@ -246,13 +246,7 @@ pub fn stage_many(
     match (parallel, db_file) {
         (p, Some(db_file)) if p > 1 => {
             let order = largest_first(conn, jobs)?;
-            // The cores are shared: each stage hashes with its share of them
-            // (issue #366's threads), never fewer than one.
-            let cores = std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1);
-            let mut cfg = config.clone();
-            cfg.staging.hash_threads = (cores / p).clamp(1, config.staging.hash_threads.max(1));
+            let cfg = config.clone();
             let next = AtomicUsize::new(0);
             let failed = AtomicBool::new(false);
             std::thread::scope(|s| {
@@ -438,7 +432,6 @@ mod tests {
         let staging = tmp.path().join("staging");
         fs::create_dir_all(&staging).unwrap();
         let mut config = Config::default();
-        config.dar.binary = "dar".into();
         config.staging.directory = staging.to_string_lossy().into_owned();
         config.defaults.slice_size = "1M".into();
         crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
@@ -498,7 +491,7 @@ mod tests {
         )
     }
 
-    /// Per unit: its stage sets' statuses, slice count and dar size, and its
+    /// Per unit: its stage sets' statuses, slice count and stream size, and its
     /// files' recorded sha256s.
     /// `(unit, stage set statuses, slices, (path, sha256) per file)`.
     type Recorded = (String, Vec<String>, i64, Vec<(String, String)>);
@@ -516,7 +509,7 @@ mod tests {
             .map(|(id, name)| {
                 let sets: Vec<(String, i64, i64)> = conn
                     .prepare(
-                        "SELECT ss.status, COALESCE(ss.num_slices, 0), COALESCE(ss.total_dar_size, 0)
+                        "SELECT ss.status, COALESCE(ss.num_slices, 0), COALESCE(ss.stream_bytes, 0)
                          FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
                          WHERE s.unit_id = ?1 ORDER BY ss.id",
                     )
@@ -546,8 +539,9 @@ mod tests {
                     .unwrap();
                 let statuses = sets.iter().map(|s| s.0.clone()).collect();
                 let slices = sets.iter().map(|s| s.1).sum();
-                // Not the dar size (s.2): dar records each file's times, which differ
-                // between the two trees, at a width that follows their values.
+                // Not the stream size (s.2): the stream records each file's
+                // times, which differ between the two trees, at a width that
+                // follows their values.
                 (name, statuses, slices, hashes)
             })
             .collect()
@@ -707,95 +701,42 @@ mod tests {
         files
     }
 
-    /// Issue #366, end to end: `stage create` hashing several files at once
-    /// records the manifest the one-file-at-a-time pass records — every
-    /// file's sha256, byte for byte, and each the sha256 of the file on disk
-    /// — and stays inside the single-read budget at every thread count:
-    /// each source file opened by the hasher once and its bytes read once
-    /// (issue #364), never a second pass. Files really were hashed at once
-    /// where the host has the cores for it.
+    /// `stage create` on tar takes each file's sha256 from the stream
+    /// (ADR-0012 item 253): every file of every unit staged is recorded with
+    /// the sha256 of the file on disk, the dotfiles too.
     #[test]
-    fn hashing_files_at_once_stages_the_serial_manifest_and_reads_each_byte_once() {
-        use super::super::validate::hash_hook;
+    fn every_staged_file_is_recorded_with_the_sha256_of_its_bytes() {
         use sha2::{Digest, Sha256};
         const TREE: [(&str, usize, usize); 3] = [
             ("u-tree", 48, 40_000),
             ("u-wide", 5, 700_000),
             ("u-tiny", 2, 10),
         ];
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let mut want: Option<Vec<Recorded>> = None;
-        for threads in [1, 4, 8] {
-            let (mut h, jobs) = home(&TREE);
-            h.config.staging.hash_threads = threads;
-            // As the unit's source path is recorded: resolved (a temp
-            // directory may sit behind a symlink).
-            let root = fs::canonicalize(h._tmp.path().join("src")).unwrap();
-            hash_hook::count_reads(&root);
-            hash_hook::track(&root);
-            // Each file stays in flight a moment after its hash, so threads
-            // that run at all are seen to overlap.
-            hash_hook::set(&root, |_| {
-                std::thread::sleep(std::time::Duration::from_millis(3))
-            });
-            let out = stage_many(
-                &h.conn,
-                &h.paths,
-                &h.config,
-                &jobs,
-                1,
-                false,
-                &mut Vec::new(),
-                &|_| {},
-            );
-            hash_hook::clear(&root);
-            let most = hash_hook::untrack(&root);
-            let reads = hash_hook::reads(&root);
-            assert_eq!(first_failure(out.unwrap()).unwrap().len(), TREE.len());
-
-            let files = source_files(&root);
-            assert_eq!(files.len(), 48 + 5 + 2 + TREE.len(), "with the dotfiles");
-            let opened: Vec<(std::path::PathBuf, usize)> = {
-                let mut v: Vec<_> = reads.opens.into_iter().collect();
-                v.sort();
-                v
-            };
-            assert_eq!(
-                opened,
-                files
-                    .iter()
-                    .map(|(p, _)| (p.clone(), 1))
-                    .collect::<Vec<_>>(),
-                "{threads} thread(s): every source file opened by the hasher exactly once"
-            );
-            let bytes: u64 = files.iter().map(|(_, n)| n).sum();
-            assert!(bytes > 0);
-            assert_eq!(
-                reads.bytes, bytes,
-                "{threads} thread(s): every source byte hashed exactly once"
-            );
-            let threads_run = threads.min(cores);
-            if threads_run > 1 {
-                assert!(
-                    (2..=threads_run).contains(&most),
-                    "{threads} thread(s): {most} file(s) hashed at once"
-                );
-            } else {
-                assert_eq!(most, 1, "one thread hashes one file at a time");
-            }
-
-            let got = recorded(&h.conn);
-            for (unit, _, _, hashes) in &got {
-                for (path, sha) in hashes {
-                    let on_disk = fs::read(root.join(unit).join(path)).unwrap();
-                    assert_eq!(sha, &format!("{:x}", Sha256::digest(&on_disk)), "{path}");
-                }
-            }
-            match &want {
-                None => want = Some(got),
-                Some(serial) => assert_eq!(&got, serial, "{threads} thread(s) vs one"),
+        let (h, jobs) = home(&TREE);
+        let root = fs::canonicalize(h._tmp.path().join("src")).unwrap();
+        let out = stage_many(
+            &h.conn,
+            &h.paths,
+            &h.config,
+            &jobs,
+            1,
+            false,
+            &mut Vec::new(),
+            &|_| {},
+        );
+        assert_eq!(first_failure(out.unwrap()).unwrap().len(), TREE.len());
+        let files = source_files(&root);
+        assert_eq!(files.len(), 48 + 5 + 2 + TREE.len(), "with the dotfiles");
+        let got = recorded(&h.conn);
+        let mut seen = 0;
+        for (unit, _, _, hashes) in &got {
+            for (path, sha) in hashes {
+                let on_disk = fs::read(root.join(unit).join(path)).unwrap();
+                assert_eq!(sha, &format!("{:x}", Sha256::digest(&on_disk)), "{path}");
+                seen += 1;
             }
         }
+        assert_eq!(seen, 48 + 5 + 2, "every file of the snapshots is recorded");
     }
 
     /// Issue #368 with issue #386: several units staged at once each log to

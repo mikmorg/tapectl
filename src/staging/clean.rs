@@ -363,11 +363,9 @@ fn in_the_window() {}
 /// - Files named for the set that no `staging_path` names, by
 ///   dot-terminated filesystem prefix (`staging::archive_base_prefix`,
 ///   scanned under `config.staging.directory`): a `'failed'` set's
-///   plaintext `.dar`/`.sha512` (dar writes all slices up front, so most
-///   have no `stage_slices` row at all) and its half-written `.dar.age`
-///   (issue #402: the crash came before the row); and, for any released
-///   set, a `.dar.age` an older, interrupted clean nulled the path of
-///   without unlinking (issue #402).
+///   half-written `.tar.age` (issue #402: the crash came before the row);
+///   and, for any released set, a `.tar.age` an older, interrupted clean
+///   nulled the path of without unlinking (issue #402).
 ///
 /// Ordering is load-bearing: `stage_slices.staging_path` is the ONLY handle
 /// on a staged `.age` file, so every DB change (nulling `staging_path`,
@@ -555,9 +553,8 @@ pub fn clean_staging(
                 };
 
                 // Files named for this set that no `staging_path` names
-                // (issue #402): a 'failed' set's plaintext `.dar`/`.sha512`
-                // (dar writes every slice up front) and a half-written
-                // `.dar.age` (the crash came before its row); and, for either
+                // (issue #402): a 'failed' set's half-written `.tar.age`
+                // (the crash came before its row); and, for either
                 // status, a `.age` whose path an older, interrupted clean
                 // nulled without unlinking it. The prefix carries the stage
                 // set id, so nothing live can match it, and the set is
@@ -1020,14 +1017,13 @@ fn remove_and_account(path: &Path, report: &mut CleanReport) {
     }
 }
 
-/// Files named for `stage_set_id` in `staging_dir` — plaintext
-/// `.dar`/`.sha512` left by a crashed dar run, and `.dar.age` ciphertext
+/// Files named for `stage_set_id` in `staging_dir` — `.tar.age` ciphertext
 /// (issue #402: a half-written one has no `stage_slices` row; one an older
 /// interrupted clean nulled has no `staging_path`) — by the same
 /// dot-terminated prefix rule as `staging::cleanup_failed_stage_set`'s
-/// `archive_base_prefix` (issue #54): dar names every slice
-/// `{base}.{N}.dar`, so `{base}.` (not the bare base) is the real
-/// filesystem prefix, keeping `_s1` from prefix-matching `_s10.1.dar`.
+/// `archive_base_prefix` (issue #54): every slice is
+/// `{base}.{N}.tar.age`, so `{base}.` (not the bare base) is the real
+/// filesystem prefix, keeping `_s1` from prefix-matching `_s10.1.tar.age`.
 fn find_prefix_orphans(
     conn: &Connection,
     staging_dir: &Path,
@@ -1054,11 +1050,7 @@ fn find_prefix_orphans(
     if let Ok(entries) = fs::read_dir(staging_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix)
-                && (name.ends_with(".dar")
-                    || name.ends_with(".sha512")
-                    || name.ends_with(".dar.age"))
-            {
+            if name.starts_with(&prefix) && name.ends_with(crate::staging::SLICE_SUFFIX) {
                 found.push(entry.path());
             }
         }
@@ -1417,10 +1409,11 @@ const HOME_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 
 /// - **`<home>/catalogs/<uuid8>/s<id>/`** (issue #419) of a stage set that
 ///   never staged: `staged_at IS NULL`, and `failed` — or `cleaned`, because
 ///   `clean_staging` releases failed sets before this runs. A set that was
-///   staged keeps its catalogue even when released: `restore` reads it
-///   (`dar::restore::entry_slices`). A set still `staging` is live.
-/// - **`<home>/tmp/*`** (`staging::home_work_dir`: dar's slice template, the
-///   write's `catalog.db`), when nothing in the entry changed for
+///   staged keeps its catalogue even when released: Layout 2's restore read
+///   it, until T4.8 ports the restores. A set still `staging` is live; a
+///   staging on tar makes no such directory.
+/// - **`<home>/tmp/*`** (`staging::home_work_dir`: tar's file list and
+///   probe, the write's `catalog.db`), when nothing in the entry changed for
 ///   [`HOME_TMP_MAX_AGE`]. Never a younger one: a live run is using it.
 ///
 /// The home is the directory holding the catalog, as for the lockfiles.
@@ -1876,12 +1869,12 @@ mod tests {
         }
     }
 
-    /// A `'failed'` stage_set with NO `stage_slices` rows (the common shape
-    /// for a crash before the encryption loop starts) but real plaintext
-    /// `.dar`/`.sha512` files sitting under `staging_dir`, named exactly the
-    /// way `stage_create_inner`'s dar run would have named them. Returns
-    /// `(conn, stage_set_id, staging_dir, dar_path, sha512_path, TempDir guard)`.
-    fn seed_failed_stage_set_with_plaintext_orphan() -> (
+    /// A `'failed'` stage_set with NO `stage_slices` rows (a crash before
+    /// any slice was recorded) but two `.tar.age` files sitting under
+    /// `staging_dir`, named exactly the way `stage_create_inner` names its
+    /// slices. Returns `(conn, stage_set_id, staging_dir, slice 1, slice 2,
+    /// TempDir guard)`.
+    fn seed_failed_stage_set_with_rowless_slices() -> (
         Connection,
         i64,
         std::path::PathBuf,
@@ -1920,17 +1913,17 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let prefix = crate::staging::archive_base_prefix(unit_uuid, 1, stage_set_id);
-        let dar_path = dir.path().join(format!("{prefix}1.dar"));
-        let sha_path = dir.path().join(format!("{prefix}1.sha512"));
-        std::fs::write(&dar_path, b"plaintext dar slice").unwrap();
-        std::fs::write(&sha_path, b"deadbeef").unwrap();
+        let slice_1 = dir.path().join(format!("{prefix}1.tar.age"));
+        let slice_2 = dir.path().join(format!("{prefix}2.tar.age"));
+        std::fs::write(&slice_1, b"age-encryption.org/v1\nslice 1").unwrap();
+        std::fs::write(&slice_2, b"age-encryption.org/v1\nslice 2").unwrap();
 
         (
             conn,
             stage_set_id,
             dir.path().to_path_buf(),
-            dar_path,
-            sha_path,
+            slice_1,
+            slice_2,
             dir,
         )
     }
@@ -2748,22 +2741,22 @@ mod tests {
     }
 
     /// The common crash shape: a `'failed'` stage_set with zero
-    /// `stage_slices` rows (the process died before the encryption loop
-    /// ever inserted one) but real plaintext `.dar`/`.sha512` files dar left
-    /// behind. `clean_staging` must find and remove them by dot-terminated
-    /// filesystem prefix, exactly as `cleanup_failed_stage_set` (#54) would
-    /// have if the process had lived long enough to run its own Err path.
+    /// `stage_slices` rows (the process died before a slice was recorded)
+    /// but `.tar.age` files left behind. `clean_staging` must find and
+    /// remove them by dot-terminated filesystem prefix, exactly as
+    /// `cleanup_failed_stage_set` (#54) would have if the process had lived
+    /// long enough to run its own Err path.
     #[test]
-    fn failed_set_with_no_slice_rows_removes_plaintext_orphans_by_prefix() {
-        let (conn, stage_set_id, staging_dir, dar_path, sha_path, _dir) =
-            seed_failed_stage_set_with_plaintext_orphan();
+    fn failed_set_with_no_slice_rows_removes_rowless_slices_by_prefix() {
+        let (conn, stage_set_id, staging_dir, slice_1, slice_2, _dir) =
+            seed_failed_stage_set_with_rowless_slices();
 
         let report =
             clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
-        assert_eq!(report.files_removed, 2, "both .dar and .sha512 orphans");
-        assert!(!dar_path.exists(), "orphaned .dar must be removed");
-        assert!(!sha_path.exists(), "orphaned .sha512 must be removed");
+        assert_eq!(report.files_removed, 2, "both rowless slices");
+        assert!(!slice_1.exists(), "rowless slice 1 must be removed");
+        assert!(!slice_2.exists(), "rowless slice 2 must be removed");
 
         let status: String = conn
             .query_row(
@@ -3045,19 +3038,19 @@ mod tests {
         assert_eq!(nulled, 2);
     }
 
-    /// Issue #402: a half-written `{prefix}N.dar.age` — the crash came
+    /// Issue #402: a half-written `{prefix}N.tar.age` — the crash came
     /// after the encryption started and before its `stage_slices` row —
-    /// has no row, so discovery by row never saw it. The prefix scan now
-    /// includes `.dar.age`.
+    /// has no row, so discovery by row never saw it. The prefix scan
+    /// finds it.
     #[test]
     fn a_failed_sets_rowless_age_file_is_removed_by_prefix() {
         let (conn, stage_set_id, _path, dir) = seed_stage_set_with_status("failed");
         let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
-        let half_written = dir.path().join(format!("{prefix}2.dar.age"));
+        let half_written = dir.path().join(format!("{prefix}2.tar.age"));
         std::fs::write(&half_written, b"half an encryption").unwrap();
         // A sibling stage set's file must not match (the trailing dot).
         let sibling = dir.path().join(format!(
-            "{}1.dar.age",
+            "{}1.tar.age",
             crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id * 10)
         ));
         std::fs::write(&sibling, b"not ours").unwrap();
@@ -3066,7 +3059,7 @@ mod tests {
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert!(
             !half_written.exists(),
-            "the row-less .dar.age must be removed"
+            "the row-less .tar.age must be removed"
         );
         assert!(
             sibling.exists(),
@@ -3083,7 +3076,7 @@ mod tests {
     fn releasing_a_half_cleaned_set_removes_its_nulled_age_files() {
         let (conn, stage_set_id, path, dir) = seed_stage_set();
         let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
-        let stranded = dir.path().join(format!("{prefix}2.dar.age"));
+        let stranded = dir.path().join(format!("{prefix}2.tar.age"));
         std::fs::write(&stranded, b"nulled but not unlinked").unwrap();
         conn.execute(
             "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
@@ -3673,7 +3666,7 @@ mod tests {
             let id = conn.last_insert_rowid();
             let dir = catalogue_dir(id);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("abcdef01_v1.1.dar"), b"catalogue").unwrap();
+            std::fs::write(dir.join("catalogue"), b"catalogue").unwrap();
             sets.push((id, status, staged));
         }
 
@@ -3701,7 +3694,7 @@ mod tests {
     }
 
     /// Issue #465 item 5: `<home>/tmp` holds the plaintext of a stage or a
-    /// write for a moment (dar's slice template, the write's `catalog.db`);
+    /// write for a moment (tar's file list, the write's `catalog.db`);
     /// a hard kill leaves it. `stage clean` removes what is older than a
     /// day — by the newest change anywhere in it, since a live write's file
     /// is rewritten inside a directory whose own mtime stays put — and
@@ -3723,11 +3716,11 @@ mod tests {
         let (day, hour) = (24 * 3600, 3600);
 
         // An old work directory and an old stray file: removed.
-        let old_dir = tmp.join(".dar-slice-template-old");
+        let old_dir = tmp.join(".tar-list-old");
         std::fs::create_dir_all(old_dir.join("empty")).unwrap();
-        std::fs::write(old_dir.join("template.1.dar"), b"x").unwrap();
+        std::fs::write(old_dir.join("tar-list-x"), b"x").unwrap();
         for p in [
-            old_dir.join("template.1.dar"),
+            old_dir.join("tar-list-x"),
             old_dir.join("empty"),
             old_dir.clone(),
         ] {
@@ -3737,7 +3730,7 @@ mod tests {
         std::fs::write(&old_file, b"x").unwrap();
         age(&old_file, 2 * day);
         // A young directory and file: kept.
-        let young_dir = tmp.join(".dar-slice-template-young");
+        let young_dir = tmp.join(".tar-list-young");
         std::fs::create_dir_all(&young_dir).unwrap();
         age(&young_dir, hour);
         let young_file = tmp.join("catalog-young.db");
@@ -3870,31 +3863,31 @@ mod tests {
         assert_eq!(report.errors, 0);
     }
 
-    /// A sibling stage_set's plaintext files must never be swept up by
+    /// A sibling stage_set's files must never be swept up by
     /// another stage_set's prefix scan — the same collision this repo's
     /// `archive_base_prefix` trailing-dot convention already guards against
     /// for `cleanup_failed_stage_set`. Uses stage_set ids 1 and 10 so a
     /// naive (non-dot-terminated) prefix match would wrongly conflate them.
     #[test]
     fn failed_set_prefix_scan_does_not_touch_a_sibling_stage_sets_files() {
-        let (conn, stage_set_id, staging_dir, dar_path, _sha_path, dir) =
-            seed_failed_stage_set_with_plaintext_orphan();
+        let (conn, stage_set_id, staging_dir, slice_1, _slice_2, dir) =
+            seed_failed_stage_set_with_rowless_slices();
 
         // A sibling stage_set (different id) sharing the same staging_dir,
         // deliberately NOT matched by this test's clean_staging call (it's
         // still 'staging', not 'failed' — never a cleanup candidate here).
         let other_uuid = "0123456789abcdef0123456789abcdef";
         let other_prefix = crate::staging::archive_base_prefix(other_uuid, 1, stage_set_id * 10);
-        let other_path = dir.path().join(format!("{other_prefix}1.dar"));
-        std::fs::write(&other_path, b"sibling's plaintext slice").unwrap();
+        let other_path = dir.path().join(format!("{other_prefix}1.tar.age"));
+        std::fs::write(&other_path, b"sibling's slice").unwrap();
 
         let report =
             clean_staging(&conn, &config_for(&staging_dir), false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 1);
-        assert!(!dar_path.exists());
+        assert!(!slice_1.exists());
         assert!(
             other_path.exists(),
-            "a sibling stage_set's plaintext files must survive"
+            "a sibling stage_set's files must survive"
         );
     }
 }

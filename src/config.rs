@@ -102,6 +102,12 @@ pub struct Config {
     #[serde(default)]
     pub dar: DarConfig,
 
+    /// GNU tar, the writer of Layout 3's data zone (`volume-format-v3.md`
+    /// §3.1; D11). `[dar]` is parsed until T4.15 removes it, and read by
+    /// nothing that stages.
+    #[serde(default)]
+    pub tar: TarConfig,
+
     #[serde(default)]
     pub backends: BackendsConfig,
 
@@ -311,6 +317,31 @@ pub const HOST_CHECK_EXAMPLE: &str = r#"
 # max_memory_pressure_pct = 10.0  # /proc/pressure/memory full avg60
 # max_io_pressure_pct = 10.0      # /proc/pressure/io full avg60
 "#;
+
+/// `[tar]`: the one key `binary` (D11), a bare name found on `PATH`, or a
+/// path. The floor it is held to is GNU tar 1.35 built with ACL support
+/// (ADR-0012 item 274; `tar::probe`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TarConfig {
+    #[serde(default = "default_tar_binary")]
+    pub binary: String,
+}
+
+/// Bare `tar`, found on `PATH` when run: never a hard-coded `/usr/bin/tar`,
+/// since a host whose system tar is below the floor has the writer's tar in
+/// `/usr/local` (ADR-0012 item 275).
+fn default_tar_binary() -> String {
+    "tar".to_string()
+}
+
+impl Default for TarConfig {
+    fn default() -> Self {
+        Self {
+            binary: default_tar_binary(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -833,6 +864,10 @@ pub struct ArchiveSetConfig {
     pub required_locations: Option<Vec<String>>,
     pub encrypt: Option<bool>,
     pub compression: Option<String>,
+    /// Item 287: the level this set's `compression` packs at. Absent means
+    /// the set does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_level: Option<i64>,
     pub checksum_mode: Option<String>,
     pub verify_interval_days: Option<i32>,
     pub slice_size: Option<String>,
@@ -860,6 +895,11 @@ pub struct DefaultsConfig {
     pub slice_size: String,
     #[serde(default = "default_compression")]
     pub compression: String,
+    /// The level `compression` packs each slice at (item 287; D15): within
+    /// the algorithm's own range (gzip 1-9, xz 0-9, zstd 1-19). Absent: the
+    /// algorithm's default (gzip 6, xz 6, zstd 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_level: Option<i64>,
     #[serde(default = "default_checksum_mode")]
     pub checksum_mode: String,
     #[serde(default = "default_true")]
@@ -979,6 +1019,7 @@ impl Default for DefaultsConfig {
         Self {
             slice_size: default_slice_size(),
             compression: default_compression(),
+            compression_level: None,
             checksum_mode: default_checksum_mode(),
             encrypt: true,
             preserve_xattrs: true,
@@ -1005,12 +1046,6 @@ impl Default for DefaultsConfig {
 pub struct StagingConfig {
     #[serde(default = "default_staging_dir")]
     pub directory: String,
-    /// How many source files one `stage create` hashes at once (issue
-    /// #366), at most the host's cores. Each thread reads its own file, so
-    /// on a single spinning disk more threads can mean more seeking; 1 is
-    /// the serial pass.
-    #[serde(default = "default_hash_threads")]
-    pub hash_threads: usize,
     /// How many units `stage create`, `collection run` and first-run stage
     /// at once (issue #368); `stage create --jobs` and `collection run
     /// --jobs` override it. 1 stages one unit after another.
@@ -1020,10 +1055,6 @@ pub struct StagingConfig {
 
 fn default_stage_jobs() -> usize {
     crate::staging::jobs::DEFAULT_JOBS
-}
-
-fn default_hash_threads() -> usize {
-    crate::staging::validate::DEFAULT_HASH_THREADS
 }
 
 /// Issue #140: this was `/mnt/staging`, a path that does not exist on a
@@ -1049,7 +1080,6 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             directory: default_staging_dir(),
-            hash_threads: default_hash_threads(),
             jobs: default_stage_jobs(),
         }
     }
@@ -1558,8 +1588,21 @@ impl Config {
     /// pins a substring of one) are unaffected by this refactor.
     pub(crate) fn size_problems(&self, path: &Path) -> Vec<String> {
         let mut problems = Vec::new();
-        if let Err(e) = crate::staging::parse_size_to_bytes(&self.defaults.slice_size) {
-            problems.push(format!("{}: defaults.slice_size = {e}", path.display()));
+        match crate::staging::parse_size_to_bytes(&self.defaults.slice_size) {
+            Err(e) => problems.push(format!("{}: defaults.slice_size = {e}", path.display())),
+            Ok(bytes) => {
+                if let Some(e) = slice_size_block_problem(bytes) {
+                    problems.push(format!(
+                        "{}: defaults.slice_size = {:?}: {e}",
+                        path.display(),
+                        self.defaults.slice_size
+                    ));
+                }
+            }
+        }
+        if let Some(e) = level_problem(&self.defaults.compression, self.defaults.compression_level)
+        {
+            problems.push(format!("{}: defaults.{e}", path.display()));
         }
         if let Err(e) =
             crate::staging::parse_size_to_bytes(&self.defaults.large_file_warn_threshold)
@@ -1611,9 +1654,29 @@ impl Config {
         // (issue #200's rule: one parser per field, never a second one).
         for (i, as_cfg) in self.archive_sets.iter().enumerate() {
             if let Some(s) = &as_cfg.slice_size {
-                if let Err(e) = crate::staging::parse_size_to_bytes(s) {
-                    problems.push(format!(
+                match crate::staging::parse_size_to_bytes(s) {
+                    Err(e) => problems.push(format!(
                         "{}: archive_sets[{i}] (\"{}\").slice_size = {e}",
+                        path.display(),
+                        as_cfg.name
+                    )),
+                    Ok(bytes) => {
+                        if let Some(e) = slice_size_block_problem(bytes) {
+                            problems.push(format!(
+                                "{}: archive_sets[{i}] (\"{}\").slice_size = {s:?}: {e}",
+                                path.display(),
+                                as_cfg.name
+                            ));
+                        }
+                    }
+                }
+            }
+            // A level is judged against the set's own algorithm when it names
+            // one; otherwise against the algorithm a unit resolves, at stage.
+            if let (Some(c), Some(_)) = (&as_cfg.compression, as_cfg.compression_level) {
+                if let Some(e) = level_problem(c, as_cfg.compression_level) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").{e}",
                         path.display(),
                         as_cfg.name
                     ));
@@ -1890,18 +1953,6 @@ impl Config {
                 path.display()
             ));
         }
-        // `[staging] hash_threads` (issue #366): 0 would hash nothing, and a
-        // count past any host's cores is a typo, not a plan.
-        let threads = self.staging.hash_threads;
-        if !(1..=crate::staging::validate::MAX_HASH_THREADS).contains(&threads) {
-            problems.push(format!(
-                "{}: staging.hash_threads = {threads} must be between 1 and {} (how many \
-                 source files `stage create` hashes at once; it never runs more than the \
-                 host's cores)",
-                path.display(),
-                crate::staging::validate::MAX_HASH_THREADS
-            ));
-        }
         // `[staging] jobs` (issue #368).
         let jobs = self.staging.jobs;
         if !(1..=crate::staging::jobs::MAX_JOBS).contains(&jobs) {
@@ -2134,6 +2185,31 @@ pub fn validate_closed_set(
             accepted.join(", ")
         ))
     }
+}
+
+/// #562: a `slice_size` is a positive multiple of 512 bytes wherever it is
+/// set, so that a slice's cut is whole tar blocks (`volume-format-v3.md`
+/// §3.3). The problem, or `None`.
+pub fn slice_size_block_problem(bytes: i64) -> Option<String> {
+    if bytes > 0 && bytes % 512 == 0 {
+        return None;
+    }
+    Some(format!(
+        "{bytes} bytes is not a positive multiple of 512: a slice holds whole tar blocks \
+         (volume-format-v3.md §3.3); use a multiple of 512 bytes, such as 1G"
+    ))
+}
+
+/// Item 287: a `compression_level` beside `compression`, in the algorithm's
+/// own range. `compression_level = …` and why, or `None`. A level beside
+/// `none`, or beside an algorithm Layout 3 does not carry (refused where
+/// the algorithm is), is not judged here.
+pub fn level_problem(compression: &str, level: Option<i64>) -> Option<String> {
+    let level = level?;
+    if !matches!(compression, "gzip" | "xz" | "zstd") {
+        return None;
+    }
+    crate::staging::pack_level_problem(compression, level)
 }
 
 /// Compression algorithms `dar` accepts via `-z`. Moved here from
@@ -4381,37 +4457,6 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap().staging.jobs, 3);
         std::fs::write(&path, "[staging]\n").unwrap();
         assert_eq!(Config::load(&path).unwrap().staging.jobs, 1);
-    }
-
-    /// Issue #366: `[staging] hash_threads` is 1 to 64; 0 would hash nothing.
-    #[test]
-    fn config_load_takes_hash_threads_and_refuses_zero() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[staging]\nhash_threads = 0\n").unwrap();
-        let msg = Config::load(&path).unwrap_err().to_string();
-        assert!(msg.contains("staging.hash_threads = 0"), "{msg}");
-        std::fs::write(&path, "[staging]\nhash_threads = 2\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 2);
-        std::fs::write(&path, "[staging]\n").unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().staging.hash_threads,
-            crate::staging::validate::DEFAULT_HASH_THREADS
-        );
-    }
-
-    /// ADR-0012, 2026-10-07 amendment, item 12: `[staging] hash_threads`
-    /// defaults to 1 (the one-file-at-a-time pass) until home2's
-    /// measurements at 1/2/4/8 are in. A literal, not the constant: a test
-    /// comparing the default to `DEFAULT_HASH_THREADS` passes at any value.
-    #[test]
-    fn hash_threads_defaults_to_one() {
-        assert_eq!(crate::staging::validate::DEFAULT_HASH_THREADS, 1);
-        assert_eq!(StagingConfig::default().hash_threads, 1);
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[staging]\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 1);
     }
 
     #[test]

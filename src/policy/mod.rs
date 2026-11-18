@@ -28,6 +28,11 @@ pub struct ResolvedPolicy {
     pub required_locations: Vec<String>,
     pub encrypt: bool,
     pub compression: String,
+    /// Item 287: the level `compression` packs at, resolved through the same
+    /// three layers as `compression` (the most specific that sets it wins).
+    /// `None`: the algorithm's own default. Judged against the resolved
+    /// algorithm where a slice is packed (`staging::pack`).
+    pub compression_level: Option<i64>,
     pub checksum_mode: String,
     pub slice_size: i64,
     pub verify_interval_days: Option<i64>,
@@ -149,6 +154,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         required_locations: Vec::new(),
         encrypt: defaults.encrypt,
         compression: defaults.compression.clone(),
+        compression_level: defaults.compression_level,
         checksum_mode: defaults.checksum_mode.clone(),
         slice_size: crate::staging::parse_size_to_bytes(&defaults.slice_size).map_err(|e| {
             TapectlError::PolicyUnresolvable {
@@ -193,7 +199,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 "SELECT min_copies, required_locations, encrypt, compression, checksum_mode,
                     slice_size, verify_interval_days, preserve_xattrs, preserve_acls,
                     preserve_fsa, dirty_on_metadata_change, warehouse_copies, allow_spanning,
-                    copies_at, name
+                    copies_at, name, compression_level
              FROM archive_sets WHERE id = ?1",
                 params![as_id],
                 |row| {
@@ -213,6 +219,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                         row.get::<_, Option<i64>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, String>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
                     ))
                 },
             )
@@ -244,6 +251,7 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
             allow_spanning,
             copies_at_json,
             set_name,
+            compression_level,
         ) = row;
 
         if let Some(v) = min_copies {
@@ -273,6 +281,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
         }
         if let Some(v) = compression {
             policy.compression = v;
+        }
+        if compression_level.is_some() {
+            policy.compression_level = compression_level;
         }
         if let Some(v) = checksum_mode {
             policy.checksum_mode = v;
@@ -463,6 +474,12 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                     })?;
                     policy.compression = v;
                 }
+                // Item 287: beside `compression`, the most specific layer
+                // that sets it winning; its range is the resolved
+                // algorithm's, judged where a slice is packed.
+                if section.compression_level.is_some() {
+                    policy.compression_level = section.compression_level;
+                }
                 if let Some(v) = section.slice_size {
                     policy.slice_size = crate::staging::parse_size_to_bytes(&v).map_err(|e| {
                         TapectlError::PolicyUnresolvable {
@@ -474,6 +491,18 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                             ),
                         }
                     })?;
+                    // #562: a multiple of 512 wherever it is set.
+                    if let Some(e) = crate::config::slice_size_block_problem(policy.slice_size) {
+                        return Err(TapectlError::PolicyUnresolvable {
+                            layer: PolicyLayer::Dotfile,
+                            detail: format!(
+                                "unit \"{}\" has an invalid [policy] slice_size in {} \
+                                 (slice_size = {v:?}: {e})",
+                                unit.name,
+                                dotfile_path.display()
+                            ),
+                        });
+                    }
                 }
                 // ADR-0006 / issue #73. Absent means "defer to the archive
                 // set", so there is deliberately no default filled in
