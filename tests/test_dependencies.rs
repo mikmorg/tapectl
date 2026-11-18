@@ -134,3 +134,40 @@ fn installed_dar_meets_the_documented_minimum() {
          (enforced at runtime by src/dar/version.rs): {version_line:?}"
     );
 }
+
+/// Layout 3's tools (2.0.0, the plan's T4.0), named beside dar: `setfacl` and
+/// `getfacl` from `acl`, for the stream's ACL checks (ADR-0012 items 270, 274),
+/// and the decompressor of each algorithm Layout 3 carries (item 285), which
+/// tests use to read library-made slices back with the real tool.
+const LAYOUT3_TOOLS: &[(&str, &str, &str)] = &[
+    ("setfacl", "--version", "acl"),
+    ("getfacl", "--version", "acl"),
+    ("gzip", "--version", "gzip"),
+    ("xz", "--version", "xz-utils"),
+    ("zstd", "--version", "zstd"),
+];
+
+fn tool_runs(name: &str, arg: &str) -> bool {
+    Command::new(name)
+        .arg(arg)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn layout_3s_tools_are_on_path() {
+    let missing: Vec<String> = LAYOUT3_TOOLS
+        .iter()
+        .filter(|(name, arg, _)| !tool_runs(name, arg))
+        .map(|(name, _, package)| format!("{name} (Debian/Ubuntu package `{package}`)"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these tools are not on PATH, and Layout 3's tests run them for real:\n  {}\n\n\
+         Install them (Debian/Ubuntu: `sudo apt install acl gzip xz-utils zstd`).",
+        missing.join("\n  "),
+    );
+}
