@@ -985,12 +985,10 @@ impl Default for DefaultsConfig {
             preserve_acls: true,
             preserve_fsa: true,
             dirty_on_metadata_change: false,
-            global_excludes: vec![
-                "*.nfo".into(),
-                "Thumbs.db".into(),
-                ".DS_Store".into(),
-                "*.tmp".into(),
-            ],
+            // ADR-0012 item 252 (#542): no file is left out unless the
+            // operator names the pattern. The old list (`*.nfo`, `Thumbs.db`,
+            // `.DS_Store`, `*.tmp`) was a guess about what is junk.
+            global_excludes: Vec::new(),
             large_file_warn_threshold: default_large_file_warn(),
             min_copies: default_min_copies(),
             min_locations: default_min_locations(),
@@ -3552,6 +3550,25 @@ mod tests {
         assert!(serialized.contains("min_copies = 2"), "{serialized}");
         assert!(serialized.contains("min_locations = 2"), "{serialized}");
         assert!(!serialized.contains("_for_tape_only"), "{serialized}");
+    }
+
+    /// ADR-0012 item 252 (#542): `init` writes no exclusion at all, so no
+    /// file is left out of a unit unless the operator said so. A config that
+    /// names patterns keeps them.
+    #[test]
+    fn init_writes_an_empty_exclusion_list_and_a_named_list_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("global_excludes = []"), "{text}");
+        assert!(Config::load(&path).unwrap().defaults.global_excludes.is_empty());
+
+        std::fs::write(&path, "[defaults]\nglobal_excludes = [\"*.nfo\", \".cache/\"]\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.global_excludes,
+            vec!["*.nfo".to_string(), ".cache/".to_string()]
+        );
     }
 
     #[test]

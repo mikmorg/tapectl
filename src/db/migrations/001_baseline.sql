@@ -340,6 +340,25 @@ CREATE TABLE stage_ids (
     PRIMARY KEY (stage_set_id, kind, id)
 ) WITHOUT ROWID;
 
+-- What a snapshot left out (#542, ADR-0012 items 252 and 270): one row for each
+-- file or folder an exclusion pattern kept out, and for each socket (which tar
+-- skips at exit 0, so a listed one would have no member). `path` is relative
+-- to the unit and escaped as the index is; `files` and `bytes` are what was
+-- under a folder (1 and the file's size for a file). `pattern` is NULL for a
+-- socket.
+CREATE TABLE snapshot_left_out (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL CHECK(seq >= 0),
+    reason      TEXT NOT NULL CHECK(reason IN ('pattern','socket')),
+    pattern     TEXT,
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK(kind IN ('file','folder')),
+    files       INTEGER NOT NULL CHECK(files >= 0),
+    bytes       INTEGER NOT NULL CHECK(bytes >= 0),
+    CHECK((reason = 'pattern') = (pattern IS NOT NULL)),
+    PRIMARY KEY (snapshot_id, seq)
+) WITHOUT ROWID;
+
 -- ---------------------------------------------------------------------------
 -- Cartridges (the physical medium, known by its chip serial) and volumes
 -- (one logical write of a cartridge), and where each is

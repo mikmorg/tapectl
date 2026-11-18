@@ -108,11 +108,13 @@ fn classify(pattern: &str) -> Option<Classified<'_>> {
 #[derive(Debug, Clone)]
 pub struct Excludes {
     root: PathBuf,
-    /// Plain patterns: matched against a basename.
-    names: Vec<Pattern>,
+    /// Plain patterns: matched against a basename. Each is kept with the
+    /// text it was written as, which a snapshot reports (#542).
+    names: Vec<(String, Pattern)>,
     /// Directory patterns, without their `/`: matched against every path
-    /// component below `root`.
-    dirs: Vec<Pattern>,
+    /// component below `root`. Each is kept with the text it was written as
+    /// (`.cache/`).
+    dirs: Vec<(String, Pattern)>,
 }
 
 impl Excludes {
@@ -123,8 +125,12 @@ impl Excludes {
         let mut dirs = Vec::new();
         for p in patterns {
             match classify(p) {
-                Some(Classified::Plain(g)) => names.extend(Pattern::new(g).ok()),
-                Some(Classified::Directory(g)) => dirs.extend(Pattern::new(g).ok()),
+                Some(Classified::Plain(g)) => {
+                    names.extend(Pattern::new(g).ok().map(|c| (p.clone(), c)))
+                }
+                Some(Classified::Directory(g)) => {
+                    dirs.extend(Pattern::new(g).ok().map(|c| (p.clone(), c)))
+                }
                 None => {}
             }
         }
@@ -162,28 +168,61 @@ impl Excludes {
             .collect()
     }
 
-    fn matches_dir_pattern(&self, component: &str) -> bool {
+    /// The directory pattern, as written, that `component` matches.
+    fn dir_pattern_of(&self, component: &str) -> Option<&str> {
         let opts = match_options();
-        self.dirs.iter().any(|p| p.matches_with(component, opts))
+        self.dirs
+            .iter()
+            .find(|(_, p)| p.matches_with(component, opts))
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// The plain pattern, as written, that `name` matches.
+    fn name_pattern_of(&self, name: &str) -> Option<&str> {
+        let opts = match_options();
+        self.names
+            .iter()
+            .find(|(_, p)| p.matches_with(name, opts))
+            .map(|(text, _)| text.as_str())
+    }
+
+    fn matches_dir_pattern(&self, component: &str) -> bool {
+        self.dir_pattern_of(component).is_some()
     }
 
     fn matches_name_pattern(&self, name: &str) -> bool {
-        let opts = match_options();
-        self.names.iter().any(|p| p.matches_with(name, opts))
+        self.name_pattern_of(name).is_some()
     }
 
     /// A NON-directory entry of a walk: excluded when its basename matches a
     /// plain pattern, or any component of its path below the root (its own
     /// name included, as dar's `-P` does) matches a directory pattern.
     pub fn excludes_file(&self, path: &Path) -> bool {
+        self.file_pattern(path).is_some()
+    }
+
+    /// The pattern, as written, that leaves the NON-directory entry `path`
+    /// out: the one [`Excludes::excludes_file`] answers by, so a snapshot can
+    /// name it (#542). A directory pattern is looked for first.
+    pub fn file_pattern(&self, path: &Path) -> Option<&str> {
         if self.is_empty() {
-            return false;
+            return None;
         }
         let parts = self.components_below_root(path);
-        parts.iter().any(|c| self.matches_dir_pattern(c))
-            || parts
-                .last()
-                .is_some_and(|leaf| self.matches_name_pattern(leaf))
+        parts
+            .iter()
+            .find_map(|c| self.dir_pattern_of(c))
+            .or_else(|| parts.last().and_then(|leaf| self.name_pattern_of(leaf)))
+    }
+
+    /// The directory pattern, as written, that matches the DIRECTORY entry
+    /// `path`'s own name: the folder a snapshot keeps as an empty entry and
+    /// reports as left out with what was under it (#542). A plain pattern
+    /// never matches a directory. `None` for an entry that merely lies
+    /// inside a pruned folder: the walk never reaches it.
+    pub fn dir_self_pattern(&self, path: &Path) -> Option<&str> {
+        let parts = self.components_below_root(path);
+        parts.last().and_then(|leaf| self.dir_pattern_of(leaf))
     }
 
     /// A DIRECTORY entry of a walk: excluded when it lies INSIDE a pruned
@@ -219,7 +258,18 @@ impl Excludes {
 /// `Excludes::excludes_dir_entry`'s question, which `walk_directory` asks
 /// to prune the walk; `walk_fingerprint` skips directories altogether.
 pub fn is_excluded(path: &Path, set: &Excludes) -> bool {
-    set.excludes_file(path)
+    set.excludes_file(path) || is_socket(path)
+}
+
+/// True if `path` is a socket (never followed: a symlink to one is a
+/// symlink). Sockets are left out of every unit (ADR-0012 item 270): tar
+/// skips one at exit 0, so a listed socket would have no member. The
+/// snapshot walk asks the same question from the file type it already
+/// holds; the dirty scan, which has only the path, asks it here, so the two
+/// walks still agree.
+pub fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
 }
 
 /// The masks dar must receive for an effective pattern list, so that what

@@ -125,7 +125,12 @@ pub fn snapshot_create_detailed_reading(
     // Walk directory and build manifest — the ONLY walk this function
     // performs. Both the content-match short-circuit immediately below and
     // the mint path that follows it reuse `walked` (issue #159).
-    let (total_size, file_count, walked) = walk_directory(&read_path, global_excludes)?;
+    let Walk {
+        total_size,
+        file_count,
+        entries: walked,
+        left_out,
+    } = walk_directory_reporting(&read_path, global_excludes)?;
 
     // ADR-0012 / issue #159: does this walk already match the unit's most
     // recent snapshot? `content_match::latest_snapshot` is the exact same
@@ -229,6 +234,9 @@ pub fn snapshot_create_detailed_reading(
                 params![unit.id, next_version, source_path, total_size, file_count],
             )?;
             let snapshot_id = tx.last_insert_rowid();
+
+            // What the patterns and the socket rule left out (#542).
+            crate::db::snapshot_left_out::insert(&tx, snapshot_id, &left_out)?;
 
             // The version's file list (`db::files`, migration 030): each
             // path interned once per unit, one narrow row per entry.
@@ -2906,7 +2914,49 @@ fn walk_directory(
     path: &str,
     global_excludes: &[String],
 ) -> Result<(i64, i64, Vec<ManifestEntry>)> {
-    use std::os::unix::fs::MetadataExt;
+    let walk = walk_directory_reporting(path, global_excludes)?;
+    Ok((walk.total_size, walk.file_count, walk.entries))
+}
+
+/// What one walk of a unit found, and what it left out (#542).
+struct Walk {
+    total_size: i64,
+    file_count: i64,
+    entries: Vec<ManifestEntry>,
+    /// Everything a pattern or the socket rule kept out, by path.
+    left_out: Vec<crate::db::snapshot_left_out::LeftOut>,
+}
+
+/// What lies under the folder `dir`, for the report of a folder a pattern
+/// left out: every entry that is not a directory, and the bytes of the
+/// regular files among them. Never follows a link; an entry it cannot read
+/// counts for nothing.
+fn count_under(dir: &Path) -> (i64, i64) {
+    let (mut files, mut bytes) = (0i64, 0i64);
+    for e in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if e.file_type().is_dir() {
+            continue;
+        }
+        files += 1;
+        if e.file_type().is_file() {
+            bytes += e.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        }
+    }
+    (files, bytes)
+}
+
+/// [`walk_directory`], with what the walk left out (ADR-0012 items 252 and
+/// 270, #542): each file an exclusion pattern kept out, each folder one
+/// pruned (with what was under it; the folder's own entry stays, empty),
+/// and each socket. Sockets are left out of every unit, pattern or none.
+fn walk_directory_reporting(path: &str, global_excludes: &[String]) -> Result<Walk> {
+    use crate::db::snapshot_left_out::{LeftOut, Reason};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use walkdir::WalkDir;
 
     let base = Path::new(path);
@@ -2919,6 +2969,7 @@ fn walk_directory(
     let mut entries = Vec::new();
     let mut total_size: i64 = 0;
     let mut file_count: i64 = 0;
+    let mut left_out: Vec<LeftOut> = Vec::new();
 
     // Issue #359 (c): a directory INSIDE a pruned subtree is neither
     // recorded nor descended — dar's `-P` + `-D` store the pruned directory
@@ -2945,6 +2996,22 @@ fn walk_directory(
             .map_err(|e| TapectlError::Other(e.to_string()))?;
         let is_dir = meta.is_dir();
 
+        // #542: a folder a directory pattern prunes keeps its own entry,
+        // empty (below); what was under it is reported, with the pattern.
+        if is_dir {
+            if let Some(pattern) = exclude_compiled.dir_self_pattern(entry.path()) {
+                let (files, bytes) = count_under(entry.path());
+                left_out.push(LeftOut {
+                    reason: Reason::Pattern,
+                    pattern: Some(pattern.to_string()),
+                    path: rel.to_string_lossy().into_owned(),
+                    folder: true,
+                    files,
+                    bytes,
+                });
+            }
+        }
+
         // Issue #49: a non-directory entry matching an exclude pattern is
         // dropped before any further work (symlink-target read, manifest
         // row) — dar will never archive it (`stage_create` hands dar the
@@ -2952,8 +3019,33 @@ fn walk_directory(
         // so the manifest/files table must not record it either. Checked
         // before the file_type classification below so an excluded entry
         // costs nothing beyond the pattern match.
-        if !is_dir && exclude::is_excluded(entry.path(), &exclude_compiled) {
-            continue;
+        if !is_dir {
+            // Inside a folder a directory pattern pruned: the folder was
+            // reported once, with all that lies under it.
+            if exclude_compiled.excludes_dir_entry(entry.path()) {
+                continue;
+            }
+            // #542: said, with the pattern, instead of dropped without a
+            // word. A pattern is the operator's rule and is named before the
+            // socket rule (item 270), which holds for every unit.
+            let reported = if let Some(pattern) = exclude_compiled.file_pattern(entry.path()) {
+                Some((Reason::Pattern, Some(pattern.to_string())))
+            } else if entry.file_type().is_socket() {
+                Some((Reason::Socket, None))
+            } else {
+                None
+            };
+            if let Some((reason, pattern)) = reported {
+                left_out.push(LeftOut {
+                    reason,
+                    pattern,
+                    path: rel.to_string_lossy().into_owned(),
+                    folder: false,
+                    files: 1,
+                    bytes: if meta.is_file() { meta.len() as i64 } else { 0 },
+                });
+                continue;
+            }
         }
         // Issue #465: names are recorded as UTF-8 text, and one that is not
         // used to be stored lossily — every stage of the unit then failed as
@@ -3043,7 +3135,13 @@ fn walk_directory(
         });
     }
 
-    Ok((total_size, file_count, entries))
+    left_out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Walk {
+        total_size,
+        file_count,
+        entries,
+        left_out,
+    })
 }
 
 /// Test-only cross-module seam (issue #49): the relative, non-directory
@@ -3192,6 +3290,128 @@ mod tests {
             "the FIFO must not contribute to total_size"
         );
         assert_eq!(file_count, 2, "the FIFO still counts toward file_count");
+    }
+
+    // ── issue #542, ADR-0012 items 252 and 270: what a snapshot left out ──
+
+    /// What `snapshot_left_out` holds for `snapshot_id`, in `seq` order:
+    /// (reason, pattern, path, kind, files, bytes).
+    type LeftOutRow = (String, Option<String>, String, String, i64, i64);
+
+    fn left_out_rows(conn: &Connection, snapshot_id: i64) -> Vec<LeftOutRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT reason, pattern, path, kind, files, bytes
+                 FROM snapshot_left_out WHERE snapshot_id = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map(params![snapshot_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn a_snapshot_reports_a_socket_an_excluded_file_and_an_excluded_folder() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) =
+            setup_unit_with_excludes(&tmp, vec!["*.nfo".to_string(), ".cache/".to_string()]);
+
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::write(src.join("a.nfo"), b"12345").unwrap();
+        fs::create_dir_all(src.join(".cache/sub")).unwrap();
+        fs::write(src.join(".cache/x"), b"123").unwrap();
+        fs::write(src.join(".cache/sub/y"), b"1234").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("s.sock")).unwrap();
+
+        let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
+
+        let mut rows = left_out_rows(&conn, snap_id);
+        rows.sort_by(|a, b| a.2.cmp(&b.2));
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "pattern".to_string(),
+                    Some(".cache/".to_string()),
+                    ".cache".to_string(),
+                    "folder".to_string(),
+                    2,
+                    7
+                ),
+                (
+                    "pattern".to_string(),
+                    Some("*.nfo".to_string()),
+                    "a.nfo".to_string(),
+                    "file".to_string(),
+                    1,
+                    5
+                ),
+                (
+                    "socket".to_string(),
+                    None,
+                    "s.sock".to_string(),
+                    "file".to_string(),
+                    1,
+                    0
+                ),
+            ]
+        );
+
+        // Left out of the file list too; the pruned folder's own entry stays.
+        for gone in ["a.nfo", "s.sock", ".cache/x", ".cache/sub/y"] {
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap_id, Some(gone)),
+                0,
+                "{gone} must not be in the file list"
+            );
+        }
+        for kept in ["keep.txt", ".cache"] {
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, snap_id, Some(kept)),
+                1,
+                "{kept} must be in the file list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_is_left_out_and_reported_with_no_pattern_configured() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::create_dir_all(src.join("d")).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("d/s.sock")).unwrap();
+
+        let outcome = snapshot_create_detailed(&conn, "unit1", &config).unwrap();
+        assert_eq!(
+            left_out_rows(&conn, outcome.snapshot_id),
+            vec![(
+                "socket".to_string(),
+                None,
+                "d/s.sock".to_string(),
+                "file".to_string(),
+                1,
+                0
+            )]
+        );
+        let (count, size): (i64, i64) = conn
+            .query_row(
+                "SELECT file_count, total_size FROM snapshots WHERE id = ?1",
+                params![outcome.snapshot_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, size), (1, 4), "the socket is not counted");
     }
 
     // ── issue #53: archive_base is per-stage-set, not per-snapshot ──
