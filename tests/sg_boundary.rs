@@ -276,6 +276,7 @@ fn spawned_programs(text: &str) -> Vec<String> {
 const SPAWNS: &[(&str, &str)] = &[
     ("src/main.rs", "dar_path"),                  // the dar version probe
     ("src/dar/mod.rs", "binary"),                 // dar itself (create, restore, isolate)
+    ("src/tar/mod.rs", "binary"),                 // GNU tar, the Layout 3 writer; no device
     ("src/volume/build.rs", "\"bash\""),          // `bash -n` over the generated RESTORE.sh
     ("src/host_check.rs", "\"systemctl\""),       // whether contending units are active
     ("src/tape/drive_identity.rs", "\"sg_inq\""), // INQUIRY: the drive's identity
