@@ -41,9 +41,11 @@ pub const MAX_JOBS: usize = 16;
 /// What one stage in flight may hold of the host's memory: the stream
 /// reader's (a member's extension headers, at most `tar::stream::MAX_EXTENDED`
 /// = 64 MiB, and a 64 KiB chunk), the slice file's 1 MiB buffer and the
-/// bounded hash queues, with room to spare: 192 MiB in all. A zstd staging
-/// also holds one slice's cut while that slice is packed (`staging::pack`:
-/// the frame states its size); that is not counted here.
+/// bounded hash queues, with room to spare: 192 MiB in all. Packing holds
+/// no slice whole (`staging::pack` writes each frame as the cut comes); a
+/// compressed staging adds its encoder's and decoder's memory, which its
+/// level decides and which is not counted here: at its defaults a few tens
+/// of MiB, but xz's own table gives 674 MiB (+65 MiB to decode) at level 9.
 pub const MEMORY_PER_JOB: u64 = 192 << 20;
 
 /// One unit to stage: its name, for the operator, and the snapshot to stage.

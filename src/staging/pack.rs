@@ -8,20 +8,17 @@
 //!
 //! - gzip: one member, no file name, a zero time (`flate2`, pure Rust);
 //! - xz: one `.xz` stream with the CRC64 check (`liblzma`, bundled C);
-//! - zstd: one frame with its content checksum on and the content size
-//!   stated (`zstd`, bundled C).
+//! - zstd: one frame with its content checksum on, written as the bytes
+//!   come, so the content size is not stated (`zstd`, bundled C).
 //!
 //! One thread for each slice. Every packed byte is also decoded again as it
 //! passes ([`Packer`]), and the decoded bytes' sha256 and length are given
 //! back, so the caller can compare them with the cut's before the slice is
 //! kept (D15: what was hashed is what goes to tape). Neither the cut nor the
-//! decoded slice is held whole for that check.
-//!
-//! The one thing held whole is a zstd slice's cut: zstd states the content
-//! size in the frame's header, which is written before the first byte of
-//! the frame, and a slice's length is known only when the cutter closes it.
-//! So a zstd slice's cut is held in memory until the slice closes (never on
-//! disk): at most one slice for each unit being staged.
+//! decoded slice is held whole for that check, and no algorithm holds a
+//! slice whole to pack it: each frame is written as the cut comes. A zstd
+//! frame therefore does not state its content size (its header is written
+//! before the slice's length is known); `zstd -dc` reads it all the same.
 
 use std::io::{self, Write};
 
@@ -208,12 +205,7 @@ impl<W: Write> Write for Tee<W> {
 enum Inner<W: Write> {
     Gzip(flate2::write::GzEncoder<Tee<W>>),
     Xz(liblzma::write::XzEncoder<Tee<W>>),
-    /// The cut, held until the slice closes (the frame states its size).
-    Zstd {
-        cut: Vec<u8>,
-        level: u32,
-        tee: Tee<W>,
-    },
+    Zstd(zstd::stream::write::Encoder<'static, Tee<W>>),
 }
 
 /// One slice being packed: its cut written in, the packed frame written to
@@ -236,11 +228,12 @@ impl<W: Write> Packer<W> {
                     .write(tee, flate2::Compression::new(packing.level)),
             ),
             Algorithm::Xz => Inner::Xz(liblzma::write::XzEncoder::new(tee, packing.level)),
-            Algorithm::Zstd => Inner::Zstd {
-                cut: Vec::new(),
-                level: packing.level,
-                tee,
-            },
+            Algorithm::Zstd => {
+                let mut e = zstd::stream::write::Encoder::new(tee, packing.level as i32)?;
+                e.include_checksum(true)?;
+                e.include_contentsize(false)?;
+                Inner::Zstd(e)
+            }
         };
         Ok(Self { inner })
     }
@@ -250,15 +243,7 @@ impl<W: Write> Packer<W> {
         let tee = match self.inner {
             Inner::Gzip(e) => e.finish()?,
             Inner::Xz(e) => e.finish()?,
-            Inner::Zstd { cut, level, tee } => {
-                let mut e = zstd::stream::write::Encoder::new(tee, level as i32)?;
-                e.include_checksum(true)?;
-                e.include_contentsize(true)?;
-                e.set_pledged_src_size(Some(cut.len() as u64))?;
-                e.write_all(&cut)?;
-                drop(cut);
-                e.finish()?
-            }
+            Inner::Zstd(e) => e.finish()?,
         };
         let Tee { out, check, packed } = tee;
         let decoded = check
@@ -280,17 +265,14 @@ impl<W: Write> Write for Packer<W> {
         match &mut self.inner {
             Inner::Gzip(e) => e.write(buf),
             Inner::Xz(e) => e.write(buf),
-            Inner::Zstd { cut, .. } => {
-                cut.extend_from_slice(buf);
-                Ok(buf.len())
-            }
+            Inner::Zstd(e) => e.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.inner {
             Inner::Gzip(e) => e.flush(),
             Inner::Xz(e) => e.flush(),
-            Inner::Zstd { .. } => Ok(()),
+            Inner::Zstd(e) => e.flush(),
         }
     }
 }
@@ -378,7 +360,7 @@ mod tests {
 
     /// The frame's fields (D15): a gzip member with no name and a zero
     /// time; an xz stream with the CRC64 check; a zstd frame with its
-    /// checksum and its content size.
+    /// content checksum, written streaming, so its content size unstated.
     #[test]
     fn each_frame_has_the_fields_d15_determines() {
         let cut = mixed(10_000);
@@ -413,14 +395,96 @@ mod tests {
         assert_eq!(&zs[..4], &[0x28, 0xb5, 0x2f, 0xfd], "a zstd frame");
         let fhd = zs[4];
         assert_ne!(fhd & 0x04, 0, "the content checksum flag");
-        assert!(
-            fhd >> 6 != 0 || fhd & 0x20 != 0,
-            "the content size is stated"
-        );
         assert_eq!(
             zstd::zstd_safe::get_frame_content_size(&zs).unwrap(),
-            Some(cut.len() as u64)
+            None,
+            "a frame written streaming states no content size"
         );
+    }
+
+    /// A zstd frame that states no content size is read by the host's own
+    /// `zstd -dc` to the cut, and its checksum is checked by it.
+    #[test]
+    fn a_zstd_frame_with_no_content_size_is_read_by_the_hosts_zstd() {
+        let cut = mixed(2_000_000);
+        let p = Packing {
+            algorithm: Algorithm::Zstd,
+            level: 3,
+        };
+        let (frame, decoded) = pack(p, &cut);
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            None
+        );
+        assert_eq!(decoded.sha256, sha(&cut));
+        let out = tool_decodes(Algorithm::Zstd, &frame)
+            .expect("zstd is installed (tests/test_dependencies.rs)");
+        assert_eq!(sha(&out), sha(&cut));
+        // A frame whose checksum does not match is refused by the tool.
+        let mut bad = frame.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        let status = Command::new("zstd")
+            .args(["-dcq"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut c| {
+                let _ = c.stdin.take().unwrap().write_all(&bad);
+                c.wait().unwrap()
+            })
+            .unwrap();
+        assert!(!status.success(), "the content checksum is in the frame");
+    }
+
+    /// No algorithm holds a slice whole to pack it: with 8 MiB of bytes that
+    /// do not shrink written in and the frame not yet finished, most of the
+    /// packed bytes have already reached the age stream.
+    #[test]
+    fn every_algorithm_packs_as_the_cut_comes_never_holding_the_slice() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Counting(Rc<Cell<u64>>);
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.set(self.0.get() + buf.len() as u64);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut noise = vec![0u8; 8 << 20];
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        for algorithm in ALL {
+            let seen = Rc::new(Cell::new(0));
+            let mut packer = Packer::new(
+                Packing {
+                    algorithm,
+                    level: algorithm.default_level(),
+                },
+                Counting(seen.clone()),
+            )
+            .unwrap();
+            for chunk in noise.chunks(64 * 1024) {
+                packer.write_all(chunk).unwrap();
+            }
+            assert!(
+                seen.get() > 4 << 20,
+                "{}: {} bytes reached the stream before the frame was finished",
+                algorithm.name(),
+                seen.get()
+            );
+            let (_, decoded) = packer.finish().unwrap();
+            assert_eq!(decoded.len, noise.len() as u64);
+        }
     }
 
     /// Bytes that do not shrink grow by less than the format's worst growth.
