@@ -100,22 +100,16 @@ pub struct CreateParams<'a> {
 ///
 /// ```text
 /// --create --file=- --format=pax --numeric-owner
-/// [--xattrs] [--acls] [--xattrs-exclude=system.posix_acl_*]
+/// [--xattrs] [--acls] [--xattrs-exclude=system.posix_acl_*, with --xattrs]
 /// --no-recursion --null --verbatim-files-from --files-from=<list>
 /// --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 /// ```
 ///
 /// `--xattrs` is given with `preserve_xattrs`, `--acls` with
-/// `preserve_acls`, and the exclude whenever `--xattrs` is (item 296) and
-/// with `--acls` (§3.1's bracket).
-///
-/// **`preserve_xattrs` off with `preserve_acls` on is refused**, pending a
-/// ruling: measured with GNU tar 1.35 on 2026-11-18, `--xattrs-exclude`
-/// turns `--xattrs` on, so §3.1's line for that pair (`--acls
-/// --xattrs-exclude=…`) stores every `user.*` attribute as
-/// `SCHILY.xattr.*`, against §3.2's "with `preserve_xattrs` off the stream
-/// simply carries none". Which one stands changes bytes on tape, so it is
-/// not chosen here.
+/// `preserve_acls`, and the exclude whenever `--xattrs` is, and only then
+/// (ADR-0012 item 296). GNU tar's `--xattrs-exclude` turns `--xattrs` on
+/// (measured with 1.35), so `--acls` alone stays alone: its stream holds
+/// the ACL's text record by number and no `SCHILY.xattr.*` record.
 pub fn create_args(params: &CreateParams<'_>) -> Result<Vec<OsString>> {
     if !params.list.is_absolute() {
         return Err(TapectlError::Tar(format!(
@@ -128,15 +122,7 @@ pub fn create_args(params: &CreateParams<'_>) -> Result<Vec<OsString>> {
         (false, false) => &[],
         (true, false) => &["--xattrs", XATTRS_EXCLUDE_POSIX_ACL],
         (true, true) => &["--xattrs", "--acls", XATTRS_EXCLUDE_POSIX_ACL],
-        (false, true) => {
-            return Err(TapectlError::Tar(
-                "preserve_acls without preserve_xattrs is not supported yet: GNU tar's \
-                 --xattrs-exclude turns --xattrs on, so the stream would carry extended \
-                 attributes that preserve_xattrs says to leave out (volume-format-v3.md \
-                 §3.1 and §3.2 disagree; the ruling is pending)"
-                    .into(),
-            ))
-        }
+        (false, true) => &["--acls"],
     };
     let mut args: Vec<OsString> = ["--create", "--file=-", "--format=pax", "--numeric-owner"]
         .iter()
@@ -443,29 +429,19 @@ mod tests {
             line(&["--xattrs", "--xattrs-exclude=system.posix_acl_*"])
         );
         assert_eq!(
+            create_args(&params(list, root, false, true)).unwrap(),
+            line(&["--acls"])
+        );
+        assert_eq!(
             create_args(&params(list, root, false, false)).unwrap(),
             line(&[])
-        );
-    }
-
-    /// `preserve_acls` without `preserve_xattrs` is held for a ruling: GNU
-    /// tar's `--xattrs-exclude` turns `--xattrs` on (measured), so §3.1's
-    /// line for that pair contradicts §3.2.
-    #[test]
-    fn acls_without_xattrs_is_refused_pending_a_ruling() {
-        let err = create_args(&params(Path::new("/w/l"), Path::new("/r"), false, true))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("preserve_acls without preserve_xattrs"),
-            "{err}"
         );
     }
 
     /// No flag §3.1 or the plan's traps rule out is ever given.
     #[test]
     fn create_args_never_carry_a_ruled_out_flag() {
-        for (x, a) in [(true, true), (true, false), (false, false)] {
+        for (x, a) in [(true, true), (true, false), (false, true), (false, false)] {
             let args = create_args(&params(Path::new("/w/l"), Path::new("/r"), x, a)).unwrap();
             for arg in &args {
                 let s = arg.to_string_lossy();
@@ -618,6 +594,96 @@ mod tests {
         let mut out = Vec::new();
         s.take_stdout().read_to_end(&mut out).unwrap();
         (out, s.finish().unwrap())
+    }
+
+    /// The keys of the pax records before each member, by member name,
+    /// read by length (`crate::tar::probe::pax_record`'s rule).
+    fn pax_keys_and_acl(stream: &[u8]) -> Vec<(Vec<u8>, Vec<String>, Option<String>)> {
+        let mut out = Vec::new();
+        let mut a = ::tar::Archive::new(stream);
+        let mut pending: Vec<u8> = Vec::new();
+        for e in a.entries().unwrap().raw(true) {
+            let mut e = e.unwrap();
+            if e.header().entry_type() == ::tar::EntryType::XHeader {
+                pending.clear();
+                e.read_to_end(&mut pending).unwrap();
+                continue;
+            }
+            let mut keys = Vec::new();
+            let mut data = &pending[..];
+            while !data.is_empty() {
+                let sp = data.iter().position(|b| *b == b' ').unwrap();
+                let len: usize = std::str::from_utf8(&data[..sp]).unwrap().parse().unwrap();
+                let rec = &data[sp + 1..len - 1];
+                let eq = rec.iter().position(|b| *b == b'=').unwrap();
+                keys.push(String::from_utf8_lossy(&rec[..eq]).into_owned());
+                data = &data[len..];
+            }
+            let acl = crate::tar::probe::pax_record(&pending, b"SCHILY.acl.access")
+                .map(|v| String::from_utf8_lossy(v).into_owned());
+            out.push((e.path_bytes().into_owned(), keys, acl));
+            pending.clear();
+        }
+        out
+    }
+
+    /// `preserve_acls` on with `preserve_xattrs` off (item 296: the
+    /// exclude goes with `--xattrs` only): the real tar stores the ACL as
+    /// its text record, by number, and no `SCHILY.xattr.*` record, though
+    /// the file carries a `user.*` attribute and the ACL's raw attribute.
+    #[test]
+    fn acls_without_xattrs_store_the_text_record_and_no_xattr() {
+        let t = tree();
+        let f = t.root.join("f");
+        std::fs::write(&f, b"data").unwrap();
+        crate::tar::probe::set_access_acl(&f).unwrap();
+        let path = std::ffi::CString::new(f.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-terminated strings and a buffer of the length given.
+        let rc = unsafe {
+            nix::libc::setxattr(
+                path.as_ptr(),
+                c"user.probe".as_ptr(),
+                b"v".as_ptr().cast(),
+                1,
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        let list = write_list(&t.work, &["f"]).unwrap();
+        for (xattrs, want_user_xattr) in [(false, false), (true, true)] {
+            let p = CreateParams {
+                binary: "tar",
+                root: &t.root,
+                list: &list,
+                xattrs,
+                acls: true,
+            };
+            let mut s = spawn_archive(&p).unwrap();
+            let mut out = Vec::new();
+            s.take_stdout().read_to_end(&mut out).unwrap();
+            assert!(s.finish().unwrap().is_clean());
+            let members = pax_keys_and_acl(&out);
+            assert_eq!(members.len(), 1, "{members:?}");
+            let (name, keys, acl) = &members[0];
+            assert_eq!(name, b"./f");
+            let acl = acl.as_deref().expect("the text ACL record");
+            assert_eq!(
+                crate::tar::probe::acl_text_is_by_number(acl),
+                Ok(()),
+                "{acl}"
+            );
+            let xattr_keys: Vec<&String> = keys
+                .iter()
+                .filter(|k| k.starts_with("SCHILY.xattr."))
+                .collect();
+            if want_user_xattr {
+                // Positive control: with --xattrs the attribute is stored,
+                // and the exclude keeps the raw ACL out.
+                assert_eq!(xattr_keys, vec!["SCHILY.xattr.user.probe"], "{keys:?}");
+            } else {
+                assert!(xattr_keys.is_empty(), "xattrs={xattrs}: {keys:?}");
+            }
+        }
     }
 
     fn member_names(stream: &[u8]) -> Vec<Vec<u8>> {

@@ -405,7 +405,7 @@ pub fn acl_text_is_by_number(text: &str) -> std::result::Result<(), String> {
 /// by writing `system.posix_acl_access` in the kernel's own format
 /// (`posix_acl_xattr.h`: a little-endian version 2, then each entry's tag,
 /// permissions and id), so the probe needs no `setfacl`.
-fn set_access_acl(file: &Path) -> std::io::Result<()> {
+pub(crate) fn set_access_acl(file: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     const UNDEFINED: u32 = u32::MAX;
     const USER_OBJ: u16 = 0x01;
