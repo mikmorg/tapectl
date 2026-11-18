@@ -1114,10 +1114,9 @@ impl Write for SmallSink<'_> {
 /// **The ending (#420, 1.6.0).** The walk reads the tape as far as
 /// [`ConfirmPlan::ended_after`]: the seal at `ended_after + 1` (K+1 on a short
 /// tape, M on a full one), content files at or before `ended_after`, and
-/// nothing after it (`volume-format-v2.md` §4.2, §5). File 3 and the Layout
+/// nothing after it (`volume-format-v3.md` §5.1, §6). File 3 and the Layout
 /// are both the plan, so step 3 still compares them whole. The seal must state
-/// the same `ended_after` ([`MismatchKind::EndedAfterDisagrees`]), and a seal
-/// before the planned position must require `short-seal` (§1.2 rule 6).
+/// the same `ended_after` ([`MismatchKind::EndedAfterDisagrees`]).
 /// [`ConfirmPlan::readback`] is hashed under every tier (§4.3 W9).
 fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan<'_>, mut read: F) -> Result<Evidence>
 where
@@ -1175,7 +1174,7 @@ where
 }
 
 /// Where the tape ended, as the walk's plan knows it (#420;
-/// `volume-format-v2.md` §4.1, §5): every position the walk reads for
+/// `volume-format-v3.md` §5, §6): every position the walk reads for
 /// content is at or before `ended_after`, and the seal is the file right
 /// after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1183,8 +1182,6 @@ struct WalkEnding {
     /// The last file before the seal: the plan's K on a short ending, M-1
     /// on a full one.
     ended_after: u32,
-    /// The planned seal position M (the Layout's `seal_marker` entry).
-    planned_seal: u32,
     /// The entry to read back past the early warning (§4.3 W9), checked to
     /// be a content file at or before `ended_after`.
     readback: Option<u32>,
@@ -1220,7 +1217,6 @@ impl WalkEnding {
         }
         Ok(Self {
             ended_after,
-            planned_seal,
             readback: plan.readback,
         })
     }
@@ -1230,12 +1226,6 @@ impl WalkEnding {
     /// `ended_after`).
     fn seal_position(self) -> u32 {
         self.ended_after + 1
-    }
-
-    /// Whether the seal is read before the planned position: a short seal,
-    /// which §1.2 rule 6 accepts only when it requires `short-seal`.
-    fn is_short(self) -> bool {
-        self.seal_position() < self.planned_seal
     }
 }
 
@@ -1250,10 +1240,8 @@ enum SealRead {
         mismatch: Mismatch,
     },
     /// A seal marker this tapectl can read, binding File 3 to this hash,
-    /// and stating that the tape ended after `ended_after`
-    /// ([`format::ParsedSeal::effective_ended_after`]: a seal before 1.6.0
-    /// states none and ended after `file_count - 2`, rule S3). `None` only
-    /// for a `file_count` below 2.
+    /// and stating that the tape ended after `ended_after` (rule S2: every
+    /// seal that parses states it).
     Bound {
         front_index_sha256: String,
         ended_after: Option<u64>,
@@ -1264,9 +1252,7 @@ enum SealRead {
 /// `ended_after + 1` (#420: M on a full ending, K+1 on a short one). It is
 /// parsed as TOML, so its true bytes are genuinely needed — small and
 /// bounded, so buffering into a `Vec` here is correct (issue #86). Absent or
-/// unparseable is the normal unsealed signal, never an Err. So is a seal read
-/// before the planned position that does not itself require `short-seal`:
-/// `volume-format-v2.md` §1.2 rule 6 accepts no other seal there.
+/// unparseable is the normal unsealed signal, never an Err.
 fn read_seal<F>(ending: WalkEnding, read: &mut F) -> SealRead
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
@@ -1318,32 +1304,10 @@ where
             },
         };
     }
-    // §1.2 rule 6, "which seal a reader accepts": before the planned
-    // position, only a seal that itself requires short-seal. Anything else
-    // there is no seal, and the tape reads as unsealed.
-    if ending.is_short() && !seal.requires_short_seal() {
-        return SealRead::Refused {
-            files_checked: 1,
-            mismatch: Mismatch {
-                position: seal_pos,
-                kind: MismatchKind::SealUnreadable,
-                expected: format!(
-                    "a short seal requiring \"{}\" before the planned seal position {}",
-                    format::SHORT_SEAL,
-                    ending.planned_seal
-                ),
-                actual: format!(
-                    "a seal marker stating requires = [{}], which is no seal before the \
-                     planned position (volume-format-v2.md §1.2 rule 6)",
-                    seal.requires
-                        .iter()
-                        .map(|f| format!("\"{f}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            },
-        };
-    }
+    // §1.2 rule 6 asks no `requires` entry of a seal before the planned
+    // position on a Layout 3 tape (D1): one that parses keeps §5's rules,
+    // and the walk compares the `ended_after` it states with the catalog's
+    // (§6 step 3: a disagreement is inconclusive, never a quarantine).
     SealRead::Bound {
         ended_after: seal.effective_ended_after(),
         front_index_sha256: seal.front_index_sha256,
@@ -5893,17 +5857,16 @@ mod tests {
             }
         }
 
-        /// A seal in the grammar before 1.6.0: no `ended_after`, `requires
-        /// = []` (what every 1.5.0 tape carries).
-        fn seal_1_5_0(seal: &[u8]) -> Vec<u8> {
+        /// `seal` without its `ended_after` line: Layout 2's rule S3 read
+        /// such a seal as full; Layout 3 has no S3, and rule S2 makes it
+        /// unparseable (`volume-format-v3.md` §5).
+        fn without_ended_after(seal: &[u8]) -> Vec<u8> {
             let text = String::from_utf8(seal.to_vec()).unwrap();
             let kept: Vec<&str> = text
                 .lines()
                 .filter(|l| !l.starts_with("ended_after = "))
                 .collect();
-            let out = kept
-                .join("\n")
-                .replace("requires = [\"short-seal\"]", "requires = []");
+            let out = kept.join("\n");
             assert!(!out.contains("ended_after =") && out.contains("requires = []\n"));
             out.into_bytes()
         }
@@ -6007,17 +5970,35 @@ mod tests {
             assert_eq!(quick.files_checked, 2);
         }
 
-        /// A tape written before 1.6.0 (its seal states no `ended_after`
-        /// and requires nothing, rule S3) still confirms under a full plan:
-        /// no `ended_after_disagrees`.
+        /// Rule S2 (`volume-format-v3.md` §5): every seal states
+        /// `ended_after`. A seal that states none (Layout 2's S3 read it as
+        /// full) is unparseable under S6, so a full plan reads the tape as
+        /// unsealed, never as sealed, and that is no evidence against the
+        /// medium. The positive control: the same seal with its line passes.
         #[test]
-        fn a_1_5_0_seal_under_a_full_plan_still_passes() {
+        fn a_seal_stating_no_ended_after_is_no_seal_under_a_full_plan() {
             let p = planned();
-            let seal = seal_1_5_0(&p.seal(M - 1));
+            let mut whole = p.tape(M - 1);
+            let evidence = whole.confirm(&p.layout, Tier::Navigable).unwrap();
+            assert!(
+                evidence.mismatches.is_empty(),
+                "positive control: {evidence:?}"
+            );
+
+            let seal = without_ended_after(&p.seal(M - 1));
             let mut store = p.written(MemStore::new(SBS), M - 1, &seal);
             for tier in [Tier::Integrity, Tier::Navigable] {
                 let evidence = store.confirm(&p.layout, tier).unwrap();
-                assert!(evidence.mismatches.is_empty(), "{tier:?}: {evidence:?}");
+                assert_eq!(
+                    kinds(&evidence),
+                    [(M, MismatchKind::SealUnreadable)],
+                    "{tier:?}"
+                );
+                assert!(
+                    evidence.mismatches[0].actual.contains("rule S2"),
+                    "{evidence:?}"
+                );
+                assert!(!evidence.proves_medium_bad());
             }
         }
 
@@ -6277,39 +6258,6 @@ mod tests {
             let evidence = sealed_short.confirm(&p.layout, Tier::Integrity).unwrap();
             assert_eq!(kinds(&evidence), [(M, MismatchKind::SealUnreadable)]);
             assert!(!evidence.proves_medium_bad());
-        }
-
-        /// §1.2 rule 6: before the planned position, only a seal that
-        /// itself requires `short-seal` is a seal. One that states
-        /// `ended_after` but requires nothing, and one in the grammar before
-        /// 1.6.0 (which reads as a full seal ending after `file_count - 2`,
-        /// rule S3, here K), are no seal at K+1.
-        #[test]
-        fn a_seal_before_the_planned_position_must_require_short_seal() {
-            let p = planned();
-            let stating = String::from_utf8(p.seal(K))
-                .unwrap()
-                .replace("requires = [\"short-seal\"]", "requires = []")
-                .into_bytes();
-            for seal in [stating, seal_1_5_0(&p.seal(K))] {
-                assert!(
-                    format::parse_seal_marker(&String::from_utf8_lossy(&seal)).is_ok(),
-                    "the seal parses: rule 6, not S1-S6, refuses it"
-                );
-                let mut store = p.written(MemStore::new(SBS), K, &seal);
-                for tier in [Tier::Integrity, Tier::Navigable] {
-                    let evidence = store.confirm_with(&p.layout, short(tier)).unwrap();
-                    assert_eq!(
-                        kinds(&evidence),
-                        [(K + 1, MismatchKind::SealUnreadable)],
-                        "{tier:?}"
-                    );
-                    assert!(
-                        evidence.mismatches[0].actual.contains("rule 6"),
-                        "{evidence:?}"
-                    );
-                }
-            }
         }
 
         /// The seal a resume's contact already read (#403) stands for the

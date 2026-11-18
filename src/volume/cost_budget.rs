@@ -126,6 +126,7 @@ fn stage_unit(
         )
         .unwrap();
         built.push(BuildSlice {
+            continues: false,
             slice_id,
             slice_number: n,
             size_bytes: content.len() as i64,
@@ -141,9 +142,9 @@ fn stage_unit(
         unit_name: name.to_string(),
         unit_uuid: format!("uuid-{name}"),
         tenant_id,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: None,
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices: built,
         span: None,
@@ -202,6 +203,7 @@ fn written() -> Written {
     )
     .unwrap();
     let inputs = BuildInputs {
+        tables: None,
         label: LABEL.to_string(),
         volume_uuid: VOL_UUID.to_string(),
         media_type: "LTO-6".to_string(),

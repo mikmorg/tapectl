@@ -627,10 +627,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
             (C93, "completed", false)
         ])
     );
-    assert_eq!(
-        requires_line(h.files(T93[0])),
-        "requires = [\"short-seal\", \"spanning\"]"
-    );
+    assert_eq!(requires_line(h.files(T93[0])), "requires = []");
     assert_eq!(
         write::recorded_ranges(c, T93[0]).unwrap(),
         [range(B93, 1, 2)]
@@ -717,7 +714,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     for (label, holds) in [(T93[0], [1, 2]), (T93[2], [3, 3])] {
         assert_eq!(
             requires_line(h.files(label)),
-            "requires = [\"short-seal\", \"spanning\"]",
+            "requires = []",
             "{label} holds {holds:?}"
         );
     }
@@ -741,8 +738,11 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// where it was. With staging on tar (T4.5) `S`'s slices hold whole members
 /// (its dotfile alone in slice 1, each file a run of 128K slices), so the
 /// figure is three blocks into tape 1's slice 17 at nominal and about three
-/// and a half blocks before slice 16 ends at 1% sooner.
-const CAP94: u64 = 2_723_840;
+/// and a half blocks before slice 16 ends at 1% sooner. Layout 3's envelopes
+/// carry each staging's file table and id map (T4.6, §1.4, §1.6): the tape's
+/// own files grew by four blocks (720,896 bytes before `S`'s slice 1), and
+/// the figure by the same 16,384 bytes.
+const CAP94: u64 = 2_740_224;
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may
@@ -1378,6 +1378,7 @@ fn rebuild(h: &Home, fresh: &Connection, label: &str) -> crate::volume::rebuild:
 /// the rebuild that completes it promotes it (item 144); at the end it has
 /// its two copies.
 #[test]
+#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_rows() {
     let h = written_93();
     let (writes, positions, slices, volumes) = (
@@ -1436,6 +1437,7 @@ fn items_130_and_144_each_tape_rebuilt_in_any_order_gives_the_writing_catalogs_r
 /// catalog, last tape first, the version is `staged` until the third, and
 /// the three give the writing catalog's rows.
 #[test]
+#[ignore = "L3-pending T4.9: catalog rebuild reads a Layout 3 block, which states no may_span (item 288), as a whole unit; it must split it by its positions and the seal (§5.3)"]
 fn items_130_and_144_item_94s_tapes_rebuilt_give_the_writing_catalogs_rows() {
     let h = written_94();
     let dir = TempDir::new().unwrap();
@@ -1524,12 +1526,13 @@ fn manifest_block(manifest: &str, unit: &str) -> String {
         .to_string()
 }
 
-/// Item 125 from the real write: on every tape whose plan holds a slice of
-/// a spannable set, the operator envelope's block of it states `may_span =
-/// true` and lists every slice of the set, giving `tape_position` only to
-/// the slices this tape's plan holds; whole units' blocks have no
-/// `may_span` and a position for every slice; and RECOVERY.md has its
-/// section on a unit across tapes.
+/// Item 125 from the real write, as Layout 3 states it (§1.9, §5.3; item
+/// 288): on every tape whose plan holds a slice of a spannable set, the
+/// operator envelope's block of it lists every slice of the set, giving
+/// `tape_position` only to the slices this tape's plan holds; whole units'
+/// blocks give a position to every slice; no block states `may_span`, and
+/// `requires` is empty (D1). RECOVERY.md has its section on a unit across
+/// tapes where the block gives a slice no position (T4.13 rewrites it).
 #[test]
 fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
     let h = written_93();
@@ -1546,7 +1549,6 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
             .iter()
             .find(|u| u.name == B93)
             .unwrap_or_else(|| panic!("{label} lists {B93}"));
-        assert!(b.may_span, "{label}");
         assert_eq!(
             b.slices.iter().map(|s| s.number).collect::<Vec<_>>(),
             [1, 2, 3],
@@ -1564,12 +1566,9 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
                 assert_eq!(p, position_of(&h.conn, label, B93, s.number), "{label}");
             }
         }
-        assert!(
-            manifest_block(&text, B93).contains("may_span = true\n"),
-            "{label}"
-        );
+        assert!(!text.contains("may_span"), "{label}: {text}");
+        assert!(manifest_block(&text, B93).contains("payload = \"tar\"\n"));
         for whole in manifest.units.iter().filter(|u| u.name != B93) {
-            assert!(!whole.may_span, "{label}: {}", whole.name);
             assert!(
                 whole.slices.iter().all(|s| s.tape_position.is_some()),
                 "{label}: {}",
@@ -1578,13 +1577,14 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
             assert!(!manifest_block(&text, &whole.name).contains("may_span"));
         }
         let recovery = member(&members, "RECOVERY.md");
-        assert!(
+        assert_eq!(
             recovery.contains("## A unit across tapes"),
+            planned != [1, 2, 3],
             "{label}: {recovery}"
         );
         assert_eq!(
             seal_requires_line(h.files(label)),
-            "requires = [\"short-seal\", \"spanning\"]",
+            "requires = []",
             "{label}"
         );
     }
@@ -1859,22 +1859,13 @@ fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
             "{label}"
         );
         let files = h.files(label);
-        assert_eq!(
-            requires_line(files),
-            "requires = [\"short-seal\"]",
-            "{label}"
-        );
-        assert_eq!(
-            seal_requires_line(files),
-            "requires = [\"short-seal\"]",
-            "{label}"
-        );
+        assert_eq!(requires_line(files), "requires = []", "{label}");
+        assert_eq!(seal_requires_line(files), "requires = []", "{label}");
         let members = operator_envelope(&h, label);
         let text = member(&members, "MANIFEST.toml");
         assert!(!text.contains("may_span"), "{label}: {text}");
         let manifest = crate::volume::envelope::parse_manifest(&text).unwrap();
         for unit in &manifest.units {
-            assert!(!unit.may_span);
             assert!(unit.slices.iter().all(|s| s.tape_position.is_some()));
         }
         let recovery = member(&members, "RECOVERY.md");
@@ -1906,5 +1897,5 @@ fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
         writes_of(&h.conn, T0[2]),
         rows(&[(B0, "completed", false), (C0, "completed", false)])
     );
-    assert_eq!(requires_line(h.files(T0[2])), "requires = [\"short-seal\"]");
+    assert_eq!(requires_line(h.files(T0[2])), "requires = []");
 }

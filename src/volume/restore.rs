@@ -8401,9 +8401,8 @@ mod tests {
             use crate::tape::fake::Op;
             use crate::volume::restore_record::rows;
 
-            /// How a 1.6.0 File 0 states what it requires (ADR-0012 item 111):
-            /// one feature, which this tapectl knows.
-            const STATED: &str = "\nrequires = [\"short-seal\"]\n";
+            /// How a Layout 3 File 0 states what it requires (D1): nothing.
+            const STATED: &str = "\nrequires = []\n";
             const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
             /// [`crate::volume::format::rewrite_file0`], by the name this
@@ -8618,13 +8617,13 @@ mod tests {
             #[test]
             fn another_layout_is_refused_on_restore() {
                 let m = one();
-                rewrite(&m, "\nlayout_version = 2\n", "\nlayout_version = 3\n");
+                rewrite(&m, "\nlayout_version = 3\n", "\nlayout_version = 2\n");
                 let dest = TempDir::new().unwrap();
                 let err = m
                     .unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
                     .unwrap_err()
                     .to_string();
-                assert!(err.contains("layout_version = 3"), "{err}");
+                assert!(err.contains("layout_version = 2"), "{err}");
                 assert_only_file0_was_read(&m.fake.ops());
             }
 
@@ -8663,14 +8662,10 @@ mod tests {
             #[test]
             fn a_tape_that_requires_nothing_restores_as_before() {
                 for (what, to) in [
-                    ("states requires = [\"short-seal\"]", STATED),
-                    (
-                        "states requires = [], as 1.1.0 to 1.5.0",
-                        "\nrequires = []\n",
-                    ),
+                    ("states requires = [], as Layout 3 does", STATED),
                     (
                         "carries a key nobody requires",
-                        "\nrequires = [\"short-seal\"]\nfuture_key = \"x\"\n",
+                        "\nrequires = []\nfuture_key = \"x\"\n",
                     ),
                 ] {
                     let m = one();

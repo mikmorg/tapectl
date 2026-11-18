@@ -1492,7 +1492,7 @@ pub(crate) mod tests {
         let old = other.files[0].clone();
         other.files[0] = crate::volume::format::rewrite_file0(
             &old,
-            "\nrequires = [\"short-seal\"]\n",
+            "\nrequires = []\n",
             "\nrequires = [\"unknown-feature\"]\n",
         );
         fx.mems.insert(B.to_string(), other);

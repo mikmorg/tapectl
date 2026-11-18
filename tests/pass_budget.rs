@@ -145,6 +145,7 @@ fn staged() -> Staged {
         )
         .unwrap();
         slices.push(BuildSlice {
+            continues: false,
             slice_id: conn.last_insert_rowid(),
             slice_number: n as i64,
             size_bytes: SLICE_BYTES as i64,
@@ -160,9 +161,9 @@ fn staged() -> Staged {
         unit_name: "pass-unit".to_string(),
         unit_uuid: "pass-unit".to_string(),
         tenant_id: 2,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: None,
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices,
         span: None,
@@ -196,6 +197,7 @@ struct WriteCost {
 fn write(probe: &Probe, check: SliceCheck, tier: Tier) -> WriteCost {
     let s = staged();
     let inputs = BuildInputs {
+        tables: None,
         label: "PASS01".to_string(),
         volume_uuid: "41641600-0000-4000-8000-000000000416".to_string(),
         media_type: "LTO-6".to_string(),

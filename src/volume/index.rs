@@ -293,9 +293,16 @@ fn write_paths<W: Write + ?Sized>(
             // Only a regular file states a hash (§1.5): whatever the column
             // holds for a directory, a symlink or a special file is not a
             // content claim the format makes. The column's CHECK admits NULL
-            // or 32 bytes.
+            // or 32 bytes. The unit's own dotfile states none either (D8,
+            // #528, #562): it is not content, a re-stage after `unit tag`
+            // carries it with new bytes, and its recorded hash is the first
+            // staging's.
             let sha256 = match (kind, row.get_ref(3)?) {
-                ('f', rusqlite::types::ValueRef::Blob(b)) if b.len() == 32 => Some(b),
+                ('f', rusqlite::types::ValueRef::Blob(b))
+                    if b.len() == 32 && !crate::unit::dotfile::is_unit_dotfile(path) =>
+                {
+                    Some(b)
+                }
                 _ => None,
             };
             // The contract is a bytewise order (§1.5); a plan that stopped
@@ -1370,6 +1377,45 @@ mod tests {
         assert_eq!(by_path["pipe"], kv("s", String::new()));
         // The row, byte for byte: six fields, the fifth empty.
         assert!(text.contains("\nmixed\t1\td\t0\t\tdir\n"), "{text}");
+    }
+
+    /// D8 (#528, #562; `volume-format-v3.md` §1.5): `paths.tsv` states no
+    /// sha256 for the unit's own dotfile, which a re-stage after `unit tag`
+    /// carries with new bytes beside the first staging's hash. A dotfile
+    /// deeper in the tree is ordinary content and keeps its hash.
+    #[test]
+    fn the_unit_dotfile_states_no_hash_and_a_deeper_one_does() {
+        let c = IndexCatalog::new();
+        let u = c.unit("alpha", "dotted");
+        let (snap, ss) = c.version(u, 1, "staged", &[1]);
+        let dotfile = crate::unit::dotfile::UNIT_DOTFILE;
+        let deeper = format!("sub/{dotfile}");
+        c.paths(
+            snap,
+            &[
+                (dotfile, Regular, 40),
+                (deeper.as_str(), Regular, 41),
+                ("file", Regular, 5),
+            ],
+        );
+        for n in [dotfile, deeper.as_str(), "file"] {
+            set_sha256(&c.conn, snap, n, Some(&hash(0x5c)));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let files = generate_to(dir.path(), &c, &[ss]);
+        let text = read(&files.tenants[&c.tenant("alpha")].paths);
+        let by_path: BTreeMap<String, String> = parse_paths(&text)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.path, r.sha256))
+            .collect();
+        assert_eq!(by_path["file"], hash(0x5c), "positive control");
+        assert_eq!(
+            by_path[deeper.as_str()],
+            hash(0x5c),
+            "a deeper one is content"
+        );
+        assert_eq!(by_path[dotfile], "", "the unit's own dotfile: no hash");
     }
 
     #[test]

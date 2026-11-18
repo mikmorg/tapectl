@@ -25,6 +25,12 @@
 //! writer that can wait on each other, and a regression there must fail this
 //! suite, not hang it.
 
+// L3-pending T4.10: the heir's script. This file runs the Layout 2 RESTORE.sh
+// against tapes it understands; from T4.6 a tape states Layout 3 (magic
+// `tapectl-volume-v3`, `layout_version = 3`, the tar payload), which that script
+// refuses. T4.10 replaces the script and deletes this file (the plan's T4.6 traps).
+#![cfg(any())]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;

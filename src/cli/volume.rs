@@ -6131,12 +6131,13 @@ mod tests {
                 unit_name: name.into(),
                 unit_uuid: name.into(),
                 tenant_id: 1,
-                dar_version: None,
-                dar_command: None,
-                catalog_path: None,
+                tar_version: None,
+                stream_bytes: 0,
+                compression: None,
                 snapshot_version: 1,
                 slices: slices
                     .map(|n| BuildSlice {
+                        continues: false,
                         slice_id: n,
                         slice_number: n,
                         size_bytes: 1,

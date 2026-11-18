@@ -196,6 +196,7 @@ mod tests {
             let path = slices_dir.path().join(format!("slice_{slice_id}.age"));
             std::fs::write(&path, &cipher).unwrap();
             slices.push(BuildSlice {
+                continues: false,
                 slice_id,
                 slice_number: n,
                 size_bytes: plain.len() as i64,
@@ -213,9 +214,9 @@ mod tests {
             unit_name: UNIT.to_string(),
             unit_uuid: "unit-uuid-107".to_string(),
             tenant_id,
-            dar_version: Some("2.7.20".to_string()),
-            dar_command: None,
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices,
             span: None,
@@ -241,6 +242,7 @@ mod tests {
         )
         .unwrap();
         let inputs = BuildInputs {
+            tables: None,
             label: LABEL.to_string(),
             volume_uuid: VOL_UUID.to_string(),
             media_type: "LTO-6".to_string(),

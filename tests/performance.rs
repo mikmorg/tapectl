@@ -614,11 +614,12 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
         unit_name: "photos/l6-0001".to_string(),
         unit_uuid: "perf-unit-uuid".to_string(),
         tenant_id: 2,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: None,
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices: vec![BuildSlice {
+            continues: false,
             slice_id: 1,
             slice_number: 1,
             size_bytes: plaintext.len() as i64,
@@ -649,6 +650,7 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
     .unwrap();
 
     let inputs = BuildInputs {
+        tables: None,
         label: LABEL.to_string(),
         volume_uuid: "77777777-8888-9999-aaaa-bbbbbbbbbbbb".to_string(),
         media_type: "LTO-6".to_string(),
@@ -1047,6 +1049,7 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
             )
             .unwrap();
         built_slices.push(BuildSlice {
+            continues: false,
             slice_id: h.conn.last_insert_rowid(),
             slice_number: n as i64,
             size_bytes: buf.len() as i64,
@@ -1069,14 +1072,15 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
         unit_name: "write-2g".to_string(),
         unit_uuid: "write-2g".to_string(),
         tenant_id: 12,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: None,
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices: built_slices,
         span: None,
     }];
     let inputs = BuildInputs {
+        tables: None,
         label: "PERF-2G".to_string(),
         volume_uuid: "41641600-0000-4000-8000-000000000009".to_string(),
         media_type: "LTO-6".to_string(),

@@ -1102,11 +1102,10 @@ fn rebuild_contacted(
         }
     }
 
-    // Issue #473: the dar catalogues, after the rows are committed (files
-    // placed inside the transaction would be orphaned by a rollback, and
-    // `stage clean` would not know them). Best effort per set: a set that
-    // cannot get its catalogue is named in the report, never a failed rebuild.
-    restore_catalogues(conn, operator, &inserted.sets, &mut report);
+    // Issue #473's dar catalogues are not put back: no Layout 3 envelope
+    // carries one (`volume-format-v3.md` §9). The file table and id map a
+    // rebuild restores come from the operator envelope's `catalog.db`
+    // (§1.4), which is T4.9's to port.
 
     // The cross-volume index (§1.5): after the rows above are committed, so
     // this tape itself is never listed as missing. Read-only on the catalog.
@@ -1965,10 +1964,10 @@ impl LocatedSeal {
 ///
 /// - **at the planned position**, a seal whose `file_count` is the plan's
 ///   (`planned + 1`): the full seal (§4.1 "Classification");
-/// - **before it**, only on a tape that requires `short-seal` (File 0's
-///   `requires`; the seal's own when File 0's claims do not parse), a seal
-///   that itself requires it, keeps §4.1's parse rules (it parsed) and states
-///   `file_count = N` for the N files on the medium. Its `ended_after` is K.
+/// - **before it**, on every Layout 3 tape (`volume-format-v3.md` §1.2 rule
+///   6, D1: no `requires` entry), a seal that keeps §5's parse rules (it
+///   parsed) and states `file_count = N` for the N files on the medium. Its
+///   `ended_after` is K. `_file0` is no longer read for it.
 ///
 /// Anything else is [`format::SealVerdict::Unsealed`], naming why: a reader
 /// of a catalog row only ever records a tape sealed on a seal it accepts. A
@@ -1978,7 +1977,7 @@ impl LocatedSeal {
 /// tape, and an unsealed reading records no copy (#458).
 pub(crate) fn locate_and_judge_seal(
     store: &mut dyn Store,
-    file0: &str,
+    _file0: &str,
     front_index: &[u8],
     front_index_position: u32,
     planned: u32,
@@ -2042,36 +2041,17 @@ pub(crate) fn locate_and_judge_seal(
             ),
         };
     }
-    // Before the planned position: the short seal, on a tape that says it may
-    // end early, and only one that says the same and counts the medium.
-    let tape_requires_short_seal = match format::parse_id_thunk_claims(file0) {
-        Ok(claims) => claims.requires.iter().any(|f| f == format::SHORT_SEAL),
-        Err(_) => seal.requires_short_seal(),
-    };
-    if !tape_requires_short_seal {
-        return LocatedSeal::unsealed(
-            Some(position),
-            format!(
-                "the tape ends at file {position}, before the seal marker File 0 plans at file \
-                 {planned}, and File 0 does not require \"{}\": a tape that does not say it may \
-                 end early has no seal there",
-                format::SHORT_SEAL
-            ),
-        );
-    }
-    if !seal.requires_short_seal() || i64::from(seal.file_count) != i64::from(position) + 1 {
+    // Before the planned position: the short seal, which every Layout 3
+    // tape may end with (`volume-format-v3.md` §1.2 rule 6, D1), when it
+    // counts the medium.
+    if !seal.is_short_seal_at(position) {
         return LocatedSeal::unsealed(
             Some(position),
             format!(
                 "the last file on the tape (file {position}) is a seal marker that does not seal \
-                 a tape ending there (it states file_count = {}{}), so it is no short seal \
-                 (volume-format-v2.md §1.2 rule 6)",
+                 a tape ending there (it states file_count = {}), so it is no short seal \
+                 (volume-format-v3.md §1.2 rule 6)",
                 seal.file_count,
-                if seal.requires_short_seal() {
-                    String::new()
-                } else {
-                    format!(" and does not require \"{}\"", format::SHORT_SEAL)
-                }
             ),
         );
     }
@@ -2384,7 +2364,7 @@ fn insert_all(
         match written {
             Written::Cut => {
                 let cut = format!("{} v{}", unit.name, unit.snapshot_version);
-                if unit.may_span {
+                if held_in_part(unit) {
                     report.cut_spanning_units.push(cut.clone());
                 }
                 report.cut_units.push(cut);
@@ -2417,7 +2397,7 @@ fn insert_all(
             snapshot_id,
             volume_id,
             written,
-            unit.may_span,
+            held_in_part(unit),
             report,
         )?;
         for (slice, slice_id) in slice_ids {
@@ -2429,7 +2409,7 @@ fn insert_all(
         // a tape this run records `sealed` is a sealed volume by the time the
         // rule is asked; a found row keeps the status it had (#158), and
         // counts only if that is `sealed`.
-        if unit.may_span {
+        if held_in_part(unit) {
             promote_spanning_version(
                 tx,
                 unit,
@@ -2447,7 +2427,7 @@ fn insert_all(
             unit_name: unit.name.clone(),
             unit_uuid: unit.uuid.clone(),
             version: unit.snapshot_version,
-            may_span: unit.may_span,
+            may_span: held_in_part(unit),
             num_slices: unit.slices.len() as i64,
             held_here: unit
                 .slices
@@ -2491,170 +2471,6 @@ struct RebuiltSet {
     /// The slice numbers this tape holds, on a tape whose seal was read: the
     /// ones its rows record `written`.
     held_here: Vec<i64>,
-}
-
-/// The tapectl home the catalog lives in, as `<home>/tapectl.db`'s directory
-/// — the rule `stage clean` uses for the lockfiles and its leftovers.
-/// `None` for an in-memory catalog, which has no home.
-fn catalog_home(conn: &Connection) -> Option<std::path::PathBuf> {
-    let db = conn.path().filter(|p| !p.is_empty())?;
-    let parent = Path::new(db).parent()?;
-    Some(if parent.as_os_str().is_empty() {
-        std::path::PathBuf::from(".")
-    } else {
-        parent.to_path_buf()
-    })
-}
-
-/// Give each rebuilt stage set the dar catalogue its tape carried (issue
-/// #473): the operator envelope's `catalogs/<uuid8>_v<N>.<k>.dar` members,
-/// copied into `<home>/catalogs/<uuid8>/s<id>/` at 0600 (0700 directories)
-/// and recorded in `stage_sets.catalog_path` as the stem `stage create`
-/// records.
-///
-/// `catalog rebuild` used to leave `catalog_path` NULL and write nothing, so
-/// a set brought back with `volume read-slices` and written to a second tape
-/// had no catalogue in its envelopes — though that tape's RECOVERY.md still
-/// says it does — and RESTORE.sh `--path` died on it.
-///
-/// A set that already has a catalogue on disk is left alone (never
-/// overwritten: it may be a live set's own). A set the catalog knew before
-/// and that still lacks one gets it now, which is how a second `catalog
-/// rebuild` of the same tape heals a catalog rebuilt before this existed.
-/// Sets still without one are named in `report.sets_without_catalogue`.
-fn restore_catalogues(
-    conn: &Connection,
-    operator: &OpenedEnvelope,
-    sets: &[RebuiltSet],
-    report: &mut RebuildReport,
-) {
-    let home = catalog_home(conn);
-    let paths = home.map(crate::config::TapectlPaths::new);
-    let mut done: HashSet<i64> = HashSet::new();
-    for set in sets {
-        if !done.insert(set.stage_set_id) {
-            continue;
-        }
-        let label = format!("{} v{}", set.unit_name, set.version);
-        match place_catalogue(conn, operator, set, paths.as_ref()) {
-            Ok(Placed::Restored) => report.catalogues_restored += 1,
-            Ok(Placed::AlreadyThere) => {}
-            Ok(Placed::NotOnTape) => report.sets_without_catalogue.push(label),
-            Err(why) => {
-                tracing::warn!(
-                    unit = %set.unit_name,
-                    version = set.version,
-                    error = %why,
-                    "rebuild: could not put the dar catalogue back; the set has none"
-                );
-                report.sets_without_catalogue.push(label);
-            }
-        }
-    }
-}
-
-enum Placed {
-    Restored,
-    AlreadyThere,
-    NotOnTape,
-}
-
-fn place_catalogue(
-    conn: &Connection,
-    operator: &OpenedEnvelope,
-    set: &RebuiltSet,
-    paths: Option<&crate::config::TapectlPaths>,
-) -> Result<Placed> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT catalog_path FROM stage_sets WHERE id = ?1",
-            params![set.stage_set_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    if existing.as_deref().is_some_and(envelope::catalogue_on_disk) {
-        return Ok(Placed::AlreadyThere);
-    }
-
-    // The tape's name for this set's catalogue: `<uuid8>_v<version>`.
-    let stem = format!(
-        "{}_v{}",
-        set.unit_uuid.get(..8).unwrap_or(&set.unit_uuid),
-        set.version
-    );
-    let members: Vec<&envelope::ExtractedCatalogue> = operator
-        .catalogues
-        .iter()
-        .filter(|c| envelope::catalogue_stem(&c.file_name) == Some(stem.as_str()))
-        .collect();
-    if members.is_empty() {
-        return Ok(Placed::NotOnTape);
-    }
-    let Some(paths) = paths else {
-        return Err(TapectlError::Other(
-            "the catalog is in memory, so there is no tapectl home to put a catalogue in"
-                .to_string(),
-        ));
-    };
-
-    // The directory is named by the LOCAL unit's uuid, as `stage create`
-    // and `stage clean` derive it.
-    let local_uuid: String = conn.query_row(
-        "SELECT u.uuid FROM stage_sets ss
-         JOIN snapshots sn ON sn.id = ss.snapshot_id
-         JOIN units u ON u.id = sn.unit_id
-         WHERE ss.id = ?1",
-        params![set.stage_set_id],
-        |r| r.get(0),
-    )?;
-    let dir = crate::staging::stage_set_catalogue_dir(paths, &local_uuid, set.stage_set_id);
-    // Named by the LOCAL unit's uuid too: the next copy's MANIFEST.toml lists
-    // the local uuid, and its RECOVERY.md and RESTORE.sh look for
-    // `catalogs/<first 8 of that uuid>_v<N>.1.dar`. Since #527 the two are
-    // always equal (a unit is found by its uuid alone, and a unit of the
-    // same name under another uuid is refused); the local one is still what
-    // the name must follow. dar does not bind a catalogue to its file name.
-    let local_stem = format!(
-        "{}_v{}",
-        local_uuid.get(..8).unwrap_or(&local_uuid),
-        set.version
-    );
-    let created = !dir.exists();
-    let copied = (|| -> Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        if let Some(unit_dir) = dir.parent() {
-            crate::config::secure_path(unit_dir, 0o700);
-        }
-        crate::config::secure_path(&dir, 0o700);
-        for member in &members {
-            // `.<k>.dar`: the tape's stem is a prefix of every member name.
-            let suffix = &member.file_name[stem.len()..];
-            let to = dir.join(format!("{local_stem}{suffix}"));
-            std::fs::copy(&member.path, &to)?;
-            crate::config::secure_path(&to, 0o600);
-            std::fs::File::open(&to)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = copied {
-        if created {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        return Err(e);
-    }
-    let catalog_path = dir.join(&local_stem);
-    crate::db::busy::retry(
-        crate::db::busy::BusyPolicy::DEFAULT,
-        "the rebuilt stage set's catalogue",
-        || {
-            Ok(conn.execute(
-                "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
-                params![catalog_path.to_string_lossy().to_string(), set.stage_set_id],
-            )?)
-        },
-    )?;
-    Ok(Placed::Restored)
 }
 
 fn existing_id(tx: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Option<i64>> {
@@ -2797,7 +2613,11 @@ fn ensure_snapshot(
     // only the positions inserted after this row can show. It is inserted
     // `staged`, as the writing catalog holds it before its tapes seal, and
     // [`promote_spanning_version`] makes it `current` when the rule holds.
-    let status = if unit.may_span { "staged" } else { "current" };
+    let status = if held_in_part(unit) {
+        "staged"
+    } else {
+        "current"
+    };
     tx.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
                                 total_size, file_count)
@@ -2985,8 +2805,8 @@ fn ensure_stage_set(
          VALUES (?1, 'cleaned', 'rebuilt', ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9)",
         params![
             snapshot_id,
-            unit.dar_version,
-            unit.dar_command,
+            None::<String>,
+            None::<String>,
             slice_size,
             unit.slices.len() as i64,
             unit.slices.iter().map(|s| s.size_bytes).sum::<i64>(),
@@ -3106,7 +2926,7 @@ fn tape_split(unit: &envelope::ManifestUnit, sealed: bool, ended_after: Option<i
     if held.len() == unit.slices.len() {
         return Written::Completed;
     }
-    if !unit.may_span {
+    if !held_in_part(unit) {
         return Written::Cut;
     }
     match (held.iter().min(), held.iter().max()) {
@@ -4100,6 +3920,15 @@ fn resolve_operator_identity(
     }
 }
 
+/// Whether a manifest block gives some of its staging's slices no
+/// `tape_position`: this tape's plan holds only a run of them. Layout 3 has
+/// no `may_span` key (`volume-format-v3.md` §1.9, item 288); until T4.9
+/// ports this reader to §5.3's split, such a block is read as Layout 2 read a
+/// block that stated `may_span = true`.
+fn held_in_part(unit: &envelope::ManifestUnit) -> bool {
+    unit.slices.iter().any(|s| s.tape_position.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4241,15 +4070,19 @@ mod tests {
             encrypted_bytes: 200,
             sha256_plain: "a".repeat(64),
             sha256_encrypted: "b".repeat(64),
+            continues: false,
         };
         let unit_at = |name: &str, position: i64| envelope::ManifestUnit {
             name: name.to_string(),
             uuid: format!("{name}-uuid"),
             snapshot_version: 1,
             stage_set_id: 0,
-            may_span: false,
-            dar_version: None,
-            dar_command: None,
+            payload: "tar".to_string(),
+            stream_bytes: 0,
+            file_table: None,
+            id_map: None,
+            tar_version: None,
+            compression: None,
             slices: vec![slice_at(position)],
         };
         let manifest = EnvelopeManifest {
@@ -4803,17 +4636,19 @@ mod tests {
             );
         }
 
-        /// §1.2 rule 6's acceptance, through [`locate_and_judge_seal`]: an
-        /// early seal is a short seal only on a tape whose File 0 requires
-        /// `short-seal`; on any other tape it is no seal.
+        /// §1.2 rule 6's acceptance, through [`locate_and_judge_seal`]: on a
+        /// Layout 3 tape an early seal that counts the medium is the short
+        /// seal, and File 0 needs no `requires` entry for it (D1; the
+        /// Layout 2 rule that asked for `short-seal` is gone).
         #[test]
-        fn an_early_seal_on_a_tape_that_does_not_require_short_seal_is_no_seal() {
+        fn an_early_seal_that_counts_the_medium_is_the_short_seal() {
             let mut t = short_tape::short_tape();
             let k = t.ended_after;
             let file0 = String::from_utf8(
                 crate::store::read_small_bytes(&mut t.store, 0, "File 0").unwrap(),
             )
             .unwrap();
+            assert!(file0.contains("requires = []"), "D1: {file0}");
             let fi_raw = crate::store::read_small_bytes(&mut t.store, 3, "File 3").unwrap();
             let fi = format::without_nul_padding(&fi_raw).to_vec();
 
@@ -4821,19 +4656,6 @@ mod tests {
             assert!(matches!(located.verdict, format::SealVerdict::Sealed(_)));
             assert_eq!(located.ended_after, Some(k));
             assert_eq!(located.position, Some(k + 1));
-
-            // The same tape, its File 0 stating it requires nothing.
-            let file0_old = file0.replace("requires = [\"short-seal\"]", "requires = []");
-            assert_ne!(
-                file0_old, file0,
-                "positive control: File 0 requires short-seal"
-            );
-            let located = locate_and_judge_seal(&mut t.store, &file0_old, &fi, 3, t.planned_seal);
-            let format::SealVerdict::Unsealed(why) = &located.verdict else {
-                panic!("an early seal there is no seal: {located:?}");
-            };
-            assert!(why.contains("does not require"), "{why}");
-            assert_eq!(located.ended_after, None);
 
             // A seal found at the planned position that states another
             // count is the two ends disagreeing, not a full seal.

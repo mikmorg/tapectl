@@ -1,8 +1,9 @@
 //! Parsers for the plaintext front index (File 3), seal marker (File M), and
 //! ID thunk (File 0) — the reader half of `layout.rs`'s `generate_front_index`
 //! / `generate_seal_marker` / `generate_id_thunk_v2` writer half. Normative
-//! grammar: `docs/design/volume-format-v2.md` §3–4; self-consistency rules:
-//! `docs/design/v2-open-questions.md` §2.5.
+//! grammar: `docs/design/volume-format-v3.md` §1.1, §1.2, §4 and §5 (Layout
+//! Version 3); self-consistency rules: `docs/design/v2-open-questions.md`
+//! §2.5, carried unchanged.
 //!
 //! All three documents share one shape: a human-readable header, then one or
 //! more TOML tables (`[volume]`/`[layout]`/`[media]` for the ID thunk,
@@ -29,16 +30,17 @@ pub struct ParsedIndexEntry {
 }
 
 /// The parsed seal marker: its `[seal]` fields plus the embedded front-index
-/// copy (`docs/design/volume-format-v2.md` §4).
+/// copy (`docs/design/volume-format-v3.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSeal {
     pub volume: String,
     pub layout_version: i64,
     pub file_count: i32,
-    /// The position of the last file before this seal (`volume-format-v2.md`
-    /// §4.1, tapectl 1.6.0): `file_count - 2` on every seal that keeps rule
-    /// S1. `None` on every seal before 1.6.0, which is a full seal (rule S3;
-    /// [`ParsedSeal::effective_ended_after`] gives its value).
+    /// The position of the last file before this seal (`volume-format-v3.md`
+    /// §5): `file_count - 2` on every seal that keeps rule S1. Every seal
+    /// that parses states it (rule S2); `None` only on a seal returned
+    /// uninterpreted because this tapectl must not read it
+    /// ([`ParsedSeal::refusal`]).
     pub ended_after: Option<u64>,
     pub sealed_at: String,
     pub front_index_sha256: String,
@@ -66,22 +68,26 @@ impl ParsedSeal {
         .refusal("the seal marker")
     }
 
-    /// Whether this seal's `requires` names [`SHORT_SEAL`]: every seal
-    /// tapectl 1.6.0 or later writes, full or short (ADR-0012 item 111).
-    /// `volume-format-v2.md` §1.2 rule 6 accepts a seal before the planned
-    /// position only when this is true (and the tape's File 0, when it reads,
-    /// requires the feature too).
-    pub fn requires_short_seal(&self) -> bool {
-        self.requires.iter().any(|f| f == SHORT_SEAL)
-    }
-
-    /// The last file before this seal: its `ended_after`, or, on a seal that
-    /// states none (every seal before 1.6.0), `file_count - 2` (rule S3: a
-    /// full seal). `None` only for a `file_count` below 2, which no seal that
-    /// keeps §4.1's rules states.
+    /// The last file before this seal: its `ended_after` (rule S2: every
+    /// seal that parses states one). `None` only on a seal returned
+    /// uninterpreted ([`ParsedSeal::refusal`]). Layout 2's rule S3, a seal
+    /// with no `ended_after` read as full, is gone with compatibility
+    /// (`volume-format-v3.md` §5; ADR-0012 item 242).
     pub fn effective_ended_after(&self) -> Option<u64> {
         self.ended_after
-            .or_else(|| u64::try_from(self.file_count).ok()?.checked_sub(2))
+    }
+
+    /// §1.2 rule 6, "Which seal a reader accepts", for a seal found BEFORE
+    /// the planned position, at `position`, the last file on the medium: one
+    /// that keeps §5's parse rules (it parsed, so it did) and states
+    /// `file_count = N` for the N files the tape holds (`position = N-1`).
+    /// It is the normal short ending on every Layout 3 tape and needs no
+    /// `requires` entry (D1). A seal at or after the planned position is the
+    /// caller's to judge.
+    pub fn is_short_seal_at(&self, position: u32) -> bool {
+        self.refusal().is_none()
+            && self.ended_after.is_some()
+            && i64::from(self.file_count) == i64::from(position) + 1
     }
 
     /// Full, short, or at odds with the plan: [`classify_seal_ending`].
@@ -89,15 +95,12 @@ impl ParsedSeal {
         classify_seal_ending(self, planned_file_count)
     }
 
-    /// `volume-format-v2.md` §4.1's parse rules S1, S2, S4 and S5, the
-    /// first one broken. [`parse_seal_marker`] already applies them to every
-    /// seal that states `ended_after` or requires [`SHORT_SEAL`]; on a seal
-    /// before 1.6.0 they are the caller's to apply (S3 then gives S5 its
-    /// position), since no reader before 1.6.0 checked the embedded copy when
-    /// it parsed a seal. A seal that breaks one is unparseable (rule S6).
+    /// `volume-format-v3.md` §5's parse rules S1, S2, S4 and S5, the first
+    /// one broken. [`parse_seal_marker`] applies them to every seal this
+    /// tapectl may read. A seal that breaks one is unparseable (rule S6).
     pub fn check_parse_rules(&self) -> std::result::Result<(), SealRuleViolation> {
-        // S2: a seal that requires short-seal states where it ended.
-        if self.requires_short_seal() && self.ended_after.is_none() {
+        // S2: every seal states where it ended.
+        if self.ended_after.is_none() {
             return Err(SealRuleViolation::MissingEndedAfter);
         }
         // S1: ended_after + 2 == file_count, so the seal's own position
@@ -138,7 +141,7 @@ impl ParsedSeal {
     }
 }
 
-/// The first of `volume-format-v2.md` §4.1's parse rules a seal breaks. A
+/// The first of `volume-format-v3.md` §5's parse rules a seal breaks. A
 /// seal that breaks one is unparseable (rule S6): by the fail-safe precedence
 /// (`v2-open-questions.md` §2.5) that is the unsealed signal, never "sealed".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +149,7 @@ pub enum SealRuleViolation {
     /// S1: `ended_after` is a non-negative integer and `ended_after + 2 ==
     /// file_count`.
     EndedAfterNotFileCountLessTwo { ended_after: i64, file_count: i32 },
-    /// S2: a seal whose `requires` names `short-seal` states `ended_after`.
+    /// S2: every seal states `ended_after`.
     MissingEndedAfter,
     /// S4: the embedded copy has exactly `file_count` entries.
     EntryCount { entries: usize, file_count: i32 },
@@ -172,10 +175,9 @@ impl std::fmt::Display for SealRuleViolation {
                 "rule S1: it states ended_after = {ended_after} and file_count = {file_count}; \
                  ended_after must be a non-negative integer two less than file_count"
             ),
-            SealRuleViolation::MissingEndedAfter => write!(
-                f,
-                "rule S2: it requires \"{SHORT_SEAL}\" but states no ended_after"
-            ),
+            SealRuleViolation::MissingEndedAfter => {
+                write!(f, "rule S2: it states no ended_after")
+            }
             SealRuleViolation::EntryCount {
                 entries,
                 file_count,
@@ -211,7 +213,7 @@ impl std::fmt::Display for SealRuleViolation {
 
 /// Where a tape ended, by its seal's `file_count` against the plan's count
 /// (File 0's `total_files`, File 3's entry count, or the Layout's):
-/// `volume-format-v2.md` §4.1, "Classification".
+/// `volume-format-v3.md` §5, "Classification".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealEnding {
     /// The seal's `file_count` is the plan's: it sits at the planned
@@ -219,9 +221,8 @@ pub enum SealEnding {
     Full,
     /// The seal's `file_count` is less than the plan's: the tape ended after
     /// `ended_after`, and every planned position past it is not on the tape
-    /// (§4.2). Whether a reader accepts it is §1.2 rule 6's question, not
-    /// this one's: only on a tape that requires `short-seal`, and only a seal
-    /// that does ([`ParsedSeal::requires_short_seal`]).
+    /// (§5.1). Whether a reader accepts it is §1.2 rule 6's question, not
+    /// this one's ([`ParsedSeal::is_short_seal_at`]).
     Short { ended_after: u64 },
     /// The seal's `file_count` is greater than the plan's (or states no file
     /// before the seal at all): the tape's two ends disagree, as a
@@ -232,11 +233,11 @@ pub enum SealEnding {
     },
 }
 
-/// Classify `seal` against the plan's file count (`volume-format-v2.md`
-/// §4.1): equal is [`SealEnding::Full`], less is [`SealEnding::Short`],
+/// Classify `seal` against the plan's file count (`volume-format-v3.md`
+/// §5): equal is [`SealEnding::Full`], less is [`SealEnding::Short`],
 /// greater is [`SealEnding::Disagrees`]. Pure: it reads nothing, and judges
 /// nothing but the two counts. Run it on a seal that parsed, and so keeps
-/// rules S1 to S5 when it states `ended_after` or requires `short-seal`.
+/// rules S1 to S5.
 pub fn classify_seal_ending(seal: &ParsedSeal, planned_file_count: u64) -> SealEnding {
     let disagrees = SealEnding::Disagrees {
         seal_file_count: seal.file_count,
@@ -285,7 +286,7 @@ impl From<FileEntryToml> for ParsedIndexEntry {
 struct IndexHeader {
     volume: String,
     layout_version: i64,
-    /// From 1.6.0 (§3). Absent means false.
+    /// Every Layout 3 File 3 states it (§1.8). Absent means false.
     #[serde(default)]
     may_end_early: bool,
 }
@@ -303,13 +304,13 @@ struct FrontIndexDoc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFrontIndex {
     pub volume: String,
-    /// `[index] may_end_early = true` (`volume-format-v2.md` §3, tapectl
-    /// 1.6.0): the tape may end before the last file listed, and its seal
-    /// says where. False when absent, on every tape before 1.6.0. It decides
-    /// nothing for a reader: `requires` and the seal's `ended_after` do.
+    /// `[index] may_end_early = true` (`volume-format-v3.md` §4, §1.8): the
+    /// tape may end before the last file listed, and its seal says where.
+    /// False when absent. It decides nothing for a reader: the seal's
+    /// `ended_after` does.
     pub may_end_early: bool,
     /// The planned files, in position order: on a tape that ended early,
-    /// the ones after the seal's `ended_after` are not on it (§4.2).
+    /// the ones after the seal's `ended_after` are not on it (§5.1).
     pub files: Vec<ParsedIndexEntry>,
 }
 
@@ -318,8 +319,8 @@ struct SealHeader {
     volume: String,
     layout_version: i64,
     file_count: i64,
-    /// From 1.6.0 (§4.1). i64 on the wire so a negative value reaches rule
-    /// S1 as a broken rule rather than as a TOML error.
+    /// Every seal states it (rule S2). i64 on the wire so a negative value
+    /// reaches rule S1 as a broken rule rather than as a TOML error.
     ended_after: Option<i64>,
     sealed_at: String,
     front_index_sha256: String,
@@ -349,14 +350,16 @@ fn toml_body<'a>(raw: &'a str, marker: &str, what: &str) -> Result<&'a str> {
 
 /// Parse the plaintext front index (File 3) into its ordered `[[files]]`
 /// entries. Absent/malformed input is a normal `Err`, not a panic — callers
-/// in the confirm chain walk (`docs/design/volume-format-v2.md` §5) treat a
+/// in the confirm chain walk (`docs/design/volume-format-v3.md` §6) treat a
 /// parse failure as "front index unreadable," never crash on it.
 pub fn parse_front_index(raw: &str) -> Result<Vec<ParsedIndexEntry>> {
     Ok(parse_front_index_document(raw)?.files)
 }
 
 /// [`parse_front_index`], with the `[index]` table's own keys: the volume
-/// label and, from 1.6.0, `may_end_early` (`volume-format-v2.md` §3).
+/// label and `may_end_early` (`volume-format-v3.md` §4). A `layout_version`
+/// other than [`LAYOUT_VERSION`] is refused: File 3 carries no magic, so
+/// the layout version is what moves (ADR-0012 item 294).
 pub fn parse_front_index_document(raw: &str) -> Result<ParsedFrontIndex> {
     let body = toml_body(raw, "[index]", "front index")?;
     let doc: FrontIndexDoc = toml::from_str(body)
@@ -383,17 +386,14 @@ pub fn parse_front_index_document(raw: &str) -> Result<ParsedFrontIndex> {
 /// marker is treated exactly like an absent one: the tape reads as unsealed,
 /// never as a crash.
 ///
-/// In this order (`volume-format-v2.md` §1.2 rule 1, §4.1):
+/// In this order (`volume-format-v3.md` §1.2 rule 1, §5):
 /// 1. A seal this tapectl must not read (a feature it does not know, another
 ///    layout: [`ParsedSeal::refusal`]) parses, uninterpreted, so that every
 ///    caller refuses it by name, and a write path's contact check still sees
 ///    a seal there.
-/// 2. A seal that states `ended_after` or requires `short-seal` (every seal
-///    1.6.0 writes) keeps the parse rules S1, S2, S4 and S5
-///    ([`ParsedSeal::check_parse_rules`]); one that breaks a rule is an `Err`
-///    naming it (rule S6).
-/// 3. A seal before 1.6.0 (no `ended_after`, no `short-seal`) parses as
-///    before: a full seal (rule S3).
+/// 2. Every other seal keeps the parse rules S1, S2, S4 and S5
+///    ([`ParsedSeal::check_parse_rules`]); one that breaks a rule, a seal
+///    with no `ended_after` among them, is an `Err` naming it (rule S6).
 pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
     let body = toml_body(raw, "[seal]", "seal marker")?;
     let doc: SealDoc = toml::from_str(body)
@@ -413,9 +413,6 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
     if seal.refusal().is_some() {
         return Ok(seal);
     }
-    if stated_ended_after.is_none() && !seal.requires_short_seal() {
-        return Ok(seal);
-    }
     let broken = match stated_ended_after {
         // S1's "non-negative": a value u64 cannot hold is no ended_after.
         Some(k) if k < 0 => Some(SealRuleViolation::EndedAfterNotFileCountLessTwo {
@@ -430,14 +427,39 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
     }
 }
 
+/// `s` as a TOML basic string, quotes included: `\` and `"` escaped, and
+/// every control character (DEL among them) as TOML escapes it
+/// (`volume-format-v3.md` §1.1, #547: every string tapectl writes into a
+/// plaintext TOML file or a MANIFEST.toml is one). Nothing else changes, so
+/// a plain string is written as it is.
+pub fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A tape file's true bytes: the block padding a tape read returns after
-/// them (trailing NULs) removed, `volume-format-v2.md` §4.
+/// them (trailing NULs) removed, `volume-format-v3.md` §5.
 pub fn without_nul_padding(raw: &[u8]) -> &[u8] {
     &raw[..raw.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)]
 }
 
 /// What a tape's seal marker proves, judged against the front index it ends
-/// (issue #458; `volume-format-v2.md` §4). The ONE judgement: `catalog
+/// (issue #458; `volume-format-v3.md` §5). The ONE judgement: `catalog
 /// rebuild --from-volume` asserts `sealed` only on [`SealVerdict::Sealed`]
 /// (ADR-0012: "asserts `sealed` only after reading the seal marker"), and
 /// `volume resume`'s adoption of a lost write (#360) asks the same question
@@ -462,7 +484,7 @@ pub enum SealVerdict {
 /// = its true bytes, padding removed) sits at `front_index_position`.
 /// `seal_read` is what reading the file at `seal_position` (File 0's
 /// `[layout] seal_marker`, or the last file on a tape that ended before it,
-/// `volume-format-v2.md` §1.2 rule 6) gave: its bytes, or the reason it did
+/// `volume-format-v3.md` §1.2 rule 6) gave: its bytes, or the reason it did
 /// not read. `seal_position` is named in the reasons, and judged by nothing.
 ///
 /// The check order, and the wording, are those `adopt_lost` has always
@@ -504,31 +526,20 @@ pub fn judge_seal(
     SealVerdict::Sealed(seal)
 }
 
-/// The layout this tapectl reads (File 0's `layout_version`).
-pub const LAYOUT_VERSION: i64 = 2;
-/// File 0's `magic` for layout 2.
-pub const MAGIC: &str = "tapectl-volume-v2";
-/// The feature every tape tapectl 1.6.0 or later writes requires (ADR-0012
-/// item 111, `volume-format-v2.md` §1.2): the tape may end before the last
-/// file its plan lists, its seal states `ended_after`, and a reader trusts
-/// the seal over the plan (§4.1, §4.2).
-pub const SHORT_SEAL: &str = "short-seal";
+/// The layout this tapectl reads and writes (File 0's, File 3's and the
+/// seal's `layout_version`; D1, ADR-0012 item 242).
+pub const LAYOUT_VERSION: i64 = 3;
+/// File 0's `magic` for Layout 3 (D1). File 3 and the seal carry no magic
+/// (ADR-0012 item 294): their `layout_version` is what moves.
+pub const MAGIC: &str = "tapectl-volume-v3";
 
-/// The feature a tape states when its plan holds a slice of a spannable
-/// stage set (ADR-0012 item 124, #478): a unit may run across tapes, so a
-/// `[[units]]` block in its envelopes may be a range (item 125: `may_span =
-/// true`, every slice of the set listed, `tape_position` only on the slices
-/// this tape plans). It is stated beside [`SHORT_SEAL`], as `requires =
-/// ["short-seal", "spanning"]` with the space after the comma (normative:
-/// without it RESTORE.sh reads the one feature `short-sealspanning`).
-pub const SPANNING: &str = "spanning";
-
-/// The features this tapectl knows how to read (ADR-0012 amendment item 15,
-/// `volume-format-v2.md` "How v2 extends"). A tape whose File 0 or seal
-/// marker lists anything else under `requires` is refused by name. Empty
-/// from 1.1.0 to 1.5.0; 1.6.0 knows [`SHORT_SEAL`] (item 111); 1.7.0 knows
-/// [`SPANNING`] too (item 124).
-pub const KNOWN_FEATURES: &[&str] = &[SHORT_SEAL, SPANNING];
+/// The features this tapectl knows how to read (`volume-format-v3.md` §1.2).
+/// Empty: on every Layout 3 tape `requires` is empty (D1; ADR-0012 items
+/// 258(a), 288). The short seal and a unit that continues on another
+/// cartridge are part of Layout 3, not features of it. The key stays, so
+/// that a later feature can fence an older Layout 3 reader: a tape whose
+/// File 0 or seal lists any feature is refused by name.
+pub const KNOWN_FEATURES: &[&str] = &[];
 
 /// What a tape says about the reader it needs: File 0's `magic`,
 /// `layout_version` and `requires` (the seal marker repeats the last two).
@@ -610,8 +621,8 @@ impl FormatClaims {
         if !self.requires_stated {
             return Some(format!(
                 "{what} states no `requires`, which every tape this tapectl ({ours}) writes \
-                 states (volume-format-v2.md §1.2){writer}: a tape written before tapectl \
-                 1.1.0, or a damaged one, which this tapectl does not read. Read it with the RESTORE.sh at \
+                 states (volume-format-v3.md §1.2){writer}: a damaged tape, or one of another \
+                 layout, which this tapectl does not read. Read it with the RESTORE.sh at \
                  the tape's own file 2"
             ));
         }
@@ -701,7 +712,7 @@ pub fn parse_id_thunk_identity(raw: &str) -> Result<IdThunkIdentity> {
 /// The ID thunk (File 0)'s `[layout]` pointers — `front_index` (always 3),
 /// `seal_marker` (the last file — `layout::generate_id_thunk_v2` computes
 /// this as `total_files - 1`), and `total_files`
-/// (`docs/design/volume-format-v2.md` §1). A tape's own claim about its own
+/// (`docs/design/volume-format-v3.md` §1.1). A tape's own claim about its own
 /// shape.
 ///
 /// Used by the fresh-write contact check (`session::check_tape_contact`,
@@ -793,7 +804,7 @@ pub fn parse_id_thunk_volume_meta(raw: &str) -> Result<IdThunkVolumeMeta> {
 
 /// The ID thunk (File 0)'s `[media]` cartridge identity — which physical
 /// cartridge this volume was written to, and **how that was established**
-/// (`docs/design/volume-format-v2.md` §1.1, ADR-0012).
+/// (`docs/design/volume-format-v3.md` §1.1, ADR-0012).
 ///
 /// A fourth parser over File 0 rather than fields bolted onto a sibling, for
 /// the same reason `IdThunkVolumeMeta` is a third: each documents exactly
@@ -886,7 +897,7 @@ pub struct IdThunkProvenance {
     /// spans any interruption: wall-clock provenance, never a throughput.
     pub created_at: Option<String>,
     /// The chip's load count when the write was planned. `0` is the
-    /// writer's "unknown" (`volume-format-v2.md` §1.1) and reads as `None`:
+    /// writer's "unknown" (`volume-format-v3.md` §1.1) and reads as `None`:
     /// a tape being written has been loaded at least once, and a stored 0
     /// would be a confident wrong count (#184, migration 015).
     pub load_count_at_write: Option<i64>,
@@ -1140,9 +1151,8 @@ mod forward_compat_tests {
         })
     }
 
-    /// A seal's embedded copy that keeps §4.1's rules S4 and S5 (Files 0-3,
-    /// one data slice, the seal), so these fixtures stay seals whether the
-    /// generator writes a 1.5.0 seal or a 1.6.0 one.
+    /// A seal's embedded copy that keeps §5's rules S4 and S5 (Files 0-3,
+    /// one data slice, the seal).
     fn seal_files() -> Vec<FrontIndexFile> {
         [
             "id_thunk",
@@ -1163,48 +1173,15 @@ mod forward_compat_tests {
         .collect()
     }
 
-    /// The full seal 1.6.0 writes over [`seal_files`]: `requires =
-    /// ["short-seal"]`, `ended_after = 4`.
+    /// The full seal this tapectl writes over [`seal_files`]: `requires =
+    /// []`, `ended_after = 4`.
     fn seal() -> String {
         generate_seal_marker("FC01", 6, "h", &seal_files())
     }
 
-    /// The seal tapectl 1.1.0 to 1.5.0 wrote over [`seal_files`], as a
-    /// literal in that grammar (`requires = []`, no `ended_after`): what a
-    /// 1.6.0 reader must still read (§1.2 rule 2, §4.1 rule S3).
-    fn seal_1_5_0() -> String {
-        let mut s = String::from(
-            "================================================================\n\
-             TAPECTL SEAL MARKER\n\
-             ================================================================\n\n\
-             Volume: FC01\n\n\
-             [seal]\n\
-             volume = \"FC01\"\n\
-             layout_version = 2\n\
-             requires = []\n\
-             file_count = 6\n\
-             sealed_at = \"2026-10-06T00:00:00Z\"\n\
-             front_index_sha256 = \"h\"\n",
-        );
-        for (position, kind) in [
-            (0, "id_thunk"),
-            (1, "system_guide"),
-            (2, "restore_sh"),
-            (3, "front_index"),
-            (4, "data_slice"),
-        ] {
-            s.push_str(&format!(
-                "\n[[files]]\nposition = {position}\ntype = \"{kind}\"\nsize_bytes = 10\n\
-                 sha256_encrypted = \"h\"\n"
-            ));
-        }
-        s.push_str("\n[[files]]\nposition = 5\ntype = \"seal_marker\"\n");
-        s
-    }
-
     /// `doc` (a File 0 or a seal) with its `requires = …` line replaced by
     /// `line`: these fixtures say what they require whatever the generator
-    /// writes there (`[]` before 1.6.0, `["short-seal"]` from it).
+    /// writes there.
     fn set_requires(doc: &str, line: &str) -> String {
         let mut done = false;
         let out: Vec<&str> = doc
@@ -1229,7 +1206,7 @@ mod forward_compat_tests {
     #[test]
     fn judge_seal_tells_sealed_from_unsealed_from_refused() {
         use sha2::Digest;
-        let front_index = b"[index]\nvolume = \"FC01\"\nlayout_version = 2\n";
+        let front_index = b"[index]\nvolume = \"FC01\"\nlayout_version = 3\n";
         let hash = format!("{:x}", sha2::Sha256::digest(front_index));
         let bound = generate_seal_marker("FC01", 6, &hash, &seal_files());
         // The tape returns block-padded reads; the judgement is on true bytes.
@@ -1269,37 +1246,35 @@ mod forward_compat_tests {
         assert_eq!(without_nul_padding(b""), b"");
     }
 
-    /// ADR-0012 item 111: every seal 1.6.0 writes requires `short-seal` and
-    /// states `ended_after`, and this tapectl reads it.
+    /// D1 (`volume-format-v3.md` §1.2): every seal this tapectl writes states
+    /// `requires = []` and `ended_after`, and this tapectl reads it.
     #[test]
-    fn a_new_tape_requires_short_seal_and_is_readable() {
+    fn a_new_tape_requires_nothing_and_is_readable() {
         let s = parse_seal_marker(&seal()).unwrap();
-        assert_eq!(s.requires, vec![SHORT_SEAL.to_string()]);
-        assert!(s.requires_short_seal());
+        assert!(s.requires.is_empty() && s.requires_stated);
         assert_eq!(s.ended_after, Some(4));
         assert_eq!(s.refusal(), None);
         assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
+        assert!(thunk().contains("\nlayout_version = 3\nrequires = []\n"));
+        check_id_thunk_readable(&thunk()).unwrap();
+        assert!(KNOWN_FEATURES.is_empty());
     }
 
-    /// ADR-0012 amendment item 15: a 1.1.0 to 1.5.0 tape states `requires =
-    /// []` in File 0 and the seal marker, and this tapectl still reads it:
-    /// a full seal (rule S3).
+    /// Rule S2 (`volume-format-v3.md` §5): every seal states `ended_after`;
+    /// one that does not (Layout 2's rule S3 read it as full) is unparseable,
+    /// naming the rule (S6).
     #[test]
-    fn a_1_1_0_to_1_5_0_tape_requires_nothing_and_is_readable() {
-        let t = set_requires(&thunk(), "requires = []");
-        check_id_thunk_readable(&t).unwrap();
-        let s = parse_seal_marker(&seal_1_5_0()).unwrap();
-        assert!(s.requires.is_empty());
-        assert_eq!(s.ended_after, None);
-        assert_eq!(s.effective_ended_after(), Some(4));
-        assert_eq!(s.refusal(), None);
-        assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
+    fn a_seal_stating_no_ended_after_is_unparseable() {
+        let without = seal().replace("ended_after = 4\n", "");
+        assert_ne!(without, seal(), "the line was there to remove");
+        let err = parse_seal_marker(&without).unwrap_err().to_string();
+        assert!(err.contains("rule S2"), "{err}");
     }
 
     /// ADR-0012 item 258(d): every File 0 and seal this tapectl writes states
-    /// `requires`; one that states none (every tape before 1.1.0) is refused,
-    /// naming the field, by File 0's check and by the seal's own refusal. The
-    /// seal still parses, so every caller refuses it by name.
+    /// `requires`; one that states none is refused, naming the field, by File
+    /// 0's check and by the seal's own refusal. The seal still parses, so
+    /// every caller refuses it by name.
     #[test]
     fn a_tape_without_requires_is_refused_naming_the_field() {
         let t = set_requires(&thunk(), "requires = []").replace("requires = []\n", "");
@@ -1308,7 +1283,7 @@ mod forward_compat_tests {
         assert!(err.contains("File 0 states no `requires`"), "{err}");
         let claims = parse_id_thunk_claims(&t).expect("the claims still parse");
         assert!(!claims.requires_stated);
-        let old = seal_1_5_0().replace("requires = []\n", "");
+        let old = seal().replace("requires = []\n", "");
         assert!(!old.contains("requires"));
         let s = parse_seal_marker(&old).expect("parses, to be refused by name");
         let why = s.refusal().expect("refused");
@@ -1317,14 +1292,12 @@ mod forward_compat_tests {
             "{why}"
         );
         // The positive control: `requires = []` is stated, and read.
-        check_id_thunk_readable(&set_requires(&thunk(), "requires = []")).unwrap();
-        assert_eq!(parse_seal_marker(&seal_1_5_0()).unwrap().refusal(), None);
+        check_id_thunk_readable(&thunk()).unwrap();
+        assert_eq!(parse_seal_marker(&seal()).unwrap().refusal(), None);
     }
 
     /// An unknown required feature is refused, by name, in File 0 and in
-    /// the seal marker; the message says what would read it. (Before 1.6.0
-    /// this test's stand-in for "unknown" was `short-seal`, which 1.6.0
-    /// knows: see `file_0_and_seal_requiring_short_seal_are_readable`.)
+    /// the seal marker; the message says what would read it.
     #[test]
     fn an_unknown_required_feature_is_refused_by_name() {
         let t = set_requires(&thunk(), "requires = [\"unknown-feature\"]");
@@ -1339,118 +1312,72 @@ mod forward_compat_tests {
         assert!(why.contains("\"unknown-feature\""), "{why}");
     }
 
-    /// ADR-0012 item 111: 1.6.0 knows `short-seal`. A File 0 that requires
-    /// it is readable, and so is a seal that requires it (and keeps §4.1's
-    /// rules); a feature beside it that this tapectl does not know is still
-    /// refused, naming only that one.
+    /// D1 (ADR-0012 items 258(a), 288): `short-seal` and `spanning` are no
+    /// longer known entries. Layout 3 states neither; a File 0 or a seal
+    /// that requires one is refused by name, like any feature this tapectl
+    /// does not know. Both names, in item 124's spelling, are refused
+    /// together.
     #[test]
-    fn file_0_and_seal_requiring_short_seal_are_readable() {
-        assert!(KNOWN_FEATURES.contains(&"short-seal"));
-        let t = set_requires(&thunk(), "requires = [\"short-seal\"]");
-        check_id_thunk_readable(&t).expect("1.6.0 reads a short-seal tape's File 0");
-        assert_eq!(parse_id_thunk_claims(&t).unwrap().refusal("File 0"), None);
-        let s = parse_seal_marker(&seal()).expect("and the seal 1.6.0 writes");
-        assert_eq!(s.refusal(), None);
-
-        let both = set_requires(&thunk(), "requires = [\"short-seal\", \"unknown-feature\"]");
-        let err = check_id_thunk_readable(&both).unwrap_err().to_string();
-        assert!(err.contains("\"unknown-feature\""), "{err}");
-        assert!(
-            !err.contains("requires \"short-seal\""),
-            "short-seal is known and is not named as the unknown one: {err}"
-        );
-    }
-
-    /// ADR-0012 item 124: 1.7.0 knows `spanning`. A File 0 and a seal that
-    /// state item 124's normative `requires = ["short-seal", "spanning"]`
-    /// (the space after the comma included) are readable, and the seal still
-    /// requires short-seal, so rule S2 still binds it. A feature beside the
-    /// two that this tapectl does not know is still refused, naming only it.
-    #[test]
-    fn file_0_and_seal_requiring_short_seal_and_spanning_are_readable() {
-        assert_eq!(SPANNING, "spanning");
-        assert_eq!(KNOWN_FEATURES, &[SHORT_SEAL, SPANNING]);
-        let line = "requires = [\"short-seal\", \"spanning\"]";
-
-        let t = set_requires(&thunk(), line);
-        assert!(
-            t.contains("\nrequires = [\"short-seal\", \"spanning\"]\n"),
-            "{t}"
-        );
-        check_id_thunk_readable(&t).expect("1.7.0 reads a span tape's File 0");
-        let claims = parse_id_thunk_claims(&t).unwrap();
-        assert_eq!(claims.requires, vec![SHORT_SEAL, SPANNING]);
-        assert_eq!(claims.refusal("File 0"), None);
-
-        let s = parse_seal_marker(&set_requires(&seal(), line))
-            .expect("a seal stating both features keeps S1-S6 and parses");
-        assert_eq!(s.requires, vec![SHORT_SEAL, SPANNING]);
-        assert!(s.requires_short_seal());
-        assert_eq!(s.refusal(), None);
-        // S2 still binds: requiring short-seal (beside spanning) without
-        // `ended_after` breaks it.
-        let mut no_ending = s.clone();
-        no_ending.ended_after = None;
-        assert_eq!(
-            no_ending.check_parse_rules(),
-            Err(SealRuleViolation::MissingEndedAfter)
-        );
-
-        let three = "requires = [\"short-seal\", \"spanning\", \"unknown-feature\"]";
-        let err = check_id_thunk_readable(&set_requires(&thunk(), three))
+    fn short_seal_and_spanning_are_no_longer_known_features() {
+        for feature in ["short-seal", "spanning"] {
+            assert!(!KNOWN_FEATURES.contains(&feature));
+            let line = format!("requires = [\"{feature}\"]");
+            let err = check_id_thunk_readable(&set_requires(&thunk(), &line))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("requires \"{feature}\" that")),
+                "{err}"
+            );
+            let why = parse_seal_marker(&set_requires(&seal(), &line))
+                .unwrap()
+                .refusal()
+                .expect("refused");
+            assert!(why.contains(&format!("\"{feature}\"")), "{why}");
+        }
+        let both = "requires = [\"short-seal\", \"spanning\"]";
+        let err = check_id_thunk_readable(&set_requires(&thunk(), both))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("requires \"unknown-feature\" that"), "{err}");
         assert!(
-            !err.contains("requires \"spanning\"") && !err.contains("\"spanning\" that"),
-            "spanning is known and is not named as the unknown one: {err}"
+            err.contains("requires \"short-seal\", \"spanning\" that"),
+            "{err}"
         );
-        let why = parse_seal_marker(&set_requires(&seal(), three))
-            .unwrap()
-            .refusal()
-            .expect("refused");
-        assert!(why.contains("requires \"unknown-feature\" that"), "{why}");
     }
 
     /// Keys this tapectl does not know are ignored unless `requires` names
-    /// them (the extension rule), in File 0 and the seal marker. (The seal's
-    /// unknown key was `ended_after` before 1.6.0, which now knows it and
-    /// holds it to rule S1.)
+    /// them (the extension rule, §1.2 rule 3), in File 0 and the seal marker.
     #[test]
     fn unknown_keys_that_are_not_required_are_ignored() {
         let t = set_requires(&thunk(), "requires = []\nfuture_key = \"x\"");
         assert!(t.contains("\nfuture_key = \"x\"\n"));
         check_id_thunk_readable(&t).unwrap();
         parse_id_thunk_identity(&t).unwrap();
-        let s = parse_seal_marker(&set_requires(
-            &seal(),
-            "requires = [\"short-seal\"]\nfuture_key = 7",
-        ))
-        .unwrap();
-        assert_eq!(s.refusal(), None);
-        let s = parse_seal_marker(&set_requires(
-            &seal_1_5_0(),
-            "requires = []\nfuture_key = 7",
-        ))
-        .unwrap();
+        let s = parse_seal_marker(&set_requires(&seal(), "requires = []\nfuture_key = 7")).unwrap();
         assert_eq!(s.refusal(), None);
     }
 
-    /// Another layout or magic is refused with a named error (#384).
+    /// Another layout or magic is refused with a named error (#384; D1):
+    /// a Layout 2 File 0 (`tapectl-volume-v2`, `layout_version = 2`), a
+    /// Layout 2 front index and a Layout 2 seal. The positive control: this
+    /// tapectl's own Layout 3 documents read.
     #[test]
     fn another_layout_or_magic_is_refused() {
-        let t = thunk().replace("layout_version = 2", "layout_version = 3");
+        assert!(thunk().contains("\nmagic = \"tapectl-volume-v3\"\n"));
+        check_id_thunk_readable(&thunk()).unwrap();
+        let t = thunk().replace("layout_version = 3", "layout_version = 2");
         let err = check_id_thunk_readable(&t).unwrap_err().to_string();
-        assert!(err.contains("layout_version = 3"), "{err}");
-        let t = thunk().replace("tapectl-volume-v2", "tapectl-volume-v3");
+        assert!(err.contains("layout_version = 2"), "{err}");
+        let t = thunk().replace("tapectl-volume-v3", "tapectl-volume-v2");
         let err = check_id_thunk_readable(&t).unwrap_err().to_string();
-        assert!(err.contains("tapectl-volume-v3"), "{err}");
-        let fi = "[index]\nvolume = \"X\"\nlayout_version = 3\n";
+        assert!(err.contains("tapectl-volume-v2"), "{err}");
+        let fi = "[index]\nvolume = \"X\"\nlayout_version = 2\n";
         let err = parse_front_index(fi).unwrap_err().to_string();
-        assert!(err.contains("layout_version 3"), "{err}");
+        assert!(err.contains("layout_version 2"), "{err}");
+        parse_front_index("[index]\nvolume = \"X\"\nlayout_version = 3\n").unwrap();
         let s =
-            parse_seal_marker(&seal().replace("layout_version = 2", "layout_version = 3")).unwrap();
-        assert!(s.refusal().unwrap().contains("layout_version = 3"));
+            parse_seal_marker(&seal().replace("layout_version = 3", "layout_version = 2")).unwrap();
+        assert!(s.refusal().unwrap().contains("layout_version = 2"));
     }
 }
 
@@ -1464,8 +1391,9 @@ mod short_seal_tests {
     use super::*;
 
     /// File 3's bytes in these fixtures, and the hash every seal here binds.
-    const FRONT_INDEX: &[u8] = b"[index]\nvolume = \"SS01\"\nlayout_version = 2\n";
-    const SHORT: &str = "[\"short-seal\"]";
+    const FRONT_INDEX: &[u8] = b"[index]\nvolume = \"SS01\"\nlayout_version = 3\n";
+    /// The `requires` every Layout 3 seal states (D1).
+    const NONE: &str = "[]";
 
     fn front_index_sha256() -> String {
         use sha2::Digest;
@@ -1523,7 +1451,7 @@ mod short_seal_tests {
             let entries = plan(slices);
             let m = entries.len() as i64 - 1;
             Fixture {
-                requires: Some(SHORT),
+                requires: Some(NONE),
                 file_count: m + 1,
                 ended_after: Some(m - 1),
                 entries,
@@ -1533,22 +1461,10 @@ mod short_seal_tests {
         /// A short 1.6.0 seal at `k + 1` over `plan(slices)`.
         fn short(slices: i64, k: i64) -> Fixture {
             Fixture {
-                requires: Some(SHORT),
+                requires: Some(NONE),
                 file_count: k + 2,
                 ended_after: Some(k),
                 entries: short_entries(slices, k),
-            }
-        }
-
-        /// A seal before 1.6.0 over `plan(slices)`: `requires = []`, no
-        /// `ended_after`.
-        fn before_1_6_0(slices: i64) -> Fixture {
-            let entries = plan(slices);
-            Fixture {
-                requires: Some("[]"),
-                file_count: entries.len() as i64,
-                ended_after: None,
-                entries,
             }
         }
 
@@ -1561,7 +1477,7 @@ mod short_seal_tests {
                  Volume: SS01\n\n\
                  [seal]\n\
                  volume = \"SS01\"\n\
-                 layout_version = 2\n",
+                 layout_version = 3\n",
             );
             if let Some(requires) = self.requires {
                 s.push_str(&format!("requires = {requires}\n"));
@@ -1595,15 +1511,12 @@ mod short_seal_tests {
         fn fields(&self) -> ParsedSeal {
             ParsedSeal {
                 volume: "SS01".into(),
-                layout_version: 2,
+                layout_version: 3,
                 file_count: self.file_count as i32,
                 ended_after: self.ended_after.map(|k| k as u64),
                 sealed_at: "2026-10-20T00:00:00Z".into(),
                 front_index_sha256: front_index_sha256(),
-                requires: match self.requires {
-                    Some(SHORT) => vec![SHORT_SEAL.to_string()],
-                    _ => Vec::new(),
-                },
+                requires: Vec::new(),
                 requires_stated: self.requires.is_some(),
                 files: self
                     .entries
@@ -1643,7 +1556,7 @@ mod short_seal_tests {
         assert_eq!(seal.file_count, 13);
         assert_eq!(seal.ended_after, Some(11));
         assert_eq!(seal.effective_ended_after(), Some(11));
-        assert!(seal.requires_short_seal());
+        assert!(seal.requires.is_empty(), "D1");
         assert_eq!(seal.refusal(), None);
         assert_eq!(seal.check_parse_rules(), Ok(()));
         assert_eq!(seal.ending(13), SealEnding::Full);
@@ -1723,7 +1636,6 @@ mod short_seal_tests {
         };
         let seal = parse_seal_marker(&good.text()).expect("S1 holds: it parses");
         assert_eq!(seal.ended_after, Some(11));
-        assert!(!seal.requires_short_seal());
 
         Fixture {
             requires,
@@ -1733,10 +1645,10 @@ mod short_seal_tests {
         .refused_naming("rule S1");
     }
 
-    /// Rule S2: a seal whose `requires` names `short-seal` states
-    /// `ended_after`.
+    /// Rule S2: every seal states `ended_after` (Layout 2's S3, a seal with
+    /// none read as full, is gone, `volume-format-v3.md` §5).
     #[test]
-    fn s2_a_seal_requiring_short_seal_states_ended_after() {
+    fn s2_every_seal_states_ended_after() {
         let f = Fixture {
             ended_after: None,
             ..Fixture::full(4)
@@ -1746,43 +1658,6 @@ mod short_seal_tests {
             f.fields().check_parse_rules(),
             Err(SealRuleViolation::MissingEndedAfter)
         );
-    }
-
-    /// Rule S3: a seal with no `ended_after` that requires nothing
-    /// (`requires = []`) parses as a full seal that ended after
-    /// `file_count - 2`. It is not held to the embedded copy's rules at
-    /// parse, as no reader before 1.6.0 held it;
-    /// [`ParsedSeal::check_parse_rules`] judges it when a caller asks. (A
-    /// seal with no `requires` line at all is refused:
-    /// `a_tape_without_requires_is_refused_naming_the_field`.)
-    #[test]
-    fn s3_a_seal_before_1_6_0_still_parses_as_full() {
-        {
-            let f = Fixture {
-                requires: Some("[]"),
-                ..Fixture::before_1_6_0(4)
-            };
-            let seal = parse_seal_marker(&f.text()).expect("a 1.5.0 seal parses");
-            assert_eq!(seal, f.fields());
-            assert_eq!(seal.ended_after, None);
-            assert_eq!(seal.effective_ended_after(), Some(11));
-            assert_eq!(seal.ending(13), SealEnding::Full);
-            assert_eq!(seal.refusal(), None);
-            assert_eq!(seal.check_parse_rules(), Ok(()), "S3 gives S5 its position");
-        }
-
-        let hollow = Fixture {
-            entries: plan(4)[..5].to_vec(),
-            ..Fixture::before_1_6_0(4)
-        };
-        let seal = parse_seal_marker(&hollow.text()).expect("parses as before 1.6.0");
-        assert!(matches!(
-            seal.check_parse_rules(),
-            Err(SealRuleViolation::EntryCount {
-                entries: 5,
-                file_count: 13
-            })
-        ));
     }
 
     /// Rule S4: the embedded copy has exactly `file_count` entries.
@@ -1863,89 +1738,6 @@ mod short_seal_tests {
         parse_seal_marker(&Fixture::short(4, 8).text()).expect("K = the first data slice");
     }
 
-    /// A span tape's seal (ADR-0012 items 124 and 126): `requires =
-    /// ["short-seal", "spanning"]`, and the 1.6.0 grammar and rules otherwise.
-    /// Full and short, it parses and keeps S1-S6; it classifies against the
-    /// plan as a 1.6.0 seal does; breaking S1, S2 or S5 makes it unparseable
-    /// exactly as it makes a 1.6.0 seal; and `judge_seal` reads a good one as
-    /// sealed. The same seals stating `short-seal` alone parse to the same
-    /// fields but the feature.
-    #[test]
-    fn a_seal_stating_both_features_keeps_s1_to_s6() {
-        const SPAN: &str = "[\"short-seal\", \"spanning\"]";
-        let both = vec![SHORT_SEAL.to_string(), SPANNING.to_string()];
-        let full = Fixture {
-            requires: Some(SPAN),
-            ..Fixture::full(4)
-        };
-        let short = Fixture {
-            requires: Some(SPAN),
-            ..Fixture::short(4, 9)
-        };
-        assert!(
-            full.text()
-                .contains("\nrequires = [\"short-seal\", \"spanning\"]\nfile_count = 13\n"),
-            "{}",
-            full.text()
-        );
-        for (f, ending) in [
-            (&full, SealEnding::Full),
-            (&short, SealEnding::Short { ended_after: 9 }),
-        ] {
-            let seal = parse_seal_marker(&f.text()).expect("a span seal parses");
-            assert_eq!(seal.requires, both);
-            assert!(seal.requires_short_seal());
-            assert_eq!(seal.refusal(), None);
-            assert_eq!(seal.check_parse_rules(), Ok(()));
-            assert_eq!(seal.ending(13), ending);
-            let one = parse_seal_marker(
-                &Fixture {
-                    requires: Some(SHORT),
-                    file_count: f.file_count,
-                    ended_after: f.ended_after,
-                    entries: f.entries.clone(),
-                }
-                .text(),
-            )
-            .unwrap();
-            assert_eq!(
-                ParsedSeal {
-                    requires: both.clone(),
-                    ..one
-                },
-                seal,
-                "the same seal but the feature"
-            );
-        }
-        let SealVerdict::Sealed(seal) = judge_seal(Ok(short.text().as_bytes()), FRONT_INDEX, 3, 10)
-        else {
-            panic!("a span short seal that keeps the rules is Sealed")
-        };
-        assert_eq!(seal.ended_after, Some(9));
-
-        Fixture {
-            ended_after: Some(8),
-            ..Fixture {
-                requires: Some(SPAN),
-                ..Fixture::short(4, 9)
-            }
-        }
-        .refused_naming("rule S1");
-        Fixture {
-            ended_after: None,
-            ..Fixture {
-                requires: Some(SPAN),
-                ..Fixture::full(4)
-            }
-        }
-        .refused_naming("rule S2");
-        Fixture {
-            requires: Some(SPAN),
-            ..Fixture::short(4, 7)
-        }
-        .refused_naming("rule S5");
-    }
-
     /// Rule S6, through the one seal judgement: a 1.6.0 seal that breaks a
     /// rule is `Unsealed`, naming the rule, even though it binds the front
     /// index in hand; one that keeps them is `Sealed`, with its
@@ -1977,7 +1769,7 @@ mod short_seal_tests {
     #[test]
     fn a_refused_seal_is_returned_uninterpreted_before_the_rules() {
         let f = Fixture {
-            requires: Some("[\"short-seal\", \"unknown-feature\"]"),
+            requires: Some("[\"unknown-feature\"]"),
             ended_after: None,
             ..Fixture::full(4)
         };
@@ -1996,15 +1788,14 @@ mod short_seal_tests {
             ..Fixture::full(4)
         }
         .text()
-        .replace("layout_version = 2", "layout_version = 3");
+        .replace("layout_version = 3", "layout_version = 2");
         let seal = parse_seal_marker(&other_layout).expect("parses, uninterpreted");
-        assert!(seal.refusal().unwrap().contains("layout_version = 3"));
+        assert!(seal.refusal().unwrap().contains("layout_version = 2"));
     }
 
-    /// §4.1 "Classification", the pure function: equal to the plan's count
-    /// is full, less is short (S3's `file_count - 2` for a seal stating no
-    /// `ended_after`), greater means the two ends disagree, and so does a
-    /// count that leaves no file before the seal.
+    /// §5 "Classification", the pure function: equal to the plan's count is
+    /// full, less is short, greater means the two ends disagree, and so does
+    /// a seal stating no file before it.
     #[test]
     fn classification_is_full_short_or_disagrees_by_the_plan_count() {
         let full = Fixture::full(4).fields();
@@ -2028,18 +1819,11 @@ mod short_seal_tests {
         );
         assert_eq!(classify_seal_ending(&short, 11), SealEnding::Full);
 
-        let old = Fixture::before_1_6_0(4).fields();
-        assert_eq!(classify_seal_ending(&old, 13), SealEnding::Full);
-        assert_eq!(
-            classify_seal_ending(&old, 15),
-            SealEnding::Short { ended_after: 11 }
-        );
-
         for file_count in [1, 0, -3] {
             let odd = ParsedSeal {
                 file_count,
                 ended_after: None,
-                ..Fixture::before_1_6_0(4).fields()
+                ..Fixture::full(4).fields()
             };
             assert_eq!(
                 classify_seal_ending(&odd, 13),
@@ -2088,9 +1872,9 @@ mod short_seal_tests {
         }
     }
 
-    /// §3: File 3's `[index]` states `may_end_early = true` from 1.6.0, the
-    /// line after `layout_version`, and the parser exposes it; the entries
-    /// read as before.
+    /// §4: File 3's `[index]` states `may_end_early = true`, the line after
+    /// `layout_version`, and the parser exposes it; the entries read as
+    /// before.
     #[test]
     fn a_front_index_declaring_may_end_early_reads_true() {
         let text = "\
@@ -2099,7 +1883,7 @@ write meant to put on the tape.
 
 [index]
 volume = \"SS01\"
-layout_version = 2
+layout_version = 3
 may_end_early = true
 
 [[files]]
@@ -2118,20 +1902,20 @@ sha256_encrypted = \"h0\"
         assert_eq!(parse_front_index(&padded).unwrap(), doc.files);
     }
 
-    /// A front index before 1.6.0 has no `may_end_early`: absent is false,
-    /// and it parses as it always has. A value that is not a bool is a
-    /// parse failure, as any malformed key is.
+    /// A front index with no `may_end_early`: absent is false (it decides
+    /// nothing, §1.8). A value that is not a bool is a parse failure, as any
+    /// malformed key is.
     #[test]
     fn a_front_index_without_may_end_early_reads_false() {
-        let text = "[index]\nvolume = \"OLD01\"\nlayout_version = 2\n\n[[files]]\nposition = 0\ntype = \"id_thunk\"\nsize_bytes = 10\nsha256_encrypted = \"h0\"\n";
-        let doc = parse_front_index_document(text).expect("a 1.5.0 File 3 parses");
+        let text = "[index]\nvolume = \"OLD01\"\nlayout_version = 3\n\n[[files]]\nposition = 0\ntype = \"id_thunk\"\nsize_bytes = 10\nsha256_encrypted = \"h0\"\n";
+        let doc = parse_front_index_document(text).expect("it parses");
         assert!(!doc.may_end_early);
         assert_eq!(doc.volume, "OLD01");
         assert_eq!(doc.files.len(), 1);
 
         let wrong = text.replace(
-            "layout_version = 2\n",
-            "layout_version = 2\nmay_end_early = 1\n",
+            "layout_version = 3\n",
+            "layout_version = 3\nmay_end_early = 1\n",
         );
         assert!(parse_front_index_document(&wrong).is_err());
     }
@@ -2222,7 +2006,7 @@ mod tests {
 
         let parsed = parse_seal_marker(&generated).expect("parses");
         assert_eq!(parsed.volume, "RT01");
-        assert_eq!(parsed.layout_version, 2);
+        assert_eq!(parsed.layout_version, 3);
         assert_eq!(parsed.file_count, files.len() as i32);
         assert_eq!(parsed.front_index_sha256, "deadbeef");
         assert!(chrono::DateTime::parse_from_rfc3339(&parsed.sealed_at).is_ok());
@@ -2324,6 +2108,31 @@ mod tests {
         let parsed = parse_id_thunk_identity(&generated).expect("parses");
         assert_eq!(parsed.label, "RT01");
         assert_eq!(parsed.uuid, "11111111-2222-3333-4444-555555555555");
+    }
+
+    /// #547 (`volume-format-v3.md` §1.1): every string in File 0 is a TOML
+    /// basic string, `[media]`'s included. A hand-typed barcode holding a
+    /// quote or a backslash, the route a drive with no chip serial takes,
+    /// still gives a File 0 every Rust reader parses, and each value comes
+    /// back as it was given.
+    #[test]
+    fn file_0_strings_holding_a_quote_or_a_backslash_read_back_as_given() {
+        let serial = "A\"B\\C";
+        let manufacturer = "M\"\\x";
+        let mut params = sample_id_thunk_params("RT547", "11111111-2222-3333-4444-555555555555");
+        params.mam_serial = serial;
+        params.mam_manufacturer = manufacturer;
+        params.cartridge_identity_source = Some("operator");
+        let generated = generate_id_thunk_v2(&params);
+
+        let identity = parse_id_thunk_identity(&generated).expect("File 0 parses");
+        assert_eq!(identity.label, "RT547");
+        let media = parse_id_thunk_media(&generated).expect("[media] parses");
+        assert_eq!(media.cartridge_serial, serial);
+        assert_eq!(media.cartridge_manufacturer.as_deref(), Some(manufacturer));
+        assert_eq!(media.cartridge_identity_source.as_deref(), Some("operator"));
+        check_id_thunk_readable(&generated).expect("its claims read");
+        parse_id_thunk_layout_pointers(&generated).expect("its pointers read");
     }
 
     #[test]
@@ -2643,18 +2452,6 @@ cartridge_serial = \"SERIAL1\"
         let generated = generate_seal_marker("EMPTY01", 0, "deadbeef", &[]);
         let err = parse_seal_marker(&generated).unwrap_err().to_string();
         assert!(err.contains("rule S1"), "{err}");
-    }
-
-    /// The reader's tolerance of a seal before 1.6.0 with no `[[files]]`
-    /// tables at all (the `files` key absent) is unchanged: an empty list,
-    /// not an error. A literal 1.5.0 seal.
-    #[test]
-    fn a_1_5_0_seal_with_no_files_parses_as_empty_not_an_error() {
-        let old = "[seal]\nvolume = \"EMPTY01\"\nlayout_version = 2\nrequires = []\n\
-                   file_count = 0\nsealed_at = \"2026-10-06T00:00:00Z\"\n\
-                   front_index_sha256 = \"deadbeef\"\n";
-        let parsed = parse_seal_marker(old).expect("parses");
-        assert!(parsed.files.is_empty());
     }
 
     #[test]

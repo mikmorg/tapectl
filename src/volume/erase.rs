@@ -1558,7 +1558,7 @@ mod tests {
         let f = report.file0.as_ref().unwrap();
         assert_eq!(f.label.as_deref(), Some("L6-0001"));
         assert_eq!(f.uuid.as_deref(), Some(UUID));
-        assert_eq!(f.layout_version, Some(2));
+        assert_eq!(f.layout_version, Some(3));
         assert_eq!(f.tapectl_version.as_deref(), Some("1.0.0"));
         assert_eq!(f.created_at.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(f.load_count_at_write, Some(7));

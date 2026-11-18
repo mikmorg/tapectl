@@ -177,9 +177,9 @@ fn make_fixture() -> Fixture {
         unit_name: "unit-alpha".to_string(),
         unit_uuid: "unit-uuid-1".to_string(),
         tenant_id,
-        dar_version: Some("2.7.20".to_string()),
-        dar_command: Some("dar -c base -R /src".to_string()),
-        catalog_path: None,
+        tar_version: None,
+        stream_bytes: 0,
+        compression: None,
         snapshot_version: 1,
         slices: vec![slice_1, slice_2],
         span: None,
@@ -216,6 +216,7 @@ fn make_fixture() -> Fixture {
         escrow_public_key: None,
         catalog_db_path: None,
         index: None,
+        tables: None,
     };
 
     let session_dir = tempfile::tempdir().unwrap();
@@ -278,6 +279,7 @@ fn fake_slice(
         sha256_plain: sha_plain,
         sha256_encrypted: sha_enc,
         staging_path: path,
+        continues: false,
     }
 }
 

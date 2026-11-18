@@ -161,16 +161,11 @@ pub(crate) fn fixture_seal_files(ended_after: u32) -> Vec<layout::FrontIndexFile
 /// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
 #[cfg(test)]
 pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: &str) -> Vec<u8> {
-    fixture_seal_requiring(
-        label,
-        seal_position,
-        front_index_sha256,
-        layout::REQUIRES_WHOLE,
-    )
+    fixture_seal_requiring(label, seal_position, front_index_sha256, layout::REQUIRES)
 }
 
-/// Test support (#478): [`fixture_seal`] stating `features` in `requires`
-/// (a span tape's seal states [`layout::REQUIRES_SPAN`], ADR-0012 item 124).
+/// Test support: [`fixture_seal`] stating `features` in `requires` (a later
+/// feature's fence; every Layout 3 tape states [`layout::REQUIRES`]).
 #[cfg(test)]
 pub(crate) fn fixture_seal_requiring(
     label: &str,
@@ -203,16 +198,11 @@ pub(crate) fn fixture_short_seal(
     ended_after: u32,
     front_index_sha256: &str,
 ) -> Vec<u8> {
-    fixture_short_seal_requiring(
-        label,
-        ended_after,
-        front_index_sha256,
-        layout::REQUIRES_WHOLE,
-    )
+    fixture_short_seal_requiring(label, ended_after, front_index_sha256, layout::REQUIRES)
 }
 
-/// Test support (#478): [`fixture_short_seal`] stating `features` in
-/// `requires` (a span tape's: ADR-0012 item 124).
+/// Test support: [`fixture_short_seal`] stating `features` in `requires` (a
+/// later feature's fence).
 #[cfg(test)]
 pub(crate) fn fixture_short_seal_requiring(
     label: &str,
@@ -1105,11 +1095,6 @@ pub(crate) struct ContactFacts {
     identity: Option<format::IdThunkIdentity>,
     /// File 0's own `[layout] seal_marker` pointer, when it parsed.
     seal_pointer: Option<i64>,
-    /// File 0's `requires`, when File 0 read and its claims parsed (#420):
-    /// `volume-format-v2.md` §1.2 rule 6 accepts a seal before the planned
-    /// position only on a tape that requires `short-seal`. `None` when File
-    /// 0 did not read or parse; the seal's own `requires` then decides.
-    file0_requires: Option<Vec<String>>,
     /// Every PLANNED seal position probed, where rule 6 found the seal's
     /// file for it (the planned position, or the last file on a medium that
     /// ends before it, `store::locate_seal`), and what was read there. Each
@@ -1214,28 +1199,18 @@ impl ContactFacts {
             .then_some((*position, seal))
     }
 
-    /// `volume-format-v2.md` §1.2 rule 6, "Which seal a reader accepts", for
+    /// `volume-format-v3.md` §1.2 rule 6, "Which seal a reader accepts", for
     /// a seal found at `position` for the planned position `planned`:
-    /// - at the planned position, any seal that parses, as before 1.6.0
-    ///   (the contact check refuses on it; confirm judges it);
-    /// - before it, only on a tape that requires `short-seal` (File 0's
-    ///   `requires`, or the seal's own when File 0 did not parse), a seal
-    ///   that itself requires it, keeps §4.1's rules (it parsed) and states
-    ///   `file_count = N` for the N files on the medium (`position = N-1`);
+    /// - at the planned position, any seal that parses (the contact check
+    ///   refuses on it; confirm judges it);
+    /// - before it, a seal that keeps §5's rules (it parsed) and states
+    ///   `file_count = N` for the N files on the medium (`position = N-1`),
+    ///   on every Layout 3 tape: no `requires` entry is asked for (D1);
     /// - before it, too, a seal this tapectl must not interpret (a feature it
     ///   does not know, §1.2 rule 1): it may be a newer tapectl's sealed
     ///   tape, and a write fails closed on it (ADR-0003).
     fn accepts(&self, seal: &format::ParsedSeal, position: u32, planned: u32) -> bool {
-        if position >= planned || seal.refusal().is_some() {
-            return true;
-        }
-        let tape_requires_short_seal = match &self.file0_requires {
-            Some(requires) => requires.iter().any(|f| f == format::SHORT_SEAL),
-            None => true,
-        };
-        tape_requires_short_seal
-            && seal.requires_short_seal()
-            && i64::from(seal.file_count) == i64::from(position) + 1
+        position >= planned || seal.refusal().is_some() || seal.is_short_seal_at(position)
     }
 
     /// The bytes this contact read at tape position `position`, if it read
@@ -1272,11 +1247,6 @@ pub(crate) fn contact_report(
         Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
             facts.file0 = Some(id_thunk_bytes.clone());
             let text = String::from_utf8_lossy(&id_thunk_bytes);
-            // #420: what File 0 requires decides whether a seal before its
-            // own pointer can be this tape's (rule 6).
-            facts.file0_requires = format::parse_id_thunk_claims(&text)
-                .ok()
-                .map(|claims| claims.requires);
             let identity = format::parse_id_thunk_identity(&text);
             facts.identity = identity.as_ref().ok().cloned();
             let matches = matches!(
@@ -4955,18 +4925,17 @@ fn mark_writes_on(tx: &Connection, write_ids: &[(i64, i64)], status: &str) -> Re
 }
 
 /// The features the session's frozen File 0 states in `requires`, which the
-/// seal must state too (`volume-format-v2.md` §1.2: File 0's `[volume]` and
-/// the seal's `[seal]` both state it; ADR-0012 item 124, coordinator ruling
-/// X7). `build` took File 0's and the seal placeholder's from one fact
-/// ([`layout::tape_requires`]: whether the plan holds a slice of a spannable
-/// set), so this is the placeholder's too, and the full seal fits it.
+/// seal must state too (`volume-format-v3.md` §1.2: File 0's `[volume]` and
+/// the seal's `[seal]` both state it). Every Layout 3 tape states
+/// [`layout::REQUIRES`], the empty list (D1), and `build` took File 0's and
+/// the seal placeholder's from it, so the full seal fits the placeholder.
 ///
 /// Read from the materialized File 0 `build` froze, never from a new Layout
 /// field (X7), so a session `rehydrate` rebuilt after a restart reads the
 /// same bytes the tape holds. Plain `std::fs`: this is not a staged-file
 /// read (`pass_count`). Fails closed: a File 0 that does not read, does not
 /// parse, or states a list this tapectl never writes is an error before the
-/// seal's first block, never a guess at one feature.
+/// seal's first block, never a guess.
 fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'static str]> {
     let entry = layout
         .entries
@@ -4994,7 +4963,7 @@ fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'s
                     path.display()
                 ))
             })?;
-    let features = layout::tape_requires(claims.requires.iter().any(|f| f == format::SPANNING));
+    let features = layout::REQUIRES;
     if !claims
         .requires
         .iter()
@@ -5002,13 +4971,12 @@ fn frozen_requires(layout: &super::layout_model::Layout) -> Result<&'static [&'s
         .eq(features.iter().copied())
     {
         return Err(TapectlError::Other(format!(
-            "seal: the frozen File 0 at {} states requires = {:?}, which is neither list this \
-             tapectl writes ({:?} or {:?}); the seal must state what File 0 states, so it is \
-             not written",
+            "seal: the frozen File 0 at {} states requires = {:?}, which is not the list this \
+             tapectl writes ({:?}); the seal must state what File 0 states, so it is not \
+             written",
             path.display(),
             claims.requires,
-            layout::REQUIRES_WHOLE,
-            layout::REQUIRES_SPAN,
+            layout::REQUIRES,
         )));
     }
     Ok(features)
@@ -5362,15 +5330,16 @@ mod tests {
             unit_name: "unit-alpha".to_string(),
             unit_uuid: "unit-uuid-1".to_string(),
             tenant_id,
-            dar_version: Some("2.7.20".to_string()),
-            dar_command: Some("dar -c base -R /src".to_string()),
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices: vec![slice_1, slice_2],
             span: None,
         };
 
         let inputs = BuildInputs {
+            tables: None,
             label: "SESSTEST".to_string(),
             volume_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             media_type: "LTO-6".to_string(),
@@ -5461,6 +5430,7 @@ mod tests {
         .unwrap();
 
         BuildSlice {
+            continues: false,
             slice_id,
             slice_number,
             size_bytes: content.len() as i64,
@@ -11532,9 +11502,9 @@ mod tests {
                     unit_name: name.to_string(),
                     unit_uuid: format!("uuid-{name}"),
                     tenant_id,
-                    dar_version: Some("2.7.20".to_string()),
-                    dar_command: Some("dar -c base -R /src".to_string()),
-                    catalog_path: None,
+                    tar_version: None,
+                    stream_bytes: 0,
+                    compression: None,
                     snapshot_version: 1,
                     slices,
                     span,
@@ -11580,6 +11550,7 @@ mod tests {
             let (_, operator_key) = key_of(true);
             let (tenant_id, tenant_key) = key_of(false);
             let inputs = BuildInputs {
+                tables: None,
                 label: label.to_string(),
                 volume_uuid: volume_uuid.to_string(),
                 media_type: "LTO-6".to_string(),
@@ -11821,20 +11792,14 @@ mod tests {
                 .unwrap()
         }
 
-        /// File 0 requiring `short-seal`, as every 1.6.0 tape's does (ADR-0012
-        /// item 111) — the rewrite until the generator writes it (worker D),
-        /// a no-op after. Padded back to the length it had.
+        /// File 0 as every Layout 3 tape states it, which needs no feature
+        /// for a short seal (D1, `volume-format-v3.md` §1.2): `requires =
+        /// []`. A no-op that checks it; it was 1.6.0's rewrite to
+        /// `["short-seal"]`.
         fn requiring_short_seal(file0: &[u8]) -> Vec<u8> {
             let text = String::from_utf8_lossy(format::without_nul_padding(file0)).to_string();
-            let text = if text.contains("\nrequires = []\n") {
-                text.replacen("\nrequires = []\n", "\nrequires = [\"short-seal\"]\n", 1)
-            } else {
-                assert!(text.contains("\nrequires = [\"short-seal\"]\n"), "{text}");
-                text
-            };
-            let mut bytes = text.into_bytes();
-            bytes.resize(bytes.len().max(file0.len()), 0);
-            bytes
+            assert!(text.contains("\nrequires = []\n"), "{text}");
+            file0.to_vec()
         }
 
         fn parsed_seal(bytes: &[u8]) -> format::ParsedSeal {
@@ -11896,7 +11861,10 @@ mod tests {
             let seal = parsed_seal(&store.files[k as usize + 1]);
             assert_eq!(seal.ended_after, Some(u64::from(k)));
             assert_eq!(seal.file_count as u32, k + 2);
-            assert!(seal.requires_short_seal());
+            assert!(
+                seal.requires.is_empty(),
+                "D1: a Layout 3 seal states no feature"
+            );
             assert_eq!(
                 seal.ending(u64::from(m) + 1),
                 format::SealEnding::Short {
@@ -12580,10 +12548,9 @@ mod tests {
             let thunk = match file0 {
                 "short-seal" => requiring_short_seal(&thunk),
                 "nothing" => {
-                    let text = String::from_utf8_lossy(format::without_nul_padding(&thunk))
-                        .replacen("\nrequires = [\"short-seal\"]\n", "\nrequires = []\n", 1);
+                    let text = String::from_utf8_lossy(format::without_nul_padding(&thunk));
                     assert!(text.contains("\nrequires = []\n"));
-                    text.into_bytes()
+                    text.into_owned().into_bytes()
                 }
                 other => panic!("{other}"),
             };
@@ -12633,10 +12600,11 @@ mod tests {
                 }
             );
 
-            // A File 0 that does not require short-seal (a tape before
-            // 1.6.0) never has a seal before its planned position: rule 6
-            // reads that file as no seal.
+            // Rule 6 (`volume-format-v3.md` §1.2) asks no `requires` entry of
+            // a Layout 3 tape (D1), only that the seal counts the medium: a
+            // seal at K+1 that seals a tape ending a file earlier is no seal.
             let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
+            store.files[k as usize + 1] = fixture_short_seal(CONTACT_LABEL, k - 1, "deadbeef");
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
                 ContactOutcome::Matches
@@ -12691,11 +12659,7 @@ mod tests {
             let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
             let seal = String::from_utf8(store.files[k as usize + 1].clone())
                 .unwrap()
-                .replacen(
-                    "requires = [\"short-seal\"]",
-                    "requires = [\"unknown-feature\"]",
-                    1,
-                );
+                .replacen("requires = []", "requires = [\"unknown-feature\"]", 1);
             store.files[k as usize + 1] = seal.into_bytes();
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -12815,7 +12779,7 @@ mod tests {
             let (s, outcome) = execute(s, &mut store);
             let pending = ready(outcome).seal(&mut store).unwrap();
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let seal = parsed_seal(&store.files[k as usize + 1]);
             assert_eq!(seal.requires, file0_requires(&store), "item 124");
             assert_eq!(seal.ended_after, Some(u64::from(k)));
@@ -12883,8 +12847,8 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Full);
             let seal = parsed_seal(&store.files[m as usize]);
             assert_eq!(seal.file_count as u32, m + 1, "the full seal");
-            assert_eq!(seal.requires, layout::REQUIRES_SPAN);
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(seal.requires, layout::REQUIRES);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Integrity)
@@ -12917,7 +12881,7 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
             assert_eq!(
                 parsed_seal(&store.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
@@ -12946,7 +12910,7 @@ mod tests {
             assert_eq!(pending.ending(), Ending::Short { ended_after: k });
             assert_eq!(
                 parsed_seal(&store.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
@@ -12999,7 +12963,7 @@ mod tests {
                 parsed_seal(&store.files[m as usize]).requires,
                 file0_requires(&store)
             );
-            assert_eq!(file0_requires(&store), layout::REQUIRES_SPAN);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Navigable)
@@ -13092,7 +13056,7 @@ mod tests {
             let pending = ready.seal(&mut store).unwrap();
             assert_eq!(
                 parsed_seal(&store.inner.files[k as usize + 1]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
             let done = sealed(
                 pending
@@ -13135,7 +13099,7 @@ mod tests {
                     warned,
                     "{what}"
                 );
-                let expected = layout::tape_requires(spannable);
+                let expected = layout::REQUIRES;
                 assert_eq!(file0_requires(&store), expected, "{what}");
                 assert_eq!(
                     parsed_seal(&store.files[at as usize]).requires,
@@ -13209,11 +13173,10 @@ mod tests {
             assert!(may_span_rows(&s).iter().all(|(_, may)| !may));
             let seal_text = String::from_utf8(store.files[k as usize + 1].clone()).unwrap();
             assert!(
-                seal_text.contains("\nrequires = [\"short-seal\"]\n")
-                    && !seal_text.contains("spanning"),
+                seal_text.contains("\nrequires = []\n") && !seal_text.contains("spanning"),
                 "{seal_text}"
             );
-            assert_eq!(file0_requires(&store), layout::REQUIRES_WHOLE);
+            assert_eq!(file0_requires(&store), layout::REQUIRES);
             let done = sealed(
                 pending
                     .confirm(&s.conn, &mut store, Tier::Navigable)
@@ -13322,7 +13285,7 @@ mod tests {
                         created_at: "2026-10-23T00:00:00Z",
                         cartridge_identity_source: None,
                     },
-                    layout::REQUIRES_SPAN,
+                    layout::REQUIRES,
                 );
                 thunk.into_bytes()
             };
@@ -13335,7 +13298,7 @@ mod tests {
             put_file(
                 &mut store,
                 k as usize + 1,
-                fixture_short_seal_requiring(CONTACT_LABEL, k, "deadbeef", layout::REQUIRES_SPAN),
+                fixture_short_seal_requiring(CONTACT_LABEL, k, "deadbeef", layout::REQUIRES),
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -13352,7 +13315,7 @@ mod tests {
             put_file(
                 &mut store,
                 m as usize,
-                fixture_seal_requiring(CONTACT_LABEL, m, "deadbeef", layout::REQUIRES_SPAN),
+                fixture_seal_requiring(CONTACT_LABEL, m, "deadbeef", layout::REQUIRES),
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
@@ -13360,7 +13323,7 @@ mod tests {
             );
             assert_eq!(
                 parsed_seal(&store.files[m as usize]).requires,
-                layout::REQUIRES_SPAN
+                layout::REQUIRES
             );
         }
 

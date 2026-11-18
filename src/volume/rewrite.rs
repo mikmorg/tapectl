@@ -2606,7 +2606,7 @@ mod tests {
                             // File 0 states the format this tapectl reads and
                             // nothing about the volume (as write.rs's recovery
                             // read fixtures do): no identity to corroborate.
-                            b"[volume]\nmagic = \"tapectl-volume-v2\"\nlayout_version = 2\nrequires = []\n"
+                            b"[volume]\nmagic = \"tapectl-volume-v3\"\nlayout_version = 3\nrequires = []\n"
                                 .to_vec()
                         } else {
                             vec![0u8]

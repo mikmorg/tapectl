@@ -2287,6 +2287,10 @@ fn build_write_layout(
         &index_runs(&units),
         &catalog_work.path().join("index"),
     )?;
+    // Each staging's file table and id map (§1.6; ADR-0012 items 265, 276):
+    // plaintext, so beside the index in the same work dir, streamed into the
+    // tenant envelopes by `build()` and removed with `catalog_work`.
+    let tables = generate_tables(conn, &units, &catalog_work.path().join("tables"))?;
 
     let inputs = BuildInputs {
         label: label.to_string(),
@@ -2310,6 +2314,7 @@ fn build_write_layout(
         escrow_public_key,
         catalog_db_path: Some(catalog_db_path),
         index: Some(index),
+        tables: Some(tables),
     };
 
     let built = build::build_with_plan_bound(&inputs, plan_bound_bytes, session_dir)?;
@@ -9247,6 +9252,11 @@ fn checked_staged_units(
     // Issue #402: every staged set whole, on disk, before anything below
     // touches a backend, a MAM or the drive.
     check_staged_slices(conn, only)?;
+    // Item 265 (#557): every unit's file table in the catalog, before
+    // anything below touches a backend, a MAM or the drive.
+    #[cfg(test)]
+    fixture_file_tables(conn);
+    check_file_tables(conn, &batch.units)?;
     if batch.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
@@ -9577,7 +9587,7 @@ fn plan_span_set(
     let rows: Vec<SpanRow> = conn
         .prepare(
             "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
-                    sha256_encrypted, staging_path
+                    sha256_encrypted, staging_path, continues
              FROM stage_slices WHERE stage_set_id = ?1
              ORDER BY slice_number",
         )?
@@ -9590,6 +9600,7 @@ fn plan_span_set(
                     encrypted_bytes: row.get(3)?,
                     sha256_plain: row.get(4)?,
                     sha256_encrypted: row.get(5)?,
+                    continues: row.get(7)?,
                 },
                 staging_path: row.get(6)?,
             })
@@ -9638,6 +9649,7 @@ fn plan_span_set(
             sha256_plain: row.slice.sha256_plain.clone(),
             sha256_encrypted: row.slice.sha256_encrypted.clone(),
             staging_path: PathBuf::from(path),
+            continues: row.slice.continues,
         });
     }
     let span = UnitSpan {
@@ -9715,7 +9727,7 @@ fn find_staged_data(
 ) -> Result<StagedBatch> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
-                ss.dar_version, ss.dar_command, ss.catalog_path, s.version
+                ss.tar_version, ss.stream_bytes, ss.compression, s.version
          FROM stage_sets ss
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN units u ON u.id = s.unit_id
@@ -9730,7 +9742,7 @@ fn find_staged_data(
         String,
         i64,
         Option<String>,
-        Option<String>,
+        Option<i64>,
         Option<String>,
         i64,
     );
@@ -9754,7 +9766,12 @@ fn find_staged_data(
     }
 
     let mut batch = StagedBatch::default();
-    for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
+    for (ss_id, snap_id, name, uuid, tenant_id, tar_version, stream_bytes, compression, snap_ver) in
+        rows
+    {
+        // §3.5: only a compressed staging names its algorithm.
+        let compression = compression.filter(|c| c != "none");
+        let stream_bytes = stream_bytes.unwrap_or(0);
         if let Spanning::ByPolicy(config) = spanning {
             let unit = queries::get_unit_by_uuid(conn, &uuid)?
                 .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
@@ -9780,9 +9797,9 @@ fn find_staged_data(
                         unit_name: name,
                         unit_uuid: uuid,
                         tenant_id,
-                        dar_version: dar_ver,
-                        dar_command: dar_cmd,
-                        catalog_path,
+                        tar_version,
+                        stream_bytes,
+                        compression,
                         snapshot_version: snap_ver,
                         slices,
                         span: Some(span),
@@ -9793,7 +9810,8 @@ fn find_staged_data(
             }
         }
         let mut slice_stmt = conn.prepare(
-            "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path
+            "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted,
+                    staging_path, continues
              FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
              ORDER BY slice_number",
         )?;
@@ -9808,6 +9826,7 @@ fn find_staged_data(
                     sha256_plain: row.get(4)?,
                     sha256_encrypted: row.get(5)?,
                     staging_path: PathBuf::from(staging_path),
+                    continues: row.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -9819,9 +9838,9 @@ fn find_staged_data(
                 unit_name: name,
                 unit_uuid: uuid,
                 tenant_id,
-                dar_version: dar_ver,
-                dar_command: dar_cmd,
-                catalog_path,
+                tar_version,
+                stream_bytes,
+                compression,
                 snapshot_version: snap_ver,
                 slices,
                 span: None,
@@ -9955,50 +9974,160 @@ fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
 /// tape or even names a drive.
 fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
     eprint!("{}", render_staged_selection(label, units));
-    eprint!("{}", render_catalogue_warnings(units));
 }
 
-/// A warning for each selected unit whose dar catalogue is not on disk
-/// (issue #473): `catalog_path` NULL (a stage set `catalog rebuild` made
-/// before it put catalogues back) or no `<stem>.<n>.dar` beside it (the
-/// file was removed). `build` packs the catalogue into the envelopes when it
-/// finds one and silently packs nothing otherwise, while the volume's
-/// RECOVERY.md says every unit's envelope holds it; the operator learns here,
-/// before the tape is touched, that this volume's copy of the unit cannot
-/// list or select files with RESTORE.sh. A warning, not a refusal: the
-/// archive itself is whole and restores as a unit. Empty when every unit has
-/// its catalogue.
-///
-/// A pure function for the reason [`render_staged_selection`] is one.
-fn render_catalogue_warnings(units: &[BuildUnit]) -> String {
-    let missing: Vec<&BuildUnit> = units
-        .iter()
-        .filter(|u| {
-            !u.catalog_path
-                .as_deref()
-                .is_some_and(super::envelope::catalogue_on_disk)
-        })
-        .collect();
+/// The units `volume write` would put on a tape (every whole staged set, in
+/// its order, each refused as the write refuses it before contact: #402's
+/// check and item 265's), as `build` takes them. Public for the keyless
+/// acceptance suite (`tests/format_v3.rs`), which builds a tape from the
+/// real staging as `volume write` does: with these, [`generate_tables`],
+/// the index and the on-tape `catalog.db`.
+pub fn staged_build_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
+    Ok(checked_staged_units(conn, Spanning::Never, None)?.units)
+}
+
+/// Refuse the write, by name, when a selected unit's file table is not in
+/// the catalog (ADR-0012 item 265, #557; `volume-format-v3.md` §1.6): every
+/// tenant envelope carries, for each staging the tape's plan holds a slice
+/// of, that staging's whole table and id map, from the catalog database,
+/// and a tape is never written without one. Before contact, beside #402's
+/// check: the tape has not moved. The message names each unit and says to
+/// stage it again.
+fn check_file_tables(conn: &Connection, units: &[BuildUnit]) -> Result<()> {
+    let mut missing = String::new();
+    for u in units {
+        if !crate::db::stage_files::exists(conn, u.stage_set_id)? {
+            missing.push_str(&format!(
+                "\n  {} v{} (stage set {})",
+                u.unit_name, u.snapshot_version, u.stage_set_id
+            ));
+        }
+    }
     if missing.is_empty() {
-        return String::new();
+        return Ok(());
     }
-    let mut out = String::from(
-        "warning: no dar catalogue on disk for these units, so the envelopes on this volume \
-         will carry none for them: RESTORE.sh `--list` will show no files and `--path` cannot \
-         pick any (whole-unit restore is unaffected):\n",
-    );
-    for u in missing {
-        out.push_str(&format!(
-            "  {} v{} (stage set {})\n",
-            u.unit_name, u.snapshot_version, u.stage_set_id
-        ));
+    Err(TapectlError::Other(format!(
+        "refusing to write: the catalog holds no file table for these units, and every \
+         tape carries the file table of each unit it holds (volume-format-v3.md §1.6). \
+         Stage each version again (`tapectl stage create`) and write that. Nothing was \
+         written and the drive was not touched:{missing}"
+    )))
+}
+
+/// Test support, for the write-path fixtures that make a stage set by hand
+/// (fake slice bytes of a calibrated size, no tar stream): give every stage
+/// set that has slices, no file table and no `tar_command` (which `stage
+/// create` always records, so no real staging is touched) one, derived from its
+/// `stage_slices` rows — one regular-file member per slice, as long as the
+/// slice's cut, in slice order — through `db::stage_files::insert`, and the
+/// stream's length as the sum when the set records none. Called, under
+/// `cfg(test)` only, where the write selects its units
+/// ([`checked_staged_units`]), so that item 265's refusal
+/// ([`check_file_tables`]) does not turn every such fixture away (some
+/// 140 tests of the write path); nothing asserts on these rows, and it is
+/// one line to drop once those fixtures stage for real. What a tape carries of a
+/// real staging's table is proven from real stagings
+/// (`layout_3_tables_tests`, `tests/format_v3.rs`).
+#[cfg(test)]
+pub(crate) fn fixture_file_tables(conn: &Connection) {
+    let sets: Vec<i64> = conn
+        .prepare(
+            "SELECT ss.id FROM stage_sets ss
+              WHERE ss.tar_command IS NULL
+                AND EXISTS (SELECT 1 FROM stage_slices sl WHERE sl.stage_set_id = ss.id)
+                AND NOT EXISTS (SELECT 1 FROM stage_files f WHERE f.stage_set_id = ss.id)
+              ORDER BY ss.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for id in sets {
+        let slices: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT slice_number, size_bytes FROM stage_slices WHERE stage_set_id = ?1
+                  ORDER BY slice_number",
+            )
+            .unwrap()
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut start = 0u64;
+        let rows: Vec<crate::volume::filetable::Row> = slices
+            .iter()
+            .map(|&(n, size)| {
+                let len = (size.max(1) as u64).div_ceil(512) * 512;
+                let row = crate::volume::filetable::Row {
+                    kind: crate::volume::filetable::Kind::File,
+                    slice: n as u64,
+                    start,
+                    end: start + len,
+                    size: len.saturating_sub(512),
+                    sha256: Some([n as u8; 32]),
+                    path: format!("fixture-slice-{n}.bin"),
+                    link: None,
+                };
+                start += len;
+                row
+            })
+            .collect();
+        crate::db::stage_files::insert(conn, id, rows.into_iter().map(Ok)).unwrap();
+        conn.execute(
+            "UPDATE stage_sets SET stream_bytes = ?1 WHERE id = ?2 AND stream_bytes IS NULL",
+            params![start as i64, id],
+        )
+        .unwrap();
     }
-    out.push_str(
-        "  to give a unit one: load a cartridge that carries it and run `tapectl catalog \
-         rebuild --from-volume --key <operator or escrow key>`, or stage the version again \
-         from source\n",
-    );
-    out
+}
+
+/// Write each unit's file table and id map as the format's text
+/// (`volume-format-v3.md` §1.6, D4, D5) into `dir`, from the catalog
+/// database, for `build()` to stream into the tenant envelopes. The table is
+/// streamed row by row from `stage_files` into the text and never held (a
+/// million members is about 121 MB). Plaintext: `dir` is in the tapectl
+/// home's work dir, never under staging. A unit with no table is refused
+/// here too ([`check_file_tables`] refuses it first, before contact).
+pub fn generate_tables(
+    conn: &Connection,
+    units: &[BuildUnit],
+    dir: &Path,
+) -> Result<std::collections::HashMap<i64, build::StagingTables>> {
+    fs::create_dir_all(dir)?;
+    let mut query = crate::db::stage_files::Query::new(conn)?;
+    let mut out = std::collections::HashMap::new();
+    for u in units {
+        if out.contains_key(&u.stage_set_id) {
+            continue;
+        }
+        check_file_tables(conn, std::slice::from_ref(u))?;
+        let stream_bytes: Option<i64> = conn.query_row(
+            "SELECT stream_bytes FROM stage_sets WHERE id = ?1",
+            params![u.stage_set_id],
+            |r| r.get(0),
+        )?;
+        let stream_bytes = u64::try_from(stream_bytes.unwrap_or(-1)).map_err(|_| {
+            TapectlError::Other(format!(
+                "{} v{} (stage set {}): the catalog records no stream length for its file \
+                 table; stage the version again",
+                u.unit_name, u.snapshot_version, u.stage_set_id
+            ))
+        })?;
+        let tables = build::StagingTables {
+            file_table: dir.join(format!("s{}.tsv", u.stage_set_id)),
+            id_map: dir.join(format!("s{}.ids.tsv", u.stage_set_id)),
+        };
+        let mut w = std::io::BufWriter::new(fs::File::create(&tables.file_table)?);
+        crate::volume::filetable::write(&mut w, stream_bytes, query.rows(u.stage_set_id)?)?;
+        std::io::Write::flush(&mut w)?;
+        let ids = crate::db::stage_ids::load(conn, u.stage_set_id)?;
+        let mut w = std::io::BufWriter::new(fs::File::create(&tables.id_map)?);
+        crate::idmap::write(&mut w, &ids)?;
+        std::io::Write::flush(&mut w)?;
+        out.insert(u.stage_set_id, tables);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -14291,7 +14420,7 @@ mod tests {
     /// the read goes on. A one-byte filler there is no File 0 at all, which
     /// the contact now refuses (#476: claims that do not parse).
     fn claims_only_file0() -> Vec<u8> {
-        b"[volume]\nmagic = \"tapectl-volume-v2\"\nlayout_version = 2\nrequires = []\n".to_vec()
+        b"[volume]\nmagic = \"tapectl-volume-v3\"\nlayout_version = 3\nrequires = []\n".to_vec()
     }
 
     /// The filler file at `position` of a fixture tape: File 0 states a
@@ -15629,27 +15758,22 @@ mod tests {
     }
 
     /// Make every envelope of a write heavier, without touching what
-    /// generates them (#491): the catalog's first stage set gets a dar
-    /// catalogue of `bytes` bytes under `dir`, which the tenant's envelope
-    /// and the operator's both pack (`catalogs/`) and their RECOVERY.md then
-    /// names (#449). Nothing when `bytes` is 0.
-    fn grow_envelopes(conn: &Connection, dir: &Path, bytes: usize) {
+    /// generates them (#491): the catalog's first stage set's version gets
+    /// one more path, `bytes` long, which the tenant's envelope carries in
+    /// `index/paths.tsv` and the operator's in `catalog.db` (Layout 3 has no
+    /// dar catalogue to grow them with, §9). Nothing when `bytes` is 0.
+    fn grow_envelopes(conn: &Connection, _dir: &Path, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join("grown.1.dar"), vec![0x5a; bytes]).unwrap();
-        let stem = dir.join("grown").to_string_lossy().into_owned();
-        assert!(
-            crate::volume::envelope::catalogue_on_disk(&stem),
-            "positive control: the build finds the catalogue"
-        );
-        conn.execute(
-            "UPDATE stage_sets SET catalog_path = ?1
-             WHERE id = (SELECT MIN(id) FROM stage_sets)",
-            params![stem],
-        )
-        .unwrap();
+        let snapshot: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = (SELECT MIN(id) FROM stage_sets)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::db::files::fixture::insert(conn, snapshot, &"g".repeat(bytes), 0, "regular", None);
     }
 
     /// The verdict list `assemble_session_keys` hands `validate`, for the
@@ -16825,65 +16949,6 @@ mod tests {
     // ── issue #201: `volume write` announces the staged sets it is about
     // to write ──
 
-    fn unit_with_catalogue(
-        name: &str,
-        stage_set_id: i64,
-        version: i64,
-        catalog_path: Option<String>,
-    ) -> BuildUnit {
-        BuildUnit {
-            stage_set_id,
-            snapshot_id: stage_set_id,
-            unit_name: name.to_string(),
-            unit_uuid: format!("{name}-uuid"),
-            tenant_id: 1,
-            dar_version: None,
-            dar_command: None,
-            catalog_path,
-            snapshot_version: version,
-            slices: Vec::new(),
-            span: None,
-        }
-    }
-
-    /// Issue #473: a unit whose dar catalogue is not on disk (no
-    /// `catalog_path`, or no `<stem>.<n>.dar` beside it) is named before the
-    /// tape is touched, because `build` packs a catalogue only if it finds
-    /// one; a unit that has it is not mentioned, and a clean selection says
-    /// nothing at all.
-    #[test]
-    fn render_catalogue_warnings_names_exactly_the_units_with_no_catalogue_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let present = dir.path().join("aaaa1111_v1");
-        fs::write(dir.path().join("aaaa1111_v1.1.dar"), b"catalogue").unwrap();
-        let gone = dir.path().join("cccc3333_v1");
-        let has = unit_with_catalogue("alpha", 1, 1, Some(present.to_string_lossy().into()));
-        let none = unit_with_catalogue("beta", 2, 2, None);
-        let removed = unit_with_catalogue("gamma", 3, 1, Some(gone.to_string_lossy().into()));
-
-        assert_eq!(
-            render_catalogue_warnings(std::slice::from_ref(&has)),
-            "",
-            "a unit with its catalogue is not mentioned"
-        );
-        let warning = render_catalogue_warnings(&[has, none, removed]);
-        assert!(
-            warning.starts_with("warning: no dar catalogue on disk"),
-            "{warning}"
-        );
-        assert!(warning.contains("\n  beta v2 (stage set 2)\n"), "{warning}");
-        assert!(
-            warning.contains("\n  gamma v1 (stage set 3)\n"),
-            "{warning}"
-        );
-        assert!(!warning.contains("alpha"), "{warning}");
-        assert!(
-            warning.contains("catalog rebuild --from-volume")
-                && warning.contains("stage the version again"),
-            "it names the way out: {warning}"
-        );
-    }
-
     /// Exact text, multi-unit multi-version — issue #201's first acceptance
     /// property. Pinned, not `contains`-checked: a silently reworded
     /// announcement is exactly the kind of drift a substring match would
@@ -16899,12 +16964,13 @@ mod tests {
                 unit_name: "alpha-collection".to_string(),
                 unit_uuid: "u1".to_string(),
                 tenant_id: 1,
-                dar_version: None,
-                dar_command: None,
-                catalog_path: None,
+                tar_version: None,
+                stream_bytes: 0,
+                compression: None,
                 snapshot_version: 3,
                 slices: vec![
                     BuildSlice {
+                        continues: false,
                         slice_id: 1,
                         slice_number: 1,
                         size_bytes: 50 * 1024 * 1024,
@@ -16914,6 +16980,7 @@ mod tests {
                         staging_path: PathBuf::from("/tmp/a1"),
                     },
                     BuildSlice {
+                        continues: false,
                         slice_id: 2,
                         slice_number: 2,
                         size_bytes: 30 * 1024 * 1024,
@@ -16931,11 +16998,12 @@ mod tests {
                 unit_name: "zeta-notes".to_string(),
                 unit_uuid: "u2".to_string(),
                 tenant_id: 1,
-                dar_version: None,
-                dar_command: None,
-                catalog_path: None,
+                tar_version: None,
+                stream_bytes: 0,
+                compression: None,
                 snapshot_version: 1,
                 slices: vec![BuildSlice {
+                    continues: false,
                     slice_id: 3,
                     slice_number: 1,
                     size_bytes: 5 * 1024 * 1024,
@@ -16974,11 +17042,12 @@ mod tests {
             unit_name: "solo".to_string(),
             unit_uuid: "u1".to_string(),
             tenant_id: 1,
-            dar_version: None,
-            dar_command: None,
-            catalog_path: None,
+            tar_version: None,
+            stream_bytes: 0,
+            compression: None,
             snapshot_version: 1,
             slices: vec![BuildSlice {
+                continues: false,
                 slice_id: 1,
                 slice_number: 1,
                 size_bytes: 1024 * 1024,
@@ -20219,12 +20288,12 @@ mod tests {
 
         /// How a 1.6.0 File 0 states what it requires (ADR-0012 item 111):
         /// one feature, which this tapectl knows.
-        const STATED: &str = "\nrequires = [\"short-seal\"]\n";
+        const STATED: &str = "\nrequires = []\n";
         const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
         /// [`loaded_fixture`] with File 0's `requires` line replaced by `to`
         /// (`STATED` leaves the tape as written — the positive control, which
-        /// also proves the fixture states `requires = ["short-seal"]`).
+        /// also proves the fixture states `requires = []`, D1).
         fn fixture(label: &str, to: &str) -> (Connection, i64, FakeTape) {
             let (conn, volume_id, fake) = loaded_fixture(label);
             let old = fake.state().files[0].clone();
@@ -20420,10 +20489,9 @@ mod tests {
             let (conn, volume_id, fake) = fixture("RQ-VS", STATED);
             let seal_position = fake.state().files.len() - 1;
             let old = fake.state().files[seal_position].clone();
-            // The seal states 1.6.0's line once its generator writes 1.6.0
-            // seals, and 1.5.0's `requires = []` before (ADR-0012 item 111).
+            // The seal states Layout 3's `requires = []` (D1).
             let text = String::from_utf8_lossy(&old).to_string();
-            let stated = [STATED, "\nrequires = []\n"]
+            let stated = [STATED]
                 .into_iter()
                 .find(|s| text.contains(s))
                 .expect("the seal states requires");
@@ -27829,10 +27897,7 @@ mod tests {
                         pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
                     );
                     assert!(may_span(&f, "SP-1", "b") && !may_span(&f, "SP-1", "a"));
-                    assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\", \"spanning\"]"
-                    );
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         snapshot_status(&f, "b"),
                         "staged",
@@ -28049,10 +28114,7 @@ mod tests {
                     assert_eq!(code, 0);
                     assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "cut")]));
                     assert!(!may_span(&f, "SR-1", "b"));
-                    assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\"]"
-                    );
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert!(recorded_ranges(&f.conn, "SR-1").unwrap().is_empty());
 
                     let mut store = ArmedAt::new(9, warning);
@@ -28409,10 +28471,7 @@ mod tests {
                     for unit in ["a", "b", "c"] {
                         assert!(!may_span(&f, "S0-1", unit), "{unit}");
                     }
-                    assert_eq!(
-                        requires_line(&store.inner.files),
-                        "requires = [\"short-seal\"]"
-                    );
+                    assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         events(&f, "S0-1", "write_completed"),
                         vec![(
@@ -28805,13 +28864,14 @@ mod tests {
                         unit_name: name.into(),
                         unit_uuid: name.into(),
                         tenant_id: 1,
-                        dar_version: None,
-                        dar_command: None,
-                        catalog_path: None,
+                        tar_version: None,
+                        stream_bytes: 0,
+                        compression: None,
                         snapshot_version: 1,
                         slices: slices
                             .iter()
                             .map(|&n| BuildSlice {
+                                continues: false,
                                 slice_id: n,
                                 slice_number: n,
                                 size_bytes: 1,
@@ -31000,5 +31060,471 @@ mod tests {
             rehearse(&f, 2 * (threshold + probe.margin) as i64)
                 .expect("within the ceiling it fits");
         }
+    }
+}
+
+/// What a tape carries of a staging's file table and id map
+/// (`volume-format-v3.md` §1.4, §1.6; ADR-0012 items 265, 276; #557, #564),
+/// through the real write: units staged by the real `stage create` on made
+/// trees (a hard link, an ACL naming an id the host has no name for), a
+/// volume made by `volume init` and written by `volume write` over a
+/// [`MemStore`], every envelope read back from the recorded bytes.
+#[cfg(test)]
+mod layout_3_tables_tests {
+    use std::fs;
+
+    use rusqlite::{params, Connection};
+    use tempfile::TempDir;
+
+    use crate::config::{Config, LtoBackendConfig, TapectlPaths};
+    use crate::store::{MemStore, Store};
+    use crate::tape::contact::ContactSlot;
+    use crate::volume::envelope;
+    use crate::volume::format;
+    use crate::volume::write::{self, ContactStore};
+
+    const BS: usize = 4096;
+    const DEVICE: &str = "/nonexistent/tapectl-t46-nst";
+    const BACKEND: &str = "lto6t46";
+    const OPERATOR: &str = "quince-operator-t46";
+    const ONE: &str = "medlar-tenant-one";
+    const TWO: &str = "medlar-tenant-two";
+    /// An id no host names: the ACL entry the first unit's file carries.
+    const NAMELESS_UID: u32 = 4_242_917;
+
+    struct Home {
+        conn: Connection,
+        paths: TapectlPaths,
+        config: Config,
+        sources: std::path::PathBuf,
+        _tmp: TempDir,
+    }
+
+    fn home() -> Home {
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        let staging = tmp.path().join("staging");
+        let sources = tmp.path().join("sources");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&sources).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.slice_size = "64K".to_string();
+        config.backends.lto.push(LtoBackendConfig {
+            name: BACKEND.into(),
+            device_tape: DEVICE.into(),
+            device_sg: "/nonexistent/tapectl-t46-sg".into(),
+            generation: "LTO-6".into(),
+            capacity_override: None,
+            fill_ceiling: crate::config::DEFAULT_FILL_CEILING,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: None,
+        });
+        crate::tenant::add_tenant(&conn, &paths, OPERATOR, None, true).unwrap();
+        for tenant in [ONE, TWO] {
+            crate::tenant::add_tenant(&conn, &paths, tenant, None, false).unwrap();
+        }
+        crate::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
+        Home {
+            conn,
+            paths,
+            config,
+            sources,
+            _tmp: tmp,
+        }
+    }
+
+    impl Home {
+        /// `unit init` of a folder of `files`, then `snapshot create` and
+        /// `stage create`: its stage set.
+        fn staged(&self, tenant: &str, name: &str, files: &[(&str, &[u8])]) -> i64 {
+            let dir = self.sources.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            for (file, bytes) in files {
+                fs::write(dir.join(file), bytes).unwrap();
+            }
+            self.prepare(name, &dir);
+            crate::unit::init_unit_with_config(
+                &self.conn,
+                &self.config,
+                dir.to_str().unwrap(),
+                tenant,
+                Some(name),
+                &[],
+                None,
+            )
+            .unwrap();
+            let snapshot = crate::staging::snapshot_create(&self.conn, name, &self.config).unwrap();
+            crate::staging::stage_create(&self.conn, &self.paths, &self.config, snapshot, true)
+                .unwrap_or_else(|e| panic!("stage create {name}: {e}"))
+        }
+
+        /// The first unit's tree gains a hard link and an ACL naming an id
+        /// no host names, as an operator's files might.
+        fn prepare(&self, name: &str, dir: &std::path::Path) {
+            if !name.ends_with("-one") {
+                return;
+            }
+            fs::hard_link(dir.join("a.bin"), dir.join("a-link.bin")).unwrap();
+            let ok = std::process::Command::new("setfacl")
+                .arg("-m")
+                .arg(format!("u:{NAMELESS_UID}:r"))
+                .arg(dir.join("a.bin"))
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "setfacl must work on the test's file system");
+        }
+
+        /// `cartridge register` then `volume init` of `label` over a medium.
+        fn volume(&self, label: &str) -> MemStore {
+            self.volume_on(label, &format!("{label}-STK"))
+        }
+
+        /// [`Self::volume`], on a cartridge registered as `barcode`.
+        fn volume_on(&self, label: &str, barcode: &str) -> MemStore {
+            let barcode = barcode.to_string();
+            crate::cli::cartridge::run(
+                &self.conn,
+                &self.config,
+                &crate::cli::cartridge::CartridgeCommands::Register {
+                    barcode: barcode.clone(),
+                    generation: "LTO-6".into(),
+                    capacity: None,
+                    serial: None,
+                    notes: None,
+                },
+                false,
+                true,
+                false,
+            )
+            .unwrap();
+            let mut medium = MemStore::new(BS);
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_init_contacted(
+                &self.conn,
+                &self.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                None,
+                Some(&barcode),
+                &mut slot,
+                ContactStore::Injected(&mut medium),
+            );
+            slot.finish_result(r).unwrap();
+            medium
+        }
+
+        /// `volume write` of `label` onto `medium`.
+        fn write(&self, label: &str, medium: &mut MemStore) -> crate::error::Result<()> {
+            let mut slot = ContactSlot::empty();
+            let r = write::volume_write_contacted(
+                &self.conn,
+                &self.paths,
+                &self.config,
+                label,
+                DEVICE,
+                BS,
+                false,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(medium),
+                None,
+            );
+            slot.finish_result(r).map(|_| ())
+        }
+
+        fn identities(&self, tenant: &str) -> Vec<age::x25519::Identity> {
+            crate::crypto::keys::load_tenant_identities(&self.conn, &self.paths.keys_dir, tenant)
+                .unwrap()
+        }
+    }
+
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 11) as u8
+            })
+            .collect()
+    }
+
+    fn entries(store: &mut MemStore) -> Vec<format::ParsedIndexEntry> {
+        let fi = crate::store::read_small_bytes(store, 3, "front index").unwrap();
+        format::parse_front_index(&String::from_utf8_lossy(&fi)).unwrap()
+    }
+
+    /// The Done-when of the plan's T4.6: `volume write` to a `MemStore`, and
+    /// a read-back of every envelope, round-trip the file table and the id
+    /// map (§1.6; D4, D5, D7).
+    /// - Each tenant envelope and its backup give, for its own staging, the
+    ///   catalog's rows exactly (`stage_files`, `stage_ids`), and name no
+    ///   other tenant's staging; its key opens no other tenant's envelope.
+    /// - The id map holds the ACL's nameless id with no name, beside the
+    ///   owner's id with the host's name.
+    /// - The operator envelope carries no `tables/` member; its `catalog.db`
+    ///   carries both stagings' rows exactly, every path they name (the hard
+    ///   link's target among them), and the format's stamp.
+    #[test]
+    fn volume_write_round_trips_every_stagings_file_table_and_id_map() {
+        let h = home();
+        let one = h.staged(
+            ONE,
+            "unit-one",
+            &[("a.bin", &noise(90_000, 1)), ("b.txt", b"small")],
+        );
+        let two = h.staged(TWO, "unit-two", &[("c.bin", &noise(20_000, 2))]);
+        let mut medium = h.volume("T46-01");
+        h.write("T46-01", &mut medium).unwrap();
+
+        let catalog_rows = |id: i64| crate::db::stage_files::load(&h.conn, id).unwrap();
+        let catalog_ids = |id: i64| crate::db::stage_ids::load(&h.conn, id).unwrap();
+        assert!(
+            catalog_rows(one)
+                .iter()
+                .any(|r| r.kind == crate::volume::filetable::Kind::HardLink),
+            "the fixture's hard link is a member"
+        );
+        let ids_one = catalog_ids(one);
+        assert!(
+            ids_one
+                .iter()
+                .any(|r| r.id == NAMELESS_UID && r.name.is_none()),
+            "the ACL's nameless id is in the map with no name: {ids_one:?}"
+        );
+        let me = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(h.sources.join("unit-one").join("b.txt"))
+                .unwrap()
+                .uid()
+        };
+        assert!(
+            ids_one.iter().any(|r| r.id == me && r.name.is_some()),
+            "the owner's id with the host's name: {ids_one:?}"
+        );
+
+        let entries = entries(&mut medium);
+        let scratch = TempDir::new().unwrap();
+        let mut seen = 0;
+        for (tenant, own, other) in [(ONE, one, two), (TWO, two, one)] {
+            let ids = h.identities(tenant);
+            let mut opened_own = 0;
+            for e in entries.iter().filter(|e| {
+                e.type_label == "tenant_envelope" || e.type_label == "tenant_envelope_backup"
+            }) {
+                let dir = scratch.path().join(format!("{tenant}-{}", e.position));
+                match envelope::open_envelope(&mut medium, e, &ids, &dir) {
+                    Ok(env) => {
+                        opened_own += 1;
+                        let rows: Vec<_> = env
+                            .file_table(own)
+                            .unwrap()
+                            .collect::<crate::error::Result<_>>()
+                            .unwrap();
+                        assert_eq!(rows, catalog_rows(own), "{tenant} at {}", e.position);
+                        assert_eq!(env.id_map(own).unwrap(), catalog_ids(own));
+                        assert!(env.file_table(other).is_err(), "no other tenant's table");
+                        assert!(env.tables.len() == 2, "{:?}", env.tables);
+                    }
+                    Err(envelope::OpenError::NoMatchingKey) => {}
+                    Err(envelope::OpenError::Failed(e)) => panic!("{e}"),
+                }
+            }
+            assert_eq!(opened_own, 2, "{tenant}: its envelope and its backup");
+            seen += opened_own;
+        }
+        assert_eq!(seen, 4);
+
+        let op_entry = entries
+            .iter()
+            .find(|e| e.type_label == "operator_envelope")
+            .unwrap();
+        let op = envelope::open_envelope(
+            &mut medium,
+            op_entry,
+            &h.identities(OPERATOR),
+            &scratch.path().join("op"),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(op.tables.is_empty());
+        for u in &op.manifest.units {
+            assert_eq!((&u.file_table, &u.id_map), (&None, &None), "{}", u.name);
+        }
+        let (conn, cat) =
+            crate::db::ontape_catalog::read_all_but_files(op.catalog_db.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            crate::db::ontape_catalog::stage_sets_with_tables(&conn).unwrap(),
+            vec![one.min(two), one.max(two)]
+        );
+        for id in [one, two] {
+            let rows: Vec<_> = crate::db::ontape_catalog::file_table(&conn)
+                .unwrap()
+                .rows(id)
+                .unwrap()
+                .collect::<crate::error::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, catalog_rows(id), "catalog.db's table of {id}");
+            assert_eq!(
+                crate::db::ontape_catalog::id_map(&conn, id).unwrap(),
+                catalog_ids(id)
+            );
+            let set = cat.stage_sets.iter().find(|s| s.id == id).unwrap();
+            let main: (Option<i64>, Option<String>, Option<String>) = h
+                .conn
+                .query_row(
+                    "SELECT stream_bytes, tar_version, compression FROM stage_sets WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    set.stream_bytes,
+                    set.tar_version.clone(),
+                    set.compression.clone()
+                ),
+                main
+            );
+            assert!(set
+                .tar_version
+                .as_deref()
+                .is_some_and(|v| v.contains("GNU tar")));
+        }
+        let stamp: (i64, i64) = conn
+            .query_row(
+                "SELECT * FROM pragma_application_id, pragma_user_version",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, (crate::db::APPLICATION_ID, 1));
+    }
+
+    /// Item 265 (#557): a write refuses, by name, a unit whose file table the
+    /// catalog cannot supply, before the tape moves, and says to stage it
+    /// again; the medium holds only what `volume init` wrote. The positive
+    /// control: with the table there, the same write seals.
+    #[test]
+    fn a_write_refuses_by_name_a_unit_whose_file_table_is_gone() {
+        let h = home();
+        h.staged(ONE, "unit-whole", &[("w.bin", &noise(5_000, 3))]);
+        let lost = h.staged(TWO, "unit-lost", &[("l.bin", &noise(5_000, 4))]);
+        let saved: Vec<_> = crate::db::stage_files::load(&h.conn, lost).unwrap();
+        h.conn
+            .execute(
+                "DELETE FROM stage_files WHERE stage_set_id = ?1",
+                params![lost],
+            )
+            .unwrap();
+        let mut medium = h.volume("T46-02");
+        let before = medium.files.clone();
+        let err = h.write("T46-02", &mut medium).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("unit-lost v1 (stage set {lost})")),
+            "names the unit: {err}"
+        );
+        assert!(err.contains("Stage each version again"), "{err}");
+        assert!(
+            !err.contains("unit-whole"),
+            "only the unit without one: {err}"
+        );
+        assert_eq!(medium.files, before, "the tape did not move");
+
+        let tx = h.conn.unchecked_transaction().unwrap();
+        crate::db::stage_files::insert(&tx, lost, saved.into_iter().map(Ok)).unwrap();
+        tx.commit().unwrap();
+        h.write("T46-02", &mut medium)
+            .expect("positive control: it seals");
+    }
+
+    /// #547: a hand-typed barcode holding a quote and a backslash (a drive
+    /// with no chip serial: `volume init --cartridge`) reaches File 0 as a
+    /// TOML basic string, so the write seals and every reader of File 0
+    /// reads it back as typed (`volume-format-v3.md` §1.1).
+    #[test]
+    fn a_barcode_holding_a_quote_and_a_backslash_is_written_escaped_and_reads_back() {
+        let h = home();
+        h.staged(ONE, "unit-q", &[("q.bin", &noise(4_000, 9))]);
+        let barcode = "Q\"7\\B";
+        let mut medium = h.volume_on("T46-04", barcode);
+        h.write("T46-04", &mut medium).expect("the write seals");
+        let mut file0 = Vec::new();
+        medium.read_file(0, &mut file0).unwrap();
+        let text = String::from_utf8_lossy(format::without_nul_padding(&file0)).into_owned();
+        format::check_id_thunk_readable(&text).unwrap();
+        assert_eq!(
+            format::parse_id_thunk_identity(&text).unwrap().label,
+            "T46-04"
+        );
+        let media = format::parse_id_thunk_media(&text).unwrap();
+        assert_eq!(media.cartridge_serial, barcode);
+        assert_eq!(media.cartridge_identity_source.as_deref(), Some("operator"));
+        assert!(
+            text.contains("cartridge_serial = \"Q\\\"7\\\\B\"\n"),
+            "escaped as TOML escapes: {text}"
+        );
+    }
+
+    /// `volume write`'s tables are plaintext: generated in the tapectl home's
+    /// work dir and gone with it, never under staging, and in no plaintext
+    /// file of the tape (invariant 3).
+    #[test]
+    fn the_tables_leave_no_plaintext_behind_and_none_on_the_tape() {
+        let h = home();
+        let name = "unit-one";
+        let marker = "zebrawood-needle-path.bin";
+        let id = h.staged(ONE, name, &[("a.bin", &noise(4_000, 5)), (marker, b"x")]);
+        let mut medium = h.volume("T46-03");
+        h.write("T46-03", &mut medium).unwrap();
+        assert!(crate::db::stage_files::load(&h.conn, id)
+            .unwrap()
+            .iter()
+            .any(|r| r.path == marker));
+        let mut stack = vec![
+            std::path::PathBuf::from(&h.config.staging.directory),
+            h.paths.home.join("tmp"),
+        ];
+        let mut scanned = 0;
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                scanned += 1;
+                let bytes = fs::read(&p).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker.as_bytes())
+                        && !bytes
+                            .windows(crate::volume::filetable::HEADER.len())
+                            .any(|w| w == crate::volume::filetable::HEADER.as_bytes()),
+                    "plaintext table at {}",
+                    p.display()
+                );
+            }
+        }
+        assert!(scanned > 0, "the scan reached staging's files");
+        let positions = entries(&mut medium);
+        let seal_at = medium.files.len() - 1;
+        for pos in [0usize, 1, 2, 3, seal_at] {
+            let mut bytes = Vec::new();
+            medium.read_file(pos as u32, &mut bytes).unwrap();
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "file {pos} names a member"
+            );
+        }
+        assert!(positions.iter().all(|e| e.type_label != "file_table"));
     }
 }

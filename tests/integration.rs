@@ -1990,6 +1990,31 @@ fn test_export_selects_single_stage_set() {
 /// `volume_write` must refuse before writing when the staged data won't fit the
 /// tape — the #8 dry-run showed the old path wrote past end-of-tape, reported
 /// success, and left dead slices with the snapshot marked current.
+/// Give stage set `ss` a one-member file table, as the write now requires
+/// of every unit it carries (ADR-0012 item 265): these fixtures make their
+/// stage sets by hand, with no tar stream, and test what comes after that
+/// check (a capacity, a missing key).
+fn give_file_table(conn: &Connection, ss: i64, slice_bytes: u64) {
+    use tapectl::volume::filetable::{Kind, Row};
+    let end = slice_bytes.div_ceil(512) * 512 + 512;
+    let row = Row {
+        kind: Kind::File,
+        slice: 1,
+        start: 0,
+        end,
+        size: end - 512,
+        sha256: Some([1; 32]),
+        path: "fixture.bin".to_string(),
+        link: None,
+    };
+    tapectl::db::stage_files::insert(conn, ss, std::iter::once(Ok(row))).unwrap();
+    conn.execute(
+        "UPDATE stage_sets SET stream_bytes = ?1 WHERE id = ?2",
+        rusqlite::params![end as i64, ss],
+    )
+    .unwrap();
+}
+
 #[test]
 fn test_volume_write_refuses_over_capacity() {
     use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
@@ -2058,6 +2083,7 @@ fn test_volume_write_refuses_over_capacity() {
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 5000000);
 
     // ADR-0010 decision 3: the ROW is what must gate this write, and config's
     // `capacity_override` must never be consulted after init. So the two
@@ -2213,6 +2239,7 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 5000000);
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
          VALUES ('L6-CEIL', 'lto', 'p', 'LTO-6', 10200000, 'initialized')",
@@ -2429,6 +2456,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
+    give_file_table(&conn, ss, 100);
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)

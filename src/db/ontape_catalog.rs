@@ -4,8 +4,8 @@
 //! # What this IS
 //!
 //! The format of the small, standalone SQLite file that rides inside the
-//! OPERATOR envelope on every volume — `docs/design/volume-format-v2.md`
-//! line 89's "the operator envelope's catalog snapshot, #83". It has an
+//! OPERATOR envelope on every volume (`docs/design/volume-format-v3.md` §1.4
+//! and Appendix A.4, #83). It has an
 //! external contract: `RECOVERY.md`'s "Querying `catalog.db`" section
 //! documents this schema to an operator armed with nothing but `sqlite3` and
 //! a decrypted envelope, and `catalog rebuild` (#136, `src/volume/rebuild.rs`)
@@ -27,18 +27,24 @@
 //!
 //! # One shape
 //!
-//! `docs/design/volume-format-v2.md` §1.4 is the normative statement. This
-//! tapectl reads the one shape it writes ([`SCHEMA`]): `tenants` (unit
-//! ownership), `stage_sets.key_fingerprints` (the escrow receipt),
-//! `stage_slices.sha256_plain`, and the main catalog's narrow per-file shape,
-//! `paths` + `file_versions`, which records each entry's kind and link
-//! target. A `catalog.db` of any other shape (the ones tapectl wrote before
-//! 1.1.0 among them) is refused, naming what was found ([`check_shape`]):
-//! there is no compatibility with them (ADR-0012 items 242 and 258(d)).
+//! `docs/design/volume-format-v3.md` §1.4 and Appendix A.4 are the normative
+//! statement (one generation, D7; ADR-0012 items 258(d), 294, 295). Its
+//! tables are exactly those `catalog rebuild` reads, plus each staging's
+//! file table and id map, and nothing else: `tenants` (unit ownership),
+//! `units`, `snapshots`, `stage_sets` (the escrow receipt, the stream's
+//! length, the compression, its level and the tar line), `stage_slices`
+//! (`sha256_plain`, `continues`), the main catalog's narrow per-file shape
+//! `paths` + `file_versions`, and `stage_files` + `stage_ids` (ADR-0012 items
+//! 265, 276; #557, #564) as the catalog database holds them, for the
+//! stagings this tape holds a slice of. So a rebuild restores both, and a
+//! copy written after a rebuild carries both. A `catalog.db` of any other
+//! shape is refused, naming what was found ([`check_shape`]): there is no
+//! compatibility (ADR-0012 items 242 and 258(d)).
 //!
-//! `PRAGMA user_version` does not say which shape a file has — it is stamped
-//! from the SOURCE database's schema level — so [`check_shape`] probes the
-//! actual tables and columns instead.
+//! The file is stamped as the catalog database is: SQLite's
+//! `application_id` is [`crate::db::APPLICATION_ID`], and `user_version` is
+//! copied from the source catalog (the baseline's 1). Neither says which
+//! shape a file has, so [`check_shape`] probes the tables and columns too.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -51,12 +57,17 @@ use crate::error::{Result, TapectlError};
 /// Table/column subset carried into the snapshot: enough to answer "what
 /// units/snapshots/files landed on this volume" without needing the source
 /// `tapectl.db` — see `RECOVERY.md`'s "Querying `catalog.db`" section for
-/// the schema as documented to the operator, and `volume-format-v2.md` §1.4
-/// for the normative one. It is the only shape this tapectl reads.
+/// the schema as documented to the operator, and `volume-format-v3.md`
+/// Appendix A.4 for the normative one. It is the only shape this tapectl
+/// reads.
 ///
 /// `paths` carries no `UNIQUE(unit_id, path)` index, unlike the main
 /// catalog's: nothing reads this file by name, a rebuild interns paths into
 /// its own catalog's index, and the index would store every path twice.
+/// `stage_files` and `stage_ids` are the baseline's (Appendix A.3), checks
+/// included, so a value outside a column's allowed set never reaches a
+/// reader; their references to `stage_sets` and `paths` are not declared,
+/// as no other table's are here.
 const SCHEMA: &str = "
 CREATE TABLE tenants (
     id          INTEGER PRIMARY KEY,
@@ -83,9 +94,12 @@ CREATE TABLE stage_sets (
     snapshot_id          INTEGER NOT NULL,
     slice_size           INTEGER,
     num_slices           INTEGER,
-    total_dar_size       INTEGER,
+    stream_bytes         INTEGER,
     total_encrypted_size INTEGER,
-    key_fingerprints     TEXT
+    key_fingerprints     TEXT,
+    compression          TEXT,
+    compression_level    INTEGER,
+    tar_version          TEXT
 );
 CREATE TABLE stage_slices (
     id               INTEGER PRIMARY KEY,
@@ -94,7 +108,8 @@ CREATE TABLE stage_slices (
     size_bytes       INTEGER,
     encrypted_bytes  INTEGER,
     sha256_plain     TEXT,
-    sha256_encrypted TEXT
+    sha256_encrypted TEXT,
+    continues        INTEGER NOT NULL DEFAULT 0 CHECK(continues IN (0, 1))
 );
 CREATE TABLE paths (
     id      INTEGER PRIMARY KEY,
@@ -111,6 +126,29 @@ CREATE TABLE file_versions (
                            OR (typeof(sha256) = 'blob' AND length(sha256) = 32)),
     link_target TEXT,
     PRIMARY KEY (snapshot_id, path_id)
+) WITHOUT ROWID;
+CREATE TABLE stage_files (
+    stage_set_id INTEGER NOT NULL,
+    seq          INTEGER NOT NULL CHECK(seq >= 0),
+    kind         TEXT NOT NULL CHECK(kind IN ('f','d','l','h','p','c','b')),
+    slice        INTEGER NOT NULL CHECK(slice >= 1),
+    path_id      INTEGER NOT NULL,
+    size         INTEGER NOT NULL CHECK(size >= 0),
+    sha256       BLOB CHECK(sha256 IS NULL
+                            OR (typeof(sha256) = 'blob' AND length(sha256) = 32)),
+    start        INTEGER NOT NULL CHECK(start >= 0),
+    \"end\"        INTEGER NOT NULL CHECK(\"end\" > start),
+    link_path_id INTEGER,
+    CHECK((kind = 'h') = (link_path_id IS NOT NULL)),
+    CHECK((kind IN ('f','h')) = (sha256 IS NOT NULL)),
+    PRIMARY KEY (stage_set_id, seq)
+) WITHOUT ROWID;
+CREATE TABLE stage_ids (
+    stage_set_id INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('u','g')),
+    id           INTEGER NOT NULL CHECK(id >= 0 AND id <= 4294967295),
+    name         TEXT CHECK(name IS NULL OR name <> ''),
+    PRIMARY KEY (stage_set_id, kind, id)
 ) WITHOUT ROWID;
 ";
 
@@ -135,27 +173,48 @@ fn has_table(conn: &Connection, table: &str) -> Result<bool> {
 
 /// The tables, and the columns of them that an older shape lacked, that
 /// every `catalog.db` this tapectl writes carries ([`SCHEMA`]).
-const REQUIRED: &[(&str, Option<&str>)] = &[
-    ("tenants", None),
-    ("units", None),
-    ("snapshots", None),
-    ("stage_sets", Some("key_fingerprints")),
-    ("stage_slices", Some("sha256_plain")),
-    ("paths", None),
-    ("file_versions", None),
+const REQUIRED: &[(&str, &[&str])] = &[
+    ("tenants", &[]),
+    ("units", &[]),
+    ("snapshots", &[]),
+    (
+        "stage_sets",
+        &[
+            "key_fingerprints",
+            "stream_bytes",
+            "compression",
+            "compression_level",
+            "tar_version",
+        ],
+    ),
+    ("stage_slices", &["sha256_plain", "continues"]),
+    ("paths", &[]),
+    ("file_versions", &[]),
+    ("stage_files", &[]),
+    ("stage_ids", &[]),
 ];
 
 /// Refuse an open `catalog.db` that is not the shape this tapectl writes
-/// ([`SCHEMA`], `volume-format-v2.md` §1.4), naming what was found: every
-/// table or column it lacks, and a `files` table, the per-file table of the
-/// shapes tapectl wrote before 1.1.0. No other shape is read (ADR-0012 item
-/// 258(d)); a reader does not guess.
+/// ([`SCHEMA`], `volume-format-v3.md` §1.4, Appendix A.4), naming what was
+/// found: another `application_id`, every table or column it lacks, and a
+/// `files` table, the per-file table of the shapes tapectl 1.x wrote before
+/// 1.1.0. No other shape is read (ADR-0012 item 258(d)); a reader does not
+/// guess.
 pub fn check_shape(conn: &Connection) -> Result<()> {
     let mut missing: Vec<String> = Vec::new();
-    for &(table, column) in REQUIRED {
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    if application_id != crate::db::APPLICATION_ID {
+        missing.push(format!(
+            "application_id {application_id:#x}, not tapectl's {:#x}",
+            crate::db::APPLICATION_ID
+        ));
+    }
+    for &(table, columns) in REQUIRED {
         if !has_table(conn, table)? {
             missing.push(format!("no `{table}` table"));
-        } else if let Some(column) = column {
+            continue;
+        }
+        for column in columns {
             if !has_column(conn, table, column)? {
                 missing.push(format!("no `{table}.{column}` column"));
             }
@@ -171,7 +230,7 @@ pub fn check_shape(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     Err(TapectlError::Other(format!(
-        "catalog.db is not the shape this tapectl writes (volume-format-v2.md §1.4): it has {}. \
+        "catalog.db is not the shape this tapectl writes (volume-format-v3.md §1.4): it has {}. \
          This tapectl reads no other shape",
         missing.join(", ")
     )))
@@ -209,9 +268,16 @@ pub struct StageSetRow {
     pub snapshot_id: i64,
     pub slice_size: Option<i64>,
     pub num_slices: Option<i64>,
-    pub total_dar_size: Option<i64>,
+    /// The tar stream's length, its tail included (D11).
+    pub stream_bytes: Option<i64>,
     pub total_encrypted_size: Option<i64>,
     pub key_fingerprints: Option<String>,
+    /// As staging recorded it: `none`, `gzip`, `xz` or `zstd`.
+    pub compression: Option<String>,
+    /// The level each slice was packed at; NULL for none.
+    pub compression_level: Option<i64>,
+    /// The writer's `tar --version` first line.
+    pub tar_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +289,8 @@ pub struct SliceRow {
     pub encrypted_bytes: i64,
     pub sha256_plain: Option<String>,
     pub sha256_encrypted: String,
+    /// The slice continues a member begun in the slice before it (D22).
+    pub continues: bool,
 }
 
 /// One entry of one on-tape version, in the catalog's own terms
@@ -464,8 +532,9 @@ pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
 
     let stage_sets = {
         let mut stmt = conn.prepare(
-            "SELECT id, snapshot_id, slice_size, num_slices, total_dar_size,
-                    total_encrypted_size, key_fingerprints
+            "SELECT id, snapshot_id, slice_size, num_slices, stream_bytes,
+                    total_encrypted_size, key_fingerprints, compression,
+                    compression_level, tar_version
              FROM stage_sets ORDER BY id",
         )?;
         let rows = stmt
@@ -475,9 +544,12 @@ pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
                     snapshot_id: r.get(1)?,
                     slice_size: r.get(2)?,
                     num_slices: r.get(3)?,
-                    total_dar_size: r.get(4)?,
+                    stream_bytes: r.get(4)?,
                     total_encrypted_size: r.get(5)?,
                     key_fingerprints: r.get(6)?,
+                    compression: r.get(7)?,
+                    compression_level: r.get(8)?,
+                    tar_version: r.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -487,7 +559,7 @@ pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
     let slices = {
         let mut stmt = conn.prepare(
             "SELECT id, stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                    sha256_plain, sha256_encrypted
+                    sha256_plain, sha256_encrypted, continues
              FROM stage_slices ORDER BY id",
         )?;
         let rows = stmt
@@ -500,6 +572,7 @@ pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
                     encrypted_bytes: r.get(4)?,
                     sha256_plain: r.get(5)?,
                     sha256_encrypted: r.get(6)?,
+                    continues: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -565,6 +638,10 @@ pub(crate) fn fill(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -
 
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     tx.execute(&format!("PRAGMA user_version = {user_version}"), [])?;
+    tx.execute(
+        &format!("PRAGMA application_id = {}", crate::db::APPLICATION_ID),
+        [],
+    )?;
 
     if !stage_set_ids.is_empty() {
         copy_rows(conn, stage_set_ids, &tx)?;
@@ -586,46 +663,24 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
     // stage_sets: the given ids, verbatim.
     {
         let sql = format!(
-            "SELECT id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size,
-                    key_fingerprints
+            "SELECT id, snapshot_id, slice_size, num_slices, stream_bytes, total_encrypted_size,
+                    key_fingerprints, compression, compression_level, tar_version
              FROM stage_sets WHERE id IN ({})",
             ph()
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })?;
         let mut insert = out.prepare(
-            "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, stream_bytes,
+                                     total_encrypted_size, key_fingerprints, compression,
+                                     compression_level, tar_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
-        for r in rows {
-            let (
-                id,
-                snapshot_id,
-                slice_size,
-                num_slices,
-                total_dar_size,
-                total_encrypted_size,
-                key_fingerprints,
-            ) = r?;
-            insert.execute(rusqlite::params![
-                id,
-                snapshot_id,
-                slice_size,
-                num_slices,
-                total_dar_size,
-                total_encrypted_size,
-                key_fingerprints
-            ])?;
+        let mut rows = stmt.query(params_from_iter(stage_set_ids.iter()))?;
+        while let Some(row) = rows.next()? {
+            let values: Vec<rusqlite::types::Value> = (0..10)
+                .map(|i| row.get(i))
+                .collect::<rusqlite::Result<_>>()?;
+            insert.execute(params_from_iter(values))?;
         }
     }
 
@@ -724,66 +779,56 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
     // stage_slices for those stage_sets.
     {
         let sql = format!(
-            "SELECT id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted
+            "SELECT id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                    sha256_encrypted, continues
              FROM stage_slices WHERE stage_set_id IN ({})",
             ph()
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
         let mut insert = out.prepare(
-            "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, continues)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
-        for r in rows {
-            let (
-                id,
-                stage_set_id,
-                slice_number,
-                size_bytes,
-                encrypted_bytes,
-                sha256_plain,
-                sha256_encrypted,
-            ) = r?;
-            insert.execute(rusqlite::params![
-                id,
-                stage_set_id,
-                slice_number,
-                size_bytes,
-                encrypted_bytes,
-                sha256_plain,
-                sha256_encrypted
-            ])?;
+        let mut rows = stmt.query(params_from_iter(stage_set_ids.iter()))?;
+        while let Some(row) = rows.next()? {
+            let values: Vec<rusqlite::types::Value> = (0..8)
+                .map(|i| row.get(i))
+                .collect::<rusqlite::Result<_>>()?;
+            insert.execute(params_from_iter(values))?;
         }
     }
 
-    // Generation 3's per-file rows (ADR-0012 2026-10-12 item 48): the
-    // catalog's own `paths` + `file_versions` (migration 030), verbatim and
-    // under the catalog's own ids, for the versions those stage sets hold.
-    // `paths` gets only the paths those versions use — a unit's other
-    // versions are not on this tape — and a version's rows go in `path_id`
-    // order: the order the catalog first interned each path, which is walk
-    // order for a unit's first version; in a later version, paths new to the
-    // unit follow all earlier ones.
+    // The per-file rows: the catalog's own `paths` + `file_versions`,
+    // verbatim and under the catalog's own ids, for the versions those stage
+    // sets hold. `paths` gets only the paths this tape's rows name — the
+    // versions' `file_versions`, and the stagings' `stage_files`, whose
+    // members and hard-link targets the catalog interned too (the unit's
+    // root `.` among them) — never a unit's other versions'. A version's
+    // rows go in `path_id` order: the order the catalog first interned each
+    // path, which is walk order for a unit's first version; in a later
+    // version, paths new to the unit follow all earlier ones.
     let versions = format!("SELECT snapshot_id FROM stage_sets WHERE id IN ({})", ph());
     {
+        let sets = ph();
         let sql = format!(
             "SELECT p.id, p.unit_id, p.path FROM paths p
              WHERE p.id IN (SELECT fv.path_id FROM file_versions fv
-                             WHERE fv.snapshot_id IN ({versions}))
+                             WHERE fv.snapshot_id IN ({versions})
+                            UNION
+                            SELECT f.path_id FROM stage_files f
+                             WHERE f.stage_set_id IN ({sets})
+                            UNION
+                            SELECT f.link_path_id FROM stage_files f
+                             WHERE f.stage_set_id IN ({sets}) AND f.link_path_id IS NOT NULL)
              ORDER BY p.id"
         );
+        let ids = stage_set_ids
+            .iter()
+            .chain(stage_set_ids)
+            .chain(stage_set_ids);
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
+        let rows = stmt.query_map(params_from_iter(ids), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -835,7 +880,66 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
         }
     }
 
+    // Each staging's file table and id map (§1.4; ADR-0012 items 265, 276):
+    // the catalog's rows verbatim, in key order, streamed row by row (a
+    // million members is a million rows; nothing holds them).
+    for (table, columns) in [
+        (
+            "stage_files",
+            "stage_set_id, seq, kind, slice, path_id, size, sha256, start, \"end\", link_path_id",
+        ),
+        ("stage_ids", "stage_set_id, kind, id, name"),
+    ] {
+        let n = columns.split(", ").count();
+        let sql = format!(
+            "SELECT {columns} FROM {table} WHERE stage_set_id IN ({}) ORDER BY {}",
+            ph(),
+            if table == "stage_files" {
+                "stage_set_id, seq"
+            } else {
+                "stage_set_id, kind, id"
+            }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let marks = (1..=n)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut insert =
+            out.prepare(&format!("INSERT INTO {table} ({columns}) VALUES ({marks})"))?;
+        let mut rows = stmt.query(params_from_iter(stage_set_ids.iter()))?;
+        while let Some(row) = rows.next()? {
+            let values: Vec<rusqlite::types::Value> = (0..n)
+                .map(|i| row.get(i))
+                .collect::<rusqlite::Result<_>>()?;
+            insert.execute(params_from_iter(values))?;
+        }
+    }
+
     Ok(())
+}
+
+/// The stagings an open `catalog.db` holds a file table for, ascending.
+pub fn stage_sets_with_tables(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT stage_set_id FROM stage_files ORDER BY 1")?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
+/// The reader of the file tables in an open `catalog.db` (§1.4): the
+/// catalog's own, `db::stage_files::Query`, over the same columns, so
+/// `file_table(conn)?.rows(stage_set_id)?` gives one staging's rows in
+/// stream order without holding them.
+pub fn file_table(conn: &Connection) -> Result<crate::db::stage_files::Query<'_>> {
+    crate::db::stage_files::Query::new(conn)
+}
+
+/// `stage_set_id`'s id map in an open `catalog.db` (§1.4): every user and
+/// group id its stream carries, with the name the host gave it or none.
+pub fn id_map(conn: &Connection, stage_set_id: i64) -> Result<Vec<crate::idmap::IdRow>> {
+    crate::db::stage_ids::load(conn, stage_set_id)
 }
 
 #[cfg(test)]
