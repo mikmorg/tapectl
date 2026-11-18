@@ -80,8 +80,7 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile    # a host with one
 Interactive, in fourteen steps, each explained before it runs. Every step
 detects whether it is already done and says so; every tape-touching command
 is confirmed by name; `--from N` resumes and `--to N` stops. Before step 1,
-on every run, the script prints the effective settings and checks an existing
-home's `config.toml` for the two `[defaults]` keys this version renamed (§6).
+on every run, the script prints the effective settings.
 `--help` prints the step list and every option.
 
 **The profile is remembered.** The first run with `--profile` records the
@@ -260,17 +259,12 @@ same wherever the home is.
 ├── logs/                created by ensure_dirs; may stay empty
 ├── tmp/                 0700: a stage's dar slice template and a write's catalog.db, each removed once used (never under staging)
 ├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`stage clean` reclaims them)
-├── config.toml.pre-rename-<stamp>   only after the pre-step-1 check renamed old [defaults] keys (§6)
 └── config.toml.superseded-<stamp>   only after step 7 regenerated a config this version could not load
 ```
 
 The home's 0700 is what keeps it private: `tapectl.db`, each private key
 (`.age.key`) and each stage report are 0600 as well, while `config.toml` and
 the `.age.pub` files take the creating process's umask.
-
-A home made by an older tapectl has `receipts/` where `stage-reports/` is now;
-the first command run on that home renames it (if both already exist, both are
-left alone and new reports go to `stage-reports/`).
 
 Outside the home: the **staging directory** (`[staging] directory` in
 `config.toml`; ephemeral encrypted slices, re-creatable by `stage create`;
@@ -390,18 +384,6 @@ from a copy (§9), and you run `scripts/first-run.sh` again. On a host with a
 profile, run it with that `--profile`, as every run: the state directory that
 remembers the profile is yours, not the home's, so on a rebuilt machine nothing
 is recorded until the first run with `--profile` records it again.
-
-**Before step 1, the renamed `[defaults]` keys.** The copy requirement every
-unit starts from is `[defaults] min_copies` and `min_locations` (ADR-0012,
-2026-09-29 amendment). A home initialised by an older tapectl has them as
-`min_copies_for_tape_only` and `min_locations_for_tape_only`, which this
-version refuses by name. On every run, whatever `--from` says, the script
-looks for the old names in the home's `config.toml` (once the service user
-exists, or under `--no-service-user`), and when it finds them it offers to
-rename them in place. It keeps the original as
-`config.toml.pre-rename-<stamp>`. The meaning and values are unchanged. If
-you decline, every `tapectl` command refuses the config until you rename the
-two lines by hand.
 
 **Step 7 detects `tapectl.db` and does not run `init`.** It then probes whether
 *this* binary can load the existing `config.toml` (`config show` must succeed;
@@ -877,7 +859,17 @@ scripts/first-run.sh --profile contrib/hosts/<host>.profile --upgrade
 ```
 
 On a host installed without a profile, leave `--profile` out. `<old>` and `<new>`
-below are the two versions, such as `1.8.1` and `1.9.0`.
+below are the two versions, such as `2.0.0` and `2.0.1`.
+
+**Upgrades start from 2.0.0.** There is no upgrade from a release before 2.0.0
+(ADR-0012 item 258(c)): 2.0.0 reads and writes Layout 3 and one baseline schema
+only. `--upgrade` refuses an installed tapectl below 2.0.0 by name, and the way
+from 1.x is a fresh start: a new catalog, new keys, new units and new cartridges.
+A Layout 2 tape is read with 1.9.2 or with its own `RESTORE.sh`. The harness
+that proves this procedure on mhvtl, `scripts/upgrade-mhvtl.sh`, installs the
+previous release tag and upgrades it, so it needs a v2.x tag to start from: while
+the newest tag before HEAD is below `v2.0.0` it exits at once with a message
+saying so, and its first real run is the release after 2.0.0.
 
 **Before you start.**
 
@@ -893,8 +885,8 @@ below are the two versions, such as `1.8.1` and `1.9.0`.
 - **There is no downgrade past a migration.** An older binary refuses a catalog
   that is ahead of its migration list. The way back is the binary and the backup
   the upgrade keeps (step 13).
-- You can skip releases: a release contains the ones before it, and step 7 shows
-  the "Upgrading" notes of every release after yours.
+- You can skip releases within 2.x: a release contains the ones before it, and
+  step 7 shows the "Upgrading" notes of every release after yours.
 
 **The steps.** Each one checks what an earlier run already did and does not do
 it twice, so a run that stopped is resumed by running `--upgrade` again;
@@ -926,42 +918,11 @@ skipped, and what an older reader of the tapes refuses. After step 10, print the
 new `COVER.txt`, put the new `catalog.db.age` and `tapectl-<new>` on the media in
 each envelope ([Keys and recovery, "The Heir Kit"](keys-and-recovery.md#the-heir-kit)),
 and destroy the sheets they replace: an older kit's tapectl may refuse the tapes
-the new one writes (1.5.0's refuses every tape written by 1.6.0 or later).
-
-**From 1.8.1 to 1.9.0.** 1.9.0 is the CLI review's release (ADR-0012 items
-198-221; [its notes](releases/1.9.0.md)). It has no catalog migration (step 5
-reports the schema unchanged) and moves no byte on tape, so 1.8.1 and 1.9.0 read
-each other's tapes. What to know:
-
-- **Renamed commands and flags lose their old spelling.** An old spelling is
-  refused by name and exits 2 (`` `tapectl backend add` was renamed in 1.9.0:
-  use `tapectl drive add` ``), so a script or a cron line of your own that uses
-  one fails loudly rather than doing something else; the notes have the table.
-  The three commands every tape's File 1 prints are unchanged. The scripts in
-  the 1.9.0 checkout use the new spellings, and step 2 backs up with 1.8.1's
-  own (`db backup --to`).
-- **Step 6 re-renders `tapectl-op`** and installs the bash completion and the
-  man pages (§7).
-- **`config.toml` needs no edit.** `[[backends.lto]]` keeps its name, and the
-  `[[collections]]` tables stay. `POST_WARNING_BYTES` is a profile variable
-  now (§2), applied by step 8, which an upgrade does not run: look with
-  `tapectl-op config get post_warning_bytes`, and if the drive has none and
-  its profile measured one, set it with `tapectl-op config set
-  'backends.lto[NAME].post_warning_bytes' <value>`.
-- **The rollback is the binary alone**, since there is no migration: `sudo cp
-  -p /usr/local/bin/tapectl-1.8.1 /usr/local/bin/tapectl` puts 1.8.1 back over
-  the catalog as it is. The printed rollback below also works, and loses what
-  the catalog recorded after step 2.
-
-**From 1.8.1 or 1.9.0 to 1.9.1 or 1.9.2.** 1.9.1 is a patch (ADR-0012 items 222-234;
-[its notes](releases/1.9.1.md)): no catalog migration, no byte on tape moved, no
-spelling removed. From 1.8.1, everything above for 1.9.0 applies too; the rollback
-is still the binary alone. The scripts are unchanged, and `config.toml` needs no edit.
-1.9.2 changes only the SQLite built into the binary ([its notes](releases/1.9.2.md)).
+the new one writes.
 
 **Rolling back.** Step 13 prints the commands. With the timers stopped, import
 the backup from step 2 while the NEW binary is still installed, then put the
-kept binary back and check the catalog with it. The order matters: a 1.x binary
+kept binary back and check the catalog with it. The order matters: an older binary
 opens the catalog before every command, its `db import` included, and refuses a
 catalog a newer one has migrated, so the old binary's own `db import` would be
 refused. (This one's `db import` runs whatever state the catalog is in, §8a.) Whatever

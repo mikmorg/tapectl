@@ -46,10 +46,7 @@ CONTENDER_UNITS=()
 # room past its early warning (scripts/lto-profile.sh), and mhvtl has none to
 # measure: its media report no real capacity, which is why the gate gives its
 # drive capacity_override, and a made-up figure here would set the slice cap on
-# nothing. And scripts/upgrade-mhvtl.sh's phase P runs the previous release's
-# first-run.sh on a profile that sources this one: a release before 1.9.0 does
-# not know the name and refuses the profile. tests/first_run_profile.rs proves
-# the path that sets it.
+# nothing. tests/first_run_profile.rs proves the path that sets it.
 # Tape commands at raised priority (#432), as home2 runs them (these are also
 # first-run.sh's defaults). The re-entry scenario asserts them on the live write.
 TAPE_NICE=-10

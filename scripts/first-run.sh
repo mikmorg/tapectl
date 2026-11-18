@@ -956,56 +956,6 @@ if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
   if [ -z "$HOME_DIR" ] && as_svc test -e "$EFFECTIVE_HOME/tapectl.db" 2>/dev/null && [ "$FROM" -le 7 ]; then
     note "$EFFECTIVE_HOME is already initialised. This script will detect that in step 7 and not re-init."
   fi
-  # ADR-0012 item 197: a home outside ~/.tapectl is found through --home, the
-  # units' TAPECTL_HOME and the pointer, and tapectl ranks an account's own
-  # ~/.tapectl above the pointer. One left beside it would be what a plain
-  # `sudo -u USER -H tapectl` opens, silently: refuse until it is moved.
-  _own="$(svc_home)/.tapectl"
-  if [ -n "$TAPECTL_HOME_DIR" ] && [ "$_own" != "$EFFECTIVE_HOME" ] && as_svc test -e "$_own" 2>/dev/null; then
-    die "$_own exists, and the home is $EFFECTIVE_HOME (TAPECTL_HOME_DIR). tapectl finds an account's own ~/.tapectl before the pointer /etc/tapectl/home, so a plain \`${SUDO_PREFIX}tapectl <command>\` would open $_own, not $EFFECTIVE_HOME. Move it aside first (handoff (i) step 2 moves it to .tapectl-old), then run this again"
-  fi
-  unset _own
-  # Keys renamed since a home may have been initialised (ADR-0012, 2026-09-28
-  # amendment; issue #348): [defaults] min_copies_for_tape_only → min_copies and
-  # min_locations_for_tape_only → min_locations, same meaning. The new binary
-  # refuses the old names, and a re-entry at --from 12/13 never reaches step 7's
-  # config probe — so the fixup lives here, where every run passes.
-  CFG0="$EFFECTIVE_HOME/config.toml"
-  if as_svc test -f "$CFG0" 2>/dev/null \
-     && as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" 2>/dev/null; then
-    note "$CFG0 uses key names this tapectl renamed (same meaning):"
-    note "  min_copies_for_tape_only → min_copies,  min_locations_for_tape_only → min_locations"
-    if confirm "Rename them in place now (the old file is kept beside it)?"; then
-      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
-      run as_svc sed -i -E \
-        -e 's/^([[:space:]]*)min_copies_for_tape_only([[:space:]]*=)/\1min_copies\2/' \
-        -e 's/^([[:space:]]*)min_locations_for_tape_only([[:space:]]*=)/\1min_locations\2/' "$CFG0"
-      as_svc grep -qE '^[[:space:]]*min_(copies|locations)_for_tape_only[[:space:]]*=' "$CFG0" \
-        && die "the rename did not take — edit [defaults] in $CFG0 by hand"
-      ok "config keys renamed"
-    else
-      note "left as is — every tapectl command will refuse this config until the two keys are renamed"
-    fi
-  fi
-  # Issue #391 (ADR-0012, 2026-10-06 items 9 and 16): [[backends.lto]]
-  # usable_capacity_factor → fill_ceiling, same meaning (the share of a
-  # cartridge a write may fill). Renaming keeps the value the file has; deleting
-  # the line instead takes the ruled default, 0.97.
-  if as_svc test -f "$CFG0" 2>/dev/null \
-     && as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" 2>/dev/null; then
-    note "$CFG0 uses a key this tapectl renamed (same meaning): usable_capacity_factor → fill_ceiling"
-    note "  renaming keeps your value; to take the new default (0.97) delete the line instead"
-    if confirm "Rename it in place now, keeping its value (the old file is kept beside it)?"; then
-      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
-      run as_svc sed -i -E \
-        -e 's/^([[:space:]]*)usable_capacity_factor([[:space:]]*=)/\1fill_ceiling\2/' "$CFG0"
-      as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" \
-        && die "the rename did not take — edit [[backends.lto]] in $CFG0 by hand"
-      ok "config key renamed"
-    else
-      note "left as is — every tapectl command will refuse this config until the key is renamed or deleted"
-    fi
-  fi
 fi
 resolve_tapectl() {
   if [ -n "$TAPECTL" ]; then [ -x "$TAPECTL" ] || die "--tapectl $TAPECTL is not executable"; return; fi
@@ -1114,6 +1064,7 @@ UNIT_BDIR=""
 if [ -r "$UNIT_FILE" ]; then UNIT_BDIR="$(sed -n '/^Environment=TAPECTL_BACKUP_DIR=/{s///p;q;}' "$UNIT_FILE")"; fi
 if [ -z "$OLD_VER" ]; then
   [ "$INST_VER" != "$NEW_VER" ] || die "the installed tapectl is already $NEW_VER ($INST_LINE), and no upgrade to it is recorded here ($U_STATE): there is nothing to upgrade. Every build installed on a production host has a version of its own (ADR-0012, 2026-09-30)"
+  vercmp_ge "$INST_VER" 2.0.0 || die "the installed tapectl is $INST_VER: there is no upgrade from a release before 2.0.0 (ADR-0012 item 258(c)), because 2.0.0 reads and writes Layout 3 and one baseline schema only. The way is a fresh start: a new catalog, new keys, new units and new cartridges (docs/install.md §10)"
   vercmp_ge "$NEW_VER" "$INST_VER" || die "$TAG is older than the installed $INST_VER: there is no downgrade past a migration (docs/install.md §10, \"Rolling back\")"
   OLD_VER="$INST_VER"
   ustate_set old "$OLD_VER"
@@ -1167,10 +1118,7 @@ else
     U_BACKUP="$U_BDIR/tapectl-pre-$NEW_VER-$(date -u +%Y%m%dT%H%M%SZ).db"
     note "tapectl-pre-$NEW_VER.db is there already; this backup goes to $U_BACKUP"
   fi
-  # The OLD binary's own spelling (ADR-0012 OQ1): `db backup FILE` from 1.9.0,
-  # `db backup --to FILE` before it (1.9.0 refuses --to by name).
-  if vercmp_ge "$OLD_VER" 1.9.0; then U_BACKUP_ARGS=("$U_BACKUP"); else U_BACKUP_ARGS=(--to "$U_BACKUP"); fi
-  run tc db backup "${U_BACKUP_ARGS[@]}" || die "db backup with $OLD_VER failed (above); nothing has changed"
+  run tc db backup "$U_BACKUP" || die "db backup with $OLD_VER failed (above); nothing has changed"
   _facts="$(db_facts "$U_BACKUP")" || die "cannot read the backup $U_BACKUP just written"
   [ "${_facts#* }" = ok ] || die "the backup $U_BACKUP fails SQLite's integrity check: do not go on"
   ustate_set backup "$U_BACKUP"

@@ -1017,35 +1017,13 @@ fn tapectl_home_dir_is_the_home_every_command_opens() {
     assert!(out.contains(&format!("home: {}", other.display())), "{out}");
 }
 
-/// Item 197: tapectl ranks an account's own `~/.tapectl` above the pointer, so
-/// one left beside a `TAPECTL_HOME_DIR` would be what a plain
-/// `sudo -u tapectl -H tapectl` opens. The run refuses before step 1, naming
-/// it; with it moved aside, the same run goes ahead. A relative path is refused.
+/// Item 197: a relative `TAPECTL_HOME_DIR` is refused. (The refusal of a
+/// `~/.tapectl` left beside it was step 0's until 2.0.0 and is step 14's now:
+/// ADR-0012 item 258(c) removed the pre-step-1 check; install-systemd.sh keeps
+/// its own.)
 #[test]
-fn a_dot_tapectl_beside_tapectl_home_dir_is_refused() {
+fn a_relative_tapectl_home_dir_is_refused() {
     let rig = Rig::new();
-    let home = rig.p("srv/tapectl/home");
-    let profile = rig.profile(
-        "p.profile",
-        &format!("TAPECTL_HOME_DIR={}\n", home.display()),
-    );
-    let p = profile.to_str().unwrap();
-    std::fs::create_dir_all(rig.p("h/.tapectl")).unwrap();
-    let o = rig.run(&["--profile", p, "--to", "0"]);
-    let (out, err) = text(&o);
-    assert_eq!(o.status.code(), Some(1), "{out}\n{err}");
-    assert!(
-        err.contains(&format!(
-            "{} exists, and the home is {} (TAPECTL_HOME_DIR)",
-            rig.p("h/.tapectl").display(),
-            home.display()
-        )),
-        "{err}"
-    );
-
-    std::fs::rename(rig.p("h/.tapectl"), rig.p("h/.tapectl-old")).unwrap();
-    ok(&rig.run(&["--profile", p, "--to", "0"]));
-
     let rel = rig.profile("rel.profile", "TAPECTL_HOME_DIR=srv/home\n");
     let o = rig.run(&["--profile", rel.to_str().unwrap(), "--to", "0"]);
     let (out, err) = text(&o);
