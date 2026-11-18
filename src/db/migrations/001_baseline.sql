@@ -6,9 +6,11 @@
 -- column (in its old order), default, CHECK, foreign key, index and trigger
 -- is what a 1.9.2 catalog carries, with what Layout 3 adds as Stage 4 builds
 -- it (`volume-format-v3.md` Appendix A.2 and A.3): the file table
--- (`stage_files`) and the id map (`stage_ids`), and the `tar_*` columns and
--- `tar_create_reports` that D11 renames dar's to. Until T4.15 removes dar,
--- each `tar_*` column stands beside the `dar_*` one it replaces. The relic row
+-- (`stage_files`) and the id map (`stage_ids`), and the `tar_*` columns of
+-- `stage_sets` and `tar_create_reports` that D11 renames dar's to. Until
+-- T4.15 removes dar, each `tar_*` column stands beside the `dar_*` one it
+-- replaces. (`restores.tar_*` come with the task that ports
+-- `volume::restore_record`, whose test pins that table's columns.) The relic row
 -- `meta.schema_version` (written once by the first 1.x migration and never
 -- moved) is not written; `PRAGMA user_version`, which the migration runner
 -- keeps, is the schema's version.
@@ -807,16 +809,10 @@ CREATE TABLE restores (
     files_restored   INTEGER,
     -- JSON array, program first: ["dar", "-x", "/dest/.tapectl-restore-tmp/restore", ...].
     dar_argv         TEXT,
-    -- JSON array, program first, as `dar_argv` (D11: tar's, on Layout 3).
-    tar_argv         TEXT,
     dar_exit_code    INTEGER,
-    tar_exit_code    INTEGER,
     dar_stdout       TEXT,
-    tar_stdout       TEXT,
     dar_stderr       TEXT,
-    tar_stderr       TEXT,
     dar_version      TEXT,
-    tar_version      TEXT,
     tapectl_version  TEXT NOT NULL
 );
 
