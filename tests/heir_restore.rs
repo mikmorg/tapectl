@@ -4667,7 +4667,8 @@ fn a_start_on_the_later_tape_names_as_not_on_this_cartridge_only_the_slices_it_d
     assert_eq!(o.code, 1, "{}", o.all());
     let all = o.all();
     assert!(
-        o.stdout.contains("NOT ON THIS CARTRIDGE: slices 1-3 of 8 of unit"),
+        o.stdout
+            .contains("NOT ON THIS CARTRIDGE: slices 1-3 of 8 of unit"),
         "{all}"
     );
     assert!(!all.contains("slices 1-4 of 8"), "{all}");
