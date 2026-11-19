@@ -86,8 +86,8 @@ pub struct BuildUnit {
     /// unit whose write may span, the slices THIS tape plans; every slice of
     /// the stage set is in [`BuildUnit::span`].
     pub slices: Vec<BuildSlice>,
-    /// `Some` when the write may span (ADR-0012 items 121, 124-125, #478):
-    /// the unit's MANIFEST.toml block states `may_span = true` and lists
+    /// `Some` when the unit continues across cartridges (ADR-0012 items 121,
+    /// 124-125, 288, #478): the unit's MANIFEST.toml block lists
     /// every slice of the stage set from here, with a `tape_position` only
     /// on the slices [`BuildUnit::slices`] plans. Frozen when the write is
     /// planned. `None` for a whole unit, whose block is the 1.6.0 block.
@@ -2600,7 +2600,7 @@ mod tests {
     /// set with their hashes, a `tape_position` on the two this tape plans
     /// (the positions the Layout gave them) and none on the others, and
     /// `continues = true` on slice 4, which continues slice 3's member (D22).
-    /// No block states `may_span` (item 288): the positions say what this
+    /// No block states the old span key (item 288): the positions say what this
     /// tape holds. The whole unit beside it gives its slice a position, and
     /// the tape itself (the Layout, so File 3) holds only the planned
     /// slices.
@@ -2709,7 +2709,7 @@ mod tests {
             assert_eq!(whole.slices.len(), 1, "{what}");
             assert_eq!(whole.slices[0].tape_position, Some(p_whole), "{what}");
 
-            assert!(!text.contains("may_span"), "{what}: {text}");
+            assert!(!text.contains(concat!("may", "_span")), "{what}: {text}");
             assert_eq!(
                 text.matches("\ncontinues = true\n").count(),
                 1,

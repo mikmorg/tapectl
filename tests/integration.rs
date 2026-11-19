@@ -2149,31 +2149,17 @@ fn test_volume_write_refuses_over_capacity() {
     )
     .unwrap_err();
     let msg = format!("{err}");
+    // Item 289 (D20): a write is never refused for the staged sets not all
+    // fitting; with not one slice fitting under the volume's ceiling it has
+    // nothing to put on the tape, says so, and writes nothing.
     assert!(
-        msg.contains("capacity exceeded"),
-        "expected a capacity refusal, got: {msg}"
+        msg.contains("no staged slice fits within the fill ceiling")
+            && msg.contains("would put nothing on it"),
+        "expected the nothing-fits refusal, got: {msg}"
     );
-    // Pin the actual boundary: the refusal must name the ROW's figure
-    // (fill_ceiling is 1.0 here, so `available` equals
-    // capacity_bytes exactly), never config's "50M"/52,428,800 — that is
-    // the whole point of this test (issue #188 / ADR-0010 decision 3).
-    let expected_available = format!("over the {ROW_CAPACITY_BYTES} bytes this volume may be");
-    assert!(
-        msg.contains(&expected_available),
-        "expected the refusal to name the volume row's capacity ({expected_available}), got: {msg}"
-    );
-    // Issue #391: the refusal names the overage (9,961,472 on tape — the
-    // tenant envelope's backup is one block of it, volume-format-v2.md §1.3
-    // — + 0 reserve - 4,194,304) and the fill ceiling it was judged against.
-    assert!(
-        msg.contains("5767168 bytes (5.5 MiB) over"),
-        "the refusal must name by how much the layout is over, got: {msg}"
-    );
-    assert!(
-        msg.contains("the fill ceiling is 100% of this volume's 4.2 MB capacity")
-            && msg.contains("--fill-ceiling"),
-        "the refusal must name the ceiling, the capacity and the override, got: {msg}"
-    );
+    // The ROW's figure gated it: config's 50M would have taken the slice
+    // (this refusal is the "no refusal at all" failure mode's positive
+    // control, issue #188 / ADR-0010 decision 3).
     assert!(
         !msg.contains("52428800"),
         "refusal must never name config's capacity_override figure, got: {msg}"
@@ -2283,20 +2269,16 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
 
     let refused = write(&config);
     assert!(
-        refused.contains("capacity exceeded") && refused.contains("over the 9894000 bytes"),
-        "the default 97% ceiling must refuse a layout that fits only at 100%: {refused}"
-    );
-    assert!(
-        refused.contains("the fill ceiling is 97% of this volume's 10.2 MB capacity"),
-        "{refused}"
+        refused.contains("no staged slice fits within the fill ceiling"),
+        "the default 97% ceiling leaves no slice a place that fits only at 100%: {refused}"
     );
 
     // Positive control: the override lifts the ceiling for this write, and
     // the same write gets past the capacity gate.
     let past = write(&config.with_fill_ceiling(Some(1.0)));
     assert!(
-        !past.contains("capacity exceeded"),
-        "at a 100% ceiling the layout fits; no capacity refusal may remain: {past}"
+        !past.contains("no staged slice fits"),
+        "at a 100% ceiling the slice fits; no nothing-fits refusal may remain: {past}"
     );
 }
 

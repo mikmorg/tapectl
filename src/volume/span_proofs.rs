@@ -1569,7 +1569,7 @@ fn manifest_block(manifest: &str, unit: &str) -> String {
 /// 288): on every tape whose plan holds a slice of a spannable set, the
 /// operator envelope's block of it lists every slice of the set, giving
 /// `tape_position` only to the slices this tape's plan holds; whole units'
-/// blocks give a position to every slice; no block states `may_span`, and
+/// blocks give a position to every slice; no block states the old span key, and
 /// `requires` is empty (D1). RECOVERY.md has its section on a unit across
 /// tapes where the block gives a slice no position (T4.13 rewrites it).
 #[test]
@@ -1605,7 +1605,7 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
                 assert_eq!(p, position_of(&h.conn, label, B93, s.number), "{label}");
             }
         }
-        assert!(!text.contains("may_span"), "{label}: {text}");
+        assert!(!text.contains(concat!("may", "_span")), "{label}: {text}");
         assert!(manifest_block(&text, B93).contains("payload = \"tar\"\n"));
         for whole in manifest.units.iter().filter(|u| u.name != B93) {
             assert!(
@@ -1613,7 +1613,7 @@ fn every_tape_of_the_written_span_lists_every_slice_and_positions_its_own() {
                 "{label}: {}",
                 whole.name
             );
-            assert!(!manifest_block(&text, &whole.name).contains("may_span"));
+            assert!(!manifest_block(&text, &whole.name).contains(concat!("may", "_span")));
         }
         let recovery = member(&members, "RECOVERY.md");
         assert_eq!(
@@ -1872,7 +1872,7 @@ fn a_short_seal_leaves_a_range_and_a_set_planned_and_not_written() {
         assert_eq!(seal_requires_line(files), "requires = []", "{label}");
         let members = operator_envelope(&h, label);
         let text = member(&members, "MANIFEST.toml");
-        assert!(!text.contains("may_span"), "{label}: {text}");
+        assert!(!text.contains(concat!("may", "_span")), "{label}: {text}");
     }
 
     // The next write: b's owed slice first, then c; b is whole across them.

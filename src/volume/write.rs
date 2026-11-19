@@ -27490,6 +27490,94 @@ mod tests {
                 /// `b` of three slices, alone.
                 const B3: &[(&str, &[usize])] = &[("b", &[SLICE, SLICE, SLICE])];
 
+                // ── T5.1 Done when (ADR-0012 items 288, 289; D19, D20) ──
+
+                /// Done when 1: a unit interrupted by the test hook's early
+                /// warning has a `range` row and no `cut` row, and the next
+                /// write lays its owed slices first.
+                #[test]
+                fn dw_an_interrupted_unit_has_a_range_row_no_cut_row_and_its_owed_slices_come_first() {
+                    let f = fixture(A_B3_C, &["DW-1", "DW-2"]);
+                    let mut store = ArmedAt::new(10, warning);
+                    write(&f, "DW-1", &mut store, false)
+                        .0
+                        .expect("a short seal is a success");
+                    let rows = writes_of(&f, "DW-1");
+                    assert!(rows.contains(&("b".to_string(), "range".to_string())), "{rows:?}");
+                    assert!(rows.iter().all(|(_, s)| s != "cut"), "{rows:?}");
+                    let cut: i64 = f
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM writes WHERE status = 'cut'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(cut, 0);
+
+                    let mut next = MemStore::new(SBS);
+                    write(&f, "DW-2", &mut next, false)
+                        .0
+                        .expect("the next write continues it");
+                    assert!(
+                        position_of(&f, "DW-2", "b", 3) < position_of(&f, "DW-2", "c", 1),
+                        "the owed slice is laid before the queue"
+                    );
+                }
+
+                /// Done when 2: a batch queued to fill ends a full tape with one
+                /// unit across its end: exactly one `range` row, and it is the
+                /// unit last on the tape.
+                #[test]
+                fn dw_a_queue_filled_to_the_warning_ends_the_tape_with_one_unit_across_its_end() {
+                    let f = fixture(A_B3_C, &["DW-3"]);
+                    let mut store = ArmedAt::new(10, warning);
+                    write(&f, "DW-3", &mut store, false).0.expect("seals short");
+                    let rows = writes_of(&f, "DW-3");
+                    let ranges: Vec<_> = rows.iter().filter(|(_, s)| s == "range").collect();
+                    assert_eq!(ranges.len(), 1, "{rows:?}");
+                    assert_eq!(ranges[0].0, "b", "{rows:?}");
+                    assert!(
+                        position_of(&f, "DW-3", "a", 1) < position_of(&f, "DW-3", "b", 1),
+                        "the whole unit before the one across the end"
+                    );
+                }
+
+                /// Done when 3: on a drive without `post_warning_bytes` the tape
+                /// ends by its plan at the ceiling and the rest continues.
+                #[test]
+                fn dw_without_post_warning_bytes_the_tape_ends_at_the_ceiling_and_the_rest_continues() {
+                    let mut f = fixture(
+                        &[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])],
+                        &["DW-4", "DW-5"],
+                    );
+                    let fixed = wide_fixed(&f, "DW-4");
+                    budget(
+                        &mut f,
+                        "DW-4",
+                        fixed + 6 * WIDE_PADDED,
+                        fixed + 2 * WIDE_PADDED,
+                        false,
+                    );
+                    let mut store = MemStore::new(SBS);
+                    write(&f, "DW-4", &mut store, false)
+                        .0
+                        .expect("the plan ends at the ceiling and is written");
+                    let rows = writes_of(&f, "DW-4");
+                    assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
+                    assert_eq!(stage_set_status(&f, "b"), "staged");
+
+                    let mut next = MemStore::new(SBS);
+                    write(&f, "DW-5", &mut next, false)
+                        .0
+                        .expect("the rest continues on the next cartridge");
+                    assert!(
+                        writes_of(&f, "DW-5").iter().any(|(u, _)| u == "b"),
+                        "{:?}",
+                        writes_of(&f, "DW-5")
+                    );
+                }
+
                 /// [`write`], scoped to `only` as `volume rewrite` scopes it
                 /// (`volume_write_scoped`).
                 fn write_scoped(

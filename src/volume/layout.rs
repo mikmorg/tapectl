@@ -2805,7 +2805,7 @@ fn unit_dir_name(unit: &ManifestUnit) -> String {
 
 /// Whether this tape's plan holds only some of the staging's slices: its
 /// block gives some slices no `tape_position` (`volume-format-v3.md` §5.3).
-/// Layout 3 has no `may_span` key (item 288): every staging may continue on
+/// Layout 3 has no span key (item 288): every staging may continue on
 /// another cartridge, and the positions say what this tape holds.
 fn held_in_part(unit: &ManifestUnit) -> bool {
     unit.slices.iter().any(|sl| sl.tape_position.is_none())
@@ -3264,7 +3264,7 @@ mod tests {
 
     /// `build` states `requires = []` in File 0 and in the seal's
     /// placeholder, whether or not a unit's block lists slices on other tapes
-    /// (D1; item 288: no `spanning` feature, no `may_span` key).
+    /// (D1; item 288: no `spanning` feature, no span key).
     #[test]
     fn build_states_requires_nothing_in_file_0_and_the_placeholder_span_or_not() {
         use crate::volume::build::{

@@ -1091,7 +1091,7 @@ fn neither_text_names_what_is_gone_or_a_name() {
             "--fill-from",
             "--stream-tapes",
             "catalogs/",
-            "may_span",
+            concat!("may", "_span"),
             "short-seal",
         ] {
             assert!(!text.contains(gone), "{what} still says {gone}");

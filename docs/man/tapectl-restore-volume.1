@@ -21,7 +21,7 @@ Destination directory: each unit is restored into `DIR/<unit name>`, which must 
 \fB\-\-unit\fR \fI<NAME>\fR
 A unit to restore; repeat for several.
 
-Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out; so is a unit of which the tape holds only a range (a version held across cartridges), with the `restore unit` that reads it. A unit named that the tape does not hold whole is refused before the drive is opened
+Without it, every unit the volume holds a written slice of: a unit of which the tape holds only a range (the one a short seal ended inside, say) is read across cartridges. A unit named that the tape holds nothing of is refused before the drive is opened
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path).

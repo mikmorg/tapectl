@@ -58,9 +58,6 @@ tapectl archive-set create [OPTIONS] <NAME>
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   
     Not read yet: dirty detection compares path, size and mtime only.
-- `--allow-spanning <BOOL>` *(one of `true`, `false`)* — Units may span tapes by their slices (true/false)
-  
-    From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
 - `--copies-at <NAME=N>` — Copies at a location, NAME=N (repeatable)
   
     E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]".
@@ -106,9 +103,6 @@ tapectl archive-set edit [OPTIONS] <NAME>
 - `--dirty-on-metadata-change <BOOL>` *(one of `true`, `false`)* — A metadata change makes a unit dirty (true/false)
   
     Not read yet: dirty detection compares path, size and mtime only.
-- `--allow-spanning <BOOL>` *(one of `true`, `false`)* — Units may span tapes by their slices (true/false)
-  
-    From tapectl 1.7.0. Never set means "defer to [defaults]", which is off.
 - `--copies-at <NAME=N>` — Copies at a location, NAME=N (repeatable)
   
     E.g. --copies-at home=1 --copies-at offsite=1; each NAME must be a registered location. Replaces the set's whole map. A unit's dotfile [policy.copies_at] replaces it in turn; never set means "defer to [defaults]".

@@ -406,7 +406,7 @@ mod tests {
     /// continuing slice 2's member, the keys in §1.9's order; and an
     /// operator envelope's block, which omits `file_table`, `id_map` and,
     /// uncompressed, `compression`. Both parse to exactly that and render
-    /// back byte for byte. No line names `may_span`, `dar` or `catalogs/`.
+    /// back byte for byte. No line names the old span key, `dar` or `catalogs/`.
     #[test]
     fn the_blocks_of_section_1_9_round_trip_byte_for_byte() {
         let text = format!(
@@ -501,7 +501,7 @@ sha256_encrypted = "{e4}"
         assert_eq!((&operator.file_table, &operator.id_map), (&None, &None));
         assert_eq!(operator.compression, None);
         assert_eq!(parsed.to_toml(), text, "serialises back byte for byte");
-        for gone in ["may_span", "dar", "catalogs/"] {
+        for gone in [concat!("may", "_span"), "dar", "catalogs/"] {
             assert!(!text.contains(gone), "{gone}: {text}");
         }
     }

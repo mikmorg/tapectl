@@ -2063,16 +2063,16 @@ fn swap_cartridge(d: &MhvtlDevices, unload: &str, load: &str) {
 /// (planned after). Then, over the real tape:
 /// - `volume write` seals short and returns Ok (exit 0): the event names K,
 ///   `volumes.ended_after` is K, K is a slice of `sb-cut` before its last,
-///   the rows are completed/completed/cut/cut, and end of data is right
+///   the rows are completed/completed/range (sc-after has none), and end of data is right
 ///   after the seal at K+1, which states it;
 /// - `volume verify` (full) passes, reading the seal at K+1;
 /// - RESTORE.sh with the real `mt`, `dd`, `age` and `tar`: `--info`
 ///   says SEALED and where the tape ended, `--verify` passes with NOT ON
 ///   TAPE for the files after K, a whole unit restores byte for byte, and
-///   the cut unit is refused by name before any slice is read;
+///   the range unit restores what the tape holds and lists the rest;
 /// - tapectl restores the whole unit;
-/// - the cut units go whole onto a second cartridge with an ordinary
-///   `volume write`, which seals full, and `sb-cut` restores from it.
+/// - the owed slices of `sb-cut` and `sc-after` go onto a second cartridge
+///   with an ordinary `volume write`, which seals full (item 288).
 #[test]
 #[ignore]
 fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
@@ -2162,9 +2162,9 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
         [
             ("op-unit".to_string(), "completed".to_string()),
             ("sa-whole".to_string(), "completed".to_string()),
-            ("sb-cut".to_string(), "cut".to_string()),
-            ("sc-after".to_string(), "cut".to_string()),
-        ]
+            ("sb-cut".to_string(), "range".to_string()),
+        ],
+        "sc-after was planned after the warning and has no row (item 288)"
     );
 
     // The tape: the short seal at K+1, and nothing after it.
@@ -2290,7 +2290,9 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
     restore_to(&h, "sa-whole", label, &dest);
     assert!(diff_recursive(&src_whole, &dest));
 
-    // The cut units, whole, on a second cartridge.
+    // The owed slices of sb-cut and sc-after, on a second cartridge (item
+    // 288: every unit continues; nothing is rewritten whole). T5.1 could not
+    // run this on mhvtl: the coordinator checks this half on the tape.
     let (first, second) = cartridge_slots(&devs);
     swap_cartridge(&devs, &first, &second);
     let _ = Command::new("mt")
@@ -2322,31 +2324,13 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
             true,
         )
     })();
-    let dest = root.join("tapectl-sb-cut");
-    let restored = second_write.and_then(|()| {
-        fs::create_dir_all(&dest).unwrap();
-        volume::restore::restore_unit(
-            &h.conn,
-            &h.paths,
-            &h.config,
-            "sb-cut",
-            label2,
-            &dest.to_string_lossy(),
-            &tape_dev(),
-            BLOCK_SIZE,
-            None,
-            false,
-            &volume::restore::RestoreOptions::default(),
-        )
-    });
     // The first cartridge back in the drive, whatever happened.
     swap_cartridge(&devs, &second, &first);
-    restored.expect("the cut unit written whole to a second cartridge, and restored from it");
-    assert!(diff_recursive(&src_cut, &dest));
+    second_write.expect("the rest of the staged sets is written to a second cartridge");
     let on_second = write_statuses(&h.conn, label2);
-    for unit in ["sb-cut", "sc-after"] {
+    for (unit, status) in [("sb-cut", "range"), ("sc-after", "completed")] {
         assert!(
-            on_second.contains(&(unit.to_string(), "completed".to_string())),
+            on_second.contains(&(unit.to_string(), status.to_string())),
             "{unit} on {label2}: {on_second:?}"
         );
     }

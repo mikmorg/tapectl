@@ -8,7 +8,7 @@ tapectl\-collection\-plan \- Show how each collection\*(Aqs pending units pack i
 .SH DESCRIPTION
 Show how each collection\*(Aqs pending units pack into tapes
 .PP
-The units are packed in name order, each tape filled until the next unit does not fit (next\-fit): each batch is one tape\*(Aqs worth. A unit that allows spanning (`allow_spanning`) is not held to one tape: it goes last in its batch, and the plan names the unit that spans onto the next cartridge. It is refused when it is larger than the staging area, or, on a drive that does not declare `post_warning_bytes`, larger than the room under the fill ceiling.
+The units are packed in name order, each tape filled until the plan passes its bound (next\-fit): each batch is one tape\*(Aqs worth, and the unit that carries it past the bound is the batch\*(Aqs last, continued on the next cartridge. No unit is held to one tape; one larger than the staging area is refused. A run may take more than a batch lists: the batch is sized by estimate, and when its staged units pack smaller it stages the next units until the plan passes the bound.
 .PP
 The units already staged and still owed a copy are listed after the batches, with the command that writes them.
 .PP
