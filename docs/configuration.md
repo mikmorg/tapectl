@@ -85,7 +85,7 @@ config: INVALID
   |
 7 | slize_size = "5G"
   | ^^^^^^^^^^
-unknown field `slize_size`, expected one of `slice_size`, `compression`, `compression_level`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `allow_spanning`, `copies_at`
+unknown field `slize_size`, expected one of `slice_size`, `compression`, `compression_level`, `checksum_mode`, `encrypt`, `preserve_xattrs`, `preserve_acls`, `dirty_on_metadata_change`, `global_excludes`, `large_file_warn_threshold`, `min_copies`, `min_locations`, `warehouse_copies`, `verify_interval_days`, `copies_at`
 
   - unknown key: defaults.slize_size
   - ~/.tapectl/config.toml: defaults.compression: invalid compression "zip": accepted values are none, gzip, xz, zstd
@@ -288,7 +288,6 @@ These are the system-wide defaults. They form the bottom layer of
 | `copies_at` | table: location name = count | none | How many copies each unit should hold at each named location, its **copy targets** (from 1.7.1; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 148-160). A copy *at* a location is an eligible tape whose recorded location is that one, or a recorded warehouse deposit there; it is counted per Version, at the Version's least-covered slice, as every copy count is. Write it inline, `copies_at = { home-rack = 1, offsite = 1 }`, or as a `[defaults.copies_at]` table with one `name = count` line each. **The most specific layer that sets `copies_at` wins whole**: a unit's dotfile [`[policy.copies_at]`](#policy-yours-to-edit), else its archive set's `copies_at` (where `required_locations` counts as one copy at each name), else this one. Maps never merge, and an empty map is a setting that hides the layers below. The copy floor becomes the larger of `min_copies` and the map's sum, and a tape-only unit's target at each location is multiplied by [`tape_only_safety_multiplier`](#compaction), as its floor is. Each count is 0 or more (0 asks for none there), refused by name at load and by `config check`. Each name must be a registered location, but that is checked when a unit's policy is resolved, not at load: a name with no [`location add`](cli/location.md#tapectl-location-add) behind it makes every unit that takes this map unresolvable, so add the locations first. [`location rename`](cli/location.md#tapectl-location-rename) rewrites the names stored in the catalog and in unit dotfiles, but not this key: change it here too. Absent, no unit has a target unless its archive set or dotfile gives one. | `audit` (`copy_count`, `location_presence`), [`report needs`](cli/report.md#tapectl-report-needs), [`stage for-location`](cli/stage.md#tapectl-stage-for-location), `volume write --for-location`, `volume plan --policy-aware`, and every reader of the copy floor (the `min_copies` row) |
 | `verify_interval_days` | integer | `365` | The full-readback clock for every unit whose archive set gives none (#453): `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit's copies, or a volume, have had no passing full readback within this many days. At least 1, refused by name otherwise. An archive set's own `verify_interval_days` overrides it; a dotfile cannot set it. Absent from the file means 365 (1.2.0); `init` writes it. There is no way to switch the clock off; a very large number is the nearest thing. `config check` prints the value in force. | [`audit`](cli/audit.md#tapectl-audit) |
 | `warehouse_copies` | integer | `0` | How many warehouse deposits each unit should have in addition to its tape copies ([ADR-0006](adr/0006-storage-interface-first-class-stores.md)). `0` means none are expected, and `audit` says nothing about warehouses. | `audit` |
-| `allow_spanning` | bool | `false` | Whether a unit may span tapes (from tapectl 1.7.0; [ADR-0012](adr/0012-copies-are-identical-content-cartridges-are-known-by-serial.md) items 82-84): a unit that allows it may have its slices run across more than one tape. It is packed after the units that may not span (one larger than a tape starts right after the slices a span in progress still owes, and the whole units it displaces go after its tail on its last tape: 1.7.1, ADR-0012 item 147), and it is cut where the drive reports early warning, not where the plan ends, its remaining slices continuing on the next cartridge; its tapes then belong together, in order, to restore it. A drive needs its measured [`post_warning_bytes`](#backendslto) for this: without it, a spannable unit that would pass the fill ceiling is refused. A unit larger than one cartridge is refused unless it allows spanning, and the refusal names this key; one that allows it is still refused if the staging area cannot hold it whole. Off by default: every unit is written whole on one tape. An archive set's `allow_spanning`, then a dotfile's, overrides it, either way. `init` writes it. | `volume write`, `collection run`, `stage create` (from 1.7.0) |
 
 `unit mark-tape-only` checks the unit against the floors of a tape-only unit, which
 it is about to be: its copy floor (the larger of its resolved `min_copies` and its
@@ -429,7 +428,6 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | `verify_interval_days` | integer | `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit with copies has had no passing full `volume verify` within this many days. Overrides `[defaults] verify_interval_days` (365 days when that is absent). It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). It must be at least 1: `archive-set create`, `edit` and `sync` refuse a smaller value by name, and so do loading config.toml and `config check` (#422). A catalog row written with one before then keeps working; at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
 | `preserve_xattrs`, `preserve_acls` | bool | Override their `[defaults]` namesakes for this set's units, with the same effect. | `--preserve-xattrs`, `--preserve-acls` (each `true\|false`) |
 | `dirty_on_metadata_change` | bool | Stored and resolved, but read by nothing, as in `[defaults]`. `config check` names it when `true`. | `--dirty-on-metadata-change true\|false` |
-| `allow_spanning` | bool | Whether this set's units may span tapes, from tapectl 1.7.0 (see [`[defaults] allow_spanning`](#defaults)). Overrides `[defaults] allow_spanning`, and a unit's dotfile overrides it in turn. Left out, the set defers to `[defaults]`, which is off. | `--allow-spanning true\|false` |
 
 An `[[archive_sets]]` table does not accept `warehouse_copies`: the key is refused as
 unknown, and the config will not load. A set's `warehouse_copies` can be set only with
@@ -669,7 +667,6 @@ large_file_warn_threshold = "100G"
 min_copies = 2                      # every unit wants two copies...
 min_locations = 2                   # ...in two places (tape-only: copies x tape_only_safety_multiplier, places as set)
 warehouse_copies = 0
-allow_spanning = false              # every unit whole on one tape (spanning is 1.7.0's)
 
 [discovery]
 watch_roots = ["/media"]            # `unit discover` finds moved units here
@@ -869,7 +866,6 @@ takes effect straight away. It accepts exactly seven keys:
 | `compression_level` | integer | the archive set, then `[defaults]` |
 | `checksum_mode` | closed set, as in `[defaults]` | Read when a unit is registered from this dotfile (`unit discover`, `collection sync`), where it wins over the archive set and `[defaults]`. Changing it later does not change the registered unit's mode (see [above](#keys-that-are-accepted-but-do-less-than-their-name-says)). It is still validated every time the policy is resolved, so a bad value makes every command that resolves the unit's policy refuse it. |
 | `warehouse_copies` | integer | the archive set, then `[defaults]` |
-| `allow_spanning` | bool | the archive set, then `[defaults]`. From tapectl 1.7.0, `true` lets this unit span tapes (see [`[defaults] allow_spanning`](#defaults)), and `false` keeps it whole on one tape even when its archive set allows spanning. |
 | `copies_at` | table: location name = count | the archive set's map (its `required_locations` included), then `[defaults]`, **whole**. From tapectl 1.7.1, the unit's own copy targets per location (see [`[defaults] copies_at`](#defaults)): written as a `[policy.copies_at]` table with one `location = count` line each, or inline as `copies_at = { offsite = 2 }` under `[policy]`. A map that names only `offsite` drops a `home-rack` its archive set named, and an empty table means "no targets". Every name must be a registered location, or the unit's policy is unresolvable, naming the name. |
 
 `min_copies`, `required_locations` and `verify_interval_days` are **not** dotfile
@@ -886,7 +882,7 @@ warning: unit 'family/letters' dotfile cannot be read, so every command that res
    |
 12 | min_copies = 3
    | ^^^^^^^^^^
-unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `compression_level`, `slice_size`, `warehouse_copies`, `allow_spanning`, `copies_at`
+unknown field `min_copies`, expected one of `checksum_mode`, `compression`, `compression_level`, `slice_size`, `warehouse_copies`, `copies_at`
  (…/letters/.tapectl-unit.toml)
   hint: an unrecognised key under [policy] is refused by name; an ABSENT key is always fine and defers to the archive set or defaults
 ```
@@ -981,7 +977,6 @@ shows which layer can carry which field:
 | compression level | `compression_level` | `compression_level` | `compression_level` |
 | checksum mode (at registration) | `checksum_mode` | `checksum_mode` | `checksum_mode` |
 | warehouse deposits | `warehouse_copies` | `warehouse_copies` (CLI only) | `warehouse_copies` |
-| spanning tapes (from 1.7.0) | `allow_spanning` | `allow_spanning` | `allow_spanning` (off) |
 | encryption | — | `encrypt` (always on) | `encrypt` (always on) |
 | xattrs, ACLs | — | `preserve_xattrs`, `preserve_acls` | `preserve_xattrs`, `preserve_acls` |
 
@@ -1078,7 +1073,6 @@ Archive set: critical
   Preserve xattrs:  -
   Preserve ACLs:    -
   Dirty on metadata change: -
-  Allow spanning:   -
   Copies at:        -
   Units using:      1
   Created:          2026-09-29 08:33:13
