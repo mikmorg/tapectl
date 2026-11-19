@@ -16,9 +16,10 @@
 #   4  /srv/acache is given back to root:root (the 2026-09-13 run chowned the
 #      whole volume to tapectl); staging becomes /srv/acache/tapectl-staging
 #   5  the catalog-backup directory /srv/local_backup/tapectl
-#   6  packages: mtx (the lifecycle suite checks for it) and dar's build deps
-#   7  dar 2.7.21 built from source into /usr/local, libdar linked statically
-#      (so buster's dar 2.6.2 and its libdar are left exactly as they are)
+#   6  packages: mtx (the lifecycle suite checks for it) and GNU tar's build deps
+#   7  GNU tar 1.35 built from the upstream release into /usr/local with ACL
+#      support (so buster's tar 1.30 is left exactly as it is), and proved to
+#      write ACL entries by number (ADR-0012 items 274, 275; #563)
 #   8  a sudoers rule letting YOU run commands AS the service user without a
 #      password (and nothing else): first-run.sh drives every tapectl command
 #      through `sudo -u tapectl`, and the verify that follows a days-long write
@@ -49,11 +50,12 @@ STAGING=/srv/acache/tapectl-staging
 BACKUP=/srv/local_backup/tapectl
 VM=vm-desk1
 HOSTDEV_XML="$(cd "$(dirname "$0")" && pwd)/home2-lto6-hostdev.xml"
-DAR_VER=2.7.21
-# sha256 of dar-2.7.21.tar.gz as downloaded from SourceForge over HTTPS on
-# 2026-09-28 (trust on first use; the upstream .sig was not published there).
-DAR_SHA256=b13a6645bb4f4bf3f36185a1ff3bc87a4eb27be5ce6487c953d84f075b4727b9
-DAR_URL="https://sourceforge.net/projects/dar/files/dar/$DAR_VER/dar-$DAR_VER.tar.gz/download"
+TAR_VER=1.35
+# sha256 of tar-1.35.tar.xz from https://ftp.gnu.org/gnu/tar/ (the same value
+# the signature file's release carries; verified against the GNU keyring on
+# 2026-11-17, docs/research/2026-11-17-t02-gnu-tar-built-on-debian-10.md).
+TAR_SHA256=4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16
+TAR_URL="https://ftp.gnu.org/gnu/tar/tar-$TAR_VER.tar.xz"
 WORK="${XDG_CACHE_HOME:-$HOME/.cache}/tapectl"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tapectl"
 
@@ -164,35 +166,43 @@ if part "Create $BACKUP (tapectl, 0700)?"; then run sudo install -d -o "$SVC" -g
 
 # ------------------------------------------------------------------ 6
 hdr "6  Packages"
-PKGS=(mtx g++ make pkg-config zlib1g-dev libbz2-dev liblzo2-dev liblzma-dev libzstd-dev liblz4-dev librsync-dev libgcrypt20-dev libgpg-error-dev libargon2-dev)
+PKGS=(mtx build-essential libacl1-dev libattr1-dev xz-utils acl)
 MISSING=(); for p in "${PKGS[@]}"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep "ok installed" >/dev/null || MISSING+=("$p"); done
 if [ "${#MISSING[@]}" = 0 ]; then ok "all present"
 elif part "apt-get install ${MISSING[*]}?"; then run sudo apt-get install -y "${MISSING[@]}"; fi
 
 # ------------------------------------------------------------------ 7
-hdr "7  dar $DAR_VER in /usr/local (libdar static)"
-if [ -x /usr/local/bin/dar ] && /usr/local/bin/dar --version </dev/null 2>&1 | grep "dar version $DAR_VER" >/dev/null; then ok "/usr/local/bin/dar is $DAR_VER"
-elif part "Download, verify, build and install dar $DAR_VER (a few minutes)?"; then
+hdr "7  GNU tar $TAR_VER in /usr/local (ACL support)"
+# The version alone is not the proof (#563): a tar built without libacl prints
+# the same version and writes no ACL at all. So the check is a real ACL entry.
+tar_acl_proof() {
+  local dir out; dir="$(mktemp -d "$WORK/tar-proof.XXXXXX")"
+  ( cd "$dir" && : > f && setfacl -m u:1:r,g:2:r f ) || { rm -rf "$dir"; return 2; }
+  out="$( cd "$dir" && /usr/local/bin/tar --format=pax --numeric-owner --xattrs --acls --xattrs-exclude='system.posix_acl_*' -cf - f | tr -c '[:print:]\n' '\n' | grep -a '^user:' || true )"
+  rm -rf "$dir"
+  case "$out" in *"user:1:r--"*) return 0 ;; *) return 1 ;; esac
+}
+if [ -x /usr/local/bin/tar ] && /usr/local/bin/tar --version </dev/null 2>&1 | head -1 | grep "tar (GNU tar) $TAR_VER" >/dev/null; then ok "/usr/local/bin/tar is $TAR_VER"
+elif part "Download, verify, build and install GNU tar $TAR_VER (a few minutes)?"; then
   run mkdir -p "$WORK"
-  run curl -fsSL -o "$WORK/dar-$DAR_VER.tar.gz" "$DAR_URL"
+  run curl -fsSL -o "$WORK/tar-$TAR_VER.tar.xz" "$TAR_URL"
   if [ "$APPLY" = 1 ]; then
-    echo "$DAR_SHA256  $WORK/dar-$DAR_VER.tar.gz" | sha256sum -c - || die "checksum mismatch — not building"
+    echo "$TAR_SHA256  $WORK/tar-$TAR_VER.tar.xz" | sha256sum -c - || die "checksum mismatch — not building"
   fi
-  run rm -rf "$WORK/dar-$DAR_VER"
-  run tar -xzf "$WORK/dar-$DAR_VER.tar.gz" -C "$WORK"
-  # --disable-shared: dar carries its own libdar, so /usr/bin/dar (2.6.2) and
-  # its libdar are untouched and ld.so never mixes the two.
-  run bash -c "cd '$WORK/dar-$DAR_VER' && ./configure --prefix=/usr/local --disable-shared --enable-static \
-    --disable-python-binding --disable-dar-static --disable-upx --disable-libcurl-linking --disable-gpgme-linking"
-  run make -C "$WORK/dar-$DAR_VER" -j"$(nproc)"
-  run sudo make -C "$WORK/dar-$DAR_VER" install-strip
+  run rm -rf "$WORK/tar-$TAR_VER"
+  run tar -xJf "$WORK/tar-$TAR_VER.tar.xz" -C "$WORK"
+  # The two --with- switches make a missing libacl-dev fail configure rather
+  # than build a tar with no ACL support. /usr/local leaves /bin/tar (1.30)
+  # alone: the system keeps its own tar, tapectl's [tar] binary names this one.
+  run bash -c "cd '$WORK/tar-$TAR_VER' && FORCE_UNSAFE_CONFIGURE=1 ./configure --prefix=/usr/local --with-posix-acls --with-xattrs --with-selinux=no"
+  run make -C "$WORK/tar-$TAR_VER" -j"$(nproc)"
+  run sudo make -C "$WORK/tar-$TAR_VER" install
   if [ "$APPLY" = 1 ]; then
-    /usr/local/bin/dar --version </dev/null 2>&1 | grep "dar version $DAR_VER" >/dev/null || die "/usr/local/bin/dar is not $DAR_VER after install"
-    ldd /usr/local/bin/dar | grep libdar >/dev/null && die "/usr/local/bin/dar links a shared libdar — the static build did not take"
-    # every compression tapectl can ask dar for must be compiled in
-    NO="$(/usr/local/bin/dar -V </dev/null 2>&1 | grep -E 'compression \(.*: *NO' || true)"
-    [ -z "$NO" ] || die "dar $DAR_VER lacks: $NO"
-    ok "dar $DAR_VER installed: $(/usr/local/bin/dar -V </dev/null 2>&1 | grep -cE 'compression \(.*: *YES') compressions compiled in, libdar static"
+    /usr/local/bin/tar --version </dev/null 2>&1 | head -1 | grep "tar (GNU tar) $TAR_VER" >/dev/null || die "/usr/local/bin/tar is not $TAR_VER after install"
+    ldd /usr/local/bin/tar | grep libacl >/dev/null || die "/usr/local/bin/tar does not link libacl — it was built without ACL support"
+    /bin/tar --version </dev/null 2>&1 | head -1 | grep "tar (GNU tar) $TAR_VER" >/dev/null && die "/bin/tar changed: the system's tar must stay as it was"
+    tar_acl_proof || die "/usr/local/bin/tar $TAR_VER does not write ACL entries by number (or the proof could not run on $WORK's filesystem)"
+    ok "GNU tar $TAR_VER installed, linked to libacl, and it writes ACL entries by number; /bin/tar is untouched"
   fi
 fi
 

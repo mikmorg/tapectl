@@ -59,7 +59,7 @@ different time:
 ```mermaid
 flowchart LR
     D[("Source directory")] -->|"1 · snapshot create<br/>walk + file list"| S["Snapshot<br/>(catalog rows only)"]
-    S -->|"2 · stage create<br/>dar + encrypt + sha256"| SS["Stage set<br/>slices in the staging directory"]
+    S -->|"2 · stage create<br/>tar + cut + encrypt + sha256"| SS["Stage set<br/>slices in the staging directory"]
     SS -->|"3 · volume write<br/>plan, write, seal, confirm"| V["Sealed volume"]
     SS -->|"volume write again<br/>(another tape)"| V2["Second sealed volume"]
     V2 -.->|"each unit at its copy floor"| X["staging space released"]
@@ -68,7 +68,7 @@ flowchart LR
 | Phase | Command | What it does | Touches tape? |
 |---|---|---|---|
 | 1 | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) | Walks the unit's directory and records every file's path, size, and mtime in the catalog. Fast, metadata only. | No |
-| 2 | [`stage create`](cli/stage.md#tapectl-stage-create) | Checks the source still matches the snapshot, runs `dar` to cut it into slices, encrypts each slice with age, and records checksums. | No |
+| 2 | [`stage create`](cli/stage.md#tapectl-stage-create) | Checks the source still matches the snapshot, runs GNU tar over the exact file list, checks the stream as it passes, cuts it into slices at member boundaries, compresses each slice if the unit asks, encrypts each with age, and records checksums. | No |
 | 3 | [`volume write`](cli/volume.md#tapectl-volume-write) | Builds the complete layout of the tape, checks it fits, writes it, writes the seal marker, then reads the front index and seal marker back to confirm it (every file with `--full-confirm`; otherwise a later `volume verify` does that). | Yes |
 
 From the session (the other three units were snapshotted and staged the same
@@ -79,7 +79,7 @@ $ tapectl snapshot create family/letters
 snapshot created: family/letters v1 (2 files, 235 B)
 
 $ tapectl stage create family/letters
-staged: family/letters (1 slice, 1.1 KiB dar, 1.8 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
 
 $ tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 ...
@@ -337,17 +337,30 @@ also current. Neither a prompt nor `--yes` accepts it; only an explicit
 ### Stage set and slices
 
 A **stage set** is one snapshot turned into encrypted, checksummed files in the
-staging directory. `stage create` runs `dar` with its archive on standard
-output, and tapectl cuts the archive into **slices** of at most `slice_size`
-(default `1G`), each a dar slice exactly as dar itself would cut it. Each slice
-is encrypted with age, as it is cut, to the unit's tenant, the operator, and
-the escrow recipient, so only ciphertext is ever written to the staging
-directory. A slice is the unit of tape I/O: one slice becomes one file on tape.
+staging directory. `stage create` runs GNU tar on the host over tapectl's exact file
+list, which writes one pax stream, and tapectl reads that stream as it passes: it
+checks every member against the list, records each file's sha256, and cuts the stream
+into **slices** of at most `slice_size` (default `1G`). A slice always begins at a
+member's start, so it holds whole files; a file larger than `slice_size` gets a run
+of slices to itself, and the slices joined in order are the stream, byte for byte. Each
+slice is compressed on its own when the unit's `compression` asks for it (off by
+default; `gzip`, `xz` or `zstd`), then encrypted with age, as it is cut, to the unit's
+tenant, the operator, and the escrow recipient, so only ciphertext is ever written to
+the staging directory. A slice is the unit of tape I/O: one slice becomes one file on
+tape. A slice's size on tape follows the files in it, and that size is visible without
+a key (see "What is plaintext").
 
-For each slice, tapectl records the sha256 of the plaintext `dar` slice and of
-the encrypted file. The encrypted hash is later printed in plaintext on the tape
-(it reveals nothing about the content), so the tape's integrity can be checked
-with no key at all.
+tapectl refuses to stage with a tar below the **writer's floor**, GNU tar 1.35 built with
+ACL support, and refuses a stream that carries a name where a number belongs or has
+lost a file's ACL (`config check` prints which tar it would use). The unit's file
+table, one row for each member with its slice, offsets and sha256, is kept in the catalog
+and travels in each tenant's envelope, with an **id map**: every user and group id the
+stream carries, with the name the writing host gave it. A restore shows the map and
+never acts on it: files come back by number.
+
+For each slice, tapectl records the sha256 of the plain cut and of the encrypted
+file. The encrypted hash is later printed in plaintext on the tape (it reveals nothing
+about the content), so the tape's integrity can be checked with no key at all.
 
 ### Receipt
 
@@ -853,7 +866,7 @@ too.
 stateDiagram-v2
     [*] --> staging : stage create starts
     [*] --> cleaned : catalog rebuild from the tape
-    staging --> staged : dar, encryption and checksums complete
+    staging --> staged : tar, encryption and checksums complete
     staging --> failed : stage create stopped partway
     staged --> cleaned : a write brings its unit to its copy floor, or stage clean
     failed --> cleaned : stage clean
@@ -894,13 +907,13 @@ the operator's, a backup of each, and four slices.
 | File | Zone | On tape | What it holds |
 |---|---|---|---|
 | 0 | ID thunk | plaintext | Label, uuid, format version, where the front index and seal marker are, and a `[media]` block describing the cartridge. What `volume identify` prints. |
-| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `dar`, `tar`, `sha256sum` and a few more coreutils it lists. |
+| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `tar`, `sha256sum` and a few more coreutils it lists. |
 | 2 | `RESTORE.sh` | plaintext | A standalone recovery script that reads the front index and restores with the same standard tools. |
 | 3 | Front index | plaintext | The map: for every file, its position, type, byte size, and sha256 of its on-tape bytes. No names. |
-| 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (each unit's name, uuid and version, the `dar` version and command, and each slice's position, sizes and plaintext and encrypted sha256), `RECOVERY.md`, and the `dar` catalogs, which are where the archived file names are. |
-| next 2 | Operator envelope + backup | encrypted to operator + escrow | One `MANIFEST.toml` covering every tenant's units, `RECOVERY.md`, every unit's `dar` catalog, the write plan (`PLAN.toml`), and a `catalog.db` covering this write (used by `catalog rebuild`). The backup is a second copy. |
+| 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (each unit's name, uuid and version, the tar version and command, and each slice's position, sizes and plain and encrypted sha256), `RECOVERY.md`, each unit's file table (where the archived file names are) and id map, and the index of the archive. |
+| next 2 | Operator envelope + backup | encrypted to operator + escrow | One `MANIFEST.toml` covering every tenant's units, `RECOVERY.md`, the write plan (`PLAN.toml`), and a `catalog.db` covering this write, file tables and id maps included (used by `catalog rebuild`). The backup is a second copy. |
 | next, one per tenant | Tenant envelope backups | as the tenant envelope | A second copy of each tenant envelope, the same bytes, in the same order (since 1.1.0). Read only when the first copy is damaged or will not read. |
-| … M−1 | Data slices | encrypted to tenant + operator + escrow | The archived data itself, one `dar` slice per file, each unit's slices together. |
+| … M−1 | Data slices | encrypted to tenant + operator + escrow | The archived data itself, one slice per file (whole members of a unit's tar stream, compressed if the unit is), each unit's slices together. |
 | M | Seal marker | plaintext | "Everything before me is here": file count, seal time, the front index's hash, and a full copy of the front index. |
 
 The envelopes come before the slices on purpose. If a tape is damaged at the end
@@ -919,8 +932,10 @@ structure: positions, file types, on-tape sizes, and hashes of ciphertext.
 Anyone holding the tape can compute those anyway. All content metadata lives
 inside the encrypted envelopes.
 
-One thing is disclosed by design. Sizes are visible, and with one unit per
-slice the size of each slice approximates the size of that unit's content.
+One thing is disclosed by design. Sizes are visible, and a slice holds whole files,
+so a slice's size on tape follows the files in it: a file alone in its slice, or in a
+run of its own, shows its size. With one unit per slice the size of each slice
+approximates the size of that unit's content.
 
 ### The integrity chain
 
@@ -941,7 +956,7 @@ seal marker is visibly unsealed.
 A sealed volume promises two things and withholds a third:
 
 1. **Data.** Every unit on it can be restored by its tenant, with that tenant's
-   key and standard tools (`mt`, `dd`, `age`, `dar`, `tar`, `sha256sum` and the few more coreutils File 1 lists), with no
+   key and standard tools (`mt`, `dd`, `age`, `tar`, `sha256sum` and the few more coreutils File 1 lists), with no
    tapectl and no database. This is the heir path.
 2. **Catalog.** With the operator or escrow key,
    [`catalog rebuild --from-volume`](cli/catalog.md#tapectl-catalog-rebuild)
@@ -1005,7 +1020,7 @@ kit, and disaster recovery are covered in
 | Reclaimable | A version you released; it stops counting and compaction may drop it. | [Snapshot status](#snapshot-status) |
 | Seal marker | The last file on a tape, asserting everything before it is present. | [What is on a tape](#what-is-on-a-tape) |
 | Sealed | A volume whose write confirmed; immutable, never appended. | [Volume and cartridge](#volume-and-cartridge) |
-| Slice | One encrypted piece of a `dar` archive; one file on tape. | [Stage set and slices](#stage-set-and-slices) |
+| Slice | One encrypted piece of a unit's tar stream, holding whole files; one file on tape. | [Stage set and slices](#stage-set-and-slices) |
 | Snapshot | A recorded file list of a unit at one version. | [Snapshot and Version](#snapshot-and-version) |
 | Stage report | The text file per stage set in `stage-reports/`: slice sizes and hashes. Not a receipt. | [Receipt](#receipt) |
 | Stage set | A snapshot turned into encrypted slices on disk, ready to write. | [Stage set and slices](#stage-set-and-slices) |

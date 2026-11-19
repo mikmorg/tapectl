@@ -29,8 +29,10 @@ Not on x86_64, or no release binary? Build it (Rust from <https://rustup.rs>):
 cargo install --locked --git https://github.com/mikmorg/tapectl
 ```
 
-tapectl also needs `dar`, `sg3-utils` and, for reading a tape back without tapectl,
-`age`, `mt-st` and `tar`. You need not install them first: `tapectl setup` checks
+tapectl also needs GNU tar 1.35 or later built with ACL support (the writer's floor;
+Debian 13 and Ubuntu 24.04 and later ship one, and [install.md](install.md#the-writers-tar)
+says how to build one on an older host), `sg3-utils` and, for reading a tape back without
+tapectl, `age` and `mt-st`. You need not install them first: `tapectl setup` checks
 and prints the install line for what is missing.
 
 ## 2. Run `tapectl setup`
@@ -138,7 +140,7 @@ collection "photos": 2 created; 0 refused · 0 moved, 0 reactivated, 0 missing �
 8. Check: `tapectl config check`
 config: valid
 home: ~/.tapectl (~/.tapectl, the default: nothing named another home)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 …
   config check: ok
@@ -203,7 +205,7 @@ line; a fresh machine gets up to three:
 
 ```text
     sudo usermod -aG tape alice
-    sudo apt install dar sg3-utils age mt-st
+    sudo apt install sg3-utils age mt-st
     sudo loginctl enable-linger alice
 ```
 

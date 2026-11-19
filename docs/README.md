@@ -24,10 +24,10 @@ the repository, grouped by what you are trying to do.
 
 | Document | What it covers |
 |---|---|
-| [On-tape format v2](design/volume-format-v2.md) | The byte layout of a tape — normative. Includes what "self-describing" does and does not promise. |
+| [On-tape format v3](design/volume-format-v3.md) | The byte layout of a Layout 3 tape — normative: the tar stream and its checks, the cut, compression, the file table and id map, the front index, the seal and short seal, the heir's script. Includes what "self-describing" does and does not promise. |
 | [Write session](design/layout-session.md) | The state machine of a tape write: build → validate → plan → execute → seal → confirm. |
-| [v2 open questions](design/v2-open-questions.md) | The format v2 design questions and how each was resolved (§§1–11) — normative after the two above. |
-| [v2 implementation plan](design/v2-implementation-plan.md) | The T0–T11 build playbook the v2 write path was built from — last in the same order of authority. |
+| [Implementation plan for 2.0.0](design/v3-implementation-plan.md) | The staged build of Layout 3, its decisions D1 to D22 and the task behind each change. |
+| [On-tape format v2](design/volume-format-v2.md), [v2 open questions](design/v2-open-questions.md), [v2 implementation plan](design/v2-implementation-plan.md) | Layout 2, which tapectl 1.x wrote: history, kept to read a tape of that layout (with tapectl 1.9.2 or its own `RESTORE.sh`). |
 | [Threat model and boundaries](design/threat-model.md) | Who the adversary is and is not; integrity versus authenticity (the seal is not a signature); the st/SG boundary and the synchronous seal filemark; the power baseline; how the format grows; one cartridge, one recovery unit. |
 | [Architecture decisions](adr/) | ADR-0001 … ADR-0013: the rules and why (escrow, consent tiers, cartridge identity, generations, …). |
 | [Vocabulary](../CONTEXT.md) | The project's defined terms. |

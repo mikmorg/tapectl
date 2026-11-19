@@ -95,8 +95,8 @@ service user ([install.md §7](install.md#7-the-timers-and-the-operator-wrapper)
 The installer also gives both `tapectl` and `tapectl-op` bash completion, so a
 command typed through the wrapper completes as one typed as yourself.
 A restore destination
-must be writable by `tapectl`; restore itself needs no root (dar runs with
-`-O`), and restored files are owned by the service user.
+must be writable by `tapectl`; restore itself needs no root (tar extracts as the
+account that runs it), and restored files are owned by the service user.
 `first-run.sh --no-service-user` keeps a run-as-yourself layout for a
 single-user machine.
 
@@ -155,7 +155,7 @@ tapectl initialized at ~/.tapectl
   config:   ~/.tapectl/config.toml
   escrow:   age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
             (the SECRET was printed above — transcribe it now onto paper; ADR-0005)
-  dar:      dar (found at /usr/bin/dar)
+  tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
 next steps:
   a tenant, whose data is archived    tapectl tenant add <TENANT>
@@ -226,8 +226,8 @@ A minimal hand-written config looks like this (every key, its default and what
 it does are in [configuration.md](configuration.md)):
 
 ```toml
-[dar]
-binary = "/usr/bin/dar"    # Path to dar binary
+[tar]
+binary = "/usr/local/bin/tar"   # GNU tar 1.35 or later with ACL support; default "tar" on PATH
 
 [[backends.lto]]
 name = "lto-primary"
@@ -267,7 +267,7 @@ tapectl config check
 ```text
 config: valid
 home: ~/.tapectl (this account's ~/.tapectl)
-dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
+tar: tar (GNU tar) 1.35 at '/usr/bin/tar' (meets the writer's floor, GNU tar 1.35 with ACL support)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 note: no drive is configured, so every write refuses: add it with `tapectl drive add --name lto6 --device-tape /dev/tape/by-id/<drive>-nst`
@@ -400,7 +400,7 @@ tapectl status
 tapectl host check
 tapectl report dirty
 
-# 1. Snapshot (fast metadata walk) and stage (dar + encrypt) the units
+# 1. Snapshot (fast metadata walk) and stage (tar + encrypt) the units
 tapectl snapshot create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 
@@ -433,10 +433,10 @@ snapshot created: work/invoices-2024 v1 (2 files, 219 B)
 
 $ tapectl stage create family/letters photos/2019-italy photos/2020-garden work/invoices-2024
 ...
-staged: family/letters (1 slice, 1.1 KiB dar, 1.8 KiB encrypted)
-staged: photos/2019-italy (1 slice, 1.1 MiB dar, 1.1 MiB encrypted)
-staged: photos/2020-garden (1 slice, 587.3 KiB dar, 588.2 KiB encrypted)
-staged: work/invoices-2024 (1 slice, 1.1 KiB dar, 1.7 KiB encrypted)
+staged: family/letters (1 slice, 1.1 KiB stream, 1.8 KiB encrypted)
+staged: photos/2019-italy (1 slice, 1.1 MiB stream, 1.1 MiB encrypted)
+staged: photos/2020-garden (1 slice, 587.3 KiB stream, 588.2 KiB encrypted)
+staged: work/invoices-2024 (1 slice, 1.1 KiB stream, 1.7 KiB encrypted)
 
 $ tapectl volume plan
 volume write plan (2 copies: the copy floor of photos/2019-italy, the largest among the staged units; --copies plans another number):
@@ -537,8 +537,8 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 728.5 KiB, covering 2 sealed volumes
-  tapectl-1.9.1    the program that made this kit, …, sha256 … (named on the sheet)
-note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/v1.9.1/tapectl-1.9.1-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
+  tapectl-X.Y.Z    the program that made this kit, …, sha256 … (named on the sheet)
+note: this tapectl is not static; the sheet names the release's static build, https://github.com/mikmorg/tapectl/releases/download/vX.Y.Z/tapectl-X.Y.Z-x86_64-linux-musl. To put it in the kit, download it, check it against that release's SHA256SUMS, and run this again with --static-binary FILE
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -581,10 +581,10 @@ names `collection run`, with staged or under-copied units the one copy loop.
 
 ### Staging a source that is in use
 
-Staging reads each unit's files once, while dar archives them, and refuses the
-whole stage if any file changes during that read (ADR-0012, 2026-10-06 item 4:
-dar runs with `--retry-on-change 0`, so a file caught mid-change is never
-archived half-changed). A failed stage starts over (#409): there is no resuming
+Staging reads each unit's files once, while tar archives them, and refuses the
+whole stage if any file changes during that read: after tar exits, each file's
+device, inode, size, mtime and ctime must be what they were before it ran, whatever
+tar said, so a file caught mid-change is never archived half-changed. A failed stage starts over (#409): there is no resuming
 it. A unit can be up to one cartridge's budget (#395), so one stage can take many hours, and
 one file touched by anything in those hours costs the whole stage.
 
@@ -655,13 +655,13 @@ a unit whose folder is not in the snapshot (see
 
 What changes during the run, and what does not:
 
-- The walk, the content match, the source check, the sha256 pass, `dar -c -R` and the
-  check after dar all read the unit's folder in the snapshot. A file touched in the
+- The walk, the content match, the source check, the tar run and the checks
+  before and after it all read the unit's folder in the snapshot. A file touched in the
   living source after the snapshot was taken is not the stage's business.
 - Every path tapectl **records** stays the real one: `units.current_path`,
-  `snapshots.source_path`, the file lists, and the `-R` in the stage set's `dar_command`,
-  which MANIFEST.toml carries to tape. `dar_create_reports` keeps the command exactly as
-  dar ran it, so it shows the snapshot's path.
+  `snapshots.source_path`, the file lists, and the directory in the stage set's `tar_command`,
+  which MANIFEST.toml carries to tape. The tar create report keeps the command exactly as
+  tar ran it, so it shows the snapshot's path.
 - `release_command` needs `snapshot_command`; the key alone is refused. It runs when the
   run's staging is over, whether the staging worked or not, and **before any tape is
   touched**, so the snapshot is held for the staging and not for the hours of writing
@@ -759,8 +759,8 @@ tape: one rewind, then every file in a single forward pass ending on the seal
 marker) and `health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
 and seal checks) and `positioning` in place of the build and pre-write steps,
 and the log names each file as it is written. `stage create` has `check` (the source against
-the snapshot, by metadata), `archive` (dar, slicing, encryption and the source's hashing in one
-pass), `recheck` (every hashed file unchanged since), `catalog` and `finalize`.
+the snapshot, by metadata), `archive` (tar, the stream's checks and hashing, slicing, compression and encryption
+in one pass), `recheck` (every file unchanged since) and `finalize`.
 
 Every such command also writes a **session log**, whether or not anything
 was shown: `<home>/logs/<UTC start>-<command>-<label>-<pid>.log` (mode 0600,
@@ -963,7 +963,7 @@ plus the `[excludes] patterns` list in a unit's dotfile. Matching ignores case.
 A plain pattern such as `*.iso` matches a file's name, anywhere in the unit. A
 pattern ending in `/`, such as `.cache/` or `node_modules/`, drops everything
 inside every directory of that name, at any depth below the unit, from the
-snapshot and from the dar archive, so none of it reaches tape (the directory
+snapshot and from the archive, so none of it reaches tape (the directory
 itself is kept, empty). A collection's own `exclude` list, which decides which
 folders become units, ignores case too: a plain pattern there matches a
 candidate folder's name, and a `name/` pattern skips every candidate below a
@@ -1114,7 +1114,7 @@ it now with `tapectl key generate --escrow` or
 # Step 1: Snapshot (fast directory walk)
 tapectl snapshot create tv/breaking-bad/s01
 
-# Step 2: Stage (dar archive + encrypt — needs staging disk space)
+# Step 2: Stage (tar stream, cut + encrypt — needs staging disk space)
 tapectl stage create tv/breaking-bad/s01
 
 # Step 3: Write a copy to tape (a blank or erased cartridge): initialise it,
@@ -1126,16 +1126,19 @@ tapectl volume write L6-0002 --init --full-confirm --move-to offsite
 ```
 
 **Staging space.** `stage create` writes only a unit's encrypted slices to
-staging, never the plaintext archive: dar writes its archive to standard
-output, and tapectl cuts and encrypts it in memory. At its peak staging holds
-the unit's slices, about the unit's size. The source is read once: each file
-is hashed within 128 MiB of dar reading it, so the second read comes from the
-page cache (dar's own page-cache eviction is switched off while it archives, and
-tapectl drops the source's pages itself once both have read them, issue #441).
-`[staging] hash_threads` files are hashed at once (1 by default,
-never more than the cores) when they fit in that 128 MiB, as many small files do;
-more threads can speed a unit of many small files, and on a single spinning
-disk they may instead read slower.
+staging, never the plaintext stream: GNU tar writes its stream to standard output
+from tapectl's exact file list, and tapectl reads it as it passes, checks it, cuts it
+at member starts, compresses each slice if the unit asks and encrypts it in memory.
+At its peak staging holds the unit's slices, about the unit's stream size. The source
+is read once, by tar: each file's sha256 is taken from the stream as it passes, with no
+second read and no hashing threads.
+
+**The writer's tar.** `stage create` refuses to run with a tar below GNU tar 1.35 built
+with ACL support, and says what it found and what the floor is (`config check` says the
+same beforehand); see [install.md](install.md#the-writers-tar) for building one. It
+also refuses a stream that carries a user or group name where a number belongs, or that
+lost a file's ACL, naming the path and the rule. A socket is left out of every unit and
+reported at `snapshot create`, because tar writes none.
 
 **Several units at once.** `stage create` takes several unit names, and
 `--jobs N` (or `[staging] jobs` in `config.toml`) stages N of them at a time,
@@ -1160,8 +1163,8 @@ staged twice at once: a second `stage create` of a unit that is being staged
 right now is refused.
 
 Before reading anything, it compares the free space with the unit's size (plus
-dar's records). If free space is below that, the unit may or may not fit
-(compression, zero-filled and hard-linked files all make it smaller), so it
+tar's headers). If free space is below that, the unit may or may not fit
+(compression and hard-linked files make it smaller), so it
 asks. The question is an ADR-0008 Tier-2 one: a terminal gets
 `stage unit "…" — proceed? [y/N]`, `--yes` proceeds (the figures are still
 printed), and a run with no terminal and no `--yes` refuses. That includes
@@ -1347,8 +1350,8 @@ considered. `--force` releases the retained ones too, and is wider than the
 gate it overrides: it also drops staged data for sets never written to any
 tape.
 
-It also clears what a killed run left behind (#465, #474): the dar catalogue
-directory of a set that never finished staging, `<home>/tmp` entries whose newest
+It also clears what a killed run left behind (#465, #474): the partial slices
+of a set that never finished staging, `<home>/tmp` entries whose newest
 file is a day old, and `clone-*` and `compact-*` directories under staging that no
 staged set references and that have been quiet for an hour. They are counted as
 "leftovers of killed runs removed" (`--json`: `home_leftovers_reclaimed`).
@@ -1580,7 +1583,7 @@ tapectl restore file family/letters 1998-letter-to-mum.txt --from L8-0002 --to /
 # Dry run
 tapectl restore unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
 
-# A large unit whose slices are spooled: they wait on another disk
+# A repair from another copy keeps what it reads on another disk
 tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
   --scratch /mnt/big
 
@@ -1628,49 +1631,56 @@ tape order with how it ended, and the command fails when any unit did
 (`--fail-fast` stops at the first failure instead). `--dry-run` lists the set
 without opening the drive.
 
-**When a slice or a file comes back damaged (1.3.0).** Copies are written from
-one staging, so a slice damaged on one cartridge is read from another that holds
-it: tapectl asks for that cartridge by label and chip serial, resumes the slice
+**When a slice or a file comes back damaged.** Copies are written from one
+staging, so a slice damaged on one cartridge is read from another that holds it:
+tapectl asks for that cartridge by label and chip serial, resumes the slice
 where the first stopped, and keeps the second in the drive while it serves. With
-no terminal it refuses by name instead and lists the holders. Next, if files are
-still damaged or missing, they are restored from another copy of the same
-version that came from a different staging (a different stage set), reading only
-the slices that hold them, and each is checked against the sha256 recorded for
-the version. Last, what no copy can give is written as zeros (age authenticates
-every 64 KiB chunk, so a defect costs 64 KiB and the files in it, not the rest
-of the slice), and the restore exits non-zero naming the slice, its byte ranges
-and the files. Use `tapectl drive eject` at the prompt. Another version is never
-a source. `--json` carries `substitutions` and `filled`. RESTORE.sh, on the heir
-path, takes a damaged slice from a directory of slice files (`--slices-from`) or
-a second tape (`--swap-tapes`), fills listed files from another tape of the same
-unit and version (`--fill-from`), and checks every restored file against its
-recorded sha256; it cannot read around a damaged chunk, because it runs the
-`age` program.
+no terminal it refuses by name instead and lists the holders. tapectl reads
+around a bad 64 KiB age chunk and leaves out only the members that touch it (in a
+compressed slice nothing after the bad chunk decodes, so the members from the chunk to
+the slice's end are left out). A slice that no copy can give is left out the same
+way: **nothing is ever filled in with zeros**, the members in it are listed as
+damaged, and the rest is restored. Next, the damaged files are restored from another
+copy of the same version that came from a different staging (a different stage set),
+reading only the slices that hold them through that copy's file table, and each is
+checked against the sha256 recorded for it. A file no copy can give is named in
+`.tapectl-damaged-files.txt` in the restored directory, and the restore exits
+non-zero. Use `tapectl drive eject` at the prompt. Another version is never a
+source. `--json` carries `substitutions` and the damaged list. Every restored
+file is hashed on disk against the unit's file table after `tar` ends
+(`--no-file-check` skips that); that check, never `tar`'s exit status, decides what
+was restored. RESTORE.sh, on the heir path, has the same one repair: its
+`--paths-from LIST` takes the list a restore left and restores those paths from
+another tape of the same unit and version. It cannot read around a damaged chunk,
+because it runs the `age` program, so a slice with one is left out whole.
+
+**A unit across cartridges.** A restore may start on any tape that holds part of a
+unit: it takes the files that tape holds whole, and asks for the others in slice
+order, by label, sticker and chip serial. The answer "skip" (I do not have it), or
+nobody at the terminal, restores what this tape holds and lists the rest with the
+tapes that hold it. A later run into the same `--to` from another tape adds that
+tape's files and leaves alone those that already pass.
+
+**Owners.** `restore` prints the unit's id map (every user and group id the stream
+carries, with the name the writing host gave it) and `--json` carries it. Files
+come back by number; no owner is changed by name, and as a non-root user `tar`
+makes the files yours.
 
 Before it opens the drive, a restore checks everything it can without the
 tape, and refuses with nothing read
 ([troubleshooting](troubleshooting.md#restoring)):
 
-- **Space.** A unit whose isolated catalogue from `stage create` is still on
-  disk (under `~/.tapectl/catalogs/`) **streams**: each slice is decrypted
-  off the tape straight into dar, joined back into the one stream dar wrote and
-  fed to its standard input (since 1.7.2, #498), so it needs only about
-  the unit's size free in `--to`, and the drive keeps reading while dar
-  extracts. Otherwise — a stage set whose catalogue is not on disk (a catalog
-  rebuilt from a tape that carried none), or dar older than 2.7.9 —
-  the restore **spools**: every slice is decrypted to disk before dar
-  extracts them, in a `.tapectl-restore-tmp` directory inside `--to`, or
-  inside `--scratch DIR` when you name one, never in the system temp
-  directory; with both on one disk a unit then needs about twice its size
-  free. `--spool` makes a unit that could stream spool anyway (to get round
-  a streaming problem, or to rehearse what a rebuilt catalog will do), at
-  that larger size. `restore volume` checks the set as a whole: every
-  restored unit, plus the largest unit's spooled slices, since the units
-  run one after another. `restore file` needs the slices it reads plus the
-  one file. Pick a
-  `--to` with room: `/tmp`, used in these small examples, is often RAM or the
-  root filesystem. `--no-space-check` skips the check, for a compressed or
-  thin-provisioned filesystem that holds more than it reports free.
+- **Space.** A restore writes no slice to disk: each slice is decrypted
+  (and decompressed) in memory off the tape and its members are fed to `tar`,
+  so `--to` needs about the unit's size free (its "bytes of stream", compressed or
+  not) and the drive keeps reading while `tar` extracts. Only the repair of a
+  damaged file from another copy extracts first, into a scratch directory inside
+  `--to`, or inside `--scratch DIR` when you name one, never in the system temp
+  directory. `restore volume` checks the set as a whole: every restored unit.
+  `restore file` needs the slices it reads plus the one file. Pick a `--to` with
+  room: `/tmp`, used in these small examples, is often RAM or the root filesystem.
+  `--no-space-check` skips the check, for a compressed or thin-provisioned
+  filesystem that holds more than it reports free.
 - **The destination.** `restore unit` wants an empty or new `--to`
   (`restore volume`, an empty or new `DIR/<unit name>` for each unit), and
   `restore file` refuses when a file of the same name is already there.
@@ -1685,18 +1695,17 @@ tape, and refuses with nothing read
   opened.
 - **The file.** `restore file --file` must be a path the catalog recorded for
   that version, relative to the unit's root, as `catalog list` and
-  `catalog search` print it. A directory is refused: restore the unit. dar is
-  asked for that one entry, and with the unit's isolated catalogue on disk
-  only the slices that hold it, its directories and dar's own catalogue (the
-  last slice) are read off the tape; without it, every slice.
-- **A streamed restore that fails partway** — a slice that fails its
-  checksum, a read error — has already let dar extract what came before it
-  into `--to`. The error says so: empty `--to` (or restore again with
-  `--overwrite`) before you trust it. A spooled restore extracts nothing until
-  every slice has been read.
-- **A leftover scratch directory.** A restore that was killed, or lost power,
-  leaves its `.tapectl-restore-tmp` behind, and it may hold decrypted data. The
-  next restore refuses and names it; remove it by hand.
+  `catalog search` print it, escaped as a name is shown: a backslash typed `\\`,
+  a tab `\t`, a newline `\n`, and a byte that is not UTF-8 `\xHH`. A directory is
+  refused: restore the unit. Only the slices that hold that one file are read off
+  the tape, using the unit's file table.
+- **A restore that fails partway** — a slice that fails its checksum, a read
+  error — has already let `tar` extract what came before it into `--to`. The
+  error says so: empty `--to` (or restore again with `--overwrite`) before you
+  trust it.
+- **A leftover scratch directory.** A repair that was killed, or lost power,
+  leaves its scratch directory behind, and it may hold decrypted data. The next
+  restore refuses and names it; remove it by hand.
 
 ### Search the catalog
 
@@ -1719,10 +1728,13 @@ and a symlink's target length as bytes, so a figure noted then can read higher.
 For each version the catalog records every entry's path, kind (directory,
 regular file, symlink or special file), size, modified time, sha256 once
 staged, and a symlink's target; each path is stored once per unit, however
-many versions hold it. Permissions, owners, ACLs, extended attributes, device
-numbers and hard links are not in the catalog: dar's catalogue is their record,
-on the home disk under `catalogs/` and in every envelope on tape, and
-`dar -l` lists them.
+many versions hold it. Permissions, owners, ACLs, extended attributes and device
+numbers are not in the catalog: the tar stream on tape is their record, and
+`tar -tv` on a restored unit's stream lists them. The unit's file table, which
+the catalog keeps and every tenant envelope on tape carries, adds each member's
+slice and offsets and its sha256, and records a hard link as a link member
+naming the path archived first. A path whose name is not UTF-8 is shown escaped
+(`\xHH` for each such byte).
 
 `catalog locate` is the one to know: every copy of a unit, where it is, and
 whether it can be relied on.
@@ -2209,7 +2221,7 @@ its unit, and the time each cost. A failed stage restarts its unit from the
 beginning ([why](troubleshooting.md#why-a-failed-stage-starts-over); ADR-0012
 item 91), so this is the record to judge that cost by. It reads only what
 the catalog already keeps: when the attempt started, and the last moment it
-recorded (its phases, dar's report, its source check).
+recorded (its phases, tar's report, its source check).
 
 ```text
 $ tapectl report failed-stages
@@ -2349,7 +2361,7 @@ keys were copied), `size_bytes` (the copy it wrote) and `keys_bytes` (the key
 files it copied, 0 when none), `db stats` gains `journal_growth` (see
 [The journals are never pruned](#the-journals-are-never-pruned)),
 `archive-set sync` gains `unchanged`, `archive-set info`
-gains `warehouse_copies`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`
+gains `warehouse_copies`, `preserve_xattrs`, `preserve_acls`
 and `dirty_on_metadata_change`, `key import --reactivate` prints
 `alias`, `fingerprint` and `reactivated`, and `unit check-integrity` gains
 `version` (the version it compared against) and
@@ -3201,8 +3213,8 @@ tapectl)" item). Follow it there rather than a second copy here;
 two drifting checklists are a failure waiting to happen. The drill's
 essentials: load a real tape, pull `RESTORE.sh` off the plaintext front zone
 with `mt` + `dd`, and run it using **only** the tools the tape's own guide
-lists — `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate`, `tar`, `mkfifo`
-and `tee` — plus the shell tools any Linux system has, and no `tapectl`, against
+lists — `mt`, `dd`, `age`, `tar`, `sha256sum`, `head` and `tail`, and `gzip`,
+`xz` or `zstd` for a unit stored compressed — plus the shell tools any Linux system has, and no `tapectl`, against
 nothing but the printed key material.
 
 Nothing automated performs a drill; schedule it yourself, on real hardware.
@@ -3245,7 +3257,7 @@ saying how to put it in the kit. When the running tapectl is itself static, its
 copy is the static binary and there is no fifth file.
 
 ```bash
-tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-1.9.1-x86_64-linux-musl
+tapectl key escrow-kit ~/heir-kit --static-binary ~/Downloads/tapectl-X.Y.Z-x86_64-linux-musl
 ```
 
 **The command stops at the files. The rest is yours, and the kit is worth
@@ -3375,7 +3387,7 @@ error rather than a shortfall. Fix what it names, then run the command again:
 
 ```text
 $ tapectl snapshot mark-reclaimable tv/show/s01 --version 1 --force
-error: unit "tv/show/s01" has an invalid [policy] compression in /media/tv/show/s01/.tapectl-unit.toml (invalid compression "bogus": accepted values are none, gzip, bzip2, lzo, xz, lzma, zstd, lz4)
+error: unit "tv/show/s01" has an invalid [policy] compression in /media/tv/show/s01/.tapectl-unit.toml (invalid compression "bogus": accepted values are none, gzip, xz, zstd)
 ```
 
 A version that no current version supersedes is different. Marking it would
@@ -3436,7 +3448,7 @@ staging has room. It asks the quiet-host question once and reads the chip
 serial. After the read it re-reads every staged slice from the staging disk and
 matches its hash, checks what the write would refuse (keys, escrow, a staged set
 not whole), and builds the new volume's real layout from the staged slices (the
-envelopes with their catalogues, the cross-volume index, `catalog.db`, the
+envelopes with their file tables and id maps, the cross-volume index, `catalog.db`, the
 backups, block padding), holding its total, plus a margin and the end-of-tape
 reserve, to the cartridge's budget. A refusal at any of these changes nothing,
 with the figures named.
@@ -3832,7 +3844,7 @@ place. A repair names each row it deletes.
 The catalog keeps every reading it takes of a tape, a drive and a write:
 `health_logs`, `verification_sessions` and `verification_results`, `events`,
 `cartridge_contacts`, `mam_journal`, `log_page_journal`, `st_stats_journal`,
-`mtget_journal`, `phase_timings`, `restores` and `dar_create_reports` only grow. Nothing removes their rows by age or size, and nothing
+`mtget_journal`, `phase_timings`, `restores` and `tar_create_reports` only grow. Nothing removes their rows by age or size, and nothing
 that does is to be added (ADR-0012, 2026-10-07, item 28). They are evidence: a
 journal with rows missing looks complete and is not, and the earliest reading of
 a cartridge is the only baseline its later readings have. The session logs and
@@ -3922,16 +3934,16 @@ not a signature) are in
 
 ### If you hold a tenant key: restore directly, no catalog needed
 
-This is the heir path. It needs `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`,
-`truncate`, `tar`, `mkfifo` and `tee` — the list the tape's own guide gives — plus
-the ordinary shell tools any Linux system already has (`bash`, `awk`, `sed`, `tr`,
-`cut`, `grep`, `wc`, `mktemp`), which RESTORE.sh uses without checking for them.
-Notably, it does not need `tapectl`. The RESTORE.sh of a tape written by 1.2.0 or
-later checks, when a mode starts and before it reads the tape, only the tools that
-mode runs: `--info` and `--verify` need `mt`, `dd`, `sha256sum` and `head`;
-`--find-envelope` adds `age`, `truncate` and `tar`; `--list` adds `dar`;
-`--restore --path` adds `tee`; a whole-unit `--restore` needs `tee` and `mkfifo` too.
-An earlier tape's script checks every tool in every mode.
+This is the heir path. It needs `mt`, `dd`, `age`, `tar`, `sha256sum`, `head` and
+`tail` — the list the tape's own guide gives, plus `gzip`, `xz` or `zstd` for a unit
+stored compressed — and the ordinary shell tools any Linux system already has (`bash`,
+`awk`, `sed`, `tr`, `cut`, `grep`, `wc`, `mktemp`), which RESTORE.sh uses without
+checking for them. Notably, it does not need `tapectl`, and its `tar` need not be the
+writer's GNU tar 1.35. RESTORE.sh checks, when a mode starts and before it reads the
+tape, only the tools that mode runs: `--info` and `--verify` need `mt`, `dd`,
+`sha256sum` and `head`; `--find-envelope`, `--list`, `--where`, `--find` and a
+whole-unit `--restore` add `age` and `tar`; `--restore --path` and `--paths-from`
+add `tail`.
 
 1. Read the ID thunk (tape file 0), which says what the tape is and how to
    read the rest. With tapectl installed, `tapectl volume identify --device "$TAPE"`
@@ -3957,17 +3969,19 @@ An earlier tape's script checks every tool in every mode.
    ./RESTORE.sh --restore --unit UNIT --key your.age.key --to /dest
    ```
 
-   On tapes written by tapectl 1.1.0 and later a restore streams each slice
-   from the tape through age into dar, so `/dest` needs about the unit's size
-   free and must be empty (`--overwrite` finishes a restore that stopped part
-   way). `--all` restores every unit; `--list` shows a unit's files and
-   `--path` restores one, from the dar catalogue in the envelope. The script
-   checks space before it reads any slice. A 1.0.x tape's own script needs
-   about twice the unit's size, plus one slice. The decrypted envelopes go to a
-   work directory under `$TMPDIR` (default `/tmp`) on a 1.2.0 tape's script, which
-   warns when that looks too small; set `TMPDIR` to move it.
+   A restore reads one slice at a time, decrypts it (and decompresses it, for a
+   compressed unit) into a work directory inside `--to` and feeds its members to
+   `tar`, so `/dest` needs about the unit's size free plus about twice the largest
+   slice, and must be empty (`--overwrite` finishes a restore that stopped part
+   way). `--work DIR` puts the work directory on another disk. `--all` restores every
+   unit; `--list` shows a unit's files from its file table and `--path` restores one,
+   reading only the slices that hold it. The script checks space before it reads any
+   slice. A slice that is missing or fails a check is left out, never zero filled:
+   its files go on `.tapectl-damaged-files.txt`, the run ends `RESTORE INCOMPLETE`, and
+   `--paths-from` that list on another tape of the same unit and version restores them.
+   A unit that continues on another cartridge asks for the next one at a prompt.
 
-   On a 1.2.0 tape, a restore with no `--unit` or `--all` that finds one unit in
+   A restore with no `--unit` or `--all` that finds one unit in
    the first envelope your key opens restores it, and then says how many other
    envelopes the key opened and how many other units they list. An operator or
    escrow key opens every tenant's envelope, so `--list`, then `--all` into a
@@ -4006,7 +4020,7 @@ tapectl initialized at ~/.tapectl-rebuilt
   operator: mike
   ...
   escrow:   adopted age1eykxeg5equrmykz4a9xa98ak0qamfhgsy4qn5mlc4zr3m0w2kahqp3xx8a (imported — its secret lives on the heir kit, not here)
-  dar:      dar (found at /usr/bin/dar)
+  tar:      tar (GNU tar) 1.35 (found at /usr/bin/tar)
 
 next steps:
   ...
@@ -4092,7 +4106,7 @@ rebuilt from volume "L8-0002" (uuid 9c3e2533-2b67-4d1d-ae22-def47129577b), 3 env
   inserted: 2 tenants, 4 units, 4 snapshots, 4 stage sets,
             4 slices, 4 writes, 4 positions, 11 file rows, 1 volume
   cartridge "L8-0002" registered from this tape's own identity and bound
-  dar catalogues: 4 stage sets got theirs back from the operator envelope, so a copy written from them carries it again
+  file tables: 4 stage sets got theirs (and the id map) back from the operator envelope, so a copy written from them carries them again
   cross-volume index: this tape names 1 other volume this catalog has no row for. Nothing was added from it (a tape's claim about another tape needs that tape); load each and run `tapectl catalog rebuild --from-volume --key <key>`:
     L8-0001  (uuid 45ae9801-8301-457d-847c-0b70c09177e7; cartridge serial E01010L8_1775794348; LTO-8; sealed 2026-11-05T03:42:07Z)
       family: family/letters v1
