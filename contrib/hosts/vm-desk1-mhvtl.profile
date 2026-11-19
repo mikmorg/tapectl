@@ -1,6 +1,6 @@
 # contrib/hosts/vm-desk1-mhvtl.profile — a rehearsal of scripts/first-run.sh on
 # the dev VM against mhvtl, NEVER the real drive. It exercises the profile
-# mechanisms home2.profile uses (work dir, dar path, staging, several locations,
+# mechanisms home2.profile uses (work dir, tar path, staging, several locations,
 # tenants, an explicit contender list) but POST_WARNING_BYTES (see below), and a
 # collection, which home2.profile no longer sets, with a throwaway home.
 #
