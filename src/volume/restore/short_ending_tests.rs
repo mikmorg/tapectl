@@ -89,16 +89,22 @@ fn a_whole_unit_restores_from_a_short_tape() {
 }
 
 /// Item 288: the unit the early warning interrupted is a range on the tape
-/// (its first slice is there), and a unit planned after the warning has no
-/// row, so the tape names no data of it: refused by name before any slice is
-/// read, with the tape untouched.
+/// (its first slice is there) and is refused as a whole-unit restore, naming
+/// the slice no live volume holds (R7); a unit planned after the warning has
+/// no row, so the tape names no data of it: refused by name before any slice
+/// is read, with the tape untouched.
 #[test]
 fn the_unit_the_tape_ended_in_is_a_range_and_one_after_it_has_no_data_there() {
     let mut t = short_tape::short_tape();
-    // bravo: a range of one slice, selected like any other write.
-    let selection = select_write_positions(&t.conn, "bravo", LABEL, None).unwrap();
-    assert_eq!(selection.positions.len(), 1, "its first slice, at K");
-    assert_eq!(selection.positions[0].position, t.ended_after.to_string());
+    // bravo: a range of one slice; its version needs every slice, and slice
+    // 2 is on no live volume.
+    let err = select_write_positions(&t.conn, "bravo", LABEL, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unit \"bravo\" version 1 cannot be restored: slice 2 of it is on no live volume"),
+        "{err}"
+    );
 
     // charlie (nothing of it on the tape) has no data there.
     let err = select_write_positions(&t.conn, "charlie", LABEL, None)

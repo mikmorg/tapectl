@@ -4649,18 +4649,6 @@ pub(crate) mod tests {
             "a `completed` writes row must disqualify"
         );
 
-        // #420: a `cut` row is on a sealed tape that ended early; the volume
-        // holds bytes tapectl knows about, so it disqualifies too.
-        conn.execute(
-            "UPDATE writes SET status = 'cut' WHERE volume_id = ?1",
-            params![volume_id],
-        )
-        .unwrap();
-        assert!(
-            has_completed_write(&conn, volume_id).unwrap(),
-            "a `cut` writes row must disqualify"
-        );
-
         // #478 (ADR-0012 item 121): a `range` row is the run of a spannable
         // set's slices this tape holds. A volume holding only one holds bytes
         // tapectl knows about and is no write target.
@@ -4675,12 +4663,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// #420 (ADR-0012 item 112), on the shared short-tape fixture: a `cut`
-    /// row is never a copy. The unit whole on the short tape has its copy;
-    /// the two the early end cut have none, though one of them has a slice on
-    /// the tape; a volume holding only cut writes is still no write target.
+    /// #420 (ADR-0012 items 112, 288), on the shared short-tape fixture: a
+    /// range is never a copy on its own. The unit whole on the short tape has
+    /// its copy; the one the early end interrupted has none, though a slice
+    /// of it is on the tape; the one planned and not written has no row; a
+    /// volume holding only a range is still no write target.
     #[test]
-    fn a_cut_row_is_never_a_copy() {
+    fn a_range_row_is_never_a_copy_on_its_own() {
         use crate::volume::restore::short_tape;
         let t = short_tape::short_tape();
         let copies = |unit: &str| -> i64 {
@@ -4705,8 +4694,17 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(in_service_copy_of_version(&t.conn, bravo, 1).unwrap(), None);
         let sole = sole_slices(&t.conn, t.volume_id).unwrap();
-        assert_eq!(sole.len(), 2, "alpha's two slices: {sole:?}");
-        assert!(sole.iter().all(|s| s.unit_name == "alpha"), "{sole:?}");
+        assert_eq!(
+            sole.iter().filter(|s| s.unit_name == "alpha").count(),
+            2,
+            "alpha's two slices: {sole:?}"
+        );
+        assert_eq!(
+            sole.iter().filter(|s| s.unit_name == "bravo").count(),
+            1,
+            "the range's one slice is the only copy of it: {sole:?}"
+        );
+        assert_eq!(sole.len(), 3, "{sole:?}");
 
         let cut_only = short_tape::range_only_tape();
         assert!(has_completed_write(&cut_only.conn, cut_only.volume_id).unwrap());
