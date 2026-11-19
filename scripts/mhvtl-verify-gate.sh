@@ -2529,17 +2529,18 @@ check erase_then_init_no_force step_erase_then_init_no_force
 # ---------- heir_short_*: a tape the early warning ended, read by the heir (1.6.0; #420) ----------
 # ADR-0012 item 70: the gate is the heir path's only test with the real age, tar,
 # mt and sha256sum, and a tape may end before its plan (volume-format-v3.md): the drive's early
-# warning comes in data slice K, the write finishes it and seals short at K+1, and every unit with
-# a slice after K is cut. mhvtl's own early warning comes only near its 500 MB end, where it then
+# warning comes in data slice K, the write finishes it and seals short at K+1; the unit it
+# interrupts is held as a range (its slices up to K) and a unit planned after K gets no row (item 288). mhvtl's own early warning comes only near its 500 MB end, where it then
 # loses what is written (tests/mhvtl_e2e.rs proves that case), so the tape here is made
 # with the test hook TAPECTL_TEST_EARLY_WARNING_AT: from 30 MiB written, the write store answers as
 # st does past a warning (store::TapeStore::open), and everything written reads back. A throwaway
 # home, alice's three units in plan order: sa-whole (whole), sb-cut (40 MiB in 4 MiB slices, the
-# warning inside them: one file larger than a slice, so a run of slices) and sc-after (planned
-# after it, so cut too). Then the RESTORE.sh on that tape: --info and --verify say where it ended,
-# a whole unit restores byte for byte, and the cut units are NOT restored as whole units (T4.16,
-# Layout 3: the script restores what a tape holds whole, leaves the rest out and lists it; it never
-# fills a lost slice with zeros). The cut unit goes when T5.1 removes `cut`.
+# warning inside them: one file larger than a slice, so a run of slices; the unit the warning
+# interrupts, held as a range) and sc-after (planned after it: in the tape's plan and so named by
+# its MANIFEST, but with no `writes` row). Then the RESTORE.sh on that tape: --info and --verify
+# say where it ended, a whole unit restores byte for byte, and the other two are NOT restored as
+# whole units (T4.16, Layout 3: the script restores what a tape holds whole, leaves the rest out
+# and lists it; it never fills a lost slice with zeros). The names sb-cut and sc-after are kept.
 SS="$RUN/short-seal"
 SS_LABEL="SS-0001"
 SSC() { "$BIN" --home "$SS/home" "$@"; }
@@ -2584,11 +2585,16 @@ step_heir_short_seal() {
         || { echo "the write did not announce the test hook"; return 1; }
     grep -F "volume \"$SS_LABEL\" sealed short:" "$SS/write.out" >/dev/null \
         || { echo "the write did not say it sealed short"; return 1; }
-    grep -F "Cut (not on this tape, still staged): sb-cut, sc-after." "$SS/write.out" >/dev/null \
-        || { echo "the write did not name the cut units sb-cut and sc-after"; return 1; }
+    grep -F "Held here as a range, the rest of each still staged: sb-cut (slice" "$SS/write.out" >/dev/null \
+        || { echo "the write did not name sb-cut as held here as a range"; return 1; }
+    grep -F "Planned and not written (still staged): sc-after." "$SS/write.out" >/dev/null \
+        || { echo "the write did not name sc-after as planned and not written"; return 1; }
+    if grep -F "Cut (not on this tape" "$SS/write.out" >/dev/null; then
+        echo "the write still speaks of cut units (item 288)"; return 1
+    fi
     k="$(ss_ended_after)" || return 1
-    # The rows: sa-whole a copy, the other two cut, and K one of sb-cut's slices
-    # before its last (else the hook's figure no longer lands where this leg says).
+    # The rows: sa-whole a copy, sb-cut a range, sc-after none (item 288), and K one of sb-cut's
+    # slices before its last (else the hook's figure no longer lands where this leg says).
     python3 - "$SS/home/tapectl.db" "$SS_LABEL" "$k" <<'PY' || return 1
 import sqlite3, sys
 db, label, k = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -2597,7 +2603,12 @@ rows = dict(c.execute(
     "SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id "
     "JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id "
     "JOIN units u ON u.id = s.unit_id WHERE v.label = ?", (label,)).fetchall())
-assert rows == {"sa-whole": "completed", "sb-cut": "cut", "sc-after": "cut"}, rows
+assert rows == {"sa-whole": "completed", "sb-cut": "range"}, rows
+# sc-after: no writes row, and its stage set stays staged with sb-cut's (the next write takes them).
+st = dict(c.execute(
+    "SELECT u.name, ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id "
+    "JOIN units u ON u.id = s.unit_id").fetchall())
+assert st["sc-after"] == "staged" and st["sb-cut"] == "staged", st
 pos = [p for (p,) in c.execute(
     "SELECT CAST(wp.position AS INTEGER) FROM write_positions wp JOIN writes w ON w.id = wp.write_id "
     "JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id "
@@ -2665,7 +2676,7 @@ step_heir_short_restore() {
     ss_sh --restore --unit sa-whole --key "$SS/home/keys/alice-primary.age.key" --to "$d" \
         && diff -r "$SS/src/sa-whole" "$d"
 }
-# The cut units (until T5.1 removes `cut`): sb-cut has slices on the tape up to K, and a file
+# The two units the tape holds in part or not at all: sb-cut has slices on the tape up to K, and a file
 # larger than a slice that begins in them and ends past K; sc-after has none. tests/heir_restore.rs
 # a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds and
 # a_unit_with_no_slice_on_a_short_tape_is_said_so_by_every_mode_that_knows: what the tape holds
@@ -2856,8 +2867,9 @@ check heir_zstd_path       step_heir_zstd_path
 # work directory at a prompt, so the proofs that were about dar and scratch slices are about that.
 #
 #   span_rows              proof 1, home A (copy target 2): two copies over three tapes laid
-#                          out as item 93 says. Tape 1 holds sa-whole and sc-whole, then
-#                          sb-span (40 MiB, allow_spanning) until the warning: a range. Tape 2
+#                          out as item 93 says. Tape 1 holds sa-whole and sa-whole-2, then
+#                          sb-span (40 MiB; it sorts last, and the queue is in unit-name order, item 288)
+#                          until the warning: a range. Tape 2
 #                          begins with the owed run, the whole set: completed. Tape 3 holds the
 #                          owed run that is left: a range. Every slice is on two volumes.
 #   span_heir_tapes_1_3    proof 2: RESTORE.sh's restore from tapes 1 and 3: one prompt, for the
@@ -2887,9 +2899,10 @@ check heir_zstd_path       step_heir_zstd_path
 #   span_rebuild_tape_3    proof 7, home R: catalog rebuild of tape 3 alone records its range and
 #                          names the missing slices and their tapes; tape 1 then completes it.
 #   span_three_tapes       proof 8, home C (copy target 1, small cartridges, post_warning_bytes):
-#                          a unit larger than one tape starts first on tape 1 (item 147), the
-#                          whole units it displaces follow its tail on tape 3, even one that
-#                          1.7.0's late start put ahead of it, and it restores across both swaps.
+#                          a unit larger than one tape is planned in the queue's order (item 288):
+#                          pa-whole first, then pb-big until the warning on tape 1; pc-small, queued
+#                          after it, is not on tapes 1 and 2 and follows pb-big's owed tail on tape 3.
+#                          It restores across both swaps.
 SP="$RUN/span"
 SP_WAIT="${TAPECTL_GATE_SWAP_WAIT:-300}"
 SP_DRIVER="$(cd "$(dirname "$0")" && pwd)/mhvtl-prompt-driver.py"
@@ -3020,22 +3033,13 @@ sp_home() { # sp_home <ctl> <dir> <operator> <min_copies>
         && "$ctl" tenant add alice \
         || { echo "home $d: init, escrow, drive add, config set or tenant add failed"; return 1; }
 }
-# The ONE place the gate sets allow_spanning (still in the binary): the unit that may span has
-# `allow_spanning = true` in its dotfile's [policy], as an operator sets it.
-sp_allow_spanning() { # sp_allow_spanning <unit dir>
-    # T5.1 removes this: every unit continues on the next cartridge, and allow_spanning goes.
-    gate_unit_policy "$1" 'allow_spanning = true'
-}
-# unit init each source under <dir>/src for alice, the one that may span (sp_allow_spanning), then
-# snapshot and stage each.
-sp_units() { # sp_units <ctl> <dir> <unit that may span> <unit>...
-    local ctl="$1" d="$2" span="$3" u
-    shift 3
+# unit init each source under <dir>/src for alice, then snapshot and stage each. No unit opts in
+# to anything: every unit continues on the next cartridge (item 288).
+sp_units() { # sp_units <ctl> <dir> <unit>...
+    local ctl="$1" d="$2" u
+    shift 2
     for u in "$@"; do
         "$ctl" unit init "$d/src/$u" --tenant alice --name "$u" || { echo "unit init $u failed"; return 1; }
-        if [ "$u" = "$span" ]; then
-            sp_allow_spanning "$d/src/$u" || return 1
-        fi
     done
     for u in "$@"; do
         "$ctl" snapshot create "$u" && "$ctl" stage create "$u" || { echo "snapshot or stage of $u failed"; return 1; }
@@ -3138,13 +3142,13 @@ step_span_rows() {
     local db="$SP/a/home/tapectl.db" n k1 run t u
     sp_ready || return 1
     sp_home SPA "$SP/a" gate-span-a 2 || return 1
-    mkdir -p "$SP/a/src/sa-whole" "$SP/a/src/sb-span/deep" "$SP/a/src/sc-whole"
+    mkdir -p "$SP/a/src/sa-whole" "$SP/a/src/sb-span/deep" "$SP/a/src/sa-whole-2"
     echo "whole, before the span by name $CANARY" >"$SP/a/src/sa-whole/a.txt"
     head -c 700000 /dev/urandom >"$SP/a/src/sa-whole/a.bin"
     head -c 41943040 /dev/urandom >"$SP/a/src/sb-span/deep/forty-megs.bin"
     echo "a unit that may span" >"$SP/a/src/sb-span/note.txt"
-    echo "whole, after the span by name" >"$SP/a/src/sc-whole/c.txt"
-    sp_units SPA "$SP/a" sb-span sa-whole sb-span sc-whole || return 1
+    echo "whole, before the span by name too" >"$SP/a/src/sa-whole-2/c.txt"
+    sp_units SPA "$SP/a" sa-whole sb-span sa-whole-2 || return 1
     for t in SPA-0001 SPA-0002 SPA-0003; do sp_assign "$t" || return 1; done
 
     # Tape 1: the hook ends sb-span in a slice before its last: a range.
@@ -3158,7 +3162,7 @@ def q(sql, *a): return c.execute(sql, a).fetchall()
 rows = dict(q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
     JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0001'"""))
-assert rows == {"sa-whole": "completed", "sb-span": "range", "sc-whole": "completed"}, f"tape 1's rows: {rows}"
+assert rows == {"sa-whole": "completed", "sb-span": "range", "sa-whole-2": "completed"}, f"tape 1's rows: {rows}"
 k = q("SELECT ended_after FROM volumes WHERE label = 'SPA-0001'")[0][0]
 assert k is not None, "tape 1 sealed full: the hook did not end it"
 def pos(unit, written_only=False):
@@ -3170,13 +3174,9 @@ def pos(unit, written_only=False):
         ORDER BY sl.slice_number""", unit)]
 b = pos("sb-span")
 assert b and b[0] <= k < b[-1], f"K = {k} is not inside sb-span's slices {b} (the hook's figure no longer lands there)"
-assert pos("sa-whole")[-1] < pos("sc-whole")[0] < b[0], "whole units first, the unit that may span last (item 83)"
-spans = dict(q("""SELECT u.name, w.may_span FROM writes w JOIN volumes v ON v.id = w.volume_id
-    JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
-    JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0001'"""))
-assert spans == {"sa-whole": 0, "sb-span": 1, "sc-whole": 0}, f"writes.may_span (item 121): {spans}"
+assert pos("sa-whole")[-1] < pos("sa-whole-2")[0] < b[0], "the queue is in unit-name order, sb-span last, so the warning falls in it (item 288)"
 k1 = len(pos("sb-span", True))
-assert j["ending"] == "short" and j["ended_after"] == k and j["cut_units"] == [], j
+assert j["ending"] == "short" and j["ended_after"] == k and "cut_units" not in j, j
 assert j["range_units"] == [{"unit": "sb-span", "version": 1, "first_slice": 1, "last_slice": k1}], j["range_units"]
 assert j["keep_together"] == [] and j["deferred_units"] == [], j
 st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'")[0][0]
@@ -3199,13 +3199,13 @@ def q(sql, *a): return c.execute(sql, a).fetchall()
 rows = dict(q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
     JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0002'"""))
-assert rows == {"sa-whole": "completed", "sb-span": "completed", "sc-whole": "completed"}, f"tape 2's rows: {rows}"
+assert rows == {"sa-whole": "completed", "sb-span": "completed", "sa-whole-2": "completed"}, f"tape 2's rows: {rows}"
 assert q("SELECT ended_after FROM volumes WHERE label = 'SPA-0002'")[0][0] is None, "tape 2 sealed short"
 first = dict(q("""SELECT u.name, MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
     JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
     JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id WHERE v.label = 'SPA-0002' GROUP BY u.name"""))
-assert first["sb-span"] < min(first["sa-whole"], first["sc-whole"]), f"the owed run is not first (item 122): {first}"
+assert first["sb-span"] < min(first["sa-whole"], first["sa-whole-2"]), f"the owed run is not first (item 122): {first}"
 st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = 'sb-span'")[0][0]
 assert st == "current", f"sb-span is {st} with every slice on a sealed volume (item 128)"
 k1 = q("""SELECT MAX(sl.slice_number) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
@@ -3619,8 +3619,8 @@ step_span_retire_floors() {
     done
     # Tape 3 holds no whole unit: its refusal names sb-span alone, while tape 1's (the positive
     # control) names the whole units it holds too.
-    sp_has "$w/SPA-0001.out" "sa-whole" "sc-whole" || return 1
-    if grep -E 'sa-whole|sc-whole' "$w/SPA-0003.out" >/dev/null; then echo "tape 3's refusal names a whole unit it does not hold"; return 1; fi
+    sp_has "$w/SPA-0001.out" "sa-whole" "sa-whole-2" || return 1
+    if grep -E 'sa-whole|sa-whole-2' "$w/SPA-0003.out" >/dev/null; then echo "tape 3's refusal names a whole unit it does not hold"; return 1; fi
     echo "tape 2 retired at Tier 2 with --yes; tapes 1 and 3 refused at Tier 3, each for slices only it holds"
 }
 check span_retire_floors step_span_retire_floors
@@ -3631,7 +3631,7 @@ step_span_floor_target_1() {
     sp_home SPF "$SP/f" gate-span-f 1 || return 1
     mkdir -p "$SP/f/src/sf-span"
     head -c 41943040 /dev/urandom >"$SP/f/src/sf-span/forty-megs.bin"
-    sp_units SPF "$SP/f" sf-span sf-span && sp_assign SPF-0001 || return 1
+    sp_units SPF "$SP/f" sf-span && sp_assign SPF-0001 || return 1
     sp_new_volume SPF "$SP/f" SPF-0001 && sp_write SPF SPF-0001 "$SP/f/w1" "$SP_HOOK_AT" || return 1
     sp_hook_only_on "$SP/f/w1.err" -- || return 1
     # The state item 128 guards: at a copy target of 1 the range's slices were released from
@@ -3725,16 +3725,15 @@ check span_rebuild_tape_3 step_span_rebuild_tape_3
 
 # Home C's figures (MiB on tape: a 4 MiB slice takes nine 512 KiB blocks, 4.5 MiB; files 0-7
 # take one block each, 4 MiB). pb-big, 57 full slices and a short one, is 257 MiB, more than a
-# 94 MiB cartridge (98566144 bytes, its room 90 MiB past the fixed files): item 94's case. It
-# starts right after the owed runs, here none, so first on tape 1, and the whole units it
-# displaces are written after its tail on its last tape (item 147). pc-small (7 MiB) is the
-# discriminating one: 1.7.0 started pb-big as late as it could while touching the fewest tapes,
-# which left 3 x 90 - 257 = 13 MiB before it on tape 1, room for pc-small though not for
-# pa-whole (27.5 MiB); under item 147 both wait for tape 3. The hook at 114 MiB, 20 MiB past
-# the cartridge's end as a real drive's warning comes past nominal, ends tapes 1 and 2 after 25
-# slices each, so tape 3 holds the last 8 (32 MiB), then pa-whole and pc-small. Each tape needs
-# post_warning_bytes (item 123); 64M leaves a 4 MiB slice and the seal inside half of it (W8),
-# with a 4 MiB reserve.
+# 94 MiB cartridge (98566144 bytes, its room 90 MiB past the fixed files): item 94's case. The
+# queue is in unit-name order (item 288): pa-whole (27.5 MiB) first on tape 1, then pb-big, which
+# carries the plan past the cartridge's nominal capacity and so is planned to its end and is the
+# last set of the plan: pc-small (7 MiB) is not on tape 1. The hook at 114 MiB, 20 MiB past
+# the cartridge's end as a real drive's warning comes past nominal, ends tapes 1 and 2 inside
+# pb-big, a range each (tape 1 after fewer slices, pa-whole being ahead of it); tape 2 is the owed
+# run alone, and tape 3 holds the last of the slices, then pc-small, queued after the owed run.
+# Each tape needs post_warning_bytes (item 123); 64M leaves a 4 MiB slice and the seal inside half
+# of it (W8), with a 4 MiB reserve.
 SP_C_CAPACITY=98566144
 SP_C_HOOK_AT=119537664
 step_span_three_tapes() {
@@ -3749,7 +3748,7 @@ step_span_three_tapes() {
     head -c 25165824 /dev/urandom >"$SP/c/src/pa-whole/whole.bin"
     head -c 239075328 /dev/urandom >"$SP/c/src/pb-big/big.bin"
     head -c 6291456 /dev/urandom >"$SP/c/src/pc-small/small.bin"
-    sp_units SPC "$SP/c" pb-big pa-whole pc-small pb-big || return 1
+    sp_units SPC "$SP/c" pa-whole pc-small pb-big || return 1
     for t in SPC-0001 SPC-0002 SPC-0003; do
         sp_assign "$t" \
             && SPC cartridge register --barcode "${SP_TAG[${SP_SLOT[$t]}]}" --generation LTO-8 \
@@ -3775,9 +3774,6 @@ sizes = dict(q("""SELECT u.name, SUM((sl.encrypted_bytes + ? - 1) / ? * ?) FROM 
     JOIN units u ON u.id = s.unit_id GROUP BY u.name""", B, B, B))
 print(f"on tape: pb-big {sizes['pb-big']}, pa-whole {sizes['pa-whole']}, pc-small {sizes['pc-small']} bytes; cartridges {cap} bytes")
 assert sizes["pb-big"] > cap, "pb-big is not larger than one tape: this is not item 94's case"
-late = 3 * (cap - 8 * B) - sizes["pb-big"]
-assert sizes["pc-small"] <= late < sizes["pa-whole"], \
-    f"1.7.0's late start leaves {late} bytes before pb-big: pc-small must fit there and pa-whole must not, or the leg cannot tell item 147 from it"
 n = q("""SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
     JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'pb-big'""")[0][0]
 def rows(label):
@@ -3801,23 +3797,21 @@ for t, ending in (("SPC-0001", "short"), ("SPC-0002", "short"), ("SPC-0003", "fu
     runs.append((t, lo, hi))
     nxt = hi + 1
     if t != "SPC-0003":
-        assert rows(t) == {"pb-big": "range"}, f"{t}'s rows: {rows(t)}"
-        assert sorted(j["deferred_units"]) == ["pa-whole", "pc-small"], f"{t}: both whole units should wait for pb-big's last tape (item 147): {j['deferred_units']}"
+        want_rows = {"pa-whole": "completed", "pb-big": "range"} if t == "SPC-0001" else {"pb-big": "range"}
+        assert rows(t) == want_rows, f"{t}'s rows: {rows(t)}, want {want_rows}"
+        assert j["deferred_units"] == ["pc-small"], f"{t}: pc-small was queued after pb-big, so it is not on this tape and stays staged: {j['deferred_units']}"
 assert nxt == n + 1, f"the runs {runs} do not reach slice {n}"
-first_data = q("""SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
-    JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id WHERE v.label = 'SPC-0001'""")[0][0]
-assert written("SPC-0001", "pb-big")[0][1] == first_data, "pb-big does not start first on tape 1 (item 147)"
-assert rows("SPC-0003") == {"pb-big": "range", "pa-whole": "completed", "pc-small": "completed"}, f"tape 3's rows: {rows('SPC-0003')}"
+assert max(p for _, p in written("SPC-0001", "pa-whole")) < written("SPC-0001", "pb-big")[0][1], "pa-whole does not come before pb-big on tape 1 (name order, item 288)"
+assert rows("SPC-0003") == {"pb-big": "range", "pc-small": "completed"}, f"tape 3's rows: {rows('SPC-0003')}"
 tail_end = written("SPC-0003", "pb-big")[-1][1]
-for whole in ("pa-whole", "pc-small"):
-    whole_at = [p for _, p in written("SPC-0003", whole)]
-    assert whole_at and min(whole_at) > tail_end, f"{whole} at {whole_at} is not after pb-big's tail (ends {tail_end})"
+small_at = [p for _, p in written("SPC-0003", "pc-small")]
+assert small_at and min(small_at) > tail_end, f"pc-small at {small_at} is not after pb-big's tail (ends {tail_end})"
 want = [{"unit": "pb-big", "version": 1, "tapes": [
     {"label": t, "first_slice": lo, "last_slice": hi} for t, lo, hi in runs]}]
 assert J["SPC-0003"]["keep_together"] == want, J["SPC-0003"]["keep_together"]
 st = dict(q("SELECT u.name, s.status FROM snapshots s JOIN units u ON u.id = s.unit_id"))
 assert st == {"pb-big": "current", "pa-whole": "current", "pc-small": "current"}, f"snapshots {st}"
-print(f"pb-big over {runs} of {n}, starting first on tape 1; pa-whole and pc-small deferred twice, then after the tail on tape 3")
+print(f"pb-big over {runs} of {n}, after pa-whole on tape 1; pc-small deferred twice, then after the owed tail on tape 3")
 PY
     # The restore from tape 1, in the default mode, across both swaps.
     sp_load SPC-0001 && sp_restore_sh "$h" || return 1
