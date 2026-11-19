@@ -2843,7 +2843,7 @@ check heir_xz_path         step_heir_xz_path
 check heir_zstd_restore    step_heir_zstd_restore
 check heir_zstd_path       step_heir_zstd_path
 
-# ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478) ----------
+# ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478; Layout 3: T4.16) ----------
 # ADR-0012 item 136: the mhvtl proof of spanning is this one leg, judged by test name, with the
 # store's early-warning test hook (TAPECTL_TEST_EARLY_WARNING_AT, as heir_short_* uses it) on
 # the write of each tape that must end inside the unit, and on no other. Everything runs in
@@ -2851,24 +2851,37 @@ check heir_zstd_path       step_heir_zstd_path
 # from the library and erased before each volume init. A cartridge is changed as a person
 # changes it: `mtx` takes the one in the drive back to its slot and loads the next (sp_swap).
 # The prompts of a restore across tapes are answered by scripts/mhvtl-prompt-driver.py: on a
-# pipe for RESTORE.sh, which reads its answer from its input, and on a pseudo-terminal for
-# tapectl, which asks only on a terminal and refuses unattended (coordinator ruling X30; there
-# is no production hook for it).
+# pipe for RESTORE.sh, which reads its answer from its input (ENTER: loaded; "done" or the end of
+# the input: "I do not have it"; "quit"), and on a pseudo-terminal for tapectl, which asks only
+# on a terminal (coordinator ruling X30; there is no production hook for it).
+# Layout 3 (T4.16): RESTORE.sh feeds ONE tar run across the cartridges and keeps no slice in its
+# work directory at a prompt, so the proofs that were about dar and scratch slices are about that.
 #
 #   span_rows              proof 1, home A (copy target 2): two copies over three tapes laid
 #                          out as item 93 says. Tape 1 holds sa-whole and sc-whole, then
 #                          sb-span (40 MiB, allow_spanning) until the warning: a range. Tape 2
 #                          begins with the owed run, the whole set: completed. Tape 3 holds the
 #                          owed run that is left: a range. Every slice is on two volumes.
-#   span_heir_tapes_1_3    proof 2: RESTORE.sh's default mode from tapes 1 and 3: tape 1's range
-#                          kept in scratch, still encrypted, until tape 3 is taken by hash.
+#   span_heir_tapes_1_3    proof 2: RESTORE.sh's restore from tapes 1 and 3: one prompt, for the
+#                          first slice tape 1 lacks; the one tar run is waiting at it and holds no
+#                          slice in the work directory.
 #   span_heir_tape_2       proof 2: from tape 2 alone, which holds sb-span whole: no prompt.
-#   span_heir_stream_swap  proof 3: --stream-tapes from tapes 1 and 3, the drive empty for
-#                          TAPECTL_GATE_SWAP_WAIT seconds (default 300) at the swap. The one dar
+#   span_heir_stream_swap  proof 3: the same restore with the drive empty for
+#                          TAPECTL_GATE_SWAP_WAIT seconds (default 300) at the swap. The one tar
 #                          run is the same process when the prompt comes and when it is answered
-#                          (item 132's open fact: dar waits on its pipe across a cartridge change).
-#   span_restore_unit      proof 4: tapectl restore unit from tape 1: refused without a terminal,
-#                          and on one it asks for the whole copy, tape 2 (item 131).
+#                          (item 267: it waits on its input across a cartridge change).
+#   span_heir_start_later  proof 3b: a restore STARTED on tape 3, which holds only the later slices:
+#                          answered "done" at the prompt for slice 1, it restores the files its
+#                          tape holds whole and lists the rest with the tapes that hold them.
+#   span_heir_second_run   proof 3c: a second run into the same --to, started on tape 1 and given
+#                          tape 3 at its one prompt, completes the unit; what already passed is not
+#                          rewritten.
+#   span_heir_not_have     proof 3d: tape 1 alone, "done" (and the end of the input) at the prompt
+#                          for slice K1+1: the run ends, exit 1, the file tar had begun is removed
+#                          and listed, nothing is asked again; "quit" stops it by name.
+#   span_restore_unit      proof 4: tapectl restore unit from tape 1: with no terminal it takes what
+#                          its tape holds whole and lists the rest; on a terminal it asks for the
+#                          whole copy, tape 2 (item 131).
 #   span_retire_floors     proof 5: retiring tape 2 is Tier 2 (one copy left); then tapes 1 and 3
 #                          each hold the last copy of slices and are refused at Tier 3.
 #   span_floor_target_1    proof 6, home F (copy target 1): tape 1 of a span released its slices
@@ -2929,18 +2942,22 @@ sp_swap() { # sp_swap <slot|asked> [wait seconds]
     echo "sp_swap: the drive is not ready after slot $slot was loaded"
     return 1
 }
-# The slice files in a restore's scratch directory inside <dest>, when a prompt comes: each
-# name and its first 21 bytes ("age-encryption.org/v1" for an age file). Exported likewise.
-sp_scratch_note() { # sp_scratch_note <dest> <out>
-    local f
+# What a restore's work directory inside <dest> (.tapectl-work*, Layout 3's) holds when a prompt
+# comes: a first line WORKDIR with its count (the positive control: the directory is there), then
+# one line for each entry. Item 267: no slice, ciphertext or plain, waits there between cartridges.
+# Exported with sp_swap: the prompt driver runs it.
+sp_work_note() { # sp_work_note <dest> <out>
+    local d f n=0
     : >"$2" || return 1
-    for f in "$1"/.tapectl-restore.*/slice.*.enc; do
-        [ -e "$f" ] || continue
-        printf '%s %s\n' "$(basename "$f")" "$(head -c 21 "$f" | tr -c '[:print:]' '?')" >>"$2"
+    for d in "$1"/.tapectl-work*; do [ -d "$d" ] && n=$((n + 1)); done
+    echo "WORKDIR $n" >"$2"
+    for d in "$1"/.tapectl-work*; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*; do [ -e "$f" ] && echo "ENTRY $(basename "$f")" >>"$2"; done
     done
-    echo "sp_scratch_note: $(wc -l <"$2") slice file(s) in a scratch directory under $1"
+    echo "sp_work_note: $n work director(ies) under $1, $(($(wc -l <"$2") - 1)) entr(ies)"
 }
-export -f sp_swap sp_scratch_note
+export -f sp_swap sp_work_note
 
 sp_q() { gate_q "$@"; }
 # "first last count" of a unit's slices written on a volume, and a unit's slice count.
@@ -3005,15 +3022,21 @@ sp_home() { # sp_home <ctl> <dir> <operator> <min_copies>
         && "$ctl" tenant add alice \
         || { echo "home $d: init, escrow, drive add, config set or tenant add failed"; return 1; }
 }
-# unit init each source under <dir>/src for alice, the one that may span with `allow_spanning =
-# true` in its dotfile's [policy] (as an operator sets it), then snapshot and stage each.
+# The ONE place the gate sets allow_spanning (still in the binary): the unit that may span has
+# `allow_spanning = true` in its dotfile's [policy], as an operator sets it.
+sp_allow_spanning() { # sp_allow_spanning <unit dir>
+    # T5.1 removes this: every unit continues on the next cartridge, and allow_spanning goes.
+    gate_unit_policy "$1" 'allow_spanning = true'
+}
+# unit init each source under <dir>/src for alice, the one that may span (sp_allow_spanning), then
+# snapshot and stage each.
 sp_units() { # sp_units <ctl> <dir> <unit that may span> <unit>...
     local ctl="$1" d="$2" span="$3" u
     shift 3
     for u in "$@"; do
         "$ctl" unit init "$d/src/$u" --tenant alice --name "$u" || { echo "unit init $u failed"; return 1; }
         if [ "$u" = "$span" ]; then
-            printf '\n[policy]\nallow_spanning = true\n' >>"$d/src/$u/.tapectl-unit.toml" || return 1
+            sp_allow_spanning "$d/src/$u" || return 1
         fi
     done
     for u in "$@"; do
@@ -3062,12 +3085,14 @@ sp_hook_only_on() { # sp_hook_only_on <hooked err>... -- <unhooked err>...
     done
     echo "the hook was announced by the hooked writes and by no other"
 }
-# File 0's requires line of the tape in the drive (ADR-0012 item 124's normative spelling).
-sp_requires_spanning() { # sp_requires_spanning <label>
+# File 0's requires line of the tape in the drive: Layout 3 states `requires = []` on every tape, a
+# spanning one too (the short seal and a unit on another cartridge are part of the layout, item
+# 288; volume-format-v3.md 1.2). A tape that fenced an older reader would say so here.
+sp_requires_none() { # sp_requires_none <label>
     local line
     line="$(mt -f "$TAPE_DEV" rewind && dd if="$TAPE_DEV" bs=512k count=1 2>/dev/null | tr -d '\0' | grep -E '^requires = ')"
-    [ "$line" = 'requires = ["short-seal", "spanning"]' ] \
-        || { echo "$1: File 0 says '${line:-no requires line}', want requires = [\"short-seal\", \"spanning\"]"; return 1; }
+    [ "$line" = 'requires = []' ] \
+        || { echo "$1: File 0 says '${line:-no requires line}', want requires = []"; return 1; }
 }
 # RESTORE.sh (file 2) of the tape in the drive, into <dir>.
 sp_restore_sh() { # sp_restore_sh <dir>
@@ -3126,7 +3151,7 @@ step_span_rows() {
 
     # Tape 1: the hook ends sb-span in a slice before its last: a range.
     sp_new_volume SPA "$SP/a" SPA-0001 && sp_write SPA SPA-0001 "$SP/a/w1" "$SP_HOOK_AT" \
-        && sp_requires_spanning SPA-0001 || return 1
+        && sp_requires_none SPA-0001 || return 1
     python3 - "$db" "$SP/a/w1.json" <<'PY' || return 1
 import json, sqlite3, sys
 c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
@@ -3167,7 +3192,7 @@ PY
 
     # Tape 2: no hook. The owed run, all of sb-span, goes first: completed, and current.
     sp_new_volume SPA "$SP/a" SPA-0002 && sp_write SPA SPA-0002 "$SP/a/w2" \
-        && sp_requires_spanning SPA-0002 || return 1
+        && sp_requires_none SPA-0002 || return 1
     python3 - "$db" "$SP/a/w2.json" <<'PY' || return 1
 import json, sqlite3, sys
 c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
@@ -3199,7 +3224,7 @@ PY
 
     # Tape 3: no hook. The owed run that is left: a range, sealed full.
     sp_new_volume SPA "$SP/a" SPA-0003 && sp_write SPA SPA-0003 "$SP/a/w3" \
-        && sp_requires_spanning SPA-0003 || return 1
+        && sp_requires_none SPA-0003 || return 1
     sp_hook_only_on "$SP/a/w1.err" -- "$SP/a/w2.err" "$SP/a/w3.err" || return 1
     n="$(sp_slices "$db" sb-span)"
     run="$(sp_run_of "$db" SPA-0001 sb-span)"; k1="${run#* }"; k1="${k1%% *}"
@@ -3271,39 +3296,43 @@ step_span_heir_tapes_1_3() {
     local h="$SP/a/heir" dest="$SP/a/heir/from-1-3" key="$SP/a/home/keys/alice-primary.age.key" rc swap
     sp_ready && sp_a_figures || return 1
     sp_load SPA-0001 && sp_restore_sh "$h" || return 1
-    swap="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/prompt-scratch.txt" "${SP_SLOT[SPA-0003]}")"
+    swap="$(printf 'sp_work_note %q %q && sp_swap %q' "$dest" "$h/prompt-work.txt" "${SP_SLOT[SPA-0003]}")"
     (cd "$h" && sp_drive "$h/from-1-3.out" "$h/from-1-3.events" "$SP_PROMPT_HEIR" quit --swap "$swap" -- \
         env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
     rc=$?
     cat "$h/from-1-3.out"
     [ "$rc" -eq 0 ] || { echo "RESTORE.sh across tapes 1 and 3 exited $rc, want 0"; return 1; }
+    # tests/heir_restore.rs a_unit_on_three_tapes_restores_across_two_swaps_as_one_run_for_each_algorithm
+    # and the_prompt_names_the_tapes_the_index_names_and_says_where_to_look_when_it_names_none
     sp_has "$h/from-1-3.out" "RESTORE COMPLETE" \
-        "'sb-span' (version 1) is held across tapes: this tape holds slices 1 to $SP_A_K1 of $SP_A_N." \
-        "'sb-span' (version 1) needs slice $((SP_A_K1 + 1)) of $SP_A_N next" \
-        "No index this key opened names a tape that holds slice $((SP_A_K1 + 1))" \
-        "This cartridge identifies as: SPA-0003" \
-        "It gives slice(s) $((SP_A_K1 + 1)) to $SP_A_N of 'sb-span'" \
-        "Every slice of 'sb-span' is in the scratch directory" || return 1
+        "needs slice $((SP_A_K1 + 1)) of $SP_A_N next" \
+        "This cartridge identifies as: SPA-0003" || return 1
     diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore from tapes 1 and 3 differs from the source"; return 1; }
-    python3 - "$h/from-1-3.events" "$h/prompt-scratch.txt" "$SP_A_K1" <<'PY' || return 1
+    python3 - "$h/from-1-3.events" "$h/prompt-work.txt" "$SP_A_K1" <<'PY' || return 1
 import json, sys
 ev = [json.loads(l) for l in open(sys.argv[1])]
 prompts = [e for e in ev if "prompt" in e]
 assert len(prompts) == 1, f"{len(prompts)} prompts, want one cartridge change: {prompts}"
 p = prompts[0]
 assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
-# An absence; its positive control is span_heir_stream_swap, where the same reading finds the one dar run.
-assert p["dar_at_prompt"] == [], f"dar ran before every slice was in scratch: {p}"
 k1 = int(sys.argv[3])
 assert f"holds slice {k1 + 1} into" in p["line"], f"the prompt is {p['line']!r}, want slice {k1 + 1}"
-notes = [l.split(" ", 1) for l in open(sys.argv[2]).read().splitlines()]
-names = sorted((n for n, _ in notes), key=lambda n: int(n.split(".")[1]))
-assert names == [f"slice.{i}.enc" for i in range(1, k1 + 1)], f"scratch at the prompt: {names}, want slices 1-{k1}"
-bad = [n for n, head in notes if head != "age-encryption.org/v1"]
-assert not bad, f"not age ciphertext at rest in scratch: {bad}"
-print(f"one prompt; scratch held slices 1-{k1}, each still age ciphertext; no dar until all were there")
+# One tar run, begun before the prompt and waiting on its input across the swap (item 267). The
+# positive control for "a tar was running" is this very reading, which finds it: an absence would
+# prove nothing without it.
+assert len(p["tar_at_prompt"]) == 1, f"want the one tar run waiting when the prompt came: {p}"
+assert p["tar_at_reply"] == p["tar_at_prompt"], f"tar {p['tar_at_prompt']} at the prompt, {p['tar_at_reply']} when it was answered"
+# Item 267: nothing of a slice waits in the work directory at the prompt. The note's first line
+# says how many work directories it looked in (the positive control), then each entry.
+note = open(sys.argv[2]).read().splitlines()
+assert note and note[0] == "WORKDIR 1", f"the work directory was not there at the prompt: {note}"
+entries = [l.split(" ", 1)[1] for l in note[1:]]
+assert entries, "positive control: the work directory held nothing at all, so 'no slice in it' proves nothing"
+slices = [e for e in entries if e.startswith("slice.")]
+assert not slices, f"slice file(s) wait in the work directory at the prompt: {slices}"
+print(f"one prompt for slice {k1 + 1}; tar {p['tar_at_prompt'][0]} waited across the swap; the work directory held {len(entries)} entr(ies), no slice")
 PY
-    if compgen -G "$dest/.tapectl-restore.*" >/dev/null; then echo "the scratch directory was left in $dest"; return 1; fi
+    if compgen -G "$dest/.tapectl-work*" >/dev/null; then echo "the work directory was left in $dest"; return 1; fi
 }
 check span_heir_tapes_1_3 step_span_heir_tapes_1_3
 
@@ -3319,7 +3348,7 @@ step_span_heir_tape_2() {
     diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore from tape 2 differs from the source"; return 1; }
     # Tape 2 holds sb-span whole: none of a restore across tapes' lines. The positive control is
     # the restore from tapes 1 and 3, whose output holds each of them.
-    for needle in "$SP_PROMPT_HEIR" "is held across tapes" "needs slice" "scratch directory"; do
+    for needle in "$SP_PROMPT_HEIR" " needs slice " "This cartridge identifies as"; do
         grep -F -- "$needle" "$SP/a/heir/from-1-3.out" >/dev/null \
             || { echo "positive control: the restore from tapes 1 and 3 lacks '$needle', so its absence here proves nothing"; return 1; }
         grep -F -- "$needle" "$h/from-2.out" >/dev/null
@@ -3329,7 +3358,7 @@ step_span_heir_tape_2() {
             *) echo "grep failed on $h/from-2.out"; return 1 ;;
         esac
     done
-    echo "tape 2 alone restored sb-span whole: no prompt, no scratch"
+    echo "tape 2 alone restored sb-span whole: no prompt"
 }
 check span_heir_tape_2 step_span_heir_tape_2
 
@@ -3338,24 +3367,20 @@ step_span_heir_stream_swap() {
     sp_ready && sp_a_figures || return 1
     [ -x "$h/RESTORE.sh" ] || { echo "no RESTORE.sh from tape 1: span_heir_tapes_1_3 did not get that far"; return 1; }
     sp_load SPA-0001 || return 1
-    swap="$(printf 'sp_scratch_note %q %q && sp_swap %q %q' "$dest" "$h/stream-scratch.txt" "${SP_SLOT[SPA-0003]}" "$SP_WAIT")"
+    swap="$(printf 'sp_work_note %q %q && sp_swap %q %q' "$dest" "$h/stream-work.txt" "${SP_SLOT[SPA-0003]}" "$SP_WAIT")"
     (cd "$h" && sp_drive "$h/stream.out" "$h/stream.events" "$SP_PROMPT_HEIR" quit --swap "$swap" -- \
-        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest" --stream-tapes)
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
     rc=$?
     cat "$h/stream.out"
-    [ "$rc" -eq 0 ] || { echo "RESTORE.sh --stream-tapes across tapes 1 and 3 exited $rc, want 0"; return 1; }
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh across tapes 1 and 3, the drive empty at the swap, exited $rc, want 0"; return 1; }
+    # "the drive is empty; waiting" is sp_swap's own line, run by the prompt driver: the proof the
+    # drive really was empty while the prompt waited. The prompt "waits for as long as you take"
+    # and holds no device (tests/heir_restore.rs the_prompt_waits_without_a_time_limit_and_holds_no_device).
     sp_has "$h/stream.out" "RESTORE COMPLETE" \
-        "--stream-tapes: one dar run, fed from each tape in turn; no slice is kept on disk." \
+        "This waits for as long as you take." \
         "sp_swap: the drive is empty; waiting ${SP_WAIT}s" \
-        "This cartridge identifies as: SPA-0003" \
-        "It gives slice(s) $((SP_A_K1 + 1)) to $SP_A_N of 'sb-span'" || return 1
-    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the streamed restore differs from the source"; return 1; }
-    # The scratch note found tape 1's slices in the default mode's scratch (the positive control);
-    # here the same note must find none, and no scratch directory may have been made.
-    [ -s "$h/prompt-scratch.txt" ] \
-        || { echo "positive control: the default mode's scratch note is empty, so an empty one here proves nothing"; return 1; }
-    [ -f "$h/stream-scratch.txt" ] && [ ! -s "$h/stream-scratch.txt" ] \
-        || { echo "--stream-tapes kept slices on disk at the prompt:"; cat "$h/stream-scratch.txt"; return 1; }
+        "This cartridge identifies as: SPA-0003" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the restore across the long swap differs from the source"; return 1; }
     python3 - "$h/stream.events" "$SP_WAIT" <<'PY' || return 1
 import json, sys
 ev = [json.loads(l) for l in open(sys.argv[1])]
@@ -3364,32 +3389,184 @@ prompts = [e for e in ev if "prompt" in e]
 assert len(prompts) == 1, f"{len(prompts)} prompts, want one cartridge change: {prompts}"
 p = prompts[0]
 assert p["swap_rc"] == 0 and p["reply"] == "", f"the swap failed: {p}"
-assert len(p["dar_at_prompt"]) == 1, f"want the one dar run waiting when the prompt came: {p}"
-assert p["dar_at_reply"] == p["dar_at_prompt"], (
-    f"dar {p['dar_at_prompt']} at the prompt, {p['dar_at_reply']} when it was answered: "
-    "the dar run did not wait across the swap (item 132)")
+assert len(p["tar_at_prompt"]) == 1, f"want the one tar run waiting when the prompt came: {p}"
+assert p["tar_at_reply"] == p["tar_at_prompt"], (
+    f"tar {p['tar_at_prompt']} at the prompt, {p['tar_at_reply']} when it was answered: "
+    "the tar run did not wait across the swap (item 267)")
 waited = p["t_reply"] - p["t_prompt"]
 assert waited >= wait, f"the swap took {waited:.0f}s, less than the {wait}s wait"
-print(f"dar {p['dar_at_prompt'][0]} waited on its pipe across the swap, {waited:.0f}s with the drive empty for {wait}s of it")
+print(f"tar {p['tar_at_prompt'][0]} waited on its input across the swap, {waited:.0f}s with the drive empty for {wait}s of it")
 PY
 }
 check span_heir_stream_swap step_span_heir_stream_swap
+
+# Whatever a restore into <dest> left, judged against the source tree: every regular file that is
+# there is the source's, byte for byte; every regular file of the source is there or on the damaged-
+# file list (never both, never neither); and each <listed> is on the list. No work directory is left.
+# tests/heir_restore.rs a_start_on_the_second_tape_alone_restores_what_it_holds_whole_and_lists_the_rest.
+sp_partition() { # sp_partition <source dir> <dest> [listed path...]
+    python3 - "$@" <<'PY'
+import os, sys
+src, dest, want = sys.argv[1], sys.argv[2], sys.argv[3:]
+def files(root, skip=()):
+    out = {}
+    for r, ds, fs in os.walk(root):
+        ds[:] = [d for d in ds if not d.startswith(".tapectl-work")]
+        for f in fs:
+            full = os.path.join(r, f)
+            rel = os.path.relpath(full, root)
+            if rel not in skip and not os.path.islink(full):
+                out[rel] = full
+    return out
+srcf = files(src)
+listf = os.path.join(dest, ".tapectl-damaged-files.txt")
+listed = []
+if os.path.exists(listf):
+    listed = [l.rstrip("\n") for l in open(listf, encoding="utf-8", errors="surrogateescape")][1:]
+there = files(dest, skip=(".tapectl-damaged-files.txt",))
+bad = []
+for rel, full in there.items():
+    if rel not in srcf: bad.append(f"{rel}: restored but not in the source")
+    elif open(full, "rb").read() != open(srcf[rel], "rb").read(): bad.append(f"{rel}: restored and differs from the source")
+    if rel in listed: bad.append(f"{rel}: restored and also on the damaged-file list")
+for rel in srcf:
+    if rel not in there and rel not in listed: bad.append(f"{rel}: neither restored nor listed")
+for rel in want:
+    if rel not in listed: bad.append(f"{rel}: not on the damaged-file list")
+    if rel in there: bad.append(f"{rel}: on the list yet on disk")
+for d in os.listdir(dest):
+    if d.startswith(".tapectl-work"): bad.append(f"{d}: the work directory was left")
+assert not bad, "\n".join(bad)
+print(f"{len(there)} file(s) restored whole, {len(listed)} listed ({', '.join(listed) or 'none'}), of {len(srcf)}")
+PY
+}
+
+# span_heir_start_later: a restore STARTED on tape 3, which holds only the later slices of sb-span.
+# The first slice it needs is not there: the prompt for it is answered "done" ("I do not have it")
+# and the run goes on with what tape 3 holds whole, lists the rest, and says where the rest is.
+step_span_heir_start_later() {
+    local h="$SP/a/heir3" dest="$SP/a/heir3/from-3" key="$SP/a/home/keys/alice-primary.age.key" rc
+    sp_ready && sp_a_figures || return 1
+    sp_load SPA-0003 && sp_restore_sh "$h" || return 1
+    (cd "$h" && sp_drive "$h/from-3.out" "$h/from-3.events" "$SP_PROMPT_HEIR" "done" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
+    rc=$?
+    cat "$h/from-3.out"
+    [ "$rc" -eq 1 ] || { echo "a restore started on tape 3 exited $rc, want 1 (what is not on it is listed)"; return 1; }
+    # tests/heir_restore.rs a_start_on_the_second_tape_alone_restores_what_it_holds_whole_and_lists_the_rest
+    sp_has "$h/from-3.out" "RESTORE INCOMPLETE" \
+        "needs slice 1 of $SP_A_N next" \
+        "NOT ON THIS CARTRIDGE: slices 1-$SP_A_K1 of $SP_A_N" \
+        "tape SPA-0001 (cartridge serial" \
+        "a folder's modification time is that of the last run that touched the folder" \
+        "a hard-linked name whose first name was not read is not made until that name is" || return 1
+    # The long file begins on tape 1 (the hook ended tape 1 inside its run): it is left out.
+    sp_partition "$SP/a/src/sb-span" "$dest" deep/forty-megs.bin || return 1
+    python3 - "$h/from-3.events" <<'PY' || return 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 1, f"{len(prompts)} prompts, want one (\"done\" is not asked again): {prompts}"
+assert prompts[0]["reply"] == "done", prompts[0]
+PY
+}
+check span_heir_start_later step_span_heir_start_later
+
+# span_heir_second_run: the list that run left is the input of the next. Tape 1 is loaded, the
+# same --to is given, and the one prompt (for slice K1+1, which only tape 3 holds) is answered by
+# loading tape 3: the unit comes back whole, the list is gone, and every file the first run had
+# already restored is the very same file (a file that passes is not rewritten).
+step_span_heir_second_run() {
+    local h="$SP/a/heir3" dest="$SP/a/heir3/from-3" key="$SP/a/home/keys/alice-primary.age.key" rc swap before after
+    sp_ready && sp_a_figures || return 1
+    [ -f "$dest/.tapectl-damaged-files.txt" ] || { echo "span_heir_start_later did not leave the list this run continues"; return 1; }
+    before="$(find "$dest" -type f ! -name .tapectl-damaged-files.txt -printf '%p %i %T@\n' | sort)"
+    [ -n "$before" ] || { echo "the first run restored no file: the second run's 'already restored' control would be empty"; return 1; }
+    sp_load SPA-0001 || return 1
+    swap="$(printf 'sp_work_note %q %q && sp_swap %q' "$dest" "$h/second-work.txt" "${SP_SLOT[SPA-0003]}")"
+    (cd "$h" && sp_drive "$h/second.out" "$h/second.events" "$SP_PROMPT_HEIR" quit --swap "$swap" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$dest")
+    rc=$?
+    cat "$h/second.out"
+    [ "$rc" -eq 0 ] || { echo "the second run exited $rc, want 0"; return 1; }
+    sp_has "$h/second.out" "RESTORE COMPLETE" "needs slice $((SP_A_K1 + 1)) of $SP_A_N next" "This cartridge identifies as: SPA-0003" || return 1
+    diff -r "$SP/a/src/sb-span" "$dest" || { echo "the unit after the second run differs from the source"; return 1; }
+    [ ! -e "$dest/.tapectl-damaged-files.txt" ] || { echo "the damaged-file list is still there after a complete run"; return 1; }
+    after="$(find "$dest" -type f -printf '%p %i %T@\n' | sort)"
+    if [ -n "$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))" ]; then
+        echo "a file the first run restored was rewritten (path, inode, mtime before and after):"
+        comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+        return 1
+    fi
+    python3 - "$h/second.events" <<'PY' || return 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+prompts = [e for e in ev if "prompt" in e]
+assert len(prompts) == 1 and prompts[0]["swap_rc"] == 0, f"want one prompt, answered by the swap: {prompts}"
+PY
+}
+check span_heir_second_run step_span_heir_second_run
+
+# span_heir_not_have: tape 1 alone. "I do not have it" at the prompt for slice K1+1 (the answer
+# "done", and the end of the input, are the same answer) ends the run: exit 1, the long file tar
+# had begun is removed and listed, no cartridge is asked for again. "quit" stops by name.
+step_span_heir_not_have() {
+    local h="$SP/a/heir4" key="$SP/a/home/keys/alice-primary.age.key" d rc prompts
+    sp_ready && sp_a_figures || return 1
+    sp_load SPA-0001 && sp_restore_sh "$h" || return 1
+    # done, through the driver.
+    d="$h/done"
+    (cd "$h" && sp_drive "$h/done.out" "$h/done.events" "$SP_PROMPT_HEIR" "done" -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$d")
+    rc=$?
+    cat "$h/done.out"
+    # tests/heir_restore.rs the_same_file_answered_i_do_not_have_it_is_listed_and_leaves_no_partial_file
+    [ "$rc" -eq 1 ] || { echo "'done' at the prompt exited $rc, want 1"; return 1; }
+    sp_has "$h/done.out" "RESTORE INCOMPLETE" "needs slice $((SP_A_K1 + 1)) of $SP_A_N next" \
+        "NOT ON THIS CARTRIDGE: slices $((SP_A_K1 + 1))-$SP_A_N of $SP_A_N" || return 1
+    sp_partition "$SP/a/src/sb-span" "$d" deep/forty-megs.bin || return 1
+    python3 - "$h/done.events" <<'PY' || return 1
+import json, sys
+prompts = [e for e in (json.loads(l) for l in open(sys.argv[1])) if "prompt" in e]
+assert len(prompts) == 1 and prompts[0]["reply"] == "done", f"want one prompt, answered done, not asked again: {prompts}"
+PY
+    # The end of the input: the same answer.
+    d="$h/eof"
+    (cd "$h" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$d" </dev/null >"$h/eof.out" 2>&1)
+    rc=$?
+    cat "$h/eof.out"
+    [ "$rc" -eq 1 ] || { echo "the end of the input at the prompt exited $rc, want 1"; return 1; }
+    sp_has "$h/eof.out" "RESTORE INCOMPLETE" "NOT ON THIS CARTRIDGE: slices $((SP_A_K1 + 1))-$SP_A_N of $SP_A_N" || return 1
+    prompts="$(grep -cF -- "$SP_PROMPT_HEIR" "$h/eof.out" || true)"
+    [ "$prompts" = 1 ] || { echo "the end of the input was asked $prompts time(s), want once"; return 1; }
+    sp_partition "$SP/a/src/sb-span" "$d" deep/forty-megs.bin || return 1
+    # quit: stops by name; what is checked stays, the file tar had begun goes.
+    d="$h/quit"
+    (cd "$h" && sp_drive "$h/quit.out" "$h/quit.events" "$SP_PROMPT_HEIR" quit -- \
+        env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-span --key "$key" --to "$d")
+    rc=$?
+    cat "$h/quit.out"
+    [ "$rc" -eq 1 ] || { echo "'quit' at the prompt exited $rc, want 1"; return 1; }
+    sp_has "$h/quit.out" "RESTORE STOPPED at your request" || return 1
+    sp_partition "$SP/a/src/sb-span" "$d" deep/forty-megs.bin || return 1
+}
+check span_heir_not_have step_span_heir_not_have
 
 step_span_restore_unit() {
     local w="$SP/a/restore" rc
     sp_ready && sp_a_figures || return 1
     mkdir -p "$w"
     sp_load SPA-0001 || return 1
-    # Without a terminal: refused before a slice is read, naming the cartridges it would read.
+    # Without a terminal tapectl asks nobody and swaps no cartridge: it restores what its own tape
+    # holds whole, and lists the rest (INCOMPLETE; src/volume/restore/span_restore_tests.rs
+    # with_nobody_at_the_terminal_the_restore_takes_what_its_tape_holds_whole_and_lists_the_rest).
     SPA restore unit --unit sb-span --from SPA-0001 --to "$w/unattended" --device "$TAPE_DEV" </dev/null >"$w/unattended.out" 2>&1
     rc=$?
     cat "$w/unattended.out"
-    [ "$rc" -ne 0 ] || { echo "restore unit across cartridges succeeded with no terminal to ask at"; return 1; }
-    sp_has "$w/unattended.out" \
-        "unit \"sb-span\" version 1 is held across cartridges, and this restore reads slices 1 to $SP_A_K1 from \"SPA-0001\"" \
-        "then slices $((SP_A_K1 + 1)) to $SP_A_N from \"SPA-0002\"" \
-        "tapectl swaps no cartridge without a person at the terminal" || return 1
-    if [ -d "$w/unattended" ] && [ -n "$(ls -A "$w/unattended")" ]; then echo "the refused restore left files"; return 1; fi
+    [ "$rc" -ne 0 ] || { echo "restore unit across cartridges, with no terminal to ask at, said it was complete"; return 1; }
+    sp_has "$w/unattended.out" "INCOMPLETE" "forty-megs.bin" || return 1
+    [ ! -e "$w/unattended/deep/forty-megs.bin" ] || { echo "the unattended restore left a partial forty-megs.bin"; return 1; }
+    if find "$w/unattended" -type f 2>/dev/null | grep -F forty-megs >/dev/null; then echo "the unattended restore left a forty-megs file"; return 1; fi
     # On a terminal: the same command asks for the next cartridge, the whole copy on tape 2
     # first (item 131), and sp_swap loads what it names.
     sp_drive "$w/attended.out" "$w/attended.events" "$SP_PROMPT_TAPECTL" stop --pty --swap "sp_swap asked" -- \
@@ -3646,8 +3823,8 @@ print(f"pb-big over {runs} of {n}, starting first on tape 1; pa-whole and pc-sma
 PY
     # The restore from tape 1, in the default mode, across both swaps.
     sp_load SPC-0001 && sp_restore_sh "$h" || return 1
-    swap1="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/scratch-1.txt" "${SP_SLOT[SPC-0002]}")"
-    swap2="$(printf 'sp_scratch_note %q %q && sp_swap %q' "$dest" "$h/scratch-2.txt" "${SP_SLOT[SPC-0003]}")"
+    swap1="$(printf 'sp_work_note %q %q && sp_swap %q' "$dest" "$h/work-1.txt" "${SP_SLOT[SPC-0002]}")"
+    swap2="$(printf 'sp_work_note %q %q && sp_swap %q' "$dest" "$h/work-2.txt" "${SP_SLOT[SPC-0003]}")"
     (cd "$h" && sp_drive "$h/restore.out" "$h/restore.events" "$SP_PROMPT_HEIR" quit --swap "$swap1" --swap "$swap2" -- \
         env TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit pb-big --key "$key" --to "$dest")
     rc=$?
@@ -3662,6 +3839,9 @@ h = sys.argv[2]
 ev = [json.loads(l) for l in open(f"{h}/restore.events")]
 prompts = [e for e in ev if "prompt" in e]
 assert len(prompts) == 2 and all(p["swap_rc"] == 0 for p in prompts), f"want two swaps: {prompts}"
+# ONE tar run across both swaps (item 267): the same process at both prompts and both replies.
+tars = {tuple(p["tar_at_prompt"]) for p in prompts} | {tuple(p["tar_at_reply"]) for p in prompts}
+assert len(tars) == 1 and len(next(iter(tars))) == 1, f"tar processes at the two prompts and replies: {tars}"
 ends = [r[0] for r in c.execute("""SELECT MAX(sl.slice_number) FROM write_positions wp
     JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
     JOIN stage_slices sl ON sl.id = wp.stage_slice_id
@@ -3671,9 +3851,11 @@ out = open(f"{h}/restore.out").read()
 for k, end in enumerate(ends, 1):
     assert f"holds slice {end + 1} into" in prompts[k - 1]["line"], f"prompt {k} is {prompts[k - 1]['line']!r}, want slice {end + 1}"
     assert f"needs slice {end + 1} of " in out, f"no 'needs slice {end + 1}' line before prompt {k}"
-    names = sorted((l.split()[0] for l in open(f"{h}/scratch-{k}.txt")), key=lambda x: int(x.split(".")[1]))
-    assert names == [f"slice.{i}.enc" for i in range(1, end + 1)], f"scratch at prompt {k}: slices {names[:2]}..{names[-1:]}, want 1-{end}"
-print(f"two swaps, at slices {[e + 1 for e in ends]}; scratch held every slice read so far at each")
+    note = open(f"{h}/work-{k}.txt").read().splitlines()
+    assert note and note[0] == "WORKDIR 1", f"work directory at prompt {k}: {note}"
+    assert len(note) > 1, f"positive control: the work directory held nothing at prompt {k}"
+    assert not [l for l in note[1:] if l.startswith("ENTRY slice.")], f"slice file(s) wait in the work directory at prompt {k}: {note}"
+print(f"two swaps, at slices {[e + 1 for e in ends]}; one tar run across both; no slice in the work directory at either")
 PY
 }
 check span_three_tapes step_span_three_tapes
@@ -3686,13 +3868,15 @@ if [ -z "$SP_PREP" ]; then
         sp_swap "$SP_ORIG" >/dev/null || echo "gate: span leg: could not put the gate's cartridge back from slot $SP_ORIG"
     fi
     sp_all_passed=1
-    for sp_name in span_rows span_heir_tapes_1_3 span_heir_tape_2 span_heir_stream_swap span_restore_unit \
+    for sp_name in span_rows span_heir_tapes_1_3 span_heir_tape_2 span_heir_stream_swap span_heir_start_later \
+        span_heir_second_run span_heir_not_have span_restore_unit \
         span_retire_floors span_floor_target_1 span_rebuild_tape_3 span_three_tapes; do
         [ "${RESULT[$sp_name]:-}" = PASS ] || sp_all_passed=0
     done
     if [ "$sp_all_passed" = 1 ]; then
         rm -rf "$SP"/{a,c,f}/src "$SP"/{a,c,f}/home/staging "$SP"/a/heir/from-1-3 "$SP"/a/heir/stream \
-            "$SP"/a/heir2/from-2 "$SP"/a/restore/attended "$SP"/c/heir/restored
+            "$SP"/a/heir2/from-2 "$SP"/a/heir3/from-3 "$SP"/a/heir4/{done,eof,quit} "$SP"/a/restore/attended \
+            "$SP"/a/restore/unattended "$SP"/c/heir/restored
     else
         echo "gate: span leg: a span check failed; its sources, staging and restored trees are kept in $SP"
     fi
