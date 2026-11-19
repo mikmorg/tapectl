@@ -2074,10 +2074,10 @@ mod tests {
     }
 
     /// #420: a tape that sealed short says where it ended and names the units
-    /// it cut as not copies; a full seal that agrees says nothing; a row
-    /// whose recorded ending disagrees is warned about either way.
+    /// it took none of as not copies; a full seal that agrees says nothing; a
+    /// row whose recorded ending disagrees is warned about either way.
     #[test]
-    fn a_short_tape_is_named_with_its_cut_units() {
+    fn a_short_tape_is_named_with_its_unwritten_units() {
         use crate::volume::rebuild::RebuildReport;
         let full = RebuildReport {
             label: "L6-0042".to_string(),
@@ -2088,7 +2088,7 @@ mod tests {
         let short = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["bravo v1".to_string(), "charlie v1".to_string()],
+            unwritten_units: vec!["bravo v1".to_string(), "charlie v1".to_string()],
             ended_after_recorded: true,
             ..Default::default()
         };
@@ -2101,13 +2101,13 @@ mod tests {
         assert!(text.contains("tapectl catalog locate <UNIT>"), "{text}");
         assert!(!text.contains("warning:"), "{text}");
 
-        // #478: a cut spannable unit is not said to need a whole copy; a
-        // whole unit cut on the same tape still is.
+        // #478: a unit whose other slices are on other tapes is not said to
+        // need a whole copy; one the tape was to hold whole still is.
         let spanning = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["bravo v1".to_string(), "video v2".to_string()],
-            cut_spanning_units: vec!["video v2".to_string()],
+            unwritten_units: vec!["bravo v1".to_string(), "video v2".to_string()],
+            unwritten_spanning_units: vec!["video v2".to_string()],
             ..Default::default()
         };
         let lines = super::short_tape_lines(&spanning);
@@ -2121,7 +2121,7 @@ mod tests {
         );
         let span = lines
             .iter()
-            .find(|l| l.contains("spanning units cut by the early end"))
+            .find(|l| l.contains("units whose other slices are planned on other tapes"))
             .expect("the spanning unit's line");
         assert!(
             span.contains("video v2") && !span.contains("bravo v1"),
@@ -2133,8 +2133,8 @@ mod tests {
         let only_spanning = RebuildReport {
             label: "L6-0042".to_string(),
             ended_after: Some(17),
-            cut_units: vec!["video v2".to_string()],
-            cut_spanning_units: vec!["video v2".to_string()],
+            unwritten_units: vec!["video v2".to_string()],
+            unwritten_spanning_units: vec!["video v2".to_string()],
             ..Default::default()
         };
         let text = super::short_tape_lines(&only_spanning).join("\n");
@@ -2690,7 +2690,7 @@ mod tests {
             )
             .unwrap();
         }
-        for (label, status) in [("L6-RANGE", "range"), ("L6-CUT", "cut")] {
+        for (label, status) in [("L6-RANGE", "range")] {
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                       capacity_bytes, status)

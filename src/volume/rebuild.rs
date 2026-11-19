@@ -4592,8 +4592,8 @@ mod tests {
         }
 
         /// THE pin: a rebuild of a short tape gives the rows the write that
-        /// made it gave — each unit `completed` or `cut` alike, the same
-        /// positions `written` (at or before K) and `pending` (after it),
+        /// made it gave — each unit `completed`, `range` or no row alike, the
+        /// same positions `written` (at or before K) and `pending` (after it),
         /// and the same `ended_after` — so the catalog says the same thing
         /// about the tape whether it wrote it or read it back
         /// (layout-session.md "Later contacts").
@@ -4607,8 +4607,9 @@ mod tests {
             assert_eq!(report.unsealed_reason, None, "a short seal is a seal");
             assert_eq!(report.ended_after, Some(u64::from(k)));
             // Item 288: the unit the early warning interrupted holds its
-            // first slice, so it is a range; only the one after it is cut.
-            assert_eq!(report.cut_units, vec!["charlie v1"]);
+            // first slice, so it is a range; only the one after it is
+            // planned and not written, and has no row.
+            assert_eq!(report.unwritten_units, vec!["charlie v1"]);
             assert_eq!(report.range_units.len(), 1, "{report:?}");
             assert_eq!(
                 (
@@ -4627,22 +4628,12 @@ mod tests {
                 vec![
                     ("alpha".to_string(), "completed".to_string()),
                     ("bravo".to_string(), "range".to_string()),
-                    ("charlie".to_string(), "cut".to_string()),
                 ]
             );
-            // The write still records the unit it interrupted as `cut`
-            // until T5.1 gives every unit the three-way split on the write's
-            // side (item 288); the tape shows it holds the unit's first
-            // slice, which is what a rebuild records. Everything else, every
-            // position and its status included, agrees.
-            assert_eq!(
-                written.0,
-                vec![
-                    ("alpha".to_string(), "completed".to_string()),
-                    ("bravo".to_string(), "cut".to_string()),
-                    ("charlie".to_string(), "cut".to_string()),
-                ]
-            );
+            // The write gives every unit the same three-way split (item
+            // 288), with no exception: what the rebuild records, the write
+            // recorded, every position and its status included.
+            assert_eq!(written.0, rebuilt.0, "the rows agree");
             assert_eq!(rebuilt.1, written.1, "the positions agree");
             for (unit, position, status) in &rebuilt.1 {
                 let expect = if *position <= i64::from(k) {
@@ -4670,7 +4661,7 @@ mod tests {
                 "the write recorded the same ending"
             );
 
-            // Nothing about a cut unit counts as a copy.
+            // Nothing about a unit the tape did not take counts as a copy.
             let copies = |unit: &str| -> i64 {
                 let id: i64 = fresh
                     .query_row("SELECT id FROM units WHERE name = ?1", [unit], |r| r.get(0))
@@ -4697,7 +4688,7 @@ mod tests {
             let report = rebuild_into(&fresh, &mut t);
             assert_eq!(report.unsealed_reason, None);
             assert_eq!(report.ended_after, None);
-            assert!(report.cut_units.is_empty());
+            assert!(report.unwritten_units.is_empty());
             let (writes, positions) = rows_and_positions(&fresh);
             assert!(writes.iter().all(|(_, s)| s == "completed"), "{writes:?}");
             assert!(

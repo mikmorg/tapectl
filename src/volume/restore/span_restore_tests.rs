@@ -22,7 +22,7 @@ use super::fixture::{
 };
 use super::repair_tests::tests::{Reply, TestBay};
 use super::{
-    cut_units_on_volume, plan_restore, plan_units, restore_unit, restore_units_from_bay,
+    plan_restore, plan_units, restore_unit, restore_units_from_bay,
     select_write_positions, span, unit_requests, units_on_volume, RestoreOptions, RestoreTarget,
     SCRATCH_NAME,
 };
@@ -1056,10 +1056,6 @@ fn restore_volume_restores_the_whole_units_and_the_unit_held_across_cartridges()
     // cartridges last, where the tape ended. Both are on the volume.
     assert_eq!(units_on_volume(&h.conn, A).unwrap(), [OTHER, UNIT]);
     assert_eq!(units_on_volume(&h.conn, B).unwrap(), [UNIT]);
-    assert!(
-        cut_units_on_volume(&h.conn, A).unwrap().is_empty(),
-        "no unit is cut (item 288)"
-    );
 
     let options = RestoreOptions::default();
     let names = vec![OTHER.to_string(), UNIT.to_string()];

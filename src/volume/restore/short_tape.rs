@@ -1,5 +1,5 @@
 //! Test support (#420): one tape that ended early, written by the real
-//! session, for every reader of a short tape and of a `cut` row.
+//! session, for every reader of a short tape and of a range.
 //!
 //! Nothing is hand-built but the drive. A home is made as `tapectl init` and
 //! `tenant add` make one (an operator and a tenant, each with a key on disk),
@@ -10,9 +10,10 @@
 //! tier) writes them to a `MemStore` whose
 //! early warning comes one byte into `bravo`'s first slice. The session then
 //! seals short at `bravo`'s first slice, K: `alpha` is whole on the tape
-//! (`completed`), `bravo` is cut with its first slice on the tape and its
-//! second not, and `charlie` is cut with nothing on the tape (`volume-format-
-//! v2.md` §4.1-§4.3; `layout-session.md` "The short ending").
+//! (`completed`), `bravo` is a `range` with its first slice on the tape and
+//! its second not, and `charlie` was planned and not written, so it has no
+//! row (`volume-format-v3.md` §5; ADR-0012 item 288; `layout-session.md`
+//! "Confirm of a short ending").
 //!
 //! [`full_tape`] is the same write with no warning: the control.
 //!
@@ -42,7 +43,7 @@ mod tests {
     pub(crate) const VOL_UUID: &str = "42000000-0000-4000-8000-000000000420";
     pub(crate) const OPERATOR: &str = "writer";
     pub(crate) const TENANT: &str = "family";
-    /// The units, in plan order: `alpha` whole, `bravo` cut by the warning in
+    /// The units, in plan order: `alpha` whole, `bravo` ended by the warning in
     /// its first slice, `charlie` planned after it.
     pub(crate) const UNITS: [&str; 3] = ["alpha", "bravo", "charlie"];
 
@@ -439,10 +440,24 @@ mod tests {
             t.rows(&t.conn),
             vec![
                 ("alpha".into(), "completed".into(), "current".into()),
-                ("bravo".into(), "cut".into(), "staged".into()),
-                ("charlie".into(), "cut".into(), "staged".into()),
-            ]
+                ("bravo".into(), "range".into(), "staged".into()),
+            ],
+            "charlie was planned and not written: no row (item 288)"
         );
+        let leftover: i64 = t
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions wp
+                   JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                   JOIN stage_sets ss ON ss.id = sl.stage_set_id
+                   JOIN snapshots s ON s.id = ss.snapshot_id
+                   JOIN units u ON u.id = s.unit_id
+                  WHERE u.name = 'charlie'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "its positions went with the row");
         let recorded: (String, Option<i64>) = t
             .conn
             .query_row(

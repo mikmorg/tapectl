@@ -5425,12 +5425,12 @@ impl SpanTapes {
 }
 
 /// Per volume label, in label then unit order: `(label, unit, writes.status,
-/// writes.may_span, completed_at recorded, snapshots.status)`.
-type SpanWriteRow = (String, String, String, bool, bool, String);
+/// completed_at recorded, snapshots.status)`.
+type SpanWriteRow = (String, String, String, bool, String);
 
 fn span_write_rows(conn: &rusqlite::Connection) -> Vec<SpanWriteRow> {
     conn.prepare(
-        "SELECT v.label, u.name, w.status, w.may_span, w.completed_at IS NOT NULL, s.status
+        "SELECT v.label, u.name, w.status, w.completed_at IS NOT NULL, s.status
            FROM writes w
            JOIN volumes v ON v.id = w.volume_id
            JOIN snapshots s ON s.id = w.snapshot_id
@@ -5445,7 +5445,6 @@ fn span_write_rows(conn: &rusqlite::Connection) -> Vec<SpanWriteRow> {
             r.get(2)?,
             r.get(3)?,
             r.get(4)?,
-            r.get(5)?,
         ))
     })
     .unwrap()
@@ -5533,12 +5532,11 @@ fn span_snapshot_status(conn: &rusqlite::Connection) -> String {
 fn the_span_fixture_is_item_93s_three_tapes() {
     let s = span_tapes();
     let rows = span_write_rows(&s.conn);
-    let row = |label: &str, unit: &str, status: &str, may_span: bool, snapshot: &str| {
+    let row = |label: &str, unit: &str, status: &str, snapshot: &str| {
         (
             label.to_string(),
             unit.to_string(),
             status.to_string(),
-            may_span,
             true,
             snapshot.to_string(),
         )
@@ -5546,10 +5544,10 @@ fn the_span_fixture_is_item_93s_three_tapes() {
     assert_eq!(
         rows,
         vec![
-            row("SPAN-T1", WHOLE_UNIT, "completed", false, "current"),
-            row("SPAN-T1", SPAN_UNIT, "range", true, "current"),
-            row("SPAN-T2", SPAN_UNIT, "completed", true, "current"),
-            row("SPAN-T3", SPAN_UNIT, "range", true, "current"),
+            row("SPAN-T1", WHOLE_UNIT, "completed", "current"),
+            row("SPAN-T1", SPAN_UNIT, "range", "current"),
+            row("SPAN-T2", SPAN_UNIT, "completed", "current"),
+            row("SPAN-T3", SPAN_UNIT, "range", "current"),
         ]
     );
     let t1: Vec<(i64, String)> = span_positions(&s.conn)
@@ -5585,7 +5583,11 @@ fn tape_3_of_a_span_rebuilt_alone_is_a_range_and_its_version_stays_staged() {
 
     assert_eq!(report.unsealed_reason, None);
     assert_eq!(report.ended_after, None, "tape 3 sealed full");
-    assert!(report.cut_units.is_empty(), "{:?}", report.cut_units);
+    assert!(
+        report.unwritten_units.is_empty(),
+        "{:?}",
+        report.unwritten_units
+    );
     assert_eq!(
         report.range_units,
         vec![rebuild::RebuiltRange {
@@ -5602,7 +5604,6 @@ fn tape_3_of_a_span_rebuilt_alone_is_a_range_and_its_version_stays_staged() {
             "SPAN-T3".to_string(),
             SPAN_UNIT.to_string(),
             "range".to_string(),
-            true,
             true,
             "staged".to_string()
         )]
@@ -5774,20 +5775,11 @@ fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
                 report.spans_in_progress
             );
         }
-        // `writes.may_span` is frozen at plan time and a Layout 3 block
-        // states none (item 288), so a rebuild sets it for a `range` row and
-        // clears it for any other (T4.9, until T5.1 removes the column).
-        let as_the_tape_shows: Vec<SpanWriteRow> = written_rows
-            .iter()
-            .cloned()
-            .map(|mut r| {
-                r.3 = r.2 == "range";
-                r
-            })
-            .collect();
+        // A Layout 3 block states no spanning key (item 288): the rows a
+        // rebuild records are the rows the write recorded, whole or range.
         assert_eq!(
             span_write_rows(&fresh),
-            as_the_tape_shows,
+            written_rows,
             "order {order:?}"
         );
         assert_eq!(span_positions(&fresh), written_positions, "order {order:?}");
@@ -5878,20 +5870,20 @@ fn a_tape_with_no_spannable_unit_rebuilds_as_it_did_before() {
     assert!(report.range_units.is_empty());
     assert!(report.versions_promoted.is_empty());
     assert!(report.spans_in_progress.is_empty());
-    let rows: Vec<(String, bool, String)> = fresh
+    let rows: Vec<(String, String)> = fresh
         .prepare(
-            "SELECT w.status, w.may_span, s.status FROM writes w
+            "SELECT w.status, s.status FROM writes w
                JOIN snapshots s ON s.id = w.snapshot_id ORDER BY w.id",
         )
         .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(rows.len(), UNITS.len());
     assert!(
         rows.iter()
-            .all(|(w, may, s)| w == "completed" && !may && s == "current"),
+            .all(|(w, s)| w == "completed" && s == "current"),
         "{rows:?}"
     );
     let detail: String = fresh
