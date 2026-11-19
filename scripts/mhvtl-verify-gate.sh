@@ -232,7 +232,7 @@ lbp_note_page() { # lbp_note_page <step>: one row, "<step>\t<state>", or why it 
 #   H1 fixed in #24: the mini-index is generated from the complete Layout, so
 #     it now lists the envelopes and the no-tapectl heir path works end-to-end
 #     (find-envelope + full restore, byte-identical).
-#   H8 fixed in #34: list_slices parses dar's numeric slice index instead of
+#   H8 fixed in #34: list_slices parses the numeric slice index instead of
 #     sorting filenames lexicographically, so slice_number no longer permutes
 #     at >=10 slices. Verified on tape: unitB staged a clean 1..=12 run and
 #     restore_multislice_unit's `diff -r` came back byte-identical.
@@ -293,7 +293,7 @@ gate_slice_pos() { # gate_slice_pos <db> <label> <unit> <n>
         JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
         JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = sl.stage_set_id
         JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
-        WHERE v.label = ? AND u.name = ? AND sl.slice_number = ? AND wp.status = 'written'" "$2" "$3" "$4"
+        WHERE v.label = ? AND u.name = ? AND sl.slice_number = ? AND wp.status IN ('written', 'verified')" "$2" "$3" "$4"
 }
 
 # ---------- leg 1: tapectl round trip ----------
@@ -790,7 +790,7 @@ dump_whole_tape() { # dump_whole_tape <outfile>
 # check that only asserts absence cannot distinguish "searched and found
 # nothing" from "searched nothing", which is the same shape as the
 # `csc_fingerprint` guard (issue #258) and the never-run `permute` restore
-# matrix. `volume-format-v2.md` puts the volume label in the ID thunk
+# matrix. `volume-format-v3.md` puts the volume label in the ID thunk
 # (File 0) in plaintext by design, so if the label is NOT found then the
 # scan itself is broken, and this check must fail as loudly as a real leak
 # rather than report a clean tape.
@@ -877,7 +877,7 @@ step_leakscan() {
     # an error and must never be read as "clean" -- that read is exactly
     # what issue #275 was.
     # #450: the isolation invariant names key fingerprints and recipients too
-    # (volume-format-v2.md §2). A key's fingerprint is its age1 recipient
+    # (volume-format-v3.md). A key's fingerprint is its age1 recipient
     # string; every one of both tenants' keys is a needle. At least two must be
     # found, or the needle list is empty and the scan proves nothing about keys.
     local keys t
@@ -1334,13 +1334,11 @@ check heir_path           step_heir_path
 # a_long_members_bad_piece_ends_its_tar_run_removes_the_partial_file_and_reads_on), and the small
 # files before it are whole.
 step_heir_long_member() {
-    local info out rc d reads s k b first last n bad list
+    local info out rc d reads s k b first last bad list
     info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
     read -r k first b < <(heir_list_row "$HEIR_KEY_B" unitB twelve-meg.bin) || { echo "heir_long_member: unitB's --list has no twelve-meg.bin"; return 1; }
     [ "$k" = f ] && [ "$b" = 12000000 ] || { echo "heir_long_member: twelve-meg.bin is '$k $first $b'"; return 1; }
     [ "$b" -gt 1048576 ] || return 1                       # larger than slice_size: a run, not a slice
-    n="$(gate_q "$HEIR_DB" "SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
-        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'unitB'")"
     # The slices of the run: those after its first that the catalog says continue it.
     last="$(gate_q "$HEIR_DB" "SELECT MAX(sl.slice_number) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
         JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
@@ -4036,9 +4034,39 @@ PY
 }
 check lbp_page_clear_after_every_command step_lbp_page_clear_after_every_command
 
+# ---------- the checks the gate must have run, by name ----------
+# Every `check` line above, in the order they run (T4.16: 78). The verdict compares the run to this
+# list by NAME, never by a total: a check named here that did not run is a FAIL (a leg that was
+# edited out, or a run that stopped early, cannot read GREEN), and so is a check that ran and is
+# not named here. TAPECTL_GATE_SPAN_ONLY judges the span_* names alone.
+GATE_EXPECTED_CHECKS=(
+    init tenants units snapshots stage_main stage_symlink_unit erase_scratch volume_init
+    volume_write sealed_at_recorded lbp_fallback_recorded volume_verify empty_drive_refused
+    evidence_row restore_diff restore_multislice_unit restore_symlink_unit crosskey_rejected
+    no_plaintext_leak heir_extract_script heir_info heir_find_envelope heir_verify heir_list
+    heir_restore heir_restore_symlinks heir_file_check heir_path heir_long_member heir_where
+    heir_find heir_find_path heir_paths_from_copy resume_bot resume_midwrite resume_verify
+    resume_restore resume_after_crash tier3_floor_unconfirmed health_by_id_device
+    health_by_id_restore log_page_sweep_complete log_page_read_once log_page_raw_kept
+    mam_journal_attributed contacts_name_their_drive tape_alert_surfaced feed_ratio_recorded
+    st_stats_recorded erase_then_init_no_force heir_short_seal heir_short_info heir_short_verify
+    heir_short_restore heir_short_cut_refused heir_gzip_restore heir_gzip_path heir_xz_restore
+    heir_xz_path heir_zstd_restore heir_zstd_path span_rows span_heir_tapes_1_3 span_heir_tape_2
+    span_heir_stream_swap span_heir_start_later span_heir_second_run span_heir_not_have
+    span_restore_unit span_retire_floors span_floor_target_1 span_rebuild_tape_3
+    span_three_tapes rust_e2e rust_motions rust_lbp perf_write_2g
+    lbp_page_clear_after_every_command
+)
+
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
 echo "== gate verdict =="
+# The run record: the tools this run read and wrote with, as RESTORE.sh and tapectl found them.
+echo "run record: $("$BIN" --version 2>&1 | head -n 1)"
+echo "  age $(age --version 2>&1 | head -n 1)"
+echo "  tar (the heir's, on PATH): $(tar --version 2>&1 | head -n 1)"
+echo "  tar (tapectl's [tar] binary, $GATE_TAR): $("$GATE_TAR" --version 2>&1 | head -n 1)"
+echo "  gzip $(gzip --version 2>&1 | head -n 1); $(xz --version 2>&1 | head -n 1); zstd $(zstd --version 2>&1 | head -n 1)"
 rc=0
 for name in "${CHECKS[@]}"; do
     want=PASS
@@ -4055,6 +4083,22 @@ for name in "${CHECKS[@]}"; do
         rc=1
     fi
 done
+# By name: an expected check that did not run, and a check that ran without being expected.
+for name in "${GATE_EXPECTED_CHECKS[@]}"; do
+    if [ -n "$GATE_SPAN_ONLY" ] && [[ "$name" != span_* ]]; then continue; fi
+    if [ -z "${RESULT[$name]:-}" ]; then
+        echo "  $name: NOT RUN  << the gate expects it and it did not run"
+        rc=1
+    fi
+done
+for name in "${CHECKS[@]}"; do
+    expected=0
+    for x in "${GATE_EXPECTED_CHECKS[@]}"; do [ "$x" = "$name" ] && expected=1; done
+    if [ "$expected" = 0 ]; then
+        echo "  $name: UNLISTED  << it ran and GATE_EXPECTED_CHECKS does not name it"
+        rc=1
+    fi
+done
 echo
 if [ -n "$GATE_SPAN_ONLY" ]; then
     # Never a gate verdict: every check but span_* was skipped. 3 when those all passed.
@@ -4063,7 +4107,7 @@ if [ -n "$GATE_SPAN_ONLY" ]; then
     exit 1
 fi
 if [ $rc -eq 0 ]; then
-    echo "GATE GREEN (against manifest: ${#EXPECTED_FAIL[@]} expected failures remain). Logs: $RUN"
+    echo "GATE GREEN: ${#CHECKS[@]} of ${#GATE_EXPECTED_CHECKS[@]} expected checks, each judged by name (against manifest: ${#EXPECTED_FAIL[@]} expected failures remain). Logs: $RUN"
 else
     echo "GATE RED. Logs: $RUN"
 fi
