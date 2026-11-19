@@ -2327,13 +2327,18 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
     // The first cartridge back in the drive, whatever happened.
     swap_cartridge(&devs, &second, &first);
     second_write.expect("the rest of the staged sets is written to a second cartridge");
+    // The home's copy floor is the default 2, so every slice is still owed:
+    // the whole units have one copy, sb-cut's slices 1 to 7 one and the rest
+    // none. sb-cut's owed run is then its whole set, from its lowest owed
+    // slice, and the second cartridge is item 93's middle tape: it holds
+    // every set whole (ADR-0012 items 93, 122 and 288; plan T5.1, "The plan,
+    // exactly").
     let on_second = write_statuses(&h.conn, label2);
-    for (unit, status) in [("sb-cut", "range"), ("sc-after", "completed")] {
-        assert!(
-            on_second.contains(&(unit.to_string(), status.to_string())),
-            "{unit} on {label2}: {on_second:?}"
-        );
-    }
+    let expected: Vec<(String, String)> = ["op-unit", "sa-whole", "sb-cut", "sc-after"]
+        .iter()
+        .map(|u| (u.to_string(), "completed".to_string()))
+        .collect();
+    assert_eq!(on_second, expected, "the rows on {label2}");
     let ended_after2: Option<i64> = h
         .conn
         .query_row(
