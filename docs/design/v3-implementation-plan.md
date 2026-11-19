@@ -2500,6 +2500,10 @@ readback has taken the rest; item 93's shape (two copies: tapes
 1 and 3, or tape 2 alone) and a unit on three tapes restore whole through tapectl and
 through the heir's script, in tests and on mhvtl (`scripts/span-acceptance.sh --mhvtl`);
 `grep -rn 'allow_spanning\|may_span' src tests` finds nothing; the suite is green.
+*Added at T4.16 (the coordinator):* the "PENDING T5.1" block of
+`examples/short_seal_filler.rs`'s `compare` (a writer's `cut` read back by a rebuild as the
+`range` it is) is deleted, and `scripts/short-seal-acceptance.sh --mhvtl` passes without it;
+the `# T5.1 removes this` lines of the gate and the acceptances go with `allow_spanning`.
 
 ### T5.2 Two places, and the per-location writes (#550; items 147 to 160, 257)
 
