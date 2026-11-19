@@ -109,3 +109,9 @@ plain cut of item 241 (by 283), item 9's "never split by the drive", item 82's o
 121's freeze of whether a set may span, item 125's `may_span`, items 83, 94, 95, 123, 124, 133
 and 147 (by 288 and 289), and
 item 253's "before any code" for the largest real unit (by 291).
+
+## Amendment, 2026-11-19
+
+ADR-0012 item 297 (#569): a file whose name is not UTF-8 is carried by its bytes. §1.5's one
+escaping rule gains `\xHH` for a byte outside valid UTF-8, and the catalog keeps paths in that
+escaped form.

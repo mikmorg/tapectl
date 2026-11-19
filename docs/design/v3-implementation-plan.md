@@ -1378,7 +1378,7 @@ is integrated):
 | E | T4.8, T4.9, T4.10 | readers of what T4.6 defined; file-disjoint |
 | F | T4.7, T4.11 | |
 | G | T4.12 | |
-| H | T4.13, T4.14 | |
+| H | T4.13, T4.14, T4.17 | T4.17 edits the heir's script after T4.12 and is file-disjoint from T4.13 and T4.14 |
 | I | T4.15 | dar leaves |
 | J | T4.16 (coordinator) | the gate and the suites on Layout 3; the tape chain is green again |
 
@@ -2190,7 +2190,7 @@ history in comments that the coordinator accepts, listed in the report; `grep -r
 
 ### T4.16 The gate and the suites on Layout 3
 
-**Owner:** coordinator (a `scripts/` change is proven only on tape). **Depends:** T4.15.
+**Owner:** coordinator (a `scripts/` change is proven only on tape). **Depends:** T4.15, T4.17.
 
 `scripts/mhvtl-verify-gate.sh`, `scripts/lifecycle-suite.sh`, `scripts/plaintext-scan.sh`,
 `scripts/short-seal-acceptance.sh`, `scripts/span-acceptance.sh`, `scripts/lbp-acceptance.sh`,
@@ -2206,6 +2206,75 @@ algorithm carried, with the real decompressor**. Legs that proved dar's stream (
 restated. The lifecycle suite's restore matrix keeps its twelve methods. Each run record
 names the age version and the tar version. **Done when** the whole chain of T6.5 is green
 on `layout-3`.
+
+### T4.17 A name that is not UTF-8 (#569)
+
+**Owner:** worker. **Depends:** T4.8, T4.12 (the heir's script is edited after its part
+three). **Carries out:** item 297; #569. *Added 2026-11-19, when the CTO ruled #569 into
+2.0.0.* **Read:** ADR-0012 item 297 and its determinations; `volume-format-v3.md` §1.5 (the
+escape's fifth case), §1.6, §1.7, §7.2 to §7.4; #569; `src/volume/index.rs`'s `escape` and
+`unescape`.
+
+**Fence** (the coordinator narrows it at dispatch with a grep of the lossy conversions of a
+path inside a unit): `src/volume/index.rs` (the escape), `src/volume/filetable.rs`, the
+snapshot's walk and the exclusion match (`src/staging/`), the list given to tar
+(`src/staging/archive.rs`, `src/tar/`), the stream reader's comparison (`src/tar/stream.rs`,
+`src/tar/pax.rs`), the catalog's writers and readers of paths (`src/db/`), the restores'
+lookup, disk check and repair (`src/volume/restore.rs`, `src/volume/restore/`), `unit
+check-integrity`, the commands that take a path (`src/cli/restore.rs`, `src/cli/unit.rs`),
+`src/volume/heir/RESTORE.sh` (the per-file check's unescape) with `tests/heir_restore.rs`
+and `tests/common/heir/`, and their tests.
+
+**Build:**
+1. **One pair of functions.** `escape` takes a name's bytes and writes §1.5's form, `\xHH`
+   for each byte outside a valid UTF-8 sequence; `unescape` gives the bytes back. Every path
+   inside a unit passes through them, and through nothing lossy: `to_string_lossy` and
+   `to_str` do not touch such a path anywhere.
+2. **The snapshot** records each path in the escaped form; the catalog keeps that form
+   (item 297). The exclusion patterns match a UTF-8 name as before; a name that is not UTF-8
+   is matched in its escaped form.
+3. **Staging** writes tar's file list from the unescaped bytes (`--null`), and the stream
+   reader compares the stream's bytes with the list's. The pax `path` and `linkpath` records
+   carry the raw bytes under `LC_ALL=C` (measured 2026-11-19, GNU tar 1.35); a record under
+   `hdrcharset=BINARY` means the same bytes and is accepted. The file table, the id map and
+   the index are written with the escape.
+4. **tapectl's restores** find a member by its escaped path, check it on disk by its bytes,
+   and repair it by the same. `restore file --path`, `unit check-integrity` and every other
+   command that takes a path inside a unit take it as bytes from the command line and escape
+   it for the lookup. Output and `--json` show the escaped form.
+5. **The heir's script** unescapes a path only where it names a file on disk: the per-file
+   check. `--path` and `--paths-from` take the escaped form, as `--list` and the
+   damaged-file list write it. The unescape is one awk program, run under gawk, mawk and
+   BusyBox awk with `LC_ALL=C`.
+6. A unit's own root that is not UTF-8 is refused by name at `unit init`; unit, tenant and
+   location names stay UTF-8 text, as today.
+
+**Traps:**
+- A UTF-8 name is written exactly as before on tape. In the catalog a name with a
+  backslash, TAB, LF or CR now reads escaped, as on tape; a test names one.
+- The id map's host names are text from the host: the same escape covers a name that is not
+  UTF-8.
+- `printf %b` is not the unescape: it reads other escapes (`\c` stops output). Write the
+  bytes by their codes, and prove the awk program on all three awks.
+- `sha256sum -c` takes raw bytes in a name; a name with a backslash or LF needs sha256sum's
+  own escaped line, which T4.10's check already writes and reads.
+- Nothing in a JSON document is a byte outside UTF-8: the escaped form is what `--json`
+  carries.
+
+**Verify:** a unit holding a name in Latin-1 (`caf\xe9.txt`), a folder so named with a file
+in it, a hard link and a symbolic link whose target is such a name, and UTF-8 names with a
+backslash, a TAB and an LF. Stage it, write it on `MemStore`, then:
+- `restore unit`, and `restore file` with the name typed as bytes;
+- `catalog rebuild`, and a second copy written from the rebuilt catalog;
+- `unit check-integrity`, clean;
+- the heir's `--list`, `--restore`, `--path`, `--paths-from` with the damaged-file list
+  round-tripping the name, and the per-file check catching a damaged one.
+
+Every restored name is compared byte for byte with the source. The test that writes the
+unit fails on the parent (the staging is refused).
+
+**Done when:** #569's criteria are met; the suite is green; the coordinator's Ubuntu 26.04
+container run of the heir's tests passes as uid 1000.
 ---
 
 ## S5. Stage 5: every carried feature, proven on the new payload
@@ -2735,6 +2804,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | #540 | T2.4 | #564 | T1.3, T4.3, T4.5, T4.6, T4.8, T4.9, T4.11 |
 | #541 | T2.1 | #565 | T0.5, T0.6, T4.0, T4.5, T4.6, T4.8, T4.10, T4.13, T4.14, T4.16, T5.7 |
 | #566 | closed: slices stay (item 282) | #567 | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8 to T4.13, T4.16, T5.1, T5.3 |
+| #569 | T4.17 (item 297) | #570 | T4.5b |
 
 **ADR-0012's items from 239.**
 
@@ -2766,6 +2836,7 @@ coordinator when every task named beside it has landed and the gate has run.
 | 283 a slice ends at a member's start | T0.7, T4.2, T4.3, T4.5, T4.6, T4.8, T4.10 to T4.13; section 5, rules 4 and 13 | 287 an archive may set a level | T4.5, T5.7 |
 | 284 each slice compressed alone | T0.5, T4.5, T4.8, T4.10; section 5, rule 11 | 288 every unit continues at the early warning | T4.6, T4.9, T4.12, T5.1, T5.3, T6.6 |
 | 285 gzip, xz and zstd are carried | T0.5, T0.6, T4.0, T4.5, T4.15 | 289 the queue is filled to the warning | T5.1, T6.6 |
+| 297 a name that is not UTF-8 is carried by its bytes | T4.17 | | |
 
 **#562's rules for the format document.** Each is written into the format document by T1.1
 and built where shown.

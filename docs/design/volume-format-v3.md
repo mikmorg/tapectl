@@ -300,8 +300,13 @@ see the cross-tenant map.
 
 **Encoding.** UTF-8 text. The first line is a header naming the columns; every further
 line is one row; fields are separated by one TAB and rows end with one LF. Inside a
-field, four characters are escaped and nothing else: backslash as `\\`, TAB as `\t`, LF
-as `\n`, CR as `\r`. An empty field means "not known". A reader finds columns by their
+field, four characters are escaped: backslash as `\\`, TAB as `\t`, LF as `\n`, CR as
+`\r`; and each byte that is not part of a valid UTF-8 sequence is written `\xHH`, two
+lowercase hex digits (ADR-0012 item 297, #569: a file name is bytes, and a name that is not
+UTF-8 is carried by its bytes). Nothing else is escaped, so a UTF-8 name is written as it
+is, and every text stays UTF-8. The escape is reversible: `\x` follows only an escaped
+byte, since a backslash is itself escaped. The catalog keeps a path in this form too. An
+empty field means "not known". A reader finds columns by their
 header name and ignores a column it does not know. Rows are sorted as given below, so
 the bytes are deterministic for a given catalog. **This escaping is the one rule for the
 whole format** (`volume::index::escape`): the file table, the id map and the
