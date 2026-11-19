@@ -963,8 +963,14 @@ const RECOVERY_CATALOG_DB: &str = "\n## Querying catalog.db\n\n\
      entry of each version: `kind` 0 directory, 1 regular file, 2 symlink, \
      3 special file such as a FIFO or device; `size_bytes`; `mtime_ns`, Unix \
      time in nanoseconds; `sha256` as 32 raw bytes, `lower(hex(sha256))` \
-     prints it; `link_target`, a symlink's target). Permissions, owners and \
-     extended attributes are in the dar catalogues beside this file, not here. \
+     prints it; `link_target`, a symlink's target), then `stage_files` (each \
+     staging's file table: one row for each file of its tar stream, `seq`, \
+     `kind`, `slice`, `path_id` into `paths`, `size`, `sha256`, `start` and \
+     `end`, and `link_path_id` for a hard link) and `stage_ids` (its id map: \
+     `kind` `u` or `g`, `id`, `name`, who each user and group number was on the \
+     computer that wrote the tape). Permissions, owners and extended \
+     attributes are in each unit's tar stream, not here; a tenant's envelope \
+     holds the same file table and id map as the text files in `tables/`. \
      Tape positions are NOT here; MANIFEST.toml beside this file has them. \
      `PRAGMA user_version` on this file mirrors the schema level of the \
      `tapectl.db` it was generated from. With the operator or escrow key, \
