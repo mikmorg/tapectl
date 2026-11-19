@@ -9998,6 +9998,16 @@ pub fn staged_build_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
     Ok(checked_staged_units(conn, Spanning::Never, None)?.units)
 }
 
+/// The units `volume write` would put on a tape when it plans spanning as a
+/// real write does (`Spanning::ByPolicy`): a set that may span gets the run
+/// of slices it still owes, from the `range` rows earlier tapes' confirms
+/// recorded. Public for the heir's suite (`tests/heir_restore.rs`), which
+/// writes a unit across cartridges with tapectl's own planner (T4.12). Until
+/// T5.1 a set spans only where its policy allows it (`allow_spanning`).
+pub fn staged_build_units_spanning(conn: &Connection, config: &Config) -> Result<Vec<BuildUnit>> {
+    Ok(checked_staged_units(conn, Spanning::ByPolicy(config), None)?.units)
+}
+
 /// Refuse the write, by name, when a selected unit's file table is not in
 /// the catalog (ADR-0012 item 265, #557; `volume-format-v3.md` §1.6): every
 /// tenant envelope carries, for each staging the tape's plan holds a slice
