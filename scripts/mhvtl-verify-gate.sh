@@ -277,6 +277,15 @@ for row in c.execute(sys.argv[2], sys.argv[3:]):
     print("\t".join("" if v is None else str(v) for v in row))
 PY
 }
+# Appends a [policy] table to a unit's dotfile (`unit init` writes none): one line each argument,
+# e.g. 'compression = "xz"'. The dotfile layer of the 3-level resolver (dotfile > archive set >
+# [defaults]), the one an operator sets.
+gate_unit_policy() { # gate_unit_policy <unit dir> <"key = value">...
+    local d="$1" line
+    shift
+    grep -E '^\[policy\]' "$d/.tapectl-unit.toml" >/dev/null && { echo "gate_unit_policy: $d already has a [policy] table"; return 1; }
+    { printf '\n[policy]\n'; for line in "$@"; do printf '%s\n' "$line"; done; } >>"$d/.tapectl-unit.toml"
+}
 # The tape file a unit's slice <n> is at on <label>, from the catalog the write recorded: what a
 # heir leg injects a fault at or expects a read of. Prints nothing when there is no such slice.
 gate_slice_pos() { # gate_slice_pos <db> <label> <unit> <n>
@@ -2520,22 +2529,24 @@ step_erase_then_init_no_force() {
 check erase_then_init_no_force step_erase_then_init_no_force
 
 # ---------- heir_short_*: a tape the early warning ended, read by the heir (1.6.0; #420) ----------
-# ADR-0012 item 70: the gate is the heir path's only test with the real age, dar,
-# mt and tar, and from 1.6.0 a tape may end before its plan (volume-format-v2.md
-# §4.1-§4.3): the drive's early warning comes in data slice K, the write finishes
-# it and seals short at K+1, and every unit with a slice after K is cut (§4.2).
-# mhvtl's own early warning comes only near its 500 MB end, where it then loses
-# what is written (tests/mhvtl_e2e.rs proves that case), so the tape here is made
-# with the test hook TAPECTL_TEST_EARLY_WARNING_AT: from 30 MiB written, the write
-# store answers as st does past a warning (store::TapeStore::open), and everything
-# written reads back. A throwaway home, alice's three units in plan order: sa-whole
-# (whole), sb-cut (40 MiB in 4 MiB slices, the warning inside them) and sc-after
-# (planned after it, so cut too). Then the RESTORE.sh on that tape: --info and
-# --verify say where it ended, a whole unit restores byte for byte, and the cut
-# unit is refused by name before any slice is read.
+# ADR-0012 item 70: the gate is the heir path's only test with the real age, tar,
+# mt and sha256sum, and a tape may end before its plan (volume-format-v3.md): the drive's early
+# warning comes in data slice K, the write finishes it and seals short at K+1, and every unit with
+# a slice after K is cut. mhvtl's own early warning comes only near its 500 MB end, where it then
+# loses what is written (tests/mhvtl_e2e.rs proves that case), so the tape here is made
+# with the test hook TAPECTL_TEST_EARLY_WARNING_AT: from 30 MiB written, the write store answers as
+# st does past a warning (store::TapeStore::open), and everything written reads back. A throwaway
+# home, alice's three units in plan order: sa-whole (whole), sb-cut (40 MiB in 4 MiB slices, the
+# warning inside them: one file larger than a slice, so a run of slices) and sc-after (planned
+# after it, so cut too). Then the RESTORE.sh on that tape: --info and --verify say where it ended,
+# a whole unit restores byte for byte, and the cut units are NOT restored as whole units (T4.16,
+# Layout 3: the script restores what a tape holds whole, leaves the rest out and lists it; it never
+# fills a lost slice with zeros). The cut unit goes when T5.1 removes `cut`.
 SS="$RUN/short-seal"
 SS_LABEL="SS-0001"
 SSC() { "$BIN" --home "$SS/home" "$@"; }
+# RESTORE.sh of the short tape (read off it into $SS/heir), against this gate's drive.
+ss_sh() { (cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh "$@"); }
 # volumes.ended_after of the short tape: K, the last file before its seal.
 ss_ended_after() {
     python3 - "$SS/home/tapectl.db" "$SS_LABEL" <<'PY'
@@ -2607,17 +2618,19 @@ PY
         && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$SS/heir/RESTORE.sh" \
         && chmod +x "$SS/heir/RESTORE.sh" && bash -n "$SS/heir/RESTORE.sh" \
         || { echo "cannot read RESTORE.sh off the short tape"; return 1; }
+    cmp -s "$SS/heir/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh" \
+        || { echo "the RESTORE.sh on the short tape is not src/volume/heir/RESTORE.sh"; return 1; }
 }
 step_heir_short_info() {
     local k out
     k="$(ss_ended_after)" || return 1
-    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info 2>&1)" || { printf '%s\n' "$out"; return 1; }
+    out="$(ss_sh --info 2>&1)" || { printf '%s\n' "$out"; return 1; }
     printf '%s\n' "$out"
-    grep -q "Tape identifies as: $SS_LABEL\$" <<<"$out" || { echo "heir_short_info: not volume $SS_LABEL"; return 1; }
-    grep -F "Verdict: SEALED" >/dev/null <<<"$out" || { echo "heir_short_info: a short tape is SEALED"; return 1; }
-    grep -F "The tape ended early, after file $k: its seal marker, the last file, is" >/dev/null <<<"$out" \
-        || { echo "heir_short_info: no line saying the tape ended after file $k"; return 1; }
-    # 1.7.0 (ADR-0012 item 140): one NOT ON TAPE line for the planned files after the end.
+    # tests/heir_restore.rs info_on_a_short_tape_says_where_it_ended_and_names_the_planned_files_not_on_it
+    grep -E "^Tape: $SS_LABEL +uuid " >/dev/null <<<"$out" || { echo "heir_short_info: not volume $SS_LABEL"; return 1; }
+    grep -F "ended EARLY, after file $k" >/dev/null <<<"$out" \
+        || { echo "heir_short_info: no line saying the tape ended EARLY, after file $k"; return 1; }
+    # One NOT ON TAPE line for the planned files after the end (ADR-0012 item 140).
     grep -E "^  NOT ON TAPE  files $((k + 1)) to [0-9]+  \(planned; the tape ended after file $k, and its seal marker is file $((k + 1))\)\$" >/dev/null <<<"$out" \
         || { echo "heir_short_info: the file map has no NOT ON TAPE line for files $((k + 1)) on"; return 1; }
     # Lines that START with it, at any indent: the --verify verdict names it mid-sentence.
@@ -2627,42 +2640,77 @@ step_heir_short_info() {
 step_heir_short_verify() {
     local k out rc
     k="$(ss_ended_after)" || return 1
-    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --verify 2>&1)"; rc=$?
+    out="$(ss_sh --verify 2>&1)"; rc=$?
     printf '%s\n' "$out"
+    # tests/heir_restore.rs verify_on_a_short_tape_hashes_what_is_on_it_and_names_the_rest_not_on_tape
     [ "$rc" -eq 0 ] || { echo "heir_short_verify: RESTORE.sh --verify exited $rc, want 0"; return 1; }
-    grep -F "VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after" >/dev/null <<<"$out" \
-        || { echo "heir_short_verify: no PASS verdict naming the early end"; return 1; }
-    # 1.7.0 (ADR-0012 item 140): one NOT ON TAPE line for the planned files after the end.
+    grep -E "^VERIFY PASSED: [0-9]+ file\(s\) match the front index\.\$" >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: no VERIFY PASSED line"; return 1; }
     grep -E "^NOT ON TAPE  files $((k + 1)) to [0-9]+  \(planned; the tape ended after file $k, and its seal marker is file $((k + 1))\)\$" >/dev/null <<<"$out" \
         || { echo "heir_short_verify: files $((k + 1)) on, planned, are not reported NOT ON TAPE"; return 1; }
-    # Lines that START with it, at any indent: the --verify verdict names it mid-sentence.
+    # Lines that START with it, at any indent: the verdict names it mid-sentence.
     [ "$(grep -cE '^ *NOT ON TAPE' <<<"$out" || true)" -eq 1 ] \
         || { echo "heir_short_verify: want exactly one NOT ON TAPE line"; return 1; }
     if grep -E "^FAIL " <<<"$out"; then echo "heir_short_verify: a FAIL line"; return 1; fi
-    # The control: the last file on the tape, K, was hashed, and none after it.
-    grep -E "^PASS  file +$k  data_slice" >/dev/null <<<"$out" \
+    # The control: the last data slice on the tape, K, was hashed, none after it, and the seal
+    # marker (file K+1) is the one file past it that has a line.
+    grep -E "^PASS +$k +data_slice" >/dev/null <<<"$out" \
         || { echo "heir_short_verify: file $k, the last data slice on the tape, was not hashed"; return 1; }
-    if grep -E "^PASS  file +$((k + 1))  " <<<"$out"; then echo "heir_short_verify: file $((k + 1)) was hashed"; return 1; fi
+    grep -E "^PASS +$((k + 1)) +seal_marker " >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: no PASS line for the seal marker, file $((k + 1))"; return 1; }
+    if awk -v k="$k" '$1 == "PASS" && $2 + 0 > k && $3 == "data_slice" { found = 1 } END { exit found ? 0 : 1 }' <<<"$out"; then
+        echo "heir_short_verify: a data slice after file $k was hashed"; return 1
+    fi
 }
 step_heir_short_restore() {
-    (cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sa-whole \
-        --key "$SS/home/keys/alice-primary.age.key" --to "$SS/heir/recovered-whole") \
-        && diff -r "$SS/src/sa-whole" "$SS/heir/recovered-whole"
+    local d="$SS/heir/recovered-whole"
+    ss_sh --restore --unit sa-whole --key "$SS/home/keys/alice-primary.age.key" --to "$d" \
+        && diff -r "$SS/src/sa-whole" "$d"
 }
+# The cut units (until T5.1 removes `cut`): sb-cut has slices on the tape up to K, and a file
+# larger than a slice that begins in them and ends past K; sc-after has none. tests/heir_restore.rs
+# a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds and
+# a_unit_with_no_slice_on_a_short_tape_is_said_so_by_every_mode_that_knows: what the tape holds
+# whole is restored (and every file that comes back is whole), the rest is left out and LISTED,
+# the run exits 1 and says RESTORE INCOMPLETE, no byte past the tape's end was asked of it, and
+# nothing of a file tar had begun is left.
 step_heir_short_cut_refused() {
-    local out rc want
-    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-cut \
-        --key "$SS/home/keys/alice-primary.age.key" --to "$SS/heir/recovered-cut" 2>&1)"; rc=$?
-    printf '%s\n' "$out"
-    [ "$rc" -ne 0 ] || { echo "heir_short_cut_refused: the cut unit was restored from a tape that does not hold it whole"; return 1; }
-    for want in "unit 'sb-cut' (version 1) is not on this tape whole: the tape ended early," \
-        "--where 'sb-cut'" "No slice has been read."; do
-        grep -F -- "$want" >/dev/null <<<"$out" || { echo "heir_short_cut_refused: the refusal lacks \"$want\""; return 1; }
-    done
-    if [ -d "$SS/heir/recovered-cut" ] && [ -n "$(ls -A "$SS/heir/recovered-cut")" ]; then
-        echo "heir_short_cut_refused: something of the cut unit was restored"; return 1
+    local out rc d list k key="$SS/home/keys/alice-primary.age.key" f rc2=0
+    k="$(ss_ended_after)" || return 1
+    d="$SS/heir/recovered-cut"
+    out="$(ss_sh --restore --unit sb-cut --key "$key" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 16
+    [ "$rc" -eq 1 ] || { echo "heir_short_cut_refused: the cut unit exited $rc, want 1"; rc2=1; }
+    grep -F "RESTORE INCOMPLETE" >/dev/null <<<"$out" || { echo "heir_short_cut_refused: no RESTORE INCOMPLETE"; rc2=1; }
+    grep -F "is after the end of this tape (it ended after file $k)" >/dev/null <<<"$out" \
+        || { echo "heir_short_cut_refused: the slices after the end are not said to be after the end of the tape"; rc2=1; }
+    list="$d/.tapectl-damaged-files.txt"
+    if [ -f "$list" ] && tail -n +2 "$list" | grep -Fx forty-megs.bin >/dev/null; then :; else
+        echo "heir_short_cut_refused: the damaged-file list does not name forty-megs.bin"; rc2=1
+    fi
+    [ ! -e "$d/forty-megs.bin" ] || { echo "heir_short_cut_refused: a partial forty-megs.bin was left"; rc2=1; }
+    # Whatever came back is whole: no zero-filled stand-in.
+    if [ -d "$d" ]; then
+        while IFS= read -r f; do
+            f="${f#"$d"/}"
+            [ "$f" = .tapectl-damaged-files.txt ] && continue
+            cmp "$SS/src/sb-cut/$f" "$d/$f" || { echo "heir_short_cut_refused: $f is not whole"; rc2=1; }
+        done < <(find "$d" -type f)
+    fi
+    # The unit planned after the end: no slice of it is on the tape, said by --list.
+    out="$(ss_sh --list --key "$key" --unit sc-after 2>&1)"
+    grep -F "PART: this tape holds none of its " >/dev/null <<<"$out" \
+        || { printf '%s\n' "$out"; echo "heir_short_cut_refused: --list sc-after does not say the tape holds none of its slices"; rc2=1; }
+    d="$SS/heir/recovered-after"
+    out="$(ss_sh --restore --unit sc-after --key "$key" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 1 ] || { echo "heir_short_cut_refused: sc-after exited $rc, want 1"; rc2=1; }
+    [ ! -e "$d/after.txt" ] || { echo "heir_short_cut_refused: sc-after's file was restored from a tape that does not hold it"; rc2=1; }
+    if [ -f "$d/.tapectl-damaged-files.txt" ] && tail -n +2 "$d/.tapectl-damaged-files.txt" | grep -Fx after.txt >/dev/null; then :; else
+        echo "heir_short_cut_refused: the damaged-file list does not name after.txt"; rc2=1
     fi
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+    return "$rc2"
 }
 echo "gate: heir_short_* — a short tape, read by RESTORE.sh with the real tools (#420)"
 check heir_short_seal      step_heir_short_seal
@@ -2671,315 +2719,129 @@ check heir_short_verify    step_heir_short_verify
 check heir_short_restore   step_heir_short_restore
 check heir_short_cut_refused step_heir_short_cut_refused
 
-# ---------- heir_big_catalogue: a unit whose catalogue dar leaves unread (#497) ----------
-# RESTORE.sh streams a unit into `dar -x --sequential-read -A <catalogue>`. Given the
-# catalogue, dar stops at the end of the file data and exits 0: it never reads the
-# archive's own trailing catalogue. With thousands of files that tail is far more than
-# a pipe holds, and before #497 the restore ended "FATAL: dar extraction failed (exit
-# 0)" over a tree restored whole (home2, 2026-10-25). Every heir leg above restores
-# units of a handful of files, whose tail fits in the pipe, so none could see it.
-# This one: a throwaway home, alice's one unit of 4000 small files with long names in
-# 6 MiB slices (the catalogue near 1.2 MB, in the last slice after the end of the
-# data: home2's shape; sized so heir_late_damage, after it, can damage that tail),
-# written to the cartridge in the drive, restored by the RESTORE.sh on that tape with
-# the real age, dar, mt and tar. It must exit 0 with RESTORE COMPLETE and no FATAL,
-# check every slice against the front index, run the per-file check over every file,
-# and give back the tree. It leaves the tape in the drive for heir_late_damage, which
-# erases it. Runs in well under a minute.
-BC="$RUN/big-catalogue"
-BC_LABEL="BC-0001"
-BCC() { "$BIN" --home "$BC/home" "$@"; }
-# One value from the throwaway home's catalog, read-only; fails on no row or a NULL.
-bc_q() { # bc_q <sql>
-    python3 - "$BC/home/tapectl.db" "$1" <<'PY'
-import sqlite3, sys
-row = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(sys.argv[2]).fetchone()
-assert row is not None and row[0] is not None, f"no value for: {sys.argv[2]}"
-print(row[0])
-PY
-}
-# Judge a RESTORE.sh --restore of one whole unit by its output (stdin): RESTORE COMPLETE,
-# no FATAL line, exactly <slices> slices checked against the front index, and the file
-# check's line for <files> files. Says what is missing; exit 1 if anything is. Pure text:
-# tests/heir_restore_sh.rs extracts it and runs it on RESTORE.sh's real output.
-heir_judge_whole_restore() { # heir_judge_whole_restore <unit> <version> <slices> <files>
-    local out n bad=0
-    out="$(cat)"
-    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; bad=1; }
-    if grep -F "FATAL" <<<"$out"; then
-        echo "a FATAL line"
-        bad=1
-    fi
-    n="$(grep -cF "  checksum verified against front index" <<<"$out")" || true
-    [ "$n" = "$3" ] || { echo "$n slice(s) checked against the front index, want $3"; bad=1; }
-    grep -F "File check: $4 restored file(s) of '$1' version $2 match the sha256 recorded in the index" >/dev/null <<<"$out" \
-        || { echo "no file check line for $4 file(s) of '$1' version $2"; bad=1; }
-    return "$bad"
-}
-step_heir_big_catalogue() {
-    local out rc n files cat_path cat_len
-    rm -rf "$BC"; mkdir -p "$BC/src/bc-many" "$BC/home/staging" "$BC/heir"
-    # 4000 files of 1600 bytes, names of about 200 characters: the names are what
-    # make dar's catalogue large.
-    python3 - "$BC/src/bc-many" <<'PY' || { echo "cannot make the source tree"; return 1; }
-import os, sys
-for i in range(4000):
-    name = f"{i:04d}-" + "n" * 190 + ".bin"
-    with open(os.path.join(sys.argv[1], name), "wb") as f:
-        f.write(os.urandom(1600))
-PY
+# ---------- heir_{gzip,xz,zstd}_{restore,path}: a compressed unit, read with the real decompressor ----------
+# Layout 3 compresses each slice alone (after the cut, before the encryption); the heir's script
+# decompresses it with the host's gzip, xz or zstd and checks the plain cut's length and hash, never
+# the decompressor's exit status (tests/heir_restore.rs a_compressed_unit_restores_whole_for_each_
+# algorithm_carried, a_decompressor_that_exits_0_after_short_output_is_caught_by_the_slice_length).
+# One tape, three units of alice's (zu-gzip, zu-xz, zu-zstd), each with `[policy] compression =
+# "<alg>"` in its dotfile; each holds text that shrinks, noise that does not, a nested file, and a
+# file larger than a slice (a run). The tape is made by the first of the six legs to run, and the
+# others find it ready (a failure there fails every one of them, with the first's log named).
+# Each *_restore leg restores the whole unit with the real decompressor on PATH, byte for byte,
+# and the control: a decompressor stand-in that fails, first on PATH, must NOT complete the restore
+# (the script runs the one on PATH, so the real one is the one that ran); each *_path leg restores
+# two paths and then the long file by --path, byte for byte.
+CZ="$RUN/compressed"
+CZ_LABEL="CZ-0001"
+CZC() { "$BIN" --home "$CZ/home" "$@"; }
+cz_sh() { (cd "$CZ/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh "$@"); }
+cz_make() {
+    local a u
+    rm -rf "$CZ"; mkdir -p "$CZ/home/staging" "$CZ/heir" "$CZ/stub" || return 1
+    for a in gzip xz zstd; do
+        u="zu-$a"
+        mkdir -p "$CZ/src/$u/deep"
+        seq 1 300000 >"$CZ/src/$u/text.txt"                       # compressible
+        head -c 1500000 /dev/urandom >"$CZ/src/$u/noise.bin"      # not
+        echo "note of $a" >"$CZ/src/$u/deep/note.txt"
+        head -c 3500000 /dev/urandom >"$CZ/src/$u/big.bin"        # larger than a slice (1M): a run
+    done
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
-    # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
-    # its secret going only to this run's log.
-    BCC init --operator gate-bc \
-        && BCC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
-        && BCC config set staging.directory "$BC/home/staging" \
-        && BCC config set defaults.slice_size 6M \
-        && BCC tenant add alice \
-        && BCC unit init "$BC/src/bc-many" --tenant alice --name bc-many \
-        && BCC snapshot create bc-many \
-        && BCC stage create bc-many \
-        || { echo "home: init/drive add/config set/tenant add/unit init/snapshot/stage failed"; return 1; }
-    # The fixture's own control: the catalogue dar is given is far more than a pipe
-    # holds (64 KiB), and the unit has more than one slice.
-    cat_path="$(bc_q "SELECT catalog_path FROM stage_sets")" || return 1
-    cat_len="$(stat -c %s "$cat_path.1.dar")" || { echo "no isolated catalogue at $cat_path.1.dar"; return 1; }
-    [ "$cat_len" -gt 524288 ] || { echo "the catalogue is $cat_len bytes: this check needs one above 512 KiB"; return 1; }
-    n="$(bc_q "SELECT COUNT(*) FROM stage_slices")" || return 1
-    [ "$n" -ge 2 ] || { echo "the unit has $n slice(s): this check needs several"; return 1; }
-    files="$(find "$BC/src/bc-many" -type f | wc -l)"
-    echo "bc-many: $files files, $n slices, a $cat_len-byte catalogue"
-    BCC volume init "$BC_LABEL" --device "$TAPE_DEV" || return 1
-    BCC volume write "$BC_LABEL" --device "$TAPE_DEV" --yes || return 1
+    CZC init --operator gate-z \
+        && CZC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && CZC config set staging.directory "$CZ/home/staging" \
+        && CZC config set defaults.slice_size 1M \
+        && CZC tenant add alice \
+        || { echo "home: init/drive add/config set/tenant add failed"; return 1; }
+    for a in gzip xz zstd; do
+        u="zu-$a"
+        CZC unit init "$CZ/src/$u" --tenant alice --name "$u" || { echo "unit init $u failed"; return 1; }
+        gate_unit_policy "$CZ/src/$u" "compression = \"$a\"" || return 1
+        CZC snapshot create "$u" && CZC stage create "$u" || { echo "snapshot or stage of $u failed"; return 1; }
+        # The staging was packed with $a: a leg that read an uncompressed unit would prove nothing.
+        [ "$(gate_q "$CZ/home/tapectl.db" "SELECT ss.compression FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+            JOIN units u ON u.id = s.unit_id WHERE u.name = ?" "$u")" = "$a" ] \
+            || { echo "the catalog does not say $u was staged with $a"; return 1; }
+    done
+    CZC volume init "$CZ_LABEL" --device "$TAPE_DEV" && CZC volume write "$CZ_LABEL" --device "$TAPE_DEV" --yes \
+        || { echo "volume init/write of the compressed tape failed"; return 1; }
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
-        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$BC/heir/RESTORE.sh" \
-        && chmod +x "$BC/heir/RESTORE.sh" && bash -n "$BC/heir/RESTORE.sh" \
-        || { echo "cannot read RESTORE.sh off the tape"; return 1; }
-    out="$(cd "$BC/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit bc-many \
-        --key "$BC/home/keys/alice-primary.age.key" --to "$BC/heir/recovered" 2>&1)"; rc=$?
-    printf '%s\n' "$out" | tail -n 40
-    [ "$rc" -eq 0 ] || { echo "heir_big_catalogue: RESTORE.sh exited $rc, want 0"; return 1; }
-    heir_judge_whole_restore bc-many 1 "$n" "$files" <<<"$out" || return 1
-    diff -r "$BC/src/bc-many" "$BC/heir/recovered" || return 1
-    # The tape stays in the drive: heir_late_damage reads it next, and erases it.
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$CZ/heir/RESTORE.sh" \
+        && chmod +x "$CZ/heir/RESTORE.sh" && bash -n "$CZ/heir/RESTORE.sh" \
+        || { echo "cannot read RESTORE.sh off the compressed tape"; return 1; }
+    cmp -s "$CZ/heir/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh" \
+        || { echo "the RESTORE.sh on the compressed tape is not src/volume/heir/RESTORE.sh"; return 1; }
 }
-echo "gate: heir_big_catalogue — a unit whose catalogue dar leaves unread (#497)"
-check heir_big_catalogue   step_heir_big_catalogue
-
-# ---------- heir_late_damage: damage only in what dar never needed (ADR-0012 item 182) ----------
-# Item 182 changed what RESTORE.sh does with damage found in the tail of a unit that dar,
-# given its catalogue, never reads (#497): it names the slice and the tape, goes on, checks
-# every file against the index, and is a whole restore if every file matches. ADR-0012 item
-# 70: the heir path is proven only with the real tools, so this leg reads
-# heir_big_catalogue's tape, which that leg leaves in the drive for it (this one erases it),
-# through the gate's dd stand-in (heir_write_injector). The stand-in flips one byte of the
-# LAST slice's ciphertext 2048 bytes before its recorded end: inside the slice, never in the
-# block padding, and inside the catalogue at the end of the archive, far past where dar
-# stops. The real age then cannot authenticate that chunk, so the slice's sha256 cannot
-# match the front index either.
-#
-# The caveat, and so the precondition. The note needs dar to have closed its stream BEFORE
-# age reaches the damage (RESTORE.sh's join.closed). Between age and dar lie a few pipes and
-# an age chunk, about 400 KiB with dar's own read-ahead, so damage within that distance of
-# where dar stops can be found while dar still reads, and that restore ends FATAL as it
-# always has: the stricter outcome, never a false pass. The leg therefore checks first,
-# failing closed, that the unit's isolated catalogue (the size of what dar leaves unread at
-# the end of the archive) is at least 1 MiB and lies inside the last slice.
-# heir_big_catalogue's unit is sized for it: 4000 files in 6 MiB slices, measured with dar
-# 2.7.13 at a 1,188,461-byte catalogue in a last slice of 2,817,557 bytes.
-#
-# Judge a RESTORE.sh --restore of one whole unit whose slice <slice> (tape file <file> of
-# <label>) is damaged after the point dar needed, by its output (stdin): RESTORE COMPLETE,
-# no FATAL line, <slices> - 1 slices checked against the front index, the file check's line
-# for <files> files, the note at the slice, and the note again in the closing summary, after
-# RESTORE COMPLETE. Says what is missing; exit 1 if anything is. Pure text:
-# tests/heir_restore_sh.rs extracts it and runs it on RESTORE.sh's real output.
-heir_judge_late_damage() { # heir_judge_late_damage <unit> <version> <slices> <files> <slice> <tape file> <label>
-    local out n note bad=0
-    out="$(cat)"
-    note="slice $5 of '$1' (tape file $6 of $7) is damaged after the point this restore needed"
-    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; bad=1; }
-    if grep -F "FATAL" <<<"$out"; then
-        echo "a FATAL line"
-        bad=1
-    fi
-    n="$(grep -cF "  checksum verified against front index" <<<"$out")" || true
-    [ "$n" = "$(($3 - 1))" ] || { echo "$n slice(s) checked against the front index, want $(($3 - 1))"; bad=1; }
-    grep -F "File check: $4 restored file(s) of '$1' version $2 match the sha256 recorded in the index" >/dev/null <<<"$out" \
-        || { echo "no file check line for $4 file(s) of '$1' version $2"; bad=1; }
-    grep -Fx -- "NOTE: $note:" >/dev/null <<<"$out" || { echo "no note at the slice: NOTE: $note:"; bad=1; }
-    awk -v c="RESTORE COMPLETE" -v want=">>> NOTE: $note." '
-        index($0, c) && !at { at = NR }
-        at && NR > at && $0 == want { found = 1 }
-        END { exit !found }' <<<"$out" \
-        || { echo "the closing summary does not repeat the note: >>> NOTE: $note."; bad=1; }
-    return "$bad"
-}
-step_heir_late_damage() {
-    local w="$BC/late" out rc n files cat_path cat_len last_plain last_enc pos fault real_dd real_mt
-    [ "${RESULT[heir_big_catalogue]:-}" = PASS ] \
-        || { echo "heir_big_catalogue did not pass, so there is no known-good tape for this leg"; return 1; }
-    [ -x "$BC/heir/RESTORE.sh" ] && [ -f "$BC/home/tapectl.db" ] \
-        || { echo "heir_big_catalogue left no RESTORE.sh or home for this leg"; return 1; }
-    rm -rf "$w"; mkdir -p "$w/inject"
-    n="$(bc_q "SELECT COUNT(*) FROM stage_slices")" || return 1
-    cat_path="$(bc_q "SELECT catalog_path FROM stage_sets")" || return 1
-    cat_len="$(stat -c %s "$cat_path.1.dar")" || { echo "no isolated catalogue at $cat_path.1.dar"; return 1; }
-    last_plain="$(bc_q "SELECT size_bytes FROM stage_slices WHERE slice_number = $n")" || return 1
-    last_enc="$(bc_q "SELECT encrypted_bytes FROM stage_slices WHERE slice_number = $n")" || return 1
-    pos="$(bc_q "SELECT wp.position FROM write_positions wp
-                   JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-                  WHERE sl.slice_number = $n AND wp.status = 'written'")" || return 1
-    # The precondition (see above): what dar leaves unread is far more than the pipes hold.
-    [ "$cat_len" -ge 1048576 ] \
-        || { echo "precondition: the catalogue is $cat_len bytes, under 1 MiB: damage at the end could be found while dar reads"; return 1; }
-    [ "$cat_len" -lt "$last_plain" ] \
-        || { echo "precondition: the $cat_len-byte catalogue is not inside the last slice ($last_plain bytes)"; return 1; }
-    fault=$((last_enc - 2048))
-    echo "bc-many: $n slices; slice $n is tape file $pos, $last_enc bytes; the byte at $fault is flipped"
-    files="$(find "$BC/src/bc-many" -type f | wc -l)" || { echo "cannot count the unit's files"; return 1; }
-    real_dd="$(command -v dd)"
-    real_mt="$(command -v mt-st || command -v mt)"
-    heir_write_injector "$w/inject/dd"
-    : >"$w/fault.log"
-    out="$(cd "$BC/heir" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$pos" \
-        "FAULT_AT=$fault" "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit bc-many \
-        --key "$BC/home/keys/alice-primary.age.key" --to "$w/recovered" 2>&1)"; rc=$?
-    printf '%s\n' "$out" | tail -n 40
-    grep -F "flipped one byte of tape file $pos" >/dev/null "$w/fault.log" \
-        || { echo "the stand-in never flipped a byte of tape file $pos, so the run proves nothing"; return 1; }
-    [ "$rc" -eq 0 ] || { echo "heir_late_damage: RESTORE.sh exited $rc, want 0"; return 1; }
-    heir_judge_late_damage bc-many 1 "$n" "$files" "$n" "$pos" "$BC_LABEL" <<<"$out" || return 1
-    diff -r "$BC/src/bc-many" "$w/recovered" || return 1
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
-}
-echo "gate: heir_late_damage — damage only in what dar never needed (ADR-0012 item 182)"
-check heir_late_damage     step_heir_late_damage
-
-# ---------- heir_slice_boundary_read: a slice that ends where a dar read ends (#498) ----------
-# dar 2.7.7 to 2.8.6, reading a sliced archive one named pipe per slice, finds a slice's
-# end only on a short read: where one of its reads ends on the last byte of a slice, the
-# slice's one-byte trailer comes back as data, and the unit fails "Bad CRC", exit 5, the
-# same way every time. RESTORE.sh fed dar that way up to 1.7.x; from 1.8.0 it joins the
-# slices back into one stream on dar's standard input (ADR-0012 item 181). This one: a
-# throwaway home, alice's unit bsr-bound of one 3,000,000-byte file of noise, staged by
-# tapectl at the trigger size P + 10 x 102,400, where P is where the file's data begins
-# in slice 1 (measured on bsr-probe, the same file staged in one slice, and checked on
-# bsr-bound itself): slice 1's payload then ends on the last byte of dar's tenth
-# 102,400-byte read of the file's data. Written to the cartridge in the drive, and
-# restored by the RESTORE.sh on that tape, streamed, with the real age, dar, mt and tar.
-# It must exit 0 with RESTORE COMPLETE, no FATAL and no "Bad CRC", check every slice
-# against the front index, run the per-file check, and give back the tree. Runs in well
-# under a minute.
-BSR="$RUN/slice-boundary"
-BSR_LABEL="BSR-0001"
-BSRC() { "$BIN" --home "$BSR/home" "$@"; }
-# One value from the throwaway home's catalog, read-only; fails on no row or a NULL.
-bsr_q() { # bsr_q <sql> [param...]
-    python3 - "$BSR/home/tapectl.db" "$@" <<'PY'
-import sqlite3, sys
-db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-row = db.execute(sys.argv[2], sys.argv[3:]).fetchone()
-assert row is not None and row[0] is not None, f"no value for: {sys.argv[2]} {sys.argv[3:]}"
-print(row[0])
-PY
-}
-# Slice 1 of <unit>'s staging, decrypted with alice's key into $BSR/<unit>.1.plain.
-bsr_slice1() { # bsr_slice1 <unit>
-    local slice
-    slice="$(bsr_q "SELECT sl.staging_path FROM stage_slices sl
-                      JOIN stage_sets ss ON ss.id = sl.stage_set_id
-                      JOIN snapshots s ON s.id = ss.snapshot_id
-                      JOIN units u ON u.id = s.unit_id
-                     WHERE u.name = ? AND sl.slice_number = 1" "$1")" || return 1
-    age -d -i "$BSR/home/keys/alice-primary.age.key" "$slice" >"$BSR/$1.1.plain" \
-        || { echo "cannot decrypt slice 1 of $1 ($slice)"; return 1; }
-}
-step_heir_slice_boundary_read() {
-    local out rc n p size files
-    rm -rf "$BSR"; mkdir -p "$BSR/src/bsr-probe" "$BSR/src/bsr-bound" "$BSR/home/staging" "$BSR/heir"
-    # Noise with no zero byte: dar stores a run of zeros as a hole, and the file's data
-    # would no longer be one run of the archive. The same file, times and all, twice.
-    python3 - "$BSR/src/bsr-probe/one.bin" <<'PY' || { echo "cannot make the source file"; return 1; }
-import os, sys
-with open(sys.argv[1], "wb") as f:
-    f.write(os.urandom(3000000).replace(b"\0", b"\1"))
-PY
-    cp -p "$BSR/src/bsr-probe/one.bin" "$BSR/src/bsr-bound/one.bin" || { echo "cannot copy the source file"; return 1; }
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
-    # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
-    # its secret going only to this run's log.
-    BSRC init --operator gate-bsr \
-        && BSRC drive add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
-        && BSRC config set staging.directory "$BSR/home/staging" \
-        && BSRC tenant add alice \
-        && BSRC unit init "$BSR/src/bsr-probe" --tenant alice --name bsr-probe \
-        && BSRC unit init "$BSR/src/bsr-bound" --tenant alice --name bsr-bound \
-        && BSRC snapshot create bsr-probe \
-        && BSRC snapshot create bsr-bound \
-        && BSRC config set defaults.slice_size 16M \
-        && BSRC stage create bsr-probe \
-        || { echo "home: init/drive add/config set/tenant add/unit init/snapshot/probe stage failed"; return 1; }
-    bsr_slice1 bsr-probe || return 1
-    p="$(python3 - "$BSR/bsr-probe.1.plain" "$BSR/src/bsr-probe/one.bin" <<'PY'
-import sys
-s = open(sys.argv[1], "rb").read()
-f = open(sys.argv[2], "rb").read()
-at = s.find(f[:64])
-assert 0 < at and s[at:at + len(f)] == f, "the probe's one slice does not hold the file in one run"
-print(at)
-PY
-)" || { echo "cannot find where the file's data begins in the probe's slice 1"; return 1; }
-    size=$((p + 10 * 102400))
-    echo "the file's data begins at byte $p of slice 1: the trigger slice size is $size"
-    BSRC config set defaults.slice_size "$size" && BSRC stage create bsr-bound \
-        || { echo "cannot stage bsr-bound at $size bytes"; return 1; }
-    # The shape's own control, on bsr-bound itself: three slices, slice 1 exactly $size
-    # bytes, holding the file from byte $p to its last payload byte, which ends dar's
-    # tenth read of the file's data.
-    n="$(bsr_q "SELECT COUNT(*) FROM stage_slices sl
-                  JOIN stage_sets ss ON ss.id = sl.stage_set_id
-                  JOIN snapshots s ON s.id = ss.snapshot_id
-                  JOIN units u ON u.id = s.unit_id
-                 WHERE u.name = ?" bsr-bound)" || return 1
-    [ "$n" -eq 3 ] || { echo "bsr-bound has $n slice(s): the trigger shape has 3"; return 1; }
-    bsr_slice1 bsr-bound || return 1
-    python3 - "$BSR/bsr-bound.1.plain" "$BSR/src/bsr-bound/one.bin" "$p" "$size" <<'PY' \
-        || { echo "bsr-bound is not at the trigger shape"; return 1; }
-import sys
-s = open(sys.argv[1], "rb").read()
-f = open(sys.argv[2], "rb").read()
-p, size = int(sys.argv[3]), int(sys.argv[4])
-held = size - 1 - p
-assert len(s) == size, f"slice 1 is {len(s)} bytes, not {size}"
-assert s[p:size - 1] == f[:held], "slice 1 does not hold the file from byte p to its last payload byte"
-assert held + 1 == 10 * 102400, "the shape is not the trigger"
-PY
-    # Every file of the unit, its own dotfile included, as heir_big_catalogue counts them.
-    files="$(find "$BSR/src/bsr-bound" -type f | wc -l)" || { echo "cannot count the unit's files"; return 1; }
-    BSRC volume init "$BSR_LABEL" --device "$TAPE_DEV" || return 1
-    BSRC volume write "$BSR_LABEL" --device "$TAPE_DEV" --yes || return 1
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
-        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$BSR/heir/RESTORE.sh" \
-        && chmod +x "$BSR/heir/RESTORE.sh" && bash -n "$BSR/heir/RESTORE.sh" \
-        || { echo "cannot read RESTORE.sh off the tape"; return 1; }
-    out="$(cd "$BSR/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit bsr-bound \
-        --key "$BSR/home/keys/alice-primary.age.key" --to "$BSR/heir/recovered" 2>&1)"; rc=$?
-    printf '%s\n' "$out" | tail -n 40
-    [ "$rc" -eq 0 ] || { echo "heir_slice_boundary_read: RESTORE.sh exited $rc, want 0"; return 1; }
-    # Streamed into dar (the way #498 broke), not read from slices on disk.
-    grep -F "Slice 1/$n — tape file" >/dev/null <<<"$out" \
-        || { echo "heir_slice_boundary_read: the unit was not streamed into dar"; return 1; }
-    if grep -F "Bad CRC" <<<"$out"; then
-        echo "heir_slice_boundary_read: dar said Bad CRC"
+cz_prepare() {
+    [ -f "$CZ/ready" ] && return 0
+    if [ -f "$RUN/compressed.failed" ]; then
+        echo "the compressed tape could not be made: see the log of the first heir_{gzip,xz,zstd}_* leg that ran"
         return 1
     fi
-    heir_judge_whole_restore bsr-bound 1 "$n" "$files" <<<"$out" || return 1
-    diff -r "$BSR/src/bsr-bound" "$BSR/heir/recovered" || return 1
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+    if cz_make; then : >"$CZ/ready"; return 0; fi
+    : >"$RUN/compressed.failed"
+    return 1
 }
-echo "gate: heir_slice_boundary_read — a slice that ends where a dar read ends (#498)"
-check heir_slice_boundary_read step_heir_slice_boundary_read
+cz_restore() { # cz_restore <algorithm>
+    local a="$1" u key out rc d needle
+    u="zu-$a"; key="$CZ/home/keys/alice-primary.age.key"
+    cz_prepare || return 1
+    # The envelope says the unit is compressed with $a (tests/heir_restore.rs a_decompressor_is_needed_only_by_a_unit_that_states_one).
+    out="$(cz_sh --find-envelope --key "$key" 2>&1)" || { printf '%s\n' "$out"; return 1; }
+    grep -E "^  $u  version 1  [0-9]+ slice\(s\)  [0-9]+ bytes  compressed with $a\$" >/dev/null <<<"$out" \
+        || { printf '%s\n' "$out"; echo "the envelope does not say $u is compressed with $a"; return 1; }
+    # The control first: a decompressor that fails, first on PATH, must not give a complete restore.
+    printf '#!/bin/sh\nexit 99\n' >"$CZ/stub/$a"; chmod +x "$CZ/stub/$a"
+    d="$CZ/heir/stubbed-$a"
+    out="$(cd "$CZ/heir" && env "PATH=$CZ/stub:$PATH" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit "$u" --key "$key" --to "$d" 2>&1)"; rc=$?
+    rm -f "$CZ/stub/$a"
+    if [ "$rc" -eq 0 ] || grep -F "RESTORE COMPLETE" >/dev/null <<<"$out"; then
+        printf '%s\n' "$out" | tail -n 10
+        echo "control: a failing $a on PATH still gave a complete restore: the script is not running the $a on PATH"; return 1
+    fi
+    # The real decompressor.
+    d="$CZ/heir/restored-$a"
+    out="$(cz_sh --restore --unit "$u" --key "$key" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 12
+    [ "$rc" -eq 0 ] || { echo "heir_${a}_restore: exited $rc, want 0"; return 1; }
+    for needle in "RESTORE COMPLETE" "regular file(s) match the sha256 in the unit's file table"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_${a}_restore: the output lacks \"$needle\""; return 1; }
+    done
+    diff -r "$CZ/src/$u" "$d" || { echo "heir_${a}_restore: the restored tree differs from the source"; return 1; }
+    [ ! -e "$d/.tapectl-damaged-files.txt" ] || { echo "heir_${a}_restore: a damaged-file list on a clean restore"; return 1; }
+}
+cz_path() { # cz_path <algorithm>
+    local a="$1" u key out rc d
+    u="zu-$a"; key="$CZ/home/keys/alice-primary.age.key"
+    cz_prepare || return 1
+    d="$CZ/heir/path-$a"
+    out="$(cz_sh --restore --unit "$u" --key "$key" --to "$d" --path text.txt --path deep/note.txt 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 10
+    [ "$rc" -eq 0 ] || { echo "heir_${a}_path: two paths exited $rc, want 0"; return 1; }
+    grep -F "File check: all 2 regular file(s) named" >/dev/null <<<"$out" || { echo "heir_${a}_path: no 'File check: all 2 regular file(s) named'"; return 1; }
+    cmp "$CZ/src/$u/text.txt" "$d/text.txt" && cmp "$CZ/src/$u/deep/note.txt" "$d/deep/note.txt" || { echo "heir_${a}_path: a path differs from the source"; return 1; }
+    [ "$(find "$d" -type f | wc -l)" = 2 ] || { echo "heir_${a}_path: more than the two files were restored"; return 1; }
+    # The long file, a run of compressed slices, by its own path.
+    d="$CZ/heir/path-long-$a"
+    out="$(cz_sh --restore --unit "$u" --key "$key" --to "$d" --path big.bin 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 6
+    [ "$rc" -eq 0 ] || { echo "heir_${a}_path: --path big.bin exited $rc, want 0"; return 1; }
+    cmp "$CZ/src/$u/big.bin" "$d/big.bin" || { echo "heir_${a}_path: big.bin differs from the source"; return 1; }
+}
+step_heir_gzip_restore() { cz_restore gzip; }
+step_heir_gzip_path() { cz_path gzip; }
+step_heir_xz_restore() { cz_restore xz; }
+step_heir_xz_path() { cz_path xz; }
+step_heir_zstd_restore() { cz_restore zstd; }
+step_heir_zstd_path() { cz_path zstd; }
+echo "gate: heir_{gzip,xz,zstd}_* — a compressed unit, read by RESTORE.sh with the real decompressor"
+check heir_gzip_restore    step_heir_gzip_restore
+check heir_gzip_path       step_heir_gzip_path
+check heir_xz_restore      step_heir_xz_restore
+check heir_xz_path         step_heir_xz_path
+check heir_zstd_restore    step_heir_zstd_restore
+check heir_zstd_path       step_heir_zstd_path
 
 # ---------- span_*: a unit across tapes, written and read on mhvtl (1.7.0; #478) ----------
 # ADR-0012 item 136: the mhvtl proof of spanning is this one leg, judged by test name, with the
