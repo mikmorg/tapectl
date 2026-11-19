@@ -13,9 +13,11 @@
 //!    started on, or the last one a substitution moved to. The slice
 //!    streams off the tape into a decrypt thread chunk by chunk
 //!    ([`crate::crypto::chunks`]), each 64 KiB chunk authenticated before
-//!    it is written to the sink, and the whole ciphertext is hashed on the
-//!    way. A clean read ends there; a clean restore costs exactly what it
-//!    did before this module.
+//!    it is kept, and the whole ciphertext is hashed on the way. The
+//!    authenticated plaintext is held in memory, whole: a slice's cut is at
+//!    most `slice_size` (`volume-format-v3.md` §3.3), and the reader that
+//!    follows ([`super::reader`]) cuts members out of it by their offsets.
+//!    A clean read ends there.
 //! 2. **A chunk that does not authenticate stops the delivery** at the
 //!    chunk before it (never a byte of unauthenticated plaintext), and the
 //!    tape is still read to its end for the hash. The cause is then known:
@@ -25,9 +27,7 @@
 //! 3. **The plaintext already delivered stays delivered.** The next copy is
 //!    decrypted from the start but its first `delivered` bytes are skipped:
 //!    the ciphertext is identical, so those bytes are the same. That is what
-//!    lets a streamed restore swap cartridges mid-slice, with the stream on
-//!    dar's standard input held open across the swap, and it lets a second
-//!    copy supply only what the first could not.
+//!    lets a second copy supply only what the first could not.
 //! 4. **Another cartridge is asked for** — by label, sticker and chip
 //!    serial — when a medium fault was the cause and the catalog knows
 //!    another holder ([`crate::volume::slice_holders`], a range included
@@ -41,10 +41,12 @@
 //!    for a person (it cannot load a cartridge).
 //! 6. **Nothing can supply it, or the operator declined**: the slice is read
 //!    once more from the cartridge in the drive with every bad chunk
-//!    written as a hole of zeros ([`Mode::Tolerant`]), the damaged byte
-//!    ranges are recorded, and the restore goes on. dar's own per-file CRCs
-//!    then name the files the holes fell in. Only what authenticates is ever
-//!    written; a hole is zeros.
+//!    recorded as a *hole* ([`Mode::Tolerant`]), a byte range that holds no
+//!    authentic byte, and the restore goes on. A hole is a range the reader
+//!    skips (item 264: no reader zero-fills a lost slice and none feeds tar
+//!    anything it did not authenticate): the placeholder that keeps the
+//!    offsets of the bytes after it is held in memory only and is never
+//!    handed to tar. Only what authenticates is ever fed.
 //!
 //! # A version across cartridges (#478)
 //!
@@ -56,11 +58,11 @@
 //! serial), with no damage behind it: the drive is released before the
 //! prompt, the cartridge that is loaded is accepted only by its identity
 //! check, and a slice is read from it only at a position the catalog records
-//! at or before its tape's end (`volume-format-v2.md` §4.2 R1 and R5, through
-//! [`crate::volume::slice_holders::holders_of`]). The streamed restore keeps
-//! dar waiting on its standard input across the swap, so the cartridges feed
-//! one extraction. Such a prompt offers no "skip": a restore
-//! needs every slice, in slice order (§4.4 R7).
+//! at or before its tape's end (`volume-format-v3.md` §5.1, R1 and R5,
+//! through [`crate::volume::slice_holders::holders_of`]). The reader keeps
+//! tar waiting on its standard input across the swap, so the cartridges
+//! feed one extraction. Such a prompt offers "I do not have it" (item 266,
+//! R7): the restore then goes on with what it has and lists the rest.
 //!
 //! # What proves a slice whole
 //!
@@ -73,21 +75,19 @@
 //!   hashes nothing more): the bytes are the bytes written, whatever the
 //!   reads that made them up, provided every read was the same age file.
 //! - **The plaintext hash matched** the checksum recorded for the slice
-//!   (`sha256_plain`), when the ciphertext's did not — a copy whose bad bytes
-//!   lay in what another copy had already given. A spooled slice is hashed
-//!   from its file when asked; a streamed one keeps a running hash from its
-//!   second read on (what went to dar on the first cannot be hashed
-//!   after the fact, so a slice whose first read was cut short and finished
-//!   by another is *unproven* when streamed).
+//!   (`sha256_plain`, of the cut before compression), when the ciphertext's
+//!   did not — a copy whose bad bytes lay in what another copy had already
+//!   given. For a compressed staging the delivered bytes are the frame, so
+//!   they are decoded first ([`SliceOut::cut`]) and the cut's hash is the
+//!   one compared.
 //!
 //! Anything else is not whole. A read whose file is not the one that began
 //! the slice (its header and nonce differ) is refused outright: chunks of
 //! two files are never mixed. A plaintext that does not match is the wrong
-//! slice — a spooled one is dropped and another copy tried, a streamed one
-//! cannot be taken back out of dar and fails the restore, by name. A slice
-//! that cannot be shown either way (holes; no recorded checksum; a stream) is
-//! **unproven**: the restore records it ([`Damage`]) and judges the files in
-//! it one by one against their recorded checksums.
+//! slice: it is dropped and another copy tried, and with none the whole
+//! slice is a hole. A slice that cannot be shown either way (holes; no
+//! recorded checksum) is **unproven**: the restore records it ([`Damage`])
+//! and judges the files in it one by one against their recorded checksums.
 //!
 //! # The contacts
 //!
@@ -102,7 +102,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Range;
-use std::path::Path;
 
 use age::secrecy::zeroize::Zeroizing;
 use rusqlite::Connection;
@@ -112,10 +111,10 @@ use tracing::{info, warn};
 use super::{Detachable, WritePositionInfo};
 use crate::config::{Config, LtoBackendConfig};
 use crate::crypto::chunks::{self, Next};
-use crate::dar;
 use crate::error::{Result, TapectlError};
 use crate::pass_count::Sha256;
 use crate::progress;
+use crate::staging::pack::Algorithm;
 use crate::store::{Store, TapeStore};
 use crate::tape::contact::{self, ContactGuard, ContactSite, Medium, Operation};
 use crate::tape::mam::MamInfo;
@@ -128,7 +127,7 @@ use crate::volume::slice_holders::{self, Holder, Shelf, Standing};
 pub(super) enum Mode {
     /// Stop delivering at the first chunk that does not authenticate.
     Strict,
-    /// Write a hole of zeros for each such chunk and go on.
+    /// Record a hole for each such chunk and go on.
     Tolerant,
 }
 
@@ -355,56 +354,26 @@ pub(crate) fn parse_answer(line: &str) -> Answer {
     }
 }
 
-/// Where one slice's plaintext goes.
-pub(super) enum SliceSink<'a> {
-    /// A file in scratch — the spooled restore.
-    File(&'a Path),
-    /// The stream on `dar`'s standard input, the slice joined into it in
-    /// order, its own header and trailer taken off and checked — the
-    /// streamed restore (#498, [`dar::restore::SequentialExtract`]). `last`
-    /// when it is the archive's last slice.
-    Stream {
-        dar: &'a dar::restore::SequentialExtract,
-        last: bool,
-    },
-}
-
-/// One slice's output, open across every attempt to fill it: the file is
-/// opened, or the slice begun in dar's stream, once, and what an earlier
-/// cartridge delivered stays delivered while a later one supplies the rest.
-pub(super) struct SliceOut<'a> {
-    sink: SliceSink<'a>,
-    file: Option<std::fs::File>,
-    /// The slice is begun in dar's stream.
-    begun: bool,
+/// One slice's plaintext, held in memory, open across every attempt to fill
+/// it: what an earlier cartridge delivered stays delivered while a later one
+/// supplies the rest. The bytes are the age plaintext, which for a compressed
+/// staging is the frame ([`SliceOut::cut`] decodes it).
+pub(super) struct SliceOut {
     slice_number: i64,
-    /// Plaintext bytes accounted for so far — authentic or a hole.
-    delivered: u64,
-    /// The spans of `delivered` that are holes. A hole is entered before it is
-    /// written, so one dar interrupted is still on the books.
+    /// The compression the slice's staging was packed with, for the proof.
+    compression: Option<Algorithm>,
+    /// What the slice's cut is recorded to be, bounding what a frame may
+    /// decode to.
+    cut_bytes: u64,
+    /// Plaintext bytes accounted for so far — authentic, or a hole's
+    /// placeholder zeros (never handed to tar: [`SliceOut::holes`] says where).
+    bytes: Vec<u8>,
+    /// The spans of `bytes` that are holes.
     holes: Vec<Range<u64>>,
-    /// Zero bytes of holes delivered (written, or dropped once `dropping`).
+    /// Zero bytes of holes held.
     hole_bytes: u64,
-    /// dar's input is gone: dar stopped reading it (or tapectl stopped
-    /// feeding it a slice that was not the archive's).
-    gone: bool,
-    /// dar wants no more of this slice (#497): it closed its input before
-    /// the slice's end, or before the slice began. The rest is still
-    /// authenticated, and its plaintext dropped; whether dar's stop is a
-    /// failure is its exit status's to say, not the input's.
-    dropping: bool,
-    /// Reads begun on this slice, from any cartridge. The first hashes no
-    /// plaintext: when its ciphertext hash matches, the bytes are proven
-    /// identical to what was written and nothing more can be asked of them.
+    /// Reads begun on this slice, from any cartridge.
     attempts: u32,
-    /// A running sha256 of the plaintext written, kept for a streamed slice
-    /// from its second read on: a slice that needs one is no longer on the
-    /// clean path, and what went to dar cannot be read back. A spooled
-    /// slice keeps none — its file is hashed from disk, when asked.
-    plain: Option<Sha256>,
-    /// Bytes went to dar before hashing began, so the whole slice's
-    /// plaintext can never be hashed.
-    unhashed: bool,
     /// The age file (header and nonce) that delivered this slice's first
     /// bytes. Every later read must be that same file: chunks authenticate
     /// under whatever key their own header unwraps, so a second file to the
@@ -412,38 +381,28 @@ pub(super) struct SliceOut<'a> {
     bound: Option<Vec<u8>>,
 }
 
-impl<'a> SliceOut<'a> {
-    pub(super) fn new(sink: SliceSink<'a>, slice_number: i64) -> Self {
+impl SliceOut {
+    pub(super) fn new(slice_number: i64, compression: Option<Algorithm>, cut_bytes: u64) -> Self {
         SliceOut {
-            sink,
-            file: None,
-            begun: false,
             slice_number,
-            delivered: 0,
+            compression,
+            cut_bytes,
+            bytes: Vec::new(),
             holes: Vec::new(),
             hole_bytes: 0,
-            gone: false,
-            dropping: false,
             attempts: 0,
-            plain: None,
-            unhashed: false,
             bound: None,
         }
     }
 
-    /// A read of this slice is starting: from the second on, a streamed
-    /// slice's plaintext is hashed as it is written (or marked unhashable if
-    /// bytes already went to dar without it).
+    /// Plaintext bytes accounted for so far, authentic or a hole's.
+    fn delivered(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// A read of this slice is starting.
     fn begin_attempt(&mut self) {
         self.attempts += 1;
-        let streamed = matches!(self.sink, SliceSink::Stream { .. });
-        if self.attempts >= 2 && streamed && self.plain.is_none() && !self.unhashed {
-            if self.delivered == 0 {
-                self.plain = Some(Sha256::new());
-            } else {
-                self.unhashed = true;
-            }
-        }
     }
 
     /// Tie this slice to the age file whose header and nonce are `header`,
@@ -454,202 +413,72 @@ impl<'a> SliceOut<'a> {
         }
     }
 
-    /// sha256 of the plaintext written so far (holes included, as zeros):
-    /// the running hash of a streamed slice, or a spooled file read back from
-    /// disk. `None` when it cannot be known — bytes went to dar before
-    /// anything was hashing them.
-    fn plain_digest(&self) -> Result<Option<[u8; 32]>> {
-        if self.unhashed {
-            return Ok(None);
-        }
-        match (&self.plain, &self.sink) {
-            (Some(running), _) => Ok(Some(running.clone().finalize().into())),
-            (None, SliceSink::File(path)) => {
-                let mut file = std::fs::File::open(path)?;
-                let mut hasher = Sha256::new();
-                let mut buf = vec![0u8; 128 * 1024];
-                loop {
-                    let n = std::io::Read::read(&mut file, &mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                Ok(Some(hasher.finalize().into()))
+    /// sha256 of the slice's cut as delivered (holes included, as zeros): of
+    /// the bytes themselves, or, for a compressed staging, of what the frame
+    /// decodes to. `None` when the frame does not decode to a whole cut of
+    /// the recorded size.
+    fn plain_digest(&self) -> Option<[u8; 32]> {
+        let cut = self.cut()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&cut);
+        Some(hasher.finalize().into())
+    }
+
+    /// The cut the bytes hold: themselves, or what the frame decodes to when
+    /// it decodes to a whole cut. `None` when a compressed slice's frame
+    /// does not.
+    fn cut(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self.compression {
+            None => Some(std::borrow::Cow::Borrowed(&self.bytes)),
+            Some(algorithm) => {
+                let d = super::decode::decode(algorithm, &self.bytes, self.cut_bytes);
+                (d.complete && d.bytes.len() as u64 == self.cut_bytes)
+                    .then_some(std::borrow::Cow::Owned(d.bytes))
             }
-            (None, SliceSink::Stream { .. }) => Ok(None),
         }
     }
 
-    /// Start a spooled slice over: what was written is not to be kept (it
-    /// is not the slice the catalog expects), so no read of it counts.
+    /// Start the slice over: what was written is not to be kept (it is not
+    /// the slice the catalog expects), so no read of it counts.
     fn reset(&mut self) {
-        self.discard();
-        self.delivered = 0;
+        self.bytes.clear();
         self.holes.clear();
         self.hole_bytes = 0;
-        self.plain = None;
-        self.unhashed = false;
         self.bound = None;
     }
 
-    fn open(&mut self) -> Result<()> {
-        if self.file.is_some() || self.begun || self.dropping {
-            return Ok(());
-        }
-        match &self.sink {
-            SliceSink::File(path) => {
-                self.file = Some(std::fs::File::create(path)?);
-                Ok(())
-            }
-            SliceSink::Stream { dar, last } => {
-                let n = u32::try_from(self.slice_number).map_err(|_| {
-                    TapectlError::Other(format!("slice {} is no slice dar has", self.slice_number))
-                })?;
-                match dar.begin_slice(n, *last) {
-                    Ok(()) => {
-                        self.begun = true;
-                        Ok(())
-                    }
-                    // dar closed its input before this slice began (#497:
-                    // given the catalogue it never reads the archive's own,
-                    // which can fill the last slices), or tapectl stopped
-                    // feeding it. The slice is read and authenticated all
-                    // the same, into nothing, and dar's exit status says
-                    // whether its stop was a failure.
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                        self.gone = true;
-                        self.dropping = true;
-                        Ok(())
-                    }
-                    Err(e) => Err(TapectlError::Other(format!(
-                        "slice {}: {e}",
-                        self.slice_number
-                    ))),
-                }
-            }
-        }
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.put(bytes, false)
-    }
-
-    /// `bytes` to the sink — a hole's zeros when `hole` — and on the books.
-    fn put(&mut self, bytes: &[u8], hole: bool) -> Result<()> {
-        self.open()?;
-        let written = match &self.sink {
-            SliceSink::File(_) => match self.file.as_mut() {
-                Some(file) => file.write_all(bytes),
-                None => Ok(()),
-            },
-            SliceSink::Stream { .. } if self.dropping => Ok(()),
-            SliceSink::Stream { dar, .. } if hole => dar.feed_hole(bytes.len() as u64),
-            SliceSink::Stream { dar, .. } => dar.feed(bytes),
-        };
-        match written {
-            Ok(()) => {}
-            // dar closed its input before the slice's end (#497: given the
-            // catalogue, dar stops where the file data ends, before the
-            // archive's own catalogue). The rest of the slice is still
-            // authenticated, its plaintext dropped, and dar's exit status
-            // says whether the stop was a failure.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                self.gone = true;
-                self.dropping = true;
-                self.file = None;
-            }
-            Err(e) => {
-                return Err(TapectlError::Other(format!(
-                    "slice {}: {e}",
-                    self.slice_number
-                )))
-            }
-        }
-        if let Some(plain) = self.plain.as_mut() {
-            plain.update(bytes);
-        }
-        self.delivered += bytes.len() as u64;
-        Ok(())
-    }
-
-    /// A hole of `len` zero bytes: the place of a chunk that did not
-    /// authenticate. Never anything else.
-    ///
-    /// The hole is recorded before it is written: dar, handed zeros where
-    /// it needed bytes, may give up and close its input before the last of
-    /// them is in, and a slice dar stopped reading at its own hole is a
-    /// slice with a hole in it (the restore tells that from dar dying of its
-    /// own accord by the damage on the books). In dar's stream a hole keeps
-    /// its place; one over the slice's header or trailer is taken off with
-    /// them ([`dar::slice::Join`]).
-    fn hole(&mut self, len: u64) -> Result<()> {
-        self.open()?;
-        let start = self.delivered;
+    /// A hole of `len` bytes: the place of a chunk that did not
+    /// authenticate. Recorded as a range; the placeholder zeros that keep
+    /// the offsets of what follows are held here and never fed to tar.
+    fn hole(&mut self, len: u64) {
+        let start = self.delivered();
         if len > 0 {
             self.holes.push(start..start + len);
         }
-        let zeros = [0u8; 16 * 1024];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(zeros.len() as u64) as usize;
-            self.put(&zeros[..n], true)?;
-            self.hole_bytes += n as u64;
-            left -= n as u64;
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        self.open()?;
-        match &self.sink {
-            SliceSink::File(_) => {
-                if let Some(file) = self.file.as_mut() {
-                    file.flush()?;
-                }
-            }
-            SliceSink::Stream { .. } if self.dropping => {}
-            SliceSink::Stream { dar, .. } => match dar.end_slice() {
-                Ok(()) => {}
-                // dar closed its input before the slice's last byte, or
-                // tapectl refused its trailer: as in `put`.
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                    self.gone = true;
-                    self.dropping = true;
-                }
-                Err(e) => {
-                    return Err(TapectlError::Other(format!(
-                        "slice {}: {e}",
-                        self.slice_number
-                    )))
-                }
-            },
-        }
-        Ok(())
-    }
-
-    /// Remove a spooled slice that is not to be kept.
-    fn discard(&mut self) {
-        self.file = None;
-        if let SliceSink::File(path) = &self.sink {
-            let _ = std::fs::remove_file(path);
-        }
+        self.bytes.resize(self.bytes.len() + len as usize, 0);
+        self.hole_bytes += len;
     }
 }
 
-/// How one slice read ended: how much of it is authentic, and where it is
-/// not.
+/// How one slice read ended: the plaintext, and where it is not authentic.
 #[derive(Debug, Clone, Default)]
 pub(super) struct SliceRead {
-    /// Plaintext bytes written that authenticated.
+    /// Plaintext bytes that authenticated.
     pub authentic_bytes: u64,
-    /// dar stopped reading before the slice was all delivered, or before it
-    /// began: a streamed restore whose archive a hole made unreadable, so
-    /// that no later slice can be of use; a dar that failed; a slice tapectl
-    /// refused to feed it; or a dar done, which given the catalogue stops
-    /// where the file data ends and exits 0 (#497). The rest of the slice
-    /// was read and authenticated all the same.
-    pub dar_gone: bool,
+    /// The plaintext as delivered: the cut, or for a compressed staging the
+    /// frame. A hole's bytes are placeholders.
+    pub bytes: Vec<u8>,
+    /// The byte ranges of `bytes` that are holes, in order.
+    pub holes: Vec<Range<u64>>,
+    /// Why the slice was not read at all: it is on a cartridge the restore
+    /// was not given (item 266: nobody at the terminal to load it, or the
+    /// answer "I do not have it"). Not damage: R6 says a slice that is on
+    /// another tape is never reported as damaged.
+    pub unavailable: Option<String>,
 }
 
 /// Why a slice could not be had from the cartridge it was read from.
@@ -741,9 +570,9 @@ impl Damage {
             .map(|r| format!("{}..{}", r.start, r.end))
             .collect();
         format!(
-            "slice {} on {}: {} hole(s) of zeros, {bytes} byte(s) in all, at plaintext byte(s) \
-             {}{} — {}; the slice as a whole is unproven, since a copy with holes cannot be \
-             checked against its recorded checksum",
+            "slice {} on {}: {} hole(s), {bytes} byte(s) in all, at plaintext byte(s) \
+             {}{} — {}; the members they touch are left out, and the slice as a whole is \
+             unproven, since a copy with holes cannot be checked against its recorded checksum",
             self.slice_number,
             self.volume,
             self.holes.len(),
@@ -872,29 +701,22 @@ enum Proof {
 }
 
 /// Test the plaintext written to `out` against `wp`'s recorded checksum.
-fn prove_plaintext(wp: &WritePositionInfo, out: &SliceOut<'_>) -> Result<Proof> {
+fn prove_plaintext(wp: &WritePositionInfo, out: &SliceOut) -> Result<Proof> {
     let Ok(recorded) = crate::db::files::sha256_from_hex(&wp.sha256_plain) else {
         return Ok(Proof::Unproven(
             "no plaintext checksum is recorded for the slice",
         ));
     };
-    Ok(match out.plain_digest()? {
+    Ok(match out.plain_digest() {
         Some(got) if got == recorded => Proof::Whole,
-        Some(_) => Proof::Wrong,
-        None => Proof::Unproven(
-            "its plaintext was streamed to dar before anything was hashing it (a spooled \
-             restore, --spool, can check it)",
-        ),
+        // A frame that does not decode to a whole cut of the recorded size
+        // is no more the slice than a cut that hashes to something else.
+        Some(_) | None => Proof::Wrong,
     })
 }
 
 /// What the decrypt thread of one attempt ended on.
 struct Ended {
-    /// The sink's reader is gone (dar exited): nothing more can be written.
-    sink_gone: bool,
-    /// After the sink's reader was gone, a chunk of the rest of the slice
-    /// did not authenticate: the slice is damaged where dar did not read.
-    tail_damaged: bool,
     /// Strict mode stopped at a chunk that did not authenticate.
     stopped: bool,
     /// The file is a different age file from the one that delivered this
@@ -906,13 +728,11 @@ struct Ended {
 
 /// One attempt at a slice, classified.
 enum Attempt {
-    /// Every chunk the sink still lacked authenticated and was written.
+    /// Every chunk the slice still lacked authenticated and was kept.
     Complete,
-    /// dar stopped reading: the slice cannot be delivered any further.
-    SinkGone,
     /// It stopped, and why.
     Stopped(Defect),
-    /// Every chunk the sink lacked authenticated and was written, but the
+    /// Every chunk the slice lacked authenticated and was kept, but the
     /// copy does not hash and the plaintext could not be shown to be the
     /// slice (and why). The slice is delivered in full; only a copy that
     /// hashes as written could still prove it.
@@ -949,6 +769,9 @@ pub(crate) struct Supply<'c, 's, 'b> {
     /// The restore's plan, `(stage set, slice, volume)` in slice order: what
     /// a prompt for the next cartridge says it holds (#478).
     route: Vec<(i64, i64, i64)>,
+    /// Cartridges the operator was asked for and did not give (item 266):
+    /// never asked for again in this restore.
+    declined: std::collections::HashSet<i64>,
     pub(crate) substitutions: Vec<Substitution>,
     pub(crate) damage: Vec<Damage>,
 }
@@ -986,6 +809,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             subject: String::new(),
             primed: None,
             route: Vec::new(),
+            declined: std::collections::HashSet::new(),
             substitutions: Vec::new(),
             damage: Vec::new(),
         }
@@ -1074,22 +898,16 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         &mut self,
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
-        sink: SliceSink<'_>,
+        compression: Option<Algorithm>,
     ) -> Result<SliceRead> {
-        let mut out = SliceOut::new(sink, wp.slice_number);
-        match self.fill_slice(wp, identities, &mut out) {
-            Ok(()) => {
-                out.finish()?;
-                Ok(SliceRead {
-                    authentic_bytes: out.delivered - out.hole_bytes,
-                    dar_gone: out.gone,
-                })
-            }
-            Err(e) => {
-                out.discard();
-                Err(e)
-            }
-        }
+        let mut out = SliceOut::new(wp.slice_number, compression, wp.size_bytes.max(0) as u64);
+        let unavailable = self.fill_slice(wp, identities, &mut out)?;
+        Ok(SliceRead {
+            authentic_bytes: out.delivered() - out.hole_bytes,
+            bytes: out.bytes,
+            holes: out.holes,
+            unavailable,
+        })
     }
 
     /// Whether no other live volume holds any slice of `wp`'s stage set, so
@@ -1111,8 +929,8 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         &mut self,
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
-        out: &mut SliceOut<'_>,
-    ) -> Result<()> {
+        out: &mut SliceOut,
+    ) -> Result<Option<String>> {
         let mut holders: Option<Vec<Holder>> = None;
         // The first cartridge it failed on and why: what a substitution, a
         // refusal or a hole is described by.
@@ -1130,7 +948,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         // holes where the chunks do not authenticate.
         let sole = self.sole_copy(wp)?;
         loop {
-            match self.choose(wp, out.delivered, tried, unproven.is_some(), &mut holders)? {
+            match self.choose(wp, out.delivered(), tried, unproven.is_some(), &mut holders)? {
                 Choice::Here(position) => {
                     tried = true;
                     self.last_position = Some(position);
@@ -1147,15 +965,14 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                             if let Some((damaged_on, defect)) = &first {
                                 self.supplied(wp, damaged_on, defect);
                             }
-                            return Ok(());
+                            return Ok(None);
                         }
-                        Attempt::SinkGone => return Ok(()),
                         Attempt::Stopped(defect) | Attempt::Unproven(defect, _) => {
                             let label = self.here_label().unwrap_or_default();
                             warn!(
                                 slice = wp.slice_number,
                                 volume = %label,
-                                delivered = out.delivered,
+                                delivered = out.delivered(),
                                 "{}",
                                 defect.describe(wp)
                             );
@@ -1165,7 +982,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                                 wp.slice_number,
                                 short_cause(&defect)
                             ));
-                            self.mark_bad(&wp.sha256_encrypted, out.delivered);
+                            self.mark_bad(&wp.sha256_encrypted, out.delivered());
                             if matches!(defect, Defect::Hash { .. }) {
                                 if let Some(volume) = self.here_volume() {
                                     self.hash_bad.insert((volume, wp.sha256_encrypted.clone()));
@@ -1190,9 +1007,20 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                     }
                 }
                 Choice::Next(holder) => {
+                    // Item 266, R7: a cartridge the restore is not given is
+                    // not an error. Its slices are on another tape, not
+                    // damaged (R6): the files in them are left out and
+                    // listed, and the restore goes on with what it has.
+                    if self.declined.contains(&holder.volume_id) {
+                        return Ok(Some(self.not_given(wp, &holder, "was not loaded")));
+                    }
                     if !self.bay.attended() {
-                        let list = holders.clone().unwrap_or_default();
-                        return Err(self.refuse_unattended(wp, first.as_ref(), &list));
+                        return Ok(Some(self.not_given(
+                            wp,
+                            &holder,
+                            "cannot be loaded: tapectl swaps no cartridge without a person at \
+                             the terminal, and --yes cannot load one",
+                        )));
                     }
                     let (why, what) = self.why_next(wp, &holder);
                     self.note_here(format!(
@@ -1205,16 +1033,12 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         holder.standing == Standing::Quarantined,
                         why,
                         &what,
-                        None,
+                        Some("go on with what is held (I do not have it): its files are listed"),
                     )? {
                         Changed::Loaded => {}
                         Changed::Declined => {
-                            return Err(TapectlError::Other(format!(
-                                "restore of {} stopped: slice {} is on {}, which was not \
-                                 loaded, and a restore needs every slice, in slice order. What \
-                                 was restored before this point stays where it is",
-                                self.subject, wp.slice_number, holder.label
-                            )))
+                            self.declined.insert(holder.volume_id);
+                            return Ok(Some(self.not_given(wp, &holder, "was not loaded")));
                         }
                     }
                 }
@@ -1243,13 +1067,26 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             // Already delivered in full: reading it again could only say the
             // same.
             self.record_damage(wp, on, reason, Vec::new());
-            return Ok(());
+            return Ok(None);
         }
-        self.salvage(wp, identities, out, first)
+        self.salvage(wp, identities, out, first)?;
+        Ok(None)
+    }
+
+    /// The words for a slice that is on a cartridge the restore was not
+    /// given.
+    fn not_given(&self, wp: &WritePositionInfo, holder: &Holder, why: &str) -> String {
+        let shelf = slice_holders::shelf_of(self.conn, holder.volume_id, &holder.label);
+        format!(
+            "slice {} is on {} ({}), which {why}",
+            wp.slice_number,
+            holder.label,
+            shelf.describe()
+        )
     }
 
     /// Nothing can give the rest of the slice whole: read it from the
-    /// cartridge in the drive with a hole of zeros for every chunk that does
+    /// cartridge in the drive with a hole recorded for every chunk that does
     /// not authenticate, and record the damage.
     ///
     /// The chunks that do authenticate are written, whatever the copy's
@@ -1264,7 +1101,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         &mut self,
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
-        out: &mut SliceOut<'_>,
+        out: &mut SliceOut,
         first: Option<(String, Defect)>,
     ) -> Result<()> {
         let Some(position) = self.last_position else {
@@ -1304,30 +1141,15 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         }
         if ended.other_file {
             // The cartridge in the drive is not the file the slice was begun
-            // from. One that hashes as recorded is the slice, and a spooled
-            // part that came from elsewhere is dropped for it.
-            if hash_ok && matches!(out.sink, SliceSink::File(_)) {
+            // from. One that hashes as recorded is the slice, and the part
+            // that came from elsewhere is dropped for it.
+            if hash_ok {
                 out.reset();
                 return self.salvage(wp, identities, out, cause);
             }
             return Err(self.other_file_error(wp, hash_ok, described(&cause)));
         }
         let new_holes: Vec<Range<u64>> = out.holes[before_holes..].to_vec();
-        if ended.sink_gone && new_holes.is_empty() {
-            // dar stopped reading mid-slice. Over a slice that hashes as
-            // written, and whose every chunk authenticated, that is dar's own
-            // doing (`read_slice` says dar is gone, and the restore says
-            // why). Over one that does not, the slice is why, and it goes on
-            // the books, as a hole would.
-            if !hash_ok || ended.tail_damaged {
-                let reason = format!(
-                    "{}; dar stopped reading it",
-                    described(&cause).unwrap_or_else(|| Defect::Chunk.describe(wp)),
-                );
-                self.record_damage(wp, label, reason, Vec::new());
-            }
-            return Ok(());
-        }
         if new_holes.is_empty() {
             // Every chunk authenticated after all: chunks other cartridges
             // gave, and this one's own. A copy that hashes as written is the
@@ -1346,14 +1168,11 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                     return Ok(());
                 }
                 Proof::Wrong => {
-                    if matches!(out.sink, SliceSink::Stream { .. }) {
-                        return Err(self.wrong_in_stream(wp));
-                    }
                     // Authentic bytes that are not this slice are no use to
-                    // dar: the slice is a hole from end to end.
-                    let len = out.delivered;
+                    // the reader: the slice is a hole from end to end.
+                    let len = out.delivered();
                     out.reset();
-                    out.hole(len)?;
+                    out.hole(len);
                     let reason = format!(
                         "{}; every chunk authenticates, but the plaintext does not match the \
                          checksum recorded for the slice — it is not the slice the catalog \
@@ -1380,10 +1199,10 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             volume = %label,
             holes = new_holes.len(),
             bytes = lost,
-            "no cartridge can give this slice whole: its damaged chunks are written as holes"
+            "no cartridge can give this slice whole: its damaged chunks are recorded as holes"
         );
         progress::log(&format!(
-            "slice {}: {} hole(s), {lost} byte(s) of zeros where no copy authenticates",
+            "slice {}: {} hole(s), {lost} byte(s) where no copy authenticates",
             wp.slice_number,
             new_holes.len()
         ));
@@ -1566,7 +1385,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         let why = if volumes.len() > 1 {
             format!(
                 "{} is held across cartridges and read in slice order \
-                 (volume-format-v2.md §4.4): slice {} is next, and it is not on {here}.",
+                 (volume-format-v3.md §5.3): slice {} is next, and it is not on {here}.",
                 capitalised(&self.subject),
                 wp.slice_number,
             )
@@ -1652,9 +1471,9 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         position: u32,
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
-        out: &mut SliceOut<'_>,
+        out: &mut SliceOut,
     ) -> Result<Attempt> {
-        let delivered_before = out.delivered;
+        let delivered_before = out.delivered();
         let mut raw = self.attempt_raw(position, wp, identities, out, Mode::Strict)?;
         // The cause, by the evidence there is: the tape would not read; what
         // it gave does not hash; it hashes and a chunk is bad anyway.
@@ -1662,7 +1481,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         let defect = raw.defect();
         let ended = match raw.ended {
             Ok(ended) => ended,
-            // The sink failed (dar stopped, the disk): not the medium.
+            // The sink failed (the disk): not the medium.
             Err(sink) => {
                 return Err(match defect {
                     Some(d) => TapectlError::Other(format!("{}; {sink}", d.describe(wp))),
@@ -1678,32 +1497,13 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 None => Err(e),
             };
         }
-        if ended.sink_gone {
-            // dar stopped reading, so nothing more can be delivered, from this
-            // copy or any other. Over a slice that hashes as written, and whose
-            // every chunk authenticated, that is dar's own doing; over one that
-            // does not, the slice is why, and it goes on the books as unproven.
-            if !hash_ok || ended.tail_damaged {
-                let on = self.here_label().unwrap_or_default();
-                let reason = format!(
-                    "{on}: {}; dar stopped reading it, so no other copy could be tried (a \
-                     spooled restore, --spool, can)",
-                    defect.map_or_else(|| Defect::Chunk.describe(wp), |d| d.describe(wp)),
-                );
-                self.record_damage(wp, on, reason, Vec::new());
-            }
-            return Ok(Attempt::SinkGone);
-        }
         if ended.other_file {
             if hash_ok {
                 // This copy hashes as the catalog recorded: it IS the slice,
                 // and the file the part already read came from is not.
-                if matches!(out.sink, SliceSink::File(_)) {
-                    // Spooled: drop that part and read this copy afresh.
-                    out.reset();
-                    return self.attempt(position, wp, identities, out);
-                }
-                return Err(self.other_file_error(wp, true, None));
+                // Drop that part and read this copy afresh.
+                out.reset();
+                return self.attempt(position, wp, identities, out);
             }
             return Ok(Attempt::Stopped(Defect::OtherFile));
         }
@@ -1743,11 +1543,8 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                      catalog recorded",
                     defect.describe(wp)
                 );
-                if matches!(out.sink, SliceSink::Stream { .. }) {
-                    return Err(self.wrong_in_stream(wp));
-                }
-                // A spooled slice that is not the slice is not kept: another
-                // copy is read afresh.
+                // A slice that is not the slice is not kept: another copy is
+                // read afresh.
                 out.reset();
                 Ok(Attempt::Stopped(defect))
             }
@@ -1780,25 +1577,10 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         TapectlError::Other(format!(
             "slice {} of {} cannot be completed: the cartridge in the drive holds a different \
              age file for it (another header and nonce) from the part already read, and chunks \
-             of two files are never mixed — {verdict}{}. A streamed restore cannot take back \
-             what it has fed to dar: restore again with --spool, or from another cartridge",
+             of two files are never mixed — {verdict}{}",
             wp.slice_number,
             self.subject,
             cause.map(|d| format!(" ({d})")).unwrap_or_default(),
-        ))
-    }
-
-    /// The refusal for a streamed slice whose plaintext is not the slice:
-    /// the bytes are in dar's input and cannot be taken back.
-    fn wrong_in_stream(&self, wp: &WritePositionInfo) -> TapectlError {
-        let on = self.here_label().unwrap_or_else(|| "the cartridge".into());
-        TapectlError::Other(format!(
-            "slice {} of {} on {on}: every chunk authenticates, but the plaintext does not match \
-             the checksum recorded for the slice, so this is not the slice the catalog expects \
-             (a wrong file at this tape position, or a wrong catalog). It was already streamed \
-             into dar, which cannot take it back: restore again with --spool, which can try \
-             another copy of the slice, or from another cartridge",
-            wp.slice_number, self.subject
         ))
     }
 
@@ -1807,7 +1589,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         position: u32,
         wp: &WritePositionInfo,
         identities: &[age::x25519::Identity],
-        out: &mut SliceOut<'_>,
+        out: &mut SliceOut,
         mode: Mode,
     ) -> Result<Raw> {
         out.begin_attempt();
@@ -2044,23 +1826,20 @@ fn short_cause(defect: &Defect) -> String {
 /// The decrypt thread of one attempt: ciphertext from `src`, authenticated
 /// chunk by chunk, to `out` from where `out` left off.
 ///
-/// `Err` is a failure of the sink (dar stopped reading, the disk): not a
-/// matter for another cartridge. A file that will not open as age is not an
-/// error here — it is reported in [`Ended`], because whether it is the
-/// medium's fault depends on the hash the caller computes.
+/// A file that will not open as age is not an error here — it is reported in
+/// [`Ended`], because whether it is the medium's fault depends on the hash
+/// the caller computes.
 fn decrypt_chunks(
     src: std::io::PipeReader,
     identities: &[age::x25519::Identity],
     encrypted: u64,
     mode: Mode,
-    out: &mut SliceOut<'_>,
+    out: &mut SliceOut,
 ) -> Result<Ended> {
     let mut chunks = match chunks::open(src, identities, encrypted) {
         Ok(chunks) => chunks,
         Err(e) => {
             return Ok(Ended {
-                sink_gone: false,
-                tail_damaged: false,
                 stopped: false,
                 other_file: false,
                 open_error: Some(e),
@@ -2069,82 +1848,53 @@ fn decrypt_chunks(
     };
     // One slice is one age file. A read whose file is not the one that
     // delivered the first bytes adds nothing: its chunks authenticate under
-    // its own key, and prove nothing about the part already written.
+    // its own key, and prove nothing about the part already kept.
     let header = chunks.header().to_vec();
     if out.bound.as_deref().is_some_and(|bound| bound != header) {
         return Ok(Ended {
-            sink_gone: false,
-            tail_damaged: false,
             stopped: false,
             other_file: true,
             open_error: None,
         });
     }
     let mut stopped = false;
-    let mut tail_damaged = false;
-    let delivered = (|| -> Result<()> {
-        out.open()?;
-        let skip = out.delivered;
-        let mut pos = 0u64;
-        let mut buf = Zeroizing::new(Vec::with_capacity(chunks::CHUNK));
-        loop {
-            let next = chunks
-                .next(&mut buf)
-                .map_err(|e| TapectlError::TapeIo(format!("slice {}: {e}", out.slice_number)))?;
-            match next {
-                Next::End => return Ok(()),
-                Next::Authentic => {
-                    let end = pos + buf.len() as u64;
-                    if end > skip {
-                        let from = skip.saturating_sub(pos) as usize;
-                        out.bind(&header);
-                        out.write(&buf[from..])?;
-                    }
-                    pos = end;
+    let skip = out.delivered();
+    let mut pos = 0u64;
+    let mut buf = Zeroizing::new(Vec::with_capacity(chunks::CHUNK));
+    loop {
+        let next = chunks
+            .next(&mut buf)
+            .map_err(|e| TapectlError::TapeIo(format!("slice {}: {e}", out.slice_number)))?;
+        match next {
+            Next::End => break,
+            Next::Authentic => {
+                let end = pos + buf.len() as u64;
+                if end > skip {
+                    let from = skip.saturating_sub(pos) as usize;
+                    out.bind(&header);
+                    out.write(&buf[from..]);
                 }
-                Next::Damaged { plain_len } => {
-                    let end = pos + plain_len as u64;
-                    if end > skip {
-                        if out.gone {
-                            // dar reads no more of this slice: nothing is
-                            // written for the chunk, and no other copy is
-                            // wanted for it. The slice is damaged all the
-                            // same, and said to be.
-                            tail_damaged = true;
-                            return Ok(());
-                        }
-                        if mode == Mode::Strict {
-                            stopped = true;
-                            return Ok(());
-                        }
-                        out.bind(&header);
-                        out.hole(end - skip.max(pos))?;
+                pos = end;
+            }
+            Next::Damaged { plain_len } => {
+                let end = pos + plain_len as u64;
+                if end > skip {
+                    if mode == Mode::Strict {
+                        stopped = true;
+                        break;
                     }
-                    pos = end;
+                    out.bind(&header);
+                    out.hole(end - skip.max(pos));
                 }
+                pos = end;
             }
         }
-    })();
-    match delivered {
-        // dar may have stopped reading part way (`out.gone`): the rest was
-        // read and authenticated all the same.
-        Ok(()) => Ok(Ended {
-            sink_gone: out.gone,
-            tail_damaged,
-            stopped,
-            other_file: false,
-            open_error: None,
-        }),
-        // dar stopped reading: not a failure of the medium or the slice.
-        Err(_) if out.gone => Ok(Ended {
-            sink_gone: true,
-            tail_damaged: false,
-            stopped: false,
-            other_file: false,
-            open_error: None,
-        }),
-        Err(e) => Err(e),
     }
+    Ok(Ended {
+        stopped,
+        other_file: false,
+        open_error: None,
+    })
 }
 
 #[cfg(test)]
@@ -2155,56 +1905,81 @@ mod tests {
         sha2::Sha256::digest(bytes).into()
     }
 
-    /// The clean path hashes no plaintext: a slice's first read keeps no
-    /// running hash (the ciphertext hash is its proof), and when a spooled
-    /// slice's plaintext is wanted anyway it is read back from its file.
+    /// The clean path hashes no plaintext of its own accord (the ciphertext
+    /// hash is its proof); when the plaintext is wanted it is hashed from
+    /// what was delivered, holes included as zeros.
     #[test]
-    fn a_first_read_keeps_no_running_hash_and_a_spooled_file_is_hashed_when_asked() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restore.1.dar");
-        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+    fn the_plaintext_digest_is_of_what_was_delivered() {
+        let mut out = SliceOut::new(1, None, 0);
         out.begin_attempt();
-        out.open().unwrap();
-        out.write(b"the first half, ").unwrap();
-        out.write(b"and the second").unwrap();
-        assert!(out.plain.is_none(), "a first read hashes nothing");
+        out.write(b"the first half, ");
+        out.write(b"and the second");
         assert_eq!(
-            out.plain_digest().unwrap(),
+            out.plain_digest(),
             Some(digest(b"the first half, and the second"))
         );
-        // A second read of a spooled slice keeps no running hash either: the
-        // file is the record.
-        out.begin_attempt();
-        assert!(out.plain.is_none() && !out.unhashed);
     }
 
-    /// A spooled slice that is not the slice is started over: nothing of it
+    /// A compressed slice's proof is of the decoded cut, never of the frame;
+    /// a frame that does not decode to a whole cut of the recorded size has
+    /// no digest.
+    #[test]
+    fn a_compressed_slices_digest_is_of_its_decoded_cut() {
+        use crate::staging::pack::{Packer, Packing};
+        let cut: Vec<u8> = (0..50_000u32)
+            .flat_map(|i| (i % 251).to_le_bytes())
+            .collect();
+        let algorithm = Algorithm::Zstd;
+        let mut packer = Packer::new(
+            Packing {
+                algorithm,
+                level: algorithm.default_level(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut packer, &cut).unwrap();
+        let frame = packer.finish().unwrap().0;
+        let mut out = SliceOut::new(1, Some(algorithm), cut.len() as u64);
+        out.write(&frame);
+        assert_eq!(out.plain_digest(), Some(digest(&cut)));
+        let mut short = SliceOut::new(1, Some(algorithm), cut.len() as u64);
+        short.write(&frame[..frame.len() / 2]);
+        assert_eq!(short.plain_digest(), None, "half a frame is no cut");
+        let mut wrong_size = SliceOut::new(1, Some(algorithm), cut.len() as u64 + 1);
+        wrong_size.write(&frame);
+        assert_eq!(wrong_size.plain_digest(), None, "not the recorded size");
+    }
+
+    /// A slice that is not the slice is started over: nothing of it
     /// survives, not the bytes, the holes, or the file it was tied to.
     #[test]
-    fn a_reset_forgets_everything_a_spooled_slice_was() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restore.1.dar");
-        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+    fn a_reset_forgets_everything_a_slice_was() {
+        let mut out = SliceOut::new(1, None, 0);
         out.begin_attempt();
         out.bind(b"header-and-nonce");
-        out.write(b"abc").unwrap();
-        out.hole(5).unwrap();
-        assert_eq!((out.delivered, out.holes.len()), (8, 1));
+        out.write(b"abc");
+        out.hole(5);
+        assert_eq!((out.delivered(), out.holes.len()), (8, 1));
+        assert_eq!(
+            out.bytes, b"abc\0\0\0\0\0",
+            "a hole holds placeholders only"
+        );
         out.reset();
-        assert_eq!((out.delivered, out.holes.len(), out.hole_bytes), (0, 0, 0));
+        assert_eq!(
+            (out.delivered(), out.holes.len(), out.hole_bytes),
+            (0, 0, 0)
+        );
         assert!(out.bound.is_none(), "free to be tied to another file");
-        assert!(!path.exists(), "the spooled bytes are gone");
-        out.write(b"xy").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"xy");
+        out.write(b"xy");
+        assert_eq!(out.bytes, b"xy");
     }
 
     /// A slice is tied to the age file that delivered its first bytes, and to
     /// that one only.
     #[test]
     fn a_slice_is_tied_to_the_first_file_that_wrote_to_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restore.1.dar");
-        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+        let mut out = SliceOut::new(1, None, 0);
         out.bind(b"first");
         out.bind(b"second");
         assert_eq!(out.bound.as_deref(), Some(&b"first"[..]));
@@ -2224,10 +1999,7 @@ mod tests {
     fn damage_says_unproven_with_holes_or_without() {
         let holed = damage(vec![0..65536, 131072..131073]).describe();
         assert!(holed.contains("slice 7 on L6-0001"), "{holed}");
-        assert!(
-            holed.contains("2 hole(s) of zeros, 65537 byte(s)"),
-            "{holed}"
-        );
+        assert!(holed.contains("2 hole(s), 65537 byte(s)"), "{holed}");
         assert!(holed.contains("0..65536, 131072..131073"), "{holed}");
         assert!(holed.contains("unproven"), "{holed}");
         let bare = damage(Vec::new()).describe();

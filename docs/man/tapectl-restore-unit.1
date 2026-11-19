@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-unit \- Restore a unit from a volume
 .SH SYNOPSIS
-\fBtapectl restore unit\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-from\fR] <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-key\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] 
+\fBtapectl restore unit\fR [\fB\-\-json\fR] [\fB\-\-unit\fR] [\fB\-\-from\fR] <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-no\-file\-check\fR] [\fB\-\-key\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIUNIT\fR] 
 .SH DESCRIPTION
 Restore a unit from a volume
 .PP
@@ -17,7 +17,7 @@ The unit, as a flag: the same as UNIT
 \fB\-\-from\fR \fI<FROM>\fR
 Volume label.
 
-Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Without it, \-\-dry\-run (which opens no drive) previews from the one volume this catalog has holding the unit, and names it; when several hold it they are listed, to name one here. For a version held across cartridges (a range on this tape), this tape (or the loaded one) must hold its slice 1: the others are asked for in slice order, by label, sticker and chip serial, and a tape that does not hold slice 1 is refused, naming the ones that do
+Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Without it, \-\-dry\-run (which opens no drive) previews from the one volume this catalog has holding the unit, and names it; when several hold it they are listed, to name one here. For a version held across cartridges (a range on this tape) the restore may start on any tape of it: the others are asked for in slice order, by label, sticker and chip serial, and the answer "skip" (I do not have it), or nobody at the terminal, restores the files this tape holds whole and lists the rest
 .TP
 \fB\-\-to\fR \fI<TO>\fR
 Destination directory
@@ -33,9 +33,9 @@ Snapshot version to restore.
 Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where the restore\*(Aqs scratch directory is made (default: inside \-\-to).
+Where a repair from another copy keeps what it reads (default: inside \-\-to).
 
-Where the restore\*(Aqs scratch directory is made (removed when the restore ends); defaults to inside \-\-to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
+Where the scratch directory is made (removed when the restore ends); defaults to inside \-\-to, never the system temp directory. A restore of a unit writes no slice to disk: each member goes to tar as its slice is read. Only the repair of a damaged file from another copy of the version extracts there first
 .TP
 \fB\-\-overwrite\fR
 Restore into a destination that already holds files, replacing any that collide.
@@ -45,12 +45,12 @@ Without it a destination that is not empty is refused before the tape is touched
 \fB\-\-no\-space\-check\fR
 Skip the free\-space check, for a filesystem that holds more than it reports.
 
-Skip the free\-space check (the unit\*(Aqs size when it streams; about twice that when its slices are spooled, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+Skip the free\-space check (the unit\*(Aqs size in \-\-to), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
 .TP
-\fB\-\-spool\fR
-Decrypt every slice to the scratch directory before dar extracts them.
+\fB\-\-no\-file\-check\fR
+Do not hash every restored file on disk once tar has ended.
 
-Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit\*(Aqs size with the scratch directory and \-\-to on one disk. Across cartridges too: a version held across cartridges is read from each in turn into the scratch directory, and dar extracts once the last is read; without it the slices stream into one extraction across the swaps
+Every member is still hashed against the file table as it is handed to tar. The check on disk is a second read of what was restored: it is what proves tar made each file whole, since tar\*(Aqs exit status is never the verdict
 .TP
 \fB\-\-key\fR \fI<FILE>\fR
 An age identity file (a secret key) to decrypt with, in this command only.

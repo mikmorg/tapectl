@@ -3,10 +3,11 @@
 //!
 //! Nothing is hand-built but the drive. A home is made as `tapectl init` and
 //! `tenant add` make one (an operator and a tenant, each with a key on disk),
-//! three units are staged as `stage create` stages them (a real dar archive
-//! cut into two slices each, every slice age-encrypted to the tenant and the
-//! operator), and the production session (build, validate, plan, execute,
-//! seal, confirm at the integrity tier) writes them to a `MemStore` whose
+//! three units are staged by the real `stage create` (GNU tar's stream cut
+//! at member starts into two slices each, every slice age-encrypted to the
+//! tenant and the operator, and a file table kept), and the production
+//! session (build, validate, plan, execute, seal, confirm at the integrity
+//! tier) writes them to a `MemStore` whose
 //! early warning comes one byte into `bravo`'s first slice. The session then
 //! seals short at `bravo`'s first slice, K: `alpha` is whole on the tape
 //! (`completed`), `bravo` is cut with its first slice on the tape and its
@@ -27,10 +28,9 @@ mod tests {
     use std::path::PathBuf;
 
     use rusqlite::{params, Connection};
-    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
-    use crate::config::TapectlPaths;
+    use crate::config::{Config, TapectlPaths};
     use crate::crypto::keys;
     use crate::store::{MemStore, Tier};
     use crate::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
@@ -102,10 +102,6 @@ mod tests {
         }
     }
 
-    fn sha_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
     fn noise(len: usize, seed: u32) -> Vec<u8> {
         (0..len as u32)
             .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -136,12 +132,25 @@ mod tests {
         paths.ensure_dirs().unwrap();
         std::fs::create_dir_all(&paths.logs_dir).unwrap();
         let conn = crate::db::open(&paths.db_file).unwrap();
+        // The units are staged by the real `stage create`: GNU tar's stream,
+        // cut at member starts into slices of at most 150 KiB, which holds
+        // a unit's dotfile and its first file and not the second.
+        let work = TempDir::new().unwrap();
+        let staging = work.path().join("staging");
+        let sources = work.path().join("sources");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&sources).unwrap();
+        let mut config = Config::default();
+        config.staging.directory = staging.to_string_lossy().into_owned();
+        config.defaults.slice_size = "150KiB".to_string();
         crate::tenant::add_tenant(&conn, &paths, OPERATOR, Some("System operator"), true).unwrap();
         let tenant_id = crate::tenant::add_tenant(&conn, &paths, TENANT, None, false).unwrap();
+        // `stage create` refuses a home with no escrow recipient (ADR-0005).
+        crate::cli::key::create_escrow_recipient(&conn, &paths, None).unwrap();
         let public_key = |name: &str| -> String {
             conn.query_row(
                 "SELECT k.public_key FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
-                  WHERE t.name = ?1 AND k.is_active = 1",
+                  WHERE t.name = ?1 AND k.is_active = 1 AND k.is_escrow = 0",
                 params![name],
                 |r| r.get(0),
             )
@@ -149,7 +158,6 @@ mod tests {
         };
         let operator_public = public_key(OPERATOR);
         let tenant_public = public_key(TENANT);
-        let recipients = vec![tenant_public.clone(), operator_public.clone()];
         let operator_file =
             keys::KeyFile::read(&keys::key_paths(&paths.keys_dir, OPERATOR, "primary").1).unwrap();
         let operator = keys::KeyFile::all_identities(std::slice::from_ref(&operator_file))
@@ -167,8 +175,6 @@ mod tests {
         .unwrap();
         let volume_id = conn.last_insert_rowid();
 
-        let work = TempDir::new().unwrap();
-        let slices_dir = TempDir::new().unwrap();
         let mut units = Vec::new();
         let mut files_by_unit = Vec::new();
         let mut stage_set_ids = Vec::new();
@@ -181,123 +187,79 @@ mod tests {
                     )
                 })
                 .collect();
-            conn.execute(
-                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
-                 VALUES (?1, ?2, ?3, ?4, 'active')",
-                params![
-                    format!("4200000{u}-0000-4000-8000-00000000042{u}"),
-                    name,
-                    tenant_id,
-                    format!("/src/{name}")
-                ],
-            )
-            .unwrap();
-            let unit_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
-                 VALUES (?1, 1, 'staged', ?2, 2, 200000)",
-                params![unit_id, format!("/src/{name}")],
-            )
-            .unwrap();
-            let snapshot_id = conn.last_insert_rowid();
+            let dir = sources.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
             for (path, bytes) in &files {
-                crate::db::files::fixture::insert(
-                    &conn,
-                    snapshot_id,
-                    path,
-                    bytes.len() as i64,
-                    "regular",
-                    Some(&sha_hex(bytes)),
-                );
+                std::fs::write(dir.join(path), bytes).unwrap();
             }
-            conn.execute(
-                "INSERT INTO stage_sets (snapshot_id, status, slice_size, key_fingerprints)
-                 VALUES (?1, 'staged', 153600, ?2)",
-                params![snapshot_id, serde_json::to_string(&recipients).unwrap()],
+            crate::unit::init_unit_with_config(
+                &conn,
+                &config,
+                dir.to_str().unwrap(),
+                TENANT,
+                Some(name),
+                &[],
+                None,
             )
             .unwrap();
-            let stage_set_id = conn.last_insert_rowid();
+            let snapshot_id = crate::staging::snapshot_create(&conn, name, &config).unwrap();
+            let stage_set_id =
+                crate::staging::stage_create(&conn, &paths, &config, snapshot_id, true)
+                    .unwrap_or_else(|e| panic!("stage create {name}: {e}"));
             stage_set_ids.push(stage_set_id);
 
-            // A real dar archive of the two files, cut at 150k: two slices.
-            let tree = work.path().join(name);
-            std::fs::create_dir_all(&tree).unwrap();
-            for (path, bytes) in &files {
-                std::fs::write(tree.join(path), bytes).unwrap();
-            }
-            let base = work.path().join(format!("{name}-arch"));
-            let created = std::process::Command::new("dar")
-                .arg("-c")
-                .arg(&base)
-                .arg("-R")
-                .arg(&tree)
-                .arg("-s")
-                .arg("150k")
-                .arg("-Q")
-                .output()
-                .unwrap();
-            assert!(
-                created.status.success(),
-                "dar -c failed in test setup: {}",
-                String::from_utf8_lossy(&created.stderr)
-            );
-            let mut slices = Vec::new();
-            for n in 1.. {
-                let part = work.path().join(format!("{name}-arch.{n}.dar"));
-                if !part.exists() {
-                    break;
-                }
-                let plain = std::fs::read(&part).unwrap();
-                let cipher = crate::staging::encrypt_data(&plain, &recipients).unwrap();
-                conn.execute(
-                    "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
-                                               encrypted_bytes, sha256_plain, sha256_encrypted)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        stage_set_id,
-                        n,
-                        plain.len() as i64,
-                        cipher.len() as i64,
-                        sha_hex(&plain),
-                        sha_hex(&cipher)
-                    ],
+            let (unit_uuid, tar_version, stream_bytes, compression, snapshot_version): (
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                i64,
+            ) = conn
+                .query_row(
+                    "SELECT u.uuid, ss.tar_version, ss.stream_bytes, ss.compression, s.version
+                       FROM stage_sets ss
+                       JOIN snapshots s ON s.id = ss.snapshot_id
+                       JOIN units u ON u.id = s.unit_id
+                      WHERE ss.id = ?1",
+                    params![stage_set_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .unwrap();
-                let slice_id = conn.last_insert_rowid();
-                let path = slices_dir.path().join(format!("slice_{slice_id}.age"));
-                std::fs::write(&path, &cipher).unwrap();
-                conn.execute(
-                    "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-                    params![path.to_string_lossy(), slice_id],
+            let slices: Vec<BuildSlice> = conn
+                .prepare(
+                    "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                            sha256_encrypted, staging_path, continues
+                       FROM stage_slices
+                      WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
+                      ORDER BY slice_number",
                 )
+                .unwrap()
+                .query_map(params![stage_set_id], |r| {
+                    Ok(BuildSlice {
+                        slice_id: r.get(0)?,
+                        slice_number: r.get(1)?,
+                        size_bytes: r.get(2)?,
+                        encrypted_bytes: r.get(3)?,
+                        sha256_plain: r.get(4)?,
+                        sha256_encrypted: r.get(5)?,
+                        staging_path: PathBuf::from(r.get::<_, String>(6)?),
+                        continues: r.get(7)?,
+                    })
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
                 .unwrap();
-                slices.push(BuildSlice {
-                    continues: false,
-                    slice_id,
-                    slice_number: n,
-                    size_bytes: plain.len() as i64,
-                    encrypted_bytes: cipher.len() as i64,
-                    sha256_plain: sha_hex(&plain),
-                    sha256_encrypted: sha_hex(&cipher),
-                    staging_path: path,
-                });
-            }
-            assert_eq!(slices.len(), 2, "each fixture unit is two dar slices");
-            conn.execute(
-                "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
-                params![stage_set_id],
-            )
-            .unwrap();
+            assert_eq!(slices.len(), 2, "each fixture unit is two slices");
             units.push(BuildUnit {
                 stage_set_id,
                 snapshot_id,
                 unit_name: name.to_string(),
-                unit_uuid: format!("4200000{u}-0000-4000-8000-00000000042{u}"),
+                unit_uuid,
                 tenant_id,
-                tar_version: None,
-                stream_bytes: 0,
-                compression: None,
-                snapshot_version: 1,
+                tar_version,
+                stream_bytes: stream_bytes.unwrap_or(0),
+                compression: compression.filter(|c| c != "none"),
+                snapshot_version,
                 slices,
                 span: None,
             });
@@ -323,8 +285,15 @@ mod tests {
             &catalog_dir.path().join("index"),
         )
         .unwrap();
+        // Each staging's file table and id map, as `volume write` makes them.
+        let tables = crate::volume::write::generate_tables(
+            &conn,
+            &units,
+            &catalog_dir.path().join("tables"),
+        )
+        .unwrap();
         let inputs = BuildInputs {
-            tables: None,
+            tables: Some(tables),
             label: LABEL.to_string(),
             volume_uuid: VOL_UUID.to_string(),
             media_type: "LTO-6".to_string(),
@@ -448,7 +417,7 @@ mod tests {
             files: files_by_unit,
             backup,
             operator,
-            _dirs: vec![home, work, slices_dir, catalog_dir, session_dir, backup_dir],
+            _dirs: vec![home, work, catalog_dir, session_dir, backup_dir],
         }
     }
 

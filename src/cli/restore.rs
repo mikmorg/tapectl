@@ -45,10 +45,11 @@ pub enum RestoreCommands {
         /// Without it, --dry-run (which opens no drive) previews from the one
         /// volume this catalog has holding the unit, and names it; when several
         /// hold it they are listed, to name one here. For a version held across
-        /// cartridges (a range on this tape), this tape (or the loaded one)
-        /// must hold its slice 1: the others are asked for in slice order, by
-        /// label, sticker and chip serial, and a tape that does not hold slice
-        /// 1 is refused, naming the ones that do
+        /// cartridges (a range on this tape) the restore may start on any tape
+        /// of it: the others are asked for in slice order, by label, sticker
+        /// and chip serial, and the answer "skip" (I do not have it), or nobody
+        /// at the terminal, restores the files this tape holds whole and lists
+        /// the rest
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
@@ -67,14 +68,13 @@ pub enum RestoreCommands {
         /// refused, naming the ones it does
         #[arg(long)]
         version: Option<i64>,
-        /// Where the restore's scratch directory is made (default: inside --to).
+        /// Where a repair from another copy keeps what it reads (default: inside --to).
         ///
-        /// Where the restore's scratch directory is made (removed when the
-        /// restore ends); defaults to inside --to, never the system temp
-        /// directory. A unit whose isolated catalogue from `stage create`
-        /// is on disk streams its slices into dar and puts only named
-        /// pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9)
-        /// every decrypted slice waits there, as large as the unit
+        /// Where the scratch directory is made (removed when the restore
+        /// ends); defaults to inside --to, never the system temp directory.
+        /// A restore of a unit writes no slice to disk: each member goes to
+        /// tar as its slice is read. Only the repair of a damaged file from
+        /// another copy of the version extracts there first
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into a destination that already holds files, replacing any that collide.
@@ -85,25 +85,19 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check, for a filesystem that holds more than it reports.
         ///
-        /// Skip the free-space check (the unit's size when it streams;
-        /// about twice that when its slices are spooled, with the scratch
-        /// directory and --to on one disk), for a filesystem that holds
-        /// more than it reports free, such as a compressed or
-        /// thin-provisioned one
+        /// Skip the free-space check (the unit's size in --to), for a
+        /// filesystem that holds more than it reports free, such as a
+        /// compressed or thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
-        /// Decrypt every slice to the scratch directory before dar extracts them.
+        /// Do not hash every restored file on disk once tar has ended.
         ///
-        /// Decrypt every slice to the scratch directory before dar extracts
-        /// them, even when the unit could stream (its isolated catalogue
-        /// on disk). Needs about twice the unit's size with the scratch
-        /// directory and --to on one disk. Across cartridges too: a version
-        /// held across cartridges is read from each in turn into the
-        /// scratch directory, and dar extracts once the last is read;
-        /// without it the slices stream into one extraction across the
-        /// swaps
+        /// Every member is still hashed against the file table as it is
+        /// handed to tar. The check on disk is a second read of what was
+        /// restored: it is what proves tar made each file whole, since tar's
+        /// exit status is never the verdict
         #[arg(long)]
-        spool: bool,
+        no_file_check: bool,
         /// An age identity file (a secret key) to decrypt with, in this command only.
         ///
         /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
@@ -162,11 +156,12 @@ pub enum RestoreCommands {
         /// is configured.
         #[arg(long)]
         device: Option<String>,
-        /// Where each unit's scratch directory is made (default: inside its own directory).
+        /// Where a repair from another copy keeps what it reads (default: inside each unit's directory).
         ///
         /// Where each unit's scratch directory is made, one at a time
         /// (removed when that unit ends); defaults to inside the unit's own
-        /// directory, never the system temp directory
+        /// directory, never the system temp directory. See `restore unit
+        /// --scratch`
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into unit directories that already hold files, replacing any that collide.
@@ -177,16 +172,14 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check of the whole set.
         ///
-        /// Skip the free-space check of the whole set (every restored unit,
-        /// plus the largest unit's spooled slices)
+        /// Skip the free-space check of the whole set (every restored unit)
         #[arg(long)]
         no_space_check: bool,
-        /// Spool every unit's slices to the scratch directory instead of streaming them.
+        /// Do not hash every restored file on disk once tar has ended.
         ///
-        /// Spool every unit's slices to the scratch directory instead of
-        /// streaming them into dar (see `restore unit --spool`)
+        /// See `restore unit --no-file-check`
         #[arg(long)]
-        spool: bool,
+        no_file_check: bool,
         /// Stop at the first unit that fails; the units after it are not attempted.
         ///
         /// Without it every unit is tried
@@ -251,13 +244,12 @@ pub enum RestoreCommands {
         /// refused, naming the ones it does
         #[arg(long)]
         version: Option<i64>,
-        /// Where the decrypted slices wait for dar (default: inside --to).
+        /// Where the file is extracted before it is placed (default: inside --to).
         ///
-        /// Where the decrypted slices wait for dar: a scratch directory is
-        /// made inside DIR and removed when the restore ends. Defaults to
-        /// inside --to, never the system temp directory. With the unit's
-        /// isolated catalogue from `stage create` on disk only the slices
-        /// holding the file (and the last) are read; otherwise every slice
+        /// Where the file is extracted before it is placed: a scratch
+        /// directory is made inside DIR and removed when the restore ends.
+        /// Defaults to inside --to, never the system temp directory. Only the
+        /// slices that hold the file (and a hard link's target) are read
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Replace a file of the same name already in --to.
@@ -267,12 +259,17 @@ pub enum RestoreCommands {
         overwrite: bool,
         /// Skip the free-space check, for a filesystem that holds more than it reports.
         ///
-        /// Skip the free-space check (the decrypted slices read, plus the
-        /// file, with the scratch directory and --to on one disk), for a
-        /// filesystem that holds more than it reports free, such as a
-        /// compressed or thin-provisioned one
+        /// Skip the free-space check (the file's size), for a filesystem
+        /// that holds more than it reports free, such as a compressed or
+        /// thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
+        /// Do not hash the restored file on disk once tar has ended.
+        ///
+        /// The member is still hashed against the file table as it is handed
+        /// to tar. The check on disk is a second read of what was restored
+        #[arg(long)]
+        no_file_check: bool,
         /// An age identity file (a secret key) to decrypt with, in this command only.
         ///
         /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
@@ -461,7 +458,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
-            spool,
+            no_file_check,
             key,
             dry_run,
         } => {
@@ -490,7 +487,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                spool: *spool,
+                no_file_check: *no_file_check,
                 keys,
             };
             let report = match from {
@@ -530,6 +527,8 @@ pub fn run(
                     "dry_run": report.dry_run,
                     "substitutions": substitutions_json(&report.substitutions),
                     "filled": filled_json(&report.filled),
+                    "id_map": id_map_json(&report.id_map),
+                    "tar_said": report.tar_said,
                 }));
             } else if report.dry_run {
                 println!(
@@ -552,6 +551,12 @@ pub fn run(
                 for line in repair_lines(&report.substitutions, &report.filled) {
                     println!("{line}");
                 }
+                for line in tar_lines(&report.tar_said) {
+                    eprintln!("{line}");
+                }
+                for line in id_map_lines(&report.id_map) {
+                    println!("{line}");
+                }
             }
         }
 
@@ -564,6 +569,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
+            no_file_check,
             key,
         } => {
             // Item 107: refused by name before anything else, as `restore
@@ -589,8 +595,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                // `restore file` always spools the slices it reads.
-                spool: false,
+                no_file_check: *no_file_check,
                 keys,
             };
             // Issue #435: no `--from` restores from the loaded tape; the
@@ -632,10 +637,18 @@ pub fn run(
                     "destination": to,
                     "substitutions": substitutions_json(&report.substitutions),
                     "filled": filled_json(&report.filled),
+                    "id_map": id_map_json(&report.id_map),
+                    "tar_said": report.tar_said,
                 }));
             } else {
                 println!("restored \"{file}\" from \"{unit}\" on {from} to {to}");
                 for line in repair_lines(&report.substitutions, &report.filled) {
+                    println!("{line}");
+                }
+                for line in tar_lines(&report.tar_said) {
+                    eprintln!("{line}");
+                }
+                for line in id_map_lines(&report.id_map) {
                     println!("{line}");
                 }
             }
@@ -649,7 +662,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
-            spool,
+            no_file_check,
             fail_fast,
             key,
             dry_run,
@@ -666,7 +679,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
-                spool: *spool,
+                no_file_check: *no_file_check,
                 keys,
             };
             let report = match label {
@@ -935,6 +948,52 @@ fn filled_json(filled: &[(String, String)]) -> serde_json::Value {
         .collect()
 }
 
+/// What tar said while it extracted (invariant 6: its exit status is never
+/// the verdict, and what it said is not dropped), as lines for the terminal.
+fn tar_lines(said: &[String]) -> Vec<String> {
+    said.iter().map(|l| format!("tar: {l}")).collect()
+}
+
+/// The staging's id map (item 278), as lines: what each user and group
+/// number in the restored unit was called by the host that wrote the tape.
+/// Shown, never acted on: a restore is by number and no owner is changed by
+/// name.
+fn id_map_lines(map: &[crate::idmap::IdRow]) -> Vec<String> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "owners are restored by number, as the stream has them; the host that wrote them \
+         called them:"
+            .to_string(),
+    ];
+    for row in map {
+        let kind = match row.kind {
+            crate::idmap::IdKind::User => "user",
+            crate::idmap::IdKind::Group => "group",
+        };
+        lines.push(format!(
+            "  {kind} {} = {}",
+            row.id,
+            row.name.as_deref().unwrap_or("(no name)")
+        ));
+    }
+    lines
+}
+
+/// `--json`'s `id_map`: one object for each id.
+fn id_map_json(map: &[crate::idmap::IdRow]) -> serde_json::Value {
+    map.iter()
+        .map(|row| {
+            serde_json::json!({
+                "kind": row.kind.letter(),
+                "id": row.id,
+                "name": row.name,
+            })
+        })
+        .collect()
+}
+
 /// The refusal for `restore volume --dry-run` with no label (issue #435): a
 /// dry run opens no drive, and without a label the volume is whatever File 0
 /// on the loaded tape says. (`restore unit` asks the catalog for the unit's
@@ -966,6 +1025,7 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
             (None, false, false) => format!("not attempted {what} (--fail-fast)"),
         });
         lines.extend(repair_lines(&u.substitutions, &u.filled));
+        lines.extend(id_map_lines(&u.id_map));
     }
     let total = report.units.len();
     lines.push(if report.dry_run {
@@ -1091,6 +1151,8 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
                 "error": u.error,
                 "substitutions": substitutions_json(&u.substitutions),
                 "filled": filled_json(&u.filled),
+                "id_map": id_map_json(&u.id_map),
+                "tar_said": u.tar_said,
             })
         })
         .collect();

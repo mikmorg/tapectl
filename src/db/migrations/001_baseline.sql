@@ -7,10 +7,10 @@
 -- is what a 1.9.2 catalog carries, with what Layout 3 adds as Stage 4 builds
 -- it (`volume-format-v3.md` Appendix A.2 and A.3): the file table
 -- (`stage_files`) and the id map (`stage_ids`), and the `tar_*` columns of
--- `stage_sets` and `tar_create_reports` that D11 renames dar's to. Until
--- T4.15 removes dar, each `tar_*` column stands beside the `dar_*` one it
--- replaces. (`restores.tar_*` come with the task that ports
--- `volume::restore_record`, whose test pins that table's columns.) The relic row
+-- `stage_sets`, `tar_create_reports` and `restores` that D11 renames dar's
+-- to. Until T4.15 removes dar, each `tar_*` column stands beside the `dar_*`
+-- one it replaces (`restores.tar_*` are written by `volume::restore_record`,
+-- whose test pins that table's columns). The relic row
 -- `meta.schema_version` (written once by the first 1.x migration and never
 -- moved) is not written; `PRAGMA user_version`, which the migration runner
 -- keeps, is the schema's version.
@@ -837,10 +837,18 @@ CREATE TABLE restores (
     files_restored   INTEGER,
     -- JSON array, program first: ["dar", "-x", "/dest/.tapectl-restore-tmp/restore", ...].
     dar_argv         TEXT,
+    -- The same, for the tar run that extracted the members (volume-format-v3.md
+    -- §7.1): JSON array, program first. A restore that fed tar more than once
+    -- (a long member's run cut short, item 264) records the last run.
+    tar_argv         TEXT,
     dar_exit_code    INTEGER,
+    tar_exit_code    INTEGER,
     dar_stdout       TEXT,
+    tar_stdout       TEXT,
     dar_stderr       TEXT,
+    tar_stderr       TEXT,
     dar_version      TEXT,
+    tar_version      TEXT,
     tapectl_version  TEXT NOT NULL
 );
 

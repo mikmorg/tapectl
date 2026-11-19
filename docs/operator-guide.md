@@ -1588,10 +1588,6 @@ tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
 tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
   --overwrite
 
-# Spool the slices to disk even though the unit could stream into dar
-tapectl restore unit family/letters --from L8-0002 --to /srv/restore/letters \
-  --spool
-
 # Every unit on a volume, in one pass over the tape, each into /srv/restore/<unit>
 tapectl restore volume L8-0002 --to /srv/restore
 

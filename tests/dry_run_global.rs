@@ -1361,7 +1361,7 @@ fn key_import_dry_run_inserts_nothing() {
     );
 }
 
-/// A home holding one unit, `u1`, with one written slice on the sealed
+/// A home holding one unit, `u1`, staged for real, with its slices written on the sealed
 /// volume `L6-0001` — the catalog rows a restore's dry run reads, and no
 /// tape. Returns the home and a root for the destination.
 fn home_with_one_written_unit() -> (TempDir, TempDir) {
@@ -1385,6 +1385,7 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
         ],
     );
     ok(home.path(), &["snapshot", "create", "u1"]);
+    ok(home.path(), &["stage", "create", "u1"]);
 
     let conn = db(home.path());
     let unit_id: i64 = conn
@@ -1405,20 +1406,16 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
     )
     .unwrap();
     let volume_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
-        rusqlite::params![snapshot_id],
-    )
-    .unwrap();
-    let stage_set_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                    sha256_plain, sha256_encrypted)
-         VALUES (?1, 1, 100, 116, ?2, ?3)",
-        rusqlite::params![stage_set_id, "a".repeat(64), "b".repeat(64)],
-    )
-    .unwrap();
-    let stage_slice_id = conn.last_insert_rowid();
+    // The staging is real (`stage create`): a restore plans from its file
+    // table, which only staging writes (invariant 8). Only the write rows,
+    // which need a tape, are made by hand.
+    let stage_set_id: i64 = conn
+        .query_row(
+            "SELECT id FROM stage_sets WHERE snapshot_id = ?1",
+            rusqlite::params![snapshot_id],
+            |r| r.get(0),
+        )
+        .unwrap();
     conn.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
          VALUES (?1, ?2, ?3, 'completed')",
@@ -1426,12 +1423,22 @@ fn home_with_one_written_unit() -> (TempDir, TempDir) {
     )
     .unwrap();
     let write_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
-         VALUES (?1, ?2, '0', 'written')",
-        rusqlite::params![write_id, stage_slice_id],
-    )
-    .unwrap();
+    let slice_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM stage_slices WHERE stage_set_id = ?1 ORDER BY slice_number")
+        .unwrap()
+        .query_map(rusqlite::params![stage_set_id], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(!slice_ids.is_empty(), "stage create made no slice");
+    for (i, stage_slice_id) in slice_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             VALUES (?1, ?2, ?3, 'written')",
+            rusqlite::params![write_id, stage_slice_id, (i + 5).to_string()],
+        )
+        .unwrap();
+    }
     drop(conn);
     (home, root)
 }

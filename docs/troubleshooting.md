@@ -2949,7 +2949,7 @@ again into an empty directory with `--spool`, which decrypts the slices to the
 scratch directory first and needs room for them as well as the files:
 
 ```bash
-tapectl restore unit --unit <unit> --to <empty dir> --spool
+tapectl restore unit --unit <unit> --to <empty dir>
 ```
 
 `restore volume --spool` does the same for a whole tape. From 1.7.0 tapectl

@@ -1092,10 +1092,12 @@ fn assert_restored(h: &Home, unit: &str, dest: &Path) {
 /// from tape 1 reads its range and asks for the live whole copy on tape 2
 /// for the rest (a whole copy first, not tape 3's range), by label; from
 /// tape 2 alone it needs no other cartridge; `--from` tape 3, which does not
-/// hold slice 1, is refused before anything is read, naming the holders of
-/// slice 1. Every restored file is byte-identical.
+/// hold slice 1, is no longer refused (item 266: a restore may start on any
+/// tape of a span): it asks for the whole copy on tape 2 and restores the
+/// version whole, and answered "skip" (I do not have it) it restores the files
+/// tape 3 holds whole and lists the rest. Every restored file is
+/// byte-identical.
 #[test]
-#[ignore = "L3-pending T4.8: tapectl's restore across cartridges, which still feeds dar the slices staging now cuts from a tar stream"]
 fn item_131_restore_unit_crosses_the_written_cartridges() {
     let h = written_93();
 
@@ -1131,30 +1133,54 @@ fn item_131_restore_unit_crosses_the_written_cartridges() {
     assert_restored(&h, B93, dest.path());
     assert!(b.asked.is_empty(), "tape 2 holds the version whole");
 
-    // Named, the refusal comes before the drive (the dry run is that path).
-    let dest = TempDir::new().unwrap();
-    let err = crate::volume::restore::restore_unit(
-        &h.conn,
-        &h.paths,
-        &h.config,
+    // Item 266: tape 3 holds only the last slice. A restore started on it asks
+    // for the cartridge that holds slice 1 (the whole copy), by label...
+    let mut b = bay(&h, T93[2], &[Reply::Load(T93[1])]);
+    let (r, dest) = restore(
+        &h,
         B93,
-        T93[2],
-        &dest.path().to_string_lossy(),
-        DEVICE,
-        BS,
-        None,
-        true,
+        What::Unit,
+        Some(T93[2]),
         &RestoreOptions::default(),
-    )
-    .unwrap_err()
-    .to_string();
-    for needle in [
-        format!("volume \"{}\" holds only slice 3", T93[2]),
-        format!("Slice 1 is on \"{}\"", T93[0]),
-        format!("--from {}", T93[0]),
-    ] {
-        assert!(err.contains(&needle), "{needle}: {err}");
+        &mut b,
+    );
+    r.unwrap_or_else(|e| panic!("from {}: {e}", T93[2]));
+    assert_restored(&h, B93, dest.path());
+    assert_eq!(b.asked_labels(), [T93[1]], "the whole copy, by label");
+
+    // ...and "I do not have it" restores what tape 3 holds whole and lists the
+    // rest: the files of the last slice are there and the others are named.
+    let mut b = bay(&h, T93[2], &[Reply::Skip]);
+    let (r, dest) = restore(
+        &h,
+        B93,
+        What::Unit,
+        Some(T93[2]),
+        &RestoreOptions::default(),
+        &mut b,
+    );
+    let err = r
+        .expect_err("files that no cartridge given holds are listed")
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    let last = num_slices(&h.conn, B93) as u64;
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, B93)).unwrap();
+    let on_tape_3: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.slice == last && r.kind == crate::volume::filetable::Kind::File)
+        .map(|r| r.path.as_str())
+        .collect();
+    assert!(!on_tape_3.is_empty(), "tape 3 holds a file whole");
+    for (file, bytes) in &h.units[B93] {
+        let there = fs::read(dest.path().join(file)).ok();
+        if on_tape_3.contains(&file.as_str()) {
+            assert_eq!(there.as_ref(), Some(bytes), "{file} is on tape 3");
+        } else {
+            assert!(there.is_none(), "{file} is not on tape 3");
+            assert!(err.contains(file.as_str()), "{file} is named: {err}");
+        }
     }
+    assert_eq!(b.asked_labels(), [T93[1]], "asked once, not again");
 
     // A whole unit of the same tapes restores as in 1.6.0.
     let mut b = bay(&h, T93[0], &[]);
@@ -1173,11 +1199,9 @@ fn item_131_restore_unit_crosses_the_written_cartridges() {
 
 /// Item 131 on item 94's tapes, which hold the version only as three
 /// ranges: `restore unit --from` tape 1 asks for tapes 2 and 3 in slice
-/// order; `restore unit` of the loaded tape 1 does the same, and so does
-/// `--spool`; `restore file` of a file whose bytes are on the later tapes
-/// reads across the cartridges. Every file comes back byte for byte.
+/// order; `restore unit` of the loaded tape 1 does the same; `restore file`
+/// of a file whose bytes are on the later tapes reads across the cartridges. Every file comes back byte for byte.
 #[test]
-#[ignore = "L3-pending T4.8: tapectl's restore across cartridges, which still feeds dar the slices staging now cuts from a tar stream"]
 fn item_131_restore_crosses_three_written_ranges() {
     let h = written_94();
     let later = [Reply::Load(T94[1]), Reply::Load(T94[2])];
@@ -1193,7 +1217,20 @@ fn item_131_restore_crosses_three_written_ranges() {
     );
     let report = r.unwrap_or_else(|e| panic!("--from {}: {e}", T94[0]));
     assert_restored(&h, S94, dest.path());
-    assert_eq!(report.slices as i64, num_slices(&h.conn, S94));
+    // Every slice that holds a member is read; a last slice that holds only
+    // the stream's tail (tar's end blocks) is not.
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, S94)).unwrap();
+    let slice_size =
+        crate::volume::restore::stage_facts(&h.conn, stage_set_of(&h.conn, S94), &rows)
+            .unwrap()
+            .slice_size;
+    let member_slices = rows
+        .iter()
+        .flat_map(|r| r.slices(slice_size))
+        .collect::<std::collections::BTreeSet<u64>>()
+        .len();
+    assert_eq!(report.slices, member_slices);
+    assert!(member_slices as i64 <= num_slices(&h.conn, S94));
     assert_eq!(b.asked_labels(), [T94[1], T94[2]], "in slice order");
     for (prompt, (label, first)) in b.asked.iter().zip([
         (T94[1], written_run(&h.conn, T94[1], S94).0),
@@ -1220,15 +1257,6 @@ fn item_131_restore_crosses_three_written_ranges() {
     assert_restored(&h, S94, dest.path());
     assert_eq!(b.asked_labels(), [T94[1], T94[2]]);
 
-    let spool = RestoreOptions {
-        spool: true,
-        ..RestoreOptions::default()
-    };
-    let mut b = bay(&h, T94[0], &later);
-    let (r, dest) = restore(&h, S94, What::Unit, Some(T94[0]), &spool, &mut b);
-    r.unwrap_or_else(|e| panic!("--spool: {e}"));
-    assert_restored(&h, S94, dest.path());
-
     let (file, bytes) = h.units[S94].last().unwrap().clone();
     let mut b = bay(&h, T94[0], &later);
     let (r, dest) = restore(
@@ -1241,10 +1269,26 @@ fn item_131_restore_crosses_three_written_ranges() {
     );
     r.unwrap_or_else(|e| panic!("restore file {file}: {e}"));
     assert_eq!(fs::read(dest.path().join(&file)).unwrap(), bytes);
+    // Only the slices that hold the file are read (the archive's catalogue
+    // is no slice any more): the later tapes that hold some of them are
+    // asked for, in slice order, and no other.
+    let rows = crate::db::stage_files::load(&h.conn, stage_set_of(&h.conn, S94)).unwrap();
+    let row = rows.iter().find(|r| r.path == file).unwrap();
+    let slice_size =
+        crate::volume::restore::stage_facts(&h.conn, stage_set_of(&h.conn, S94), &rows)
+            .unwrap()
+            .slice_size;
+    let wanted: Vec<i64> = row.slices(slice_size).map(|n| n as i64).collect();
+    let holds = |label: &str| {
+        let (first, last, _) = written_run(&h.conn, label, S94);
+        wanted.iter().any(|n| (first..=last).contains(n))
+    };
+    let expected: Vec<&str> = T94[1..].iter().copied().filter(|l| holds(l)).collect();
+    assert!(!expected.is_empty(), "the file's bytes are on a later tape");
     assert_eq!(
         b.asked_labels(),
-        [T94[1], T94[2]],
-        "the file's bytes, and the archive's end, are on the later tapes"
+        expected,
+        "the file's slices, and no other, are read from the later tapes"
     );
 
     // The whole unit written after the span's tail restores alone.

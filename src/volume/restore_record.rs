@@ -5,8 +5,8 @@
 //! A restore is the one operation that proves the archive works, and until
 //! this table it was the one operation that left no record: the contact row
 //! said a cartridge was in a drive, the health row said what the counters
-//! read afterwards, and nothing said what the restore DID or what dar made
-//! of the archive. This module is the writer and the reader; the migration
+//! read afterwards, and nothing said what the restore DID or what tar made
+//! of the members it was fed. This module is the writer and the reader; the migration
 //! header is the column-by-column contract.
 //!
 //! **Bookkeeping never refuses the command.** [`record`] warns and returns
@@ -17,8 +17,6 @@
 use rusqlite::types::Value;
 use rusqlite::{params, Connection};
 use tracing::warn;
-
-use crate::dar::restore::DarReport;
 
 /// `restores.kind` for `restore unit`.
 pub const KIND_UNIT: &str = "unit";
@@ -36,6 +34,25 @@ pub const ALL_KINDS: &[&str] = &[KIND_UNIT, KIND_FILE, KIND_RAW_VOLUME];
 /// `opened_at` without conversion.
 pub fn now_sqlite() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// What the last tar run of a restore did, verbatim (`volume-format-v3.md`
+/// §7.1): its command line, its exit status and what it wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TarReport {
+    /// The program first, then its arguments.
+    pub argv: Vec<String>,
+    /// `None` when tar was killed by a signal.
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl TarReport {
+    /// `argv` as a JSON array, the spelling `mam_journal.tool_argv` uses.
+    pub fn argv_json(&self) -> String {
+        serde_json::Value::from(self.argv.clone()).to_string()
+    }
 }
 
 /// One restore, as [`record`] writes it. Field meanings, per kind, are in
@@ -64,12 +81,12 @@ pub struct RestoreRecord<'a> {
     pub slices_read: Option<i64>,
     pub bytes_restored: Option<i64>,
     pub files_restored: Option<i64>,
-    /// `None` when dar never ran.
-    pub dar: Option<&'a DarReport>,
-    pub dar_version: Option<&'a str>,
+    /// `None` when tar never ran.
+    pub tar: Option<&'a TarReport>,
+    pub tar_version: Option<&'a str>,
 }
 
-/// dar's stream as the row stores it: TEXT when valid UTF-8, a BLOB of the
+/// tar's stream as the row stores it: TEXT when valid UTF-8, a BLOB of the
 /// exact bytes otherwise — never a lossy conversion (022's rule for
 /// `mam_journal.raw`).
 fn verbatim(bytes: &[u8]) -> Value {
@@ -84,13 +101,13 @@ fn verbatim(bytes: &[u8]) -> Value {
 /// Best-effort: a failed insert is a `warn!` naming the kind and unit, and
 /// `None`. Returns the row id otherwise.
 pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
-    let (dar_argv, dar_exit_code, dar_stdout, dar_stderr) = match rec.dar {
-        Some(d) => (
-            Value::Text(d.argv_json()),
-            d.exit_code
+    let (tar_argv, tar_exit_code, tar_stdout, tar_stderr) = match rec.tar {
+        Some(t) => (
+            Value::Text(t.argv_json()),
+            t.exit_code
                 .map_or(Value::Null, |c| Value::Integer(c.into())),
-            verbatim(&d.stdout),
-            verbatim(&d.stderr),
+            verbatim(&t.stdout),
+            verbatim(&t.stderr),
         ),
         None => (Value::Null, Value::Null, Value::Null, Value::Null),
     };
@@ -99,7 +116,7 @@ pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
              (contact_id, volume_id, volume_label, unit_id, unit_name, version,
               kind, file_path, destination, started_at, finished_at, outcome, error,
               slices_read, bytes_restored, files_restored,
-              dar_argv, dar_exit_code, dar_stdout, dar_stderr, dar_version,
+              tar_argv, tar_exit_code, tar_stdout, tar_stderr, tar_version,
               tapectl_version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
@@ -120,11 +137,11 @@ pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
             rec.slices_read,
             rec.bytes_restored,
             rec.files_restored,
-            dar_argv,
-            dar_exit_code,
-            dar_stdout,
-            dar_stderr,
-            rec.dar_version,
+            tar_argv,
+            tar_exit_code,
+            tar_stdout,
+            tar_stderr,
+            rec.tar_version,
             crate::build_info::VERSION,
         ],
     );
@@ -144,7 +161,7 @@ pub fn record(conn: &Connection, rec: &RestoreRecord<'_>) -> Option<i64> {
 
 /// A `restores` row read back — what a report or a test queries.
 ///
-/// `dar_stdout`/`dar_stderr` are `None` when dar never ran; a stream that
+/// `tar_stdout`/`tar_stderr` are `None` when tar never ran; a stream that
 /// was stored as a BLOB (non-UTF-8) is returned lossily here, which is fine
 /// for display and is why the column, not this reader, is the record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,11 +183,11 @@ pub struct RestoreRow {
     pub slices_read: Option<i64>,
     pub bytes_restored: Option<i64>,
     pub files_restored: Option<i64>,
-    pub dar_argv: Option<String>,
-    pub dar_exit_code: Option<i64>,
-    pub dar_stdout: Option<String>,
-    pub dar_stderr: Option<String>,
-    pub dar_version: Option<String>,
+    pub tar_argv: Option<String>,
+    pub tar_exit_code: Option<i64>,
+    pub tar_stdout: Option<String>,
+    pub tar_stderr: Option<String>,
+    pub tar_version: Option<String>,
     pub tapectl_version: String,
 }
 
@@ -180,7 +197,7 @@ pub fn rows(conn: &Connection) -> rusqlite::Result<Vec<RestoreRow>> {
         "SELECT id, contact_id, volume_id, volume_label, unit_id, unit_name, version,
                 kind, file_path, destination, started_at, finished_at, outcome, error,
                 slices_read, bytes_restored, files_restored,
-                dar_argv, dar_exit_code, dar_stdout, dar_stderr, dar_version,
+                tar_argv, tar_exit_code, tar_stdout, tar_stderr, tar_version,
                 tapectl_version
            FROM restores ORDER BY id",
     )?;
@@ -212,11 +229,11 @@ pub fn rows(conn: &Connection) -> rusqlite::Result<Vec<RestoreRow>> {
                 slices_read: r.get(14)?,
                 bytes_restored: r.get(15)?,
                 files_restored: r.get(16)?,
-                dar_argv: r.get(17)?,
-                dar_exit_code: r.get(18)?,
-                dar_stdout: text(r.get(19)?),
-                dar_stderr: text(r.get(20)?),
-                dar_version: r.get(21)?,
+                tar_argv: r.get(17)?,
+                tar_exit_code: r.get(18)?,
+                tar_stdout: text(r.get(19)?),
+                tar_stderr: text(r.get(20)?),
+                tar_version: r.get(21)?,
                 tapectl_version: r.get(22)?,
             })
         })?
@@ -229,16 +246,16 @@ mod tests {
     use super::*;
     use crate::tape::contact::{OUTCOME_FAILED, OUTCOME_OK};
 
-    fn report(stdout: &[u8], stderr: &[u8]) -> DarReport {
-        DarReport {
-            argv: vec!["dar".into(), "-x".into(), "/d/restore".into()],
+    fn report(stdout: &[u8], stderr: &[u8]) -> TarReport {
+        TarReport {
+            argv: vec!["tar".into(), "--extract".into(), "--directory=/d".into()],
             exit_code: Some(0),
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         }
     }
 
-    fn rec<'a>(started_at: &'a str, dar: Option<&'a DarReport>) -> RestoreRecord<'a> {
+    fn rec<'a>(started_at: &'a str, tar: Option<&'a TarReport>) -> RestoreRecord<'a> {
         RestoreRecord {
             contact_id: None,
             volume_id: None,
@@ -255,8 +272,8 @@ mod tests {
             slices_read: Some(1),
             bytes_restored: Some(4096),
             files_restored: Some(3),
-            dar,
-            dar_version: Some("2.7.13"),
+            tar,
+            tar_version: Some("tar (GNU tar) 1.35"),
         }
     }
 
@@ -297,11 +314,18 @@ mod tests {
                 expect("slices_read", "INTEGER", 0),
                 expect("bytes_restored", "INTEGER", 0),
                 expect("files_restored", "INTEGER", 0),
+                // Each tar_* column stands beside the column it replaces
+                // until T4.15 drops the old ones.
                 expect("dar_argv", "TEXT", 0),
+                expect("tar_argv", "TEXT", 0),
                 expect("dar_exit_code", "INTEGER", 0),
+                expect("tar_exit_code", "INTEGER", 0),
                 expect("dar_stdout", "TEXT", 0),
+                expect("tar_stdout", "TEXT", 0),
                 expect("dar_stderr", "TEXT", 0),
+                expect("tar_stderr", "TEXT", 0),
                 expect("dar_version", "TEXT", 0),
+                expect("tar_version", "TEXT", 0),
                 expect("tapectl_version", "TEXT", 1),
             ],
             "no drive column (ADR-0013 §1): the drive is reached through contact_id"
@@ -387,7 +411,7 @@ mod tests {
     fn record_writes_every_field_and_the_report_verbatim() {
         let conn = crate::db::open_memory().unwrap();
         let started = now_sqlite();
-        let rep = report(b" 3 inode(s) restored\n", b"a warning\n");
+        let rep = report(b"3 members\n", b"a warning\n");
         let id = record(&conn, &rec(&started, Some(&rep))).expect("row written");
         let rows = rows(&conn).unwrap();
         assert_eq!(rows.len(), 1);
@@ -405,18 +429,21 @@ mod tests {
         assert_eq!(r.slices_read, Some(1));
         assert_eq!(r.bytes_restored, Some(4096));
         assert_eq!(r.files_restored, Some(3));
-        assert_eq!(r.dar_argv.as_deref(), Some(r#"["dar","-x","/d/restore"]"#));
-        assert_eq!(r.dar_exit_code, Some(0));
-        assert_eq!(r.dar_stdout.as_deref(), Some(" 3 inode(s) restored\n"));
-        assert_eq!(r.dar_stderr.as_deref(), Some("a warning\n"));
-        assert_eq!(r.dar_version.as_deref(), Some("2.7.13"));
+        assert_eq!(
+            r.tar_argv.as_deref(),
+            Some(r#"["tar","--extract","--directory=/d"]"#)
+        );
+        assert_eq!(r.tar_exit_code, Some(0));
+        assert_eq!(r.tar_stdout.as_deref(), Some("3 members\n"));
+        assert_eq!(r.tar_stderr.as_deref(), Some("a warning\n"));
+        assert_eq!(r.tar_version.as_deref(), Some("tar (GNU tar) 1.35"));
         assert_eq!(r.tapectl_version, crate::build_info::VERSION);
     }
 
-    /// NULL means dar never ran; "" means it ran and said nothing. The two
+    /// NULL means tar never ran; "" means it ran and said nothing. The two
     /// are different facts and the row keeps them apart.
     #[test]
-    fn no_dar_is_null_and_a_silent_dar_is_empty() {
+    fn no_tar_is_null_and_a_silent_tar_is_empty() {
         let conn = crate::db::open_memory().unwrap();
         let started = now_sqlite();
         let mut failed = rec(&started, None);
@@ -425,7 +452,7 @@ mod tests {
         failed.slices_read = None;
         failed.bytes_restored = None;
         failed.files_restored = None;
-        failed.dar_version = None;
+        failed.tar_version = None;
         record(&conn, &failed).unwrap();
         let silent = report(b"", b"");
         record(&conn, &rec(&started, Some(&silent))).unwrap();
@@ -433,34 +460,34 @@ mod tests {
         let rows = rows(&conn).unwrap();
         assert_eq!(rows[0].outcome, "failed");
         assert_eq!(rows[0].error.as_deref(), Some("no secret keys found"));
-        assert_eq!(rows[0].dar_stdout, None, "dar never ran: NULL");
-        assert_eq!(rows[0].dar_stderr, None);
-        assert_eq!(rows[0].dar_argv, None);
-        assert_eq!(rows[0].dar_exit_code, None);
+        assert_eq!(rows[0].tar_stdout, None, "tar never ran: NULL");
+        assert_eq!(rows[0].tar_stderr, None);
+        assert_eq!(rows[0].tar_argv, None);
+        assert_eq!(rows[0].tar_exit_code, None);
         assert_eq!(
-            rows[1].dar_stdout.as_deref(),
+            rows[1].tar_stdout.as_deref(),
             Some(""),
             "ran, said nothing: empty"
         );
-        assert_eq!(rows[1].dar_stderr.as_deref(), Some(""));
+        assert_eq!(rows[1].tar_stderr.as_deref(), Some(""));
     }
 
-    /// A non-UTF-8 file name in dar's output is stored as the exact bytes,
+    /// A non-UTF-8 file name in tar's output is stored as the exact bytes,
     /// not rewritten (the rule `mam_journal.raw` follows).
     #[test]
     fn a_non_utf8_stream_is_kept_as_its_exact_bytes() {
         let conn = crate::db::open_memory().unwrap();
         let started = now_sqlite();
-        let bytes = b"/dest/caf\xe9.txt not restored (user choice)\n";
+        let bytes = b"tar: /dest/caf\xe9.txt: Cannot open\n";
         let rep = report(bytes, b"");
         record(&conn, &rec(&started, Some(&rep))).unwrap();
         let raw: Value = conn
-            .query_row("SELECT dar_stdout FROM restores", [], |r| r.get(0))
+            .query_row("SELECT tar_stdout FROM restores", [], |r| r.get(0))
             .unwrap();
         assert_eq!(raw, Value::Blob(bytes.to_vec()));
         // The UTF-8 sibling is TEXT, so the type is chosen per stream.
         let stderr: Value = conn
-            .query_row("SELECT dar_stderr FROM restores", [], |r| r.get(0))
+            .query_row("SELECT tar_stderr FROM restores", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stderr, Value::Text(String::new()));
     }
