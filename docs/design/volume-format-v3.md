@@ -308,7 +308,10 @@ is, and every text stays UTF-8. The escape is reversible: `\x` follows only an e
 byte, since a backslash is itself escaped. The catalog keeps a path in this form too. An
 empty field means "not known". A reader finds columns by their
 header name and ignores a column it does not know. Rows are sorted as given below, so
-the bytes are deterministic for a given catalog. **This escaping is the one rule for the
+the bytes are deterministic for a given catalog. **Determined** (the coordinator, T4.17):
+wherever the format says "bytewise", the bytes compared are a path's escaped text, the
+order the catalog keeps; this differs from the order of the raw names only for a name
+holding a backslash, TAB, LF, CR or a byte outside UTF-8. **This escaping is the one rule for the
 whole format** (`volume::index::escape`): the file table, the id map and the
 damaged-file list use it too.
 
@@ -675,7 +678,8 @@ stored in the raw record no reader restores with its ordinary flags (T0.1).
 - No `--sparse`: a sparse file is stored as its bytes. No compression by tar.
 
 **The list** is tapectl's: the snapshot's own entries, NUL-separated, every name prefixed
-`./`, sorted bytewise, folders listed as their own entries, the unit's dotfile included.
+`./`, sorted bytewise on each name's escaped text (§1.5), folders listed as their own
+entries, the unit's dotfile included.
 
 **The environment.** tar runs in the unit's root, with `LC_ALL=C`, and with `TAR_OPTIONS`
 and `POSIXLY_CORRECT` removed from its environment. If `--directory` is used in place of
