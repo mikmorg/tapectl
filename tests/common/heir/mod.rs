@@ -128,6 +128,32 @@ pub struct Shape {
     /// End the tape early: the drive's warning comes inside the slice with
     /// this index counted over every slice of the plan (0-based).
     pub warning_in_slice: Option<usize>,
+    /// How many tapes are written from the same stagings (copies of one
+    /// version: `HEIR01`, `HEIR02` ...). With a `restage` the series is the
+    /// first tape and the tape of the second staging, and this is not used.
+    pub copies: usize,
+    /// Which tape of a series the early warning ends (`warning_in_slice`
+    /// counts over that tape's own slices).
+    pub warn_tape: usize,
+    /// Stage the first unit a second time after the first tape is written,
+    /// and write a second tape from that staging alone.
+    pub restage: Restage,
+    /// Edit the generated index files before the build (`units.tsv` and
+    /// `paths.tsv` of each envelope), to give a tape a map that real
+    /// catalogs of one write do not make.
+    pub index_edit: Option<fn(&index::IndexFiles)>,
+    /// Build the tape with no cross-volume index at all.
+    pub no_index: bool,
+}
+
+/// What a second staging of the first unit changes (#528).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Restage {
+    None,
+    /// `unit tag` rewrites the unit's dotfile; the same Version stages again.
+    Dotfile,
+    /// A file's bytes change: a new Version (2) is minted and staged.
+    Content,
 }
 
 impl Shape {
@@ -140,6 +166,11 @@ impl Shape {
             ],
             compression: "none",
             warning_in_slice: None,
+            copies: 1,
+            warn_tape: 0,
+            restage: Restage::None,
+            index_edit: None,
+            no_index: false,
         }
     }
     /// One big unit of tenant A, compressed.
@@ -148,6 +179,11 @@ impl Shape {
             units: vec![(UNIT_A.into(), TENANT_A, true)],
             compression,
             warning_in_slice: None,
+            copies: 1,
+            warn_tape: 0,
+            restage: Restage::None,
+            index_edit: None,
+            no_index: false,
         }
     }
 }
@@ -164,7 +200,12 @@ pub struct Tape {
     pub entries: Vec<format::ParsedIndexEntry>,
     /// File 2, the script, as the tape holds it.
     pub script: Vec<u8>,
-    _home: tempfile::TempDir,
+    /// The volume's label and uuid (File 0's).
+    pub label: String,
+    pub volume_uuid: String,
+    /// The unit's uuid of each unit, by name.
+    pub unit_uuids: BTreeMap<String, String>,
+    _home: std::sync::Arc<tempfile::TempDir>,
 }
 
 fn key_name(w: Who) -> &'static str {
@@ -181,6 +222,29 @@ struct Home {
     paths: TapectlPaths,
     config: Config,
     sources: PathBuf,
+}
+
+/// What writing a tape needs besides the catalog.
+struct Ctx {
+    escrow_public: String,
+    keys: BTreeMap<&'static str, String>,
+    tmp: std::sync::Arc<tempfile::TempDir>,
+}
+
+fn label_of(n: usize) -> String {
+    if n == 0 {
+        LABEL.to_string()
+    } else {
+        format!("HEIR{:02}", n + 1)
+    }
+}
+
+fn volume_uuid_of(n: usize) -> String {
+    if n == 0 {
+        VOLUME_UUID.to_string()
+    } else {
+        format!("a1b2c3d4-e5f6-4789-a123-4567890000{n:02x}")
+    }
 }
 
 fn public_keys(conn: &Connection, tenant: &str) -> Vec<String> {
@@ -226,9 +290,14 @@ fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -
             files.push((format!("inner/mid-{i}.dat"), noise(12_000, seed + 10 + i)));
         }
         files.push(("odd\\back name.txt".to_string(), text(2_000, seed + 30)));
+        // A TAB and a newline in a name: the index's escaping carries both.
+        files.push(("tab\tand\nnewline.txt".to_string(), text(1_500, seed + 32)));
+        // A folder whose name holds a backslash.
+        files.push(("dir\\one/leaf.txt".to_string(), text(700, seed + 33)));
         files.push(("notes.txt".to_string(), text(40_000, seed + 31)));
     }
     for (path, bytes) in &files {
+        fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
         fs::write(dir.join(path), bytes).unwrap();
     }
     std::os::unix::fs::symlink(format!("{name}-small.txt"), dir.join("a-symlink")).unwrap();
@@ -270,10 +339,193 @@ fn make_unit(h: &Home, name: &str, tenant: &'static str, big: bool, seed: u32) -
     }
 }
 
+/// Write one tape of `units` (the selection `bu`) to a memory store through
+/// the whole write session, and keep what it recorded. `n` numbers the tapes
+/// of one catalog: it names the label and the volume uuid.
+fn write_tape(
+    h: &Home,
+    ctx: &Ctx,
+    shape: &Shape,
+    units: &[UnitTruth],
+    bu: Vec<build::BuildUnit>,
+    n: usize,
+) -> Tape {
+    let label = label_of(n);
+    let volume_uuid = volume_uuid_of(n);
+    let ids: Vec<i64> = bu.iter().map(|u| u.stage_set_id).collect();
+    let work = tempfile::tempdir().unwrap();
+    let idx = if shape.no_index {
+        None
+    } else {
+        let idx = index::generate_files(
+            &h.conn,
+            &IndexThisTape {
+                label: &label,
+                uuid: &volume_uuid,
+                cartridge_serial: SERIAL,
+                generation: "LTO-6",
+            },
+            &ids,
+            &work.path().join("index"),
+        )
+        .unwrap();
+        if let Some(edit) = shape.index_edit {
+            edit(&idx);
+        }
+        Some(idx)
+    };
+    let tables = write::generate_tables(&h.conn, &bu, &work.path().join("tables")).unwrap();
+    let catalog_db = work.path().join("catalog.db");
+    db::ontape_catalog::write(&h.conn, &ids, &catalog_db).unwrap();
+    let mut tenant_ids: Vec<i64> = bu.iter().map(|u| u.tenant_id).collect();
+    tenant_ids.sort_unstable();
+    tenant_ids.dedup();
+    let tenants: Vec<TenantInfo> = [TENANT_A, TENANT_B]
+        .into_iter()
+        .map(|t| TenantInfo {
+            tenant_id: tenant_id(&h.conn, t),
+            tenant_name: t.to_string(),
+            public_keys: public_keys(&h.conn, t),
+        })
+        .filter(|t| tenant_ids.contains(&t.tenant_id))
+        .collect();
+    h.conn
+        .execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, uuid)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', ?2)",
+            params![label, volume_uuid],
+        )
+        .unwrap();
+    let volume_id = h.conn.last_insert_rowid();
+    let inputs = BuildInputs {
+        label: label.clone(),
+        volume_uuid: volume_uuid.clone(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at: "2026-11-19T00:00:00Z".to_string(),
+        block_size: BS,
+        usable_bytes: 512 * 1024 * 1024,
+        enospc_buffer: 0,
+        nominal_capacity: 2_500_000_000_000,
+        mam_capacity: 2_500_000_000_000,
+        mam_manufacturer: "TAPECTL-TEST".to_string(),
+        mam_serial: SERIAL.to_string(),
+        cartridge_identity_source: Some("mam".to_string()),
+        mam_length: 0,
+        mam_loads: 0,
+        units: bu.clone(),
+        tenants,
+        operator_public_keys: public_keys(&h.conn, OPERATOR),
+        escrow_public_key: Some(ctx.escrow_public.clone()),
+        catalog_db_path: Some(catalog_db),
+        index: idx,
+        tables: Some(tables),
+    };
+    let session_dir = tempfile::tempdir().unwrap();
+    let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+    let kav = KeyAvailability {
+        tenant_ids: tenant_ids.clone(),
+        tenants_with_active_key: tenant_ids.iter().copied().collect(),
+        operator_key_present: true,
+        escrow_recipient_present: Some(true),
+        stage_sets_lacking_escrow: None,
+    };
+    let mut store = MemStore::new(BS as usize);
+    if let Some(k) = shape.warning_in_slice.filter(|_| n == shape.warn_tape) {
+        let slices: Vec<(i32, u64)> = built
+            .layout
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .map(|e| (e.position, e.size_bytes.unwrap()))
+            .collect();
+        let (pos, size) = slices[k];
+        assert!(
+            size > BS,
+            "the slice spans blocks, for the warning to come in it"
+        );
+        let before: u64 = built
+            .layout
+            .entries
+            .iter()
+            .filter(|e| e.position < pos)
+            .map(|e| e.size_bytes.unwrap().div_ceil(BS) * BS)
+            .sum();
+        store = store.with_early_warning_after(before + 1);
+    }
+    let validated = built
+        .into_validated(&kav, SliceCheck::FullHash, &mut store)
+        .expect("validate passes for a tape of real stagings");
+    let planned = validated
+        .plan(&h.conn, volume_id, &bu)
+        .expect("plan inserts its rows");
+    let ready = match planned.execute(&h.conn, &mut store).expect("execute") {
+        ExecuteOutcome::Ready(r) => r,
+        ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption"),
+        ExecuteOutcome::Aborted(a) => panic!("unexpected abort: {}", a.reason),
+    };
+    let ending = ready.ending();
+    let pending = ready.seal(&mut store).expect("seal");
+    match pending
+        .confirm(&h.conn, &mut store, Tier::Integrity)
+        .expect("confirm")
+    {
+        ConfirmOutcome::Sealed(_) => {}
+        ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+        ConfirmOutcome::Inconclusive(i) => panic!("inconclusive: {:?}", i.evidence.mismatches),
+    }
+    let fi_len = store.files[3]
+        .iter()
+        .rposition(|b| *b != 0)
+        .map(|i| i + 1)
+        .unwrap();
+    let entries =
+        format::parse_front_index(&String::from_utf8_lossy(&store.files[3][..fi_len])).unwrap();
+    let script_entry = &entries[2];
+    assert_eq!(script_entry.type_label, "restore_sh");
+    let script = store.files[2][..script_entry.size_bytes.unwrap() as usize].to_vec();
+    drop(work);
+    drop(session_dir);
+    let files = store.files.clone();
+    let mut unit_uuids = BTreeMap::new();
+    for u in units {
+        let uuid: String = h
+            .conn
+            .query_row(
+                "SELECT uuid FROM units WHERE name = ?1",
+                params![u.name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        unit_uuids.insert(u.name.clone(), uuid);
+    }
+    Tape {
+        files,
+        units: units.to_vec(),
+        keys: ctx.keys.clone(),
+        ending,
+        entries,
+        script,
+        label,
+        volume_uuid,
+        unit_uuids,
+        _home: ctx.tmp.clone(),
+    }
+}
+
 impl Tape {
     /// Build a tape of `shape` from real stagings.
     pub fn build(shape: &Shape) -> Tape {
-        let tmp = tempfile::tempdir().unwrap();
+        Tape::build_series(shape).remove(0)
+    }
+
+    /// The tapes of `shape`: `shape.copies` tapes written from the same
+    /// stagings, or, with a `restage`, the first tape and a second tape
+    /// written from the second staging of the first unit alone. They share
+    /// one catalog, so one set of keys and one uuid for each unit.
+    pub fn build_series(shape: &Shape) -> Vec<Tape> {
+        let tmp = std::sync::Arc::new(tempfile::tempdir().unwrap());
         let paths = TapectlPaths::new(tmp.path().join("home"));
         paths.ensure_dirs().unwrap();
         let conn = db::open(&paths.db_file).unwrap();
@@ -305,146 +557,81 @@ impl Tape {
         keys.insert(key_name(Who::TenantB), secret_of(&h, TENANT_B));
         keys.insert(key_name(Who::Operator), secret_of(&h, OPERATOR));
         keys.insert(key_name(Who::Escrow), escrow.keypair.secret_key.clone());
-
-        let bu = write::staged_build_units(&h.conn).expect("the staged selection");
-        let ids: Vec<i64> = bu.iter().map(|u| u.stage_set_id).collect();
-        let work = tempfile::tempdir().unwrap();
-        let idx = index::generate_files(
-            &h.conn,
-            &IndexThisTape {
-                label: LABEL,
-                uuid: VOLUME_UUID,
-                cartridge_serial: SERIAL,
-                generation: "LTO-6",
-            },
-            &ids,
-            &work.path().join("index"),
-        )
-        .unwrap();
-        let tables = write::generate_tables(&h.conn, &bu, &work.path().join("tables")).unwrap();
-        let catalog_db = work.path().join("catalog.db");
-        db::ontape_catalog::write(&h.conn, &ids, &catalog_db).unwrap();
-        let mut tenant_ids: Vec<i64> = bu.iter().map(|u| u.tenant_id).collect();
-        tenant_ids.sort_unstable();
-        tenant_ids.dedup();
-        let tenants: Vec<TenantInfo> = [TENANT_A, TENANT_B]
-            .into_iter()
-            .map(|t| TenantInfo {
-                tenant_id: tenant_id(&h.conn, t),
-                tenant_name: t.to_string(),
-                public_keys: public_keys(&h.conn, t),
-            })
-            .filter(|t| tenant_ids.contains(&t.tenant_id))
-            .collect();
-        h.conn
-            .execute(
-                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
-                                      status, uuid)
-                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized', ?2)",
-                params![LABEL, VOLUME_UUID],
-            )
-            .unwrap();
-        let volume_id = h.conn.last_insert_rowid();
-        let inputs = BuildInputs {
-            label: LABEL.to_string(),
-            volume_uuid: VOLUME_UUID.to_string(),
-            media_type: "LTO-6".to_string(),
-            tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
-            created_at: "2026-11-19T00:00:00Z".to_string(),
-            block_size: BS,
-            usable_bytes: 512 * 1024 * 1024,
-            enospc_buffer: 0,
-            nominal_capacity: 2_500_000_000_000,
-            mam_capacity: 2_500_000_000_000,
-            mam_manufacturer: "TAPECTL-TEST".to_string(),
-            mam_serial: SERIAL.to_string(),
-            cartridge_identity_source: Some("mam".to_string()),
-            mam_length: 0,
-            mam_loads: 0,
-            units: bu.clone(),
-            tenants,
-            operator_public_keys: public_keys(&h.conn, OPERATOR),
-            escrow_public_key: Some(escrow.keypair.public_key.clone()),
-            catalog_db_path: Some(catalog_db),
-            index: Some(idx),
-            tables: Some(tables),
-        };
-        let session_dir = tempfile::tempdir().unwrap();
-        let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
-        let kav = KeyAvailability {
-            tenant_ids: tenant_ids.clone(),
-            tenants_with_active_key: tenant_ids.iter().copied().collect(),
-            operator_key_present: true,
-            escrow_recipient_present: Some(true),
-            stage_sets_lacking_escrow: None,
-        };
-        let mut store = MemStore::new(BS as usize);
-        if let Some(k) = shape.warning_in_slice {
-            let slices: Vec<(i32, u64)> = built
-                .layout
-                .entries
-                .iter()
-                .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
-                .map(|e| (e.position, e.size_bytes.unwrap()))
-                .collect();
-            let (pos, size) = slices[k];
-            assert!(
-                size > BS,
-                "the slice spans blocks, for the warning to come in it"
-            );
-            let before: u64 = built
-                .layout
-                .entries
-                .iter()
-                .filter(|e| e.position < pos)
-                .map(|e| e.size_bytes.unwrap().div_ceil(BS) * BS)
-                .sum();
-            store = store.with_early_warning_after(before + 1);
-        }
-        let validated = built
-            .into_validated(&kav, SliceCheck::FullHash, &mut store)
-            .expect("validate passes for a tape of real stagings");
-        let planned = validated
-            .plan(&h.conn, volume_id, &bu)
-            .expect("plan inserts its rows");
-        let ready = match planned.execute(&h.conn, &mut store).expect("execute") {
-            ExecuteOutcome::Ready(r) => r,
-            ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption"),
-            ExecuteOutcome::Aborted(a) => panic!("unexpected abort: {}", a.reason),
-        };
-        let ending = ready.ending();
-        let pending = ready.seal(&mut store).expect("seal");
-        match pending
-            .confirm(&h.conn, &mut store, Tier::Integrity)
-            .expect("confirm")
-        {
-            ConfirmOutcome::Sealed(_) => {}
-            ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
-            ConfirmOutcome::Inconclusive(i) => panic!("inconclusive: {:?}", i.evidence.mismatches),
-        }
-        let fi_len = store.files[3]
-            .iter()
-            .rposition(|b| *b != 0)
-            .map(|i| i + 1)
-            .unwrap();
-        let entries =
-            format::parse_front_index(&String::from_utf8_lossy(&store.files[3][..fi_len])).unwrap();
-        let script_entry = &entries[2];
-        assert_eq!(script_entry.type_label, "restore_sh");
-        let script = store.files[2][..script_entry.size_bytes.unwrap() as usize].to_vec();
-        drop(work);
-        drop(session_dir);
-        let files = store.files.clone();
-        drop(h);
-        Tape {
-            files,
-            units,
+        let ctx = Ctx {
+            escrow_public: escrow.keypair.public_key.clone(),
             keys,
-            ending,
-            entries,
-            script,
-            _home: tmp,
+            tmp: tmp.clone(),
+        };
+        let all = write::staged_build_units(&h.conn).expect("the staged selection");
+        let mut tapes = Vec::new();
+        match shape.restage {
+            Restage::None => {
+                for n in 0..shape.copies.max(1) {
+                    tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), n));
+                }
+            }
+            r => {
+                tapes.push(write_tape(&h, &ctx, shape, &units, all.clone(), 0));
+                // The first staging is released, as a write releases it; the
+                // second is made after a change, as `stage create` makes it.
+                let first = &shape.units[0];
+                let old_set = all
+                    .iter()
+                    .find(|u| u.unit_name == first.0)
+                    .unwrap()
+                    .stage_set_id;
+                h.conn
+                    .execute(
+                        "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                        params![old_set],
+                    )
+                    .unwrap();
+                let mut truth = units.clone();
+                let dir = h.sources.join(&first.0);
+                // Whole-second mtimes: let the change land in a later second.
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+                match r {
+                    Restage::Dotfile => {
+                        let unit = tapectl::db::queries::get_unit_by_name(&h.conn, &first.0)
+                            .unwrap()
+                            .unwrap();
+                        tapectl::unit::tag_unit(&h.conn, &unit, &["re-staged".to_string()], &[])
+                            .unwrap();
+                    }
+                    _ => {
+                        let path = format!("{}-small.txt", first.0);
+                        let bytes = text(3_500, 99);
+                        fs::write(dir.join(&path), &bytes).unwrap();
+                        let t = &mut truth[0];
+                        for (p, b) in t.files.iter_mut() {
+                            if *p == path || p.ends_with("-hardlink.txt") {
+                                *b = bytes.clone();
+                            }
+                        }
+                    }
+                }
+                let snapshot =
+                    tapectl::staging::snapshot_create(&h.conn, &first.0, &h.config).unwrap();
+                let set =
+                    tapectl::staging::stage_create(&h.conn, &h.paths, &h.config, snapshot, true)
+                        .unwrap_or_else(|e| panic!("the second staging of {}: {e}", first.0));
+                let slices: i64 = h
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
+                        params![set],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                truth[0].slices = slices as usize;
+                let mut again = write::staged_build_units(&h.conn).expect("the staged selection");
+                again.retain(|u| u.stage_set_id == set);
+                assert_eq!(again.len(), 1, "the second staging alone");
+                tapes.push(write_tape(&h, &ctx, shape, &truth, again, 1));
+            }
         }
+        drop(h);
+        tapes
     }
 
     /// The position of the last file before the seal.
@@ -925,4 +1112,140 @@ exit $rc
         real = real.display(),
         victim = victim
     )
+}
+
+// ---- editing the generated index (what a real catalog of one write does not make) ----
+
+/// Rewrite a TSV file: `f` gets the header's column names and the rows (each a
+/// vector of fields, as written, still escaped).
+pub fn edit_tsv(path: &Path, f: impl FnOnce(&mut Vec<String>, &mut Vec<Vec<String>>)) {
+    let text = fs::read_to_string(path).unwrap();
+    let mut lines = text.lines();
+    let mut header: Vec<String> = lines
+        .next()
+        .unwrap()
+        .split('\t')
+        .map(str::to_string)
+        .collect();
+    let mut rows: Vec<Vec<String>> = lines
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect();
+    f(&mut header, &mut rows);
+    let mut out = header.join("\t");
+    out.push('\n');
+    for r in rows {
+        out.push_str(&r.join("\t"));
+        out.push('\n');
+    }
+    fs::write(path, out).unwrap();
+}
+
+fn col(header: &[String], name: &str) -> usize {
+    header.iter().position(|c| c == name).unwrap()
+}
+
+/// Every `units.tsv` of an index: the operator's, then each tenant's.
+fn units_files(idx: &index::IndexFiles) -> Vec<PathBuf> {
+    let mut v = vec![idx.operator_units.clone()];
+    v.extend(idx.tenants.values().map(|t| t.units.clone()));
+    v
+}
+
+/// Two earlier tapes that hold every version this tape holds: `OLD01`,
+/// sealed, and `OLD02`, sealed and then proven bad.
+pub fn index_holders(idx: &index::IndexFiles) {
+    for p in units_files(idx) {
+        edit_tsv(&p, |h, rows| {
+            let mut extra = Vec::new();
+            for r in rows.iter() {
+                for (vol, state) in [("OLD01", "sealed"), ("OLD02", "quarantined")] {
+                    let mut c = r.clone();
+                    c[col(h, "volume")] = vol.to_string();
+                    c[col(h, "volume_uuid")] =
+                        format!("00000000-0000-4000-8000-0000000000{}", &vol[3..]);
+                    c[col(h, "cartridge_serial")] = format!("SERIAL{vol}");
+                    c[col(h, "state")] = state.to_string();
+                    c[col(h, "sealed_at")] = "2026-10-01T00:00:00Z".to_string();
+                    extra.push(c);
+                }
+            }
+            // A third tape holds only the first slice of a unit of several.
+            for r in rows.iter() {
+                if r[col(h, "num_slices")].parse::<u32>().unwrap_or(1) > 1 {
+                    let mut c = r.clone();
+                    c[col(h, "volume")] = "OLD03".to_string();
+                    c[col(h, "volume_uuid")] = "00000000-0000-4000-8000-000000000003".to_string();
+                    c[col(h, "state")] = "sealed".to_string();
+                    c[col(h, "sealed_at")] = "2026-10-02T00:00:00Z".to_string();
+                    c[col(h, "first_slice")] = "1".to_string();
+                    c[col(h, "last_slice")] = "1".to_string();
+                    extra.push(c);
+                }
+            }
+            rows.extend(extra);
+        });
+    }
+}
+
+/// The columns in the opposite order and one column this script does not
+/// know, in every file of the index.
+pub fn index_permuted(idx: &index::IndexFiles) {
+    let mut files = units_files(idx);
+    files.extend(idx.tenants.values().map(|t| t.paths.clone()));
+    for p in files {
+        edit_tsv(&p, |h, rows| {
+            h.reverse();
+            h.push("zzz-unknown".to_string());
+            for r in rows.iter_mut() {
+                r.reverse();
+                r.push("something new".to_string());
+            }
+        });
+    }
+}
+
+/// Sixty more units in every index file: each tenant's `units.tsv` and the
+/// operator's, and sixty more paths in each tenant's `paths.tsv`, all
+/// matching `bulk/`.
+pub fn index_bulk(idx: &index::IndexFiles) {
+    for (i, p) in units_files(idx).into_iter().enumerate() {
+        edit_tsv(&p, |h, rows| {
+            let tenant = col_opt(h, "tenant");
+            for n in 0..60 {
+                let mut r = vec![String::new(); h.len()];
+                r[col(h, "unit")] = format!("bulk-{i}-{n:02}");
+                r[col(h, "unit_uuid")] = format!("bbbbbbbb-0000-4000-8000-{i:04}{n:08}");
+                r[col(h, "version")] = if n % 7 == 0 { "10".into() } else { "2".into() };
+                r[col(h, "num_slices")] = "3".into();
+                r[col(h, "first_slice")] = "1".into();
+                r[col(h, "last_slice")] = "3".into();
+                r[col(h, "version_bytes")] = "3000000".into();
+                r[col(h, "volume")] = "OLD01".into();
+                r[col(h, "volume_uuid")] = "00000000-0000-4000-8000-000000000001".into();
+                r[col(h, "state")] = "sealed".into();
+                r[col(h, "sealed_at")] = "2026-10-01T00:00:00Z".into();
+                if let Some(t) = tenant {
+                    r[t] = TENANT_A.into();
+                }
+                rows.push(r);
+            }
+        });
+    }
+    for t in idx.tenants.values() {
+        edit_tsv(&t.paths, |h, rows| {
+            for n in 0..60 {
+                let mut r = vec![String::new(); h.len()];
+                r[col(h, "unit")] = "bulk".into();
+                r[col(h, "version")] = "2".into();
+                r[col(h, "kind")] = "f".into();
+                r[col(h, "size_bytes")] = "10".into();
+                r[col(h, "path")] = format!("bulk/file-{n:02}.txt");
+                rows.push(r);
+            }
+        });
+    }
+}
+
+fn col_opt(header: &[String], name: &str) -> Option<usize> {
+    header.iter().position(|c| c == name)
 }

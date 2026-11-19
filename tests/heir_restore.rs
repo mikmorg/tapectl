@@ -109,9 +109,13 @@ fn key(h: &Heir, who: Who) -> String {
     h.key(who).to_string_lossy().into_owned()
 }
 
-/// A path as the index writes it: a backslash is `\\\\`.
+/// A path as the index writes it (§1.5): a backslash is `\\\\`, a TAB `\\t`,
+/// a newline `\\n`, a carriage return `\\r`.
 fn escaped(path: &str) -> String {
     path.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn unit_files<'a>(t: &'a Tape, name: &str) -> &'a [(String, Vec<u8>)] {
@@ -197,16 +201,56 @@ fn lint_every_awk_reads_the_modes_alike() {
         let v = h.run(&["--verify"]);
         assert_eq!(v.code, 0, "{name}: {}", v.all());
         let find = h.run(&["--find-envelope", "--key", &ka]);
+        // The named paths, the index modes: the same words under every awk.
+        let one = h.dest("one");
+        let deep = format!("inner/{UNIT_A}-deep.dat");
+        let p = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            one.to_str().unwrap(),
+            "--unit",
+            UNIT_A,
+            "--path",
+            &deep,
+        ]);
+        assert_eq!(p.code, 0, "{name}: {}", p.all());
+        assert!(one.join(&deep).is_file(), "{name}");
+        let hh = Heir::of(with_holders());
+        put_awk(&hh, body);
+        let kh = key(&hh, Who::TenantA);
+        let ke = key(&hh, Who::Escrow);
+        let mut index = String::new();
+        for args in [
+            vec!["--where", UNIT_A, "--key", &kh],
+            vec!["--where", "--all", "--key", &ke],
+            vec!["--find", "deep", "--key", &ke],
+            vec!["--where", "nothing", "--key", &kh],
+        ] {
+            let o = hh.run(&args);
+            assert!(o.code <= 1, "{name} {args:?}: {}", o.all());
+            index.push_str(&o.stdout);
+        }
         outputs.push((
             name.to_string(),
-            format!("{}\n{}\n{}", info.stdout, list.stdout, find.stdout),
+            format!(
+                "{}\n{}\n{}\n{}\n{}",
+                info.stdout, list.stdout, find.stdout, p.stdout, index
+            ),
         ));
     }
     // The words each mode printed are the same under every awk, but for the
     // work directory's random name.
     let norm = |s: &str| {
         s.lines()
-            .filter(|l| !l.contains("tapectl-work") && !l.contains("To restore, run:"))
+            .filter(|l| {
+                !l.contains("tapectl-work")
+                    && !l.contains("To restore, run:")
+                    && !l.contains("into /")
+                    && !l.contains("/RESTORE.sh --")
+                    && !l.contains("written 20")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -276,34 +320,14 @@ fn an_unknown_option_a_missing_mode_and_a_missing_key_are_told_by_name() {
     assert!(h.ops().is_empty(), "no usage error reads the tape");
 }
 
-/// The modes of later builds are refused by name, before the tape moves.
+/// The modes part three carries are still refused by name, before the tape
+/// moves; `--scratch` is spelled `--work` (the cross-cartridge prompt is
+/// T4.12's).
 #[test]
-fn the_modes_part_two_and_three_carry_are_refused_by_name() {
+fn the_modes_part_three_carries_are_refused_by_name() {
     let h = Heir::of(two());
     let ka = key(&h, Who::TenantA);
     for args in [
-        vec![
-            "--restore",
-            "--key",
-            &ka,
-            "--to",
-            "/x",
-            "--unit",
-            "u",
-            "--path",
-            "p",
-        ],
-        vec![
-            "--restore",
-            "--key",
-            &ka,
-            "--to",
-            "/x",
-            "--paths-from",
-            "list",
-        ],
-        vec!["--where", "u", "--key", &ka],
-        vec!["--find", "text", "--key", &ka],
         vec![
             "--restore",
             "--key",
@@ -748,7 +772,7 @@ fn list_shows_a_units_files_from_its_table_and_reads_no_slice() {
     for (path, _) in unit_files(t, UNIT_B) {
         // The table's paths are written as the index writes them: a
         // backslash is `\\\\`.
-        let shown = path.replace('\\', "\\\\");
+        let shown = escaped(path);
         assert!(
             o.stdout.contains(&shown),
             "{path} is not listed:\n{}",
@@ -2284,4 +2308,1959 @@ fn the_space_need_is_split_across_two_file_systems_and_added_on_one() {
         "{}",
         o.stderr
     );
+}
+
+// ---- named paths, the one repair, the index (the plan's T4.11) ----
+
+/// Two tapes written from the same stagings: the same units, versions and
+/// keys, two labels (`HEIR01`, `HEIR02`), each of which a test may damage.
+fn copies() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.copies = 2;
+        Tape::build_series(&shape)
+    })
+}
+
+/// The first tape of one unit and, written from its second staging after
+/// `unit tag` rewrote the dotfile, a second tape of the same Version (#528).
+fn restaged_dotfile() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.restage = heir::Restage::Dotfile;
+        Tape::build_series(&shape)
+    })
+}
+
+/// The first tape (Version 1) and a second tape of Version 2 of the same unit.
+fn restaged_content() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.restage = heir::Restage::Content;
+        Tape::build_series(&shape)
+    })
+}
+
+/// A whole tape and a second one that ended early, inside the second slice of
+/// the plan: the big unit has only its first slice on it, a range.
+fn whole_and_range() -> &'static [Tape] {
+    static T: OnceLock<Vec<Tape>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.copies = 2;
+        shape.warning_in_slice = Some(1);
+        shape.warn_tape = 1;
+        Tape::build_series(&shape)
+    })
+}
+
+/// The tape position of slice `n` (1-based) of `unit` on `t`, whose units lie
+/// on it in staging order.
+fn slice_pos(t: &Tape, unit: &str, n: usize) -> usize {
+    let mut base = 0;
+    for u in &t.units {
+        if u.name == unit {
+            break;
+        }
+        base += u.slices;
+    }
+    t.slice_positions()[base + n - 1]
+}
+
+/// The data slices a run read from the tape, in order.
+fn data_reads(t: &Tape, h: &Heir) -> Vec<usize> {
+    let slices = t.slice_positions();
+    let end = t.ended_after();
+    h.dd_reads()
+        .into_iter()
+        .filter(|p| slices.contains(p) && *p <= end)
+        .collect()
+}
+
+/// The slices the members named by `listed` (escaped paths) are in, and the
+/// slice of the first name of a hard link among them (it is brought too).
+fn slices_needed(
+    t: &Tape,
+    rows: &[Row],
+    unit: &str,
+    listed: &[String],
+) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    for p in listed {
+        let r = row_esc(rows, p);
+        out.insert(slice_pos(t, unit, r.1));
+        if r.0 == "h" {
+            // The table's sort puts `<unit>-hardlink.txt` before its link.
+            out.insert(slice_pos(
+                t,
+                unit,
+                row(rows, &format!("{unit}-hardlink.txt")).1,
+            ));
+        }
+    }
+    out
+}
+
+/// One row of `--list`: kind, slice, bytes and path (the path as printed).
+type Row = (String, usize, u64, String);
+
+fn list_rows(h: &Heir, key_file: &str, unit: &str) -> Vec<Row> {
+    let o = h.run(&["--list", "--key", key_file, "--unit", unit]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    fn tok(s: &str) -> (&str, &str) {
+        let s = s.trim_start();
+        match s.find(char::is_whitespace) {
+            Some(i) => (&s[..i], s[i..].trim_start()),
+            None => (s, ""),
+        }
+    }
+    o.stdout
+        .lines()
+        .filter_map(|l| {
+            let (kind, rest) = tok(l);
+            if kind.len() != 1 || !"fdlhpcb".contains(kind) {
+                return None;
+            }
+            let (slice, rest) = tok(rest);
+            let (bytes, path) = tok(rest);
+            Some((
+                kind.to_string(),
+                slice.parse().ok()?,
+                bytes.parse().ok()?,
+                path.split("  -> ").next().unwrap().to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// The row of `path`; `--list` prints a path as the table writes it, escaped.
+fn row<'a>(rows: &'a [Row], path: &str) -> &'a Row {
+    row_esc(rows, &escaped(path))
+}
+
+fn row_esc<'a>(rows: &'a [Row], escaped_path: &str) -> &'a Row {
+    rows.iter()
+        .find(|r| r.3 == escaped_path)
+        .unwrap_or_else(|| panic!("no row for {escaped_path}: {rows:?}"))
+}
+
+fn unit_slices(t: &Tape, unit: &str) -> usize {
+    t.units.iter().find(|u| u.name == unit).unwrap().slices
+}
+
+fn damaged_list(dest: &Path) -> Vec<String> {
+    std::fs::read_to_string(dest.join(".tapectl-damaged-files.txt"))
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+fn dest_str(p: &Path) -> &str {
+    p.to_str().unwrap()
+}
+
+/// #518's defect was a path restore that read the wrong slices and exited 0.
+/// One file of a unit of many slices: the stand-in `dd`'s log says WHICH tape
+/// files were read (the front matter, then the one slice that holds the
+/// file's member and no other), and the file is right.
+#[test]
+fn a_path_restore_reads_only_the_slice_that_holds_the_file_and_the_file_is_right() {
+    let t = two();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let rows = list_rows(&h, &kb, UNIT_B);
+    let n = unit_slices(t, UNIT_B);
+    assert!(n >= 4, "a unit of many slices: {n}");
+    let (_, slice, _, _) = row(&rows, "inner/mid-3.dat");
+    assert!(
+        *slice > 1 && *slice < n,
+        "a file in the middle of the unit, not in its first or last slice: {slice} of {n}"
+    );
+    let dest = h.dest("one");
+    h.reset_ops();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "inner/mid-3.dat",
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(
+        data_reads(t, &h),
+        vec![slice_pos(t, UNIT_B, *slice)],
+        "only the slice that holds the member was read: {:?}",
+        h.ops()
+    );
+    let got = heir::tree(&dest);
+    let (_, want) = unit_files(t, UNIT_B)
+        .iter()
+        .find(|(p, _)| p == "inner/mid-3.dat")
+        .unwrap();
+    assert_eq!(got.len(), 1, "{:?}", got.keys());
+    assert_eq!(got.get("inner/mid-3.dat"), Some(want));
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("File check: all 1 regular file(s) named"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("Who the ids were"),
+        "a path restore prints the id map too: {}",
+        o.stdout
+    );
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+}
+
+/// Two paths in two slices read those two slices, in order, once each; a
+/// compressed unit is cut by the offsets of the stream, after decompression.
+#[test]
+fn paths_in_two_slices_read_those_two_slices_once_each_for_every_algorithm() {
+    for (label, t) in [
+        ("none", two()),
+        ("gzip", compressed("gzip")),
+        ("xz", compressed("xz")),
+        ("zstd", compressed("zstd")),
+    ] {
+        let unit = if label == "none" { UNIT_B } else { UNIT_A };
+        let who = if label == "none" {
+            Who::TenantB
+        } else {
+            Who::TenantA
+        };
+        let h = Heir::of(t);
+        let k = key(&h, who);
+        let rows = list_rows(&h, &k, unit);
+        let first = format!("inner/{unit}-deep.dat");
+        let (_, s1, _, _) = row(&rows, &first);
+        let (_, s2, _, _) = row(&rows, "notes.txt");
+        let dest = h.dest("two");
+        h.reset_ops();
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &k,
+            "--to",
+            dest_str(&dest),
+            "--unit",
+            unit,
+            "--path",
+            "notes.txt",
+            "--path",
+            &first,
+        ]);
+        assert_eq!(o.code, 0, "{label}: {}", o.all());
+        let mut want = vec![slice_pos(t, unit, *s1), slice_pos(t, unit, *s2)];
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(data_reads(t, &h), want, "{label}: {:?}", h.ops());
+        let got = heir::tree(&dest);
+        assert_eq!(got.len(), 2, "{label}: {:?}", got.keys());
+        for (path, bytes) in unit_files(t, unit) {
+            if let Some(have) = got.get(path) {
+                assert_eq!(have, bytes, "{label}: {path}");
+            }
+        }
+    }
+}
+
+/// A long member's run is read piece by piece, and the member is whole; its
+/// first slice is read before its last.
+#[test]
+fn a_path_in_a_long_members_run_is_fed_piece_by_piece_and_comes_back_whole() {
+    let t = two();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let large = format!("{UNIT_B}-large.bin");
+    let rows = list_rows(&h, &kb, UNIT_B);
+    let (_, first, size, _) = row(&rows, &large);
+    assert!(*size > 65_536 * 2, "a run of three slices");
+    let dest = h.dest("long");
+    h.reset_ops();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        &large,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let want: Vec<usize> = (0..3).map(|i| slice_pos(t, UNIT_B, first + i)).collect();
+    assert_eq!(data_reads(t, &h), want, "{:?}", h.ops());
+    let got = heir::tree(&dest);
+    let (_, bytes) = unit_files(t, UNIT_B)
+        .iter()
+        .find(|(p, _)| *p == large)
+        .unwrap();
+    assert_eq!(got.get(&large), Some(bytes));
+}
+
+/// A bad LATER piece of a long member ends the tar run: the partial file is
+/// removed and the member listed; a path after it still comes back.
+#[test]
+fn a_path_whose_long_run_breaks_is_removed_and_listed_and_the_next_path_comes_back() {
+    let t = two();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let large = format!("{UNIT_B}-large.bin");
+    let rows = list_rows(&h, &kb, UNIT_B);
+    let (_, first, _, _) = row(&rows, &large);
+    let bad = slice_pos(t, UNIT_B, first + 1);
+    h.flip(bad, 4000);
+    let dest = h.dest("broken");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        &large,
+        "--path",
+        "notes.txt",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("a long file's run broke at a bad slice"),
+        "{}",
+        o.stderr
+    );
+    assert!(!dest.join(&large).exists(), "the partial file was removed");
+    assert_eq!(damaged_list(&dest), vec![large.clone()]);
+    let got = heir::tree(&dest);
+    let (_, bytes) = unit_files(t, UNIT_B)
+        .iter()
+        .find(|(p, _)| p == "notes.txt")
+        .unwrap();
+    assert_eq!(got.get("notes.txt"), Some(bytes), "the next path is whole");
+}
+
+/// A hard link brings its first name's member first; the two are one file.
+#[test]
+fn a_hard_link_is_restored_with_its_first_name_and_the_two_share_one_file() {
+    use std::os::unix::fs::MetadataExt;
+    let t = two();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    // The table's sort puts `hardlink.txt` first: `small.txt` is the link.
+    let link = format!("{UNIT_A}-small.txt");
+    let dest = h.dest("hl");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_A,
+        "--path",
+        &link,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stderr.contains("hard link(s) among them"), "{}", o.stderr);
+    let first = dest.join(format!("{UNIT_A}-hardlink.txt"));
+    let a = std::fs::metadata(&first).unwrap();
+    let b = std::fs::metadata(dest.join(&link)).unwrap();
+    assert_eq!(
+        (a.ino(), a.dev()),
+        (b.ino(), b.dev()),
+        "one file, two names"
+    );
+    assert!(a.nlink() >= 2);
+    assert_eq!(
+        std::fs::read(dest.join(&link)).unwrap(),
+        unit_files(t, UNIT_A)[0].1
+    );
+}
+
+/// A folder names its own entry only: nothing under it is restored, and the
+/// script says so.
+#[test]
+fn a_folder_path_restores_the_folder_and_nothing_under_it() {
+    let t = two();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("dir");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_A,
+        "--path",
+        "inner",
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(dest.join("inner").is_dir());
+    assert_eq!(std::fs::read_dir(dest.join("inner")).unwrap().count(), 0);
+    assert!(o.stderr.contains("a folder names only its own entry"));
+}
+
+/// A path the table does not have is refused before any slice is read, naming
+/// it; nothing in the destination changes.
+#[test]
+fn a_path_not_in_the_table_is_refused_before_any_slice_is_read() {
+    let t = two();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("none");
+    h.reset_ops();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_A,
+        "--path",
+        "no/such/file",
+        "--path",
+        "notes.txt",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("no/such/file") && o.stderr.contains("not in the file table"),
+        "{}",
+        o.stderr
+    );
+    assert!(data_reads(t, &h).is_empty(), "no slice read: {:?}", h.ops());
+    assert!(heir::tree(&dest).is_empty());
+}
+
+/// `--path` names a unit: exactly one, and never `--all`; `--path` and
+/// `--paths-from` go with `--restore` only.
+#[test]
+fn path_modes_have_usage_errors_and_are_in_help() {
+    let h = Heir::of(two());
+    let ka = key(&h, Who::TenantA);
+    for (args, word) in [
+        (
+            vec!["--restore", "--key", &ka, "--to", "/x", "--path", "p"],
+            "ONE unit",
+        ),
+        (
+            vec![
+                "--restore",
+                "--key",
+                &ka,
+                "--to",
+                "/x",
+                "--all",
+                "--path",
+                "p",
+            ],
+            "ONE unit",
+        ),
+        (
+            vec![
+                "--restore",
+                "--key",
+                &ka,
+                "--to",
+                "/x",
+                "--unit",
+                "a",
+                "--path",
+                "p",
+                "--paths-from",
+                "l",
+            ],
+            "give one",
+        ),
+        (
+            vec!["--list", "--key", &ka, "--path", "p"],
+            "go with --restore",
+        ),
+        (
+            vec![
+                "--restore",
+                "--key",
+                &ka,
+                "--to",
+                "/x",
+                "--all",
+                "--paths-from",
+                "l",
+            ],
+            "ONE unit",
+        ),
+        (vec!["--key", &ka, "--where"], "needs a value"),
+        (vec!["--key", &ka, "--find"], "needs a value"),
+        (vec!["--where", "u"], "needs your age key file"),
+    ] {
+        let o = h.run(&args);
+        assert_eq!(o.code, 2, "{args:?}: {}", o.all());
+        assert!(o.stderr.contains(word), "{args:?}: {}", o.stderr);
+    }
+    assert!(h.ops().is_empty(), "a usage error reads no tape");
+    let o = h.run(&["--help"]);
+    for word in [
+        "--path P",
+        "--paths-from LIST",
+        "--where UNIT",
+        "--where --all",
+        "--find TEXT",
+    ] {
+        assert!(o.stdout.contains(word), "{word} is in --help: {}", o.stdout);
+    }
+}
+
+/// The check of a path restore covers the paths restored and no others: a
+/// unit whose other files are not in the destination is no damage.
+/// Also with a `sha256sum` that quotes names, and with a name holding a
+/// backslash.
+#[test]
+fn a_path_restore_checks_only_the_paths_it_restored_even_with_a_quoting_sha256sum() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("sha256sum").unwrap();
+    h.put_tool(
+        "sha256sum",
+        &format!(
+            "#!/bin/bash\n{real} \"$@\" | while IFS= read -r l; do\n  case \"$l\" in\n    *'\\\\'*) printf '\\\\%s\\n' \"$l\" ;;\n    *) printf '%s\\n' \"$l\" ;;\n  esac\ndone\nexit ${{PIPESTATUS[0]}}\n",
+            real = real.display()
+        ),
+    );
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("quoted");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "odd\\back name.txt",
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("File check: all 1 regular file(s) named"),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(heir::tree(&dest).len(), 1);
+}
+
+/// A tar that drops the file at exit 0 (BusyBox does) leaves the path
+/// damaged: the check, not tar's status, decides.
+#[test]
+fn a_path_a_tar_dropped_at_exit_0_is_caught_and_listed() {
+    let t = two();
+    let h = Heir::of(t);
+    let real = heir::host_tool("tar").unwrap();
+    h.put_tool("tar", &heir::dropping_tar(&real, "notes.txt"));
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("dropped");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "notes.txt",
+        "--path",
+        "inner/mid-1.dat",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("File check: 1 of 2 regular file(s) named"),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(damaged_list(&dest), vec!["notes.txt".to_string()]);
+}
+
+/// An existing file the path names is refused without `--overwrite`, before
+/// any slice is read; with it the file is replaced.
+#[test]
+fn an_existing_file_is_refused_without_overwrite_and_replaced_with_it() {
+    let t = two();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("exists");
+    std::fs::write(dest.join("notes.txt"), b"mine").unwrap();
+    h.reset_ops();
+    let name = format!("{UNIT_A}-small.txt");
+    std::fs::write(dest.join(&name), b"mine").unwrap();
+    let go = |extra: &[&str]| {
+        let mut a = vec![
+            "--restore",
+            "--key",
+            ka.as_str(),
+            "--to",
+            dest_str(&dest),
+            "--unit",
+            UNIT_A,
+            "--path",
+            name.as_str(),
+        ];
+        a.extend_from_slice(extra);
+        h.run(&a)
+    };
+    let o = go(&[]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stderr.contains("--overwrite"), "{}", o.stderr);
+    assert!(data_reads(t, &h).is_empty(), "{:?}", h.ops());
+    assert_eq!(std::fs::read(dest.join(&name)).unwrap(), b"mine");
+    let o = go(&["--overwrite"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(
+        std::fs::read(dest.join(&name)).unwrap(),
+        unit_files(t, UNIT_A)[0].1
+    );
+    // The other file in the destination was not touched.
+    assert_eq!(std::fs::read(dest.join("notes.txt")).unwrap(), b"mine");
+}
+
+/// A path with a TAB, a newline and a backslash is named as the heir types it
+/// and written to the list in the index's escaping, and read back from it.
+#[test]
+fn a_tab_a_newline_and_a_backslash_in_a_path_round_trip_through_the_list() {
+    let t = &copies()[0];
+    let t2 = &copies()[1];
+    let tab_nl = "tab\tand\nnewline.txt";
+    let back = "odd\\back name.txt";
+    // Both are named raw to --path.
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("raw");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        tab_nl,
+        "--path",
+        back,
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let got = heir::tree(&dest);
+    for p in [tab_nl, back] {
+        let (_, bytes) = unit_files(t, UNIT_B).iter().find(|(q, _)| q == p).unwrap();
+        assert_eq!(got.get(p), Some(bytes), "{p:?}");
+    }
+    // The list a restore writes names them in the index's escaping.
+    let h1 = Heir::of(t);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (_, slice, _, _) = row(&rows, back);
+    h1.flip(slice_pos(t, UNIT_B, *slice), 300);
+    let dest1 = h1.dest("first");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dest_str(&dest1)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let list = damaged_list(&dest1);
+    assert!(
+        list.iter().any(|l| l == "odd\\\\back name.txt"),
+        "a backslash is two: {list:?}"
+    );
+    // The same slice also holds the TAB-and-newline file or not; whichever
+    // were listed come back from the other copy, exactly.
+    let h2 = Heir::of(t2);
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest1),
+        "--paths-from",
+        dest1.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_restored(t, UNIT_B, &dest1);
+    assert!(!dest1.join(".tapectl-damaged-files.txt").exists());
+    // A list naming the TAB-and-newline file, escaped, is read as that file.
+    let h3 = Heir::of(t2);
+    let dest3 = h3.dest("esc");
+    let uuid = &t2.unit_uuids[UNIT_B];
+    let list_file = h3.root.path().join("my-list.txt");
+    std::fs::write(
+        &list_file,
+        format!(
+            "#tapectl-damaged-files\t1\tunit={UNIT_B}\tuuid={uuid}\tversion=1\ntab\\tand\\nnewline.txt\nodd\\\\back name.txt\n"
+        ),
+    )
+    .unwrap();
+    let o = h3.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest3),
+        "--paths-from",
+        list_file.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let got = heir::tree(&dest3);
+    assert_eq!(got.len(), 2, "{:?}", got.keys());
+    assert!(got.contains_key(tab_nl) && got.contains_key(back));
+}
+
+/// The one repair, and the Done-when of T4.11: two copies of one unit and
+/// version, each damaged in different files, made whole in two runs. The
+/// second run reads only the slices that hold the listed files, the list is
+/// removed, and nothing else in the destination is touched.
+#[test]
+fn two_copies_each_damaged_in_different_files_are_made_whole_in_two_runs() {
+    let (t1, t2) = (&copies()[0], &copies()[1]);
+    let kb = |h: &Heir| key(h, Who::TenantB);
+    let h1 = Heir::of(t1);
+    let rows = list_rows(&h1, &kb(&h1), UNIT_B);
+    let n = unit_slices(t1, UNIT_B);
+    assert!(n >= 5, "{n}");
+    // Copy 1 loses the slice of mid-1; copy 2 the slice of notes.txt.
+    let (_, s1, _, _) = row(&rows, "inner/mid-1.dat");
+    let (_, s2, _, _) = row(&rows, "notes.txt");
+    assert_ne!(s1, s2, "different slices, so different files");
+    h1.flip(slice_pos(t1, UNIT_B, *s1), 500);
+    let dest = h1.dest("unit");
+    let o = h1.run(&["--restore", "--key", &kb(&h1), "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let list = damaged_list(&dest);
+    assert!(list.contains(&"inner/mid-1.dat".to_string()), "{list:?}");
+    assert!(!list.contains(&"notes.txt".to_string()), "{list:?}");
+    let mut before = heir::tree(&dest);
+    before.remove(".tapectl-damaged-files.txt");
+    // Copy 2, damaged in notes.txt's slice, repairs the list: the slice it
+    // needs is intact, the one it does not is never read.
+    let h2 = Heir::of(t2);
+    h2.flip(slice_pos(t2, UNIT_B, *s2), 500);
+    h2.reset_ops();
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb(&h2),
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("is removed: nothing is left to repair"),
+        "{}",
+        o.stdout
+    );
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert!(
+        !data_reads(t2, &h2).contains(&slice_pos(t2, UNIT_B, *s2)),
+        "the damaged slice of copy 2 was never needed: {:?}",
+        h2.ops()
+    );
+    assert_restored(t1, UNIT_B, &dest);
+    // Nothing beyond the listed paths was written: every file that was whole
+    // before is the very same bytes (and the run read only the slices of the
+    // listed files).
+    for (p, b) in &before {
+        assert_eq!(heir::tree(&dest).get(p), Some(b), "{p}");
+    }
+    let needed = slices_needed(t2, &rows, UNIT_B, &list);
+    let read: std::collections::BTreeSet<usize> = data_reads(t2, &h2).into_iter().collect();
+    assert_eq!(read, needed, "{:?}", h2.ops());
+}
+
+/// A listed file that the second copy also lost stays on the list; the list
+/// is rewritten with the paths still damaged and the exit is 1.
+#[test]
+fn a_repair_whose_files_still_fail_leaves_a_list_with_just_those() {
+    let (t1, t2) = (&copies()[0], &copies()[1]);
+    let h1 = Heir::of(t1);
+    let kb = key(&h1, Who::TenantB);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (_, s1, _, _) = row(&rows, "inner/mid-1.dat");
+    let (_, s2, _, _) = row(&rows, "notes.txt");
+    assert_ne!(s1, s2);
+    // Copy 1 loses two slices; copy 2 loses one of the same.
+    h1.flip(slice_pos(t1, UNIT_B, *s1), 500);
+    h1.flip(slice_pos(t1, UNIT_B, *s2), 500);
+    let dest = h1.dest("unit");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let list = damaged_list(&dest);
+    assert!(list.contains(&"notes.txt".to_string()) && list.contains(&"inner/mid-1.dat".into()));
+    let h2 = Heir::of(t2);
+    h2.flip(slice_pos(t2, UNIT_B, *s2), 500);
+    let list_path = dest.join(".tapectl-damaged-files.txt");
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        list_path.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE INCOMPLETE"), "{}", o.stdout);
+    let left = damaged_list(&dest);
+    assert!(left.contains(&"notes.txt".to_string()), "{left:?}");
+    assert!(
+        !left.contains(&"inner/mid-1.dat".to_string()),
+        "the file the second copy had is whole and off the list: {left:?}"
+    );
+    let got = heir::tree(&dest);
+    let (_, want) = unit_files(t1, UNIT_B)
+        .iter()
+        .find(|(p, _)| p == "inner/mid-1.dat")
+        .unwrap();
+    assert_eq!(got.get("inner/mid-1.dat"), Some(want));
+    // The header of the rewritten list still names this unit and version.
+    let first = std::fs::read_to_string(&list_path).unwrap();
+    assert!(
+        first.starts_with(&format!(
+            "#tapectl-damaged-files\t1\tunit={UNIT_B}\tuuid={}\tversion=1\n",
+            t1.unit_uuids[UNIT_B]
+        )),
+        "{first}"
+    );
+}
+
+/// With a `sha256sum` that quotes names the repair still counts a file as
+/// whole only when `sha256sum` said it matched.
+#[test]
+fn a_repair_with_a_sha256sum_that_checks_nothing_leaves_every_path_listed() {
+    let (t1, t2) = (&copies()[0], &copies()[1]);
+    let h1 = Heir::of(t1);
+    let kb = key(&h1, Who::TenantB);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (_, s1, _, _) = row(&rows, "inner/mid-1.dat");
+    h1.flip(slice_pos(t1, UNIT_B, *s1), 500);
+    let dest = h1.dest("unit");
+    h1.run(&["--restore", "--key", &kb, "--to", dest_str(&dest)]);
+    let before = damaged_list(&dest);
+    assert!(!before.is_empty());
+    let h2 = Heir::of(t2);
+    // A sha256sum that prints nothing and exits 0 when it is asked to check.
+    let real = heir::host_tool("sha256sum").unwrap();
+    h2.put_tool(
+        "sha256sum",
+        &format!(
+            "#!/bin/bash\ncase \"$*\" in *-c*) exit 0 ;; esac\nexec {} \"$@\"\n",
+            real.display()
+        ),
+    );
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let after = damaged_list(&dest);
+    for p in before
+        .iter()
+        .filter(|p| row_esc(&rows, p).0 != "d" && !p.contains('\\'))
+    {
+        // (A folder is restored and cannot be checked; a path with a backslash
+        // is checked by its own sha256sum call, not through `-c`; every other
+        // file stays.)
+        assert!(after.contains(p), "{p} stays listed: {after:?}");
+    }
+}
+
+/// Another version, another unit (same name, other uuid) and a list that is
+/// not a damaged-file list are each refused by name, with nothing read from a
+/// slice and the list left as it was.
+#[test]
+fn a_repair_is_refused_for_another_version_another_unit_or_a_file_that_is_no_list() {
+    let first = |h: &Heir, who| key(h, who);
+    // A damaged restore of version 2 (the second tape of the series).
+    let series = restaged_content();
+    let (t_v1, t_v2) = (&series[0], &series[1]);
+    let h = Heir::of(t_v2);
+    let ka = first(&h, Who::TenantA);
+    let rows = list_rows(&h, &ka, UNIT_A);
+    let (_, slice, _, _) = row(&rows, &format!("{UNIT_A}-small.txt"));
+    h.flip(slice_pos(t_v2, UNIT_A, *slice), 400);
+    let dest = h.dest("v2");
+    let o = h.run(&["--restore", "--key", &ka, "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let list_path = dest.join(".tapectl-damaged-files.txt");
+    let list_before = std::fs::read(&list_path).unwrap();
+    let tree_before = heir::tree(&dest);
+    assert!(
+        String::from_utf8_lossy(&list_before).contains("\tversion=2\n"),
+        "version 2: {}",
+        String::from_utf8_lossy(&list_before)
+    );
+    // The tape of version 1 of the same unit: another version.
+    let h1 = Heir::of(t_v1);
+    h1.reset_ops();
+    let o = h1.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        list_path.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("only as version(s) 1") && o.stderr.contains("list is for version 2"),
+        "{}",
+        o.stderr
+    );
+    assert!(data_reads(t_v1, &h1).is_empty(), "{:?}", h1.ops());
+    // A tape of another home: the same unit NAME, another uuid, another unit.
+    let other = Tape::build(&Shape::two());
+    let ho = Heir::of(&other);
+    let o = ho.run(&[
+        "--restore",
+        "--key",
+        &key(&ho, Who::TenantA),
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        list_path.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("another unit than the list's"),
+        "{}",
+        o.stderr
+    );
+    // A file that is no list.
+    let junk = h.root.path().join("junk.txt");
+    std::fs::write(&junk, "a\nb\n").unwrap();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        junk.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("is not a damaged-file list"),
+        "{}",
+        o.stderr
+    );
+    // A list of a format this script does not know.
+    std::fs::write(
+        &junk,
+        "#tapectl-damaged-files\t2\tunit=a\tuuid=b\tversion=1\n",
+    )
+    .unwrap();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        junk.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stderr.contains("format 2"), "{}", o.stderr);
+    // Through all of that the list and the destination are as they were.
+    assert_eq!(std::fs::read(&list_path).unwrap(), list_before);
+    assert_eq!(heir::tree(&dest), tree_before);
+    // The right tape (this one's own copy is the tape itself, intact) works.
+    let h_ok = Heir::of(t_v2);
+    let o = h_ok.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        list_path.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!list_path.exists());
+}
+
+/// A listed path the second tape's table does not have is refused before any
+/// slice is read, and `--unit` or `--version` that disagree with the list are
+/// usage errors.
+#[test]
+fn a_repair_with_a_path_the_table_lacks_or_a_unit_that_disagrees_is_refused() {
+    let t = &copies()[1];
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let uuid = &t.unit_uuids[UNIT_B];
+    let list = h.root.path().join("list.txt");
+    std::fs::write(
+        &list,
+        format!("#tapectl-damaged-files\t1\tunit={UNIT_B}\tuuid={uuid}\tversion=1\nnotes.txt\nnot/a/file\n"),
+    )
+    .unwrap();
+    let dest = h.dest("d");
+    h.reset_ops();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        list.to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stderr.contains("not/a/file"), "{}", o.stderr);
+    assert!(data_reads(t, &h).is_empty());
+    for extra in [vec!["--unit", "other"], vec!["--version", "9"]] {
+        let mut args = vec![
+            "--restore",
+            "--key",
+            kb.as_str(),
+            "--to",
+            dest_str(&dest),
+            "--paths-from",
+            list.to_str().unwrap(),
+        ];
+        args.extend(extra.iter().copied());
+        let o = h.run(&args);
+        assert_eq!(o.code, 2, "{extra:?}: {}", o.all());
+    }
+}
+
+/// A lost FOLDER goes on the damaged-file list, as every lost member does; the
+/// repair brings its own entry and nothing under it (it reads by offsets and
+/// never extracts by name).
+#[test]
+fn a_lost_folder_is_listed_and_the_repair_brings_its_own_entry_and_nothing_under_it() {
+    let (t1, t2) = (&copies()[0], &copies()[1]);
+    let h1 = Heir::of(t1);
+    let kb = key(&h1, Who::TenantB);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (kind, dir_slice, _, _) = row(&rows, "inner");
+    assert_eq!(kind, "d");
+    h1.flip(slice_pos(t1, UNIT_B, *dir_slice), 400);
+    let dest = h1.dest("unit");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let list = damaged_list(&dest);
+    assert!(
+        list.contains(&"inner".to_string()),
+        "the folder is on the list: {list:?}"
+    );
+    // A file under the folder that came back whole from another slice: take
+    // it away, to see the repair leave it away.
+    let under: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.3.starts_with("inner/") && r.1 != *dir_slice)
+        .collect();
+    let victim = &under
+        .first()
+        .expect("a file under inner in another slice")
+        .3;
+    assert!(!list.contains(victim));
+    std::fs::remove_file(dest.join(victim)).unwrap();
+    // The folder's own entry is gone from the damaged copy: make it so.
+    let h2 = Heir::of(t2);
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(dest.join("inner").is_dir());
+    assert!(
+        !dest.join(victim).exists(),
+        "the repair did not extract what lies under the folder"
+    );
+    // Only the listed members were fed: the same slices the list's members
+    // begin in, and no others.
+    let needed = slices_needed(t2, &rows, UNIT_B, &list);
+    let read: std::collections::BTreeSet<usize> = data_reads(t2, &h2).into_iter().collect();
+    assert_eq!(read, needed, "{:?}", h2.ops());
+}
+
+/// #528: a tape written from a re-stage after `unit tag` rewrote the dotfile
+/// states the NEW dotfile's hash in its own table, so the whole restore is
+/// complete, the dotfile is the new one, and a path restore of it checks out.
+#[test]
+fn a_tape_written_from_a_restage_after_a_dotfile_edit_restores_complete() {
+    let series = restaged_dotfile();
+    let (first, second) = (&series[0], &series[1]);
+    assert_eq!(first.unit_uuids[UNIT_A], second.unit_uuids[UNIT_A]);
+    let dotfile_of = |t: &Tape| {
+        let h = Heir::of(t);
+        let ka = key(&h, Who::TenantA);
+        let dest = h.dest("whole");
+        let o = h.run(&["--restore", "--key", &ka, "--to", dest_str(&dest)]);
+        assert_eq!(o.code, 0, "{}", o.all());
+        assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+        assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+        let dot = std::fs::read_to_string(dest.join(".tapectl-unit.toml")).unwrap();
+        // And by path.
+        let one = h.dest("one");
+        let o = h.run(&[
+            "--restore",
+            "--key",
+            &ka,
+            "--to",
+            dest_str(&one),
+            "--unit",
+            UNIT_A,
+            "--path",
+            ".tapectl-unit.toml",
+        ]);
+        assert_eq!(o.code, 0, "{}", o.all());
+        assert!(
+            o.stdout.contains("File check: all 1 regular file(s) named"),
+            "the dotfile is checked against this tape's own table: {}",
+            o.stdout
+        );
+        assert_eq!(
+            std::fs::read_to_string(one.join(".tapectl-unit.toml")).unwrap(),
+            dot
+        );
+        dot
+    };
+    let old = dotfile_of(first);
+    let new = dotfile_of(second);
+    assert!(!old.contains("re-staged"), "{old}");
+    assert!(
+        new.contains("re-staged"),
+        "the tape of the re-stage holds the new dotfile: {new}"
+    );
+}
+
+/// A range is a source for the files it holds whole: a copy that ended early
+/// restores the listed files whose slices it holds, and the others stay on
+/// the list.
+#[test]
+fn a_range_tape_restores_the_listed_files_it_holds_and_the_rest_stay_listed() {
+    let (whole, range) = (&whole_and_range()[0], &whole_and_range()[1]);
+    let h1 = Heir::of(whole);
+    let kb = key(&h1, Who::TenantB);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    // Lose two slices on the whole tape: one that the range tape also holds
+    // (its first slice) and one it does not.
+    let first_slice = rows.iter().map(|r| r.1).min().unwrap();
+    let last_slice = rows.iter().map(|r| r.1).max().unwrap();
+    h1.flip(slice_pos(whole, UNIT_B, first_slice), 300);
+    h1.flip(slice_pos(whole, UNIT_B, last_slice), 300);
+    let dest = h1.dest("unit");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let listed = damaged_list(&dest);
+    let in_first: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.1 == first_slice && r.0 == "f")
+        .collect();
+    let in_last: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.1 == last_slice && r.0 == "f")
+        .collect();
+    assert!(!in_first.is_empty() && !in_last.is_empty());
+    let h2 = Heir::of(range);
+    h2.reset_ops();
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--paths-from",
+        dest.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("do not lie in slices this tape holds")
+            || o.stderr.contains("lie in slices this tape does not hold"),
+        "{}",
+        o.stderr
+    );
+    let left = damaged_list(&dest);
+    for r in &in_first {
+        let p = r.3.clone();
+        assert!(listed.contains(&p), "{p}: {listed:?}");
+        assert!(!left.contains(&p), "{p} came from the range tape: {left:?}");
+    }
+    for r in &in_last {
+        let p = r.3.clone();
+        assert!(left.contains(&p), "{p} is still listed: {left:?}");
+    }
+    // Only the slice the range tape holds was read, and no read was sent
+    // past the end of the tape, whatever the directory held there (R3).
+    assert_eq!(
+        data_reads(range, &h2),
+        vec![slice_pos(range, UNIT_B, first_slice)],
+        "{:?}",
+        h2.ops()
+    );
+    assert!(
+        h2.dd_reads().iter().all(|p| *p <= range.ended_after() + 1),
+        "{:?}",
+        h2.dd_reads()
+    );
+}
+
+// ---- the index: --where and --find (volume-format-v3.md 1.5) ----
+
+fn indexed(edit: fn(&tapectl::volume::index::IndexFiles)) -> Tape {
+    let mut shape = Shape::two();
+    shape.index_edit = Some(edit);
+    Tape::build(&shape)
+}
+
+/// Two earlier tapes hold both units: one sealed, one proven bad.
+fn with_holders() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| indexed(heir::index_holders))
+}
+
+fn permuted() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| indexed(heir::index_permuted))
+}
+
+fn bulk() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| indexed(heir::index_bulk))
+}
+
+fn no_index() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.no_index = true;
+        Tape::build(&shape)
+    })
+}
+
+#[test]
+fn where_prints_every_version_and_holder_of_a_unit_from_a_tenant_key() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let o = h.run(&["--where", UNIT_A, "--key", &key(&h, Who::TenantA)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let out = &o.stdout;
+    for want in [
+        "Index read from tape: HEIR01",
+        &format!("Unit {UNIT_A} (tenant {TENANT_A}):"),
+        "  Version 1: ",
+        &format!("unit uuid {}", t.unit_uuids[UNIT_A]),
+        "    tape HEIR01  (this tape)  slices 1-",
+        "    tape OLD01  (sealed 2026-10-01T00:00:00Z)",
+        "    tape OLD02  (QUARANTINED: a verify proved this medium bad",
+        "volume uuid ",
+        "cartridge serial SERIALOLD01",
+        "generation LTO-6",
+        "A holder marked 'this tape' is the tape you have loaded",
+    ] {
+        assert!(out.contains(want), "{want}: {out}");
+    }
+    assert!(
+        !out.contains(UNIT_B),
+        "another tenant's unit is not shown: {out}"
+    );
+    assert!(!out.contains("a range"), "a whole tape is no range: {out}");
+}
+
+/// Columns are found by their header names: reversed, with one this script
+/// does not know, every mode reads the same.
+#[test]
+fn columns_are_found_by_header_name_and_an_unknown_column_is_ignored() {
+    let (a, b) = (permuted(), two());
+    let (h1, h2) = (Heir::of(a), Heir::of(b));
+    for (mode, arg) in [("--where", UNIT_A), ("--find", "deep")] {
+        let o1 = h1.run(&[mode, arg, "--key", &key(&h1, Who::TenantA)]);
+        let o2 = h2.run(&[mode, arg, "--key", &key(&h2, Who::TenantA)]);
+        assert_eq!(o1.code, 0, "{mode}: {}", o1.all());
+        assert_eq!(o2.code, 0, "{mode}: {}", o2.all());
+        // The tapes differ in their uuids, and the written date is the same.
+        let norm = |t: &Tape, s: &str| {
+            s.replace(&t.unit_uuids[UNIT_A], "UUID")
+                .replace(&t.volume_uuid, "VOL")
+        };
+        // (The ciphertext sizes of two stagings differ: the byte count of the
+        // Version line is not compared, its words are.)
+        let drop_bytes = |s: String| {
+            s.lines()
+                .map(|l| match l.find("slice(s), ") {
+                    Some(i) if l.starts_with("  Version") => l[..i].to_string(),
+                    _ if l.contains("/RESTORE.sh ") => "RESTORE.sh ...".to_string(),
+                    _ => l.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            drop_bytes(norm(a, &o1.stdout)),
+            drop_bytes(norm(b, &o2.stdout)),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn where_with_the_escrow_key_reads_the_operator_map_of_every_tenant() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let ke = key(&h, Who::Escrow);
+    let o = h.run(&["--where", UNIT_B, "--key", &ke]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains(&format!("Unit {UNIT_B} (tenant {TENANT_B}):")),
+        "{}",
+        o.stdout
+    );
+    assert!(o.stdout.contains("tape OLD01"), "{}", o.stdout);
+    let o = h.run(&["--where", UNIT_A, "--key", &ke]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains(&format!("Unit {UNIT_A} (tenant {TENANT_A}):")),
+        "{}",
+        o.stdout
+    );
+}
+
+#[test]
+fn where_names_the_units_the_index_lists_when_it_finds_none() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let o = h.run(&["--where", "no-such-unit", "--key", &key(&h, Who::TenantA)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("No unit named 'no-such-unit' is in this index"),
+        "{}",
+        o.stdout
+    );
+    assert!(o.stdout.contains(&format!("    {UNIT_A}")), "{}", o.stdout);
+    assert!(!o.stdout.contains(UNIT_B), "{}", o.stdout);
+    assert!(
+        o.stdout
+            .contains("A tenant's key opens that tenant's index only"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--where", "no-such-unit", "--key", &key(&h, Who::Escrow)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(o.stdout.contains(UNIT_A) && o.stdout.contains(UNIT_B));
+    assert!(!o.stdout.contains("A tenant's key opens"), "{}", o.stdout);
+}
+
+/// A miss on a large index names every unit (no cap), and `--where --all`
+/// lists every unit the index names past forty, in the order the rows give,
+/// with each unit's newest version by number, never by text.
+#[test]
+fn a_miss_and_where_all_on_a_large_index_name_every_unit() {
+    let t = bulk();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&["--where", "nothing", "--key", &ka]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    for n in 0..60 {
+        assert!(
+            o.stdout.contains(&format!("bulk-1-{n:02}")),
+            "{n}: {}",
+            o.stdout
+        );
+    }
+    let o = h.run(&["--where", "--all", "--key", &ka]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    // Tenant A's index: its own unit and its sixty.
+    assert!(
+        o.stdout.contains(
+            "61 unit(s) in this index; this tape holds the newest version of 1 of them whole."
+        ),
+        "{}",
+        o.stdout
+    );
+    for n in 0..60 {
+        assert!(o.stdout.contains(&format!(
+            "Unit bulk-1-{n:02} (tenant {TENANT_A}): newest version"
+        )));
+    }
+    // Version 10 is newer than version 2 by number.
+    assert!(
+        o.stdout.contains(
+            "Unit bulk-1-00 (tenant loquat-alpha): newest version 10, NOT on this tape (whole)"
+        ),
+        "{}",
+        o.stdout
+    );
+    assert!(o.stdout.contains("Version 10 (newest): "), "{}", o.stdout);
+    assert!(
+        o.stdout
+            .contains("The newest version of these is NOT on this tape whole"),
+        "{}",
+        o.stdout
+    );
+    // The escrow key opens the operator's map: every tenant's units.
+    let o = h.run(&["--where", "--all", "--key", &key(&h, Who::Escrow)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("62 unit(s) in this index"),
+        "{}",
+        o.stdout
+    );
+    assert!(o
+        .stdout
+        .contains(&format!("Unit {UNIT_B} (tenant {TENANT_B})")));
+}
+
+#[test]
+fn a_tape_without_an_index_says_so_for_where_and_find() {
+    let t = no_index();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    for args in [
+        vec!["--where", UNIT_A, "--key", &ka],
+        vec!["--where", "--all", "--key", &ka],
+        vec!["--find", "deep", "--key", &ka],
+    ] {
+        let o = h.run(&args);
+        assert_eq!(o.code, 1, "{args:?}: {}", o.all());
+        assert!(
+            o.stdout.contains("This tape carries no index"),
+            "{args:?}: {}",
+            o.stdout
+        );
+        assert!(o.stdout.contains("--find-envelope"), "{}", o.stdout);
+    }
+}
+
+#[test]
+fn find_prints_matching_paths_with_their_holders() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&["--find", "mid-3", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    for want in [
+        &format!("In the index of tenant {TENANT_B}:"),
+        &format!("  {UNIT_B}  v1  f  12000 bytes  inner/mid-3.dat"),
+        &format!("  Tapes holding {UNIT_B} version 1:"),
+        "    tape HEIR01  (this tape)",
+        "    tape OLD01  (sealed 2026-10-01T00:00:00Z)",
+        "--restore --key KEY --unit UNIT --path PATH",
+    ] {
+        assert!(o.stdout.contains(want), "{want}: {}", o.stdout);
+    }
+    assert!(!o.stdout.contains("mid-4"), "{}", o.stdout);
+    let o = h.run(&["--find", "nowhere-at-all", "--key", &kb]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stdout.contains("No path in this index contains"),
+        "{}",
+        o.stdout
+    );
+}
+
+/// The match is on the decoded path and a path with a TAB or newline is
+/// printed on one line, escaped for the eye.
+#[test]
+fn find_matches_the_decoded_path_and_prints_it_on_one_line() {
+    let t = two();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&["--find", "tab\tand\nnew", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let line = o
+        .stdout
+        .lines()
+        .find(|l| l.contains("12") || l.contains("newline.txt"))
+        .unwrap();
+    assert!(line.ends_with("tab\\tand\\nnewline.txt"), "{line:?}");
+    assert!(
+        o.stdout.contains("Paths containing 'tab\\tand\\nnew'"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--find", "odd\\back", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("odd\\back name.txt"), "{}", o.stdout);
+}
+
+#[test]
+fn find_caps_its_matches_and_counts_the_rest_under_one_limit_for_every_tenant() {
+    let t = bulk();
+    let h = Heir::of(t);
+    let o = h.run(&["--find", "bulk/", "--key", &key(&h, Who::TenantA)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(
+        o.stdout
+            .matches("  bulk  v2  f  10 bytes  bulk/file-")
+            .count(),
+        50,
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("10 more match(es) are not shown"),
+        "{}",
+        o.stdout
+    );
+    // One limit across the tenants the escrow key opens.
+    let o = h.run(&["--find", "bulk/", "--key", &key(&h, Who::Escrow)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_eq!(
+        o.stdout
+            .matches("  bulk  v2  f  10 bytes  bulk/file-")
+            .count(),
+        50,
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("70 more match(es) are not shown"),
+        "{}",
+        o.stdout
+    );
+}
+
+/// The index modes read forward from one rewind, as `--find-envelope` does,
+/// and need exactly the tools that open an envelope.
+#[test]
+fn the_index_modes_read_forward_from_one_rewind_and_check_the_tools_they_run() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&["--find-envelope", "--key", &ka]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    let want = h.count_ops("mt rewind");
+    for args in [
+        vec!["--where", UNIT_A, "--key", &ka],
+        vec!["--where", "--all", "--key", &ka],
+        vec!["--find", "deep", "--key", &ka],
+    ] {
+        h.reset_ops();
+        let o = h.run(&args);
+        assert_eq!(o.code, 0, "{args:?}: {}", o.all());
+        assert_eq!(h.count_ops("mt rewind"), want, "{args:?}: {:?}", h.ops());
+        assert!(
+            h.dd_reads()
+                .iter()
+                .all(|p| !t.slice_positions().contains(p)),
+            "the index modes read no data slice: {:?}",
+            h.ops()
+        );
+    }
+    // A host with no `age` is refused before the tape is read; `--info` needs none.
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    h.remove_tool("age");
+    let o = h.run(&["--where", UNIT_A, "--key", &ka]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("missing required tool(s): age"),
+        "{}",
+        o.stderr
+    );
+    assert!(h.ops().is_empty(), "{:?}", h.ops());
+}
+
+/// On a tape that ended early, the version it holds only some of is marked a
+/// range (the seal and the manifest say which slices are here), never a copy
+/// of the whole version, by `--where`, `--where --all` and `--find`.
+#[test]
+fn where_and_find_on_a_range_tape_mark_this_tape_a_range_and_not_a_whole_copy() {
+    let range = &whole_and_range()[1];
+    let h = Heir::of(range);
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&["--where", UNIT_B, "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("tape HEIR02  (this tape, a range: not the whole version)  slices 1-1 of "),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("holds only the slices it names"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--where", "--all", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains(&format!(
+            "Unit {UNIT_B} (tenant {TENANT_B}): newest version 1, NOT on this tape (whole)"
+        )),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("(this tape: slices 1-1 only)"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--find", "notes", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("this tape, a range: not the whole version"),
+        "{}",
+        o.stdout
+    );
+    // The whole copy of the same stagings is no range.
+    let h = Heir::of(&whole_and_range()[0]);
+    let o = h.run(&["--where", UNIT_B, "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!o.stdout.contains("a range"), "{}", o.stdout);
+}
+
+/// BusyBox tar takes a member given whole, as the heir's path restore gives
+/// it, and does not take a named folder with all that lies under it: a file,
+/// a hard link with its first name, a folder and a long member's run all come
+/// back, the repair included.
+#[test]
+fn busybox_tar_restores_named_paths_and_the_repair_from_members_given_whole() {
+    let Some(bb) = optional_tool("busybox") else {
+        return;
+    };
+    let busybox_tar = format!("#!/bin/sh\nexec {} tar \"$@\"\n", bb.display());
+    let (t1, t2) = (&copies()[0], &copies()[1]);
+    let h = Heir::of(t1);
+    h.put_tool("tar", &busybox_tar);
+    let kb = key(&h, Who::TenantB);
+    let large = format!("{UNIT_B}-large.bin");
+    let link = format!("{UNIT_B}-small.txt");
+    let dest = h.dest("named");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        &large,
+        "--path",
+        &link,
+        "--path",
+        "inner",
+        "--path",
+        "inner/mid-5.dat",
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("CONTENT ONLY"), "{}", o.stdout);
+    let got = heir::tree(&dest);
+    for p in [large.as_str(), link.as_str(), "inner/mid-5.dat"] {
+        let (_, bytes) = unit_files(t1, UNIT_B).iter().find(|(q, _)| q == p).unwrap();
+        assert_eq!(got.get(p), Some(bytes), "{p}");
+    }
+    assert!(
+        !got.contains_key("inner/mid-4.dat") && !got.contains_key("notes.txt"),
+        "nothing under the named folder was extracted: {:?}",
+        got.keys()
+    );
+    // The repair under BusyBox tar, from a copy with the slice of mid-1 lost.
+    let h1 = Heir::of(t1);
+    let rows = list_rows(&h1, &kb, UNIT_B);
+    let (_, s, _, _) = row(&rows, "inner/mid-1.dat");
+    h1.flip(slice_pos(t1, UNIT_B, *s), 500);
+    let whole = h1.dest("whole");
+    let o = h1.run(&["--restore", "--key", &kb, "--to", dest_str(&whole)]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    let h2 = Heir::of(t2);
+    h2.put_tool("tar", &busybox_tar);
+    let o = h2.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&whole),
+        "--paths-from",
+        whole.join(".tapectl-damaged-files.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert_restored(t1, UNIT_B, &whole);
+}
+
+// ---- what the review of this task added ----
+
+/// A tape that holds a run of a version's slices, and not the whole of it,
+/// is a range in the index, from the tape's own table.
+#[test]
+fn where_marks_an_earlier_tape_that_holds_a_run_of_slices_only_as_a_range() {
+    let t = with_holders();
+    let h = Heir::of(t);
+    let ke = key(&h, Who::Escrow);
+    let o = h.run(&["--where", UNIT_B, "--key", &ke]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains(
+            "    tape OLD03  (sealed 2026-10-02T00:00:00Z, a range: not the whole version)  slices 1-1 of "
+        ),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout
+            .contains("tape OLD01  (sealed 2026-10-01T00:00:00Z)"),
+        "a whole holder is no range: {}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("holds only the slices it names"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--where", "--all", "--key", &ke]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("OLD03"), "{}", o.stdout);
+    // A unit of one slice has no partial holder.
+    let o = h.run(&["--where", UNIT_A, "--key", &ke]);
+    assert!(!o.stdout.contains("OLD03"), "{}", o.stdout);
+    let o = h.run(&["--find", "mid-3", "--key", &key(&h, Who::TenantB)]);
+    assert!(o.stdout.contains("tape OLD03"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("holds only the slices it names"),
+        "{}",
+        o.stdout
+    );
+}
+
+/// Three units, the tape ended early inside the big one's first slice: the
+/// third unit has no slice on it.
+fn three_short() -> &'static Tape {
+    static T: OnceLock<Tape> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut shape = Shape::two();
+        shape.units.push(("charlie-unit".into(), TENANT_A, true));
+        shape.warning_in_slice = Some(1);
+        Tape::build(&shape)
+    })
+}
+
+#[test]
+fn a_unit_with_no_slice_on_a_short_tape_is_said_so_by_every_mode_that_knows() {
+    let t = three_short();
+    let h = Heir::of(t);
+    let ka = key(&h, Who::TenantA);
+    let o = h.run(&["--where", "charlie-unit", "--key", &ka]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("no slice of it is on this tape (it ended before them)"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("a range: not the whole version"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--where", "--all", "--key", &ka]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("(this tape: no slice of it)"),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--find-envelope", "--key", &ka]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout
+            .contains("PART: unit charlie-unit version 1: this tape holds none of its "),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--list", "--key", &ka, "--unit", "charlie-unit"]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("PART: this tape holds none of its "),
+        "{}",
+        o.stdout
+    );
+    // A path of it is not read: the tape does not hold it, and it is listed.
+    let h = Heir::of(t);
+    let dest = h.dest("none");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        "charlie-unit",
+        "--path",
+        "notes.txt",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr
+            .contains("lie in slices this tape does not hold whole"),
+        "{}",
+        o.stderr
+    );
+    assert_eq!(damaged_list(&dest), vec!["notes.txt".to_string()]);
+    assert!(data_reads(t, &h).is_empty(), "{:?}", h.ops());
+}
+
+/// `--find-envelope` and `--list` mark a unit the tape holds only part of.
+#[test]
+fn find_envelope_and_list_mark_a_unit_a_range_tape_holds_only_part_of() {
+    let range = &whole_and_range()[1];
+    let h = Heir::of(range);
+    let kb = key(&h, Who::TenantB);
+    let o = h.run(&["--find-envelope", "--key", &kb]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains(&format!(
+            "PART: unit {UNIT_B} version 1: this tape holds only slices 1-1 of its "
+        )),
+        "{}",
+        o.stdout
+    );
+    let o = h.run(&["--list", "--key", &kb, "--unit", UNIT_B]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(
+        o.stdout.contains("PART: this tape holds only slices 1-1"),
+        "{}",
+        o.stdout
+    );
+    // The whole tape and the unit that is whole on the range tape say nothing.
+    let o = h.run(&["--find-envelope", "--key", &key(&h, Who::TenantA)]);
+    assert!(!o.stdout.contains("PART:"), "{}", o.stdout);
+    let w = Heir::of(&whole_and_range()[0]);
+    let o = w.run(&["--find-envelope", "--key", &key(&w, Who::TenantB)]);
+    assert!(!o.stdout.contains("PART:"), "{}", o.stdout);
+}
+
+/// A refusal by the destination file system (tar's words, its exit status 2)
+/// is not damage: the restored files check out, so the restore is complete
+/// and no list is written. The per-file check decides, whole unit or path.
+#[test]
+fn a_destination_refusal_in_tars_words_is_no_damage_when_the_files_check_out() {
+    let t = two();
+    let real = heir::host_tool("tar").unwrap();
+    let refusing = format!(
+        "#!/bin/bash\n\"{}\" \"$@\"\nrc=$?\ncase \" $* \" in\n  *\" -C \"*\" --numeric-owner \"*)\n    echo 'tar: ./x: Cannot change ownership to uid 0: Operation not permitted' >&2\n    exit 2 ;;\nesac\nexit $rc\n",
+        real.display()
+    );
+    let h = Heir::of(t);
+    h.put_tool("tar", &refusing);
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("whole");
+    let o = h.run(&["--restore", "--key", &ka, "--to", dest_str(&dest)]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(o.stdout.contains("RESTORE COMPLETE"), "{}", o.stdout);
+    assert!(o.stderr.contains("tar ended with status 2"), "{}", o.stderr);
+    assert!(!dest.join(".tapectl-damaged-files.txt").exists());
+    assert_restored(t, UNIT_A, &dest);
+    let one = h.dest("one");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&one),
+        "--unit",
+        UNIT_A,
+        "--path",
+        "notes.txt",
+        "--path",
+        &format!("inner/{UNIT_A}-deep.dat"),
+    ]);
+    // (unit A has no notes.txt: refused before any read)
+    assert_eq!(o.code, 1, "{}", o.all());
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&one),
+        "--unit",
+        UNIT_A,
+        "--path",
+        &format!("inner/{UNIT_A}-deep.dat"),
+    ]);
+    assert_eq!(o.code, 0, "{}", o.all());
+    assert!(!one.join(".tapectl-damaged-files.txt").exists());
+}
+
+/// `tail` cuts each member from its slice: the path modes name it in the tool
+/// check, before the tape is read; a whole-unit restore does not need it.
+#[test]
+fn the_path_modes_check_for_tail_and_a_whole_restore_does_not_need_it() {
+    let t = two();
+    let h = Heir::of(t);
+    h.remove_tool("tail");
+    let ka = key(&h, Who::TenantA);
+    let dest = h.dest("p");
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &ka,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_A,
+        "--path",
+        "empty",
+    ]);
+    assert_eq!(o.code, 1, "{}", o.all());
+    assert!(
+        o.stderr.contains("missing required tool(s): tail"),
+        "{}",
+        o.stderr
+    );
+    assert!(h.ops().is_empty(), "{:?}", h.ops());
+    let o = h.run(&["--restore", "--key", &ka, "--to", dest_str(&h.dest("w"))]);
+    assert_eq!(o.code, 0, "{}", o.all());
+}
+
+/// A folder whose name holds a backslash is a folder, not a file the
+/// destination already holds: the text off the tape reaches awk as it is.
+#[test]
+fn an_existing_folder_named_with_a_backslash_is_not_refused_as_an_existing_file() {
+    let t = two();
+    let h = Heir::of(t);
+    let kb = key(&h, Who::TenantB);
+    let dest = h.dest("exists");
+    std::fs::create_dir_all(dest.join("dir\\one")).unwrap();
+    let o = h.run(&[
+        "--restore",
+        "--key",
+        &kb,
+        "--to",
+        dest_str(&dest),
+        "--unit",
+        UNIT_B,
+        "--path",
+        "dir\\one",
+        "--path",
+        "dir\\one/leaf.txt",
+    ]);
+    assert_eq!(o.code, 0, "an existing folder is no refusal: {}", o.all());
+    assert!(dest.join("dir\\one/leaf.txt").is_file());
 }

@@ -742,9 +742,16 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// carry each staging's file table and id map (T4.6, §1.4, §1.6): the tape's
 /// own files grew by four blocks (720,896 bytes before `S`'s slice 1), and
 /// the figure by the same 16,384 bytes. Layout 3's RESTORE.sh (T4.10, a new
-/// script in the tree) is 14 blocks where 1.8.0's was 74: the tape's own
-/// files shrank by 60 blocks, and the figure by the same 245,760 bytes.
-const CAP94: u64 = 2_494_464;
+/// script in the tree) is far smaller than 1.8.0's: the tape's own files
+/// shrank, and the figure by the same 245,760 bytes. Since T4.11
+/// the figure is computed from File 2's size in blocks (RESTORE.sh alone,
+/// `build.rs`), so a change to the script moves it by exactly what the tape's
+/// own files moved and every cut stays where it was. 2,433,024 bytes is the
+/// rest of the figure: a change to any other file before `S`'s slice 1 still
+/// moves it by hand, as above.
+const CAP94: u64 = 2_433_024 + RESTORE_SH_BLOCKS * BS as u64;
+/// File 2's size in blocks: RESTORE.sh, padded to the block.
+const RESTORE_SH_BLOCKS: u64 = (crate::volume::heir::RESTORE_SH.len() as u64).div_ceil(BS as u64);
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may

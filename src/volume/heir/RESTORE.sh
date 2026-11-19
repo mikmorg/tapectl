@@ -21,6 +21,23 @@
 #   RESTORE.sh --restore --key K --to DIR --unit U [--unit U2 ...] [--version N]
 #                                              whole units; with more than one
 #                                              unit each goes to DIR/UNIT
+#   RESTORE.sh --restore --key K --to DIR --unit U [--version N] --path P [--path P2 ...]
+#                                              only those files of one unit, by
+#                                              its file table: the slices that
+#                                              hold them are read, no others
+#   RESTORE.sh --restore --key K --to DIR --paths-from LIST
+#                                              the one repair: LIST is the
+#                                              .tapectl-damaged-files.txt of an
+#                                              earlier restore, and this tape is
+#                                              another copy of the same unit and
+#                                              version; only the listed paths are
+#                                              restored (and overwritten)
+#   RESTORE.sh --where UNIT --key K            every version of a unit and the
+#   RESTORE.sh --where --all --key K           tapes that hold it; every unit
+#   RESTORE.sh --find TEXT --key K             paths containing TEXT, with their
+#                                              unit, version and tapes
+#                                              (all three read the index this
+#                                              tape carries, as of its writing)
 #   Also: [--key K2 ...] repeats a key; --work DIR puts the work directory
 #   there (the default is inside --to); --no-space-check; --overwrite (--to
 #   need not be empty); --no-file-check.
@@ -56,6 +73,9 @@ TOOLS_READ=(dd head sha256sum)
 TOOLS_ENVELOPE=(dd head sha256sum age tar)
 TOOLS_LIST=(dd head sha256sum age tar)
 TOOLS_RESTORE=(dd head sha256sum age tar)
+TOOLS_INDEX=(dd head sha256sum age tar)
+# What a path restore or the repair adds: members are cut from a slice with it.
+TOOLS_PATHS=(tail)
 # What a unit that states `compression` needs, and only such a unit:
 # algorithm=tool, one per line.
 DECOMPRESSORS="
@@ -67,6 +87,10 @@ zstd=zstd
 MODE=""
 KEYS=()
 UNITS=()
+PATHS=()
+PATHS_FROM=""
+WHERE_UNIT=""
+FIND_TEXT=""
 ALL=0
 VERSION=""
 TO=""
@@ -119,7 +143,7 @@ die_usage() {
 
 # Modes of the format that a later build of this script carries.
 later_build() {
-  die "$1 is not in this build of RESTORE.sh yet. This build restores whole units (--restore --all, --restore --unit U), lists a unit's files, and checks a tape (--info, --verify, --find-envelope)."
+  die "$1 is not in this build of RESTORE.sh yet. This build restores whole units and named paths (--restore --all, --restore --unit U [--path P]), makes the one repair (--paths-from), lists a unit's files, reads the index (--where, --find) and checks a tape (--info, --verify, --find-envelope). A unit across cartridges is not in it."
 }
 
 is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
@@ -142,6 +166,28 @@ while [ $# -gt 0 ]; do
   --find-envelope) set_mode find-envelope ;;
   --list) set_mode list ;;
   --restore) set_mode restore ;;
+  --where)
+    need_arg "$@"
+    set_mode where
+    WHERE_UNIT=$2
+    shift
+    ;;
+  --find)
+    need_arg "$@"
+    set_mode find
+    FIND_TEXT=$2
+    shift
+    ;;
+  --path)
+    need_arg "$@"
+    PATHS+=("$2")
+    shift
+    ;;
+  --paths-from)
+    need_arg "$@"
+    PATHS_FROM=$2
+    shift
+    ;;
   --key)
     need_arg "$@"
     KEYS+=("$2")
@@ -172,7 +218,7 @@ while [ $# -gt 0 ]; do
   --no-space-check) NO_SPACE_CHECK=1 ;;
   --overwrite) OVERWRITE=1 ;;
   --no-file-check) NO_FILE_CHECK=1 ;;
-  --path | --paths-from | --where | --find | --slices-from | --swap-tapes | --fill-from | --stream-tapes)
+  --slices-from | --swap-tapes | --fill-from | --stream-tapes)
     later_build "$1"
     ;;
   --scratch) die_usage "--scratch is now --work DIR" ;;
@@ -185,16 +231,30 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ -n "$MODE" ] || die_usage "no mode given (--info, --verify, --find-envelope, --list or --restore)"
+[ -n "$MODE" ] || die_usage "no mode given (--info, --verify, --find-envelope, --list, --restore, --where or --find)"
 case $MODE in
-find-envelope | list | restore) [ ${#KEYS[@]} -gt 0 ] || die_usage "--$MODE needs your age key file: --key FILE" ;;
+find-envelope | list | restore | where | find) [ ${#KEYS[@]} -gt 0 ] || die_usage "--$MODE needs your age key file: --key FILE" ;;
 esac
+if [ "$MODE" = find ] && [ -z "$FIND_TEXT" ]; then die_usage "--find needs the text to look for"; fi
+if [ "$MODE" = where ] && [ -z "$WHERE_UNIT" ]; then die_usage "--where needs a unit name, or --all"; fi
+if [ "$MODE" != restore ] && { [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; }; then
+  die_usage "--path and --paths-from go with --restore"
+fi
+if [ "$MODE" = restore ] && [ ${#PATHS[@]} -gt 0 ] && [ -n "$PATHS_FROM" ]; then
+  die_usage "--path and --paths-from are two ways to name paths: give one"
+fi
+if [ ${#PATHS[@]} -gt 0 ]; then
+  [ "$ALL" = 0 ] && [ ${#UNITS[@]} -eq 1 ] || die_usage "--path names files of ONE unit: give exactly one --unit NAME (and not --all)"
+fi
+if [ -n "$PATHS_FROM" ]; then
+  [ "$ALL" = 0 ] && [ ${#UNITS[@]} -le 1 ] || die_usage "--paths-from restores the paths of ONE unit, the one its list names: give no --all and at most that --unit"
+fi
 if [ "$MODE" = restore ]; then
   [ -n "$TO" ] || die_usage "--restore needs a destination: --to DIR"
 fi
 if [ "$ALL" = 1 ] && [ ${#UNITS[@]} -gt 0 ]; then die_usage "--all and --unit are two ways to choose: give one"; fi
 case $MODE in
-restore | list | find-envelope) : ;;
+restore | list | find-envelope | where | find) : ;;
 *) if [ ${#KEYS[@]} -gt 0 ] || [ ${#UNITS[@]} -gt 0 ] || [ -n "$TO" ]; then die_usage "--$MODE takes no --key, --unit or --to"; fi ;;
 esac
 
@@ -204,8 +264,12 @@ tools_of_mode() {
   case $1 in
   info | verify) echo "${TOOLS_READ[*]}" ;;
   find-envelope) echo "${TOOLS_ENVELOPE[*]}" ;;
+  where | find) echo "${TOOLS_INDEX[*]}" ;;
   list) echo "${TOOLS_LIST[*]}" ;;
-  restore) echo "${TOOLS_RESTORE[*]}" ;;
+  restore)
+    echo "${TOOLS_RESTORE[*]}"
+    if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then echo "${TOOLS_PATHS[*]}"; fi
+    ;;
   esac
 }
 
@@ -970,6 +1034,34 @@ collect_units() {
   done
 }
 
+# The versions an opened envelope lists that this tape holds only some of
+# (a range), in $WORK/range.versions: uuid TAB version TAB first TAB last TAB
+# slices (see AWK_RANGE_VERSIONS). The tape's own seal and manifest say which.
+collect_ranges() {
+  local pos
+  : >"$WORK/range.versions"
+  for pos in $OPENED; do note_range_versions "$WORK/env.$pos"; done
+}
+
+# What this tape holds of version $2 of the unit with uuid $1 when it is only
+# part of it: "first last slices" (first and last empty when none), or nothing.
+range_of() { # <unit uuid> <version>
+  RANGE_UUID="$1" RANGE_VER="$2" awk -F'\t' '
+    $1 == ENVIRON["RANGE_UUID"] && ($2 + 0) == (ENVIRON["RANGE_VER"] + 0) { print $3 "|" $4 "|" $5; exit }
+  ' "$WORK/range.versions"
+}
+
+# The words for a range, from range_of's answer.
+range_words() { # <first|last|slices>
+  local first last n
+  IFS='|' read -r first last n <<<"$1"
+  if [ -z "$first" ]; then
+    printf 'this tape holds none of its %s slices (it ended before them)' "$n"
+  else
+    printf 'this tape holds only slices %s-%s of its %s' "$first" "$last" "$n"
+  fi
+}
+
 # ---- --find-envelope ----
 
 do_find_envelope() {
@@ -981,8 +1073,16 @@ do_find_envelope() {
     say "The key opens the envelope at file $pos ($(file_type_at "$pos" "$FILES_TXT"))."
   done
   collect_units
+  collect_ranges
   say "Units in the envelope(s) your key opened (unit, version, slices, bytes of stream, compression):"
   awk -F'|' '{ printf "  %s  version %s  %s slice(s)  %s bytes%s\n", $3, $4, $11, $8, ($7 != "" ? "  compressed with " $7 : "") }' "$WORK/units.txt"
+  local row r name ver uuid ft
+  while IFS= read -r row <&3; do
+    IFS='|' read -r _ _ name ver _ uuid _ _ ft _ <<<"$row"
+    [ -n "$ft" ] || continue
+    r=$(range_of "$uuid" "$ver")
+    [ -z "$r" ] || say "  PART: unit $(safe_str "$name") version $ver: $(range_words "$r"); the rest is on another tape."
+  done 3<"$WORK/units.txt"
   nunits=$(awk -F'|' '$9 != "" { n[$3 ""] = 1 } END { c = 0; for (k in n) c++; print c }' "$WORK/units.txt")
   if [ "${nunits:-0}" -gt 1 ]; then
     say "To restore one, run: $0 --restore --key KEY --to DIR --unit NAME   (or --all for every unit, each in DIR/NAME)"
@@ -1038,12 +1138,15 @@ do_list() {
   envelope_space_check
   open_envelopes
   collect_units
+  collect_ranges
   choose_units listing
-  local pos idx name ver uuid comp sb ft idm ns table
-  while IFS='|' read -r pos idx name ver _ uuid comp sb ft idm ns; do
+  local pos name ver uuid comp sb ft idm ns table r
+  while IFS='|' read -r pos _ name ver _ uuid comp sb ft idm ns; do
     table=$(unit_table_path "$pos" "$ft")
     [ -f "$table" ] || die "the envelope has no file table for unit $(safe_str "$name") at $(safe_str "$ft")"
     say "Unit $(safe_str "$name")  version $ver  ($ns slice(s), $sb bytes of stream${comp:+, compressed with $comp})"
+    r=$(range_of "$uuid" "$ver")
+    [ -z "$r" ] || say "  PART: $(range_words "$r"). A file in a slice this tape does not hold is not on it."
     say "  kind  slice  bytes  path"
     awk -F'\t' '/^#/ { next } { printf "  %s  %5s  %s  %s%s\n", $1, $2, $5, $7, ($1 == "h" ? "  -> " $8 : "") }' "$table"
   done <"$WORK/chosen.txt"
@@ -1090,13 +1193,15 @@ check_destination() {
 }
 
 # One slice per entry, 1-based: the manifest's claims for the unit chosen.
-SL_POS=() SL_SIZE=() SL_ENC=() SL_SHAP=() SL_SHAE=() SL_CONT=()
+SL_POS=() SL_SIZE=() SL_ENC=() SL_SHAP=() SL_SHAE=() SL_CONT=() SL_OFF=()
 NSL=0
 COMP=""
 
+# SL_OFF[k] is where slice k's cut begins in the unit's stream: the sum of the
+# plain lengths before it (the slices joined are the stream, rule 13).
 load_slices() { # <pos> <idx>
-  local num tp sz en sp se co
-  SL_POS=() SL_SIZE=() SL_ENC=() SL_SHAP=() SL_SHAE=() SL_CONT=()
+  local num tp sz en sp se co off=0
+  SL_POS=() SL_SIZE=() SL_ENC=() SL_SHAP=() SL_SHAE=() SL_CONT=() SL_OFF=()
   NSL=0
   while IFS='|' read -r num tp sz en sp se co; do
     is_uint "$num" || continue
@@ -1108,6 +1213,8 @@ load_slices() { # <pos> <idx>
     SL_SHAP[$NSL]=$sp
     SL_SHAE[$NSL]=$se
     SL_CONT[$NSL]=$co
+    SL_OFF[$NSL]=$off
+    if is_uint "$sz"; then off=$((off + sz)); fi
   done <<EOF
 $(awk -v want="$2" "$AWK_SLICES" "$WORK/env.$1/MANIFEST.toml")
 EOF
@@ -1271,14 +1378,17 @@ unesc() { # <escaped text>; result in REPLY
   REPLY=$out
 }
 
-# The paths (escaped) of the non-folder members of a table that begin in the
-# slices listed in $2 (one number at the start of each line).
+# The paths (escaped) of every member of a table that begins in the slices
+# listed in $2 (one number at the start of each line): a folder is a member
+# like another and is listed too. A listed folder brings back its own entry
+# (its mode, owner and times) and nothing under it: the repair reads members
+# by their offsets and never extracts by name.
 members_in_slices() { # <table> <bad.slices file: number|why>
   cut -d'|' -f1 "$2" >"$WORK/bad.numbers"
   awk -F'\t' '
     FILENAME == ARGV[1] { bad[$1 ""] = 1; next }
     /^#/ { next }
-    ($1 != "d") && (($2 "") in bad) { print $7 }
+    (($2 "") in bad) { print $7 }
   ' "$WORK/bad.numbers" "$1"
 }
 
@@ -1342,21 +1452,54 @@ tar_extract() { # <destination>
 DAMAGED_TOTAL=0
 UNITS_DONE=0
 
-restore_one() { # <chosen row> <destination>
-  local pos idx name ver uuid comp sb ft idm ns dest=$2 table ids
-  IFS='|' read -r pos idx name ver _ uuid comp sb ft idm ns <<<"$1"
-  table=$(unit_table_path "$pos" "$ft")
-  [ -f "$table" ] || die "the envelope has no file table for unit $(safe_str "$name") at $(safe_str "$ft")"
-  COMP=$comp
+# The unit chosen, from its row of units.txt: its file table and its slices
+# are read, and the decompressor its staging needs is found.
+U_POS="" U_IDX="" U_NAME="" U_VER="" U_UUID="" U_COMP="" U_SB="" U_FT="" U_IDM="" U_NS="" U_TABLE=""
+unit_open() { # <chosen row>
+  IFS='|' read -r U_POS U_IDX U_NAME U_VER _ U_UUID U_COMP U_SB U_FT U_IDM U_NS <<<"$1"
+  U_TABLE=$(unit_table_path "$U_POS" "$U_FT")
+  [ -f "$U_TABLE" ] || die "the envelope has no file table for unit $(safe_str "$U_NAME") at $(safe_str "$U_FT")"
+  COMP=$U_COMP
   DECOMP=""
   if [ -n "$COMP" ]; then
     DECOMP=$(decompressor_for "$COMP" || true)
-    [ -n "$DECOMP" ] || die "unit $(safe_str "$name") states compression '$(safe_str "$COMP")', which this RESTORE.sh does not know (it knows gzip, xz and zstd). Use a newer tapectl or RESTORE.sh."
+    [ -n "$DECOMP" ] || die "unit $(safe_str "$U_NAME") states compression '$(safe_str "$COMP")', which this RESTORE.sh does not know (it knows gzip, xz and zstd). Use a newer tapectl or RESTORE.sh."
     command -v "$DECOMP" >/dev/null 2>&1 ||
-      die "unit $(safe_str "$name") was compressed with $COMP and needs the tool '$DECOMP', which is not installed (package: $DECOMP, or xz-utils for xz). Nothing has been read from a slice."
+      die "unit $(safe_str "$U_NAME") was compressed with $COMP and needs the tool '$DECOMP', which is not installed (package: $DECOMP, or xz-utils for xz). Nothing has been read from a slice."
   fi
-  load_slices "$pos" "$idx"
-  [ "$NSL" -gt 0 ] || die "the manifest lists no slice for unit $(safe_str "$name")"
+  load_slices "$U_POS" "$U_IDX"
+  [ "$NSL" -gt 0 ] || die "the manifest lists no slice for unit $(safe_str "$U_NAME")"
+}
+
+# The damaged-file list of a unit's restored directory (volume-format-v3.md
+# 1.7): the header, then one path a line, escaped as the index escapes.
+write_damaged_list() { # <destination> <name> <uuid> <version> <file of paths>
+  local list="$1/.tapectl-damaged-files.txt"
+  {
+    printf '#tapectl-damaged-files\t1\tunit=%s\tuuid=%s\tversion=%s\n' "$2" "$3" "$4"
+    cat "$5"
+  } >"$list" || die_io "cannot write the damaged-file list" "" "$1"
+}
+
+print_damaged() { # <file of paths> <count> <list path>
+  say "DAMAGED: $2 path(s) were left out or failed the check. They are listed in $3:"
+  head -n 41 "$1" | sed 's/^/  /'
+  if [ "$2" -gt 40 ]; then say "  ... and $(($2 - 40)) more, in the list."; fi
+}
+
+# Who the ids were: the id map of the staging, shown and never acted on.
+print_id_map() { # <envelope position> <id map name>
+  local ids="$WORK/env.$1/$2"
+  if [ -n "$2" ] && [ -f "$ids" ]; then
+    say "Who the ids were (the stream carries owners by number; a restore never remaps them by name):"
+    awk -F'\t' '/^#/ { next } { printf "  %s %s  %s\n", ($1 == "u" ? "user " : "group"), $2, ($3 == "" ? "(no name known)" : $3) }' "$ids"
+  fi
+}
+
+restore_one() { # <chosen row> <destination>
+  local dest=$2 table pos name ver uuid idm ns sb
+  unit_open "$1"
+  table=$U_TABLE pos=$U_POS name=$U_NAME ver=$U_VER uuid=$U_UUID idm=$U_IDM ns=$U_NS sb=$U_SB
   mkdir -p -- "$dest" || die "cannot create $(safe_str "$dest")"
   # Space: the unit's files, and one slice twice (the cut, and its plain form).
   local files_bytes biggest=0 k
@@ -1430,54 +1573,1059 @@ restore_one() { # <chosen row> <destination>
   ndam=$(wc -l <"$WORK/damaged.paths" | tr -d ' ')
   local list="$dest/.tapectl-damaged-files.txt"
   if [ "$ndam" -gt 0 ]; then
-    {
-      printf '#tapectl-damaged-files\t1\tunit=%s\tuuid=%s\tversion=%s\n' "$name" "$uuid" "$ver"
-      cat "$WORK/damaged.paths"
-    } >"$list" || die_io "cannot write the damaged-file list" "" "$dest"
-    say "DAMAGED: $ndam path(s) were left out or failed the check. They are listed in $list:"
-    head -n 41 "$WORK/damaged.paths" | sed 's/^/  /'
-    if [ "$ndam" -gt 40 ]; then say "  ... and $((ndam - 40)) more, in the list."; fi
+    write_damaged_list "$dest" "$name" "$uuid" "$ver" "$WORK/damaged.paths"
+    print_damaged "$WORK/damaged.paths" "$ndam" "$list"
     DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
   else
     rm -f -- "$list"
   fi
-  ids="$WORK/env.$pos/$idm"
-  if [ -n "$idm" ] && [ -f "$ids" ]; then
-    say "Who the ids were (the stream carries owners by number; a restore never remaps them by name):"
-    awk -F'\t' '/^#/ { next } { printf "  %s %s  %s\n", ($1 == "u" ? "user " : "group"), $2, ($3 == "" ? "(no name known)" : $3) }' "$ids"
-  fi
+  print_id_map "$pos" "$idm"
   UNITS_DONE=$((UNITS_DONE + 1))
+}
+
+# ---- named paths and the one repair (volume-format-v3.md 7.2 "One file", 1.7) ----
+
+# The index's escaping of a path, as the file table and the damaged-file list
+# write it: backslash, TAB, LF and CR, and nothing else. The result is REPLY.
+esc() { # <text>
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  REPLY=$s
+}
+
+# The wanted members, in stream order: what to cut from which slices.
+M_START=() M_END=() M_SLICE=() M_LAST=() M_PATH=()
+NM=0
+
+# Is slice $1 on this tape whole: planned here and at or before the seal's
+# ended_after (a range holds some of a unit's slices, a short tape fewer)?
+slice_here() { # <slice number>
+  local p=${SL_POS[$1]:-}
+  is_uint "$p" && on_tape "$((10#$p))"
+}
+
+# Load the rows of $1 (table rows, stream order) as the members to feed, each
+# with the slice it begins in and the slice its last byte is in. A member whose
+# slices are not all on this tape is not fed: its path goes to
+# $WORK/absent.paths and it stays damaged.
+load_members() { # <rows file>
+  local slice start end path k last here
+  M_START=() M_END=() M_SLICE=() M_LAST=() M_PATH=()
+  NM=0
+  : >"$WORK/absent.paths"
+  while IFS=$'\t' read -r _ slice start end _ _ path _; do
+    is_uint "$slice" && is_uint "$start" && is_uint "$end" || die "the file table of unit $(safe_str "$U_NAME") has a row with a number that is not one (path $(safe_str "$path"))"
+    slice=$((10#$slice)) start=$((10#$start)) end=$((10#$end))
+    if [ "$slice" -lt 1 ] || [ "$slice" -gt "$NSL" ] || [ "$start" -lt "${SL_OFF[$slice]}" ] ||
+      [ "$start" -ge $((SL_OFF[$slice] + SL_SIZE[$slice])) ] || [ "$end" -le "$start" ]; then
+      die "the file table and the manifest of unit $(safe_str "$U_NAME") disagree about $(safe_str "$path"): it begins at byte $start in slice $slice. The envelope is damaged; try another copy of this tape."
+    fi
+    last=$slice
+    while [ $((SL_OFF[last] + SL_SIZE[last])) -lt "$end" ]; do
+      [ "$last" -lt "$NSL" ] || die "the file table of unit $(safe_str "$U_NAME") puts $(safe_str "$path") past the last slice. The envelope is damaged; try another copy of this tape."
+      last=$((last + 1))
+    done
+    here=1
+    for ((k = slice; k <= last; k++)); do slice_here "$k" || here=0; done
+    if [ "$here" = 0 ]; then
+      printf '%s\n' "$path" >>"$WORK/absent.paths"
+      continue
+    fi
+    NM=$((NM + 1))
+    M_START[$NM]=$start
+    M_END[$NM]=$end
+    M_SLICE[$NM]=$slice
+    M_LAST[$NM]=$last
+    M_PATH[$NM]=$path
+  done <"$1"
+}
+
+# The slice a member's part is cut from, prepared and still in slice.plain.
+HAVE_SLICE=""
+HAVE_RC=1
+need_slice() { # <slice number>: 0 when its plain cut is in slice.plain
+  local k=$1
+  if [ "$HAVE_SLICE" = "$k" ]; then return "$HAVE_RC"; fi
+  rm -f "$WORK/slice.plain"
+  HAVE_SLICE=$k
+  HAVE_RC=1
+  # A slice found bad by an earlier tar run is not read again.
+  if awk -F'|' -v k="$k" '($1 + 0) == (k + 0) { f = 1 } END { exit f ? 0 : 1 }' "$WORK/bad.slices"; then
+    return 1
+  fi
+  if prepare_slice "$k"; then HAVE_RC=0; fi
+  return "$HAVE_RC"
+}
+
+# Give tar the part of member $1 that lies in slice $2: bytes [from, to) of
+# the stream, cut from the slice's plain file by offset, as a pipeline of its
+# own. Returns 1 when tar stopped reading.
+emit_part() { # <member> <slice>
+  local j=$1 k=$2 off from to rc=0
+  off=${SL_OFF[$k]}
+  from=${M_START[$j]}
+  to=${M_END[$j]}
+  [ "$from" -ge "$off" ] || from=$off
+  [ "$to" -le $((off + SL_SIZE[k])) ] || to=$((off + SL_SIZE[k]))
+  { tail -c +$((from - off + 1)) "$WORK/slice.plain" || true; } | head -c $((to - from)) || rc=$?
+  return "$rc"
+}
+
+mark_left() { # <member>
+  printf '%s\n' "${M_PATH[$1]}" >>"$WORK/left.out"
+}
+
+# Feed the wanted members from member $1 on, in stream order, to our standard
+# output (the left of the pipe into tar). Each member is cut from its slice or
+# slices by its offsets and given whole, never named to tar. A member in a long
+# member's run is fed piece by piece, each piece checked first. When its first
+# slice is bad the member never begins and the next one is fed; when a later
+# piece is bad nothing more is fed, so tar's input ends and that run ends: the
+# partial file is removed by the caller, the member is listed, and the next run
+# starts at the next member.
+feed_members() { # <member number>
+  local j=$1 a b k
+  HAVE_SLICE=""
+  HAVE_RC=1
+  while [ "$j" -le "$NM" ]; do
+    a=${M_SLICE[$j]}
+    b=${M_LAST[$j]}
+    for ((k = a; k <= b; k++)); do
+      if ! need_slice "$k"; then
+        mark_left "$j"
+        if [ "$k" -gt "$a" ]; then
+          echo "resume $((j + 1)) $j" >"$WORK/feed.state"
+          printf '%s\n' "$CUR" >"$WORK/feed.cur"
+          return 0
+        fi
+        break
+      fi
+      if ! emit_part "$j" "$k"; then
+        echo "gone $j" >"$WORK/feed.state"
+        printf '%s\n' "$CUR" >"$WORK/feed.cur"
+        return 0
+      fi
+    done
+    j=$((j + 1))
+  done
+  echo "done" >"$WORK/feed.state"
+  printf '%s\n' "$CUR" >"$WORK/feed.cur"
+}
+
+# $1 is the wanted paths (escaped, one a line, sorted) and $2 the unit's table.
+# Writes $WORK/wanted.rows (the table rows of those paths, plus the first name
+# of each hard link among them, in stream order), $WORK/brought.paths (the
+# paths brought only as a hard link's first name) and $WORK/missing.paths (the
+# wanted paths the table does not have).
+resolve_paths() { # <wanted paths file> <table>
+  awk -F'\t' -v rows="$WORK/wanted.rows" -v brought="$WORK/brought.paths" -v missing="$WORK/missing.paths" '
+    FILENAME == ARGV[1] { want[$0 ""] = 1; next }
+    /^#/ { next }
+    { n++; line[n] = $0; path[n] = $7 ""; kind[n] = $1; target[n] = $8 ""; at[$7 ""] = n }
+    END {
+      for (i = 1; i <= n; i++) if (path[i] in want) { take[i] = 1; found[path[i]] = 1 }
+      for (i = 1; i <= n; i++) if (take[i] == 1 && kind[i] == "h" && (target[i] in at) && !take[at[target[i]]]) take[at[target[i]]] = 2
+      for (i = 1; i <= n; i++) if (take[i]) { print line[i] > rows; if (take[i] == 2) print path[i] > brought }
+      for (w in want) if (!(w in found)) print w > missing
+      close(rows); close(brought); close(missing)
+    }
+  ' "$1" "$2"
+}
+
+# Merge this run into the destination's damaged-file list. The list keeps what
+# an earlier restore of THIS unit and version left damaged, less the paths this
+# run was asked for (whole now, or still damaged: the latter are in
+# damaged.paths), plus what is still damaged. Another unit's list is never
+# touched (returns 2). The list is removed when nothing is left.
+LIST_LEFT=0
+merge_damaged_list() { # <destination> <requested and brought paths file>
+  local list="$1/.tapectl-damaged-files.txt" first
+  : >"$WORK/list.old"
+  if [ -f "$list" ]; then
+    first=$(head -n 1 "$list" 2>/dev/null || true)
+    case $first in
+    "#tapectl-damaged-files"$'\t'1$'\t'"unit=$U_NAME"$'\t'"uuid=$U_UUID"$'\t'"version=$U_VER")
+      sed -n '2,$p' "$list" | grep -v '^$' >"$WORK/list.old" || true
+      ;;
+    *)
+      note "$list is the damaged-file list of another unit or version and is left alone; this run's damaged paths are only printed."
+      return 2
+      ;;
+    esac
+  fi
+  awk 'FILENAME == ARGV[1] { drop[$0 ""] = 1; next } !(($0 "") in drop)' "$2" "$WORK/list.old" >"$WORK/list.kept"
+  sort -u "$WORK/list.kept" "$WORK/damaged.paths" >"$WORK/list.new"
+  if [ -s "$WORK/list.new" ]; then
+    write_damaged_list "$1" "$U_NAME" "$U_UUID" "$U_VER" "$WORK/list.new"
+    LIST_LEFT=$(wc -l <"$WORK/list.new" | tr -d ' ')
+  else
+    rm -f -- "$list"
+    LIST_LEFT=0
+  fi
+}
+
+# Restore the paths of $WORK/want.paths from the unit open (unit_open) into
+# $1, by the file table; $2 is "repair" for --paths-from, "path" for --path.
+restore_paths() { # <destination> <how>
+  local dest=$1 how=$2 npaths nm k p files_bytes biggest=0 ndam
+  mkdir -p -- "$dest" || die "cannot create $(safe_str "$dest")"
+  sort -u "$WORK/want.paths" >"$WORK/want.sorted"
+  npaths=$(wc -l <"$WORK/want.sorted" | tr -d ' ')
+  : >"$WORK/wanted.rows"
+  : >"$WORK/brought.paths"
+  : >"$WORK/missing.paths"
+  resolve_paths "$WORK/want.sorted" "$U_TABLE"
+  if [ -s "$WORK/missing.paths" ]; then
+    echo "FATAL: $(wc -l <"$WORK/missing.paths" | tr -d ' ') path(s) are not in the file table of unit $(safe_str "$U_NAME") version $U_VER on this tape (a path is written as '$0 --list' shows it, relative to the unit's root):" >&2
+    sort "$WORK/missing.paths" | head -n 10 | while IFS= read -r p; do printf '         %s\n' "$(safe_str "$p")" >&2; done
+    echo "       Nothing has been read from a slice and nothing was changed." >&2
+    exit 1
+  fi
+  if [ "$how" = path ] && [ "$OVERWRITE" = 0 ]; then
+    while IFS= read -r p; do
+      unesc "$p"
+      if [ -e "$dest/$REPLY" ] || [ -L "$dest/$REPLY" ]; then
+        WANT_PATH="$p" awk -F'\t' '($7 "") == (ENVIRON["WANT_PATH"] "") && $1 == "d" { f = 1 } END { exit f ? 0 : 1 }' "$U_TABLE" ||
+          die "$(safe_str "$REPLY") is already in $(safe_str "$dest"). Give --overwrite to replace the named files (nothing has been read from a slice)."
+      fi
+    done <"$WORK/want.sorted"
+  fi
+  # A folder names its own entry only: its mode, owner and times, nothing under it.
+  nm=$(awk -F'\t' 'FILENAME == ARGV[1] { want[$0 ""] = 1; next } /^#/ { next } $1 == "d" && (($7 "") in want) { n++ } END { print n + 0 }' "$WORK/want.sorted" "$U_TABLE")
+  if [ "$nm" -gt 0 ]; then
+    note "$nm of the paths is a folder: a folder names only its own entry (its mode, owner and times), never what lies under it. Name each file under it to restore those."
+  fi
+  load_members "$WORK/wanted.rows"
+  files_bytes=$(awk -F'\t' '$1 == "f" { s += $5 } END { printf "%.0f", s }' "$WORK/wanted.rows")
+  for ((k = 1; k <= NSL; k++)); do
+    if is_uint "${SL_SIZE[$k]}" && [ "${SL_SIZE[$k]}" -gt "$biggest" ]; then biggest=${SL_SIZE[$k]}; fi
+    if is_uint "${SL_ENC[$k]}" && [ "${SL_ENC[$k]}" -gt "$biggest" ]; then biggest=${SL_ENC[$k]}; fi
+  done
+  check_space "the named paths of unit $(safe_str "$U_NAME") need their files, and the work directory one slice twice" "$dest" "$files_bytes" "$WORK" $((2 * biggest + BLOCK))
+  say ">>> Unit $(safe_str "$U_NAME") version $U_VER: $npaths path(s) by the file table, into $dest"
+  if [ -s "$WORK/brought.paths" ]; then
+    note "$(wc -l <"$WORK/brought.paths" | tr -d ' ') hard link(s) among them are made from the first name of the file, which is restored first and is checked too."
+  fi
+  if [ -s "$WORK/absent.paths" ]; then
+    note "$(wc -l <"$WORK/absent.paths" | tr -d ' ') of the paths lie in slices this tape does not hold whole (a unit across cartridges, or a tape that ended early): they are not read here and stay on the list."
+  fi
+  : >"$WORK/bad.slices"
+  : >"$WORK/left.out"
+  rm -f "$WORK/fatal.flag"
+  local resume=1 state="" tarrc
+  while [ "$resume" -le "$NM" ]; do
+    rm -f "$WORK/feed.state" "$WORK/tar.rc" "$WORK/feed.cur"
+    {
+      { feed_members "$resume"; } || true
+    } | tar_extract "$dest"
+    if [ -e "$WORK/fatal.flag" ]; then exit 1; fi
+    CUR=$(cat "$WORK/feed.cur" 2>/dev/null || true)
+    state=$(cat "$WORK/feed.state" 2>/dev/null || echo "gone ?")
+    tarrc=$(cat "$WORK/tar.rc" 2>/dev/null || echo "?")
+    if [ "$tarrc" != 0 ]; then
+      note "tar ended with status $tarrc: $(head -n 3 "$WORK/tar.err" 2>/dev/null | tr '\n' ' '). The per-file check below decides what was restored."
+    fi
+    case $state in
+    done) break ;;
+    resume*)
+      # shellcheck disable=SC2086
+      set -- $state
+      resume=$2
+      unesc "${M_PATH[$3]}"
+      rm -f -- "${dest:?}/${REPLY:?}" 2>/dev/null || true
+      note "a long file's run broke at a bad slice; its partial file was removed and the file is listed. Reading on with the next path."
+      ;;
+    *)
+      # shellcheck disable=SC2086
+      set -- $state
+      warn "tar stopped reading at path number ${2:-?} (tar: $(head -n 2 "$WORK/tar.err" 2>/dev/null | tr '\n' ' ')); the paths from there on were not given to it."
+      for ((k = ${2:-1}; k <= NM; k++)); do mark_left "$k"; done
+      break
+      ;;
+    esac
+  done
+  local nbad
+  nbad=$(wc -l <"$WORK/bad.slices" | tr -d ' ')
+  if [ "$nbad" -gt 0 ]; then
+    warn "$nbad slice(s) of unit $(safe_str "$U_NAME") were left out; the paths in them are listed as damaged:"
+    awk -F'|' '{ printf "         slice %s: %s\n", $1, $2 }' "$WORK/bad.slices" >&2
+  fi
+  : >"$WORK/failed.paths"
+  if [ "$NO_FILE_CHECK" = 0 ]; then
+    file_check "$WORK/wanted.rows" "$dest" "$WORK/failed.paths"
+    if [ "$CHECK_ROWS" -eq 0 ]; then
+      say "File check: the named paths hold no regular file, so none was checked."
+    elif [ "$CHECK_FAILED" -eq 0 ]; then
+      say "File check: all $CHECK_ROWS regular file(s) named match the sha256 in the unit's file table."
+    else
+      say "File check: $CHECK_FAILED of $CHECK_ROWS regular file(s) named are missing or differ from the file table."
+    fi
+  else
+    note "--no-file-check: the restored files were not checked against the file table."
+  fi
+  sort -u "$WORK/left.out" "$WORK/failed.paths" "$WORK/absent.paths" >"$WORK/damaged.paths"
+  ndam=$(wc -l <"$WORK/damaged.paths" | tr -d ' ')
+  sort -u "$WORK/want.sorted" "$WORK/brought.paths" >"$WORK/asked.paths"
+  local merged=0
+  merge_damaged_list "$dest" "$WORK/asked.paths" || merged=$?
+  if [ "$ndam" -gt 0 ]; then
+    if [ "$merged" = 0 ]; then
+      print_damaged "$WORK/damaged.paths" "$ndam" "$dest/.tapectl-damaged-files.txt"
+    else
+      say "DAMAGED: $ndam path(s) were left out or failed the check:"
+      head -n 41 "$WORK/damaged.paths" | sed 's/^/  /'
+    fi
+    DAMAGED_TOTAL=$((DAMAGED_TOTAL + ndam))
+  elif [ "$how" = repair ] && [ "$merged" = 0 ]; then
+    if [ "$LIST_LEFT" -eq 0 ]; then
+      say "The damaged-file list in $dest is removed: nothing is left to repair."
+    else
+      say "The damaged-file list in $dest is kept with the $LIST_LEFT path(s) this run did not name."
+    fi
+  fi
+  print_id_map "$U_POS" "$U_IDM"
+  UNITS_DONE=$((UNITS_DONE + 1))
+}
+
+# --restore --unit U --path P [--path P2 ...]
+do_paths() {
+  local p
+  : >"$WORK/want.paths"
+  for p in "${PATHS[@]}"; do
+    p=${p#./}
+    while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+    [ -n "$p" ] || p=.
+    esc "$p"
+    printf '%s\n' "$REPLY" >>"$WORK/want.paths"
+  done
+  unit_open "$(head -n 1 "$WORK/chosen.txt")"
+  restore_paths "$TO" path
+}
+
+# The list --paths-from names: its header says which unit and version it is
+# for; its other lines are the paths (escaped), written to $WORK/want.paths.
+LIST_UNIT="" LIST_UUID="" LIST_VER=""
+read_repair_list() {
+  local first tag fmt f1 f2 f3
+  [ -f "$PATHS_FROM" ] && [ -r "$PATHS_FROM" ] || die "--paths-from $(safe_str "$PATHS_FROM"): the file does not exist or cannot be read"
+  first=$(head -n 1 "$PATHS_FROM" 2>/dev/null || true)
+  IFS=$'\t' read -r tag fmt f1 f2 f3 <<<"$first" || true
+  [ "${tag:-}" = "#tapectl-damaged-files" ] ||
+    die "--paths-from $(safe_str "$PATHS_FROM") is not a damaged-file list: its first line is not '#tapectl-damaged-files' (the list a restore writes in the restored directory as .tapectl-damaged-files.txt). To restore named paths, give each with --path under --unit."
+  [ "${fmt:-}" = 1 ] || die "the damaged-file list $(safe_str "$PATHS_FROM") is of format $(safe_str "${fmt:-?}"), which this RESTORE.sh does not know."
+  LIST_UNIT=${f1:-}
+  LIST_UUID=${f2:-}
+  LIST_VER=${f3:-}
+  case $LIST_UNIT in unit=?*) LIST_UNIT=${LIST_UNIT#unit=} ;; *) LIST_UNIT="" ;; esac
+  case $LIST_UUID in uuid=?*) LIST_UUID=${LIST_UUID#uuid=} ;; *) LIST_UUID="" ;; esac
+  case $LIST_VER in version=?*) LIST_VER=${LIST_VER#version=} ;; *) LIST_VER="" ;; esac
+  { [ -n "$LIST_UNIT" ] && [ -n "$LIST_UUID" ] && is_uint "$LIST_VER"; } ||
+    die "the damaged-file list $(safe_str "$PATHS_FROM") has a header this RESTORE.sh cannot read (it names the unit, its uuid and its version)."
+  LIST_VER=$((10#$LIST_VER))
+  sed -n '2,$p' "$PATHS_FROM" | grep -v '^$' >"$WORK/want.paths" || true
+}
+
+# Choose the unit the list is for: the row with its uuid and version, by what
+# the envelope says. Another version or another unit is refused, naming it,
+# and the list is left as it is.
+choose_repair_unit() {
+  LIST_ID="$LIST_UUID" awk -F'|' -v ver="$LIST_VER" '
+    $9 == "" { next }
+    ($6 "") == (ENVIRON["LIST_ID"] "") && ($4 + 0) == (ver + 0) { if (!n++ || ($5 + 0) > best) { best = $5 + 0; row = $0 } }
+    END { if (n) print row }
+  ' "$WORK/units.txt" >"$WORK/chosen.txt"
+  [ -s "$WORK/chosen.txt" ] && return 0
+  local others same
+  others=$(LIST_ID="$LIST_UUID" awk -F'|' '$9 != "" && ($6 "") == (ENVIRON["LIST_ID"] "") { printf "%s ", $4 }' "$WORK/units.txt")
+  same=$(LIST_NAME="$LIST_UNIT" awk -F'|' '$9 != "" && ($3 "") == (ENVIRON["LIST_NAME"] "") { n++ } END { print n + 0 }' "$WORK/units.txt")
+  if [ -n "$others" ]; then
+    die "this tape holds unit $(safe_str "$LIST_UNIT") only as version(s) ${others% }, and the list is for version $LIST_VER. Another version is not a copy of the files the list names: the list is left as it is. Load a tape that holds version $LIST_VER."
+  elif [ "$same" -gt 0 ]; then
+    die "this tape holds a unit named $(safe_str "$LIST_UNIT"), but it is another unit than the list's (its uuid is not $(safe_str "$LIST_UUID")): the list is left as it is. Load a tape that holds the same unit."
+  fi
+  die "unit $(safe_str "$LIST_UNIT") (uuid $(safe_str "$LIST_UUID")) is not in the envelope(s) your key opened on this tape: the list is left as it is. Is it the right key, and the right tape?"
+}
+
+# --restore --paths-from LIST: the one repair.
+do_repair() {
+  read_repair_list
+  if [ ${#UNITS[@]} -eq 1 ] && [ "${UNITS[0]}" != "$LIST_UNIT" ]; then
+    die_usage "--unit ${UNITS[0]} is not the list's unit ($(safe_str "$LIST_UNIT")): give no --unit, or the list's"
+  fi
+  if [ -n "$VERSION" ] && [ "$VERSION" != "$LIST_VER" ]; then
+    die_usage "--version $VERSION is not the list's version ($LIST_VER): give no --version, or the list's"
+  fi
+  choose_repair_unit
+  unit_open "$(head -n 1 "$WORK/chosen.txt")"
+  if [ ! -s "$WORK/want.paths" ]; then
+    say "The damaged-file list names no path: nothing to restore."
+    return 0
+  fi
+  restore_paths "$TO" repair
 }
 
 do_restore() {
   tar_init
-  check_destination
+  if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
+    # A named path or a repair goes into a directory a restore made.
+    if [ -e "$TO" ] && [ ! -d "$TO" ]; then die "--to $(safe_str "$TO") exists and is not a directory"; fi
+  else
+    check_destination
+  fi
   # The work directory is made once the destination is known to be usable.
   make_work_for_restore
   establish
   envelope_space_check
   open_envelopes
   collect_units
-  choose_units
   local n row name dest
-  n=$(wc -l <"$WORK/chosen.txt" | tr -d ' ')
-  # fd 3, so that nothing a unit's restore runs can read the list from stdin.
-  while IFS= read -r row <&3; do
-    IFS='|' read -r _ _ name _ <<<"$row"
-    if [ "$n" -eq 1 ]; then dest=$TO; else dest="$TO/$name"; fi
-    restore_one "$row" "$dest"
-  done 3<"$WORK/chosen.txt"
+  if [ -n "$PATHS_FROM" ]; then
+    do_repair
+  elif [ ${#PATHS[@]} -gt 0 ]; then
+    choose_units
+    [ "$(wc -l <"$WORK/chosen.txt" | tr -d ' ')" -eq 1 ] || die "--path names files of one unit: more than one unit matched"
+    do_paths
+  else
+    choose_units
+    n=$(wc -l <"$WORK/chosen.txt" | tr -d ' ')
+    # fd 3, so that nothing a unit's restore runs can read the list from stdin.
+    while IFS= read -r row <&3; do
+      IFS='|' read -r _ _ name _ <<<"$row"
+      if [ "$n" -eq 1 ]; then dest=$TO; else dest="$TO/$name"; fi
+      restore_one "$row" "$dest"
+    done 3<"$WORK/chosen.txt"
+  fi
   say "The tar used: ${TAR_NAME:-unknown}. What it does not restore: $TAR_LOSES."
   if [ "$DAMAGED_TOTAL" -gt 0 ]; then
-    say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy."
+    say "RESTORE INCOMPLETE: $DAMAGED_TOTAL path(s) are damaged or left out; restore them from another copy (the list is the one repair: give it to --paths-from on a tape that holds the same version)."
     return 1
   fi
-  say "RESTORE COMPLETE: $UNITS_DONE unit(s) restored into $TO."
+  if [ ${#PATHS[@]} -gt 0 ] || [ -n "$PATHS_FROM" ]; then
+    say "RESTORE COMPLETE: the named path(s) of unit $(safe_str "$U_NAME") are restored into $TO."
+  else
+    say "RESTORE COMPLETE: $UNITS_DONE unit(s) restored into $TO."
+  fi
 }
 
 make_work_for_restore() {
   mkdir -p -- "$TO" 2>/dev/null || die "cannot create --to $(safe_str "$TO")"
   make_work
+}
+
+# ---- the cross-volume index (--where, --find; volume-format-v3.md 1.5) ----
+
+# Each envelope carries, as its last members, index/units.tsv (the tenant's
+# units: every version and every tape holding it; the operator's: every
+# tenant's) and, in a tenant envelope, index/paths.tsv (every path of those
+# versions). Both are tab-separated text with a header naming the columns, and
+# are read here with awk. The index is as of the moment its own tape was
+# written: it never names a tape written after it, and a tape it names may
+# since have been retired or erased. A column is found by its header name and a
+# column this script does not know is ignored.
+
+# The functions the index programs share: the escapes of 1.5 decoded by ONE
+# left-to-right scan (never chained substitutions, which turn the escaped text
+# of a backslash followed by t into a TAB), a printable form of a value (a path
+# may hold a real newline, which would break one-row-per-line output and could
+# forge a row: only what is printed is made visible; the match is on the
+# decoded text), a human size, and the header-name column lookup.
+AWK_INDEX_COMMON='
+function unesc(s,    out, i, n, c, d) {
+  if (index(s, "\\") == 0) return s
+  out = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c == "\\" && i < n) {
+      d = substr(s, i + 1, 1)
+      if (d == "t")  { out = out "\t"; i++; continue }
+      if (d == "n")  { out = out "\n"; i++; continue }
+      if (d == "r")  { out = out "\r"; i++; continue }
+      if (d == "\\") { out = out "\\"; i++; continue }
+    }
+    out = out c
+  }
+  return out
+}
+function show(s,    out, i, n, c) {
+  s = unesc(s)
+  if (s !~ /[[:cntrl:]]/) return s
+  out = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c == "\t") out = out "\\t"
+    else if (c == "\n") out = out "\\n"
+    else if (c == "\r") out = out "\\r"
+    else if (c ~ /[[:cntrl:]]/) out = out "?"
+    else out = out c
+  }
+  return out
+}
+function human(b) {
+  if (b !~ /^[0-9]+$/) return "size not known"
+  if (b + 0 >= 1073741824) return sprintf("%.1f GiB", b / 1073741824)
+  if (b + 0 >= 1048576) return sprintf("%.1f MiB", b / 1048576)
+  return sprintf("%.1f KiB", b / 1024)
+}
+function header(line, names,    n, f, i) {
+  n = split(line, f, "\t")
+  for (i = 1; i <= n; i++) names[f[i]] = i
+  return n
+}
+function val(f, names, key) {
+  if (!(key in names)) return ""
+  return f[names[key]]
+}
+function nk(s) {
+  return (s == "") ? "not known" : s
+}
+function range_here(row, names,    f, line, q, key) {
+  if (!range_read) {
+    range_read = 1
+    f = ENVIRON["INDEX_RANGE"]
+    if (f != "") {
+      while ((getline line < f) > 0) {
+        split(line, q, "\t")
+        rangev[q[1] "\t" q[2]] = q[3] "\t" q[4]
+      }
+      close(f)
+    }
+  }
+  if (val(row, names, "state") != "this-tape") return ""
+  key = val(row, names, "unit_uuid") "\t" val(row, names, "version")
+  return (key in rangev) ? rangev[key] : ""
+}
+function partial(first, last, count) {
+  if (first !~ /^[0-9]+$/ || last !~ /^[0-9]+$/ || count !~ /^[0-9]+$/) return 0
+  return (first + 0 != 1 || last + 0 != count + 0)
+}
+function note_partial(    f) {
+  f = ENVIRON["INDEX_PARTIAL"]
+  if (f == "" || partial_noted) return
+  partial_noted = 1
+  print "1" >> f
+  close(f)
+}
+function holder(row, names,    state, sealed, first, last, count, st, s, run, q, part) {
+  state = show(val(row, names, "state"))
+  sealed = show(val(row, names, "sealed_at"))
+  first = show(val(row, names, "first_slice"))
+  last = show(val(row, names, "last_slice"))
+  count = show(val(row, names, "num_slices"))
+  run = range_here(row, names)
+  if (run != "") { split(run, q, "\t"); first = q[1]; last = q[2] }
+  part = (run != "" || partial(first, last, count))
+  if (state == "this-tape") st = "this tape"
+  else if (state == "sealed") st = (sealed == "") ? "sealed" : "sealed " sealed
+  else if (state == "quarantined") {
+    st = "QUARANTINED: a verify proved this medium bad, it may still read in part"
+    if (sealed != "") st = st "; sealed " sealed
+  }
+  else st = (state == "") ? "state not known" : "state " state
+  if (part) { st = st ", a range: not the whole version"; note_partial() }
+  s = "    tape " nk(show(val(row, names, "volume"))) "  (" st ")"
+  if (first != "" && last != "") s = s "  slices " first "-" last (count == "" ? "" : " of " count)
+  else if (run != "") s = s "  no slice of it is on this tape (it ended before them)"
+  s = s "\n        volume uuid " nk(show(val(row, names, "volume_uuid")))
+  s = s "; cartridge serial " nk(show(val(row, names, "cartridge_serial")))
+  s = s "; generation " nk(show(val(row, names, "generation")))
+  return s
+}
+'
+
+# The versions an envelope MANIFEST.toml lists that this tape holds only some
+# of (a range; every unit continues, so a version can end on this tape's seal),
+# by which of each block's slices the tape holds: a slice with no
+# tape_position is on another tape, one whose tape_position is after k (the
+# seal's ended_after, or empty) is not on this one, the others are here. Each
+# such version is appended to the file RANGE_OUT as: uuid TAB version TAB first
+# TAB last TAB slices (the first and last slice number here, empty when none,
+# and how many slices the block lists). uuid and snapshot_version are read in
+# the [[units]] head only.
+AWK_RANGE_VERSIONS='
+function slice_done() {
+  if (in_s && num != "") {
+    n++
+    if (tp == "") away++
+    else if (k != "" && tp + 0 > k + 0) past++
+    else { here++; if (first == "") first = num; last = num }
+  }
+  num = ""; tp = ""
+}
+function done_block() {
+  slice_done()
+  if (inblk && id != "" && away + past > 0 && rf != "") printf "%s\t%s\t%s\t%s\t%s\n", id, v, first, last, n >> rf
+  inblk = 0; id = ""; v = ""; in_s = 0
+  n = 0; here = 0; away = 0; past = 0; first = ""; last = ""
+}
+BEGIN { rf = ENVIRON["RANGE_OUT"] }
+/^\[\[units\]\]/ { done_block(); inblk = 1; in_head = 1; next }
+/^\[\[units\.slices\]\]/ { slice_done(); in_head = 0; in_s = inblk; next }
+/^\[/ { slice_done(); in_head = 0; in_s = 0 }
+in_head && /^uuid = / { id = $3; gsub(/"/, "", id) }
+in_head && /^snapshot_version = / { v = $3 + 0 }
+in_s && /^number = / { num = $3 }
+in_s && /^tape_position = / { tp = $3 }
+END { done_block(); if (rf != "") close(rf) }
+'
+
+# --where UNIT over one index/units.tsv: every row for the unit, grouped by
+# version, with the slice range and count, the bytes, and each holding tape.
+# The unit name comes in through WHERE_UNIT in the environment, never -v, which
+# would process the backslashes of an escaped name; it is compared with the
+# DECODED unit column. Every unit name seen is appended to the file WHERE_KNOWN,
+# so a miss can list what the index does hold. WHERE_TENANT names the tenant of
+# a tenant envelope, whose rows carry no tenant column. Exit status 0 when the
+# unit has rows, 1 when it has none, 2 when the file lacks the unit or version
+# column.
+AWK_INDEX_WHERE='
+BEGIN {
+  FS = "\t"
+  want = ENVIRON["WHERE_UNIT"]
+  known = ENVIRON["WHERE_KNOWN"]
+  tenant = ENVIRON["WHERE_TENANT"]
+}
+NR == 1 {
+  header($0, h)
+  if (!("unit" in h) || !("version" in h)) { bad = 1; exit 2 }
+  next
+}
+{
+  split($0, f, "\t")
+  u = unesc(val(f, h, "unit"))
+  if (!(u in seen)) { seen[u] = 1; print show(val(f, h, "unit")) >> known }
+  if (u != want) next
+  found = 1
+  t = ("tenant" in h) ? val(f, h, "tenant") : tenant
+  if (!started || t != lastt) {
+    if (started) print ""
+    print "Unit " show(val(f, h, "unit")) (t == "" ? "" : " (tenant " show(t) ")") ":"
+    started = 1; lastt = t; lastv = ""; vseen = 0
+  }
+  v = val(f, h, "version")
+  if (!vseen || v != lastv) {
+    print ""
+    print "  Version " show(v) ": " show(val(f, h, "num_slices")) " slice(s), " human(val(f, h, "version_bytes")) " (" show(val(f, h, "version_bytes")) " bytes); unit uuid " nk(show(val(f, h, "unit_uuid")))
+    lastv = v; vseen = 1
+  }
+  print holder(f, h)
+}
+END {
+  if (bad) exit 2
+  exit(found ? 0 : 1)
+}
+'
+
+# --where --all over one index/units.tsv: EVERY unit the index names, with no
+# limit, so an heir can enumerate a box. The whole file is read before anything
+# is printed, and no row order is relied on: a unit deleted and made again under
+# one name is two units with two uuids whose rows interleave, so a unit is keyed
+# by tenant, name AND unit uuid, in the order first seen, and its newest version
+# is the highest by NUMBER (never by text, where 9 follows 10). For each unit it
+# prints the newest version, whether this tape holds it whole, and every version
+# with each tape that holds it. ALL_TENANT names the tenant of a tenant
+# envelope. Two files are written for the caller, who prints a summary before the
+# listing: ALL_COUNTS gets "UNITS ON_THIS_TAPE", and ALL_ABSENT gets, appended,
+# one line for each unit whose newest version this tape does not hold whole,
+# with the tapes that do. Exit status 0 when the file has units, 1 when it has
+# none, 2 when it lacks the unit or version column.
+AWK_INDEX_ALL='
+function holders_of(k,    j, r, s, lab, st, run, q) {
+  s = ""
+  for (j = 1; j <= rows[k]; j++) {
+    split(row[k, j], r, "\t")
+    lab = nk(show(val(r, h, "volume")))
+    st = val(r, h, "state")
+    run = range_here(r, h)
+    if (run != "") {
+      split(run, q, "\t")
+      lab = lab (q[1] == "" ? " (this tape: no slice of it)" : " (this tape: slices " q[1] "-" q[2] " only)")
+    }
+    else if (st == "this-tape") lab = lab " (this tape)"
+    else if (st == "quarantined") lab = lab " (QUARANTINED)"
+    if (st != "this-tape" && partial(val(r, h, "first_slice"), val(r, h, "last_slice"), val(r, h, "num_slices")))
+      lab = lab " (slices " show(val(r, h, "first_slice")) "-" show(val(r, h, "last_slice")) " only)"
+    s = s (s == "" ? "" : ", ") lab
+  }
+  return (s == "") ? "no tape the index lists" : s
+}
+BEGIN {
+  FS = "\t"
+  tenant = ENVIRON["ALL_TENANT"]
+  counts = ENVIRON["ALL_COUNTS"]
+  absent = ENVIRON["ALL_ABSENT"]
+}
+NR == 1 {
+  header($0, h)
+  if (!("unit" in h) || !("version" in h)) { bad = 1; exit 2 }
+  next
+}
+$0 == "" { next }
+{
+  split($0, f, "\t")
+  t = ("tenant" in h) ? val(f, h, "tenant") : tenant
+  id = val(f, h, "unit_uuid")
+  g = unesc(t) SUBSEP unesc(val(f, h, "unit")) SUBSEP id
+  if (!(g in gnum)) { gnum[g] = ++ng; gten[ng] = t; gunit[ng] = val(f, h, "unit") }
+  n = gnum[g]
+  v = val(f, h, "version") + 0
+  k = n SUBSEP v
+  if (!(k in rows)) {
+    rows[k] = 0
+    nver[n]++
+    ver[n, nver[n]] = v
+    vtext[k] = val(f, h, "version")
+    vslices[k] = val(f, h, "num_slices")
+    vbytes[k] = val(f, h, "version_bytes")
+    vuuid[k] = id
+  }
+  rows[k]++
+  row[k, rows[k]] = $0
+  if (val(f, h, "state") == "this-tape" && range_here(f, h) == "") here[k] = 1
+}
+END {
+  if (bad) exit 2
+  for (n = 1; n <= ng; n++) {
+    c = nver[n]
+    for (i = 1; i <= c; i++) vs[i] = ver[n, i]
+    for (i = 2; i <= c; i++) {
+      x = vs[i]
+      for (j = i - 1; j >= 1 && vs[j] > x; j--) vs[j + 1] = vs[j]
+      vs[j + 1] = x
+    }
+    newest = vs[c]
+    kn = n SUBSEP newest
+    who = (gten[n] == "") ? "" : " (tenant " show(gten[n]) ")"
+    onhere = (kn in here)
+    if (onhere) tothere++
+    print "Unit " show(gunit[n]) who ": newest version " show(vtext[kn]) ", " (onhere ? "on this tape" : "NOT on this tape (whole)")
+    if (!onhere) printf "    %s%s, version %s, unit uuid %s: %s\n", show(gunit[n]), who, show(vtext[kn]), nk(show(vuuid[kn])), holders_of(kn) >> absent
+    for (i = 1; i <= c; i++) {
+      k = n SUBSEP vs[i]
+      if (i > 1) print ""
+      print "  Version " show(vtext[k]) (vs[i] == newest ? " (newest)" : "") ": " show(vslices[k]) " slice(s), " human(vbytes[k]) " (" show(vbytes[k]) " bytes); unit uuid " nk(show(vuuid[k]))
+      for (j = 1; j <= rows[k]; j++) {
+        split(row[k, j], r, "\t")
+        print holder(r, h)
+      }
+    }
+    print ""
+  }
+  print ng + 0, tothere + 0 > counts
+  close(counts)
+  close(absent)
+  exit(ng > 0 ? 0 : 1)
+}
+'
+
+# --find TEXT over one tenant envelope: FIND_UNITS is its index/units.tsv (or
+# /dev/null), the program input its index/paths.tsv. Prints the rows whose
+# DECODED path contains the literal text in FIND_TEXT (index(), not a pattern),
+# at most FIND_LIMIT of them, each as unit, version, kind, size and path, then
+# the tapes holding each printed version. FIND_WHO names the envelope. The
+# numbers printed and matched are written to the file FIND_COUNTS, so the
+# caller can say how many matches it did not print and share one limit across
+# envelopes. Exit status 2 when paths.tsv lacks a unit, version or path column.
+AWK_INDEX_FIND='
+BEGIN {
+  FS = "\t"
+  needle = ENVIRON["FIND_TEXT"]
+  limit = ENVIRON["FIND_LIMIT"] + 0
+  uf = ENVIRON["FIND_UNITS"]
+  cf = ENVIRON["FIND_COUNTS"]
+  who = ENVIRON["FIND_WHO"]
+  if ((getline line < uf) > 0) {
+    header(line, uh)
+    while ((getline line < uf) > 0) {
+      split(line, r, "\t")
+      k = unesc(val(r, uh, "unit")) SUBSEP val(r, uh, "version")
+      nh[k]++
+      hold[k, nh[k]] = line
+    }
+  }
+  close(uf)
+}
+NR == 1 {
+  header($0, ph)
+  if (!("unit" in ph) || !("version" in ph) || !("path" in ph)) { bad = 1; exit 2 }
+  next
+}
+{
+  p = $(ph["path"])
+  if (index(unesc(p), needle) == 0) next
+  total++
+  if (shown >= limit) next
+  shown++
+  if (shown == 1) print "In the index of " who ":"
+  us = $(ph["unit"])
+  vs = $(ph["version"])
+  printf "  %s  v%s  %s  %s bytes  %s\n", show(us), show(vs), (("kind" in ph) ? show($(ph["kind"])) : "?"), (("size_bytes" in ph) ? show($(ph["size_bytes"])) : "?"), show(p)
+  k = unesc(us) SUBSEP vs
+  if (!(k in want)) { want[k] = 1; order[++nord] = k; dunit[k] = show(us); dver[k] = show(vs) }
+}
+END {
+  if (bad) exit 2
+  for (i = 1; i <= nord; i++) {
+    k = order[i]
+    print ""
+    print "  Tapes holding " dunit[k] " version " dver[k] ":"
+    if (nh[k] + 0 == 0) print "    none is listed in this envelope"
+    for (j = 1; j <= nh[k]; j++) {
+      split(hold[k, j], r, "\t")
+      print holder(r, uh)
+    }
+  }
+  print shown + 0, total + 0 > cf
+  close(cf)
+}
+'
+
+INDEX_OPENED=0
+INDEX_HAD=0
+
+# The versions an opened envelope lists that this tape holds only some of, to
+# $WORK/range.versions (see AWK_RANGE_VERSIONS). The index programs never print
+# the loaded tape as a holder of the whole of such a version.
+note_range_versions() { # <envelope dir>
+  [ -f "$1/MANIFEST.toml" ] || return 0
+  RANGE_OUT="$WORK/range.versions" awk -v k="$ENDED_AFTER" "$AWK_RANGE_VERSIONS" "$1/MANIFEST.toml"
+}
+
+# The line after a listing that printed a holder of only some slices of a
+# version.
+note_range_holders() {
+  [ -s "$WORK/partial.flag" ] || return 0
+  say "A holder marked 'a range' holds only the slices it names of that version, and is not a copy of it"
+  say "on its own: a restore needs every slice, 1 to the last, in slice order, from the tapes that hold them."
+}
+
+index_banner() {
+  say ""
+  say "Index read from tape: $(safe_str "${LABEL:-<unreadable>}") (written $(safe_str "${CREATED_AT:-unknown}"))"
+  say "An index is as of the moment its own tape was written. It never names a tape written"
+  say "after it, and a tape it names may since have been retired or erased. The newest tape"
+  say "you hold has the most complete index: if this is not it, run this on that one."
+}
+
+# A tape with no index says so and points at what it can do. Exit 1: the answer
+# is not on this tape.
+die_no_index() {
+  say ""
+  say "This tape carries no index, and nothing on this tape says where a unit's other versions"
+  say "or copies are. What this tape can tell you about itself:"
+  say "  $0 --find-envelope --key KEY     the units, versions and slices it holds"
+  say "  $0 --list --key KEY              the files of a unit (add --unit NAME)"
+  say "For another tape, load it and run its own RESTORE.sh the same way; a tape written later"
+  say "can answer for all the tapes written before it."
+  exit 1
+}
+
+# The envelopes the key opened: collect each one's units.tsv (the operator's
+# lists every tenant's units, so it alone is read when it opened) and note the
+# versions of the loaded tape that are only a range.
+WHERE_FILES=()
+WHERE_TENANTS=()
+WHERE_OPERATOR=""
+collect_index_files() {
+  local pos d ty who
+  WHERE_FILES=()
+  WHERE_TENANTS=()
+  WHERE_OPERATOR=""
+  : >"$WORK/range.versions"
+  rm -f "$WORK/partial.flag"
+  for pos in $OPENED; do
+    d="$WORK/env.$pos"
+    INDEX_OPENED=$((INDEX_OPENED + 1))
+    note_range_versions "$d"
+    ty=$(file_type_at "$pos" "$FILES_TXT")
+    if [ -f "$d/index/units.tsv" ]; then
+      INDEX_HAD=$((INDEX_HAD + 1))
+      case $ty in
+      operator_envelope*) WHERE_OPERATOR="$d/index/units.tsv" ;;
+      *)
+        who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
+        WHERE_FILES+=("$d/index/units.tsv")
+        WHERE_TENANTS+=("$who")
+        ;;
+      esac
+    fi
+  done
+  if [ -n "$WHERE_OPERATOR" ]; then
+    WHERE_FILES=("$WHERE_OPERATOR")
+    WHERE_TENANTS=("")
+  fi
+}
+
+# --where --all: every unit the index names, with no limit. The awk reads each
+# index file whole and writes the totals and the units whose newest version this
+# tape does not hold to two files, so the summary can come before the listing.
+where_every_unit() {
+  local i f rc n a total=0 here=0
+  : >"$WORK/all.absent"
+  : >"$WORK/all.out"
+  for ((i = 0; i < ${#WHERE_FILES[@]}; i++)); do
+    f=${WHERE_FILES[$i]}
+    : >"$WORK/all.counts"
+    rc=0
+    ALL_TENANT="${WHERE_TENANTS[$i]}" ALL_COUNTS="$WORK/all.counts" ALL_ABSENT="$WORK/all.absent" \
+      INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
+      awk "$AWK_INDEX_COMMON $AWK_INDEX_ALL" "$f" >>"$WORK/all.out" || rc=$?
+    case "$rc" in
+    0 | 1)
+      n="" a=""
+      read -r n a <"$WORK/all.counts" || true
+      if is_uint "$n" && is_uint "$a"; then
+        total=$((total + n))
+        here=$((here + a))
+      fi
+      ;;
+    *) warn "an index in this tape's envelopes has no unit or version column, so this script cannot read it." ;;
+    esac
+  done
+  if [ "$total" -eq 0 ]; then
+    say "This index names no unit."
+    exit 1
+  fi
+  say "$total unit(s) in this index; this tape holds the newest version of $here of them whole."
+  if [ -s "$WORK/all.absent" ]; then
+    say ""
+    say "The newest version of these is NOT on this tape whole (unit, version, unit uuid, the tapes that hold it):"
+    cat "$WORK/all.absent"
+  fi
+  say ""
+  say "Every unit the index names, with every version and every tape that holds it:"
+  say ""
+  cat "$WORK/all.out"
+  say "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
+  say "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
+  note_range_holders
+}
+
+do_where() {
+  establish
+  envelope_space_check
+  open_envelopes
+  collect_index_files
+  local i rc f found=0
+  index_banner
+  say ""
+  [ "$INDEX_HAD" -gt 0 ] || die_no_index
+  if [ "$WHERE_UNIT" = --all ]; then
+    where_every_unit
+    return 0
+  fi
+  : >"$WORK/where.known"
+  for ((i = 0; i < ${#WHERE_FILES[@]}; i++)); do
+    f=${WHERE_FILES[$i]}
+    rc=0
+    WHERE_UNIT="$WHERE_UNIT" WHERE_KNOWN="$WORK/where.known" WHERE_TENANT="${WHERE_TENANTS[$i]}" \
+      INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
+      awk "$AWK_INDEX_COMMON $AWK_INDEX_WHERE" "$f" || rc=$?
+    case "$rc" in
+    0) found=1 ;;
+    1) ;;
+    *) warn "an index in this tape's envelopes has no unit or version column, so this script cannot read it." ;;
+    esac
+  done
+  if [ "$found" = 0 ]; then
+    say ""
+    say "No unit named '$(safe_str "$WHERE_UNIT")' is in this index."
+    if [ -s "$WORK/where.known" ]; then
+      say "It names these units (all of them; each one's newest version and holders:"
+      say "  $0 --where --all --key KEY):"
+      sort -u "$WORK/where.known" | sed 's/^/    /'
+    fi
+    if [ -z "$WHERE_OPERATOR" ]; then
+      say "A tenant's key opens that tenant's index only; the operator or escrow key opens the"
+      say "index of every tenant."
+    fi
+    exit 1
+  fi
+  say ""
+  say "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
+  say "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
+  note_range_holders
+}
+
+# The text given, with a TAB, newline or carriage return written out, so a
+# message about it stays on its own line.
+visible_text() { # <text>
+  local t=$1
+  t=${t//$'\t'/\\t}
+  t=${t//$'\n'/\\n}
+  t=${t//$'\r'/\\r}
+  printf '%s' "$t"
+}
+
+# --find: the matches of each tenant envelope's paths.tsv, kept in a file so
+# the banner can come first. One limit is shared by every envelope.
+FIND_LEFT=50
+FIND_SHOWN=0
+FIND_TOTAL=0
+find_in_envelope() { # <position>
+  local pos=$1 d="$WORK/env.$1" u who shown total
+  INDEX_OPENED=$((INDEX_OPENED + 1))
+  note_range_versions "$d"
+  if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
+    INDEX_HAD=$((INDEX_HAD + 1))
+  fi
+  if [ -f "$d/index/paths.tsv" ]; then
+    u="$d/index/units.tsv"
+    [ -f "$u" ] || u=/dev/null
+    who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
+    : >"$WORK/find.counts"
+    FIND_TEXT="$FIND_TEXT" FIND_LIMIT="$FIND_LEFT" FIND_UNITS="$u" FIND_COUNTS="$WORK/find.counts" \
+      FIND_WHO="tenant $(safe_str "$who")" INDEX_RANGE="$WORK/range.versions" INDEX_PARTIAL="$WORK/partial.flag" \
+      awk "$AWK_INDEX_COMMON $AWK_INDEX_FIND" "$d/index/paths.tsv" >>"$WORK/find.out" || {
+      warn "the index in the envelope at file $pos has no unit, version or path column, so this script cannot read it."
+      : >"$WORK/find.counts"
+    }
+    shown=0
+    total=0
+    read -r shown total <"$WORK/find.counts" || true
+    if is_uint "$shown" && is_uint "$total"; then
+      FIND_SHOWN=$((FIND_SHOWN + shown))
+      FIND_TOTAL=$((FIND_TOTAL + total))
+      FIND_LEFT=$((FIND_LEFT - shown))
+    fi
+  fi
+}
+
+do_find() {
+  local pos
+  : >"$WORK/find.out"
+  : >"$WORK/range.versions"
+  rm -f "$WORK/partial.flag"
+  establish
+  envelope_space_check
+  open_envelopes
+  for pos in $OPENED; do find_in_envelope "$pos"; done
+  index_banner
+  [ "$INDEX_HAD" -gt 0 ] || die_no_index
+  if [ "$FIND_TOTAL" -eq 0 ]; then
+    say ""
+    say "No path in this index contains '$(visible_text "$FIND_TEXT")'. (The text is matched as it stands, not as a"
+    say "pattern, and capitals matter. A path is relative to its unit's root.)"
+    exit 1
+  fi
+  say ""
+  say "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
+  say "f file, l symlink, s special). A TAB, newline or carriage return in a path is shown as"
+  say "\\t, \\n or \\r."
+  say ""
+  cat "$WORK/find.out"
+  say ""
+  if [ "$FIND_TOTAL" -gt "$FIND_SHOWN" ]; then
+    say "$((FIND_TOTAL - FIND_SHOWN)) more match(es) are not shown: this prints the first $FIND_SHOWN. Give more of"
+    say "the path to narrow it."
+  fi
+  note_range_holders
+  say "To restore one of these from the tape that holds it:"
+  say "  $0 --restore --key KEY --unit UNIT --path PATH --to /your/destination"
 }
 
 # ---- main ----
@@ -1491,6 +2639,8 @@ restore) do_restore ;;
   verify) do_verify ;;
   find-envelope) do_find_envelope ;;
   list) do_list ;;
+  where) do_where ;;
+  find) do_find ;;
   esac
   ;;
 esac
