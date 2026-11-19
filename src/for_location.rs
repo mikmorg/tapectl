@@ -1873,7 +1873,6 @@ mod tests {
     #[test]
     fn a_span_continues_only_at_its_location() {
         let mut c = Cat::new();
-        c.config.defaults.allow_spanning = true;
         c.config.defaults.min_copies = 1;
         let u = c.unit("span", "active", None);
         let v = c.version(u, 1, "staged");
@@ -1953,50 +1952,33 @@ mod tests {
     /// closes the tape, so a smaller one after it waits too (item 69), and
     /// every waiting unit is named with its need.
     #[test]
-    fn packing_fills_the_volume_with_units_that_may_span_last_and_names_the_waiting() {
+    fn packing_ends_the_tape_at_the_unit_that_carries_the_plan_past_the_room_and_names_the_waiting() {
         let c = Cat::new();
         let mib = MIB as usize;
         c.unit("a", "active", Some(&[("f", 3 * mib)]));
         c.unit("b", "active", Some(&[("f", 4 * mib)]));
         c.unit("c", "active", Some(&[("f", 5 * mib)]));
         c.unit("d", "active", Some(&[("f", mib)]));
-        let span = c.unit("aa-span", "active", Some(&[("f", mib)]));
-        let dir: String = c
-            .conn
-            .query_row(
-                "SELECT current_path FROM units WHERE id = ?1",
-                params![span],
-                |r| r.get(0),
-            )
-            .unwrap();
-        std::fs::write(
-            Path::new(&dir).join(".tapectl-unit.toml"),
-            "[unit]\nuuid = \"aa-span\"\nname = \"aa-span\"\ncreated = \"2026-10-25\"\n\
-             tenant = \"t\"\n\n[policy]\nallow_spanning = true\n",
-        )
-        .unwrap();
-
         let plan = c.plan("offsite").unwrap();
         assert_eq!(
             names(&plan.planned),
-            ["\"a\" (new version)", "\"b\" (new version)"]
+            [
+                "\"a\" (new version)",
+                "\"b\" (new version)",
+                "\"c\" (new version)"
+            ]
         );
-        assert_eq!(plan.planned_bytes(), 7 * MIB);
+        assert_eq!(plan.planned_bytes(), 12 * MIB);
         assert_eq!(
             names(&plan.waiting),
-            [
-                "\"c\" (new version)",
-                "\"d\" (new version)",
-                "\"aa-span\" (new version)"
-            ],
-            "c closes the tape; d would fit but waits; the unit that may span is last"
+            ["\"d\" (new version)"],
+            "c carries the plan past the room and is the tape's last (item 289); d waits"
         );
-        assert_eq!(plan.waiting[2].class, PlanClass::Spannable);
         assert!(plan.waiting.iter().all(
             |w| w.describe_need("offsite") == "group 2: 0 of its copy floor 2, none at offsite"
         ));
 
-        // With room for all but c, the unit that may span is planned last.
+        // Without c, everything fits the room.
         std::fs::remove_dir_all(c.tmp.path().join("src").join("c")).unwrap();
         let plan = c.plan("offsite").unwrap();
         assert_eq!(
@@ -2004,8 +1986,7 @@ mod tests {
             [
                 "\"a\" (new version)",
                 "\"b\" (new version)",
-                "\"d\" (new version)",
-                "\"aa-span\" (new version)"
+                "\"d\" (new version)"
             ]
         );
         assert_eq!(

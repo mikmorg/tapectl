@@ -5988,39 +5988,20 @@ mod tests {
     /// the order a write takes them — and says nothing at all without
     /// `post_warning_bytes`, so its output is as before 1.6.0.
     #[test]
-    fn the_plan_names_the_units_past_the_fill_ceiling_only_with_a_plan_bound() {
+    fn the_plan_names_the_bound_only_with_a_plan_bound() {
         let bs = DEFAULT_BLOCK_SIZE as u64;
         let tape = crate::config::TapeBudget::new("one LTO-6 tape".into(), 10 * bs, 0.5, 0, false);
-        let units = vec![
-            ("a".to_string(), 1, 2 * bs),
-            ("b".to_string(), 2, 4 * bs),
-            ("c".to_string(), 1, 3 * bs),
-            ("d".to_string(), 1, 5 * bs),
-        ];
-        assert!(
-            plan_bound_lines(&tape, &units).is_empty(),
-            "no bound, no lines"
-        );
+        assert!(plan_bound_lines(&tape).is_empty(), "no bound, no lines");
 
-        let lines = plan_bound_lines(&tape.clone().with_plan_bound(Some(10 * bs)), &units);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].starts_with("past the fill ceiling: a write may plan whole units up to "));
+        let lines = plan_bound_lines(&tape.with_plan_bound(Some(10 * bs)));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("past the fill ceiling: a write may plan up to "));
         assert!(
             lines[0].contains(&format!("({} bytes)", 10 * bs)),
             "{}",
             lines[0]
         );
-        // `a` fits the 5-block ceiling; `b` crosses it, and `c` ends at 9 of
-        // the 10 blocks; `d` is beyond the bound.
-        assert!(
-            lines[1].ends_with("(the tape may end before them): b v2, c v1"),
-            "{}",
-            lines[1]
-        );
-
-        // Every unit under the ceiling: the bound is named, no unit is.
-        let lines = plan_bound_lines(&tape.with_plan_bound(Some(10 * bs)), &units[..1]);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("continues on the next cartridge"), "{}", lines[0]);
     }
 
     /// #418 R4: `volume plan` names the index's size, twice it for the
@@ -6046,7 +6027,7 @@ mod tests {
         use crate::volume::layout_model::{Placed, Placement, PlanClass};
         use crate::volume::write::{CopyTape, KeepTogether, RecordedEnding, RecordedRange};
 
-        fn unit(name: &str, slices: std::ops::RangeInclusive<i64>, span: bool) -> BuildUnit {
+        fn unit(name: &str, slices: std::ops::RangeInclusive<i64>) -> BuildUnit {
             BuildUnit {
                 stage_set_id: 1,
                 snapshot_id: 1,
@@ -6069,7 +6050,7 @@ mod tests {
                         staging_path: std::path::PathBuf::new(),
                     })
                     .collect(),
-                span: span.then(|| UnitSpan { slices: Vec::new() }),
+                span: Some(UnitSpan { slices: Vec::new() }),
             }
         }
 
@@ -6081,16 +6062,16 @@ mod tests {
         fn the_plan_shows_the_placement_of_a_span() {
             let preview = write::PlanPreview {
                 units: vec![
-                    unit("old", 4..=6, true),
-                    unit("a", 1..=1, false),
-                    unit("c", 1..=1, false),
-                    unit("big", 1..=9, true),
+                    unit("old", 4..=6),
+                    unit("a", 1..=1),
+                    unit("c", 1..=1),
+                    unit("big", 1..=9),
                 ],
                 classes: vec![
                     PlanClass::Owed,
-                    PlanClass::Whole,
-                    PlanClass::Whole,
-                    PlanClass::Spannable,
+                    PlanClass::Queued,
+                    PlanClass::Queued,
+                    PlanClass::Queued,
                 ],
                 placement: Placement {
                     order: vec![0, 1, 3],
@@ -6100,7 +6081,7 @@ mod tests {
                         Placed::Deferred,
                         Placed::Tail,
                     ],
-                    errors: Vec::new(),
+                    tail_room: None,
                 },
             };
             let span = Ok(preview);
@@ -6108,25 +6089,25 @@ mod tests {
                 plan_span_lines(&span)[1..],
                 [
                     "  old v1: owed run, slices 4-6, under the fill ceiling",
-                    "  a v1: whole, under the fill ceiling",
-                    "  big v1: may span, slices 1-9, past the cartridge's nominal capacity, to \
-                     its end; the drive's early warning ends it on the tape",
+                    "  a v1: queued, slice 1, under the fill ceiling",
+                    "  big v1: queued, slices 1-9, the last of the plan: to its end past the \
+                     cartridge's nominal capacity, or, on a drive with no post_warning_bytes, up \
+                     to the fill ceiling; the rest of it continues on the next cartridge",
                     "  waits for the next tape (not on this one, still staged): c v1",
                 ]
             );
-            assert!(plan_span_lines(&span)[0].starts_with("spanning: one write of everything"));
+            assert!(plan_span_lines(&span)[0].starts_with("plan order: one write of everything"));
             let json = plan_span_json(&span);
             assert_eq!(json["units"][0]["class"], "owed run");
             assert_eq!(json["units"][0]["first_slice"], 4);
             assert_eq!(json["units"][2]["placed"], "tail");
             assert_eq!(json["deferred"][0]["unit"], "c");
-            assert_eq!(json["refused"], serde_json::json!([]));
 
             let refused: std::result::Result<write::PlanPreview, String> =
                 Err("refusing to write: ...".into());
             assert_eq!(
                 plan_span_lines(&refused),
-                ["spanning: a write of everything staged would refuse: refusing to write: ..."]
+                ["plan order: a write of everything staged would refuse: refusing to write: ..."]
             );
             assert_eq!(
                 plan_span_json(&refused)["refusal"],
@@ -6151,7 +6132,6 @@ mod tests {
             };
             let span = done(RecordedEnding {
                 ended_after: None,
-                cut_units: Vec::new(),
                 range_units: vec![RecordedRange {
                     unit: "b".into(),
                     version: 1,
@@ -6919,17 +6899,7 @@ mod tests {
                     )
                     .unwrap();
                 if self.fail == Fail::Short {
-                    self.conn
-                        .execute(
-                            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
-                             SELECT ss.id, ss.snapshot_id, v.id, 'cut'
-                             FROM stage_sets ss
-                             JOIN snapshots s ON s.id = ss.snapshot_id
-                             JOIN units u ON u.id = s.unit_id, volumes v
-                             WHERE u.name = 'testlib/beta' AND v.label = ?1",
-                            [label],
-                        )
-                        .unwrap();
+                    // beta was planned and not written: it has no row (item 288).
                     self.conn
                         .execute(
                             "UPDATE volumes SET ended_after = 9 WHERE label = ?1",
@@ -7077,17 +7047,18 @@ mod tests {
             assert!(json["medium"].is_null(), "no --init, no decision: {json}");
             assert!(json["moved_to"].is_null() && json["move_warning"].is_null());
             assert_eq!(json["volumes_moved"], serde_json::json!([]));
-            // #420: a full seal says so, and cut nothing.
+            // #420: a full seal says so.
             assert_eq!(json["ending"], "full");
             assert!(json["ended_after"].is_null(), "{json}");
-            assert_eq!(json["cut_units"], serde_json::json!([]));
+            assert!(json.get("cut_units").is_none(), "{json}");
         }
 
         /// #420, additive keys: a write whose tape sealed short says so in
         /// `--json` — `ending: "short"`, the `ended_after` its seal states,
-        /// and the units it cut — with every key it always had unchanged.
+        /// and the units left staged (planned and not written, item 288) in
+        /// `deferred_units` — with every key it always had unchanged.
         #[test]
-        fn a_short_seal_is_named_in_the_write_json_with_its_cut_units() {
+        fn a_short_seal_is_named_in_the_write_json_with_its_unwritten_units() {
             let conn = crate::db::open_memory().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let tenant_id = tenant(&conn);
@@ -7116,7 +7087,7 @@ mod tests {
             assert_eq!(json["status"], "completed", "a short seal is a success");
             assert_eq!(json["ending"], "short");
             assert_eq!(json["ended_after"], 9);
-            assert_eq!(json["cut_units"], serde_json::json!(["testlib/beta"]));
+            assert_eq!(json["deferred_units"], serde_json::json!(["testlib/beta"]));
             assert_eq!(json["label"], NEW);
         }
 
@@ -10109,11 +10080,10 @@ mod tests {
             assert_eq!(session_state("retired", true, ["interrupted"]), None);
         }
 
-        /// #490: a short volume names where it ended and the units it cut,
-        /// a cut-only one says no unit is wholly on it, and a full or
-        /// unsealed volume prints no ending line.
+        /// #490: a short volume names where it ended, one holding no whole
+        /// unit says so, and a full or unsealed volume prints no ending line.
         #[test]
-        fn info_names_a_short_ending_and_the_cut_units() {
+        fn info_names_a_short_ending() {
             let conn = crate::db::open_memory().unwrap();
             conn.execute_batch(
                 "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
@@ -10156,38 +10126,28 @@ mod tests {
                 .unwrap();
             };
             add("a", "L6-SHORT", "completed");
-            add("b", "L6-SHORT", "cut");
-            add("c", "L6-SHORT", "cut");
-            add("d", "L6-CUT", "cut");
+            add("b", "L6-SHORT", "range");
+            add("d", "L6-CUT", "range");
             add("e", "L6-FULL", "completed");
 
             let short = volume_info(&conn, "L6-SHORT", false).unwrap();
             assert_eq!((short.ended_after, short.unit_count), (Some(9), 1));
-            assert_eq!(short.cut_units, ["b", "c"]);
             assert_eq!(
-                render_ending_line(short.ended_after, &short.cut_units, short.unit_count).unwrap(),
-                "  Ended short: after tape file 9, at the drive's early warning\n  \
-                 Cut (not on this tape): b, c"
+                render_ending_line(short.ended_after, short.unit_count).unwrap(),
+                "  Ended short: after tape file 9, at the drive's early warning"
             );
             let json = serde_json::to_value(&short).unwrap();
             assert_eq!(json["ended_after"], 9);
-            assert_eq!(json["cut_units"], serde_json::json!(["b", "c"]));
+            assert!(json.get("cut_units").is_none(), "{json}");
 
-            let cut_only = volume_info(&conn, "L6-CUT", false).unwrap();
-            assert_eq!(cut_only.unit_count, 0);
-            let line = render_ending_line(
-                cut_only.ended_after,
-                &cut_only.cut_units,
-                cut_only.unit_count,
-            )
-            .unwrap();
+            let none_whole = volume_info(&conn, "L6-CUT", false).unwrap();
+            assert_eq!(none_whole.unit_count, 0);
+            let line = render_ending_line(none_whole.ended_after, none_whole.unit_count).unwrap();
             assert!(line.contains("no unit is wholly on this tape"), "{line}");
-            assert!(line.ends_with("Cut (not on this tape): d"), "{line}");
 
             let full = volume_info(&conn, "L6-FULL", false).unwrap();
             assert_eq!(full.ended_after, None);
-            assert!(full.cut_units.is_empty());
-            assert_eq!(render_ending_line(None, &[], 1), None);
+            assert_eq!(render_ending_line(None, 1), None);
             assert!(serde_json::to_value(&full).unwrap()["ended_after"].is_null());
         }
 

@@ -2611,11 +2611,12 @@ mod checksum_mode_tests {
         assert!(!line.contains("above a tenth"), "{line}");
     }
 
-    /// ADR-0012 item 113: `collection plan` and `collection run` name a
-    /// batch's units past the fill ceiling, in the batch's order, and say
-    /// nothing for a batch under it — every batch, without a plan bound.
+    /// ADR-0012 items 113, 288 and 289: `collection plan` and `collection run`
+    /// name a batch's units past the fill ceiling, in the batch's order, and
+    /// the unit that carries the plan past the bound, which continues on the
+    /// next cartridge; and say nothing for a batch under the ceiling.
     #[test]
-    fn a_batch_names_its_units_past_the_fill_ceiling_and_only_those() {
+    fn a_batch_names_its_units_past_the_fill_ceiling_and_the_one_that_continues() {
         let bs = 512 * 1024u64;
         let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
             name: name.into(),
@@ -2625,75 +2626,29 @@ mod checksum_mode_tests {
             units: vec![unit("lib/a", 3), unit("lib/b", 3), unit("lib/c", 2)],
             ..Default::default()
         };
-        let lines = |fill: u64| {
+        let lines = |fill: u64, bound: u64| {
             let room = collection::selector::BatchRoom {
                 fill,
-                bound: Some(u64::MAX),
+                bound: Some(bound),
             };
-            placement_lines(&collection::plan::placement(
-                &batch,
-                room,
-                &Default::default(),
-            ))
+            placement_lines(&collection::plan::placement(&batch, room))
         };
-        assert!(lines(8 * bs).is_empty(), "all under");
-        let lines = lines(4 * bs);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines(8 * bs, 20 * bs).is_empty(), "all under");
+        // Fill 4 blocks, bound 20: a (3) is under, b (6) and c (8) are past
+        // the ceiling within the bound.
+        let past = lines(4 * bs, 20 * bs);
+        assert_eq!(past.len(), 1, "{past:?}");
         assert!(
-            lines[0].starts_with("past the fill ceiling (the tape may end before them;"),
-            "{lines:?}"
+            past[0].starts_with("past the fill ceiling (the tape's early warning may end it"),
+            "{past:?}"
         );
-        assert!(lines[0].ends_with(": lib/b, lib/c"), "{lines:?}");
-    }
-
-    /// #478 (ADR-0012 items 94, 95, 123 and 147): the preview names the unit
-    /// that spans, last on its batch's tape and continued on the next, and
-    /// a unit that allows spanning past the fill ceiling as one that may. A
-    /// 10-block tape at a 6-block ceiling: `lib/a` (3) and `lib/m` (4,
-    /// spannable, past the ceiling, ending at 7) on one; `lib/z` (12,
-    /// spannable) alone crosses the bound.
-    #[test]
-    fn the_preview_names_the_unit_that_spans_and_one_that_may() {
-        let bs = 512 * 1024u64;
-        let unit = |name: &str, blocks: u64| collection::selector::PendingUnit {
-            name: name.into(),
-            size_bytes: blocks * bs,
-        };
-        let room = collection::selector::BatchRoom {
-            fill: 6 * bs,
-            bound: Some(10 * bs),
-        };
-        let spannable: std::collections::HashSet<String> =
-            ["lib/m".to_string(), "lib/z".to_string()].into();
-        let lines = |units: Vec<collection::selector::PendingUnit>| {
-            let batch = collection::selector::Batch {
-                units,
-                ..Default::default()
-            };
-            placement_lines(&collection::plan::placement(&batch, room, &spannable))
-        };
+        assert!(past[0].ends_with(": lib/b, lib/c"), "{past:?}");
+        // A bound of 7 blocks: c would end at 8, so it is the batch's last,
+        // continued on the next cartridge.
+        let tail = lines(4 * bs, 7 * bs);
         assert_eq!(
-            lines(vec![unit("lib/z", 12)]),
-            ["spans: last on its batch's tape, continued on the next: lib/z"]
-        );
-        assert_eq!(
-            lines(vec![unit("lib/a", 3), unit("lib/m", 4)]),
-            [
-                "may span: last on its batch's tape, past the fill ceiling; if the tape ends \
-                 inside it, continued on the next: lib/m"
-            ]
-        );
-        assert!(lines(vec![unit("lib/a", 1), unit("lib/m", 1)]).is_empty());
-        // Item 147: beside whole units, `lib/z`, larger than one tape, starts
-        // its batch's first tape; by X11's estimate (10 blocks a tape) its
-        // last tape holds its last 2, and `lib/a` goes after that tail.
-        assert_eq!(
-            lines(vec![unit("lib/a", 1), unit("lib/z", 12)]),
-            [
-                "spans: larger than one tape, first on its batch's first tape, continued on the \
-                 next: lib/z",
-                "after the span's tail, on its last tape (ADR-0012 item 147): lib/a",
-            ]
+            tail.last().unwrap(),
+            "last on its batch's tape, continued on the next cartridge: lib/c"
         );
     }
 
@@ -2737,6 +2692,7 @@ mod checksum_mode_tests {
         };
         let report = collection::batch::BatchExecutionReport {
             units_staged: 2,
+            rounds_staged: Vec::new(),
             copies_written: 1,
             cleaned: Some(whole),
             released_units: Vec::new(),

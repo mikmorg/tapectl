@@ -11959,7 +11959,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.ending, Ending::Short { ended_after: k });
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["b", "c"]);
             assert_eq!(
                 rows(&s),
                 [
@@ -12013,7 +12013,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
@@ -12059,7 +12059,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.ending, Ending::Full);
-            assert!(done.cut_units.is_empty());
+            assert!(done.unwritten_units.is_empty());
             assert_eq!(done.short_ending_report(), None);
             assert!(rows(&s)
                 .iter()
@@ -12241,7 +12241,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Integrity)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["b", "c"]);
         }
 
         /// What `volume resume` finds after a crash between the event and
@@ -12348,7 +12348,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["b", "c"]);
             assert_eq!(
                 rows(&s),
                 [
@@ -12515,7 +12515,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Navigable)
                     .unwrap(),
             );
-            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(done.unwritten_units, ["b", "c"]);
         }
 
         /// Step 1: `sealed_at` and `ended_after` are recorded, and the seal
@@ -12858,7 +12858,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(done.range_units, [range("b", 1, 2)]);
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [
@@ -12895,7 +12895,7 @@ mod tests {
                 serde_json::json!({
                     "ending": "short",
                     "ended_after": k,
-                    "cut_units": ["c"],
+                    "unwritten_units": ["c"],
                     "range_units": [{"unit": "b", "first_slice": 1, "last_slice": 2}],
                 })
             );
@@ -12923,7 +12923,7 @@ mod tests {
                     .confirm(&s.conn, &mut store, Tier::Integrity)
                     .unwrap(),
             );
-            assert!(done.range_units.is_empty() && done.cut_units.is_empty());
+            assert!(done.range_units.is_empty() && done.unwritten_units.is_empty());
             assert_eq!(
                 rows(&s),
                 [
@@ -12958,7 +12958,7 @@ mod tests {
                     .unwrap(),
             );
             assert!(done.range_units.is_empty());
-            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(done.unwritten_units, ["c"]);
             assert_eq!(
                 rows(&s),
                 [row("b", "completed", "current"), row("c", "cut", "staged")]
@@ -12987,7 +12987,7 @@ mod tests {
                     .unwrap(),
             );
             assert!(done.range_units.is_empty());
-            assert_eq!(done.cut_units, ["b"]);
+            assert_eq!(done.unwritten_units, ["b"]);
             assert_eq!(
                 rows(&s),
                 [row("a", "completed", "current"), row("b", "cut", "staged")]
@@ -13268,7 +13268,7 @@ mod tests {
             let v1_6_0 = serde_json::json!({
                 "ending": "short",
                 "ended_after": ended_after,
-                "cut_units": done.cut_units,
+                "unwritten_units": done.unwritten_units,
             })
             .to_string();
             assert_eq!(done.write_completed_details(), Some(v1_6_0.clone()));

@@ -10378,7 +10378,7 @@ mod tests {
             volume_id,
             label: label.to_string(),
             ending: session::Ending::Full,
-            cut_units: Vec::new(),
+            unwritten_units: Vec::new(),
             range_units: Vec::new(),
         }
     }
@@ -15086,7 +15086,7 @@ mod tests {
             .unwrap();
         }
 
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+        let units = find_staged_data(&conn, &Config::default(), None)
             .unwrap()
             .units;
         assert_eq!(units.len(), 2);
@@ -15143,7 +15143,7 @@ mod tests {
             ids.insert(name, ss_id);
         }
         let names = |only: Option<&[i64]>| -> Vec<String> {
-            find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), only)
+            find_staged_data(&conn, &Config::default(), only)
                 .unwrap()
                 .units
                 .into_iter()
@@ -15200,24 +15200,24 @@ mod tests {
             params![ss_id],
         )
         .unwrap();
-        let mut config = Config::default();
-        config.defaults.allow_spanning = true;
+        let config = Config::default();
         let ids = [ss_id];
         let classes = |scope: StagedScope| -> Vec<PlanClass> {
-            find_staged_data(&conn, scope.spanning(&config), scope.only())
+            find_staged_data(&conn, &config, scope.only())
                 .unwrap()
                 .classes
         };
-        assert_eq!(classes(StagedScope::Every), [PlanClass::Spannable]);
+        assert_eq!(classes(StagedScope::Every), [PlanClass::Queued]);
         assert_eq!(
             classes(StagedScope::ForLocation(ids.to_vec())),
-            [PlanClass::Spannable],
-            "a write for a location plans a set that may span by policy"
+            [PlanClass::Queued],
+            "a write for a location plans a set like any ordinary write"
         );
-        assert_eq!(
-            classes(StagedScope::Rewrite(ids.to_vec())),
-            [PlanClass::Whole],
-            "a rewrite never spans (item 142)"
+        assert_eq!(classes(StagedScope::Rewrite(ids.to_vec())), [PlanClass::Queued]);
+        assert!(StagedScope::Every.may_plan_past_the_ceiling());
+        assert!(
+            !StagedScope::Rewrite(ids.to_vec()).may_plan_past_the_ceiling(),
+            "a rewrite plans under the fill ceiling (item 142)"
         );
         assert!(
             classes(StagedScope::ForLocation(Vec::new())).is_empty(),
@@ -15438,7 +15438,7 @@ mod tests {
         )
         .unwrap();
 
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+        let units = find_staged_data(&conn, &Config::default(), None)
             .unwrap()
             .units;
         assert!(
@@ -16259,7 +16259,7 @@ mod tests {
 
         // Positive control: the selection really does hand `build` a
         // one-slice unit — the defect this gate exists for.
-        let units = find_staged_data(&conn, Spanning::ByPolicy(&Config::default()), None)
+        let units = find_staged_data(&conn, &Config::default(), None)
             .unwrap()
             .units;
         assert_eq!(units.len(), 1);
@@ -26923,16 +26923,13 @@ mod tests {
                 );
                 assert_eq!(stage_set_status(&f, "a"), "cleaned");
                 for unit in ["b", "c"] {
-                    let set = stage_set_of(&f, unit);
                     assert_eq!(stage_set_status(&f, unit), "staged", "{unit}");
-                    assert_eq!(
-                        release_blocker(&f.conn, set).unwrap(),
-                        ReleaseBlocker::Cut {
-                            volume_label: Some("SE-1".into())
-                        },
-                        "{unit}"
-                    );
                 }
+                assert_eq!(
+                    release_blocker(&f.conn, stage_set_of(&f, "c")).unwrap(),
+                    ReleaseBlocker::NeverWritten,
+                    "c was planned and not written: no row (item 288)"
+                );
 
                 // The next ordinary `volume write`, onto another cartridge,
                 // writes the cut units whole, and seals full.
@@ -27266,7 +27263,7 @@ mod tests {
                 usable: u64,
                 bound: Option<u64>,
             ) -> (build::BuiltLayout, tempfile::TempDir) {
-                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                let units = checked_staged_units(&f.conn, &f.config, None)
                     .unwrap()
                     .units;
                 let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
@@ -27404,19 +27401,13 @@ mod tests {
                 budget(&mut f, "SE-P", capacity, fill, true);
 
                 let (layout, _dir) = built(&f, "SE-P", fill, Some(capacity));
-                let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+                let units = checked_staged_units(&f.conn, &f.config, None)
                     .unwrap()
                     .units;
-                let split = layout.split(&units);
-                assert_eq!((split.committed, split.planned, split.units), (1, 3, 3));
-                assert!(past_ceiling_refusal("SE-P", &split, &units).is_none());
-                let notice = past_ceiling_notice("SE-P", &split, &units).expect("named");
-                assert!(
-                    notice.starts_with(
-                        "volume \"SE-P\": \"b\" v1, \"c\" v1 planned past the fill ceiling; the \
-                         tape may end before them."
-                    ),
-                    "{notice}"
+                let p = layout.place(&units, &[PlanClass::Queued; 3]);
+                assert_eq!(
+                    p.placed,
+                    vec![Placed::Committed, Placed::PastCeiling, Placed::PastCeiling]
                 );
 
                 let mut store = MemStore::new(SBS);
@@ -27430,12 +27421,16 @@ mod tests {
                 assert_eq!(volume_row(&f, "SE-P"), ("sealed".into(), true, None));
             }
 
-            /// Without `post_warning_bytes`, the same batch on the same
-            /// volume is refused at the fill ceiling exactly as before 1.6.0:
-            /// today's refusal, byte for byte, given the figure the build
-            /// counted. Nothing is written and no session is planned.
+            /// Without `post_warning_bytes` the plan ends at the fill ceiling
+            /// (item 289, D20): the same batch on the same volume is NOT
+            /// refused. `a` is committed, and the set that carries the plan
+            /// past the ceiling is planned as the longest prefix of its
+            /// slices that fits (a range), or deferred when not even one
+            /// does; nothing of `c` is on the tape. The write exits 0, the
+            /// rows are `completed` for `a` and no row for a set none of
+            /// which reached the tape, and the rest stays staged.
             #[test]
-            fn without_post_warning_bytes_the_same_write_is_refused_with_todays_text() {
+            fn without_post_warning_bytes_the_write_ends_at_the_fill_ceiling_and_continues() {
                 let mut f = fixture(WIDE_ABC, &["SE-N"]);
                 let fixed = wide_fixed(&f, "SE-N");
                 let fill = fixed + 2 * WIDE_PADDED;
@@ -27444,62 +27439,28 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-N", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                let needed: u64 = msg
-                    .split("the layout needs ")
-                    .nth(1)
-                    .and_then(|t| t.split(' ').next())
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or_else(|| panic!("no figure in: {msg}"));
-                let available = f.config.backends.lto[0].fill_budget_bytes(capacity);
-                let expected = format!(
-                    "volume \"SE-N\" failed pre-write validation: {}; {}",
-                    crate::volume::layout_model::LayoutError::CapacityExceeded {
-                        needed,
-                        reserve: 0,
-                        available,
-                    },
-                    crate::volume::layout_model::capacity_refusal_note(
-                        &[crate::volume::layout_model::LayoutError::CapacityExceeded {
-                            needed,
-                            reserve: 0,
-                            available,
-                        }],
-                        f.config.backends.lto[0].fill_ceiling,
-                        capacity,
-                    )
-                    .unwrap(),
+                r.expect("a plan that ends at the ceiling is written");
+                assert_eq!(code, 0);
+                let rows = writes_of(&f, "SE-N");
+                assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
+                assert!(
+                    rows.iter().all(|(u, _)| u != "c"),
+                    "nothing of c reached the tape: {rows:?}"
                 );
-                assert_eq!(msg, expected);
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-N").is_empty(), "no session was planned");
+                assert_eq!(stage_set_status(&f, "c"), "staged");
+                // The tape ends by its plan at the ceiling: the figure the
+                // build counted fits the fill budget exactly as before 1.6.0.
+                let layout = f.config.backends.lto[0].fill_budget_bytes(capacity);
+                assert!(layout >= fill);
             }
 
-            /// Units beyond the plan bound are refused, never trimmed (the
-            /// coordinator's ruling on item 113): the whole capacity holds
-            /// `a` and `b` but not `c`, and the write refuses by the bound.
+            /// With a bound the plan may reach the nominal capacity: a plan
+            /// whose end is beyond it is not refused or trimmed (item 289):
+            /// the set that crosses is planned to its end, and the drive's
+            /// early warning ends the tape inside it.
             #[test]
-            fn a_plan_beyond_the_bound_is_refused_not_trimmed() {
-                refused_by_the_bound_not_trimmed(0);
-            }
-
-            /// #491's positive control: the same refusal however heavy the
-            /// envelopes are ([`grow_envelopes`]).
-            #[test]
-            fn a_plan_beyond_the_bound_is_refused_however_heavy_the_envelopes() {
-                for bytes in [512, 2048, 4096, 4608] {
-                    refused_by_the_bound_not_trimmed(bytes);
-                }
-            }
-
-            /// The body of the two tests above, with the envelopes grown by
-            /// a catalogue of `catalogue_bytes`. The bound sits half a
-            /// slice past `b`'s end on the probe, more than the drift
-            /// ([`wide_fixed`]) either side.
-            fn refused_by_the_bound_not_trimmed(catalogue_bytes: usize) {
+            fn a_plan_beyond_the_bound_is_planned_to_its_end() {
                 let mut f = fixture(WIDE_ABC, &["SE-B"]);
-                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                 let fixed = wide_fixed(&f, "SE-B");
                 let fill = fixed + 2 * WIDE_PADDED;
                 let capacity = fixed + 3 * WIDE_PADDED + WIDE_PADDED / 2;
@@ -27507,48 +27468,20 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-B", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                assert!(msg.contains("failed pre-write validation"), "{msg}");
-                assert!(msg.contains("nominal capacity"), "{msg}");
-                assert!(msg.contains("ADR-0012 item 113"), "{msg}");
-                assert!(
-                    !msg.contains("--fill-ceiling"),
-                    "raising the ceiling cannot help: {msg}"
+                r.expect("the tail is planned to its end, and nothing here ends the tape early");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-B"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
                 );
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-B").is_empty(), "no session was planned");
             }
 
-            /// A plan whose every unit is past the fill ceiling commits
-            /// nothing, and is refused (the coordinator's ruling: a tape that
-            /// can only end cut is not a plan), before the tape moves.
+            /// A plan whose every unit is past the fill ceiling is planned
+            /// all the same when the bound holds it (item 289): the tape may
+            /// end inside any of them, each a range then.
             #[test]
-            fn a_plan_that_commits_no_unit_is_refused() {
-                commits_no_unit_and_is_refused(0);
-            }
-
-            /// #491's positive control: the same refusal however heavy the
-            /// envelopes are, so wherever their sizes fall against a block
-            /// ([`grow_envelopes`]; 512 bytes was enough to break the figures
-            /// this test used to place).
-            #[test]
-            fn a_plan_that_commits_no_unit_is_refused_however_heavy_the_envelopes() {
-                for bytes in [512, 2048, 4096, 4608] {
-                    commits_no_unit_and_is_refused(bytes);
-                }
-            }
-
-            /// The body of the two tests above, with the envelopes grown by
-            /// a catalogue of `catalogue_bytes`. The fill budget sits half
-            /// a slice past the probe's files ([`wide_fixed`]), which leaves
-            /// the drift on both sides: the real files still fit under the
-            /// ceiling (else the refusal is the capacity gate's, not this one)
-            /// and `a` still does not (else it is committed and the write goes
-            /// ahead).
-            fn commits_no_unit_and_is_refused(catalogue_bytes: usize) {
+            fn a_plan_that_commits_no_unit_is_planned_within_the_bound() {
                 let mut f = fixture(WIDE_ABC, &["SE-0"]);
-                grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                 let fixed = wide_fixed(&f, "SE-0");
                 let fill = fixed + WIDE_PADDED / 2;
                 let capacity = fixed + 6 * WIDE_PADDED;
@@ -27556,12 +27489,12 @@ mod tests {
 
                 let mut store = MemStore::new(SBS);
                 let (r, code) = write(&f, "SE-0", &mut store, false);
-                let msg = r.unwrap_err().to_string();
-                assert!(msg.contains("would commit nothing"), "{msg}");
-                assert!(msg.contains("\"a\" v1, \"b\" v1, \"c\" v1"), "{msg}");
-                assert_eq!(code, 2);
-                assert!(store.files.is_empty(), "nothing was written");
-                assert!(writes_of(&f, "SE-0").is_empty(), "no session was planned");
+                r.expect("within the bound");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-0"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
+                );
             }
             // ── #478: a write that plans, writes and reports a span ──
 
@@ -27582,28 +27515,6 @@ mod tests {
                 ];
                 /// `b` of three slices, alone.
                 const B3: &[(&str, &[usize])] = &[("b", &[SLICE, SLICE, SLICE])];
-
-                /// `unit`'s dotfile says `allow_spanning = value` (ADR-0012
-                /// item 82: the unit's own layer of the policy).
-                fn dotfile(f: &Fixture, unit: &str, value: bool) {
-                    let dir = f._tmp.path().join("sources").join(unit);
-                    fs::create_dir_all(&dir).unwrap();
-                    fs::write(
-                        dir.join(".tapectl-unit.toml"),
-                        format!("[policy]\nallow_spanning = {value}\n"),
-                    )
-                    .unwrap();
-                    f.conn
-                        .execute(
-                            "UPDATE units SET current_path = ?2 WHERE name = ?1",
-                            params![unit, dir.to_string_lossy()],
-                        )
-                        .unwrap();
-                }
-
-                fn allow_spanning(f: &Fixture, unit: &str) {
-                    dotfile(f, unit, true);
-                }
 
                 /// [`write`], scoped to `only` as `volume rewrite` scopes it
                 /// (`volume_write_scoped`).
@@ -27638,19 +27549,6 @@ mod tests {
                         }
                     };
                     (r, code)
-                }
-
-                /// `writes.may_span` of `unit`'s write on `label`.
-                fn may_span(f: &Fixture, label: &str, unit: &str) -> bool {
-                    f.conn
-                        .query_row(
-                            "SELECT w.may_span FROM writes w
-                             JOIN volumes v ON v.id = w.volume_id
-                             WHERE v.label = ?1 AND w.stage_set_id = ?2",
-                            params![label, stage_set_of(f, unit)],
-                            |r| r.get(0),
-                        )
-                        .unwrap()
                 }
 
                 /// `unit`'s snapshot status.
@@ -27743,7 +27641,6 @@ mod tests {
                 fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
                     let mut f = fixture(A_B3_C, &["SP-1", "SP-2", "SP-3"]);
                     f.config.defaults.min_copies = 2;
-                    allow_spanning(&f, "b");
 
                     // Tape 1: a at 8, c at 9, b last at 10-12; the warning in
                     // b's second slice (11).
@@ -27765,7 +27662,6 @@ mod tests {
                         writes_of(&f, "SP-1"),
                         pairs(&[("a", "completed"), ("b", "range"), ("c", "completed")])
                     );
-                    assert!(may_span(&f, "SP-1", "b") && !may_span(&f, "SP-1", "a"));
                     assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         snapshot_status(&f, "b"),
@@ -27853,7 +27749,6 @@ mod tests {
                 #[test]
                 fn a_continuation_onto_another_generation_is_refused_naming_both() {
                     let f = fixture(B3, &["SG-1", "SG-5", "SG-6"]);
-                    allow_spanning(&f, "b");
                     f.conn
                         .execute(
                             "UPDATE volumes SET media_type = 'LTO-5',
@@ -27922,7 +27817,6 @@ mod tests {
                 fn span_past_the_ceiling_is_refused_naming_the_key(catalogue_bytes: usize) {
                     let mut f =
                         fixture(&[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])], &["SN-1"]);
-                    allow_spanning(&f, "b");
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                     let fixed = wide_fixed(&f, "SN-1");
                     budget(
@@ -27974,7 +27868,6 @@ mod tests {
                 #[test]
                 fn a_rewrite_scoped_write_never_makes_a_range() {
                     let f = fixture(B3, &["SR-1", "SR-2"]);
-                    allow_spanning(&f, "b");
                     let b = stage_set_of(&f, "b");
 
                     let mut store = ArmedAt::new(9, warning);
@@ -27982,14 +27875,12 @@ mod tests {
                     r.expect("a short seal is a success");
                     assert_eq!(code, 0);
                     assert_eq!(writes_of(&f, "SR-1"), pairs(&[("b", "cut")]));
-                    assert!(!may_span(&f, "SR-1", "b"));
                     assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert!(recorded_ranges(&f.conn, "SR-1").unwrap().is_empty());
 
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SR-2", &mut store, false).0.expect("seals short");
                     assert_eq!(writes_of(&f, "SR-2"), pairs(&[("b", "range")]));
-                    assert!(may_span(&f, "SR-2", "b"));
                 }
 
                 /// #493 (ADR-0012 items 151 and 159): a write scoped as `volume
@@ -28000,7 +27891,6 @@ mod tests {
                 #[test]
                 fn a_for_location_scoped_write_spans_by_policy_and_leaves_the_rest_staged() {
                     let f = fixture(&[("a", &[SLICE]), ("b", &[SLICE, SLICE, SLICE])], &["SL-1"]);
-                    allow_spanning(&f, "b");
                     let b = stage_set_of(&f, "b");
 
                     let mut store = ArmedAt::new(9, warning);
@@ -28023,7 +27913,6 @@ mod tests {
                     );
                     slot.finish_result(r).expect("a short seal is a success");
                     assert_eq!(writes_of(&f, "SL-1"), pairs(&[("b", "range")]));
-                    assert!(may_span(&f, "SL-1", "b"));
                     let a_status: String = f
                         .conn
                         .query_row(
@@ -28044,7 +27933,6 @@ mod tests {
                 #[test]
                 fn an_owed_slice_released_from_staging_is_refused_naming_read_slices() {
                     let mut f = fixture(B3, &["SX-1", "SX-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SX-1", &mut store, false)
                         .0
@@ -28132,7 +28020,6 @@ mod tests {
                         ],
                         &["SD-1", "SD-2"],
                     );
-                    allow_spanning(&f, "b");
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                     let fixed = wide_fixed(&f, "SD-1");
                     budget(
@@ -28168,25 +28055,19 @@ mod tests {
 
                 // ── #491: the read-back of a span plan built again ──
 
-                /// `units` staged on "SR-1", those in `spannable` allowed to
-                /// span, the envelopes grown by `catalogue_bytes`
-                /// ([`grow_envelopes`]): the batch in its plan order (whole
-                /// units, then the spannable sets, each in name order, so the
-                /// whole units are named first), the write's own build of it,
-                /// and that build's files that are not slices. The build's
-                /// budget is the test's to place.
+                /// `units` staged on "SR-1", the envelopes grown by
+                /// `catalogue_bytes` ([`grow_envelopes`]): the batch in its
+                /// plan order (the queue in name order), the write's own
+                /// build of it, and that build's files that are not slices.
+                /// The build's budget is the test's to place.
                 fn read_back_case(
                     units: &[(&str, &[usize])],
-                    spannable: &[&str],
                     catalogue_bytes: usize,
                 ) -> (StagedBatch, build::BuiltLayout, tempfile::TempDir, u64) {
                     let f = fixture(units, &["SR-1"]);
-                    for name in spannable {
-                        allow_spanning(&f, name);
-                    }
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
                     let batch =
-                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
+                        checked_staged_units(&f.conn, &f.config, None).unwrap();
                     let (built, dir) = built(&f, "SR-1", u64::MAX / 4, None);
                     let fixed = built.layout.fixed_on_tape_bytes();
                     (batch, built, dir, fixed)
@@ -28202,47 +28083,29 @@ mod tests {
                         .capacity_errors_against(built.layout.budget.available_bytes)
                 }
 
-                /// The false refusal (#491): a rebuild of fewer units holds no
-                /// more content than the probe the plan was made on, but its
-                /// files can land a block above the probe's (tar pads each
-                /// member to 512 bytes, so a dropped unit's text can shrink
-                /// nothing, and every envelope gets a fresh random grease
-                /// stanza in its age header). Here the probe was one block
-                /// lighter. Items 83 and 95: the whole units `a` and `b` fill
-                /// the fill ceiling exactly on the probe's bytes, and `c`, a
-                /// spannable set that fits one tape (four slices past the
-                /// probe's files), goes last and is the tail by crossing the
-                /// bound. On the built bytes `b` ends a block past the
-                /// ceiling, so the build's own placement defers it and step 4
-                /// used to refuse ("internal error") a Layout the capacity gate
-                /// accepts. Within the drift (one block per generated file),
-                /// the plan's own bytes are read instead. Positive control: a
-                /// probe lighter than that drift allows is a defect, and still
-                /// refused.
+                /// A rebuild a block heavier than the probe (#491): a unit the
+                /// plan had under the ceiling ends a block past it on the
+                /// built bytes. Every unit is one class now (item 289), so the
+                /// plan only ever defers a set after its tail, and a build whose
+                /// own placement agrees with the plan's order is read back as it
+                /// stands: `a` is committed, `b` past the ceiling and `c`, the
+                /// last, the tail by crossing the bound.
                 #[test]
-                fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_on_the_plans_bytes() {
+                fn a_rebuild_a_block_heavier_than_the_probe_is_read_back_as_the_build_places_it() {
                     for bytes in [0, 512, 2048, 4096, 4608] {
                         let (batch, mut built, _dir, fixed) = read_back_case(
                             &[("a", &[SLICE]), ("b", &[SLICE]), ("c", &[SLICE; 3])],
-                            &["c"],
                             bytes,
                         );
-                        assert_eq!(
-                            batch.classes,
-                            [PlanClass::Whole, PlanClass::Whole, PlanClass::Spannable]
-                        );
+                        assert_eq!(batch.classes, [PlanClass::Queued; 3]);
                         let planned = fixed - SBS as u64;
                         built.layout.budget.plan_bound_bytes = Some(planned + 4 * PADDED);
                         built.layout.budget.available_bytes = planned + 2 * PADDED;
-                        assert!(
-                            3 * PADDED <= built.layout.budget.plan_bound_bytes.unwrap() - fixed,
-                            "positive control: `c` fits one tape on the built bytes too"
-                        );
 
                         let own = built.place(&batch.units, &batch.classes);
                         assert_eq!(
                             own.placed,
-                            [Placed::Committed, Placed::Deferred, Placed::Tail],
+                            [Placed::Committed, Placed::PastCeiling, Placed::Tail],
                             "the build's own bytes push `b` off the ceiling"
                         );
                         assert!(
@@ -28250,25 +28113,11 @@ mod tests {
                             "the Layout fits: {:?}",
                             gate(&built)
                         );
-
                         let plan =
                             read_back_span_plan(&built, &batch.units, &batch.classes, planned)
                                 .unwrap_or_else(|why| panic!("{bytes} bytes: {why}"));
-                        assert_eq!(
-                            plan.placed,
-                            [Placed::Committed, Placed::Committed, Placed::Tail]
-                        );
+                        assert_eq!(plan.placed, own.placed);
                         assert_eq!(plan.order, [0, 1, 2]);
-
-                        let margin = capacity_numbers(&built.layout).unwrap().margin;
-                        let why = read_back_span_plan(
-                            &built,
-                            &batch.units,
-                            &batch.classes,
-                            fixed - margin - SBS as u64,
-                        )
-                        .expect_err("a drift past the margin is not one");
-                        assert!(why.starts_with("\"b\" v1 no longer fit"), "{why}");
                     }
                 }
 
@@ -28284,7 +28133,6 @@ mod tests {
                     for bytes in [0, 512, 2048, 4096, 4608] {
                         let (batch, mut built, _dir, fixed) = read_back_case(
                             &[("a", &[SLICE]), ("b", &[SLICE; 3]), ("c", &[SLICE])],
-                            &["b", "c"],
                             bytes,
                         );
                         let planned = fixed - SBS as u64;
@@ -28316,30 +28164,26 @@ mod tests {
                     }
                 }
 
-                /// With `allow_spanning` off at every layer (the dotfile says
-                /// false, `[defaults]` is false), a write is 1.6.0's: the same
-                /// plan order, rows, File 0, `write_completed` event and
-                /// recorded ending as [`an_early_warning_mid_unit_seals_short_exits_0_and_the_next_write_takes_the_cut_units`],
-                /// and nothing that names a range, a deferral or a span.
+                /// A short seal under the one rule (item 288): the same plan
+                /// order, rows, `write_completed` event and recorded ending for
+                /// every unit, none of which opts in to anything. `b`, the unit
+                /// the warning interrupted, is a range of the slices on the
+                /// tape; `c`, planned after the warning and not written, has no
+                /// row and is named as unwritten.
                 #[test]
-                fn with_allow_spanning_off_everywhere_a_write_is_1_6_0s() {
+                fn a_short_seal_records_a_range_and_no_row_for_the_unwritten() {
                     let f = fixture(ABC, &["S0-1"]);
-                    dotfile(&f, "b", false);
-                    let batch =
-                        checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None).unwrap();
-                    assert!(!batch.spans());
-                    assert!(batch.classes.iter().all(|c| *c == PlanClass::Whole));
+                    let batch = checked_staged_units(&f.conn, &f.config, None).unwrap();
+                    assert!(batch.classes.iter().all(|c| *c == PlanClass::Queued));
 
                     let mut store = ArmedAt::new(B_FIRST, warning);
                     write(&f, "S0-1", &mut store, false).0.expect("seals short");
                     assert_eq!(position_of(&f, "S0-1", "b", 1), B_FIRST);
                     assert_eq!(
                         writes_of(&f, "S0-1"),
-                        pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                        pairs(&[("a", "completed"), ("b", "range")])
                     );
-                    for unit in ["a", "b", "c"] {
-                        assert!(!may_span(&f, "S0-1", unit), "{unit}");
-                    }
+                    assert_eq!(stage_set_status(&f, "c"), "staged");
                     assert_eq!(requires_line(&store.inner.files), "requires = []");
                     assert_eq!(
                         events(&f, "S0-1", "write_completed"),
@@ -28349,7 +28193,10 @@ mod tests {
                                 serde_json::json!({
                                     "ending": "short",
                                     "ended_after": B_FIRST,
-                                    "cut_units": ["b", "c"],
+                                    "unwritten_units": ["c"],
+                                    "range_units": [
+                                        {"unit": "b", "first_slice": 1, "last_slice": 1}
+                                    ],
                                 })
                                 .to_string()
                             )
@@ -28359,7 +28206,8 @@ mod tests {
                         recorded_ending(&f.conn, "S0-1").unwrap(),
                         RecordedEnding {
                             ended_after: Some(i64::from(B_FIRST)),
-                            cut_units: vec!["b".into(), "c".into()],
+                            range_units: vec![range("b", 1, 1)],
+                            deferred_units: vec!["c".into()],
                             ..RecordedEnding::default()
                         }
                     );
@@ -28373,7 +28221,6 @@ mod tests {
                 #[test]
                 fn a_write_that_releases_part_of_a_span_names_the_released_and_kept_slices() {
                     let f = fixture(B3, &["SL-1", "SL-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SL-1", &mut store, false)
                         .0
@@ -28483,7 +28330,6 @@ mod tests {
                 #[test]
                 fn a_full_verify_marks_a_range_write_verified_and_a_quick_one_does_not() {
                     let f = fixture(A_B3_C, &["SV-1"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(11, warning);
                     write(&f, "SV-1", &mut store, false)
                         .0
@@ -28524,7 +28370,6 @@ mod tests {
                 #[test]
                 fn read_slices_from_a_range_tape_restages_its_released_slices() {
                     let mut f = fixture(B3, &["SQ-1", "SQ-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SQ-1", &mut store, false)
                         .0
@@ -28575,7 +28420,6 @@ mod tests {
                 #[test]
                 fn a_full_verify_records_the_figures_of_a_tape_holding_a_range() {
                     let f = fixture(A_B3_C, &["SG-1", "SG-2"]);
-                    allow_spanning(&f, "b");
                     let mut tape1 = ArmedAt::new(11, warning);
                     write(&f, "SG-1", &mut tape1, false)
                         .0
@@ -28641,7 +28485,6 @@ mod tests {
                 fn the_402_remedy_for_a_missing_slice_of_a_span_names_the_range_holding_it() {
                     let mut f = fixture(B3, &["SM-1", "SM-2"]);
                     f.config.defaults.min_copies = 2;
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SM-1", &mut store, false)
                         .0
@@ -28693,7 +28536,6 @@ mod tests {
                 #[test]
                 fn the_402_remedy_names_each_range_holding_a_missing_slice() {
                     let f = fixture(B3, &["SM-1", "SM-2"]);
-                    allow_spanning(&f, "b");
                     let mut store = ArmedAt::new(9, warning);
                     write(&f, "SM-1", &mut store, false)
                         .0
@@ -28727,7 +28569,7 @@ mod tests {
                 /// The units of a hand-made span plan, `a` whole, `b` may span
                 /// (slices 1-3), `c` whole.
                 fn plan_units() -> Vec<BuildUnit> {
-                    let unit = |name: &str, slices: &[i64], span: bool| BuildUnit {
+                    let unit = |name: &str, slices: &[i64]| BuildUnit {
                         stage_set_id: 1,
                         snapshot_id: 1,
                         unit_name: name.into(),
@@ -28750,72 +28592,73 @@ mod tests {
                                 staging_path: PathBuf::new(),
                             })
                             .collect(),
-                        span: span.then(|| UnitSpan { slices: Vec::new() }),
+                        span: Some(UnitSpan { slices: Vec::new() }),
                     };
-                    vec![
-                        unit("a", &[1], false),
-                        unit("b", &[1, 2, 3], true),
-                        unit("c", &[1], false),
-                    ]
+                    vec![unit("a", &[1]), unit("b", &[1, 2, 3]), unit("c", &[1])]
                 }
 
-                /// The notices a span tape's plan prints before the tape moves
-                /// name the unit that may span past the fill ceiling and the
-                /// whole units that wait for the next tape; and the write
-                /// names those again when it is done. A plan with a unit that
-                /// may span is never one that commits nothing.
+                /// The notices a tape's plan prints before the tape moves name
+                /// the unit planned past the fill ceiling, to its end, and the
+                /// units that wait for the next tape; and the write names
+                /// those again when it is done.
                 #[test]
-                fn a_span_plans_notices_name_the_span_and_the_units_that_wait() {
+                fn a_plans_notices_name_the_tail_and_the_units_that_wait() {
                     let units = plan_units();
                     let plan = SpanPlan {
                         placement: Placement {
                             order: vec![0, 1],
                             placed: vec![Placed::Committed, Placed::Tail],
-                            errors: Vec::new(),
+                            tail_room: None,
                         },
                         deferred: vec![units[2].clone()],
+                        stops_short: Vec::new(),
                     };
                     let notices = span_plan_notices("SN-0", &plan, &units[..2]);
                     assert_eq!(notices.len(), 2, "{notices:?}");
                     assert!(
                         notices[0].starts_with(
-                            "volume \"SN-0\": \"b\" v1 may span, and the plan takes it past the \
-                             fill ceiling to its end"
+                            "volume \"SN-0\": \"b\" v1 planned past the fill ceiling, to its end: \
+                             the drive's early warning, not the plan, ends it on this tape"
                         ),
                         "{notices:?}"
                     );
                     assert_eq!(notices[1], waiting_notice("SN-0", &plan.deferred).unwrap());
                     assert!(
-                        notices[1].starts_with("volume \"SN-0\": \"c\" v1 waits for the next tape"),
+                        notices[1].starts_with(
+                            "volume \"SN-0\": \"c\" v1 planned and not written: the plan ends \
+                             before it"
+                        ),
                         "{notices:?}"
                     );
-                    assert!(placed_past_ceiling_refusal("SN-0", &plan, &units[..2]).is_none());
 
-                    // A span tail alone commits nothing and is still a plan
-                    // (item 94); a whole unit alone past the ceiling is not.
-                    let tail = SpanPlan {
+                    // A drive with no post_warning_bytes plans the tail only up
+                    // to the fill ceiling, and says which slices.
+                    let short = SpanPlan {
                         placement: Placement {
-                            order: vec![0],
-                            placed: vec![Placed::Tail],
-                            errors: Vec::new(),
+                            order: vec![0, 1],
+                            placed: vec![Placed::Committed, Placed::Committed],
+                            tail_room: None,
                         },
                         deferred: Vec::new(),
+                        stops_short: vec![StopsShort {
+                            unit: "\"b\" v1".into(),
+                            first: 1,
+                            last: 2,
+                        }],
                     };
-                    assert!(placed_past_ceiling_refusal("SN-0", &tail, &units[1..2]).is_none());
-                    let past = SpanPlan {
-                        placement: Placement {
-                            order: vec![0],
-                            placed: vec![Placed::PastCeiling],
-                            errors: Vec::new(),
-                        },
-                        deferred: Vec::new(),
-                    };
-                    assert!(placed_past_ceiling_refusal("SN-0", &past, &units[..1])
-                        .is_some_and(|r| r.contains("would commit nothing")));
+                    let notices = span_plan_notices("SN-0", &short, &units[..2]);
+                    assert_eq!(notices.len(), 1, "{notices:?}");
+                    assert!(
+                        notices[0].starts_with(
+                            "volume \"SN-0\": \"b\" v1 is planned only up to the fill ceiling, \
+                             slices 1-2: the drive declares no post_warning_bytes"
+                        ),
+                        "{notices:?}"
+                    );
                 }
 
-                /// The index's `this-tape` rows (item 126): a unit that may span
-                /// says the run this tape plans, a whole unit its whole set.
+                /// The index's `this-tape` rows (item 126): a unit says the run
+                /// this tape plans.
                 #[test]
                 fn the_index_states_the_run_each_span_unit_plans() {
                     let mut units = plan_units();
@@ -28823,12 +28666,18 @@ mod tests {
                     assert_eq!(
                         index_runs(&units),
                         [
-                            coverage::IndexRun::whole(1),
+                            coverage::IndexRun {
+                                stage_set_id: 1,
+                                slices: Some((1, 1)),
+                            },
                             coverage::IndexRun {
                                 stage_set_id: 1,
                                 slices: Some((2, 3)),
                             },
-                            coverage::IndexRun::whole(1),
+                            coverage::IndexRun {
+                                stage_set_id: 1,
+                                slices: Some((1, 1)),
+                            },
                         ]
                     );
                 }
@@ -28842,7 +28691,7 @@ mod tests {
                         volume_id: 1,
                         label: "SF-3".into(),
                         ending,
-                        cut_units: Vec::new(),
+                        unwritten_units: Vec::new(),
                         range_units,
                     };
                     let run = vec![RangeUnit {
@@ -30639,7 +30488,7 @@ mod tests {
         /// way a not-yet-existing volume can: another uuid and time, other
         /// chip strings, a real MAM length and load count.
         fn real_write_layout_errors(f: &Fixture, usable_bytes: u64) -> Vec<String> {
-            let units = checked_staged_units(&f.conn, Spanning::ByPolicy(&f.config), None)
+            let units = checked_staged_units(&f.conn, &f.config, None)
                 .unwrap()
                 .units;
             let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();

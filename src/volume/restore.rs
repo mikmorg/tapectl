@@ -2703,27 +2703,6 @@ fn select(
     })
 }
 
-/// The first live holder of `stage_set_id`'s slice 1, in-service first
-/// ([`crate::volume::slice_holders::holders_of`]): where a restore of it
-/// across cartridges starts (#478).
-fn slice_one_holder(conn: &Connection, stage_set_id: i64) -> Result<Option<String>> {
-    let first: Option<String> = conn
-        .query_row(
-            "SELECT sha256_encrypted FROM stage_slices
-              WHERE stage_set_id = ?1 AND slice_number = 1",
-            params![stage_set_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(match first {
-        Some(sha) => crate::volume::slice_holders::holders_of(conn, &sha)?
-            .into_iter()
-            .next()
-            .map(|h| h.label),
-        None => None,
-    })
-}
-
 /// Every unit with a live copy on `volume_label` — written slices of a
 /// completed write or a range (item 266), the predicate
 /// [`select_write_positions`] reads by, so

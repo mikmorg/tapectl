@@ -2421,69 +2421,38 @@ mod tests {
         }
     }
 
-    // --- `cut` (1.6.0, issue #420; ADR-0012 item 112) ---
+    // --- a set the tape did not take (ADR-0012 item 288) ---
 
-    /// A `cut` row for `stage_set_id` on a volume that sealed short at
-    /// `ended_after`: the only shape the spec allows a `cut` row in.
-    fn seed_cut(conn: &Connection, stage_set_id: i64, label: &str, ended_after: i64) {
-        seed_write(conn, stage_set_id, label, "cut");
-        conn.execute(
-            "UPDATE volumes SET status = 'sealed', sealed_at = datetime('now'), ended_after = ?2
-             WHERE label = ?1",
-            params![label, ended_after],
-        )
-        .unwrap();
-    }
-
-    /// A `cut` row is no write: a stage set whose only row is `cut` was
-    /// never written whole, and the next `volume write` rewrites it from
+    /// A set planned onto a tape that sealed short and not written has no
+    /// row: it was never written, and the next `volume write` writes it from
     /// these slices, so a bare clean keeps it. The positive control is the
-    /// same row `completed`, which the same call releases.
+    /// same set with a `completed` row, which the same call releases.
     #[test]
-    fn default_guard_keeps_a_set_whose_only_write_is_cut() {
+    fn default_guard_keeps_a_set_the_short_tape_did_not_take() {
         let (conn, stage_set_id, path, dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
 
         let report =
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
-        assert_eq!(report.sets_cleaned, 0, "a cut-only set must stay staged");
+        assert_eq!(report.sets_cleaned, 0, "a set with no write must stay staged");
         assert!(path.exists());
 
-        conn.execute("UPDATE writes SET status = 'completed'", [])
-            .unwrap();
+        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
         let report =
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
         assert_eq!(
             report.sets_cleaned, 1,
             "positive control: completed releases"
         );
-        assert!(!path.exists());
-    }
-
-    /// Once the cut set is written whole on another cartridge, the `cut` row
-    /// does not hold its staging the way an unfinished write would: it is
-    /// released by the same rule as any other.
-    #[test]
-    fn default_guard_releases_a_cut_set_once_it_is_completed_elsewhere() {
-        let (conn, stage_set_id, path, dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
-        seed_write(&conn, stage_set_id, "V-NEXT", "completed");
-
-        let report =
-            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
-        assert_eq!(report.sets_cleaned, 1);
         assert_eq!(report.files_removed, 1);
         assert!(!path.exists());
     }
 
-    /// A `cut` row excuses nothing else: beside a completed copy, any other
-    /// row that is not `completed` still keeps the staging, exactly as it
-    /// does without the cut.
+    /// Beside a completed copy, any other row that is not `completed` still
+    /// keeps the staging.
     #[test]
-    fn a_cut_row_does_not_excuse_an_unfinished_or_abandoned_write_elsewhere() {
+    fn an_unfinished_or_abandoned_write_elsewhere_keeps_the_staging() {
         for other in ["planned", "in_progress", "interrupted", "aborted", "failed"] {
             let (conn, stage_set_id, path, dir) = seed_stage_set();
-            seed_cut(&conn, stage_set_id, "V-SHORT", 9);
             seed_write(&conn, stage_set_id, "V-SEALED", "completed");
             seed_write(&conn, stage_set_id, "V-OTHER", other);
 
@@ -2494,26 +2463,15 @@ mod tests {
         }
     }
 
-    /// `release_blocker` drops `cut` rows before it classifies, as the guard
-    /// does: cut-only reads as cut, naming the volume that cut it (the next
-    /// `volume write` onto another cartridge is the remedy), cut beside a
-    /// completed copy reads as releasable, and a cut never turns an
-    /// interrupted session into an abandoned one -- the fall-through a `cut`
-    /// row would otherwise take, whose advice is `--force`.
+    /// `release_blocker`: no row reads as never written, a completed copy as
+    /// releasable, and an interrupted or aborted row as itself.
     #[test]
-    fn release_blocker_treats_a_cut_row_as_no_write() {
+    fn release_blocker_classifies_the_rows_a_set_has() {
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
             ReleaseBlocker::NeverWritten,
-            "positive control: no row at all is never written"
-        );
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
-        assert_eq!(
-            release_blocker(&conn, stage_set_id).unwrap(),
-            ReleaseBlocker::Cut {
-                volume_label: Some("V-SHORT".into())
-            }
+            "no row at all is never written"
         );
         seed_write(&conn, stage_set_id, "V-NEXT", "completed");
         assert_eq!(
@@ -2522,7 +2480,6 @@ mod tests {
         );
 
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
         seed_write(&conn, stage_set_id, "V-PAUSED", "interrupted");
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
@@ -2532,23 +2489,21 @@ mod tests {
         );
 
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
-        seed_cut(&conn, stage_set_id, "V-SHORT", 9);
         seed_write(&conn, stage_set_id, "V-DEAD", "aborted");
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
-            ReleaseBlocker::Abandoned { reconfirm_on: None },
-            "the aborted row is the blocker, not the cut one"
+            ReleaseBlocker::Abandoned { reconfirm_on: None }
         );
     }
 
     /// A short-sealed session is finished with its directory: its volume is
-    /// sealed and confirmed, and the slices a `cut` row did write stay in
-    /// `write_positions`. So `cut`, like `completed`, frees the directory.
+    /// sealed and confirmed, and the slices a `range` row did write stay in
+    /// `write_positions`. So `range`, like `completed`, frees the directory.
     #[test]
-    fn session_dir_reclaimed_when_write_is_cut() {
+    fn session_dir_reclaimed_when_write_is_a_range() {
         let conn = db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "cut");
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "range");
 
         let mut report = CleanReport::default();
         reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
@@ -2564,10 +2519,9 @@ mod tests {
     /// until someone decides which it is (`live_status_check`'s reason).
     #[test]
     fn session_dir_statuses_cover_every_write_status() {
-        // `range` (039, ADR-0012 item 121) is terminal, like `cut`: its
-        // volume is sealed and confirmed, and its written slices stay in
-        // `write_positions`.
-        let finished = ["completed", "cut", "range", "failed", "aborted"];
+        // `range` (039, ADR-0012 item 121) is terminal: its volume is sealed
+        // and confirmed, and its written slices stay in `write_positions`.
+        let finished = ["completed", "range", "failed", "aborted"];
         let mut covered: Vec<String> = SESSION_NON_TERMINAL
             .iter()
             .chain(finished.iter())
@@ -3232,7 +3186,7 @@ mod tests {
             (false, true),
             "a set holding a range is released slice by slice, never whole"
         );
-        seed_whole_on(&conn, set, "V-W2", true);
+        seed_whole_on(&conn, set, "V-W2");
         assert_eq!(release_blocker(&conn, set).unwrap(), ReleaseBlocker::None);
         assert_eq!(predicates(&conn, set), (false, true));
 
@@ -3260,7 +3214,7 @@ mod tests {
 
         // A set with no range row reads exactly as in 1.6.0.
         let (conn, set, _files, _dir) = seed_span(2);
-        seed_whole_on(&conn, set, "V-W1", true);
+        seed_whole_on(&conn, set, "V-W1");
         assert_eq!(predicates(&conn, set), (true, false));
     }
 
@@ -3332,7 +3286,7 @@ mod tests {
         assert_eq!(report.slices_short, vec![(set, vec![1, 2, 3, 4])]);
         assert!(files.iter().all(|f| f.exists()));
 
-        seed_whole_on(&conn, set, "V-T2", true);
+        seed_whole_on(&conn, set, "V-T2");
         let report = release_covered_slices(&conn, &config, set, 2).unwrap();
         assert_eq!(report.slices_released, vec![(set, vec![1, 2])]);
         assert_eq!(report.slices_short, vec![(set, vec![3, 4])]);
@@ -3378,7 +3332,7 @@ mod tests {
         let (conn, set, files, dir) = seed_span(4);
         let config = config_for(dir.path());
         seed_range_on(&conn, set, "V-T1", 1..=2);
-        seed_whole_on(&conn, set, "V-T2", true);
+        seed_whole_on(&conn, set, "V-T2");
 
         let report = clean_staging(&conn, &config, false, CleanScope::Whole).unwrap();
         assert_eq!(report.sets_cleaned, 0, "{report:?}");

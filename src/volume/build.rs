@@ -1394,6 +1394,7 @@ fn append_tar_file_member<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::layout_model::Placed;
     use std::io::Write;
 
     const BS: u64 = 512 * 1024;
@@ -2100,9 +2101,14 @@ mod tests {
                 .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })),
             "{errs:?}"
         );
-        let split = unbounded.split(&inputs.units);
-        assert_eq!((split.committed, split.planned), (1, 1));
-        assert!(unbounded.entries_past_ceiling(&inputs.units).is_empty());
+        let queued = [PlanClass::Queued; 3];
+        let p = unbounded.place(&inputs.units, &queued);
+        assert_eq!(
+            p.placed,
+            vec![Placed::Committed, Placed::Tail, Placed::Deferred],
+            "without a bound the plan ends at the ceiling inside bravo (item 289)"
+        );
+        assert!(p.tail_room.is_some());
         let sidecar = std::fs::read_to_string(unbounded_dir.path().join(LAYOUT_SIDECAR)).unwrap();
         assert!(!sidecar.contains("plan_bound_bytes"), "{sidecar}");
 
@@ -2111,22 +2117,14 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let built = build_with_plan_bound(&inputs, Some(total), session.path()).unwrap();
         built.validate(&ok_keys(&inputs), SliceCheck::Size).unwrap();
-        let split = built.split(&inputs.units);
-        assert_eq!(split.past_ceiling(), 1..3);
-        assert!(split.fits());
-        let names: Vec<&str> = inputs.units[split.past_ceiling()]
-            .iter()
-            .map(|u| u.unit_name.as_str())
-            .collect();
-        assert_eq!(names, ["unit-bravo", "unit-charlie"]);
-        let past: Vec<i32> = built
-            .entries_past_ceiling(&inputs.units)
-            .iter()
-            .map(|e| e.position)
-            .collect();
+        let p = built.place(&inputs.units, &queued);
+        assert_eq!(
+            p.placed,
+            vec![Placed::Committed, Placed::PastCeiling, Placed::PastCeiling]
+        );
         let alpha_last = slice_position(&built.layout, 2);
-        assert_eq!(past, vec![alpha_last + 1, alpha_last + 2]);
         assert_eq!(slice_position(&built.layout, 3), alpha_last + 1);
+        let past = [alpha_last + 1, alpha_last + 2];
 
         // They are ordinary plan entries: the bound moves no position or
         // size, and the front index lists every slice.
@@ -2174,9 +2172,12 @@ mod tests {
                 bound: total - 1
             }]
         );
-        let split = built.split(&inputs.units);
-        assert_eq!((split.committed, split.planned), (1, 2));
-        assert_eq!(split.beyond_bound(), 2..3);
+        let p = built.place(&inputs.units, &queued);
+        assert_eq!(
+            p.placed,
+            vec![Placed::Committed, Placed::PastCeiling, Placed::Tail],
+            "charlie carries the plan past the bound: the tail, planned to its end"
+        );
     }
 
     #[test]
@@ -2195,15 +2196,8 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let built = build_with_plan_bound(&inputs, Some(total), session.path()).unwrap();
         built.validate(&ok_keys(&inputs), SliceCheck::Size).unwrap();
-        let split = built.split(&inputs.units);
-        assert_eq!(split.past_ceiling(), 0..3);
-        let past: Vec<i32> = built
-            .entries_past_ceiling(&inputs.units)
-            .iter()
-            .map(|e| e.position)
-            .collect();
-        let first = slice_position(&built.layout, 1);
-        assert_eq!(past, vec![first, first + 1, first + 2, first + 3]);
+        let p = built.place(&inputs.units, &[PlanClass::Queued; 3]);
+        assert_eq!(p.placed, vec![Placed::PastCeiling; 3]);
     }
 
     #[test]
@@ -3062,13 +3056,12 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let built = build(&inputs, session.path()).unwrap();
         assert!(slice_position(&built.layout, 12) < slice_position(&built.layout, 21));
-        for (span_is, order) in [
-            (PlanClass::Spannable, vec![1, 0]),
-            (PlanClass::Owed, vec![0, 1]),
+        for (classes, order) in [
+            ([PlanClass::Queued, PlanClass::Owed], vec![1, 0]),
+            ([PlanClass::Owed, PlanClass::Queued], vec![0, 1]),
         ] {
-            let p = built.place(&inputs.units, &[span_is, PlanClass::Whole]);
-            assert!(p.is_ok(), "{span_is:?}: {:?}", p.errors);
-            assert_eq!(p.order, order, "{span_is:?}");
+            let p = built.place(&inputs.units, &classes);
+            assert_eq!(p.order, order, "{classes:?}");
         }
     }
 

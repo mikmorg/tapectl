@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use tempfile::TempDir;
 
 use super::short_tape::{self, ShortTape, LABEL};
