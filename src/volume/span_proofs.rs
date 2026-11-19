@@ -741,8 +741,10 @@ const T94: [&str; 3] = ["SPN94-T1", "SPN94-T2", "SPN94-T3"];
 /// and a half blocks before slice 16 ends at 1% sooner. Layout 3's envelopes
 /// carry each staging's file table and id map (T4.6, §1.4, §1.6): the tape's
 /// own files grew by four blocks (720,896 bytes before `S`'s slice 1), and
-/// the figure by the same 16,384 bytes.
-const CAP94: u64 = 2_740_224;
+/// the figure by the same 16,384 bytes. Layout 3's RESTORE.sh (T4.10, a new
+/// script in the tree) is 14 blocks where 1.8.0's was 74: the tape's own
+/// files shrank by 60 blocks, and the figure by the same 245,760 bytes.
+const CAP94: u64 = 2_494_464;
 
 /// Item 94's catalog at a copy target of 1: `W` whole (under half a tape)
 /// staged first, so 1.6.0's order would put it first, then `S`, which may

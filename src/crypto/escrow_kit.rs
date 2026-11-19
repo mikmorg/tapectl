@@ -2332,14 +2332,15 @@ mod tests {
     }
 
     /// Issue #448 item 4: one tool list, from RESTORE.sh's own prerequisite
-    /// loop. The test READS the loop out of the generated script, so a tool
-    /// added to it and not to the sheet fails here.
+    /// table. The test READS the table out of the script (File 2, one file in
+    /// the tree), so a tool added to it and not to the sheet fails here.
     #[test]
     fn the_tool_list_covers_every_tool_restore_sh_checks_for() {
-        // Since 1.2.0 each RESTORE.sh mode checks its own tools (#449 item 2);
-        // the set `--restore` checks is the union of them all, and the one
-        // list this sheet must cover.
-        let script = crate::volume::layout::generate_restore_script_v2("L6-0001", 3);
+        // Each RESTORE.sh mode checks its own tools; the set `--restore`
+        // checks is the one list this sheet must cover. Layout 3's script
+        // needs fewer tools than Layout 2's (no dar, no FIFOs); the sheet's
+        // own list is T4.14's, so here the script's set must be within it.
+        let script = crate::volume::heir::RESTORE_SH;
         let line = script
             .lines()
             .find(|l| l.starts_with("TOOLS_RESTORE=("))
@@ -2352,14 +2353,15 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(
-            tools.len() >= 9 && tools.contains(&"mkfifo") && tools.contains(&"tee"),
+            tools.contains(&"age") && tools.contains(&"tar") && tools.contains(&"sha256sum"),
             "parsed the wrong line: {line:?}"
         );
-        assert_eq!(
-            tools,
-            crate::volume::layout::restore_sh_tools(),
-            "the --restore set is the union the table names"
-        );
+        for tool in &tools {
+            assert!(
+                crate::volume::layout::restore_sh_tools().contains(tool),
+                "the script checks for {tool:?}, which the tool table behind File 1 does not name"
+            );
+        }
         let txt = render_cover_text(&facts_for(&[], &[]));
         for tool in &tools {
             assert!(

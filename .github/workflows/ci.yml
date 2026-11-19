@@ -88,6 +88,52 @@ jobs:
         # (2026-10-21 to 10-24, when the runner moved to Ubuntu 26).
         run: cargo test --locked --no-fail-fast
 
+  heir-script:
+    name: RESTORE.sh lint
+    # The heir's script (src/volume/heir/RESTORE.sh, File 2 of every Layout 3
+    # tape; the plan's T4.10, #553) is a shell file, so it is linted as one:
+    # `bash -n`, `shellcheck` at warning level, and its awk programs run under
+    # every awk an heir may have (gawk, mawk, BusyBox awk). The tests that do
+    # the third are the `lint_` tests of tests/heir_restore.rs; with
+    # TAPECTL_REQUIRE_HEIR_TOOLS=1 a missing tool fails them instead of
+    # skipping them, so a lint that did not run is never green.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install the lint tools and what the script's tests run
+        # acl and attr, the decompressors: the fixtures are real stagings (GNU tar
+        # at the writer's floor, setfacl, each algorithm's tool).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck gawk mawk busybox acl attr gzip xz-utils zstd
+          shellcheck --version | head -2
+          gawk --version | head -1
+          mawk -W version 2>&1 | head -1
+          busybox 2>&1 | head -1
+          tar --version | head -1
+
+      - name: bash -n and shellcheck
+        run: |
+          bash -n src/volume/heir/RESTORE.sh
+          shellcheck -S warning src/volume/heir/RESTORE.sh
+
+      - name: The script under gawk, mawk and BusyBox awk
+        env:
+          TAPECTL_REQUIRE_HEIR_TOOLS: "1"
+        run: |
+          cargo build --locked --example heir_age
+          cargo test --locked --test heir_restore lint_
+
   man-drift:
     name: Man pages in sync
     runs-on: ubuntu-latest

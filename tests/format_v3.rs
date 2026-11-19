@@ -1216,7 +1216,7 @@ fn leaks(position: usize, file: &[u8], needle: &str, host_names: &[String]) -> b
     let control = if position == 1 {
         tapectl::volume::layout::generate_system_guide_v2_for_media("CONTROL", 9, "LTO-6")
     } else {
-        tapectl::volume::layout::generate_restore_script_v2("CONTROL", 9)
+        tapectl::volume::heir::RESTORE_SH.to_string()
     };
     !control.contains(needle)
 }

@@ -26,6 +26,7 @@ use crate::error::{Result, TapectlError};
 use crate::staging;
 
 use super::format;
+use super::heir;
 use super::index::{self, IndexFiles};
 use super::layout::{self, FrontIndexFile, IdThunkV2Params};
 use super::layout_model::{
@@ -403,7 +404,7 @@ pub fn build_with_plan_bound(
         source: ContentSource::Materialized(guide_path),
     });
 
-    let restore_sh_bytes = layout::generate_restore_script_v2(&inputs.label, total_files);
+    let restore_sh_bytes = heir::RESTORE_SH;
     let (restore_sh_path, restore_sh_size, restore_sh_hash) =
         materialize(session_dir, "0002_restore_sh", restore_sh_bytes.as_bytes())?;
     entries.push(LayoutEntry {

@@ -26,8 +26,8 @@ use tapectl::config::{Config, LtoBackendConfig, StagingConfig, TapectlPaths};
 use tapectl::store::{Evidence, MismatchKind, Store, TapeStore, Tier};
 use tapectl::volume::format::{self, ParsedIndexEntry};
 use tapectl::volume::layout::{
-    generate_front_index, generate_id_thunk_v2, generate_restore_script_v2, generate_seal_marker,
-    generate_system_guide_v2, FrontIndexFile, IdThunkV2Params,
+    generate_front_index, generate_id_thunk_v2, generate_seal_marker, generate_system_guide_v2,
+    FrontIndexFile, IdThunkV2Params,
 };
 use tapectl::volume::layout_model::{CapacityBudget, ContentSource, Layout, LayoutEntry, ZoneKind};
 use tapectl::{db, staging, tenant, unit, volume};
@@ -1487,7 +1487,7 @@ fn write_hand_corrupted_volume(device: &str, block_size: usize, label: &str) -> 
         cartridge_identity_source: None,
     });
     let guide_text = generate_system_guide_v2(label, TOTAL_FILES);
-    let restore_text = generate_restore_script_v2(label, TOTAL_FILES);
+    let restore_text = tapectl::volume::heir::RESTORE_SH.to_string();
 
     // Two data slices; arbitrary bytes are fine — `--verify`/`chain_walk`
     // never attempts decryption, only ciphertext-hash comparison

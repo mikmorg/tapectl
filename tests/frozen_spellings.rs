@@ -102,7 +102,7 @@ fn file_1() -> String {
 }
 
 fn file_2() -> String {
-    tapectl::volume::layout::generate_restore_script_v2("L6-0001", 12)
+    tapectl::volume::heir::RESTORE_SH.to_string()
 }
 
 /// A real cover sheet: a home made by the binary's own `init` (which mints
