@@ -910,8 +910,8 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     let id_text = std::str::from_utf8(&id_thunk).expect("id thunk utf8");
     assert!(id_text.contains(label));
     assert!(
-        id_text.contains("tapectl-volume-v2"),
-        "id thunk must carry the v2 magic"
+        id_text.contains("magic = \"tapectl-volume-v3\""),
+        "id thunk must carry the Layout 3 magic"
     );
     let total_files = parse_i32_field(id_text, "total_files").expect("total_files");
     let front_index_pos = parse_i32_field(id_text, "front_index").expect("front_index");
@@ -1425,7 +1425,7 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
     let script_text = extract_restore_sh(&tape_dev(), BLOCK_SIZE, &script_path);
     assert!(
         script_text.contains("--verify"),
-        "extracted File 2 does not look like RESTORE.sh v2 (no --verify mode found)"
+        "extracted File 2 does not look like RESTORE.sh (no --verify mode found)"
     );
 
     let output = run_restore_sh_verify(&script_path, &tape_dev());
@@ -1436,8 +1436,8 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
         "RESTORE.sh --verify must PASS on a good tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("VERIFY: PASS"),
-        "expected a VERIFY: PASS line, got:\n{stdout}"
+        stdout.contains("VERIFY PASSED"),
+        "expected a VERIFY PASSED line (tests/heir_restore.rs asserts it), got:\n{stdout}"
     );
 }
 
@@ -1750,18 +1750,18 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_corrupted_position() {
         "RESTORE.sh --verify must FAIL on the hand-corrupted tape\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("VERIFY: PASS"),
-        "must not print VERIFY: PASS on a corrupted tape:\n{stdout}"
+        !stdout.contains("VERIFY PASSED") && stdout.contains("VERIFY FAILED: 1 file(s)"),
+        "must print VERIFY FAILED, never VERIFY PASSED, on a corrupted tape:\n{stdout}"
     );
 
-    // Per-file lines are `printf "FAIL  file %3d  %-24s  ..."` — token 0 is
-    // "FAIL", token 1 is "file", token 2 is the position. Parsed rather than
+    // Per-file lines are `FAIL     5  data_slice  ...` — token 0 is "FAIL",
+    // token 1 is the position. Parsed rather than
     // matched as an exact-width substring so this isn't brittle to printf's
     // padding.
     let fail_positions: Vec<i32> = stdout
         .lines()
         .filter(|l| l.trim_start().starts_with("FAIL"))
-        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter_map(|l| l.split_whitespace().nth(1))
         .filter_map(|s| s.parse::<i32>().ok())
         .collect();
     assert!(
@@ -2201,18 +2201,18 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
     let info = restore_sh(&script, &tape_dev(), &["--info"]);
     let out = String::from_utf8_lossy(&info.stdout);
     assert!(info.status.success(), "{info:?}");
-    assert!(out.contains("Verdict: SEALED"), "{out}");
     assert!(
-        out.contains(&format!("The tape ended early, after file {k}:")),
+        out.contains(&format!("Seal marker: present (file {})", k + 1)),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("this tape ended EARLY, after file {k}.")),
         "{out}"
     );
     let verify = restore_sh(&script, &tape_dev(), &["--verify"]);
     let out = String::from_utf8_lossy(&verify.stdout);
     assert!(verify.status.success(), "{verify:?}");
-    assert!(
-        out.contains("VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after"),
-        "{out}"
-    );
+    assert!(out.contains("VERIFY PASSED: "), "{out}");
     // One line for the planned files after the end (ADR-0012 item 140).
     assert!(
         out.contains(&format!("NOT ON TAPE  files {} to ", k + 1)),
@@ -2261,22 +2261,29 @@ fn mhvtl_a_short_seal_at_the_test_hooks_warning_reads_back_over_real_st() {
         String::from_utf8_lossy(&refused.stdout),
         String::from_utf8_lossy(&refused.stderr)
     );
+    // Layout 3: the script restores what this tape holds of the unit, leaves
+    // out the members of the slices it does not hold, lists them, and says the
+    // restore is incomplete (item 264; tests/heir_restore.rs asserts these
+    // texts). It never reports a part as the whole.
     assert!(
         !refused.status.success(),
-        "the cut unit must be refused: {said}"
+        "a unit this tape holds in part is no whole restore: {said}"
     );
     for want in [
-        "unit 'sb-cut'",
-        "is not on this tape whole: the tape ended early,",
-        "--where 'sb-cut'",
-        "No slice has been read.",
+        "NOT ON THIS CARTRIDGE: slices ",
+        " of 13 of unit sb-cut (version 1)",
+        "RESTORE INCOMPLETE: 2 path(s)",
     ] {
         assert!(said.contains(want), "{want:?} not in: {said}");
     }
-    assert!(
-        fs::read_dir(&heir_cut).map_or(true, |mut d| d.next().is_none()),
-        "nothing of the cut unit is restored"
-    );
+    let damaged = fs::read_to_string(heir_cut.join(".tapectl-damaged-files.txt"))
+        .expect("the damaged-file list is written in --to");
+    for name in ["forty-megs.bin", "small.txt"] {
+        assert!(
+            damaged.lines().any(|l| l == name),
+            "{name} is on the damaged-file list: {damaged}"
+        );
+    }
 
     // tapectl restores the whole unit.
     let dest = root.join("tapectl-sa-whole");
@@ -2451,6 +2458,20 @@ fn synthetic_unit(
             ("staging_path", text(&slice.to_string_lossy())),
         ],
     );
+    // A write refuses a unit with no file table (item 265, §1.6), so the copy
+    // carries the source's file table and id map: this test is about the end
+    // of the cartridge, never about what the slices hold.
+    for table in [
+        "stage_files (stage_set_id, seq, kind, slice, path_id, size, sha256, start, \"end\", link_path_id) \
+         SELECT ?2, seq, kind, slice, path_id, size, sha256, start, \"end\", link_path_id FROM stage_files",
+        "stage_ids (stage_set_id, kind, id, name) SELECT ?2, kind, id, name FROM stage_ids",
+    ] {
+        conn.execute(
+            &format!("INSERT INTO {table} WHERE stage_set_id = ?1"),
+            rusqlite::params![set_id, set],
+        )
+        .unwrap();
+    }
 }
 
 /// **A seal lost past the cartridge's end never seals** (#420; plan §5, the
