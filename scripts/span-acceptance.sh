@@ -5,7 +5,7 @@
 #
 # WHAT IT PROVES (item 137 as item 139 amends it), on the one test cartridge used as two
 # volumes in turn:
-#   1 tape 1: a filler up to the fill ceiling, then a real unit that allows spanning, written
+#   1 tape 1: a filler up to the fill ceiling, then a real unit (every unit may span: item 288), written
 #     with --keep-staging and ended by the drive's REAL early warning inside that unit. Its
 #     write row is `range`, every written position at or before ended_after; what was written
 #     past the warning reads back (item 114); File 0 and the short seal state
@@ -28,12 +28,12 @@
 # HOW TAPE 1 IS FILLED. As 1.6.0's run (item 115): a filler unit staged normally from a
 # source a little larger than one slice, then given N slice rows naming its one real staged
 # slice (examples/short_seal_filler.rs, `fill`). Here the filler is the whole unit and ends
-# at the fill ceiling: with a unit that may span queued, whole units stop at the ceiling and
-# the unit that may span is planned last, past the plan bound to its end (items 83 and 123),
-# so the early warning ends it on the tape. The cartridge keeps the generation table's 2.5 TB
+# at the fill ceiling: the queue is in unit-name order (the filler sorts before the real unit), and
+# the set that carries the plan past the plan bound is planned to its end and is the last
+# (items 123, 288 and 289), so the early warning ends it on the tape. The cartridge keeps the generation table's 2.5 TB
 # (production's figure): the ceiling is 2.425 TB, the warning came near 2.502 TB on this
 # cartridge (2026-10-21), so about 77 GB of a 100 GB unit is on tape 1. `fill --plan-end` is
-# the plan's end, and the plan holds the unit that may span to its end, so the end given is
+# the plan's end, and the plan holds the last set to its end, so the end given is
 # the ceiling plus that unit's size.
 #
 # THE UNIT THAT MAY SPAN is a COPY of --span-source (the operator's real data on home2) in
@@ -109,7 +109,7 @@ usage: TAPECTL_HOME=<fresh dir> TAPECTL_BIN=<tapectl> [FIXTURE_BIN=<short_seal_f
        scripts/span-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst [options]
        scripts/span-acceptance.sh --print-plan [--mhvtl]
 
-The 1.7.0 acceptance run of spanning: a unit that may span cut by the drive's early warning
+The 1.7.0 acceptance run of spanning: a unit ended as a range by the drive's early warning
 on tape 1, RESTORE.sh restoring tape 1's range and held at its prompt, a rebuild of tape 1, the same
 cartridge written again as tape 2, and the held restore finished from it. OVERWRITES THE
 CARTRIDGE, twice.
@@ -837,10 +837,7 @@ else
 fi
 run unit-f 0 tctl unit init "$FILLER_SRC" --tenant "$TENANT" --name "$UNIT_F"
 run unit-s 0 tctl unit init "$SPAN_DIR" --tenant "$TENANT" --name "$UNIT_S"
-# Item 82: the unit allows spanning, in its dotfile's [policy], as an operator sets it.
-# T5.1 removes this (item 288: every unit continues on the next cartridge; the key goes).
-printf '\n[policy]\nallow_spanning = true\n' >> "$SPAN_DIR/.tapectl-unit.toml"
-cp "$SPAN_DIR/.tapectl-unit.toml" "$STEP_DIR/span-dotfile.toml"
+# Item 288: no unit opts in to spanning; its dotfile is left as `unit init` wrote it.
 for u in "$UNIT_F" "$UNIT_S"; do
     run "snapshot-$u" 0 tctl snapshot create "$u"
 done
@@ -897,8 +894,8 @@ fi
 [ "$END_MIN" -gt "$CAPACITY" ] || fail "$UNIT_S ends by $END_MIN, within the plan bound $CAPACITY: it would not be the span's tail (item 123)"
 log "  $UNIT_S starts between $START_MIN and $START_MAX and ends past $END_MIN; the warning expected at $WARNING_AT"
 run staging-status any tctl --json stage list --all
-# The plan, before any tape: the filler whole under the ceiling, the unit that may span the
-# tail, planned to its end (items 83 and 123), nothing deferred or refused.
+# The plan, before any tape: the filler under the ceiling, then the real unit as the tail, planned
+# to its end (items 123 and 288), both queued (no owed run yet), nothing deferred.
 run plan 0 tctl --json volume plan
 python3 - "$STEP_DIR/plan.out" "$UNIT_F" "$UNIT_S" "$N" <<'PY' > "$STEP_DIR/assert-plan.txt" 2>&1 || fail "volume plan does not plan the filler under the ceiling and $UNIT_S as the span's tail ($STEP_DIR/assert-plan.txt)"
 import json, sys
@@ -906,10 +903,10 @@ d = json.load(open(sys.argv[1]))["spanning"]
 f, s, n = sys.argv[2], sys.argv[3], int(sys.argv[4])
 assert d is not None, "volume plan shows no spanning plan"
 got = [(u["unit"], u["class"], u["placed"], u["first_slice"], u["last_slice"]) for u in d["units"]]
-want = [(f, "whole", "committed", 1, got[0][4] if got else 0), (s, "may span", "tail", 1, n)]
+want = [(f, "queued", "committed", 1, got[0][4] if got else 0), (s, "queued", "tail", 1, n)]
 assert got == want, f"the plan: {got}, want {want}"
-assert d["deferred"] == [] and d["refused"] == [], d
-print(f"volume plan: {f} whole under the fill ceiling, then {s} slices 1-{n}, the tail")
+assert d["deferred"] == [], d
+print(f"volume plan: {f} under the fill ceiling, then {s} slices 1-{n}, the tail")
 PY
 log "  $(tail -n 1 "$STEP_DIR/assert-plan.txt")"
 end_step
@@ -962,7 +959,7 @@ c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
 j = json.load(open(out))
 def q(sql, *a): return c.execute(sql, a).fetchall()
 assert j["ending"] == "short" and j["ended_after"] == k, j
-assert j["cut_units"] == [] and j["deferred_units"] == [] and j["keep_together"] == [], j
+assert "cut_units" not in j and j["deferred_units"] == [] and j["keep_together"] == [], j
 assert len(j["range_units"]) == 1, j["range_units"]
 r = j["range_units"][0]
 k1 = r["last_slice"]
@@ -970,10 +967,10 @@ assert r == {"unit": us, "version": 1, "first_slice": 1, "last_slice": k1} and 1
 assert j["keep_staging"] is True and j["staging_released"] is False, "--keep-staging did not keep the staging"
 assert all(s["slices"] == [] for s in j["slices_released"]), f"slices released under --keep-staging: {j['slices_released']}"
 assert q("SELECT status, ended_after FROM volumes WHERE label = ?", label) == [("sealed", k)], q("SELECT status, ended_after FROM volumes WHERE label = ?", label)
-rows = {u: (st, ms) for u, st, ms in q("""SELECT u.name, w.status, w.may_span FROM writes w
+rows = dict(q("""SELECT u.name, w.status FROM writes w
     JOIN volumes v ON v.id = w.volume_id JOIN snapshots s ON s.id = w.snapshot_id
-    JOIN units u ON u.id = s.unit_id WHERE v.label = ?""", label)}
-assert rows == {uf: ("completed", 0), us: ("range", 1)}, f"tape 1's rows (status, may_span): {rows} (items 121, 124)"
+    JOIN units u ON u.id = s.unit_id WHERE v.label = ?""", label))
+assert rows == {uf: "completed", us: "range"}, f"tape 1's rows (status): {rows} (items 121, 288)"
 pos = q("""SELECT sl.slice_number, CAST(wp.position AS INTEGER), wp.status FROM write_positions wp
     JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
     JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN snapshots s ON s.id = w.snapshot_id
@@ -989,7 +986,7 @@ assert all(p > k for _, p, _ in past), f"an unwritten position at or before ende
 f_last = q("""SELECT MAX(CAST(wp.position AS INTEGER)) FROM write_positions wp JOIN writes w ON w.id = wp.write_id
     JOIN volumes v ON v.id = w.volume_id JOIN snapshots s ON s.id = w.snapshot_id JOIN units u ON u.id = s.unit_id
     WHERE v.label = ? AND u.name = ? AND wp.status = 'written'""", label, uf)[0][0]
-assert f_last is not None and f_last < ps[0], f"the filler ends at {f_last}, not before {us} at {ps[0]} (item 83)"
+assert f_last is not None and f_last < ps[0], f"the filler ends at {f_last}, not before {us} at {ps[0]} (the queue's name order, item 288)"
 st = q("SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = ?", us)[0][0]
 assert st == "staged", f"{us} is {st} after tape 1: a range alone is not a copy (item 128)"
 sl = q("""SELECT sl.slice_number, sl.released_at, sl.staging_path FROM stage_slices sl
@@ -1206,10 +1203,10 @@ c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
 j = json.load(open(out))
 def q(sql, *a): return c.execute(sql, a).fetchall()
 assert j["ending"] == "full" and j["ended_after"] is None, j
-assert j["cut_units"] == [] and j["range_units"] == [] and j["deferred_units"] == [] and j["keep_together"] == [], j
-rows = q("""SELECT u.name, w.status, w.may_span FROM writes w JOIN volumes v ON v.id = w.volume_id
+assert "cut_units" not in j and j["range_units"] == [] and j["deferred_units"] == [] and j["keep_together"] == [], j
+rows = q("""SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
     JOIN snapshots s ON s.id = w.snapshot_id JOIN units u ON u.id = s.unit_id WHERE v.label = ?""", label)
-assert rows == [(us, "completed", 1)], f"tape 2's rows (unit, status, may_span): {rows} (item 139)"
+assert rows == [(us, "completed")], f"tape 2's rows (unit, status): {rows} (item 139)"
 written = [sn for (sn,) in q("""SELECT sl.slice_number FROM write_positions wp JOIN writes w ON w.id = wp.write_id
     JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id
     WHERE v.label = ? AND wp.status = 'written' ORDER BY sl.slice_number""", label)]
