@@ -5439,13 +5439,7 @@ fn span_write_rows(conn: &rusqlite::Connection) -> Vec<SpanWriteRow> {
     )
     .unwrap()
     .query_map([], |r| {
-        Ok((
-            r.get(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-        ))
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
     })
     .unwrap()
     .collect::<rusqlite::Result<_>>()
@@ -5777,11 +5771,7 @@ fn the_three_tapes_rebuilt_in_any_order_give_the_writing_catalogs_rows() {
         }
         // A Layout 3 block states no spanning key (item 288): the rows a
         // rebuild records are the rows the write recorded, whole or range.
-        assert_eq!(
-            span_write_rows(&fresh),
-            written_rows,
-            "order {order:?}"
-        );
+        assert_eq!(span_write_rows(&fresh), written_rows, "order {order:?}");
         assert_eq!(span_positions(&fresh), written_positions, "order {order:?}");
         let stage_sets: i64 = fresh
             .query_row(
@@ -5882,8 +5872,7 @@ fn a_tape_with_no_spannable_unit_rebuilds_as_it_did_before() {
         .unwrap();
     assert_eq!(rows.len(), UNITS.len());
     assert!(
-        rows.iter()
-            .all(|(w, s)| w == "completed" && s == "current"),
+        rows.iter().all(|(w, s)| w == "completed" && s == "current"),
         "{rows:?}"
     );
     let detail: String = fresh

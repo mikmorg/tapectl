@@ -3990,9 +3990,7 @@ impl SealedPending {
                                     });
                                     range_writes.push((*write_id, *snapshot_id));
                                 }
-                                Split::Unwritten => {
-                                    unwritten_units.push(unit_name(*snapshot_id)?)
-                                }
+                                Split::Unwritten => unwritten_units.push(unit_name(*snapshot_id)?),
                             }
                         }
                         if completed == 0 {
@@ -11986,7 +11984,10 @@ mod tests {
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("sealed short"), "{report}");
             assert!(report.contains(&format!("tape file {k}")), "{report}");
-            assert!(report.contains("Planned and not written (still staged): c."), "{report}");
+            assert!(
+                report.contains("Planned and not written (still staged): c."),
+                "{report}"
+            );
             assert!(
                 report.contains("`tapectl volume write <label>`"),
                 "{report}"
@@ -12878,7 +12879,10 @@ mod tests {
             assert!(done.unwritten_units.is_empty());
             assert_eq!(
                 rows(&s),
-                [row("b", "completed", "current"), row("c", "range", "staged")]
+                [
+                    row("b", "completed", "current"),
+                    row("c", "range", "staged")
+                ]
             );
         }
 
@@ -13194,7 +13198,10 @@ mod tests {
             );
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("Held here as a range"), "{report}");
-            assert!(report.contains("Planned and not written (still staged): c."), "{report}");
+            assert!(
+                report.contains("Planned and not written (still staged): c."),
+                "{report}"
+            );
 
             // And a full seal: no details, as before 1.6.0.
             let s = three_units();

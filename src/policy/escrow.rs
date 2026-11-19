@@ -571,11 +571,8 @@ mod tests {
                 params![ss_id],
             )
             .unwrap();
-            conn.execute(
-                "DELETE FROM writes WHERE stage_set_id = ?1",
-                params![ss_id],
-            )
-            .unwrap();
+            conn.execute("DELETE FROM writes WHERE stage_set_id = ?1", params![ss_id])
+                .unwrap();
             assert!(stage_set_coverage(&conn, Scope::Unit(unit_id), ESCROW)
                 .unwrap()
                 .is_empty());

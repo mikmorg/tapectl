@@ -1511,7 +1511,10 @@ mod tests {
             vec![Placed::Committed, Placed::Tail, Placed::Deferred]
         );
         assert_eq!(p.order, vec![0, 1]);
-        assert_eq!(p.tail_room, None, "with a bound the tail is planned to its end");
+        assert_eq!(
+            p.tail_room, None,
+            "with a bound the tail is planned to its end"
+        );
         // Alone, a set larger than a tape is the tail, never refused.
         let p = budget(8 * BS, 0, Some(10 * BS)).place(BS, &items[1..2]);
         assert_eq!(p.placed, vec![Placed::Tail]);

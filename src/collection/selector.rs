@@ -263,7 +263,10 @@ mod tests {
             unit("e", 2),
         ];
         let batches = plan_batches(units, None, None, fill(10), 1).unwrap();
-        assert_eq!(names_of(&batches), vec![vec!["a", "b", "c", "d"], vec!["e"]]);
+        assert_eq!(
+            names_of(&batches),
+            vec![vec!["a", "b", "c", "d"], vec!["e"]]
+        );
         assert_eq!(batches[0].padded_bytes, 15);
         assert_eq!(batches[1].padded_bytes, 2);
     }
@@ -382,11 +385,20 @@ mod tests {
     /// is the last.
     #[test]
     fn with_a_bound_a_batch_reaches_past_the_ceiling_and_ends_at_the_unit_that_crosses_it() {
-        let units = vec![unit("a", 4), unit("b", 4), unit("c", 2), unit("d", 3), unit("e", 1)];
+        let units = vec![
+            unit("a", 4),
+            unit("b", 4),
+            unit("c", 2),
+            unit("d", 3),
+            unit("e", 1),
+        ];
         let batches = plan_batches(units, None, None, ROOM, 1).unwrap();
         // a=4, b=8 (the ceiling), c=10 (past the ceiling, at the bound), d=13
         // crosses the bound: the batch's last unit.
-        assert_eq!(names_of(&batches), vec![vec!["a", "b", "c", "d"], vec!["e"]]);
+        assert_eq!(
+            names_of(&batches),
+            vec![vec!["a", "b", "c", "d"], vec!["e"]]
+        );
         let planned = ROOM.budget().place(
             0,
             &batches[0]

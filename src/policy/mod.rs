@@ -1613,7 +1613,10 @@ slice_size = "500M"
             )
             .unwrap();
         t.conn
-            .execute("UPDATE units SET archive_set_id = NULL WHERE name = 'bravo'", [])
+            .execute(
+                "UPDATE units SET archive_set_id = NULL WHERE name = 'bravo'",
+                [],
+            )
             .unwrap();
         assert_eq!(
             volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
@@ -1623,8 +1626,7 @@ slice_size = "500M"
 
         let range_only = short_tape::range_only_tape();
         assert_eq!(
-            volume_verify_interval_days(&range_only.conn, range_only.volume_id, Some(365))
-                .unwrap(),
+            volume_verify_interval_days(&range_only.conn, range_only.volume_id, Some(365)).unwrap(),
             Some(365),
             "a volume holding only a range still has its interval"
         );

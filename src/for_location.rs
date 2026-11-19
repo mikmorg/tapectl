@@ -1952,7 +1952,8 @@ mod tests {
     /// closes the tape, so a smaller one after it waits too (item 69), and
     /// every waiting unit is named with its need.
     #[test]
-    fn packing_ends_the_tape_at_the_unit_that_carries_the_plan_past_the_room_and_names_the_waiting() {
+    fn packing_ends_the_tape_at_the_unit_that_carries_the_plan_past_the_room_and_names_the_waiting()
+    {
         let c = Cat::new();
         let mib = MIB as usize;
         c.unit("a", "active", Some(&[("f", 3 * mib)]));
@@ -2370,7 +2371,12 @@ mod tests {
         );
         assert_eq!(
             names(&plan.planned),
-            ["\"s1\" v1", "\"s2\" v1", "\"s4\" v1", "\"new\" (new version)"]
+            [
+                "\"s1\" v1",
+                "\"s2\" v1",
+                "\"s4\" v1",
+                "\"new\" (new version)"
+            ]
         );
         assert_eq!(
             plan.planned[3].how,

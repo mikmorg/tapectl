@@ -102,7 +102,9 @@ fn the_unit_the_tape_ended_in_is_a_range_and_one_after_it_has_no_data_there() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("unit \"bravo\" version 1 cannot be restored: slice 2 of it is on no live volume"),
+        err.contains(
+            "unit \"bravo\" version 1 cannot be restored: slice 2 of it is on no live volume"
+        ),
         "{err}"
     );
 

@@ -2433,7 +2433,10 @@ mod tests {
 
         let report =
             clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
-        assert_eq!(report.sets_cleaned, 0, "a set with no write must stay staged");
+        assert_eq!(
+            report.sets_cleaned, 0,
+            "a set with no write must stay staged"
+        );
         assert!(path.exists());
 
         seed_write(&conn, stage_set_id, "V-NEXT", "completed");

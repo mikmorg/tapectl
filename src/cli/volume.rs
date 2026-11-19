@@ -6001,7 +6001,11 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert!(lines[0].contains("continues on the next cartridge"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("continues on the next cartridge"),
+            "{}",
+            lines[0]
+        );
     }
 
     /// #418 R4: `volume plan` names the index's size, twice it for the

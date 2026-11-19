@@ -6842,9 +6842,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains(&format!(
-                "unit \"unit1\" is {size} bytes"
-            )),
+            msg.contains(&format!("unit \"unit1\" is {size} bytes")),
             "{msg}"
         );
         assert!(

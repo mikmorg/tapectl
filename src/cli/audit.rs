@@ -6991,17 +6991,14 @@ mod tests {
         fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
             let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
             assert!(
-                violations
-                    .iter()
-                    .all(|f| f.check != "completed_past_ending"
-                        && f.check != "completed_without_every_slice"),
+                violations.iter().all(|f| f.check != "completed_past_ending"
+                    && f.check != "completed_without_every_slice"),
                 "{violations:?}"
             );
             warnings
                 .into_iter()
                 .filter(|f| {
-                    f.check == "completed_past_ending"
-                        || f.check == "completed_without_every_slice"
+                    f.check == "completed_past_ending" || f.check == "completed_without_every_slice"
                 })
                 .collect()
         }

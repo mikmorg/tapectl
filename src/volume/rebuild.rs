@@ -2403,8 +2403,7 @@ fn insert_all(
         // A staging the tape holds none of has no write on it, and so no
         // positions: its slices stay staged for another tape (item 288).
         if written != Written::Unwritten {
-            let write_id =
-                ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
+            let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, written, report)?;
             for (slice, slice_id) in slice_ids {
                 let laid_down = sealed && slice_on_tape(slice, ended_after);
                 ensure_position(tx, write_id, slice_id, slice, laid_down, report)?;
@@ -2626,13 +2625,12 @@ fn ensure_snapshot(
     // only the positions inserted after this row can show. It is inserted
     // `staged`, as the writing catalog holds it before its tapes seal, and
     // [`promote_spanning_version`] makes it `current` when the rule holds.
-    let status = if held_in_part(unit)
-        || matches!(written, Written::Range { .. } | Written::Unwritten)
-    {
-        "staged"
-    } else {
-        "current"
-    };
+    let status =
+        if held_in_part(unit) || matches!(written, Written::Range { .. } | Written::Unwritten) {
+            "staged"
+        } else {
+            "current"
+        };
     tx.execute(
         "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
                                 total_size, file_count)

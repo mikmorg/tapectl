@@ -15219,7 +15219,10 @@ mod tests {
             [PlanClass::Queued],
             "a write for a location plans a set like any ordinary write"
         );
-        assert_eq!(classes(StagedScope::Rewrite(ids.to_vec())), [PlanClass::Queued]);
+        assert_eq!(
+            classes(StagedScope::Rewrite(ids.to_vec())),
+            [PlanClass::Queued]
+        );
         assert!(StagedScope::Every.may_plan_past_the_ceiling());
         assert!(
             !StagedScope::Rewrite(ids.to_vec()).may_plan_past_the_ceiling(),
@@ -27416,7 +27419,11 @@ mod tests {
                 r.expect("a plan that ends at the ceiling is written");
                 assert_eq!(code, 0);
                 let rows = writes_of(&f, "SE-N");
-                assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
+                assert_eq!(
+                    rows[0],
+                    ("a".to_string(), "completed".to_string()),
+                    "{rows:?}"
+                );
                 assert!(
                     rows.iter().all(|(u, _)| u != "c"),
                     "nothing of c reached the tape: {rows:?}"
@@ -27496,14 +27503,18 @@ mod tests {
                 /// warning has a `range` row and no `cut` row, and the next
                 /// write lays its owed slices first.
                 #[test]
-                fn dw_an_interrupted_unit_has_a_range_row_no_cut_row_and_its_owed_slices_come_first() {
+                fn dw_an_interrupted_unit_has_a_range_row_no_cut_row_and_its_owed_slices_come_first(
+                ) {
                     let f = fixture(A_B3_C, &["DW-1", "DW-2"]);
                     let mut store = ArmedAt::new(10, warning);
                     write(&f, "DW-1", &mut store, false)
                         .0
                         .expect("a short seal is a success");
                     let rows = writes_of(&f, "DW-1");
-                    assert!(rows.contains(&("b".to_string(), "range".to_string())), "{rows:?}");
+                    assert!(
+                        rows.contains(&("b".to_string(), "range".to_string())),
+                        "{rows:?}"
+                    );
                     assert!(rows.iter().all(|(_, s)| s != "cut"), "{rows:?}");
                     let cut: i64 = f
                         .conn
@@ -27546,7 +27557,8 @@ mod tests {
                 /// Done when 3: on a drive without `post_warning_bytes` the tape
                 /// ends by its plan at the ceiling and the rest continues.
                 #[test]
-                fn dw_without_post_warning_bytes_the_tape_ends_at_the_ceiling_and_the_rest_continues() {
+                fn dw_without_post_warning_bytes_the_tape_ends_at_the_ceiling_and_the_rest_continues(
+                ) {
                     let mut f = fixture(
                         &[("a", &[WIDE_SLICE]), ("b", &[WIDE_SLICE; 3])],
                         &["DW-4", "DW-5"],
@@ -27564,7 +27576,11 @@ mod tests {
                         .0
                         .expect("the plan ends at the ceiling and is written");
                     let rows = writes_of(&f, "DW-4");
-                    assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
+                    assert_eq!(
+                        rows[0],
+                        ("a".to_string(), "completed".to_string()),
+                        "{rows:?}"
+                    );
                     assert_eq!(stage_set_status(&f, "b"), "staged");
 
                     let mut next = MemStore::new(SBS);
@@ -27897,7 +27913,11 @@ mod tests {
                     r.expect("the plan ends at the ceiling and is written");
                     assert_eq!(code, 0);
                     let rows = writes_of(&f, "SN-1");
-                    assert_eq!(rows[0], ("a".to_string(), "completed".to_string()), "{rows:?}");
+                    assert_eq!(
+                        rows[0],
+                        ("a".to_string(), "completed".to_string()),
+                        "{rows:?}"
+                    );
                     assert!(
                         rows.iter().all(|(u, s)| u != "b" || s == "range"),
                         "b is never whole on this tape: {rows:?}"
@@ -28138,8 +28158,7 @@ mod tests {
                 ) -> (StagedBatch, build::BuiltLayout, tempfile::TempDir, u64) {
                     let f = fixture(units, &["SR-1"]);
                     grow_envelopes(&f.conn, &f._tmp.path().join("catalogue"), catalogue_bytes);
-                    let batch =
-                        checked_staged_units(&f.conn, &f.config, None).unwrap();
+                    let batch = checked_staged_units(&f.conn, &f.config, None).unwrap();
                     let (built, dir) = built(&f, "SR-1", u64::MAX / 4, None);
                     let fixed = built.layout.fixed_on_tape_bytes();
                     (batch, built, dir, fixed)
@@ -28410,10 +28429,7 @@ mod tests {
                         writes_of(&f, "SV-1"),
                         pairs(&[("a", "completed"), ("b", "range")])
                     );
-                    let none = vec![
-                        ("a".to_string(), false),
-                        ("b".to_string(), false),
-                    ];
+                    let none = vec![("a".to_string(), false), ("b".to_string(), false)];
                     assert_eq!(verified(&f, "SV-1"), none, "a quick confirm");
 
                     verify(&f, "SV-1", &mut store, Tier::Navigable);
@@ -28422,10 +28438,7 @@ mod tests {
                     verify(&f, "SV-1", &mut store, Tier::Integrity);
                     assert_eq!(
                         verified(&f, "SV-1"),
-                        [
-                            ("a".to_string(), true),
-                            ("b".to_string(), true),
-                        ],
+                        [("a".to_string(), true), ("b".to_string(), true),],
                         "the full readback read the range too"
                     );
                 }

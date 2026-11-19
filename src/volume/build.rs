@@ -1393,8 +1393,8 @@ fn append_tar_file_member<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::layout_model::Placed;
+    use super::*;
     use std::io::Write;
 
     const BS: u64 = 512 * 1024;

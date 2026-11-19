@@ -639,11 +639,8 @@ mod tests {
     fn a_range_is_a_fill_copy_and_is_marked_as_a_range() {
         let conn = catalog();
         // Stage set 2's only holder becomes a range of it.
-        conn.execute(
-            "UPDATE writes SET status = 'range' WHERE id = 3",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE writes SET status = 'range' WHERE id = 3", [])
+            .unwrap();
         let copies = other_copies_of_version(&conn, 1, 1).unwrap();
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].stage_set_id, 2);

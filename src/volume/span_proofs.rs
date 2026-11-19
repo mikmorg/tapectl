@@ -243,13 +243,7 @@ impl Home {
     }
 
     /// [`Self::unit`], in archive set `archive_set` when given.
-    fn unit_in(
-        &mut self,
-        tenant: &str,
-        name: &str,
-        files: Files,
-        archive_set: Option<&str>,
-    ) {
+    fn unit_in(&mut self, tenant: &str, name: &str, files: Files, archive_set: Option<&str>) {
         let dir = self.sources.join(name);
         fs::create_dir_all(&dir).unwrap();
         for (file, bytes) in &files {
@@ -607,11 +601,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     );
     assert_eq!(
         writes_of(c, T93[0]),
-        rows(&[
-            (A93, "completed"),
-            (B93, "range"),
-            (C93, "completed")
-        ])
+        rows(&[(A93, "completed"), (B93, "range"), (C93, "completed")])
     );
     assert_eq!(requires_line(h.files(T93[0])), "requires = []");
     assert_eq!(
@@ -648,11 +638,7 @@ fn item_93_two_copies_over_three_tapes_are_range_completed_range() {
     assert_eq!(sealing(c, T93[1]), (true, None), "a full seal");
     assert_eq!(
         writes_of(c, T93[1]),
-        rows(&[
-            (A93, "completed"),
-            (B93, "completed"),
-            (C93, "completed")
-        ])
+        rows(&[(A93, "completed"), (B93, "completed"), (C93, "completed")])
     );
     assert!(write::recorded_ranges(c, T93[1]).unwrap().is_empty());
     assert_eq!(
@@ -753,11 +739,7 @@ fn home_94() -> Home {
         W94,
         files("waiting-ledger", &[380_000, 380_000], 21),
     );
-    h.unit(
-        TENANT_ONE,
-        S94,
-        files("sequoia-reel", &[775_000; 6], 22),
-    );
+    h.unit(TENANT_ONE, S94, files("sequoia-reel", &[775_000; 6], 22));
     h.stage(W94);
     h.stage(S94);
     for label in T94 {
@@ -1313,9 +1295,7 @@ fn write_rows(conn: &Connection) -> Vec<WriteRow> {
           ORDER BY v.label, u.name",
     )
     .unwrap()
-    .query_map([], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-    })
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
     .unwrap()
     .collect::<rusqlite::Result<_>>()
     .unwrap()
@@ -1839,10 +1819,7 @@ fn a_short_seal_leaves_a_range_and_a_set_planned_and_not_written() {
             rows(&[(A0, "completed"), (B0, "range")]),
             "{label}"
         );
-        assert_eq!(
-            write::recorded_ranges(c, label).unwrap(),
-            [range(B0, 1, 2)]
-        );
+        assert_eq!(write::recorded_ranges(c, label).unwrap(), [range(B0, 1, 2)]);
         assert!(write::keep_together(c, label).unwrap().is_empty());
         assert_eq!(
             write::recorded_ending(c, label).unwrap(),

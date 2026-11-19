@@ -3527,7 +3527,10 @@ pub(crate) mod tests {
         );
 
         c.conn
-            .execute("DELETE FROM write_positions WHERE write_id = ?1", params![w1])
+            .execute(
+                "DELETE FROM write_positions WHERE write_id = ?1",
+                params![w1],
+            )
             .unwrap();
         c.conn
             .execute("DELETE FROM writes WHERE id = ?1", params![w1])

@@ -151,14 +151,8 @@ fn batches_for_budget(
         fill: packing.fill,
         bound: packing.bound,
     };
-    let batches = selector::plan_batches(
-        synthetic,
-        first,
-        staging_total(config),
-        room,
-        BLOCK_SIZE,
-    )
-    .map_err(|larger| staging_refusal(&lib.name, config, &larger))?;
+    let batches = selector::plan_batches(synthetic, first, staging_total(config), room, BLOCK_SIZE)
+        .map_err(|larger| staging_refusal(&lib.name, config, &larger))?;
     Ok(Packed {
         batches,
         refused: scan.refused,
@@ -2756,7 +2750,10 @@ compression = "bogus"
             let (batches, refused) =
                 plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
             assert!(refused.is_empty());
-            assert_eq!(batch_names(&batches), [vec!["testlib/alpha", "testlib/big"]]);
+            assert_eq!(
+                batch_names(&batches),
+                [vec!["testlib/alpha", "testlib/big"]]
+            );
         }
     }
 

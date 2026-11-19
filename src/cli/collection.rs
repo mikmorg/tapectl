@@ -1499,7 +1499,10 @@ fn cmd_plan(
                     crate::render::plural(copies, "copy", "copies"),
                     crate::render::plural(batches.len() as i64 * copies, "cartridge", "cartridges"),
                 );
-                if batches.iter().any(|b| packed.placement(b).continues.is_some()) {
+                if batches
+                    .iter()
+                    .any(|b| packed.placement(b).continues.is_some())
+                {
                     println!("  {SPAN_COUNT_CAVEAT}");
                 }
                 if !batches.is_empty() {

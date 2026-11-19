@@ -455,7 +455,10 @@ patterns = [\"*.iso\"]
         std::fs::write(&path, WRITTEN_BY_AN_EARLIER_BUILD).unwrap();
         let df = read_dotfile(&path).unwrap();
         write_dotfile(&path, &df).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), WRITTEN_BY_AN_EARLIER_BUILD);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            WRITTEN_BY_AN_EARLIER_BUILD
+        );
     }
 
     /// An unknown `[policy]` key is refused by name, with the file's path,

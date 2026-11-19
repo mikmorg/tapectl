@@ -22,9 +22,8 @@ use super::fixture::{
 };
 use super::repair_tests::tests::{Reply, TestBay};
 use super::{
-    plan_restore, plan_units, restore_unit, restore_units_from_bay,
-    select_write_positions, span, unit_requests, units_on_volume, RestoreOptions, RestoreTarget,
-    SCRATCH_NAME,
+    plan_restore, plan_units, restore_unit, restore_units_from_bay, select_write_positions, span,
+    unit_requests, units_on_volume, RestoreOptions, RestoreTarget, SCRATCH_NAME,
 };
 use crate::error::Result;
 use crate::store::{CapacityReport, EarlyWarning, MemStore, Store, TapeStore};
