@@ -4,12 +4,15 @@
 # Five legs over a real mhvtl tape, driven through the tapectl BINARY:
 #   1. tapectl round trip: init → tenants → units → snapshot → stage →
 #      volume init/write/verify → restore → diff -r
-#   2. Heir leg (no tapectl, no DB): dd RESTORE.sh off the tape and run
-#      --info / --find-envelope / --restore with a tenant key; since 1.3.0
-#      also --where and --find (the cross-volume index) and a --restore that
-#      takes a bad slice from a second cartridge (--slices-from, #480)
+#   2. Heir leg (no tapectl, no DB): dd RESTORE.sh off the tape and run it with the real age,
+#      tar, mt, dd and sha256sum. Layout 3's script has these modes (T4.16; tests/heir_restore.rs
+#      is its own suite): --info, --verify, --find-envelope, --list, --restore (a whole unit,
+#      --unit/--all), --restore --path, --restore --paths-from (the one repair, from a second
+#      cartridge), --where, --find; and, for a unit that continues on another cartridge, one
+#      prompt (ENTER: loaded; done or end of input: "I do not have it"; quit). A unit stored with
+#      compression is read with the real gzip, xz or zstd.
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
-#      contain plaintext canaries
+#      contain plaintext canaries or a plaintext tar stream
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
 #   5. Interrupt + resume (issue #93): interrupt a real write three ways and
 #      prove `volume resume` finishes each one — the recovery command that
@@ -21,11 +24,11 @@
 #      Includes tape_alert_surfaced (issue #340): `report health` shows a
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
-#   Span leg (1.7.0, #478; ADR-0012 item 136): a unit across tapes, in its
+#   Span leg (1.7.0, #478; ADR-0012 item 136; Layout 3: T4.16): a unit across tapes, in its
 #      own homes and on its own cartridges, swapped with mtx; RESTORE.sh's
 #      prompts and tapectl's (on a pseudo-terminal) answered by
 #      scripts/mhvtl-prompt-driver.py. TAPECTL_GATE_SWAP_WAIT (seconds,
-#      default 300) is how long the drive stays empty at --stream-tapes' swap.
+#      default 300) is how long the drive stays empty at the swap of span_heir_stream_swap.
 #   LBP legs (1.7.2, #388; ADR-0012 items 162-166, 174): the gate's TD8 drive speaks CRC32C
 #      and mhvtl cannot carry tapectl's 524,292-byte wire block, so every open falls back
 #      (item 165): lbp_fallback_recorded proves the write records it, warned once, and
@@ -33,14 +36,18 @@
 #      rust_lbp runs tests/mhvtl_lbp.rs on a TD6 drive (Reed-Solomon), named by
 #      TAPECTL_GATE_TAPE_TD6, at a 262,144-byte payload mhvtl can carry.
 #
-# The `check` lines below are the list (67 since item 182's heir_late_damage; 66 since #498's
-# heir_slice_boundary_read; 65 since #388's lbp_fallback_recorded, rust_lbp and
-# lbp_page_clear_after_every_command; 62 since #497's heir_big_catalogue; 61 since #478's span_rows, span_heir_tapes_1_3,
-# span_heir_tape_2, span_heir_stream_swap, span_restore_unit, span_retire_floors,
-# span_floor_target_1, span_rebuild_tape_3 and span_three_tapes; 52 since #420's heir_short_seal, heir_short_info,
-# heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
-# heir_file_check; 46 since #480: heir_where, heir_find and heir_slice_from_copy join the
-# 43 of #444; #400 is not exercisable on mhvtl, see its section). The verdict judges each by NAME against the manifest, never by a total (#471).
+# The `check` lines below are the list, and GATE_EXPECTED_CHECKS (just before the verdict) names
+# every one: the verdict judges each by NAME against it, never by a total (#471), a name that did
+# not run is a FAIL and so is a check nobody listed. Layout 3 (T4.16) dropped heir_big_catalogue,
+# heir_late_damage and heir_slice_boundary_read (they proved dar's stream), renamed
+# heir_slice_from_copy to heir_paths_from_copy and heir_restore_symlink_unit to
+# heir_restore_symlinks, and added heir_verify, heir_list, heir_path, heir_find_path,
+# heir_long_member, span_heir_start_later, span_heir_second_run, span_heir_not_have and
+# heir_{gzip,xz,zstd}_{restore,path}: 78 checks. #400 is not exercisable on mhvtl, see its section.
+#
+# The tools it names: tar (GNU tar 1.35, built with ACL support, is the writer's floor; the
+# config it writes names [tar] binary, never [dar]), age, gzip, xz, zstd (the heir's real
+# decompressors), mt, dd, sha256sum. The summary prints each one's version for the run record.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -66,9 +73,16 @@ die() { echo "GATE PRECONDITION FAILED: $*" >&2; exit 2; }
 grep -q '^mhvtl ' /proc/modules \
     || die "mhvtl module not loaded for $(uname -r) — dkms status; see docs/operator-guide.md"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV missing — systemctl start mhvtl.target"
-for bin in lsscsi mtx mt dar age sha256sum python3 cargo sg_modes; do
+# tar is the writer (config's [tar] binary) and the heir's reader; gzip, xz and zstd are the
+# heir's real decompressors for the heir_{gzip,xz,zstd}_* legs. dar is gone (Layout 3).
+for bin in lsscsi mtx mt tar gzip xz zstd age age-keygen sha256sum python3 cargo sg_modes; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
+# The tar tapectl writes with: TAPECTL_GATE_TAR names one, else the first on PATH. tapectl
+# refuses a tar below its floor itself (GNU tar 1.35 with ACL support); the gate does not judge it.
+GATE_TAR="${TAPECTL_GATE_TAR:-$(command -v tar)}"
+[ -x "$GATE_TAR" ] || die "TAPECTL_GATE_TAR=$GATE_TAR is not an executable"
+GATE_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Single-drive rule (#9): one tape user at a time, across processes.
 exec 9>/tmp/tapectl-tape.lock
@@ -236,21 +250,54 @@ echo "$CANARY payload" > "$SRC/unitA/${CANARY}.txt"
 : > "$SRC/unitA/empty.bin"
 head -c 700000 /dev/urandom > "$SRC/unitA/big-block.bin"
 echo "nested" > "$SRC/unitA/nested/déjà-vu.txt"
-head -c 12000000 /dev/urandom > "$SRC/unitB/twelve-meg.bin"   # ~12 slices @1M
+# A hard link: two names, one file (the second name is an h member of the tar; heir_restore checks
+# the restored names are one file, heir_list that the table lists one f and one h).
+echo "hard-linked" > "$SRC/unitA/hl-a.txt"
+ln "$SRC/unitA/hl-a.txt" "$SRC/unitA/hl-b.txt"
+# unitB (bob's): three files under a slice (700000 bytes each: a slice ends at a member's start, so
+# each is the only file of its own slice, s1 with the dotfile) and one file larger than a slice
+# (12000000 bytes at slice_size 1M: a run of 13 slices to itself). So a bad slice costs exactly one
+# small file (heir_paths_from_copy), a bad piece of the run costs the long file (heir_long_member),
+# and a path is read from one slice (heir_path). Slice numbers are asked of --list, never assumed.
+mkdir -p "$SRC/unitB/set"
+head -c 700000 /dev/urandom > "$SRC/unitB/set/s1.bin"
+head -c 700000 /dev/urandom > "$SRC/unitB/set/s2.bin"
+head -c 700000 /dev/urandom > "$SRC/unitB/set/s3.bin"
+head -c 12000000 /dev/urandom > "$SRC/unitB/twelve-meg.bin"
 echo "target" > "$SRC/unitC/target.txt"
 ln -s target.txt "$SRC/unitC/link-ok"
 ln -s /nonexistent-gate-path "$SRC/unitC/link-broken"
+
+# Rows of an SQL query on a catalog, read-only, tab-separated (the span leg's sp_q is this).
+gate_q() { # gate_q <db> <sql> [param...]
+    python3 - "$@" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+for row in c.execute(sys.argv[2], sys.argv[3:]):
+    print("\t".join("" if v is None else str(v) for v in row))
+PY
+}
+# The tape file a unit's slice <n> is at on <label>, from the catalog the write recorded: what a
+# heir leg injects a fault at or expects a read of. Prints nothing when there is no such slice.
+gate_slice_pos() { # gate_slice_pos <db> <label> <unit> <n>
+    gate_q "$1" "SELECT CAST(wp.position AS INTEGER) FROM write_positions wp
+        JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+        JOIN stage_slices sl ON sl.id = wp.stage_slice_id JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE v.label = ? AND u.name = ? AND sl.slice_number = ? AND wp.status = 'written'" "$2" "$3" "$4"
+}
 
 # ---------- leg 1: tapectl round trip ----------
 # Each command's status is checked (issue #415): this step's verdict used to
 # be `mkdir`'s alone, so a failed `init` or config rewrite still read PASS.
 step_init() {
     TCTL init --operator gate-op --no-escrow || return 1
-    python3 - "$CFG" "$RUN" "$TAPE_DEV" "$DRIVE_SG" <<'PY' || return 1
+    python3 - "$CFG" "$RUN" "$TAPE_DEV" "$DRIVE_SG" "$GATE_TAR" <<'PY' || return 1
 import sys, re
-cfg, run, tape, sg = sys.argv[1:5]
+cfg, run, tape, sg, tar = sys.argv[1:6]
 t = open(cfg).read()
-t = re.sub(r'(?m)^binary *=.*$', 'binary = "/usr/bin/dar"', t, count=1)
+# [tar] binary: the first `binary =` line init writes is the [tar] table's (there is no [dar]).
+t = re.sub(r'(?m)^binary *=.*$', f'binary = "{tar}"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{run}/staging"', t, count=1)
 t = re.sub(r'(?m)^device_tape *=.*$', f'device_tape = "{tape}"', t)
@@ -281,7 +328,12 @@ enospc_buffer = "2G"
 '''
 open(cfg, 'w').write(t)
 PY
-    mkdir -p "$RUN/staging"
+    mkdir -p "$RUN/staging" || return 1
+    # The config names [tar], and no [dar]: the tar line is the first `binary =` in the file.
+    grep -E '^\[tar\]$' "$CFG" >/dev/null || { echo "the config has no [tar] table"; return 1; }
+    if grep -E '^\[dar\]' "$CFG" >/dev/null; then echo "the config has a [dar] table"; return 1; fi
+    grep -F "binary = \"$GATE_TAR\"" "$CFG" >/dev/null || { echo "[tar] binary is not $GATE_TAR"; return 1; }
+    TCTL config check
 }
 step_tenants() {
     TCTL tenant add alice && TCTL tenant add bob \
@@ -738,6 +790,15 @@ dump_whole_tape() { # dump_whole_tape <outfile>
 # on a real LTO-6, which has no media directory at all -- it is no longer
 # mhvtl-only.
 #
+# Layout 3 (T4.16): the slices hold age-encrypted tar streams, not dar's, so the needles that
+# say "a plaintext archive is on this tape" are a tar's. A pax tar (what tapectl writes:
+# `tar --format=pax --numeric-owner`) has "ustar", a NUL and "00" at offset 257 of every header
+# block, and a member's name is in the stream in the clear: the scan looks for that magic and for
+# names the units hold. Each needle KIND has a positive control in the same check: a tar made now
+# from a file with such a name, run through the SAME scan function, must be found, or the
+# negative scan below proves nothing (a scan for dar's signatures would have passed on any tar
+# tape; a regex grep that silently matches nothing would too).
+#
 # The whole tape is scanned, encrypted slices included, rather than only
 # the plaintext positions the Rust `mhvtl_no_plaintext_tenant_metadata`
 # test parses out of the layout. That is deliberate: it is strictly
@@ -745,6 +806,13 @@ dump_whole_tape() { # dump_whole_tape <outfile>
 # layout parser it exists to cross-check. The cost is a chance of a short
 # needle appearing in ciphertext by coincidence -- for "unitA" in a
 # gate-sized volume that is ~1e-5, and the canary is long and unique.
+# One scan, one answer: 0 found, 1 not found, 2 the search itself failed (never read as clean).
+leak_found_fixed() { # leak_found_fixed <text> <file>
+    LC_ALL=C grep -a -q -F -- "$1" "$2" 2>/dev/null
+}
+leak_found_regex() { # leak_found_regex <perl regex> <file>
+    LC_ALL=C grep -a -q -P -- "$1" "$2" 2>/dev/null
+}
 step_leakscan() {
     local dump="$RUN/leakscan-tape.bin" needle rc
     dump_whole_tape "$dump" || return 1
@@ -764,6 +832,37 @@ step_leakscan() {
         echo "leakscan: the seal marker (the volume's last file) is NOT in the tape dump -- the scan stopped short of the end, not the tape clean"
         return 1
     }
+
+    # The tar needles and their positive control, before any negative is read.
+    local ctl="$RUN/leakscan-control" tarmagic='ustar\x0000' name
+    local -a names=(twelve-meg.bin big-block.bin link-broken)
+    rm -rf "$ctl"; mkdir -p "$ctl/src" || return 1
+    echo "positive control" >"$ctl/src/${names[0]}"
+    "$GATE_TAR" --create --file="$ctl/sample.tar" --format=pax --numeric-owner -C "$ctl/src" "${names[0]}" \
+        || { echo "leakscan: could not make the control tar with $GATE_TAR"; return 1; }
+    leak_found_regex "$tarmagic" "$ctl/sample.tar"
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "leakscan: positive control: the ustar-magic scan did not find a pax tar's header (rc=$rc) -- the scan is broken, not the tape clean"; return 1; }
+    leak_found_fixed "${names[0]}" "$ctl/sample.tar"
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "leakscan: positive control: the name scan did not find a member's name in a tar stream (rc=$rc)"; return 1; }
+    echo "leakscan: positive control: the scans found the ustar magic and the name '${names[0]}' in a plaintext tar made now"
+    leak_found_regex "$tarmagic" "$dump"
+    rc=$?
+    case "$rc" in
+        0) echo "leakscan: PLAINTEXT TAR LEAK -- a tar header (ustar magic) is on the tape"; return 1 ;;
+        1) ;;
+        *) echo "leakscan: the ustar-magic scan failed (rc=$rc) -- inconclusive, not clean"; return 1 ;;
+    esac
+    for name in "${names[@]}"; do
+        leak_found_fixed "$name" "$dump"
+        rc=$?
+        case "$rc" in
+            0) echo "leakscan: PLAINTEXT LEAK -- the member name \"$name\" appears on tape"; return 1 ;;
+            1) ;;
+            *) echo "leakscan: grep failed (rc=$rc) looking for \"$name\" -- inconclusive, not clean"; return 1 ;;
+        esac
+    done
 
     # Negative needles. grep's rc 1 (no match) is the real pass; rc >= 2 is
     # an error and must never be read as "clean" -- that read is exactly
@@ -813,129 +912,36 @@ check crosskey_rejected step_crosskey
 check no_plaintext_leak step_leakscan
 
 # ---------- leg 2: heir leg (no tapectl, no DB) ----------
+# Layout 3's RESTORE.sh (T4.16; src/volume/heir/RESTORE.sh), read off the tape by File 1's own
+# mt and dd lines and run with the REAL age, tar, mt, dd and sha256sum: one leg for each mode the
+# script has. tests/heir_restore.rs is the script's own suite (with those tools faked); every text
+# a check below greps for is one a test there asserts, and the comment beside it names the test.
+# The unit, the version, the slice and the position a leg expects come from the CATALOG and the
+# source tree, never from the script's own output, so a script that printed a fixed answer fails.
 HEIR="$RUN/heir"; mkdir -p "$HEIR"
-step_heir_extract() {
-    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
-    && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$HEIR/RESTORE.sh" \
-    && chmod +x "$HEIR/RESTORE.sh" && bash -n "$HEIR/RESTORE.sh"
-}
+HEIR_KEY_A="$HOME_DIR/keys/alice-primary.age.key"
+HEIR_KEY_B="$HOME_DIR/keys/bob-primary.age.key"
+HEIR_DB="$HOME_DIR/tapectl.db"
 # RESTORE.sh defaults to `${TAPE_DEVICE:-/dev/nst0}` — the tape an HEIR would
 # reach for, NOT necessarily this gate's drive. Every invocation below therefore
 # pins TAPE_DEVICE="$TAPE_DEV". Without it the heir leg silently reads /dev/nst0:
 # harmless while nst0 happened to be the mhvtl drive, but on a host where nst0 is
 # a DIFFERENT (e.g. real) drive it reads the wrong tape entirely — heir_info still
 # "passes" against any valid volume there while heir_find/restore fail on keys.
-# Assert the tape read is the tape this gate WROTE, not merely some valid
-# volume. Without this, heir_info passes against any sealed tape in any drive —
-# which is exactly how the wrong-device read above stayed hidden for three runs
-# while three later checks failed on "no envelope matched the provided key".
-step_heir_info() {
-    local out
-    out=$( (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info) ) || return 1
-    printf '%s\n' "$out"
-    grep -q "Tape identifies as: $LABEL\$" <<<"$out" ||
-        {
-            echo "heir_info: tape in $TAPE_DEV is not volume $LABEL — wrong drive or wrong cartridge" >&2
-            return 1
-        }
-    grep -q "Verdict: SEALED" <<<"$out" || {
-        echo "heir_info: volume $LABEL is not SEALED" >&2
-        return 1
-    }
-}
-step_heir_find() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$HOME_DIR/keys/alice-primary.age.key"); }
-step_heir_restore() {
-    # RESTORE.sh extracts the unit's contents directly into --to (dar restores
-    # the unit's own tree), so compare that tree to the source directly — same
-    # shape as the tapectl restore_diff leg.
-    #
-    # `--unit unitA` is REQUIRED, and its absence used to pass only by
-    # accident: alice owns both unitA and unitC, but before #33 unitC could
-    # never stage, so alice's envelope happened to hold exactly one unit and
-    # RESTORE.sh had nothing to disambiguate. With #33 fixed, unitC reaches
-    # the tape and RESTORE.sh correctly refuses to guess ("FATAL: multiple
-    # units found"). Naming the unit restores the intended assertion — this
-    # leg diffs against $SRC/unitA, so it must ask for unitA.
-    (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered") \
-    && diff -r "$SRC/unitA" "$HEIR/recovered"
-}
-# The heir path is the reason this project exists, so symlink survival is
-# checked there too, not only through tapectl. See step_restore_C for why
-# --no-dereference is mandatory here.
-step_heir_restore_symlinks() {
-    (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitC --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-C") \
-    && diff -r --no-dereference "$SRC/unitC" "$HEIR/recovered-C"
-}
-echo "gate: leg 2 — heir leg (RESTORE.sh, no tapectl)"
-check heir_extract_script step_heir_extract
-check heir_info           step_heir_info
-check heir_find_envelope  step_heir_find
-check heir_restore        step_heir_restore
-check heir_restore_symlink_unit step_heir_restore_symlinks
-
-# heir_file_check (1.3.0, ADR-0012 item 103): the RESTORE.sh on the tape checks every
-# restored regular file against the sha256 the tenant index records, with the real
-# sha256sum; --no-file-check skips it. The leg wants the "match" line (never the
-# "no envelope ... lists" or "do NOT match" lines) and the tree equal to the source,
-# then the skipped line on a second restore.
-step_heir_file_check() {
-    local out
-    out=$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-fc" 2>&1) \
-        || { echo "$out" | tail -20; return 1; }
-    if ! printf '%s\n' "$out" | grep -E "File check: [1-9][0-9]* restored file\(s\) of .* match the sha256 recorded in the index" >/dev/null; then
-        echo "no file-check match line; the File check lines were:"
-        printf '%s\n' "$out" | grep "File check" || echo "(none)"
-        return 1
-    fi
-    if printf '%s\n' "$out" | grep "do NOT match" >/dev/null; then
-        printf '%s\n' "$out" | grep -A5 "do NOT match"
-        return 1
-    fi
-    diff -r "$SRC/unitA" "$HEIR/recovered-fc" || return 1
-    out=$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --no-file-check --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-nofc" 2>&1) \
-        || { echo "$out" | tail -20; return 1; }
-    printf '%s\n' "$out" | grep "File check skipped (--no-file-check)" >/dev/null \
-        || { echo "no skipped line with --no-file-check"; return 1; }
-}
-check heir_file_check     step_heir_file_check
-
-# ---------- heir_where, heir_find, heir_slice_from_copy (1.3.0; ADR-0012 items 78-81 and 101; #418, #480) ----------
-#
-# The tape tapectl wrote carries the cross-volume index in its envelopes
-# (volume-format-v2 1.5), and the RESTORE.sh on that tape reads it with the real
-# age, with no tapectl and no database. The unit, the version and the path the
-# first two legs expect come from the CATALOG and the source tree, never from the
-# script's own output, so a script that printed a fixed answer would fail.
-#
-# The third leg is item 101 on real media: the SAME staged unit written to a
-# second cartridge (a real tapectl copy, whose slices are byte for byte the first
-# tape's), one slice of the first tape bad when it is read, and RESTORE.sh
-# --slices-from a directory of slice files dd-copied off the second cartridge.
-# "Bad when it is read": a tape cannot be edited in the middle, so a dd stand-in
-# first on PATH flips one byte of that one tape file as RESTORE.sh reads it.
-# Everything else (mt, the drive, age, dar, tar, sha256sum) is the real thing.
-# The functions below are pure text work, and tests/heir_restore_sh.rs extracts
-# them from this file and runs them on RESTORE.sh's real output.
+heir_sh() { (cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh "$@"); }
 
 # The tape files of one type in RESTORE.sh --info's file map, which prints
-# "  12  data_slice  1234 bytes  abcd..."; the --info text is on stdin.
+# "  12  data_slice  1234 bytes"; the --info text is on stdin.
 heir_positions_of_type() { # heir_positions_of_type <type>
     awk -v t="$1" '$2 == t && $1 ~ /^[0-9]+$/ { print $1 }'
 }
-# The tape file of every slice of one unit, in order, from the MANIFEST.toml that
-# --find-envelope prints (on stdin).
-heir_slice_positions() { # heir_slice_positions <unit>
-    awk -v want="$1" '
-        /^\[\[units\]\]/ { head = 1; hit = 0; next }
-        /^\[\[units\.slices\]\]/ { head = 0; next }
-        /^\[/ { head = 0 }
-        head && /^name = / { v = $3; gsub(/"/, "", v); hit = (v == want) }
-        hit && /^tape_position = / { print $3 }
-    '
+# How many files --info's map lists (the seal's line included): --verify has a PASS line for each.
+heir_map_count() {
+    awk '/^Files on the map/ { f = 1; next } /^Next:/ { f = 0 } f && $1 ~ /^[0-9]+$/ { n++ } END { print n + 0 }'
 }
 # The newest snapshot version the CATALOG holds for a unit.
 heir_unit_version() { # heir_unit_version <unit>
-    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PY'
+    python3 - "$HEIR_DB" "$1" <<'PY'
 import sqlite3, sys
 row = sqlite3.connect(sys.argv[1]).execute(
     "SELECT MAX(s.version) FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = ?",
@@ -944,16 +950,21 @@ assert row is not None and row[0] is not None, f"no snapshot of {sys.argv[2]} in
 print(row[0])
 PY
 }
-# The dd stand-in. It reads through the real dd (REAL_DD) and flips one byte of
-# the tape file at FAULT_POS, found by asking the drive (REAL_MT status) which
-# file the head is at when dd starts; every other read is untouched. The byte is at
-# FAULT_AT in the file (100000 when unset, or the file's last). Each flip is
-# logged to FAULT_LOG, so a run can show the fault really happened. It handles dd
-# writing to a file (of=) and to a pipe.
+
+# The stand-ins on PATH for the heir legs that need a fault or a count (a real tape cannot be
+# edited in the middle, and the heir's reads are not otherwise observable). Everything else (mt,
+# the drive, age, tar, sha256sum) is the real thing.
+#  - dd: reads through the real dd (REAL_DD), asks the drive (REAL_MT) which tape file the head
+#    is at when dd starts, appends that number to TRACE_LOG when it is set, and flips one byte of
+#    the file at FAULT_POS as it is read ("bad when it is read"); every other read is untouched.
+#    The byte is at FAULT_AT (100000 when unset, or the file's last). Each flip is logged to
+#    FAULT_LOG, so a run can show the fault really happened. It handles dd writing to a file (of=)
+#    and to a pipe, as RESTORE.sh uses it.
 heir_write_injector() { # heir_write_injector <path of the dd to write>
     cat >"$1" <<'INJECT'
 #!/bin/sh
 pos=$("$REAL_MT" -f "$TAPE_DEVICE" status 2>/dev/null | sed -n 's/.*[Ff]ile number *= *\([0-9-]*\).*/\1/p' | head -n 1)
+[ -z "${TRACE_LOG:-}" ] || echo "$pos" >>"$TRACE_LOG"
 if [ "$pos" = "$FAULT_POS" ]; then
     of=
     for a in "$@"; do
@@ -979,40 +990,463 @@ exec "$REAL_DD" "$@"
 INJECT
     chmod +x "$1"
 }
+#  - tar: the real tar (REAL_TAR), then deletes DROP_PATH from the directory it extracted into
+#    (-C), at exit 0: a tar that drops a file silently, which only the per-file sha256 check catches.
+heir_write_dropper() { # heir_write_dropper <path of the tar to write>
+    cat >"$1" <<'DROP'
+#!/bin/bash
+dest=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[$i]}" = -C ]; then dest=${args[$((i + 1))]}; fi
+done
+"$REAL_TAR" "$@"
+rc=$?
+if [ -n "$dest" ] && [ -d "$dest" ]; then rm -f -- "$dest/$DROP_PATH"; fi
+exit $rc
+DROP
+    chmod +x "$1"
+}
+HEIR_HOOK="$RUN/heir-hook"
+heir_hook_ready() {
+    [ -x "$HEIR_HOOK/dd" ] && [ -x "$HEIR_HOOK/tar-drop/tar" ] && return 0
+    mkdir -p "$HEIR_HOOK/tar-drop" && heir_write_injector "$HEIR_HOOK/dd" && heir_write_dropper "$HEIR_HOOK/tar-drop/tar"
+}
+# RESTORE.sh with the dd stand-in first on PATH: <fault pos> is the tape file whose read has a byte
+# flipped ("none" for no fault); the faults it made go to <fault log>, every read's tape file to
+# <trace log>. Both logs are emptied first.
+heir_sh_hooked() { # heir_sh_hooked <fault pos|none> <fault log> <trace log> RESTORE.sh-args...
+    local pos="$1" flog="$2" tlog="$3"; shift 3
+    heir_hook_ready || { echo "cannot write the stand-ins under $HEIR_HOOK"; return 1; }
+    : >"$flog"; : >"$tlog"
+    (cd "$HEIR" && env "PATH=$HEIR_HOOK:$PATH" "REAL_DD=$(command -v dd)" "REAL_MT=$(command -v mt-st || command -v mt)" \
+        "FAULT_POS=$pos" "FAULT_LOG=$flog" "TRACE_LOG=$tlog" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh "$@")
+}
+# The tape files of <trace log> that are data slices (<info text> is --info's, which names them),
+# in the order they were read, one a line.
+heir_slice_reads() { # heir_slice_reads <trace log> <info text>
+    local pos all
+    all="$(heir_positions_of_type data_slice <<<"$2")"
+    while IFS= read -r pos; do
+        [ -n "$pos" ] || continue
+        grep -Fx -- "$pos" <<<"$all" >/dev/null && echo "$pos"
+    done <"$1"
+    return 0
+}
+# <row kind> <slice> <bytes> of one path in a unit's --list (the path as printed), from the table.
+heir_list_row() { # heir_list_row <key> <unit> <path as printed>
+    local out
+    out="$(heir_sh --list --key "$1" --unit "$2" 2>&1)" || { printf '%s\n' "$out" >&2; return 1; }
+    awk -v want="$3" '{ k = $1; s = $2; b = $3; p = $0; sub(/^ *[a-z] +[0-9]+ +[0-9]+  /, "", p); sub(/  -> .*/, "", p)
+        if (length(k) == 1 && s ~ /^[0-9]+$/ && b ~ /^[0-9]+$/ && p == want) { print k, s, b; found = 1; exit } }
+        END { exit found ? 0 : 1 }' <<<"$out"
+}
+
+step_heir_extract() {
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+    && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' > "$HEIR/RESTORE.sh" \
+    && chmod +x "$HEIR/RESTORE.sh" && bash -n "$HEIR/RESTORE.sh" || return 1
+    # Every heir leg runs THIS script. Layout 2's says "Layout 2" in its second line; the file in
+    # the tree is the one tests/heir_restore.rs runs (file_2_is_the_file_in_the_tree_byte_for_byte),
+    # and the one File 2 of this tape must be, byte for byte once File 2's zero padding is stripped.
+    sed -n 2p "$HEIR/RESTORE.sh" | grep -F "for a tapectl volume of Layout 3" >/dev/null \
+        || { echo "the script read off the tape does not call itself Layout 3's: $(sed -n 2p "$HEIR/RESTORE.sh")"; return 1; }
+    cmp -s "$HEIR/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh" \
+        || { echo "the RESTORE.sh on the tape is not src/volume/heir/RESTORE.sh"; cmp "$HEIR/RESTORE.sh" "$GATE_REPO/src/volume/heir/RESTORE.sh"; return 1; }
+}
+# Assert the tape read is the tape this gate WROTE, not merely some valid
+# volume. Without this, heir_info passes against any sealed tape in any drive —
+# which is exactly how the wrong-device read above stayed hidden for three runs
+# while three later checks failed on "no envelope matched the provided key".
+step_heir_info() {
+    local out rc
+    out="$(heir_sh --info 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_info: RESTORE.sh --info exited $rc, want 0"; return 1; }
+    # tests/heir_restore.rs info_names_the_tape_its_files_and_its_full_seal_and_rewinds_once
+    grep -E "^Tape: $LABEL +uuid " >/dev/null <<<"$out" || { echo "heir_info: tape in $TAPE_DEV is not volume $LABEL — wrong drive or wrong cartridge" >&2; return 1; }
+    grep -F "Layout 3, written by tapectl" >/dev/null <<<"$out" || { echo "heir_info: the tape does not say it is Layout 3" >&2; return 1; }
+    grep -F "the tape is complete, every planned file is on it" >/dev/null <<<"$out" || { echo "heir_info: volume $LABEL is not sealed whole" >&2; return 1; }
+    grep -F "The seal binds the front index" >/dev/null <<<"$out" || { echo "heir_info: the seal does not bind the front index" >&2; return 1; }
+    # The control: the map names the tape's data slices, so the map was read.
+    [ -n "$(heir_positions_of_type data_slice <<<"$out")" ] || { echo "heir_info: the file map names no data_slice" >&2; return 1; }
+}
+# --find-envelope: the key opens the tenant's envelope and shows that tenant's units only.
+step_heir_find() {
+    local out rc needle stranger="$HEIR/stranger.key"
+    out="$(heir_sh --find-envelope --key "$HEIR_KEY_A" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_find_envelope: exited $rc, want 0"; return 1; }
+    # tests/heir_restore.rs find_envelope_with_a_tenant_key_shows_that_tenants_units_only and
+    # find_envelope_with_the_escrow_key_lists_every_unit_and_closes_with_a_command_that_works
+    for needle in "The key opens the envelope at file" "  unitA  version " "  unitC  version " \
+        "--restore --key KEY --to DIR --unit NAME" "(or --all for every unit, each in DIR/NAME)"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_find_envelope: alice's output lacks \"$needle\""; return 1; }
+    done
+    if grep -F "unitB" >/dev/null <<<"$out"; then echo "heir_find_envelope: alice's key shows bob's unit"; return 1; fi
+    # The control: bob's key opens another envelope and shows his unit and none of alice's.
+    out="$(heir_sh --find-envelope --key "$HEIR_KEY_B" 2>&1)" || { printf '%s\n' "$out"; echo "heir_find_envelope: bob's key failed"; return 1; }
+    grep -F "  unitB  version " >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_find_envelope: bob's key does not show unitB"; return 1; }
+    if grep -E "unitA|unitC" >/dev/null <<<"$out"; then echo "heir_find_envelope: bob's key shows alice's unit"; return 1; fi
+    # A key that is not a recipient: exit 1, said as a wrong key, never as damage
+    # (tests/heir_restore.rs a_key_that_is_not_a_recipient_opens_nothing_and_says_so).
+    age-keygen -o "$stranger" >/dev/null 2>&1 || { echo "age-keygen failed"; return 1; }
+    out="$(heir_sh --find-envelope --key "$stranger" 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_find_envelope: a key that opens nothing exited $rc, want 1"; return 1; }
+    for needle in "no envelope on this tape" "opens with the key given"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_find_envelope: the wrong-key refusal lacks \"$needle\""; return 1; }
+    done
+    if grep -F "DAMAGED" >/dev/null <<<"$out"; then echo "heir_find_envelope: a wrong key was called damage"; return 1; fi
+}
+# --verify: no key; every file of the tape against the front index. The control: the same verify
+# with one data slice flipped as it is read must fail, name the file and exit non-zero.
+step_heir_verify() {
+    local out rc info files passes bad
+    info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    files="$(heir_map_count <<<"$info")"
+    [ "$files" -gt 8 ] || { echo "heir_verify: the file map lists only $files files"; return 1; }
+    out="$(heir_sh --verify 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    # tests/heir_restore.rs verify_passes_a_full_tape_with_no_key_and_reads_it_forward_once
+    [ "$rc" -eq 0 ] || { echo "heir_verify: --verify exited $rc, want 0"; return 1; }
+    grep -E "^VERIFY PASSED: [0-9]+ file\\(s\\) match the front index\\.\$" >/dev/null <<<"$out" || { echo "heir_verify: no VERIFY PASSED line"; return 1; }
+    passes="$(grep -c '^PASS ' <<<"$out" || true)"
+    [ "$passes" = "$files" ] || { echo "heir_verify: $passes PASS line(s) for $files file(s) on the map"; return 1; }
+    if grep -E '^FAIL ' >/dev/null <<<"$out"; then echo "heir_verify: a FAIL line on an intact tape"; return 1; fi
+    # The control (tests/heir_restore.rs verify_names_the_file_that_differs_and_exits_nonzero).
+    bad="$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB 2)"
+    [ -n "$bad" ] || { echo "heir_verify: the catalog has no slice 2 of unitB on $LABEL"; return 1; }
+    out="$(heir_sh_hooked "$bad" "$RUN/heir-verify.fault" "$RUN/heir-verify.trace" --verify 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 12
+    [ -s "$RUN/heir-verify.fault" ] || { echo "control: the stand-in never flipped a byte, so the run proves nothing"; return 1; }
+    [ "$rc" -ne 0 ] || { echo "control: --verify passed with tape file $bad corrupted"; return 1; }
+    grep -E "^FAIL +$bad  data_slice " >/dev/null <<<"$out" || { echo "control: no FAIL line for tape file $bad"; return 1; }
+    grep -E "^VERIFY FAILED: 1 file\\(s\\) differ" >/dev/null <<<"$out" || { echo "control: no VERIFY FAILED: 1 file(s) differ"; return 1; }
+}
+# --list: a unit's files from its file table, no key to a slice and no slice read. The rows are
+# checked against the source tree (kind, size, path), the tape files read against --info.
+heir_list_rows_match() { # heir_list_rows_match <source dir> <list output file>
+    python3 - "$@" <<'PY'
+import os, sys
+src, path = sys.argv[1:3]
+rows = {}
+for line in open(path, encoding="utf-8", errors="surrogateescape"):
+    p = line.rstrip("\n").split(None, 3)
+    if len(p) == 4 and len(p[0]) == 1 and p[0] in "fdlhpcb" and p[1].isdigit() and p[2].isdigit():
+        rows[p[3].split("  -> ")[0]] = (p[0], int(p[2]))
+assert rows, f"no row in {path}"
+want, links = {}, {}
+for root, dirs, files in os.walk(src):
+    for n in dirs + files:
+        full = os.path.join(root, n)
+        rel = os.path.relpath(full, src)
+        assert "\\" not in rel and "\t" not in rel and "\n" not in rel, f"{rel}: the leg's source needs no escaping"
+        st = os.lstat(full)
+        if os.path.islink(full): want[rel] = ("l", None)
+        elif os.path.isdir(full): want[rel] = ("d", None)
+        else:
+            want[rel] = ("f", None if rel == ".tapectl-unit.toml" else st.st_size)
+            if st.st_nlink > 1: links.setdefault((st.st_dev, st.st_ino), []).append(rel)
+bad = []
+for rel, (kind, size) in sorted(want.items()):
+    got = rows.get(rel)
+    if got is None: bad.append(f"{rel}: not listed"); continue
+    if kind == "f" and got[0] in "fh": pass            # the second name of a hard link is an h row
+    elif got[0] != kind: bad.append(f"{rel}: kind {got[0]}, want {kind}")
+    if size is not None and got[0] == "f" and got[1] != size: bad.append(f"{rel}: {got[1]} bytes, want {size}")
+for names in links.values():
+    kinds = sorted(rows[n][0] for n in names if n in rows)
+    if kinds != ["f", "h"]: bad.append(f"hard link {names}: rows {kinds}, want one f and one h")
+extra = sorted(set(rows) - set(want))
+if extra: bad.append(f"listed but not in the source: {extra}")
+assert not bad, "\n".join(bad)
+print(f"{len(rows)} rows, every one in the source; {len(links)} hard-linked pair(s) f + h")
+PY
+}
+step_heir_list() {
+    local info out rc u listing="$RUN/heir-list.out" reads
+    info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    for u in unitA unitC; do
+        out="$(heir_sh_hooked none "$RUN/heir-list.fault" "$RUN/heir-list.trace" --list --key "$HEIR_KEY_A" --unit "$u" 2>&1)"; rc=$?
+        printf '%s\n' "$out" >"$listing"
+        printf '%s\n' "$out" | head -n 30
+        [ "$rc" -eq 0 ] || { echo "heir_list: --list --unit $u exited $rc, want 0"; return 1; }
+        # tests/heir_restore.rs list_shows_a_units_files_from_its_table_and_reads_no_slice
+        grep -E "^Unit $u  version [0-9]+  \\([0-9]+ slice\\(s\\), [0-9]+ bytes of stream" >/dev/null <<<"$out" || { echo "heir_list: no 'Unit $u  version N  (K slice(s), B bytes of stream' line"; return 1; }
+        grep -F "  kind  slice  bytes  path" >/dev/null <<<"$out" || { echo "heir_list: no column header"; return 1; }
+        heir_list_rows_match "$SRC/$u" "$listing" || return 1
+        # No data slice is read, and the control: front matter was (the trace is not empty).
+        [ -s "$RUN/heir-list.trace" ] || { echo "control: the stand-in saw no read at all"; return 1; }
+        reads="$(heir_slice_reads "$RUN/heir-list.trace" "$info")"
+        [ -z "$reads" ] || { echo "heir_list: --list read data slice file(s): $reads"; return 1; }
+    done
+    # The escaped form is the spelling --path and --paths-from take: a name with a non-ASCII letter
+    # is printed as it is (only a backslash, a TAB, a newline, a CR or a non-UTF-8 byte is escaped).
+    heir_sh --list --key "$HEIR_KEY_A" --unit unitA 2>&1 | grep -F "nested/déjà-vu.txt" >/dev/null \
+        || { echo "heir_list: unitA's list lacks nested/déjà-vu.txt"; return 1; }
+    # A key opens its own tenant's units only: bob's unit is not listed by alice's key.
+    if heir_sh --list --key "$HEIR_KEY_A" 2>&1 | grep -F "unitB" >/dev/null; then echo "heir_list: alice's key lists bob's unit"; return 1; fi
+}
+step_heir_restore() {
+    local out rc dest="$HEIR/recovered" a b
+    # `--unit unitA` is REQUIRED: alice owns unitA and unitC, and RESTORE.sh refuses to guess
+    # ("FATAL: multiple units found"). One unit chosen is restored directly into --to.
+    out="$(heir_sh --restore --unit unitA --key "$HEIR_KEY_A" --to "$dest" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 30
+    [ "$rc" -eq 0 ] || { echo "heir_restore: exited $rc, want 0"; return 1; }
+    # tests/heir_restore.rs a_lone_unit_restores_byte_for_byte_into_to_and_the_work_directory_is_gone
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "heir_restore: no RESTORE COMPLETE"; return 1; }
+    diff -r "$SRC/unitA" "$dest" || return 1
+    [ ! -e "$dest/.tapectl-damaged-files.txt" ] || { echo "heir_restore: a damaged-file list on a clean restore"; return 1; }
+    if compgen -G "$dest/.tapectl-work*" >/dev/null; then echo "heir_restore: the work directory was left in $dest"; return 1; fi
+    # A hard link stays a link (a_lone_unit_restores_...: "a hard link stays a link").
+    a="$(stat -c %i "$dest/hl-a.txt")" && b="$(stat -c %i "$dest/hl-b.txt")" || return 1
+    [ "$a" = "$b" ] || { echo "heir_restore: hl-a.txt and hl-b.txt are two files after the restore"; return 1; }
+    # tests/heir_restore.rs a_restore_prints_the_id_map_the_damaged_list_and_the_tar_it_used
+    for needle in "Who the ids were" "never remaps them by name" "  user  $(id -u)  " "The tar used: tar (GNU tar" "What it does not restore:"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_restore: the output lacks \"$needle\""; return 1; }
+    done
+}
+# The heir path is the reason this project exists, so symlink survival is
+# checked there too, not only through tapectl. See step_restore_C for why
+# --no-dereference is mandatory here.
+step_heir_restore_symlinks() {
+    local dest="$HEIR/recovered-C" l
+    heir_sh --restore --unit unitC --key "$HEIR_KEY_A" --to "$dest" || return 1
+    diff -r --no-dereference "$SRC/unitC" "$dest" || return 1
+    for l in link-ok link-broken; do
+        [ -L "$dest/$l" ] || { echo "heir_restore_symlinks: $l is not a symlink after the restore"; return 1; }
+        [ "$(readlink "$dest/$l")" = "$(readlink "$SRC/unitC/$l")" ] || { echo "heir_restore_symlinks: $l points elsewhere"; return 1; }
+    done
+}
+echo "gate: leg 2 — heir leg (RESTORE.sh of Layout 3, no tapectl)"
+check heir_extract_script step_heir_extract
+check heir_info           step_heir_info
+check heir_find_envelope  step_heir_find
+check heir_verify         step_heir_verify
+check heir_list           step_heir_list
+check heir_restore        step_heir_restore
+check heir_restore_symlinks step_heir_restore_symlinks
+
+# heir_file_check (ADR-0012 item 103; Layout 3: the file table's sha256): the RESTORE.sh on the tape
+# checks every restored regular file against the sha256 the unit's file table records, with the
+# real sha256sum, and it is the check, never tar's exit status, that decides. The leg wants the
+# "all N regular file(s) match" line, the tree equal to the source, the skipped line with
+# --no-file-check, and the control: a tar that drops a file at exit 0 is caught, listed, exit 1.
+step_heir_file_check() {
+    local out rc victim="nested/déjà-vu.txt" list first
+    out=$(heir_sh --restore --unit unitA --key "$HEIR_KEY_A" --to "$HEIR/recovered-fc" 2>&1) \
+        || { echo "$out" | tail -20; return 1; }
+    # tests/heir_restore.rs a_lone_unit_restores_byte_for_byte_into_to_and_the_work_directory_is_gone
+    if ! printf '%s\n' "$out" | grep -E "File check: all [1-9][0-9]* regular file\\(s\\) match the sha256 in the unit's file table\\." >/dev/null; then
+        echo "no file-check match line; the File check lines were:"
+        printf '%s\n' "$out" | grep "File check" || echo "(none)"
+        return 1
+    fi
+    diff -r "$SRC/unitA" "$HEIR/recovered-fc" || return 1
+    # tests/heir_restore.rs a_tar_that_drops_a_file_at_exit_0_is_caught_by_the_file_check
+    out=$(heir_sh --restore --unit unitA --no-file-check --key "$HEIR_KEY_A" --to "$HEIR/recovered-nofc" 2>&1) \
+        || { echo "$out" | tail -20; return 1; }
+    printf '%s\n' "$out" | grep -F -- "--no-file-check: the restored files were not checked" >/dev/null \
+        || { echo "no 'the restored files were not checked' line with --no-file-check"; return 1; }
+    heir_hook_ready || return 1
+    out="$(cd "$HEIR" && env "PATH=$HEIR_HOOK/tar-drop:$PATH" "REAL_TAR=$(command -v tar)" "DROP_PATH=$victim" "TAPE_DEVICE=$TAPE_DEV" \
+        ./RESTORE.sh --restore --unit unitA --key "$HEIR_KEY_A" --to "$HEIR/recovered-drop" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 12
+    [ "$rc" -eq 1 ] || { echo "control: a tar that dropped $victim at exit 0 gave exit $rc, want 1"; return 1; }
+    grep -F "RESTORE INCOMPLETE: 1 path(s)" >/dev/null <<<"$out" || { echo "control: no 'RESTORE INCOMPLETE: 1 path(s)'"; return 1; }
+    grep -F "File check: 1 of " >/dev/null <<<"$out" || { echo "control: no 'File check: 1 of ' line"; return 1; }
+    list="$HEIR/recovered-drop/.tapectl-damaged-files.txt"
+    [ -f "$list" ] || { echo "control: no damaged-file list"; return 1; }
+    first="$(head -n 1 "$list")"
+    case "$first" in
+        $'#tapectl-damaged-files\t1\tunit=unitA\t'*) ;;
+        *) echo "control: the list's first line is '$first'"; return 1 ;;
+    esac
+    [ "$(tail -n +2 "$list")" = "$victim" ] || { echo "control: the list names '$(tail -n +2 "$list")', want exactly $victim"; return 1; }
+}
+check heir_file_check     step_heir_file_check
+
+# ---------- heir_path, heir_long_member (Layout 3: one file by the file table) ----------
+# --restore --path reads, by the unit's file table, only the slices that hold the file (#518 was a
+# path restore that read the wrong slices and exited 0): unitB's three small files are one slice
+# each, and twelve-meg.bin, larger than a slice, is a run of slices to itself. The slice a file is
+# in comes from --list, the tape file of a slice from the catalog, and the tape files the script
+# READ from the dd stand-in's trace, never from the script's say-so.
+step_heir_path() {
+    local info out rc d reads want s k b i
+    info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    # One path, in a middle slice of a unit of many.
+    read -r k s b < <(heir_list_row "$HEIR_KEY_B" unitB set/s2.bin) || { echo "heir_path: unitB's --list has no set/s2.bin"; return 1; }
+    [ "$k" = f ] && [ "$s" -gt 1 ] && [ "$b" = 700000 ] || { echo "heir_path: set/s2.bin is '$k $s $b', want a 700000-byte file past slice 1"; return 1; }
+    want="$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB "$s")"
+    [ -n "$want" ] || { echo "heir_path: no tape file for slice $s of unitB"; return 1; }
+    d="$HEIR/path-one"
+    out="$(heir_sh_hooked none "$RUN/heir-path.fault" "$RUN/heir-path.trace" --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" --path set/s2.bin 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 20
+    [ "$rc" -eq 0 ] || { echo "heir_path: --path set/s2.bin exited $rc, want 0"; return 1; }
+    # tests/heir_restore.rs a_path_restore_reads_only_the_slice_that_holds_the_file_and_the_file_is_right
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "heir_path: no RESTORE COMPLETE"; return 1; }
+    grep -F "File check: all 1 regular file(s) named" >/dev/null <<<"$out" || { echo "heir_path: no 'File check: all 1 regular file(s) named'"; return 1; }
+    grep -F "Who the ids were" >/dev/null <<<"$out" || { echo "heir_path: no id map"; return 1; }
+    cmp "$SRC/unitB/set/s2.bin" "$d/set/s2.bin" || { echo "heir_path: set/s2.bin differs from the source"; return 1; }
+    [ "$(find "$d" -type f | wc -l)" = 1 ] || { echo "heir_path: more than the one file was restored:"; find "$d" -type f; return 1; }
+    reads="$(heir_slice_reads "$RUN/heir-path.trace" "$info")"
+    [ "$reads" = "$want" ] || { echo "heir_path: the slice reads were '$(tr '\n' ' ' <<<"$reads")', want only tape file $want (slice $s)"; return 1; }
+    # Two paths, in two slices: those two slices, in order, once each
+    # (tests/heir_restore.rs paths_in_two_slices_read_those_two_slices_once_each_for_every_algorithm).
+    read -r k s b < <(heir_list_row "$HEIR_KEY_B" unitB set/s1.bin) || return 1
+    read -r k i b < <(heir_list_row "$HEIR_KEY_B" unitB set/s3.bin) || return 1
+    want="$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB "$s")
+$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB "$i")"
+    d="$HEIR/path-two"
+    out="$(heir_sh_hooked none "$RUN/heir-path.fault" "$RUN/heir-path.trace" --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" \
+        --path set/s1.bin --path set/s3.bin 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 0 ] || { echo "heir_path: two paths exited $rc, want 0"; return 1; }
+    grep -F "File check: all 2 regular file(s) named" >/dev/null <<<"$out" || { echo "heir_path: no 'File check: all 2 regular file(s) named'"; return 1; }
+    for b in s1 s3; do cmp "$SRC/unitB/set/$b.bin" "$d/set/$b.bin" || return 1; done
+    reads="$(heir_slice_reads "$RUN/heir-path.trace" "$info")"
+    [ "$reads" = "$want" ] || { echo "heir_path: two paths read '$(tr '\n' ' ' <<<"$reads")', want '$(tr '\n' ' ' <<<"$want")'"; return 1; }
+    # A path the table lacks is refused before any slice is read (a_path_not_in_the_table_is_refused_before_any_slice_is_read).
+    out="$(heir_sh_hooked none "$RUN/heir-path.fault" "$RUN/heir-path.trace" --restore --unit unitB --key "$HEIR_KEY_B" --to "$HEIR/path-none" \
+        --path no/such/file --path set/s1.bin 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_path: a path not in the table exited $rc, want 1"; return 1; }
+    grep -F "no/such/file" >/dev/null <<<"$out" && grep -F "not in the file table" >/dev/null <<<"$out" \
+        || { printf '%s\n' "$out"; echo "heir_path: the refusal does not name the path and 'not in the file table'"; return 1; }
+    [ -z "$(heir_slice_reads "$RUN/heir-path.trace" "$info")" ] || { echo "heir_path: a slice was read for a path the table lacks"; return 1; }
+}
+check heir_path           step_heir_path
+
+# heir_long_member: twelve-meg.bin is larger than slice_size (1M): a run of slices to itself. Whole
+# unit and --path restore it across the run (the run fed to tar piece by piece, each checked); the
+# slices a path restore reads are the run's, in order, once each. The control: a bad LATER piece of
+# the run ends tar's run, the partial file is removed and listed (tests/heir_restore.rs
+# a_long_members_bad_piece_ends_its_tar_run_removes_the_partial_file_and_reads_on), and the small
+# files before it are whole.
+step_heir_long_member() {
+    local info out rc d reads s k b first last n bad list
+    info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    read -r k first b < <(heir_list_row "$HEIR_KEY_B" unitB twelve-meg.bin) || { echo "heir_long_member: unitB's --list has no twelve-meg.bin"; return 1; }
+    [ "$k" = f ] && [ "$b" = 12000000 ] || { echo "heir_long_member: twelve-meg.bin is '$k $first $b'"; return 1; }
+    [ "$b" -gt 1048576 ] || return 1                       # larger than slice_size: a run, not a slice
+    n="$(gate_q "$HEIR_DB" "SELECT COUNT(*) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name = 'unitB'")"
+    # The slices of the run: those after its first that the catalog says continue it.
+    last="$(gate_q "$HEIR_DB" "SELECT MAX(sl.slice_number) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE u.name = 'unitB' AND sl.continues = 1")"
+    [ -n "$last" ] && [ "$last" -ge $((first + 5)) ] || { echo "heir_long_member: the catalog's run is slices $first-$last, want a run of 6 or more"; return 1; }
+    # Whole unit across the run.
+    d="$HEIR/long-whole"
+    out="$(heir_sh --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 0 ] || { echo "heir_long_member: whole unitB exited $rc, want 0"; return 1; }
+    diff -r "$SRC/unitB" "$d" || { echo "heir_long_member: the whole-unit restore differs from the source"; return 1; }
+    # The one path: the run's slices, once each, in order.
+    d="$HEIR/long-path"
+    out="$(heir_sh_hooked none "$RUN/heir-long.fault" "$RUN/heir-long.trace" --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" --path twelve-meg.bin 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 8
+    [ "$rc" -eq 0 ] || { echo "heir_long_member: --path twelve-meg.bin exited $rc, want 0"; return 1; }
+    cmp "$SRC/unitB/twelve-meg.bin" "$d/twelve-meg.bin" || { echo "heir_long_member: --path twelve-meg.bin differs from the source"; return 1; }
+    reads="$(heir_slice_reads "$RUN/heir-long.trace" "$info")"
+    [ "$(sort -n <<<"$reads")" = "$reads" ] && [ "$(sort -nu <<<"$reads")" = "$reads" ] \
+        || { echo "heir_long_member: the slices were not read once each in order: $(tr '\n' ' ' <<<"$reads")"; return 1; }
+    for s in $(seq "$first" "$last"); do
+        grep -Fx -- "$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB "$s")" <<<"$reads" >/dev/null \
+            || { echo "heir_long_member: slice $s of the run was not read"; return 1; }
+    done
+    for s in $(seq 1 $((first - 1))); do
+        if grep -Fx -- "$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB "$s")" <<<"$reads" >/dev/null; then
+            echo "heir_long_member: slice $s, before the run, was read"; return 1
+        fi
+    done
+    # The control: the run's second piece is bad.
+    bad="$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB $((first + 1)))"
+    [ -n "$bad" ] || { echo "heir_long_member: no tape file for slice $((first + 1))"; return 1; }
+    d="$HEIR/long-bad"
+    out="$(heir_sh_hooked "$bad" "$RUN/heir-long.fault" "$RUN/heir-long.trace" --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 14
+    [ -s "$RUN/heir-long.fault" ] || { echo "control: the stand-in never flipped a byte, so the run proves nothing"; return 1; }
+    [ "$rc" -eq 1 ] || { echo "control: a bad piece of the run exited $rc, want 1"; return 1; }
+    grep -F "a long file's run broke at a bad slice" >/dev/null <<<"$out" || { echo "control: no \"a long file's run broke at a bad slice\""; return 1; }
+    [ ! -e "$d/twelve-meg.bin" ] || { echo "control: the partial twelve-meg.bin was left"; return 1; }
+    list="$d/.tapectl-damaged-files.txt"
+    [ -f "$list" ] && tail -n +2 "$list" | grep -Fx twelve-meg.bin >/dev/null || { echo "control: the damaged-file list does not name twelve-meg.bin"; return 1; }
+    for b in s1 s2 s3; do cmp "$SRC/unitB/set/$b.bin" "$d/set/$b.bin" || { echo "control: set/$b.bin, before the run, is not whole"; return 1; }; done
+}
+check heir_long_member    step_heir_long_member
+
+# ---------- heir_where, heir_find, heir_find_path, heir_paths_from_copy (ADR-0012 items 78-81 and 101; #418, #480) ----------
+#
+# The tape tapectl wrote carries the cross-volume index in its envelopes
+# (volume-format-v3.md 1.5), and the RESTORE.sh on that tape reads it with the real
+# age, with no tapectl and no database. The unit, the version and the path the
+# legs expect come from the CATALOG and the source tree, never from the script's
+# own output, so a script that printed a fixed answer would fail.
+#
+# heir_paths_from_copy is the one repair of Layout 3 (item 255) on real media: a slice of the
+# first cartridge bad when it is read (the dd stand-in flips a byte of that one tape file, since a
+# tape cannot be edited in the middle) leaves one file out and listed; the SAME staged unit written
+# to a second cartridge (a real tapectl copy, whose slices are byte for byte the first tape's) is
+# then put in the drive, and `--restore --paths-from LIST` makes the listed path whole from it.
 
 step_heir_where() {
-    local ver out rc needle key="$HOME_DIR/keys/alice-primary.age.key"
+    local ver out rc needle key="$HEIR_KEY_A"
     ver="$(heir_unit_version unitA)" || return 1
-    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where unitA --key "$key" 2>&1)"; rc=$?
+    out="$(heir_sh --where unitA --key "$key" 2>&1)"; rc=$?
     printf '%s\n' "$out"
     [ "$rc" -eq 0 ] || { echo "heir_where: RESTORE.sh --where unitA exited $rc, want 0"; return 1; }
-    for needle in "Unit unitA (tenant alice):" "  Version $ver: " "    tape $LABEL  (this tape)"; do
+    # tests/heir_restore.rs where_prints_every_version_and_holder_of_a_unit_from_a_tenant_key
+    for needle in "Index read from tape: $LABEL" "Unit unitA (tenant alice):" "  Version $ver: " "    tape $LABEL  (this tape)"; do
         grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_where: the output lacks \"$needle\""; return 1; }
     done
     # The same index asked about a unit it does not hold: exit 1, and it names the
     # units it does hold. This is the control for the lines above, which prove the
-    # search finds a unit; this proves it is a search and not a fixed answer.
-    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where no-such-unit --key "$key" 2>&1)"; rc=$?
+    # search finds a unit; this proves it is a search and not a fixed answer
+    # (tests/heir_restore.rs where_names_the_units_the_index_lists_when_it_finds_none).
+    out="$(heir_sh --where no-such-unit --key "$key" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_where: an unknown unit exited $rc, want 1"; return 1; }
+    grep -F "No unit named 'no-such-unit' is in this index" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_where: no 'No unit named' line"; return 1; }
     grep -F -- "unitA" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_where: the unknown-unit answer does not list the units the index holds"; return 1; }
-    # --where --all (the third fresh read of File 1): every unit the index names, no cap.
-    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where --all --key "$key" 2>&1)"; rc=$?
+    # --where --all: every unit the index names (tests/heir_restore.rs a_miss_and_where_all_on_a_large_index_name_every_unit).
+    out="$(heir_sh --where --all --key "$key" 2>&1)"; rc=$?
     [ "$rc" -eq 0 ] || { printf '%s\n' "$out"; echo "heir_where: --where --all exited $rc, want 0"; return 1; }
     grep -F -- "Unit unitA (tenant alice): newest version $ver, on this tape" >/dev/null <<<"$out" \
         || { printf '%s\n' "$out"; echo "heir_where: --where --all does not list unitA at its newest version on this tape"; return 1; }
+    grep -E "^[0-9]+ unit\\(s\\) in this index; this tape holds the newest version of [0-9]+ of them whole\\.\$" >/dev/null <<<"$out" \
+        || { printf '%s\n' "$out"; echo "heir_where: --where --all has no totals line"; return 1; }
 }
 step_heir_find_path() {
-    local ver size out rc needle key="$HOME_DIR/keys/alice-primary.age.key"
+    local ver size out rc needle key="$HEIR_KEY_A"
     ver="$(heir_unit_version unitA)" || return 1
     size=$(( $(wc -c <"$SRC/unitA/plain.txt") ))
-    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find plain.txt --key "$key" 2>&1)"; rc=$?
+    out="$(heir_sh --find plain.txt --key "$key" 2>&1)"; rc=$?
     printf '%s\n' "$out"
     [ "$rc" -eq 0 ] || { echo "heir_find: RESTORE.sh --find plain.txt exited $rc, want 0"; return 1; }
-    for needle in "  unitA  v$ver  f  $size bytes  plain.txt" "    tape $LABEL  (this tape)"; do
+    # tests/heir_restore.rs find_prints_matching_paths_with_their_holders
+    for needle in "In the index of tenant alice:" "  unitA  v$ver  f  $size bytes  plain.txt" "  Tapes holding unitA version $ver:" \
+        "    tape $LABEL  (this tape)" "--restore --key KEY --unit UNIT --path PATH"; do
         grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_find: the output lacks \"$needle\""; return 1; }
     done
-    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find no-such-path-anywhere --key "$key" 2>&1)"; rc=$?
+    out="$(heir_sh --find no-such-path-anywhere --key "$key" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_find: a path nothing holds exited $rc, want 1"; return 1; }
+    grep -F "No path in this index contains" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_find: no 'No path in this index contains'"; return 1; }
+}
+# heir_find_path: --find prints a path on one line, as --path takes it; the path as printed is
+# restored by --restore --path and comes back byte for byte (a name with non-ASCII letters, in a
+# folder, so the printed form is the form --path reads).
+step_heir_find_to_path() {
+    local out rc printed d key="$HEIR_KEY_A"
+    out="$(heir_sh --find vu.txt --key "$key" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_find_path: --find vu.txt exited $rc, want 0"; return 1; }
+    printed="$(sed -n 's/^  unitA  v[0-9]*  f  [0-9]* bytes  //p' <<<"$out")"
+    [ "$printed" = "nested/déjà-vu.txt" ] || { echo "heir_find_path: the match was printed as '$printed', want nested/déjà-vu.txt"; return 1; }
+    d="$HEIR/find-path"
+    heir_sh --restore --unit unitA --key "$key" --to "$d" --path "$printed" || { echo "heir_find_path: --path '$printed' failed"; return 1; }
+    cmp "$SRC/unitA/$printed" "$d/$printed" || { echo "heir_find_path: '$printed' differs from the source"; return 1; }
+    [ "$(find "$d" -type f | wc -l)" = 1 ] || { echo "heir_find_path: more than that one file was restored"; return 1; }
 }
 
 # The first cartridge back in the drive: a no-op when it is there already.
@@ -1022,18 +1456,17 @@ heir_reload_first() { # heir_reload_first <the storage slot the first cartridge 
     if grep -F "Data Transfer Element $DTE:Full (Storage Element $1 Loaded)" >/dev/null <<<"$status"; then
         return 0
     fi
-    loaded="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p" <<<"$status")"
+    loaded="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \\([0-9]*\\) Loaded).*/\\1/p" <<<"$status")"
     if [ -n "$loaded" ]; then
         mtx -f "$CHG_SG" unload "$loaded" "$DTE" || return 1
     fi
     mtx -f "$CHG_SG" load "$1" "$DTE" || return 1
     mt -f "$TAPE_DEV" rewind >/dev/null 2>&1 || true
 }
-# A real second copy: another cartridge, the same staged sets (--keep-staging, or
-# the write would release the staging that leg 4 writes from), and its data slices
-# dd-copied into a directory under names that say nothing about which slice is which.
-heir_second_copy() { # heir_second_copy <work dir> <label> <slot of the second cartridge> <slot of the first>
-    local w="$1" label="$2" b_slot="$3" a_slot="$4" info pos n cur=0
+# A real second copy: another cartridge, the same staged sets (--keep-staging, or the write would
+# release the staging that leg 4 writes from). It is left LOADED in the drive.
+heir_second_copy() { # heir_second_copy <label> <slot of the second cartridge> <slot of the first>
+    local label="$1" b_slot="$2" a_slot="$3" info
     mtx -f "$CHG_SG" unload "$a_slot" "$DTE" || { echo "cannot take the first cartridge out to slot $a_slot"; return 1; }
     mtx -f "$CHG_SG" load "$b_slot" "$DTE" || { echo "cannot load slot $b_slot"; return 1; }
     if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase; }; then
@@ -1041,78 +1474,63 @@ heir_second_copy() { # heir_second_copy <work dir> <label> <slot of the second c
     fi
     TCTL volume init "$label" --device "$TAPE_DEV" || return 1
     TCTL volume write "$label" --device "$TAPE_DEV" --yes --keep-staging || return 1
-    # The copy's own RESTORE.sh (File 2 of the second cartridge) reads its file map.
-    if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
-        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$w/RESTORE-copy.sh" \
-        && chmod +x "$w/RESTORE-copy.sh"; }; then
-        echo "cannot read RESTORE.sh off the second cartridge"; return 1
-    fi
-    info="$(TAPE_DEVICE="$TAPE_DEV" "$w/RESTORE-copy.sh" --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
-    grep -F "Verdict: SEALED" >/dev/null <<<"$info" || { printf '%s\n' "$info"; echo "the second copy is not SEALED"; return 1; }
-    mt -f "$TAPE_DEV" rewind || return 1
-    for pos in $(heir_positions_of_type data_slice <<<"$info"); do
-        if [ "$pos" -gt "$cur" ]; then
-            mt -f "$TAPE_DEV" fsf $((pos - cur)) || { echo "cannot space to tape file $pos"; return 1; }
-        fi
-        dd if="$TAPE_DEV" of="$w/copies/tape-file-$pos" bs=512k 2>/dev/null || { echo "reading tape file $pos of the copy failed"; return 1; }
-        cur=$((pos + 1))
-    done
-    n=$(find "$w/copies" -type f | wc -l)
-    [ "$n" -gt 0 ] || { echo "the second copy has no data slice"; return 1; }
-    echo "second copy $label: $n slice file(s) copied off it"
+    info="$(heir_sh --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    grep -F "the tape is complete, every planned file is on it" >/dev/null <<<"$info" || { printf '%s\n' "$info"; echo "the second copy is not sealed whole"; return 1; }
+    grep -E "^Tape: $label +uuid " >/dev/null <<<"$info" || { echo "the cartridge in the drive is not $label"; return 1; }
 }
-step_heir_slice_from_copy() {
-    local w="$RUN/slice-copy" key="$HOME_DIR/keys/bob-primary.age.key" clabel="MHVTLC2"
-    local status a_slot b_slot manifest bad rc=0 out real_dd real_mt cleanup_rc=0
-    rm -rf "$w"; mkdir -p "$w/copies" "$w/inject"
+step_heir_paths_from_copy() {
+    local w="$RUN/paths-copy" clabel="MHVTLC2" status a_slot b_slot bad out rc list d rc2=0 cleanup_rc=0 got
+    rm -rf "$w"; mkdir -p "$w"
     status="$(mtx -f "$CHG_SG" status)" || { echo "mtx status failed"; return 1; }
-    a_slot="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p" <<<"$status")"
+    a_slot="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \\([0-9]*\\) Loaded).*/\\1/p" <<<"$status")"
     [ -n "$a_slot" ] || { echo "no cartridge in DTE $DTE"; return 1; }
     b_slot="$(grep -E "Storage Element [0-9]+:Full" <<<"$status" | grep "VolumeTag=[EF][0-9]*$GEN" | head -n 1 | sed -n 's/.*Storage Element \([0-9]*\):Full.*/\1/p')"
     [ -n "$b_slot" ] || { echo "no second $GEN cartridge in the library: this leg needs two"; return 1; }
-    # unitB is twelve 1 MiB slices on the first tape; the third is the one that goes bad.
-    manifest="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$key" 2>&1)" \
-        || { printf '%s\n' "$manifest"; echo "RESTORE.sh --find-envelope failed on the first cartridge"; return 1; }
-    bad="$(heir_slice_positions unitB <<<"$manifest" | sed -n 3p)"
-    [ -n "$bad" ] || { printf '%s\n' "$manifest"; echo "unitB has fewer than 3 slices on the first tape: nothing to corrupt"; return 1; }
+    # unitB's slice 2 holds set/s2.bin and nothing else (a slice ends at a member's start): the one
+    # slice that goes bad, and so the one file the repair must bring back.
+    bad="$(gate_slice_pos "$HEIR_DB" "$LABEL" unitB 2)"
+    [ -n "$bad" ] || { echo "no tape file for slice 2 of unitB on $LABEL"; return 1; }
     echo "first cartridge in slot $a_slot; second in slot $b_slot; tape file $bad is the slice that goes bad"
+    # The control: the first cartridge alone. The restore leaves set/s2.bin out and lists it.
+    d="$w/unit"
+    out="$(heir_sh_hooked "$bad" "$w/fault.log" "$w/trace.log" --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 16
+    [ -s "$w/fault.log" ] || { echo "control: the stand-in never flipped a byte, so the run proves nothing"; return 1; }
+    # tests/heir_restore.rs a_bad_slice_is_left_out_its_files_are_listed_and_the_rest_restores
+    [ "$rc" -eq 1 ] || { echo "control: the restore with tape file $bad corrupted exited $rc, want 1"; return 1; }
+    grep -F "RESTORE INCOMPLETE" >/dev/null <<<"$out" || { echo "control: no RESTORE INCOMPLETE"; return 1; }
+    grep -F "differs from the front index's hash" >/dev/null <<<"$out" || { echo "control: the output does not say the slice differs from the front index's hash"; return 1; }
+    list="$d/.tapectl-damaged-files.txt"
+    [ -f "$list" ] || { echo "control: no damaged-file list"; return 1; }
+    [ "$(tail -n +2 "$list")" = "set/s2.bin" ] || { echo "control: the list names '$(tail -n +2 "$list" | tr '\n' ' ')', want exactly set/s2.bin"; return 1; }
+    [ ! -e "$d/set/s2.bin" ] || { echo "control: set/s2.bin is on disk although its slice was bad"; return 1; }
+    for got in set/s1.bin set/s3.bin twelve-meg.bin; do cmp "$SRC/unitB/$got" "$d/$got" || { echo "control: $got is not whole"; return 1; }; done
 
-    heir_second_copy "$w" "$clabel" "$b_slot" "$a_slot" || rc=$?
-    # Whatever happened, the first cartridge goes back into the drive, and the
-    # copy stops being a live copy: leg 4 asserts that its volumes hold the ONLY
-    # copy of unitA/unitB, which a second sealed volume would falsify.
+    # The second cartridge: a real copy, left in the drive. Whatever happens the first cartridge
+    # goes back, and the copy stops being a live copy: leg 4 asserts that its volumes hold the
+    # ONLY copy of unitA/unitB, which a second sealed volume would falsify.
+    heir_second_copy "$clabel" "$b_slot" "$a_slot" || rc2=$?
+    if [ "$rc2" -eq 0 ]; then
+        # The repair, from the loaded copy: only the listed path, and the list is removed.
+        out="$(heir_sh --restore --unit unitB --key "$HEIR_KEY_B" --to "$d" --paths-from "$list" 2>&1)"; rc=$?
+        printf '%s\n' "$out" | tail -n 16
+        # tests/heir_restore.rs two_copies_each_damaged_in_different_files_are_made_whole_in_two_runs
+        if [ "$rc" -ne 0 ]; then echo "the repair from the second cartridge exited $rc, want 0"; rc2=1; fi
+        grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "the repair did not say RESTORE COMPLETE"; rc2=1; }
+        grep -F "is removed: nothing is left to repair" >/dev/null <<<"$out" || { echo "the repair did not remove the damaged-file list"; rc2=1; }
+        [ ! -e "$list" ] || { echo "the damaged-file list is still there"; rc2=1; }
+    fi
     heir_reload_first "$a_slot" || { echo "cannot put the first cartridge back in the drive"; return 1; }
     if TCTL volume retire "$clabel" --yes; then :; else cleanup_rc=$?; echo "volume retire $clabel exited $cleanup_rc"; fi
-    [ "$rc" -eq 0 ] || return 1
-
-    real_dd="$(command -v dd)"
-    real_mt="$(command -v mt-st || command -v mt)"
-    heir_write_injector "$w/inject/dd"
-    # The control: slice $bad bad and no copy offered. The restore must fail and say
-    # what would help; it also proves the stand-in flips what it claims to.
-    : >"$w/fault.log"
-    out="$(cd "$HEIR" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$bad" \
-        "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit unitB --key "$key" --to "$w/no-copy" 2>&1)"; rc=$?
-    printf '%s\n' "$out" | tail -n 12
-    [ -s "$w/fault.log" ] || { echo "control: the stand-in never flipped a byte, so the run proves nothing"; return 1; }
-    [ "$rc" -ne 0 ] || { echo "control: the restore SUCCEEDED with tape file $bad corrupted"; return 1; }
-    grep -F -- "--slices-from DIR" >/dev/null <<<"$out" || { echo "control: the failure does not name --slices-from"; return 1; }
-    # The leg: the same bad slice, the slices of the second cartridge offered.
-    : >"$w/fault.log"
-    out="$(cd "$HEIR" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$bad" \
-        "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit unitB --key "$key" --to "$w/recovered" \
-        --slices-from "$w/copies" 2>&1)"; rc=$?
-    printf '%s\n' "$out" | tail -n 25
-    [ -s "$w/fault.log" ] || { echo "the stand-in never flipped a byte, so the run proves nothing"; return 1; }
-    [ "$rc" -eq 0 ] || { echo "RESTORE.sh --slices-from exited $rc, want 0"; return 1; }
-    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; return 1; }
-    grep -F "taking slice 3 from $w/copies/tape-file-" >/dev/null <<<"$out" || { echo "slice 3 was not taken from the copy"; return 1; }
-    diff -r "$SRC/unitB" "$w/recovered" || return 1
+    [ "$rc2" -eq 0 ] || return 1
+    # The restored names compared byte for byte with the source.
+    diff -r "$SRC/unitB" "$d" || { echo "the repaired tree differs from the source"; return 1; }
     [ "$cleanup_rc" -eq 0 ] || return 1
 }
 check heir_where          step_heir_where
 check heir_find           step_heir_find_path
-check heir_slice_from_copy step_heir_slice_from_copy
+check heir_find_path      step_heir_find_to_path
+check heir_paths_from_copy step_heir_paths_from_copy
 
 # ---------- leg 4: interrupt + resume (issue #93) ----------
 #
@@ -2662,15 +3080,7 @@ sp_scratch_note() { # sp_scratch_note <dest> <out>
 }
 export -f sp_swap sp_scratch_note
 
-# Rows of an SQL query on a catalog, read-only, tab-separated.
-sp_q() { # sp_q <db> <sql> [param...]
-    python3 - "$@" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-for row in c.execute(sys.argv[2], sys.argv[3:]):
-    print("\t".join("" if v is None else str(v) for v in row))
-PY
-}
+sp_q() { gate_q "$@"; }
 # "first last count" of a unit's slices written on a volume, and a unit's slice count.
 sp_run_of() { # sp_run_of <db> <label> <unit>
     sp_q "$1" "SELECT MIN(sl.slice_number), MAX(sl.slice_number), COUNT(*) FROM write_positions wp
@@ -3445,7 +3855,6 @@ fi
 # `ok`. cargo exits 0 when a name filter matches nothing, and an on-media test
 # that skips returns early and also says `ok`; TAPECTL_GATE_REQUIRE_MEDIA turns
 # such a skip into a panic, and ran_ok names each test that must have run.
-GATE_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ignored_tests() { # the #[ignore] test functions of a test file, one per line
     awk '/^#\[ignore/{f=1; next} f && /^fn [a-z_0-9]+\(/{sub(/^fn /,""); sub(/\(.*/,""); print; f=0}' "$1"
 }
