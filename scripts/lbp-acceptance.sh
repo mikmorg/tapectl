@@ -16,16 +16,15 @@
 #                     checked by lbp.py, a CRC implementation that is not tapectl's, and each
 #                     payload compared with what was written. The page is put back after (and by
 #                     the exit trap, if the script dies in between).
-#                  1b tapectl's: OLD_BIN, a tapectl before 1.7.2 (no LBP: production's L6-0001
-#                     and L6-0002 were written so), writes and seals LBA-0001 in its own home;
-#                     the candidate's `volume verify --full` reads it back. Its session log says
-#                     what the candidate armed for a read, which is item 175's switch as built.
-#                Why both: 1a answers the drive's behaviour alone, in a minute, independent of
-#                tapectl's code; 1b is the path the switch governs (a verify of an old tape).
-#                Both yes, with the switch at "every read": item 162 stands. 1a no: item 175's
-#                fallback (LBP_R only for the confirm of a session that wrote with LBP); a
-#                candidate built without it stops here, to be rebuilt. --r1-only stops after
-#                this step either way, so the switch can be decided before the long steps.
+#                  1b (1.8.0's) is not run: it had a tapectl before 1.7.2 write a tape without LBP
+#                     and the candidate verify it, and a 2.0.0 candidate reads no tape or
+#                     catalog of a 1.x tapectl (ADR-0012 item 258, 269; Layout 3 only). R1 was
+#                     answered YES on the HP on 2026-10-28 (docs/runs/2026-10-28-1.8.0-lbp-
+#                     acceptance.md) and 1a measures it again here, on the drive alone.
+#                Yes: item 162 stands (LBP_R on every read; the candidate ships LBP_R_POLICY =
+#                AllReads). No: item 175's fallback (LBP_R only for the confirm of a session that
+#                wrote with LBP): the run stops, to be decided before the long steps. --r1-only
+#                stops after this step either way.
 #   2 write      the candidate writes LBA-0002 (three units) with --full-confirm: write_lbp
 #                'on', the session log names the page armed, no fallback warning, the full
 #                readback passed, the page method 0 afterwards.
@@ -82,9 +81,7 @@
 #   - the drive's serial is HUJ808A5L4 and the cartridge's chip serial is EW7VWMVKF6, named
 #     again with --i-will-lose-the-cartridge (the barcode is a sticker; ADR-0012) -- or --mhvtl,
 #     on an mhvtl drive, never that one;
-#   - on the real drive, TAPECTL_BIN is 1.7.2 or later and OLD_BIN (required on the real drive) is 1.6.0 or later
-#     and before 1.7.2 (the commands this script gives it are 1.6.0's; any tapectl before 1.7.2
-#     writes without LBP, as 1.1.0 wrote production's tapes);
+#   - on the real drive, TAPECTL_BIN is 1.7.2 or later (2.0.0 for Layout 3);
 #   - TAPECTL_TEST_LBP_CORRUPT_BLOCK and TAPECTL_TEST_EARLY_WARNING_AT are unset;
 #   - the page reads method 0 with neither check on;
 #   - tapectl-drive-poll.timer is not active, and the tape lock is free.
@@ -114,19 +111,18 @@ SVC_USER="tapectl"
 # The 1.6.0 acceptance's write rate on this drive (docs/runs/2026-10-21-1.6.0-acceptance.md).
 RATE_1_6_0_MBPS=160
 
-LABEL1="LBA-0001"; LABEL2="LBA-0002"; LABEL3="LBA-0003"; LABEL4="LBA-0004"; LABEL5="LBA-0005"
+LABEL2="LBA-0002"; LABEL3="LBA-0003"; LABEL4="LBA-0004"; LABEL5="LBA-0005"
 OPERATOR="lba-op"
 TENANT="lba"
 UNIT_A="lba-a-docs"
 UNIT_B="lba-b-photos"
 UNIT_C="lba-c-tail"
-UNIT_R="lba-r1"
 LEFTOVER_NOTE="had its Logical Block Protection page armed when tapectl opened it"
 FALLBACK_WARNING="warning: Logical Block Protection is not available on "
 
 usage() {
     cat <<'USAGE'
-usage: TAPECTL_HOME=<fresh dir> TAPECTL_BIN=<tapectl 1.7.2> OLD_BIN=<tapectl before 1.7.2> \
+usage: TAPECTL_HOME=<fresh dir> TAPECTL_BIN=<the tapectl candidate> \
        scripts/lbp-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
            --i-will-lose-the-cartridge EW7VWMVKF6 [options]
        scripts/lbp-acceptance.sh --mhvtl --device /dev/tape/by-id/scsi-XYZZY_A3-nst [options]
@@ -156,10 +152,7 @@ the heir's restore, R11 and the write rate. OVERWRITES THE CARTRIDGE, several ti
 
   TAPECTL_HOME (env)             Required: the throwaway home, absent or empty.
   TAPECTL_BIN (env)              Required: the tapectl under test (1.7.2 or later).
-  OLD_BIN (env)                  A tapectl from 1.6.0 to 1.7.1, which writes without LBP (step
-                                 1b). Required on the real drive; on --mhvtl, 1b is skipped
-                                 without it.
-  DAR_BIN (env)                  dar for the throwaway configs. Default: dar on PATH.
+  TAR_BIN (env)                  GNU tar for the throwaway configs. Default: tar on PATH.
 USAGE
 }
 
@@ -205,12 +198,12 @@ MiB=$((1024 * 1024)); GiB=$((1024 * MiB))
 if [ "$MHVTL" = 1 ]; then
     SLICE_SIZE="1M"
     RAW_BLOCK=262144        # mhvtl carries 262,148 bytes in one command, not 524,292
-    SIZE_A=$((600 * 1024)); SIZE_B=$((6 * MiB)); SIZE_C=$((2560 * 1024)); SIZE_R=$((3 * MiB))
+    SIZE_A=$((600 * 1024)); SIZE_B=$((6 * MiB)); SIZE_C=$((2560 * 1024))
     KILL_AFTER=$((4 * MiB)) # st write bytes before the SIGKILL
 else
     SLICE_SIZE="1G"
     RAW_BLOCK=524288
-    SIZE_A=$((256 * MiB)); SIZE_B=$((6 * GiB)); SIZE_C=$((1 * GiB)); SIZE_R=$((1536 * MiB))
+    SIZE_A=$((256 * MiB)); SIZE_B=$((6 * GiB)); SIZE_C=$((1 * GiB))
     KILL_AFTER=$((2 * GiB))
 fi
 FORMAT_BLOCK=524288
@@ -226,8 +219,7 @@ BEFORE YOU START (the operator):
        sudo systemctl stop tapectl-drive-poll.timer      (start it again afterwards)
      no production tapectl command running or scheduled, and the host quiet (vm-desk1's heavy
      jobs paused, docs/operator-guide.md "A quiet host while the tape runs").
-  3. Have both binaries: the 1.7.2 candidate (TAPECTL_BIN) and a tapectl before 1.7.2
-     (OLD_BIN, e.g. the installed production one), which writes step 1b's tape without LBP.
+  3. Have the candidate (TAPECTL_BIN, built with the LBP code of 1.7.2 or later).
   4. Run it inside tmux. A dropped terminal does not stop it.
   5. A FAIL stops the run and leaves the cartridge as it is. Do not reuse or erase it until the
      failure is read (docs/lto6-validation-checklist.md).
@@ -238,8 +230,7 @@ THE STEPS and their time on home2 (the write near 117 MB/s for a debug candidate
 a release one; about $(( (SIZE_A + SIZE_B + SIZE_C) / GiB )) GiB a volume):
   0 preflight   read only: the page, block limits, sg_inq; the page must read method 0.   ~1 min
   1 r1          1a: 16 blocks dd'd without LBP, read back with LBP_R armed by hand, every CRC
-                checked by lbp.py. 1b: OLD_BIN stages ~$((SIZE_R / MiB)) MiB, writes and seals
-                $LABEL1; the candidate's verify --full reads it with LBP_R.            ~15 min
+                checked by lbp.py.                                          ~5 min
                 THIS ANSWERS R1 AND ITEM 175. --r1-only stops here.
   2 write       three units staged (debug: ~30-40 min), $LABEL2 written with LBP and read back
                 in full; write_lbp 'on'; the page clear after.                         ~45 min
@@ -258,7 +249,7 @@ a release one; about $(( (SIZE_A + SIZE_B + SIZE_C) / GiB )) GiB a volume):
 
 THE COMMAND (operator's login on home2, inside tmux):
   TAPECTL_HOME=\$HOME/.cache/tapectl/lba-home-\$(date +%Y%m%d) \\
-  TAPECTL_BIN=<the 1.7.2 candidate> OLD_BIN=/usr/local/bin/tapectl \\
+  TAPECTL_BIN=<the candidate> \\
     scripts/lbp-acceptance.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \\
       --i-will-lose-the-cartridge EW7VWMVKF6 [--r1-only]
 
@@ -273,7 +264,7 @@ if [ "$PRINT_PLAN" = 1 ]; then print_plan; exit 0; fi
 # ---------- preconditions: nothing below touches the drive until every one holds ----------
 [ -n "$TAPE_DEV" ] || { usage >&2; die "--device is required; there is no default (/dev/nstN numbering moves)"; }
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
-for bin in mt dd tr cmp head od sg_read_attr sg_logs sg_modes sg_wr_mode sg_inq python3 flock age dar tar sha256sum diff awk tee df stat getent; do
+for bin in mt dd tr cmp head od sg_read_attr sg_logs sg_modes sg_wr_mode sg_inq python3 flock age tar sha256sum diff awk tee df stat getent; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 [ -r "$LBP_PY" ] || die "the prototype's host tool $LBP_PY is missing (docs/research/lbp-prototype/lbp.py)"
@@ -290,8 +281,8 @@ done
 [ -n "${TAPECTL_BIN:-}" ] || die "TAPECTL_BIN is required: the tapectl under test (this script never builds one)"
 [ -x "$TAPECTL_BIN" ] || die "TAPECTL_BIN=$TAPECTL_BIN is not an executable file"
 TAPECTL_BIN="$(readlink -f "$TAPECTL_BIN")"
-: "${DAR_BIN:=$(command -v dar)}"
-[ -x "$DAR_BIN" ] || die "DAR_BIN=$DAR_BIN is not an executable file"
+: "${TAR_BIN:=$(command -v tar)}"
+[ -x "$TAR_BIN" ] || die "TAR_BIN=$TAR_BIN is not an executable file"
 version_of() { "$1" --version 2>&1 | sed -n 1p; }
 version_in() { # <version text> <min a.b.c> <below a.b.c or ''>: 0 when min <= v < below
     python3 - "$1" "$2" "$3" <<'PY'
@@ -311,16 +302,6 @@ TAPECTL_VERSION="$(version_of "$TAPECTL_BIN")"
 if [ "$MHVTL" = 0 ]; then
     version_in "$TAPECTL_VERSION" 1.7.2 "" || die "TAPECTL_BIN reports '$TAPECTL_VERSION': the acceptance run is for tapectl 1.7.2 or later"
 fi
-OLD_VERSION=""
-if [ -n "${OLD_BIN:-}" ]; then
-    [ -x "$OLD_BIN" ] || die "OLD_BIN=$OLD_BIN is not an executable file"
-    OLD_BIN="$(readlink -f "$OLD_BIN")"
-    OLD_VERSION="$(version_of "$OLD_BIN")"
-    version_in "$OLD_VERSION" 1.6.0 1.7.2 || die "OLD_BIN reports '$OLD_VERSION': step 1b needs a tapectl from 1.6.0 to 1.7.1, which writes without LBP"
-elif [ "$MHVTL" = 0 ]; then
-    die "OLD_BIN is required on the real drive: a tapectl before 1.7.2 writes step 1b's tape without LBP (R1's tapectl route)"
-fi
-
 # ---------- the throwaway home; production's must be unreachable ----------
 [ -n "${TAPECTL_HOME:-}" ] || die "TAPECTL_HOME is unset: name a fresh throwaway home (it must not exist yet, or be empty)"
 case "$TAPECTL_HOME" in /*) ;; *) die "TAPECTL_HOME must be an absolute path (got '$TAPECTL_HOME')" ;; esac
@@ -433,13 +414,12 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SAFE_SERIAL="$(printf '%s' "$SERIAL" | tr -c 'A-Za-z0-9_.-' '_')"
 RUN="$OUT_DIR/lba-$STAMP-$SAFE_SERIAL"
 mkdir -p "$RUN" || die "cannot create $RUN"
-NEED=$((2 * (SIZE_A + SIZE_B + SIZE_C + SIZE_R) + SIZE_B + 32 * RAW_BLOCK + 256 * MiB))
+NEED=$((2 * (SIZE_A + SIZE_B + SIZE_C) + SIZE_B + 32 * RAW_BLOCK + 256 * MiB))
 AVAIL="$(df --output=avail -B1 "$RUN" | tail -n 1 | tr -d ' ')"
 [ "$AVAIL" -ge "$NEED" ] || die "$RUN has $((AVAIL / MiB)) MiB free; the sources, staging and restores need $((NEED / MiB)) MiB"
 mkdir -p "$TAPECTL_HOME"
-R1_HOME="$RUN/r1-home"
-STAGING="$RUN/staging"; R1_STAGING="$RUN/r1-staging"; SRC="$RUN/src"; WORK="$RUN/work"
-mkdir -p "$STAGING" "$R1_STAGING" "$SRC" "$WORK" "$RUN/tmp" "$R1_HOME"
+STAGING="$RUN/staging"; SRC="$RUN/src"; WORK="$RUN/work"
+mkdir -p "$STAGING" "$SRC" "$WORK" "$RUN/tmp"
 CFG="$TAPECTL_HOME/config.toml"
 DB="$TAPECTL_HOME/tapectl.db"
 
@@ -515,7 +495,7 @@ snapshot_drive() { # <dir> <tag>
 # (tapectl's progress), the command line to commands.log, and every session log the command
 # wrote copied to <name>.logs/. Sets RC; FAILs on any other rc.
 RC=0
-LOG_DIRS=("$TAPECTL_HOME/logs" "$R1_HOME/logs")
+LOG_DIRS=("$TAPECTL_HOME/logs")
 run() {
     local name="$1" want="$2"; shift 2
     printf '+ %q' "$@" >> "$RUN/commands.log"; echo >> "$RUN/commands.log"
@@ -550,8 +530,6 @@ tctl_hooked() { # step 3's write: the test hook on this one command line
 tctl_second() { # step 4's write: the hook's list on this one command line
     env TAPECTL_TEST_LBP_CORRUPT_BLOCK="$SECOND_LIST" "$TAPECTL_BIN" --home "$TAPECTL_HOME" --config "$CFG" "$@" </dev/null
 }
-old() { env -u TAPECTL_TEST_LBP_CORRUPT_BLOCK "$OLD_BIN" --home "$R1_HOME" --config "$R1_HOME/config.toml" "$@" </dev/null; }
-cand_r1() { env -u TAPECTL_TEST_LBP_CORRUPT_BLOCK "$TAPECTL_BIN" --home "$R1_HOME" --config "$R1_HOME/config.toml" "$@" </dev/null; }
 
 begin_step() { # <number> <name> <what>
     STEP="$1 $2"
@@ -628,7 +606,7 @@ assert_identical() {
 
 random_file() { head -c "$2" /dev/urandom > "$1"; }
 make_sources() {
-    mkdir -p "$SRC/a/nested" "$SRC/b/raw" "$SRC/c" "$SRC/r"
+    mkdir -p "$SRC/a/nested" "$SRC/b/raw" "$SRC/c"
     echo "plain content $STAMP" > "$SRC/a/plain.txt"
     printf '\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e content\n' > "$SRC/a/nested/ünïcödé 日本語.txt"
     : > "$SRC/a/empty.bin"
@@ -639,8 +617,6 @@ make_sources() {
     echo "photos manifest $STAMP" > "$SRC/b/index.txt"
     random_file "$SRC/c/tail.bin" "$SIZE_C"
     echo "the third unit $STAMP" > "$SRC/c/README.txt"
-    random_file "$SRC/r/old.bin" "$SIZE_R"
-    echo "written by a tapectl before 1.7.2, without LBP $STAMP" > "$SRC/r/README.txt"
 }
 
 extract_restore_sh() { # <dir>: RESTORE.sh off the loaded tape, as File 1 tells an heir to
@@ -711,8 +687,8 @@ print_plan | tee "$RUN/PLAN.txt"
 log "run $RUN"
 log "drive $DRIVE_SERIAL ($SYS_MODEL) at $TAPE_DEV ($TAPE_REAL, $DRIVE_SG); cartridge chip serial $SERIAL"
 log "mode: $([ "$MHVTL" = 1 ] && echo "mhvtl rehearsal: every tapectl open falls back" || echo "REAL DRIVE")"
-log "tapectl: $TAPECTL_BIN ($TAPECTL_VERSION); OLD_BIN: ${OLD_BIN:-none} ${OLD_VERSION:+($OLD_VERSION)}"
-log "home: $TAPECTL_HOME; R1 home: $R1_HOME; staging: $STAGING"
+log "tapectl: $TAPECTL_BIN ($TAPECTL_VERSION)"
+log "home: $TAPECTL_HOME; staging: $STAGING"
 {
     echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "host=$(hostname)"
@@ -722,10 +698,9 @@ log "home: $TAPECTL_HOME; R1 home: $R1_HOME; staging: $STAGING"
     echo "tapectl=$TAPECTL_BIN"; echo "tapectl_version=$TAPECTL_VERSION"
     echo "tapectl_sha256=$(sha256sum "$TAPECTL_BIN" | awk '{print $1}')"
     echo "tapectl_file=$(file -b "$TAPECTL_BIN" 2>/dev/null || echo unknown)"
-    echo "old_bin=${OLD_BIN:-}"; echo "old_version=$OLD_VERSION"
-    echo "dar=$("$DAR_BIN" --version 2>&1 | sed -n 1p)"
     echo "age=$(age --version 2>&1 | sed -n 1p)"
-    echo "tar=$(tar --version 2>&1 | sed -n 1p)"
+    echo "tar=$("$TAR_BIN" --version 2>&1 | head -1)"
+    echo "tar_heir=$(tar --version 2>&1 | head -1)"
     echo "sg3_utils=$(sg_wr_mode --version 2>&1 | sed -n 1p)"
     echo "script_commit=$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "page_found=$FOUND_PAGE"; echo "slice_size=$SLICE_SIZE"; echo "raw_block=$RAW_BLOCK"
@@ -791,81 +766,31 @@ else
     R1_RAW=no
 fi
 log "  1a: R1 by the prototype's route: $R1_RAW"
-# A filemark at BOT: File 0 EMPTY for OLD_BIN's volume init (on mhvtl it reads the old bytes
-# as an unparseable File 0, issue #327; --force takes either).
+# A filemark at BOT, so File 0 reads EMPTY (on mhvtl it reads the 1a bytes as an unparseable
+# File 0, issue #327; step 2's `volume init --force` takes either).
 mt -f "$TAPE_DEV" weof 1 || fail "mt weof 1 at BOT failed"
 mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
 
-# 1b, tapectl's route.
-R1_POLICY=""
-if [ -n "${OLD_BIN:-}" ]; then
-    make_sources
-    run r1-init 0 old init --operator "$OPERATOR-r1" --no-escrow
-    run r1-escrow 0 old key generate --escrow
-    chmod 600 "$STEP_DIR/r1-escrow.out" "$STEP_DIR/r1-escrow.err"
-    run r1-cfg-dar 0 old config set dar.binary "\"$DAR_BIN\""
-    run r1-cfg-slice 0 old config set defaults.slice_size "\"$SLICE_SIZE\""
-    run r1-cfg-copies 0 old config set defaults.min_copies 1
-    run r1-cfg-staging 0 old config set staging.directory "\"$R1_STAGING\""
-    run r1-backend 0 old backend add --name lba --device-tape "$TAPE_DEV" --generation LTO-6
-    run r1-tenant 0 old tenant add "$TENANT"
-    run r1-unit 0 old unit init "$SRC/r" --tenant "$TENANT" --name "$UNIT_R"
-    run r1-snapshot 0 old snapshot create "$UNIT_R"
-    run r1-stage 0 old --yes stage create "$UNIT_R"
-    run r1-vol-init 0 old volume init "$LABEL1" --device "$TAPE_DEV" --force
-    run r1-write 0 old --yes volume write "$LABEL1" --device "$TAPE_DEV"
-    log "  1b: $OLD_VERSION wrote and sealed $LABEL1 without LBP"
-    cp -a "$R1_HOME/tapectl.db" "$RUN/r1-catalog-before-verify.db"
-    run r1-verify any cand_r1 volume verify "$LABEL1" --device "$TAPE_DEV"
-    R1_VERIFY_RC="$RC"
-    if session_says r1-verify "sends its own with every block read"; then
-        R1_POLICY=all
-    elif session_says r1-verify "Logical Block Protection is not available on"; then
-        R1_POLICY=unavailable
-    else
-        R1_POLICY=confirm-only
-    fi
-    log "  1b: the candidate's verify exited $R1_VERIFY_RC; what it armed for the read: $R1_POLICY; the verification recorded: $(last_verify_of "$R1_HOME/tapectl.db" "$LABEL1" | tr '\t' ' ')"
-else
-    log "  1b: no OLD_BIN: tapectl's route not run (the rehearsal's only)"
-fi
-
-# The answer, and what it means for item 175.
+# The answer, and what it means for item 175. Only 1a runs (see the header: 1b needed a 1.x tapectl).
 {
     echo "R1 by the prototype's route (1a, dd + lbp.py): $R1_RAW"
     echo "  dd rc $RAW_DD_RC; $(tail -1 "$STEP_DIR/raw-verify.txt"); $(cat "$STEP_DIR/raw-payload.txt")"
-    [ -z "$R1_POLICY" ] || echo "R1 by tapectl's route (1b): the candidate's verify of $LABEL1 exited $R1_VERIFY_RC, arming '$R1_POLICY' for the read"
 } > "$RUN/R1.txt"
 if [ "$MHVTL" = 1 ]; then
     echo "REHEARSAL: mhvtl computes a CRC for every block it returns; this says nothing of the HP." >> "$RUN/R1.txt"
     [ "$R1_RAW" = yes ] || fail "1a on mhvtl: the hand-armed read did not return a valid CRC for every block (R1.txt): the script's route is broken"
-    if [ -n "$R1_POLICY" ]; then
-        [ "$R1_POLICY" = unavailable ] || fail "1b on mhvtl: the candidate armed '$R1_POLICY' for a read at 524,288; mhvtl cannot carry the wire block, so it must fall back"
-        [ "$R1_VERIFY_RC" = 0 ] || fail "1b on mhvtl: the candidate's verify of $LABEL1 exited $R1_VERIFY_RC"
-    fi
     R1_POLICY=fallback
     R1_NOTE="rehearsal"
 else
-    case "$R1_RAW/$R1_POLICY" in
-        yes/all)
-            [ "$R1_VERIFY_RC" = 0 ] || fail "R1: the drive returns valid CRCs for blocks written without LBP (1a), yet the candidate's verify of $LABEL1 with LBP_R exited $R1_VERIFY_RC: tapectl's read path, not the drive (r1-verify.err, its session log)"
-            R1_NOTE="R1 = YES: the HP returns a valid CRC for blocks written without LBP. Item 175's switch stays at LBP_R on every read (LbpReadPolicy::AllReads, item 162): verify and restore of production's older tapes run with LBP_R."
+    case "$R1_RAW" in
+        yes)
+            R1_POLICY=all
+            R1_NOTE="R1 = YES: the HP returns a valid CRC for blocks written without LBP. Item 175's switch stays at LBP_R on every read (LbpReadPolicy::AllReads, item 162)."
             ;;
-        yes/confirm-only)
-            fail "R1: the drive returns valid CRCs for blocks written without LBP (1a), so item 175's fallback is not warranted, but the candidate is built with it (its verify armed no read check): rebuild with LBP_R_POLICY = LbpReadPolicy::AllReads (src/tape/lbp.rs) and run again"
+        *)
+            echo "R1 = NO: item 175's fallback is in question (src/tape/lbp.rs LBP_R_POLICY); this run stops for that decision." >> "$RUN/R1.txt"
+            fail "R1 = NO: the HP returns no valid CRC for blocks written without LBP (1a: R1.txt). Item 175: LBP_R only for the confirm of a session that wrote with LBP. Decide LBP_R_POLICY (src/tape/lbp.rs) before the long steps; the candidate ships AllReads"
             ;;
-        no/all)
-            echo "R1 = NO: item 175's fallback. Rebuild the candidate with LBP_R_POLICY = LbpReadPolicy::OnlyConfirmOfLbpWrite (src/tape/lbp.rs) and run again." >> "$RUN/R1.txt"
-            fail "R1 = NO: the HP returns no valid CRC for blocks written without LBP (1a: R1.txt), and the candidate's verify exited $R1_VERIFY_RC. Item 175: LBP_R only for the confirm of a session that wrote with LBP. Rebuild the candidate with LBP_R_POLICY = LbpReadPolicy::OnlyConfirmOfLbpWrite (src/tape/lbp.rs) and run again"
-            ;;
-        no/confirm-only)
-            [ "$R1_VERIFY_RC" = 0 ] || fail "R1 = NO and the candidate carries item 175's fallback, yet its verify of $LABEL1 (no read check) exited $R1_VERIFY_RC"
-            R1_NOTE="R1 = NO: the HP returns no valid CRC for blocks written without LBP. The candidate carries item 175's fallback (LBP_R only for the confirm of a session that wrote with LBP), as it must."
-            ;;
-        */unavailable)
-            fail "1b: LBP could not be armed for the candidate's read on the real drive (r1-verify's session log names why): R11, sg3-utils, or the drive; R1's tapectl route is unanswered"
-            ;;
-        *) fail "R1: no answer from tapectl's route (1b)" ;;
     esac
 fi
 echo "$R1_NOTE" >> "$RUN/R1.txt"
@@ -875,7 +800,7 @@ end_step "$R1_NOTE"
 if [ "$R1_ONLY" = 1 ]; then
     { echo "RESULT: R1 ANSWERED (--r1-only; steps 2-9 not run)"; cat "$RUN/R1.txt"; } > "$RUN/RESULT.txt"
     log "RESULT: --r1-only: R1 answered, the run stops here. $RUN/R1.txt"
-    log "The cartridge holds $LABEL1, in $R1_HOME."
+    log "The cartridge holds 1a's blocks, no volume."
     exit 3
 fi
 
@@ -885,7 +810,7 @@ begin_step 2 write "$LABEL2 written with LBP and read back in full"
 run init 0 tctl init --operator "$OPERATOR" --no-escrow
 run escrow 0 tctl key generate --escrow
 chmod 600 "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err"
-run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
+run cfg-tar 0 tctl config set tar.binary "\"$TAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
 run cfg-copies 0 tctl config set defaults.min_copies 1
 run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
@@ -1096,7 +1021,7 @@ if [ "$MHVTL" = 0 ]; then
     log "  RESTORE.sh --info with the page left armed: exit $INFO_RC"
     [ "$INFO_RC" != 124 ] || fail "RESTORE.sh --info hung for 600 s with the page left armed: item 164 expects a refusal (EIO), not a hang"
     [ "$INFO_RC" != 0 ] || fail "RESTORE.sh --info succeeded with the page left armed"
-    ! grep -F "Verdict: SEALED" "$STEP_DIR/info-leftover.out" >/dev/null \
+    ! grep -F "the tape is complete, every planned file is on it" "$STEP_DIR/info-leftover.out" >/dev/null \
         || fail "RESTORE.sh --info called the tape sealed with the page left armed"
 else
     log "  rehearsal: RESTORE.sh is not run against the leftover (mhvtl hangs a read at BOT with LBP_R armed)"
@@ -1111,9 +1036,11 @@ assert_page_clear "volume identify over the leftover"
 ARMED_BY_HAND=0
 # Reads work again: the killed write left the tape unsealed, so any verdict will do.
 heir "$HEIR2" info-after any --info
-grep -F "Verdict: " "$STEP_DIR/info-after.out" >/dev/null \
-    || fail "RESTORE.sh --info gives no verdict with the page clear (exit $RC): its reads still fail"
-log "  RESTORE.sh --info reads the tape again with the page clear: $(grep -F "Verdict: " "$STEP_DIR/info-after.out" | sed -n 1p)"
+# --info's seal line (src/volume/heir/RESTORE.sh do_info), the one tests/heir_restore.rs
+# info_names_the_tape_its_files_and_its_full_seal_and_rewinds_once asserts for a sealed tape.
+grep -F "Seal marker: " "$STEP_DIR/info-after.out" >/dev/null \
+    || fail "RESTORE.sh --info gives no seal line with the page clear (exit $RC): its reads still fail"
+log "  RESTORE.sh --info reads the tape again with the page clear: $(grep -F "Seal marker: " "$STEP_DIR/info-after.out" | sed -n 1p)"
 mhvtl_rewind_first "volume resume"
 run resume5 0 tctl --json --yes volume resume "$LABEL5" --device "$TAPE_DEV" --keep-staging
 [ "$(status_of "$LABEL5")" = sealed ] || fail "$LABEL5 is '$(status_of "$LABEL5")' after the resume, not sealed"
@@ -1137,7 +1064,8 @@ begin_step 7 heir "RESTORE.sh off $LABEL5 with the real tools, the page clear, n
 HEIR5="$WORK/heir-$LABEL5"
 extract_restore_sh "$HEIR5"
 heir "$HEIR5" heir-verify 0 --verify
-grep -F "VERIFY: PASS" "$STEP_DIR/heir-verify.out" >/dev/null || fail "RESTORE.sh --verify did not PASS"
+# tests/heir_restore.rs::verify_passes_a_full_tape_with_no_key_and_reads_it_forward_once
+grep -F "VERIFY PASSED" "$STEP_DIR/heir-verify.out" >/dev/null || fail "RESTORE.sh --verify did not PASS"
 TENANT_KEY="$TAPECTL_HOME/keys/$TENANT-primary.age.key"
 [ -f "$TENANT_KEY" ] || fail "the tenant key $TENANT_KEY is missing"
 heir "$HEIR5" heir-restore 0 --restore --unit "$UNIT_B" --key "$TENANT_KEY" --to "$WORK/restore-heir-b"

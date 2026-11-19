@@ -9,19 +9,20 @@
 #     with --keep-staging and ended by the drive's REAL early warning inside that unit. Its
 #     write row is `range`, every written position at or before ended_after; what was written
 #     past the warning reads back (item 114); File 0 and the short seal state
-#     requires = ["short-seal", "spanning"] (item 124).
-#   2 RESTORE.sh's default mode, read off tape 1, spools tape 1's range into --scratch as
-#     ciphertext and stops at its swap prompt (item 132). The script HOLDS that run: its input
-#     is a FIFO the script answers in step 5, and it waits with no timeout and no tape device
-#     open (the coordinator's ruling in #478's build plan, section 9).
+#     `requires = []` (Layout 3: neither is a feature a reader must know, item 258(a)).
+#   2 RESTORE.sh, read off tape 1, restores tape 1's range (each slice read, checked, decrypted
+#     and handed to tar as it is read; Layout 3 keeps no slice in its --work directory, item
+#     267) and stops at its prompt for the next cartridge. The script HOLDS that run: its
+#     input is a FIFO the script answers in step 5, and it waits with no timeout and no tape
+#     device open (the coordinator's ruling in #478's build plan, section 9).
 #   3 catalog rebuild --from-volume of tape 1 into a second home: a `range` row, the version
 #     staged, the to-do naming the slices tape 1 lacks (item 130).
 #   4 tape 2: the cartridge erased and initialised again in the writing catalog. That marks
 #     tape 1 `erased` (binding records the displacement), so tape 2 is planned from slice 1 and
 #     holds the unit WHOLE, written from the kept staging (item 139).
 #   5 the held RESTORE.sh run is answered with tape 2 in the drive. It takes tape 2 because
-#     its front index lists slice K1+1 (R8, its seal read first), finishes from scratch plus
-#     tape 2, and the unit restores identical to a sha256 manifest of its source.
+#     its front index lists slice K1+1 (R8, its seal read first), goes on in the same tar run
+#     with tape 2's slices, and the unit restores identical to a sha256 manifest of its source.
 #   6 the closing text names the cleanup. Nothing is erased automatically.
 #
 # HOW TAPE 1 IS FILLED. As 1.6.0's run (item 115): a filler unit staged normally from a
@@ -54,8 +55,8 @@
 # A FAIL STOPS THE RUN and leaves the cartridge as the failed step left it: no later step, no
 # exit trap, ever writes the medium a failed step measured (#420's lost readback). The exit
 # trap only ends the held RESTORE.sh run, which writes nothing to the medium, after recording
-# each file its scratch holds with its size and sha256 (RESTORE.sh's own cleanup removes the
-# scratch directory when it is ended). The run
+# each file its work directory holds with its size and sha256 (RESTORE.sh's own cleanup removes
+# the work directory when it is ended). The run
 # directory keeps every command's output, the catalog, and the drive's sysfs options and
 # counters, MAM and log pages 0x02 0x03 0x0c 0x17 before and after every step.
 #
@@ -69,8 +70,8 @@
 #   - TAPECTL_TEST_EARLY_WARNING_AT is unset (a real run with the test hook proves nothing);
 #   - tapectl-drive-poll.timer is not active, and the tape lock is free;
 #   - on the real drive, --span-source names the unit's source, large enough to reach past the
-#     drive's warning; the work directory has room for its copy, its staging, the scratch and
-#     the restore, and the run directory for the rest.
+#     drive's warning; the work directory has room for its copy, its staging, the work directory
+#     and the restore, and the run directory for the rest.
 #
 # --mhvtl is the rehearsal on a virtual drive (vm-desk1): the same six steps, a generated
 # source of 48 MiB, 1 MiB slices, the drive's capacity_override at 200 MB (the harnesses'
@@ -109,7 +110,7 @@ usage: TAPECTL_HOME=<fresh dir> TAPECTL_BIN=<tapectl> [FIXTURE_BIN=<short_seal_f
        scripts/span-acceptance.sh --print-plan [--mhvtl]
 
 The 1.7.0 acceptance run of spanning: a unit that may span cut by the drive's early warning
-on tape 1, RESTORE.sh holding tape 1's range in scratch, a rebuild of tape 1, the same
+on tape 1, RESTORE.sh restoring tape 1's range and held at its prompt, a rebuild of tape 1, the same
 cartridge written again as tape 2, and the held restore finished from it. OVERWRITES THE
 CARTRIDGE, twice.
 
@@ -137,7 +138,7 @@ CARTRIDGE, twice.
                                  drive).
   FIXTURE_BIN (env)              The short_seal_filler example built with it. Default:
                                  <dir of TAPECTL_BIN>/examples/short_seal_filler.
-  DAR_BIN (env)                  dar for the throwaway config. Default: dar on PATH.
+  TAR_BIN (env)                  GNU tar for the throwaway config. Default: tar on PATH.
 USAGE
 }
 
@@ -239,15 +240,15 @@ THE STEPS, and the time each takes on home2 (the write at ~152 MiB/s and the rea
                  $UNIT_S until the drive's warning near 2.502 TB: a short seal, $UNIT_S a
                  range of slices 1..K1, item 114's readback of the slice past the warning.
                                                                                  ~4.5 h
-  2  spool       RESTORE.sh off tape 1 reads the range (~80 GB) into scratch, still
-                 encrypted, and waits at its prompt for the next cartridge.          ~15 min
+  2  restore 1   RESTORE.sh off tape 1 restores the range (~80 GB), slice by slice into one
+                 tar run, and waits at its prompt for the next cartridge.            ~15 min
   3  rebuild     catalog rebuild --from-volume of $LABEL1 into a second home.        ~5 min
   4a re-init     the two refusals (retire, cartridge erase), the filler released, one
                  filemark written at the start of the tape, $LABEL2 initialised with --force:
                  $LABEL1 is marked erased.                                           ~5 min
   4b write       $LABEL2: $UNIT_S whole, from the kept staging.                     ~15 min
-  5  answer      the held RESTORE.sh takes $LABEL2 by hash, reads slices K1+1..N, restores
-                 the unit (~100 GB) and the manifest is compared.                   ~1 h
+  5  answer      the held RESTORE.sh takes $LABEL2 by hash, reads slices K1+1..N in the
+                 same tar run, finishes the unit (~100 GB) and the manifest is compared.                   ~1 h
   6  close       the result and the cleanup commands.
   About 5.5 hours of drive time; staging is most of the rest.
 
@@ -269,7 +270,7 @@ if [ "$PRINT_PLAN" = 1 ]; then print_plan; exit 0; fi
 # ---------- preconditions: nothing below touches the drive until every one holds ----------
 [ -n "$TAPE_DEV" ] || { usage >&2; die "--device is required; there is no default (/dev/nstN numbering moves)"; }
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
-for bin in mt dd tr sg_read_attr sg_logs python3 flock age dar tar sha256sum awk tee df du \
+for bin in mt dd tr sg_read_attr sg_logs python3 flock age tar sha256sum awk tee df du \
     cp find mkfifo setsid; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
@@ -277,15 +278,6 @@ SG_LOGS_HELP="$(sg_logs --help 2>&1 || true)"
 for opt in '--maxlen' '--in=' '--pdt' '--raw' '--page'; do
     case "$SG_LOGS_HELP" in *"$opt"*) ;; *) die "this sg_logs does not list the $opt option; the log-page reads would fail" ;; esac
 done
-# RESTORE.sh restores a unit across tapes only with dar 2.7.9 or later (2.7.21 without the
-# unit's catalogue in the envelope); it would refuse after tape 1's hours of writing.
-HEIR_DAR="$(dar -V 2>&1 </dev/null | sed -n 's/.*dar version \([0-9][0-9.]*\).*/\1/p' | sed -n 1p)"
-python3 - "$HEIR_DAR" <<'PY' || die "the dar on PATH is '${HEIR_DAR:-unknown}': RESTORE.sh restores a unit across tapes with dar 2.7.9 or later"
-import sys
-v = tuple(int(x) for x in (sys.argv[1] or "0").split(".")[:3] if x.isdigit())
-sys.exit(0 if v >= (2, 7, 9) else 1)
-PY
-
 # A real write with the test hook seals where the hook says, not where the medium does.
 if [ -n "${TAPECTL_TEST_EARLY_WARNING_AT+set}" ]; then
     [ "$MHVTL" = 1 ] || die "TAPECTL_TEST_EARLY_WARNING_AT is set: a real-drive run with the test hook proves nothing. Unset it"
@@ -297,8 +289,8 @@ fi
 TAPECTL_BIN="$(readlink -f "$TAPECTL_BIN")"
 : "${FIXTURE_BIN:=$(dirname "$TAPECTL_BIN")/examples/short_seal_filler}"
 [ -x "$FIXTURE_BIN" ] || die "FIXTURE_BIN=$FIXTURE_BIN is not an executable file (cargo build --example short_seal_filler, built with TAPECTL_BIN)"
-: "${DAR_BIN:=$(command -v dar)}"
-[ -x "$DAR_BIN" ] || die "DAR_BIN=$DAR_BIN is not an executable file"
+: "${TAR_BIN:=$(command -v tar)}"
+[ -x "$TAR_BIN" ] || die "TAR_BIN=$TAR_BIN is not an executable file"
 TAPECTL_VERSION="$("$TAPECTL_BIN" --version 2>&1 | sed -n 1p)"
 if [ "$MHVTL" = 0 ]; then
     # The run is the 1.7.0 candidate's: a binary before 1.7.0 cannot span at all.
@@ -481,10 +473,10 @@ held_alive() {
     s="$(held_state)"
     [ -n "$s" ] && [ "$s" != Z ] && [ "$s" != X ]
 }
-# What the held run's scratch holds, file by file: path, size, sha256. RESTORE.sh's own exit
-# trap removes its scratch directory when it ends on TERM, INT or HUP, or by itself (only a
-# KILL, a crash or a power loss leaves it), so this is the evidence of the spool a FAIL keeps.
-# On home2 it hashes up to the whole range, which takes minutes.
+# What the held run's work directory holds, file by file: path, size, sha256. RESTORE.sh's own
+# exit trap removes its work directory when it ends on TERM, INT or HUP, or by itself (only a
+# KILL, a crash or a power loss leaves it), so this is the evidence a FAIL keeps. It holds the
+# envelopes' text and at most one slice (item 267), so it is quick to hash.
 HELD_LIST=""
 record_scratch() {
     HELD_LIST="$RUN/held-scratch-at-end.tsv"
@@ -509,14 +501,14 @@ end_held() {
     local n
     for n in 1 2 3 4 5 6 7 8 9 10; do
         if ! held_alive; then
-            HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) was ended with TERM; its own cleanup removed its scratch directory. What the scratch held (each file's size and sha256) is in $HELD_LIST."
+            HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) was ended with TERM; its own cleanup removed its work directory. What it held (each file's size and sha256) is in $HELD_LIST."
             echo "span-acceptance: $HELD_END_NOTE" >&2
             return 0
         fi
         sleep 1
     done
     kill -KILL -- "-$HELD_PID" 2>/dev/null || kill -KILL "$HELD_PID" 2>/dev/null || true
-    HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) did not end on TERM within ${n}s and was killed, so its scratch directory under $SCRATCH may remain, holding encrypted slices only: remove it by hand once the failure is read. What it held is listed in $HELD_LIST."
+    HELD_END_NOTE="The held RESTORE.sh run (pid $HELD_PID) did not end on TERM within ${n}s and was killed, so its work directory (.tapectl-work.*) under $SCRATCH may remain, holding the decrypted envelopes and at most one slice's plain tar: remove it by hand once the failure is read. What it held is listed in $HELD_LIST."
     echo "span-acceptance: $HELD_END_NOTE" >&2
 }
 trap 'end_held' EXIT
@@ -694,13 +686,14 @@ tape_file() { # <position> <out>
     if [ "$1" -gt 0 ]; then mt -f "$TAPE_DEV" fsf "$1" || fail "mt fsf $1 failed"; fi
     dd if="$TAPE_DEV" bs=512k 2>"$2.dd.err" | tr -d '\0' > "$2" || fail "dd of tape file $1 failed"
 }
-# The `requires` line of the tape file at <position> must be item 124's normative spelling.
+# The `requires` line of the tape file at <position> must be Layout 3's: empty (volume-format-v3.md
+# 1.2; "short-seal" and "spanning" are not features of Layout 3, item 258(a) and item 288).
 assert_requires_spanning() { # <position> <what>
     local f="$STEP_DIR/tape-file-$1.txt" line
     tape_file "$1" "$f"
     line="$(grep -E '^requires = ' "$f" | sed -n 1p || true)"
-    [ "$line" = 'requires = ["short-seal", "spanning"]' ] \
-        || fail "$2 (tape file $1) says '${line:-no requires line}', want requires = [\"short-seal\", \"spanning\"] (item 124)"
+    [ "$line" = 'requires = []' ] \
+        || fail "$2 (tape file $1) says '${line:-no requires line}', want requires = [] (Layout 3)"
     log "  $2 (tape file $1): $line"
 }
 
@@ -784,10 +777,9 @@ log "the unit's source: ${SPAN_SOURCE:-generated} ($SRC_BYTES bytes); the filler
     echo "tapectl=$TAPECTL_BIN"; echo "tapectl_version=$TAPECTL_VERSION"
     echo "tapectl_sha256=$(sha256sum "$TAPECTL_BIN" | awk '{print $1}')"
     echo "fixture=$FIXTURE_BIN"
-    echo "dar_config=$("$DAR_BIN" -V 2>&1 </dev/null | grep -m1 'dar version' || true)"
-    echo "dar_heir=$HEIR_DAR"
     echo "age=$(age --version 2>&1 | sed -n 1p)"
-    echo "tar=$(tar --version 2>&1 | sed -n 1p)"
+    echo "tar=$("$TAR_BIN" --version 2>&1 | head -1)"
+    echo "tar_heir=$(tar --version 2>&1 | head -1)"
     echo "script_commit=$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "capacity=$CAPACITY"; echo "capacity_override=${CAP_OVERRIDE:-none}"
     echo "post_warning_bytes=$POST_WARNING"; echo "slice_size=$SLICE_SIZE"
@@ -809,7 +801,7 @@ printf '%s\n' "$ESCROW_SECRET" > "$RUN/keys/escrow.key"
 umask "$umask_old"
 printf '%s\n' "$ESCROW_PUB" > "$RUN/keys/escrow.pub"
 chmod 600 "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err"
-run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
+run cfg-tar 0 tctl config set tar.binary "\"$TAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
 run cfg-copies 0 tctl config set defaults.min_copies 1
 # Every file of the copy is archived, so the restore can be compared with all of it.
@@ -846,6 +838,7 @@ fi
 run unit-f 0 tctl unit init "$FILLER_SRC" --tenant "$TENANT" --name "$UNIT_F"
 run unit-s 0 tctl unit init "$SPAN_DIR" --tenant "$TENANT" --name "$UNIT_S"
 # Item 82: the unit allows spanning, in its dotfile's [policy], as an operator sets it.
+# T5.1 removes this (item 288: every unit continues on the next cartridge; the key goes).
 printf '\n[policy]\nallow_spanning = true\n' >> "$SPAN_DIR/.tapectl-unit.toml"
 cp "$SPAN_DIR/.tapectl-unit.toml" "$STEP_DIR/span-dotfile.toml"
 for u in "$UNIT_F" "$UNIT_S"; do
@@ -1032,7 +1025,7 @@ log "  write_early_warning: $(tail -1 "$STEP_DIR/early-warning-event.tsv")"
 dbq "$DB" "SELECT action, details FROM events WHERE action IN ('write_feed_ratio', 'write_capacity_used', 'write_completed')
     ORDER BY id" > "$STEP_DIR/write-events.tsv" || true
 log "  feed ratio: $(grep '^write_feed_ratio' "$STEP_DIR/write-events.tsv" | sed -n 1p | cut -f2 || true)"
-# Item 124: File 0 and the short seal (the last file, at K+1) state both features.
+# Layout 3: File 0 and the short seal (the last file, at K+1) carry an empty `requires`.
 assert_requires_spanning 0 "File 0"
 assert_requires_spanning $((K + 1)) "the short seal"
 grep -E "^ended_after = $K\$" "$STEP_DIR/tape-file-$((K + 1)).txt" >/dev/null || fail "the short seal at file $((K + 1)) does not state ended_after = $K"
@@ -1041,7 +1034,7 @@ cp -a "$DB" "$RUN/catalog-after-tape1.db"
 end_step
 
 # ------------------------------------------------------------
-begin_step 2 spool "RESTORE.sh's default mode spools tape 1's range into scratch and is held at its prompt"
+begin_step 2 restore1 "RESTORE.sh restores tape 1's range into one tar run and is held at its prompt for the next cartridge"
 HEIR_DIR="$RUN/heir"
 extract_restore_sh "$HEIR_DIR"
 TENANT_KEY="$TAPECTL_HOME/keys/$TENANT-primary.age.key"
@@ -1055,7 +1048,7 @@ mkfifo "$FIFO"
 exec 8<>"$FIFO"
 HELD_OUT="$STEP_DIR/held.out"
 HELD_CMD=(env TAPE_DEVICE="$TAPE_DEV" TMPDIR="$RUN/tmp" setsid "$HEIR_DIR/RESTORE.sh" --restore
-    --unit "$UNIT_S" --key "$TENANT_KEY" --to "$RESTORE_TO" --scratch "$SCRATCH")
+    --unit "$UNIT_S" --key "$TENANT_KEY" --to "$RESTORE_TO" --work "$SCRATCH")
 printf '+ %q' "${HELD_CMD[@]}" >> "$RUN/commands.log"; echo " < $FIFO (held)" >> "$RUN/commands.log"
 log "  \$ ${HELD_CMD[*]} < $FIFO   (held: answered in step 5)"
 "${HELD_CMD[@]}" <"$FIFO" >"$HELD_OUT" 2>&1 8>&- &
@@ -1064,7 +1057,7 @@ echo "$HELD_PID" > "$STEP_DIR/held.pid"
 sleep 2
 HELD_SID="$(python3 -c 'import os, sys; print(os.getsid(int(sys.argv[1])))' "$HELD_PID" 2>/dev/null || true)"
 [ "$HELD_SID" = "$HELD_PID" ] || fail "the held run (pid $HELD_PID) is not its own session (sid '${HELD_SID:-gone}'): setsid forked, or it ended at once (held.out)"
-# Until its prompt: RESTORE.sh reads the range, ~$((RANGE_BYTES / 1000000)) MB; a bound of
+# Until its prompt: RESTORE.sh reads and restores the range, ~$((RANGE_BYTES / 1000000)) MB; a bound of
 # half an hour plus 10 MB/s, so a hung read ends the run rather than holding it for ever.
 SPOOL_BOUND=$((1800 + RANGE_BYTES / 10000000))
 T0="$(date +%s)"; NEXT_NOTE=$((T0 + 300))
@@ -1073,7 +1066,7 @@ while ! grep -F "$PROMPT" "$HELD_OUT" >/dev/null; do
     NOW="$(date +%s)"
     [ $((NOW - T0)) -le "$SPOOL_BOUND" ] || fail "RESTORE.sh has not reached its swap prompt after $((NOW - T0)) s (the bound is $SPOOL_BOUND s; $HELD_OUT)"
     if [ "$NOW" -ge "$NEXT_NOTE" ]; then
-        log "  spooling: $(find "$SCRATCH" -name 'slice.*.enc' 2>/dev/null | wc -l) of $K1 slices in scratch after $((NOW - T0)) s"
+        log "  restoring tape 1's range: $(find "$RESTORE_TO" -type f 2>/dev/null | wc -l) files in place after $((NOW - T0)) s"
         NEXT_NOTE=$((NOW + 300))
     fi
     sleep 10
@@ -1082,35 +1075,31 @@ sleep 5
 held_alive || fail "RESTORE.sh ended after its swap prompt, without an answer ($HELD_OUT)"
 [ "$(grep -cF "$PROMPT" "$HELD_OUT")" = 1 ] || fail "RESTORE.sh prompted more than once before an answer ($HELD_OUT)"
 log "  at the prompt after $(( $(date +%s) - T0 )) s: $(grep -F "$PROMPT" "$HELD_OUT")"
-for needle in "'$UNIT_S' (version 1) is held across tapes: this tape holds slices 1 to $K1 of $N." \
-    "'$UNIT_S' (version 1) needs slice $((K1 + 1)) of $N next" \
-    "No index this key opened names a tape that holds slice $((K1 + 1))" \
-    "${PROMPT}$((K1 + 1)) into "; do
+# The prompt's own words: RESTORE.sh's ask_cartridge (src/volume/heir/RESTORE.sh), whose first
+# line and eject line tests/heir_restore.rs::a_unit_on_three_tapes_restores_across_two_swaps_as_one_run_for_each_algorithm
+# asserts ("First eject the cartridge now in the drive", then PROMPT).
+for needle in "Unit $UNIT_S (version 1) needs slice $((K1 + 1)) of $N next" \
+    "No tape the index in this tape's envelope names holds slice $((K1 + 1))" \
+    "First eject the cartridge now in the drive" \
+    "${PROMPT}$((K1 + 1)) into " \
+    "its seal marker covers:"; do
     grep -F -- "$needle" "$HELD_OUT" >/dev/null || fail "RESTORE.sh's output lacks: $needle ($HELD_OUT)"
 done
-# The spool: slices 1..K1, each still age ciphertext, each the size the catalog records.
-python3 - "$DB" "$SCRATCH" "$UNIT_S" "$K1" <<'PY' > "$STEP_DIR/assert-spool.txt" 2>&1 || fail "the scratch directory does not hold tape 1's range as ciphertext ($STEP_DIR/assert-spool.txt)"
-import glob, os, sqlite3, sys
-db, scratch, us, k1 = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
-size = dict(c.execute("""SELECT sl.slice_number, sl.encrypted_bytes FROM stage_slices sl
-    JOIN stage_sets ss ON ss.id = sl.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id
-    JOIN units u ON u.id = s.unit_id WHERE u.name = ?""", (us,)).fetchall())
-dirs = glob.glob(os.path.join(scratch, ".tapectl-restore.*"))
-assert len(dirs) == 1, f"scratch directories under {scratch}: {dirs}"
-files = sorted(os.listdir(dirs[0]))
-want = sorted(f"slice.{i}.enc" for i in range(1, k1 + 1))
-assert files == want, f"{dirs[0]} holds {files}, want slice.1.enc to slice.{k1}.enc"
-for name in files:
-    p = os.path.join(dirs[0], name)
-    n = int(name.split(".")[1])
-    with open(p, "rb") as f:
-        head = f.read(21)
-    assert head == b"age-encryption.org/v1", f"{name} is not age ciphertext at rest: {head!r}"
-    assert os.path.getsize(p) == size[n], f"{name} is {os.path.getsize(p)} bytes, the slice {size[n]}"
-print(f"{dirs[0]}: slices 1-{k1}, each age ciphertext of the slice's recorded size")
+# Item 267, tests/heir_restore.rs::nothing_of_a_slice_waits_in_the_work_directory_at_the_prompt:
+# no slice, ciphertext or plain, waits in the work directory at the prompt. Positive control: the
+# directory is there (one, named .tapectl-work.*) and holds the unpacked envelope (env.*), so the
+# listing saw the held run's directory and its absence of slice.* files means something.
+python3 -I - "$SCRATCH" > "$STEP_DIR/assert-workdir.txt" 2>&1 <<'PY' || fail "the work directory at the prompt is not as item 267 says ($STEP_DIR/assert-workdir.txt)"
+import glob, os, sys
+dirs = glob.glob(os.path.join(sys.argv[1], ".tapectl-work.*"))
+assert len(dirs) == 1, f"work directories under {sys.argv[1]}: {dirs}"
+names = sorted(os.listdir(dirs[0]))
+assert any(n.startswith("env.") for n in names), f"{dirs[0]} holds no unpacked envelope (env.*): {names}"
+waiting = [n for n in names if n.startswith("slice.")]
+assert not waiting, f"{dirs[0]} holds slice file(s) at the prompt: {waiting}"
+print(f"{dirs[0]}: {len(names)} entries, an unpacked envelope and no slice")
 PY
-log "  $(tail -n 1 "$STEP_DIR/assert-spool.txt")"
+log "  $(tail -n 1 "$STEP_DIR/assert-workdir.txt")"
 assert_no_device_open "$STEP_DIR/held-fds.txt" > "$STEP_DIR/held-fds.summary"
 log "  $(cat "$STEP_DIR/held-fds.summary")"
 end_step
@@ -1231,7 +1220,7 @@ assert q("SELECT status FROM volumes WHERE label = ?", label) == [("sealed",)], 
 print(f"tape 2: {us} completed, slices 1-{n}, planned from slice 1; the version current")
 PY
 log "  $(tail -n 1 "$STEP_DIR/assert-write2.txt")"
-# Item 124: any tape whose plan holds a slice of a spannable set states both features.
+# Layout 3: no tape states a feature in `requires`, a spannable set or not.
 assert_requires_spanning 0 "$LABEL2's File 0"
 run volume-info2 0 tctl volume info "$LABEL2"
 cp -a "$DB" "$RUN/catalog-after-tape2.db"
@@ -1249,7 +1238,7 @@ printf '\n' >&8
 T5="$(date +%s)"
 while held_alive; do
     if [ "$(grep -cF "$PROMPT" "$HELD_OUT" || true)" -gt 1 ]; then
-        # "quit" ends it through its own cleanup, which removes the scratch: record it first.
+        # "quit" ends it through its own cleanup, which removes the work directory: record it first.
         record_scratch
         printf 'quit\n' >&8
         sleep 5
@@ -1267,15 +1256,14 @@ echo "$HELD_RC" > "$STEP_DIR/held.rc"
 cp "$HELD_OUT" "$STEP_DIR/held-final.out"
 log "  RESTORE.sh exited $HELD_RC, $(( $(date +%s) - T5 )) s after the answer"
 [ "$HELD_RC" = 0 ] || fail "the held RESTORE.sh run exited $HELD_RC ($HELD_OUT)"
+# "This cartridge identifies as: LABEL" and "RESTORE COMPLETE" are the words the same test asserts.
 for needle in "This cartridge identifies as: $LABEL2" \
-    "It gives slice(s) $((K1 + 1)) to $N of '$UNIT_S'" \
-    "positions its seal marker covers." \
-    "Every slice of '$UNIT_S' is in the scratch directory" \
     "RESTORE COMPLETE"; do
     grep -F -- "$needle" "$HELD_OUT" >/dev/null || fail "RESTORE.sh's output lacks: $needle ($HELD_OUT)"
 done
 [ "$(grep -cF "$PROMPT" "$HELD_OUT")" = 1 ] || fail "RESTORE.sh asked for more than one cartridge ($HELD_OUT)"
-if compgen -G "$SCRATCH/.tapectl-restore.*" >/dev/null; then fail "the scratch directory was left in $SCRATCH"; fi
+if compgen -G "$SCRATCH/.tapectl-work.*" >/dev/null; then fail "the work directory was left in $SCRATCH"; fi
+[ ! -e "$RESTORE_TO/.tapectl-damaged-files.txt" ] || fail "a complete restore left a list of damaged files ($RESTORE_TO/.tapectl-damaged-files.txt)"
 log "  the manifest of the restored tree"
 run manifest-restored 0 manifest "$RESTORE_TO" "$RUN/manifest-restored.tsv"
 if ! cmp -s "$RUN/manifest-source.tsv" "$RUN/manifest-restored.tsv"; then
@@ -1291,7 +1279,7 @@ cp -a "$DB" "$RUN/catalog-at-end.db"
 {
     echo "RESULT: PASS"
     echo "every step passed: $LABEL1 sealed short after file $K with $UNIT_S a range of slices 1-$K1 of $N;"
-    echo "RESTORE.sh held that range in scratch, took $LABEL2 by hash and restored $UNIT_S identical"
+    echo "RESTORE.sh restored that range and held at its prompt, took $LABEL2 by hash and restored $UNIT_S identical"
     echo "the cartridge now holds $LABEL2 ($UNIT_S whole) and belongs to $TAPECTL_HOME"
 } > "$RUN/RESULT.txt"
 [ -z "$FILLER_DIR" ] || rm -rf "$FILLER_DIR"

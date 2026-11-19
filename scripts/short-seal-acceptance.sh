@@ -98,7 +98,7 @@ short seal, then restore, rebuild and rewrite around it. OVERWRITES THE CARTRIDG
                                  drive).
   FIXTURE_BIN (env)              The short_seal_filler example built with it. Default:
                                  <dir of TAPECTL_BIN>/examples/short_seal_filler.
-  DAR_BIN (env)                  dar for the throwaway config. Default: dar on PATH.
+  TAR_BIN (env)                  GNU tar for the throwaway config. Default: tar on PATH.
 USAGE
 }
 
@@ -138,7 +138,7 @@ else
     ALLOWANCE=$((512 * MiB))
     SIZE_A=$((64 * MiB)); SIZE_B=$((1536 * MiB)); SIZE_Z=$((256 * MiB))
 fi
-# The filler's source: one full slice and a sixteenth, so its slice 1 is a full dar slice.
+# The filler's source: one full slice and a sixteenth, so its slice 1 is a full tar slice.
 SIZE_F=$((SLICE_BYTES + SLICE_BYTES / 16))
 case "$CAPACITY" in ''|*[!0-9]*) die "--capacity must be a plain decimal byte count (got '$CAPACITY')" ;; esac
 [ -z "$HOOK_AT" ] || case "$HOOK_AT" in *[!0-9]*) die "--hook-at must be a plain decimal byte count" ;; esac
@@ -166,7 +166,7 @@ THE STEPS and the drive time each takes on the HP LTO-6 (estimates: the write at
 reads at the 140 MiB/s production verify ran at, RECORD #326):
   1 setup        no tape. A throwaway home and config (post_warning_bytes = $POST_WARNING,
                  min_copies = 1), the cartridge registered at $cap_tb TB, four units staged
-                 (~3 GiB through dar and age, about 5 min), the filler's rows.        ~10 min
+                 (~3 GiB through tar and age, about 5 min), the filler's rows.        ~10 min
   2 volume init  whatever the cartridge holds erased by this home's cartridge erase, then
                  $LABEL1 initialised without --force.                                 ~5 min
   3 volume write the plan reaches past the $ceil_tb TB fill ceiling to ~$cap_tb TB; the drive's
@@ -201,7 +201,7 @@ if [ "$PRINT_PLAN" = 1 ]; then print_plan; exit 0; fi
 # ---------- preconditions: nothing below touches the drive until every one holds ----------
 [ -n "$TAPE_DEV" ] || { usage >&2; die "--device is required; there is no default (/dev/nstN numbering moves)"; }
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
-for bin in mt dd tr sg_read_attr sg_logs python3 flock age dar tar sha256sum diff awk tee df; do
+for bin in mt dd tr sg_read_attr sg_logs python3 flock age tar sha256sum diff awk tee df; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 SG_LOGS_HELP="$(sg_logs --help 2>&1 || true)"
@@ -220,8 +220,8 @@ fi
 TAPECTL_BIN="$(readlink -f "$TAPECTL_BIN")"
 : "${FIXTURE_BIN:=$(dirname "$TAPECTL_BIN")/examples/short_seal_filler}"
 [ -x "$FIXTURE_BIN" ] || die "FIXTURE_BIN=$FIXTURE_BIN is not an executable file (cargo build --example short_seal_filler, built with TAPECTL_BIN)"
-: "${DAR_BIN:=$(command -v dar)}"
-[ -x "$DAR_BIN" ] || die "DAR_BIN=$DAR_BIN is not an executable file"
+: "${TAR_BIN:=$(command -v tar)}"
+[ -x "$TAR_BIN" ] || die "TAR_BIN=$TAR_BIN is not an executable file"
 TAPECTL_VERSION="$("$TAPECTL_BIN" --version 2>&1 | sed -n 1p)"
 if [ "$MHVTL" = 0 ]; then
     # The run is the 1.6.0 candidate's: a binary before 1.6.0 cannot seal short at all.
@@ -510,9 +510,8 @@ log "home: $TAPECTL_HOME; rebuild home: $REBUILD_HOME; staging: $STAGING; filler
     echo "tapectl=$TAPECTL_BIN"; echo "tapectl_version=$TAPECTL_VERSION"
     echo "tapectl_sha256=$(sha256sum "$TAPECTL_BIN" | awk '{print $1}')"
     echo "fixture=$FIXTURE_BIN"
-    echo "dar=$("$DAR_BIN" --version 2>&1 | sed -n 1p)"
     echo "age=$(age --version 2>&1 | sed -n 1p)"
-    echo "tar=$(tar --version 2>&1 | sed -n 1p)"
+    echo "tar=$("$TAR_BIN" --version 2>&1 | head -1)"
     echo "script_commit=$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "capacity_registered=$CAPACITY"; echo "post_warning_bytes=$POST_WARNING"; echo "slice_size=$SLICE_SIZE"
 } > "$RUN/meta.txt"
@@ -531,7 +530,7 @@ printf '%s\n' "$ESCROW_SECRET" > "$RUN/keys/escrow.key"
 umask "$umask_old"
 printf '%s\n' "$ESCROW_PUB" > "$RUN/keys/escrow.pub"
 chmod 600 "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err"
-run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
+run cfg-tar 0 tctl config set tar.binary "\"$TAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
 run cfg-copies 0 tctl config set defaults.min_copies 1
 run cfg-staging 0 tctl config set staging.directory "\"$STAGING\""
@@ -670,13 +669,15 @@ run verify 0 tctl volume verify "$LABEL1" --full --device "$TAPE_DEV"
 HEIR_DIR="$WORK/heir"
 extract_restore_sh "$HEIR_DIR"
 heir info 0 --info
-grep -F "Verdict: SEALED" "$STEP_DIR/info.out" >/dev/null || fail "RESTORE.sh --info does not say Verdict: SEALED"
-grep -F "The tape ended early, after file $K" "$STEP_DIR/info.out" >/dev/null || fail "RESTORE.sh --info does not say the tape ended early after file $K"
+# The words tests/heir_restore.rs::info_on_a_short_tape_says_where_it_ended_and_names_the_planned_files_not_on_it asserts.
+grep -F "ended EARLY, after file $K" "$STEP_DIR/info.out" >/dev/null || fail "RESTORE.sh --info does not say the tape ended EARLY, after file $K"
+grep -F "NOT ON TAPE  files $((K + 1)) to " "$STEP_DIR/info.out" >/dev/null || fail "RESTORE.sh --info does not name the planned files after file $K as NOT ON TAPE"
 heir heir-verify 0 --verify
-grep -F "VERIFY: PASS" "$STEP_DIR/heir-verify.out" >/dev/null || fail "RESTORE.sh --verify did not PASS"
-NOT_ON_TAPE="$(grep -c "^NOT ON TAPE" "$STEP_DIR/heir-verify.out" || true)"
+# tests/heir_restore.rs::verify_on_a_short_tape_hashes_what_is_on_it_and_names_the_rest_not_on_tape
+grep -F "VERIFY PASSED" "$STEP_DIR/heir-verify.out" >/dev/null || fail "RESTORE.sh --verify did not PASS"
+NOT_ON_TAPE="$(grep -c "NOT ON TAPE" "$STEP_DIR/heir-verify.out" || true)"
 [ "$NOT_ON_TAPE" -eq 1 ] || fail "RESTORE.sh --verify prints $NOT_ON_TAPE NOT ON TAPE lines on a short tape, want one (ADR-0012 item 140)"
-log "  RESTORE.sh --verify: PASS; $(grep "^NOT ON TAPE" "$STEP_DIR/heir-verify.out")"
+log "  RESTORE.sh --verify: PASSED; $(grep "NOT ON TAPE" "$STEP_DIR/heir-verify.out")"
 end_step
 
 # ------------------------------------------------------------
@@ -689,8 +690,17 @@ heir restore-heir 0 --restore --unit "$UNIT_B" --key "$TENANT_KEY" --to "$WORK/r
 assert_identical "$SRC/b" "$WORK/restore-heir-b" heir-restore
 heir restore-heir-cut any --restore --unit "$UNIT_Z" --key "$TENANT_KEY" --to "$WORK/restore-heir-z"
 [ "$RC" != 0 ] || fail "RESTORE.sh restored the cut unit $UNIT_Z from a tape that does not hold it whole"
-grep -F "not on this tape whole" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null \
-    || fail "RESTORE.sh's refusal of $UNIT_Z does not say it is not on this tape whole"
+# Layout 3's script restores what a short tape holds and says the rest is missing: "RESTORE
+# INCOMPLETE" with a list of the files left out (tests/heir_restore.rs::
+# a_whole_unit_restores_from_a_short_tape_and_a_partial_one_restores_what_it_holds), or, for a
+# unit no envelope on the tape lists, a refusal naming it.
+if grep -F "RESTORE INCOMPLETE" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null; then
+    [ -s "$WORK/restore-heir-z/.tapectl-damaged-files.txt" ] \
+        || fail "RESTORE.sh called the restore of $UNIT_Z incomplete but left no list of the files it left out"
+else
+    grep -F "is not in the envelope(s) your key opened" "$STEP_DIR/restore-heir-cut.out" "$STEP_DIR/restore-heir-cut.err" >/dev/null \
+        || fail "RESTORE.sh's refusal of $UNIT_Z is neither RESTORE INCOMPLETE nor 'not in the envelope(s) your key opened'"
+fi
 run restore-tapectl-cut any tctl restore unit --unit "$UNIT_Z" --from "$LABEL1" --to "$WORK/restore-tapectl-z" --device "$TAPE_DEV"
 [ "$RC" != 0 ] || fail "tapectl restored the cut unit $UNIT_Z from $LABEL1"
 end_step

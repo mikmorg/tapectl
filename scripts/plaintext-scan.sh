@@ -19,12 +19,18 @@
 #      xattr value, unit name and tenant name all carry a second per-run
 #      token, with `compression = "none"` so any leak is verbatim. Small,
 #      multi-slice, sparse and hard-linked files.
-#   4. Unmount and count both tokens in the raw image file.
+#   4. Unmount and count both tokens, and a plaintext tar's own marker (the
+#      "ustar" magic of a header, at offset 257 of a 512-byte block), in the
+#      raw image file. Layout 3 stages a tar stream, so a leaked stream shows
+#      the planted names and contents verbatim and the magic in every header.
+#   5. Positive control for step 4: the same count over a plaintext tar of the
+#      planted tree, made here by GNU tar. It must find the token and the
+#      magic, or the counting is broken and the run fails instead of passing.
 #
-# PASS: the canary is found and the product token is not. Exit 0 pass,
+# PASS: the canary is found and neither the product token nor the tar magic is. Exit 0 pass,
 # 1 fail (or a canary the scan could not see), 2 setup error.
 #
-# Needs: sudo (mount/umount), mkfs.ext4, dar, setfattr (optional: the xattr
+# Needs: sudo (mount/umount), mkfs.ext4, tar (the GNU tar tapectl stages with), setfattr (optional: the xattr
 # leg is skipped without it). Touches no tape device. The tapectl home is a
 # normal directory outside the image: this checks the staging device only.
 #
@@ -133,7 +139,7 @@ python3 - "$HOME_DIR/config.toml" "$MNT" <<'PY'
 import re, sys
 cfg, staging = sys.argv[1:3]
 t = open(cfg).read()
-t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
+t = re.sub(r'(?m)^binary *=.*$', 'binary = "tar"', t, count=1)  # [tar] binary
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "4M"', t, count=1)
 t = re.sub(r'(?m)^compression *=.*$', 'compression = "none"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{staging}"', t, count=1)
@@ -164,17 +170,44 @@ echo "positive control: $nslices encrypted slice(s) on the scanned device"
 sync
 sudo umount "$MNT"
 mounted=0
-count() { { grep -a -o -F "$1" "$IMG" || true; } | wc -l; }
-canary_hits=$(count "$CANARY")
-token_hits=$(count "$TOKEN")
-echo "raw image: canary $canary_hits hit(s), product token $token_hits hit(s)"
+# count FILE NEEDLE: occurrences of the fixed string NEEDLE in FILE.
+count() { { grep -a -o -F "$2" "$1" || true; } | wc -l; }
+# The tar header magic: "ustar" followed by NUL and "00" (POSIX/pax) or by two
+# spaces and NUL (GNU), 257 bytes into a header. Counted as the 5 letters plus
+# the byte after them being NUL or a space, which the ciphertext and ext4
+# metadata reach only by chance (about 2^-40 a position).
+magic_count() {
+    python3 -I - "$1" <<'PY'
+import mmap, re, sys
+with open(sys.argv[1], "rb") as f:
+    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        print(sum(1 for _ in re.finditer(rb"ustar[\x00 ]", m)))
+PY
+}
+
+# 5 (control first, so a broken count fails before it can bless a clean image).
+# A plaintext tar of the planted tree: what a leaked stream would look like.
+CONTROL=$WORK/control.tar
+tar --format=pax -cf "$CONTROL" -C "$SRC_PARENT" "$UNIT"
+control_token=$(count "$CONTROL" "$TOKEN")
+control_magic=$(magic_count "$CONTROL")
+echo "control (a plaintext tar of the planted tree): product token $control_token hit(s), tar magic $control_magic"
+if [ "$control_token" -eq 0 ] || [ "$control_magic" -eq 0 ]; then
+    echo "FAIL: the scan does not see a plaintext tar of the planted tree (token $control_token, magic $control_magic); a clean image would prove nothing"
+    exit 1
+fi
+
+canary_hits=$(count "$IMG" "$CANARY")
+token_hits=$(count "$IMG" "$TOKEN")
+magic_hits=$(magic_count "$IMG")
+echo "raw image: canary $canary_hits hit(s), product token $token_hits hit(s), tar magic $magic_hits hit(s)"
 
 if [ "$canary_hits" -eq 0 ]; then
     echo "FAIL: the deleted canary is not in the image, so this scan cannot see a deleted file; it proves nothing"
     exit 1
 fi
-if [ "$token_hits" -ne 0 ]; then
-    echo "FAIL: plaintext from the staged unit is on the staging device ($token_hits hit(s))"
+if [ "$token_hits" -ne 0 ] || [ "$magic_hits" -ne 0 ]; then
+    echo "FAIL: plaintext from the staged unit is on the staging device (token $token_hits hit(s), tar magic $magic_hits hit(s))"
     exit 1
 fi
 if [ "$XATTR_LEG" = skipped ]; then
