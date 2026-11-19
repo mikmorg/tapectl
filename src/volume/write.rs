@@ -28508,14 +28508,12 @@ mod tests {
                         .0
                         .expect("tape 1 seals short");
                     // a has its copy: the release cleans it.
-                    for unit in ["a"] {
-                        f.conn
-                            .execute(
-                                "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
-                                params![stage_set_of(&f, unit)],
-                            )
-                            .unwrap();
-                    }
+                    f.conn
+                        .execute(
+                            "UPDATE stage_sets SET status = 'cleaned' WHERE id = ?1",
+                            params![stage_set_of(&f, "a")],
+                        )
+                        .unwrap();
                     let mut tape2 = MemStore::new(SBS);
                     write(&f, "SG-2", &mut tape2, false)
                         .0
